@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './validate-release.mjs';
-import { prepareNative } from './prepare-native.mjs';
+import { npmSync, prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
 import { bumpRelease } from './bump-release.mjs';
 
@@ -36,7 +36,7 @@ function packAll(t, fixtureVersion = version) {
     chmodSync(binary, 0o755);
     prepareNative(f.root, p.id, join(f.root, 'dist'));
   }
-  execFileSync('npm', ['pack', '--json', '--pack-destination', join(f.root, 'dist')], { cwd: join(f.root, 'extension'), stdio: 'pipe' });
+  npmSync(['pack', '--json', '--pack-destination', join(f.root, 'dist')], { cwd: join(f.root, 'extension'), stdio: 'pipe' });
   return f;
 }
 const response = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body });
@@ -184,7 +184,7 @@ test('all packed packages include the approved MIT license', t => {
       put(`${p.directory}/bin/pi-famulus`, '#!/bin/sh\necho license-pack-fixture\n');
       chmodSync(join(root, p.directory, 'bin/pi-famulus'), 0o755);
     }
-    const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8', stdio: 'pipe' }));
+    const [pack] = JSON.parse(npmSync(['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8', stdio: 'pipe' }));
     const packedLicense = execFileSync('tar', ['-xOzf', join(destination, pack.filename), 'package/LICENSE'], { encoding: 'utf8', stdio: 'pipe' });
     assert.equal(packedLicense, license, `license included despite files whitelist: ${p.name}`);
   }
@@ -318,7 +318,7 @@ test('tampered metadata and omitted native binary in real tarballs fail closed',
   const { root, put } = packAll(t);
   const directory = 'npm/linux-x64';
   const pkg = JSON.parse(readFileSync(join(root, directory, 'package.json')));
-  const repack = () => execFileSync('npm', ['pack', '--json', '--pack-destination', join(root, 'dist')], { cwd: join(root, directory), stdio: 'pipe' });
+  const repack = () => npmSync(['pack', '--json', '--pack-destination', join(root, 'dist')], { cwd: join(root, directory), stdio: 'pipe' });
   const opts = { tag: 'v0.1.0', dryRun: true, run: () => assert.fail('publish') };
   put(`${directory}/package.json`, { ...pkg, main: './tampered' });
   repack();

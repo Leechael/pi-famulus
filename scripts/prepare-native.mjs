@@ -5,6 +5,17 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PLATFORMS, validateMetadata } from './validate-release.mjs';
 
+/** `execFileSync('npm')` is ENOENT on Windows; the shim is `npm.cmd`. */
+export const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+
+export function npmSync(args, options = {}) {
+  return execFileSync(npmCommand, args, {
+    ...options,
+    // Batch shims need a shell; keep Unix on execFile's no-shell path.
+    shell: process.platform === 'win32' ? true : options.shell,
+  });
+}
+
 export function prepareNative(root, platform, destination) {
   const p = PLATFORMS.find(p => p.id === platform);
   assert.ok(p, `unsupported platform: ${platform}`);
@@ -33,7 +44,7 @@ export function prepareNative(root, platform, destination) {
   }
   destination = resolve(destination);
   mkdirSync(destination, { recursive: true });
-  const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8' }));
+  const [pack] = JSON.parse(npmSync(['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8' }));
   assert.equal(pack.name, p.name);
   assert.equal(pack.version, version);
   assert.ok(pack.files.some(f => f.path === 'bin/pi-famulus' && f.size > 0), 'packed artifact must contain native binary');
