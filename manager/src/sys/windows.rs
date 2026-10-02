@@ -13,10 +13,12 @@ use std::os::windows::io::{OwnedHandle, RawHandle};
 use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, DUPLICATE_SAME_ACCESS,
+    CloseHandle, DuplicateHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, DUPLICATE_SAME_ACCESS,
 };
 use windows_sys::Win32::System::Console::{
-    GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
@@ -60,7 +62,22 @@ pub fn apply_new_session_std(cmd: &mut std::process::Command) {
 
 /// Spawn the daemon out of the caller's job (a terminal or IDE may kill its
 /// job when it closes), or inside it when that job forbids breakaway.
+///
+/// CreateProcess hands every inheritable handle to the child, and our own
+/// stdio usually is one (pipes from whoever ran us). The daemon would then
+/// hold those pipes open for its whole life, so a caller reading our output
+/// (`pi-famulus ls | findstr x`) would not see EOF until the daemon exits.
+/// The daemon's stdio is set explicitly, so our handles stop being
+/// inheritable first; std duplicates any handle it passes on purpose.
 pub fn spawn_detached_std(cmd: &mut std::process::Command) -> io::Result<std::process::Child> {
+    for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let h = GetStdHandle(std_handle);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
     apply_new_session_std(cmd);
     match cmd.spawn() {
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
