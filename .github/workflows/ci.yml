@@ -189,19 +189,21 @@ jobs:
       - run: npm run test:graders
         working-directory: eval
         if: runner.os != 'Windows'
+      # Windows: keep the sandboxes on the workspace drive; upload-artifact
+      # cannot collect files from another drive.
       - run: npm run test:e2e
         working-directory: eval
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
       - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: e2e-sandboxes-${{ matrix.os }}
           path: |
             pi-famulus-test-artifacts/
-            /tmp/eval-*/h/manager.log
-            /tmp/eval-*/h/events.jsonl
-            /tmp/eval-*/h/config.json
-            /tmp/eval-*/faux-trace.jsonl
-            ~/AppData/Local/Temp/eval-*/h/manager.log
-            ~/AppData/Local/Temp/eval-*/h/events.jsonl
-            ~/AppData/Local/Temp/eval-*/faux-trace.jsonl
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/manager.log
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/events.jsonl
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/config.json
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/faux-trace.jsonl
           if-no-files-found: ignore
