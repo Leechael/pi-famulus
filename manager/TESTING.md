@@ -372,12 +372,16 @@ unbounded buffering), not a few percent:
 | `running20.daemon_handles_per_task` | ≤ 16 |
 | `running20.runner_rss_avg` | ≤ 16 MiB |
 | `running20.daemon_cpu_3s`, `running20.runners_cpu_3s` | ≤ 150 ms each |
-| `churn200.handle_growth`, `leftovers20.handle_growth` | ≤ 24 |
+| `churn200.handle_growth`, `leftovers20.handle_growth` (after tokio's 10 s blocking-thread keep-alive) | ≤ 24 |
 | `churn.rss_after` | ≤ 64 MiB |
 | `output128m.rss_growth_peak` | ≤ 48 MiB |
 
-`idle.handles`, `output128m.throughput` and `daemon.cpu_total` are reported
-without a budget.
+`idle.handles`, `churn200.handle_growth_warm`, `output128m.throughput` and
+`daemon.cpu_total` are reported without a budget. On Windows each pipe read
+of a running task occupies a tokio blocking thread, and threads hold
+handles, so right after a burst of tasks the count reflects the idle
+thread pool (74 handles after the churn on `windows-latest`); the leak
+budgets apply once those threads have exited.
 
 ## Observability contract (manager + CLI side)
 
