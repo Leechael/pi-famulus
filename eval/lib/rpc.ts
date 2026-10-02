@@ -6,7 +6,7 @@
  * monitor, subagent-handover…) would never be observed.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { EXTENSION_DIR, PI_BIN } from "./paths.ts";
+import { EXTENSION_DIR, piCommand } from "./paths.ts";
 
 export interface RpcEvent {
   /** ms since the process was spawned */
@@ -59,7 +59,8 @@ export class PiRpc {
   exited: Promise<number | null>;
 
   constructor(opts: PiRpcOptions) {
-    this.proc = spawn(PI_BIN, piArgs(opts, "rpc"), {
+    const [program, args] = piCommand(piArgs(opts, "rpc"));
+    this.proc = spawn(program, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
       stdio: ["pipe", "pipe", "pipe"],

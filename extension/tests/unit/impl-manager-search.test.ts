@@ -38,10 +38,17 @@ describe("Famulus home and binary lookup", () => {
     });
   });
 
-  it("uses a namespaced named pipe on Windows", async () => {
-    const { fnv1a64 } = await import("../../src/config");
-    const home = "C:\\Users\\me\\.pi\\agent\\pi-famulus";
-    expect(famulusPaths(home, "win32").socket).toBe(`\\\\.\\pipe\\pi-famulus-${fnv1a64(home)}`);
+  // Same vectors as `lifecycle::tests::windows_pipe_ident_vectors` in the
+  // manager: both sides must name the same pipe for one home, however it is
+  // spelled, including non-ASCII user names.
+  it.each([
+    ["C:\\Users\\runneradmin\\.pi\\agent\\pi-famulus", "70d9f71744070b1c"],
+    ["C:/Users/RunnerAdmin/.pi/agent/pi-famulus/", "70d9f71744070b1c"],
+    ["C:\\Users\\张三\\.pi\\agent\\pi-famulus", "3d482c281b363211"],
+    ["D:\\", "cb481618f4f646d5"],
+    ["D:/famulus\\\\", "44a0c6fb5c0148ee"],
+  ])("names the Windows pipe of %s like the manager does", (home, hash) => {
+    expect(famulusPaths(home, "win32").socket).toBe(`\\\\.\\pipe\\pi-famulus-${hash}`);
   });
 
   it("looks up pi-famulus in config, env, home/bin, then executable PATH order", () => {

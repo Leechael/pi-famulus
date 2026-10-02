@@ -19,10 +19,17 @@ import { famulusPaths } from "../../src/config";
 const RUN = process.env.PI_FAMULUS_INTEG === "1";
 const BIN =
   process.env.PI_FAMULUS_MANAGER_PATH ??
-  join(__dirname, "../../../manager/target/release/pi-famulus");
+  join(__dirname, "../../../manager/target/release", process.platform === "win32" ? "pi-famulus.exe" : "pi-famulus");
 if (RUN && !existsSync(BIN)) {
   throw new Error(`Requested pi-famulus integration binary does not exist: ${BIN}`);
 }
+
+// Tasks get what the extension sends: the real cwd and pi's environment
+// (Git Bash on Windows needs PATH and SystemRoot).
+const TASK_CWD = tmpdir();
+const TASK_ENV = Object.fromEntries(
+  Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined),
+);
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -91,8 +98,8 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     const { task_id, pid } = await client.start({
       kind: "shell",
       command: "echo hello-integ",
-      cwd: "/tmp",
-      env: {},
+      cwd: TASK_CWD,
+      env: TASK_ENV,
     });
     expect(task_id.length).toBeGreaterThan(0);
     expect(pid).toBeGreaterThan(0);
@@ -113,8 +120,8 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     const { task_id } = await client.start({
       kind: "shell",
       command: "true",
-      cwd: "/tmp",
-      env: {},
+      cwd: TASK_CWD,
+      env: TASK_ENV,
     });
     await client.wait(task_id, 5000);
     await delay(200); // allow event delivery
@@ -127,8 +134,8 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     const { task_id } = await client.start({
       kind: "shell",
       command: "sleep 30",
-      cwd: "/tmp",
-      env: {},
+      cwd: TASK_CWD,
+      env: TASK_ENV,
     });
     const w = await client.wait(task_id, 300);
     expect(w.done).toBe(false);
@@ -148,8 +155,8 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     const { task_id } = await client.start({
       kind: "monitor",
       command: "printf 'line-a\\n'; sleep 0.3; printf 'line-b\\n'",
-      cwd: "/tmp",
-      env: {},
+      cwd: TASK_CWD,
+      env: TASK_ENV,
     });
     await client.watch(task_id);
     await client.wait(task_id, 5000);
@@ -180,8 +187,8 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     const { task_id } = await client.start({
       kind: "shell",
       command: "sleep 30",
-      cwd: "/tmp",
-      env: {},
+      cwd: TASK_CWD,
+      env: TASK_ENV,
     });
     await delay(200);
     const killed = await client.shutdownSession();
