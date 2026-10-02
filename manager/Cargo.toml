@@ -30,10 +30,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
-# Portable black-box suite. The binary is also its own task program
-# (`taskkit`), so it brings its own `main`.
+# Portable black-box suite and resource benchmark. Each binary is also its
+# own task program (`taskkit`), so they bring their own `main`.
 [[test]]
 name = "platform"
+harness = false
+
+[[test]]
+name = "resource_bench"
 harness = false
 
 [features]
