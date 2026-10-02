@@ -26,8 +26,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+
+# Portable black-box suite. The binary is also its own task program
+# (`taskkit`), so it brings its own `main`.
+[[test]]
+name = "platform"
+harness = false
 
 [features]
 # Test-only: the daemon's own timers (idle grace, SIGKILL escalation,

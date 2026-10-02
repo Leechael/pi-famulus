@@ -424,6 +424,21 @@ mod tests {
         dir
     }
 
+    /// Same vectors as the extension's `famulusPaths(home, "win32")` test.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_ident_vectors() {
+        for (home, hash) in [
+            (r"C:\Users\runneradmin\.pi\agent\pi-famulus", "70d9f71744070b1c"),
+            ("C:/Users/RunnerAdmin/.pi/agent/pi-famulus/", "70d9f71744070b1c"),
+            (r"C:\Users\张三\.pi\agent\pi-famulus", "3d482c281b363211"),
+            (r"D:\", "cb481618f4f646d5"),
+            (r"D:/famulus\\", "44a0c6fb5c0148ee"),
+        ] {
+            assert_eq!(windows_pipe_ident(Path::new(home)), format!("pi-famulus-{hash}"), "{home}");
+        }
+    }
+
     #[test]
     fn home_resolution_priority() {
         // flag wins over everything (§3.1).
