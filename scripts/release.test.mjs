@@ -364,7 +364,7 @@ test('workflow literal security, release graph and host/target contracts', () =>
   assert.ok(!ci.includes('npm ci --omit=optional'), 'source installs must retain TypeScript/Rollup native optional bindings');
   assertExtensionSourceInstall(ci);
   assert.ok(ci.includes('npm run test:graders'));
-  assert.ok(ci.includes('/tmp/eval-*'));
+  assert.ok(ci.includes("${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/manager.log"));
   const publish = workflow('publish');
   assert.ok(publish.includes('needs: [validate, tests]'));
   assert.ok(publish.includes('uses: ./.github/workflows/ci.yml'));
