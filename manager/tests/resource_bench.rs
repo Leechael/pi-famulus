@@ -212,6 +212,9 @@ fn resource_usage() {
         let t = c.wait_terminal(&id, S(120)).expect("large output task did not finish");
         let secs = t0.elapsed().as_secs_f64();
         assert_eq!(t["output_size"], BIG, "{t}");
+        // The guard drops only after this expression is evaluated, so join
+        // would wait forever unless the sampler is stopped first.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         (secs, sampler.join().unwrap())
     });
     r.metric("output128m.throughput", (BIG as f64 / MIB) / secs, "MiB/s", None);
