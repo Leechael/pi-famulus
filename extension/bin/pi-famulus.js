@@ -7,7 +7,7 @@ if (!binary) {
   const name = nativePackageName(process.platform, process.arch);
   console.error(name
     ? `pi-famulus: missing usable ${name}. Reinstall pi-famulus with optional dependencies enabled (npm install --include=optional pi-famulus).`
-    : `pi-famulus: unsupported ${process.platform}/${process.arch}; only Linux/macOS x64/arm64 are supported.`);
+    : `pi-famulus: unsupported ${process.platform}/${process.arch}; only Linux/macOS/Windows x64/arm64 are supported.`);
   process.exit(1);
 }
 const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });

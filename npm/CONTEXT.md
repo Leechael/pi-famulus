@@ -1,6 +1,6 @@
 # Native npm release context
 
-The five packages are one release set: users install the root extension and receive the matching native manager without a compiler or separate transport.
+The packages are one release set: users install the root extension and receive the matching native manager without a compiler or separate transport.
 
 ## Language
 
@@ -10,7 +10,7 @@ _Avoid_: using "manager package" for the root.
 **Native package**: One os/cpu-specific package containing the executable built for that platform.
 _Avoid_: "download installer"; there is no install hook.
 
-**Release set**: The root and four native tarballs sharing one stable version and source commit.
+**Release set**: The root and native tarballs sharing one stable version and source commit.
 _Avoid_: "release" when referring to only one platform's archive.
 
 **Published version**: Immutable registry bytes for a package name/version, identified by tarball integrity.

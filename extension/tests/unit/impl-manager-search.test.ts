@@ -30,12 +30,18 @@ describe("Famulus home and binary lookup", () => {
     expect(getFamulusHome({})).toBe(expected);
     expect(getFamulusHome({ PI_FAMULUS_HOME: "   " })).toBe(expected);
     expect(getFamulusHome({ PI_FAMULUS_HOME: "/custom/famulus" })).toBe("/custom/famulus");
-    expect(famulusPaths(expected)).toMatchObject({
+    expect(famulusPaths(expected, "linux")).toMatchObject({
       socket: join(expected, "manager.sock"),
       pidFile: join(expected, "manager.pid"),
       spawnLock: join(expected, "manager.spawn.lock"),
       log: join(expected, "manager.log"),
     });
+  });
+
+  it("uses a namespaced named pipe on Windows", async () => {
+    const { fnv1a64 } = await import("../../src/config");
+    const home = "C:\\Users\\me\\.pi\\agent\\pi-famulus";
+    expect(famulusPaths(home, "win32").socket).toBe(`\\\\.\\pipe\\pi-famulus-${fnv1a64(home)}`);
   });
 
   it("looks up pi-famulus in config, env, home/bin, then executable PATH order", () => {

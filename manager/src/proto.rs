@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -39,6 +39,7 @@ pub const SHUTTING_DOWN: &str = "manager is shutting down";
 /// §3.3: signals travel as names ("SIGTERM", "SIGKILL"). Unknown numbers
 /// render as "SIG<n>".
 pub fn signal_name(sig: i32) -> String {
+    #[cfg(unix)]
     let name = match sig {
         libc::SIGHUP => "SIGHUP",
         libc::SIGINT => "SIGINT",
@@ -57,6 +58,15 @@ pub fn signal_name(sig: i32) -> String {
         libc::SIGTERM => "SIGTERM",
         libc::SIGXCPU => "SIGXCPU",
         libc::SIGXFSZ => "SIGXFSZ",
+        _ => return format!("SIG{sig}"),
+    };
+    #[cfg(windows)]
+    let name = match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        9 => "SIGKILL",
+        15 => "SIGTERM",
         _ => return format!("SIG{sig}"),
     };
     name.to_string()
@@ -652,10 +662,20 @@ pub fn encode<T: Serialize>(v: &T) -> Vec<u8> {
 // id / randomness helpers
 // ---------------------------------------------------------------------------
 
-/// Fill buf from /dev/urandom, falling back to a time/pid mix (unix targets).
+/// Fill buf from the OS CSPRNG, falling back to a time/pid mix.
 pub fn random_bytes(buf: &mut [u8]) {
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(buf).is_ok() {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            if f.read_exact(buf).is_ok() {
+                return;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if crate::sys::random_bytes(buf) {
             return;
         }
     }
@@ -909,6 +929,7 @@ mod tests {
 
     #[test]
     fn signal_names_on_wire_and_legacy_numbers_load() {
+        #[cfg(unix)]
         for (sig, name) in [
             (libc::SIGHUP, "SIGHUP"),
             (libc::SIGINT, "SIGINT"),
@@ -929,6 +950,11 @@ mod tests {
             (libc::SIGXFSZ, "SIGXFSZ"),
         ] {
             assert_eq!(signal_name(sig), name);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(signal_name(9), "SIGKILL");
+            assert_eq!(signal_name(15), "SIGTERM");
         }
         assert_eq!(signal_name(250), "SIG250");
         let base = serde_json::json!({
@@ -956,7 +982,7 @@ mod tests {
         let ev = Event::new(EventKind::TaskExited {
             task_id: "sh_a".into(),
             exit_code: None,
-            signal: Some(signal_name(libc::SIGKILL)),
+            signal: Some(signal_name(9)),
             duration_ms: 1,
             output_path: "/x".into(),
             output_size: 0,

@@ -20,8 +20,10 @@ Supported native packages:
 | Linux | arm64 | `pi-famulus-linux-arm64` |
 | macOS | Intel x64 | `pi-famulus-darwin-x64` |
 | macOS | Apple Silicon arm64 | `pi-famulus-darwin-arm64` |
+| Windows | x64 | `pi-famulus-win32-x64` |
+| Windows | arm64 | `pi-famulus-win32-arm64` |
 
-Linux binaries are statically linked with musl. macOS binaries target macOS 13 or newer; your Node/pi runtime's requirements also apply. Windows and other CPU architectures are not supported.
+Linux binaries are statically linked with musl. macOS binaries target macOS 13 or newer; Windows binaries use MSVC. Your Node/pi runtime's requirements also apply. In-place manager upgrade remains Unix-only.
 
 The npm package also exposes the `pi-famulus` CLI (`npx pi-famulus --help`). The extension's binary search order is:
 

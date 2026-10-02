@@ -151,12 +151,12 @@ struct Local {
 fn local(ms: u64) -> Local {
     let tm = crate::sys::localtime((ms / 1000) as i64);
     Local {
-        year: tm.tm_year + 1900,
-        mon: (tm.tm_mon + 1) as u32,
-        day: tm.tm_mday as u32,
-        hour: tm.tm_hour as u32,
-        min: tm.tm_min as u32,
-        sec: tm.tm_sec as u32,
+        year: tm.year,
+        mon: tm.month,
+        day: tm.day,
+        hour: tm.hour,
+        min: tm.min,
+        sec: tm.sec,
         ms: (ms % 1000) as u32,
     }
 }

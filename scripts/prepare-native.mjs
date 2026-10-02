@@ -10,21 +10,23 @@ export function prepareNative(root, platform, destination) {
   assert.ok(p, `unsupported platform: ${platform}`);
   const packages = validateMetadata(root);
   const version = packages[0].metadata.version;
-  const binary = join(root, 'manager/target', p.target, 'release/pi-famulus');
+  const exeName = p.os === 'win32' ? 'pi-famulus.exe' : 'pi-famulus';
+  const binary = join(root, 'manager/target', p.target, 'release', exeName);
   let stat;
   try { stat = statSync(binary); } catch { throw new Error(`missing native binary: ${binary}`); }
-  assert.ok(stat.isFile() && stat.size > 0 && (stat.mode & 0o111), `native binary must be a nonempty executable: ${binary}`);
+  assert.ok(stat.isFile() && stat.size > 0 && (p.os === 'win32' || (stat.mode & 0o111)), `native binary must be a nonempty executable: ${binary}`);
   const output = execFileSync(binary, ['--version'], { encoding: 'utf8', timeout: 10_000 }).trim();
   assert.match(output, new RegExp(`^pi-famulus ${version.replaceAll('.', '\\.')}([+][\\w.-]+)?$`), 'native binary version must match package version');
   const binDir = join(root, p.directory, 'bin');
   mkdirSync(binDir, { recursive: true });
   // A new inode is essential on macOS: overwriting a previously executed
   // Mach-O file in place can invalidate its code-signing cache.
+  // npm package always exposes `bin/pi-famulus` (no .exe) so the resolver is OS-agnostic.
   const stage = mkdtempSync(join(binDir, '.stage-'));
   try {
     const stagedBinary = join(stage, 'pi-famulus');
     copyFileSync(binary, stagedBinary);
-    chmodSync(stagedBinary, 0o755);
+    if (p.os !== 'win32') chmodSync(stagedBinary, 0o755);
     renameSync(stagedBinary, join(binDir, 'pi-famulus'));
   } finally {
     rmSync(stage, { recursive: true, force: true });

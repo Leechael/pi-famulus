@@ -25,14 +25,35 @@ pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
             return PathBuf::from(env);
         }
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
     home.join(".pi").join("agent").join("pi-famulus")
 }
 
+/// Namespaced pipe identity (no `\\.\pipe\` prefix). Shared with the extension.
+#[cfg(windows)]
+pub fn windows_pipe_ident(home: &Path) -> String {
+    let h = crate::sys::fnv1a64(home.to_string_lossy().as_bytes());
+    format!("pi-famulus-{h:x}")
+}
+
 pub fn socket_path(home: &Path) -> PathBuf {
-    home.join("manager.sock")
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\{}", windows_pipe_ident(home)))
+    }
+    #[cfg(not(windows))]
+    {
+        home.join("manager.sock")
+    }
 }
 
 pub fn pid_path(home: &Path) -> PathBuf {
@@ -89,7 +110,12 @@ pub fn write_pid_file(home: &Path, pid: u32) -> io::Result<()> {
 
 /// Remove socket + pid files (stale after a dead manager, or at shutdown).
 pub fn cleanup_stale_files(home: &Path) -> io::Result<()> {
-    for p in [socket_path(home), pid_path(home)] {
+    let mut paths = vec![pid_path(home)];
+    // Named pipes are not filesystem files.
+    if !cfg!(windows) {
+        paths.push(socket_path(home));
+    }
+    for p in paths {
         match fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -117,6 +143,7 @@ pub struct DaemonLockGuard {
 impl DaemonLockGuard {
     /// The lock file's descriptor. An in-place upgrade keeps it open across
     /// the exec, so the lock (it belongs to the open file) is never released.
+    #[cfg(unix)]
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         self._guard.as_raw_fd()
@@ -126,6 +153,7 @@ impl DaemonLockGuard {
 /// Take over the daemon lock from a descriptor inherited across an in-place
 /// upgrade. The lock is already ours; re-locking the same open file is a
 /// no-op that must succeed.
+#[cfg(unix)]
 pub fn adopt_daemon_lock(fd: std::os::fd::OwnedFd) -> io::Result<DaemonLockGuard> {
     let lock: &'static mut fd_lock::RwLock<std::fs::File> =
         Box::leak(Box::new(fd_lock::RwLock::new(std::fs::File::from(fd))));
@@ -237,7 +265,11 @@ pub fn daemon_running(home: &Path) -> io::Result<bool> {
 pub fn clean_if_no_daemon(home: &Path) -> io::Result<Option<Vec<PathBuf>>> {
     clean_if_no_daemon_with(home, |home| {
         let mut removed = Vec::new();
-        for p in [socket_path(home), pid_path(home)] {
+        let mut paths = vec![pid_path(home)];
+        if !cfg!(windows) {
+            paths.push(socket_path(home));
+        }
+        for p in paths {
             if p.exists() {
                 fs::remove_file(&p)?;
                 removed.push(p);
@@ -401,9 +433,16 @@ mod tests {
         std::env::set_var("PI_FAMULUS_HOME", "/tmp/pi-famulus-env");
         assert_eq!(resolve_home(None), PathBuf::from("/tmp/pi-famulus-env"));
         std::env::remove_var("PI_FAMULUS_HOME");
-        // default: ~/.pi/agent/pi-famulus
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
-        assert_eq!(resolve_home(None), home.join(".pi/agent/pi-famulus"));
+        // default: ~/.pi/agent/pi-famulus (USERPROFILE on Windows)
+        let home = if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .unwrap()
+        } else {
+            std::env::var_os("HOME").map(PathBuf::from).unwrap()
+        };
+        assert_eq!(resolve_home(None), home.join(".pi").join("agent").join("pi-famulus"));
     }
 
     #[test]
@@ -411,6 +450,7 @@ mod tests {
         let home = temp_home("claim");
         // A live but unrelated pid in manager.pid (pid reuse) does not block.
         write_pid_file(&home, std::process::id()).unwrap();
+        #[cfg(unix)]
         fs::write(socket_path(&home), b"").unwrap();
         let first = match claim_daemon(&home).unwrap() {
             Claim::Acquired(g) => g,
@@ -418,6 +458,7 @@ mod tests {
         };
         // The lock holder removed the stale files.
         assert!(!pid_path(&home).exists());
+        #[cfg(unix)]
         assert!(!socket_path(&home).exists());
         assert!(daemon_running(&home).unwrap());
         // A second claim while the first is held is refused and leaves the

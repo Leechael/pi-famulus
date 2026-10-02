@@ -72,6 +72,9 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
             target: aarch64-apple-darwin
+          - platform: win32-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
       PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
@@ -109,11 +112,14 @@ jobs:
           echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
       # Keep real-time timing canaries AND manually stepped daemon clock coverage.
+      # On Windows, integration suites that assume Unix sockets/shells are cfg-gated.
       - run: cargo test --locked
         working-directory: manager
       - run: cargo test --locked --features test-clock
         working-directory: manager
+        if: runner.os != 'Windows'
       - name: Build release binary
+        shell: bash
         run: |
           if [[ "$RUNNER_OS" == Linux ]]; then
             export RUSTFLAGS='-C target-feature=+crt-static'
@@ -130,10 +136,12 @@ jobs:
             exit 1
           fi
       - name: Prepare and pack actual native and root tarballs
+        shell: bash
         run: |
           node scripts/prepare-native.mjs "$PLATFORM" "$RUNNER_TEMP/packages"
           npm pack ./extension --pack-destination "$RUNNER_TEMP/packages"
       - name: Install tarballs and verify automatic CLI and extension resolution
+        if: runner.os != 'Windows'
         run: |
           sandbox=$(mktemp -d "$RUNNER_TEMP/npm-smoke.XXXXXX")
           export HOME="$sandbox/home"

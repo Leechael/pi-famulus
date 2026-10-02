@@ -25,7 +25,7 @@ After the first public npm release:
 pi install npm:pi-famulus
 ```
 
-npm installs the matching exact-version native manager automatically: Linux/macOS × x64/arm64. No Rust compiler, postinstall download, or separate manager install is required. Linux builds are static musl binaries; macOS builds target macOS 13+ (Node/pi runtime requirements also apply). Windows and other architectures are unsupported. Keep optional dependencies enabled. The npm package also exposes `pi-famulus` on its npm bin path (`npx pi-famulus --help`).
+npm installs the matching exact-version native manager automatically: Linux/macOS/Windows × x64/arm64. No Rust compiler, postinstall download, or separate manager install is required. Linux builds are static musl binaries; macOS builds target macOS 13+; Windows builds use MSVC (Node/pi runtime requirements also apply). In-place upgrade is Unix-only. Keep optional dependencies enabled. The npm package also exposes `pi-famulus` on its npm bin path (`npx pi-famulus --help`).
 
 Discovery order: executable config `managerPath` → executable `PI_FAMULUS_MANAGER_PATH` → exact-version native npm package → executable home/bin → executable PATH. Installation does not move runtime state or copy into the shared home. Package installation/usage details: [extension/README.md](extension/README.md). CI, five-package publishing, and the one-time npm Trusted Publisher setup: [docs/releasing.md](docs/releasing.md).
 

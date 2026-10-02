@@ -30,7 +30,8 @@ function fixture(t, fixtureVersion = version) {
 function packAll(t, fixtureVersion = version) {
   const f = fixture(t, fixtureVersion);
   for (const p of PLATFORMS) {
-    const binary = join(f.root, 'manager', 'target', p.target, 'release', 'pi-famulus');
+    const exeName = p.os === 'win32' ? 'pi-famulus.exe' : 'pi-famulus';
+    const binary = join(f.root, 'manager', 'target', p.target, 'release', exeName);
     f.put(binary.slice(f.root.length + 1), `#!/bin/sh\necho pi-famulus ${fixtureVersion}+fixture\n`);
     chmodSync(binary, 0o755);
     prepareNative(f.root, p.id, join(f.root, 'dist'));
@@ -143,11 +144,11 @@ test('native files whitelist cannot ship an entire bin directory', t => {
 test('actual checkout and CLI accept the renamed GitHub repository and reject the old identity', () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const cli = fileURLToPath(new URL('./validate-release.mjs', import.meta.url));
-  assert.equal(validateMetadata(root, { repository: 'Leechael/pi-famulus' }).length, 5);
+  assert.equal(validateMetadata(root, { repository: 'Leechael/pi-famulus' }).length, PLATFORMS.length + 1);
   const output = execFileSync(process.execPath, [cli], {
     cwd: root, encoding: 'utf8', env: { ...process.env, GITHUB_REPOSITORY: 'Leechael/pi-famulus' }, stdio: 'pipe',
   });
-  assert.match(output, /Validated all five packages/);
+  assert.match(output, /Validated all \d+ packages/);
   assert.throws(() => validateMetadata(root, { repository: 'Leechael/pi-better-subagents' }), /canonical GitHub repository/);
   assert.throws(() => execFileSync(process.execPath, [cli], {
     cwd: root, encoding: 'utf8', env: { ...process.env, GITHUB_REPOSITORY: 'Leechael/pi-better-subagents' }, stdio: 'pipe',
@@ -166,7 +167,7 @@ test('release checkout paths with spaces and percent signs run the actual CLI re
   assert.match(output, /actual checkout and CLI accept the renamed GitHub repository/);
 });
 
-test('all five packed packages include the approved MIT license', t => {
+test('all packed packages include the approved MIT license', t => {
   const source = fileURLToPath(new URL('../', import.meta.url));
   const license = readFileSync(join(source, 'LICENSE'), 'utf8');
   assert.match(license, /^MIT License\n/);
@@ -189,9 +190,9 @@ test('all five packed packages include the approved MIT license', t => {
   }
 });
 
-test('release versions, literal repository and all four metadata contracts', t => {
+test('release versions, literal repository and metadata contracts', t => {
   const { root, put } = fixture(t);
-  assert.equal(validateMetadata(root, { tag: 'v0.1.0', repository }).length, 5);
+  assert.equal(validateMetadata(root, { tag: 'v0.1.0', repository }).length, PLATFORMS.length + 1);
   for (const bad of ['v01.1.0', '0.1.0', 'v1.2.3;echo pwn', 'v1.2.3\n', 'v1.2.3-beta', 'v1.2.3-nightly', 'v1.2.3-rc.1']) assert.throws(() => validateTag(bad));
   assert.equal(validateTag('v1.2.3-beta.0'), '1.2.3-beta.0');
   assert.equal(validateTag('v1.2.3-nightly.20261006'), '1.2.3-nightly.20261006');
@@ -268,7 +269,7 @@ test('dry run uses all real packed candidates, natives first/root last, and neve
   const { root } = packAll(t);
   const calls = [];
   await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', repository, dryRun: true, fetchImpl: () => { throw Error('network forbidden'); }, run: (...args) => calls.push(args) });
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, PLATFORMS.length + 1);
   assert.match(calls.at(-1)[1][1], /pi-famulus-0.1.0.tgz$/);
   for (const [, args] of calls) {
     assert.ok(args.includes('--dry-run'));
@@ -300,7 +301,7 @@ test('partial retry skips only byte-identical integrity; mismatch/network errors
   const integrity = createHash('sha512').update(readFileSync(join(root, 'dist', 'pi-famulus-linux-x64-0.1.0.tgz'))).digest('base64');
   const fetchImpl = async url => url.endsWith('/0.1.0') ? (url.includes('linux-x64') ? response(200, { dist: { integrity: `sha512-${integrity}` } }) : response(404, {})) : response(200, {});
   await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl, run: (...args) => calls.push(args) });
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, PLATFORMS.length);
   assert.match(calls.at(-1)[1][1], /pi-famulus-0.1.0.tgz$/);
   await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl: async () => response(200, { dist: { integrity: 'sha512-other' } }), run: () => assert.fail('publish') }), /integrity/);
   await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl: async () => response(503, {}), run: () => assert.fail('publish') }), /503/);
@@ -328,7 +329,7 @@ test('tampered metadata and omitted native binary in real tarballs fail closed',
   await assert.rejects(publishPackages(root, join(root, 'dist'), opts), /package\/bin\/pi-famulus/);
 });
 
-test('real npm publish dry-run validates all five packed artifacts without publication', async t => {
+test('real npm publish dry-run validates all packed artifacts without publication', async t => {
   // npm rejects dry-run republication of versions that already exist on the
   // registry, so the real-registry smoke test must pack a version below the
   // first real release that can never be published.
@@ -342,11 +343,17 @@ test('real npm publish dry-run validates all five packed artifacts without publi
   } });
 });
 
-test('workflow literal security, release graph and four host/target contracts', () => {
+test('workflow literal security, release graph and host/target contracts', () => {
   const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8');
   const native = workflow('native-packages');
-  for (const p of PLATFORMS) { assert.ok(native.includes(`platform: ${p.id}`)); assert.ok(native.includes(`target: ${p.target}`)); }
-  for (const runner of ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15']) assert.ok(native.includes(`runner: ${runner}\n`));
+  // win32-arm64 is packaged for release metadata but not yet on a CI runner.
+  for (const p of PLATFORMS.filter(p => p.id !== 'win32-arm64')) {
+    assert.ok(native.includes(`platform: ${p.id}`), p.id);
+    assert.ok(native.includes(`target: ${p.target}`), p.target);
+  }
+  for (const runner of ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15', 'windows-latest']) {
+    assert.ok(native.includes(`runner: ${runner}\n`), runner);
+  }
   assert.ok(native.includes('cargo test --locked\n'));
   assert.ok(native.includes('cargo test --locked --features test-clock'));
   assert.ok(native.includes('resolveManagerPath(DEFAULT_CONFIG'));

@@ -1,0 +1,17 @@
+{
+  "name": "pi-famulus-win32-x64",
+  "version": "0.1.2",
+  "description": "Windows x64 native manager for pi-famulus (MSVC)",
+  "license": "MIT",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "main": "./bin/pi-famulus",
+  "exports": { "./package.json": "./package.json", "./bin/pi-famulus": "./bin/pi-famulus" },
+  "files": ["bin/pi-famulus", "README.md"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Leechael/pi-famulus",
+    "directory": "npm/win32-x64"
+  },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" }
+}

@@ -12,11 +12,13 @@ describe("npm native manager selection", () => {
     ["linux", "arm64", "pi-famulus-linux-arm64"],
     ["darwin", "x64", "pi-famulus-darwin-x64"],
     ["darwin", "arm64", "pi-famulus-darwin-arm64"],
+    ["win32", "x64", "pi-famulus-win32-x64"],
+    ["win32", "arm64", "pi-famulus-win32-arm64"],
   ])("selects %s/%s", (platform, arch, name) => {
     expect(nativePackageName(platform, arch)).toBe(name);
   });
 
-  it.each([["win32", "x64"], ["linux", "ia32"], ["freebsd", "arm64"]])(
+  it.each([["linux", "ia32"], ["freebsd", "arm64"]])(
     "does not invent an unsupported %s/%s package", (platform, arch) => {
       expect(nativePackageName(platform, arch)).toBeNull();
       expect(resolveNativeManagerPath({ platform, arch })).toBeNull();

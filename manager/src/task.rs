@@ -9,11 +9,15 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(unix)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
+#[cfg(unix)]
 use tokio::net::unix::pipe;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -129,6 +133,24 @@ impl LiveCpuTracker {
     }
 }
 
+/// Status-pipe reader (Unix unix-pipe; Windows tokio file over an anonymous pipe).
+#[cfg(unix)]
+pub type StatusRx = pipe::Receiver;
+#[cfg(windows)]
+pub type StatusRx = tokio::fs::File;
+
+/// stdout/stderr read ends parked between tee pumps (Unix fds; Windows unused).
+#[cfg(unix)]
+pub type PipeFd = OwnedFd;
+#[cfg(windows)]
+pub type PipeFd = ();
+
+/// Live stdout/stderr sources for the tee.
+#[cfg(unix)]
+pub type TeeSource = OwnedFd;
+#[cfg(windows)]
+pub type TeeSource = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+
 /// §3.4: in-memory ring buffer is 64KB; the disk file keeps the full stream.
 pub const RING_CAPACITY: usize = 64 * 1024;
 
@@ -229,7 +251,7 @@ pub struct SpawnedTask {
     /// The task's runner (`pi-famulus __run`), leader of its process group.
     pub child: Child,
     /// Read end of the runner's status pipe (see `crate::runner`).
-    pub status: pipe::Receiver,
+    pub status: StatusRx,
     pub pid: u32,
     pub output: Arc<Mutex<OutputState>>,
     pub chunks: mpsc::Receiver<OutputChunk>,
@@ -278,6 +300,10 @@ pub fn stderr_path_for(output_path: &Path) -> PathBuf {
 /// only this process holds the write end, so any end of the daemon (even
 /// `kill -9`) is an EOF every runner sees. A single owner, so an in-place
 /// exec handover has exactly one descriptor to carry across.
+///
+/// On Windows the Job Object's `KILL_ON_JOB_CLOSE` is the lifeline; this
+/// type still exists so shared call sites compile, but pipes are unused.
+#[cfg(unix)]
 pub struct Lifeline {
     /// Read end, numbered >= 10, close-on-exec (placed at fd 3 in runners).
     pub read: OwnedFd,
@@ -286,10 +312,12 @@ pub struct Lifeline {
     pub write: OwnedFd,
 }
 
+#[cfg(unix)]
 static LIFELINE: OnceLock<Lifeline> = OnceLock::new();
 
 /// Install the lifeline inherited across an in-place upgrade: the same pipe
 /// every runner already holds. Both ends go back to close-on-exec.
+#[cfg(unix)]
 pub fn adopt_lifeline(read: OwnedFd, write: OwnedFd) -> io::Result<()> {
     crate::sys::set_cloexec(read.as_raw_fd())?;
     crate::sys::set_cloexec(write.as_raw_fd())?;
@@ -298,6 +326,7 @@ pub fn adopt_lifeline(read: OwnedFd, write: OwnedFd) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "lifeline already set"))
 }
 
+#[cfg(unix)]
 pub fn lifeline() -> io::Result<&'static Lifeline> {
     if let Some(l) = LIFELINE.get() {
         return Ok(l);
@@ -335,22 +364,35 @@ pub fn runner_exe() -> io::Result<PathBuf> {
 pub struct ProcessParts {
     pub child: Child,
     /// Read end of the runner's status pipe (see `crate::runner`).
-    pub status: pipe::Receiver,
+    pub status: StatusRx,
     pub pid: u32,
-    /// Read ends of the task's stdout / stderr pipes.
-    pub stdout: OwnedFd,
-    pub stderr: OwnedFd,
+    /// Read ends of the task's stdout / stderr (Unix: OwnedFd for handover;
+    /// Windows: async readers — no in-place upgrade).
+    pub stdout: TeeSource,
+    pub stderr: TeeSource,
 }
 
 /// Spawn `<runner> __run <command>` as a session leader (setsid in
 /// pre_exec, §3.4) so the whole process tree can be signalled as one group.
-/// The runner execs `sh -c <command>` in that group, holds the lifeline,
-/// and reports the command's real status (see `crate::runner`).
+/// The runner execs `sh -c` / `cmd /c <command>` in that group, holds the
+/// lifeline (Unix) or sits in a Job Object (Windows), and reports status.
 ///
-/// stdout and stderr come back as raw pipe descriptors; [`start_tee`] reads
-/// them. Keeping them as descriptors lets the daemon park the readers and
-/// carry the pipes across an in-place upgrade.
+/// stdout and stderr come back as platform tee sources; [`start_tee`] reads
+/// them. On Unix, keeping them as descriptors lets the daemon park readers
+/// and carry pipes across an in-place upgrade.
 pub fn spawn_process(command: &str, cwd: &str, env: &HashMap<String, String>) -> io::Result<ProcessParts> {
+    #[cfg(unix)]
+    {
+        spawn_process_unix(command, cwd, env)
+    }
+    #[cfg(windows)]
+    {
+        spawn_process_windows(command, cwd, env)
+    }
+}
+
+#[cfg(unix)]
+fn spawn_process_unix(command: &str, cwd: &str, env: &HashMap<String, String>) -> io::Result<ProcessParts> {
     let lifeline = lifeline()?;
     let (status_read, status_write) = crate::sys::pipe_cloexec()?;
     let status_write = crate::sys::dup_cloexec_high(&status_write)?;
@@ -384,6 +426,72 @@ pub fn spawn_process(command: &str, cwd: &str, env: &HashMap<String, String>) ->
     Ok(ProcessParts { child, status, pid, stdout, stderr })
 }
 
+#[cfg(windows)]
+fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>) -> io::Result<ProcessParts> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::Foundation::SetHandleInformation;
+
+    let mut read_h: HANDLE = std::ptr::null_mut();
+    let mut write_h: HANDLE = std::ptr::null_mut();
+    // SECURITY_ATTRIBUTES with bInheritHandle = TRUE for the write end.
+    let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let ok = unsafe { CreatePipe(&mut read_h, &mut write_h, &mut sa, 0) };
+    if ok == 0 || read_h.is_null() || write_h.is_null() || read_h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // Parent read end must not be inherited.
+    unsafe {
+        SetHandleInformation(read_h, HANDLE_FLAG_INHERIT, 0);
+    }
+    let status_read = unsafe { OwnedHandle::from_raw_handle(read_h as RawHandle) };
+    let status_write = unsafe { OwnedHandle::from_raw_handle(write_h as RawHandle) };
+    let write_raw = status_write.as_raw_handle() as usize;
+
+    let runner = runner_exe()?;
+    let mut cmd = Command::new(&runner);
+    cmd.arg("__run").arg(command);
+    cmd.current_dir(cwd);
+    cmd.env_clear().envs(env);
+    cmd.env("PI_FAMULUS_STATUS_HANDLE", write_raw.to_string());
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    crate::sys::apply_runner_setup_tokio(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        io::Error::new(e.kind(), format!("cannot spawn runner {}: {e}", runner.display()))
+    })?;
+    drop(status_write); // child inherited a copy
+    let pid = child.id().unwrap_or(0);
+    if let Some(h) = child.raw_handle() {
+        crate::sys::assign_job(pid, h)?;
+    }
+    let status_file = crate::sys::file_from_handle(status_read.as_raw_handle())?;
+    drop(status_read);
+    let status = tokio::fs::File::from_std(status_file);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stdout pipe missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stderr pipe missing"))?;
+    Ok(ProcessParts {
+        child,
+        status,
+        pid,
+        stdout: Box::new(stdout),
+        stderr: Box::new(stderr),
+    })
+}
+
 /// Open (append) the merged output file and its `.stderr` sibling.
 pub fn open_output_files(output_path: &Path) -> io::Result<(File, File)> {
     let out = OpenOptions::new().create(true).append(true).open(output_path)?;
@@ -392,47 +500,65 @@ pub fn open_output_files(output_path: &Path) -> io::Result<(File, File)> {
 }
 
 /// The two tee pumps of one task. Each returns its pipe's descriptor when it
-/// was parked, or None once the pipe hit EOF.
+/// was parked (Unix), or None once the pipe hit EOF / Windows (no park).
 #[allow(dead_code)] // awaited when the tee is parked (in-place upgrade)
 pub struct Tee {
-    pub stdout: tokio::task::JoinHandle<Option<OwnedFd>>,
-    pub stderr: tokio::task::JoinHandle<Option<OwnedFd>>,
+    pub stdout: tokio::task::JoinHandle<Option<PipeFd>>,
+    pub stderr: tokio::task::JoinHandle<Option<PipeFd>>,
 }
 
-/// Start reading a task's stdout / stderr descriptors: both append to the
-/// merged `.output` file + ring (protocol / agent view stays merged), and
-/// stderr is mirrored into `stderr_mirror` for CLI inspection
-/// (`pi-famulus log -f --stderr <task_id>`). Either may be None when that
-/// pipe already reached EOF.
-///
-/// When `park` turns true, each pump stops between two reads, so every
-/// byte taken from a pipe is already on disk and in the ring, and hands its
-/// descriptor back. Bytes still in the pipe stay there for whoever reads it
-/// next. Must be called inside a Tokio runtime.
+/// Start reading a task's stdout / stderr: both append to the merged
+/// `.output` file + ring, and stderr is mirrored into `stderr_mirror`.
 pub fn start_tee(
-    stdout: Option<OwnedFd>,
-    stderr: Option<OwnedFd>,
+    stdout: Option<TeeSource>,
+    stderr: Option<TeeSource>,
     output: Arc<Mutex<OutputState>>,
     stderr_mirror: Option<File>,
     tx: mpsc::Sender<OutputChunk>,
     park: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<Tee> {
-    let out_rx = stdout.map(pipe::Receiver::from_owned_fd).transpose()?;
-    let err_rx = stderr.map(pipe::Receiver::from_owned_fd).transpose()?;
-    let (o, t, p) = (output.clone(), tx.clone(), park.clone());
-    let stdout = tokio::spawn(async move {
-        match out_rx {
-            Some(r) => pump(r, o, t, None, p).await,
-            None => None,
-        }
-    });
-    let stderr = tokio::spawn(async move {
-        match err_rx {
-            Some(r) => pump(r, output, tx, stderr_mirror, park).await,
-            None => None,
-        }
-    });
-    Ok(Tee { stdout, stderr })
+    #[cfg(unix)]
+    {
+        let out_rx = stdout.map(pipe::Receiver::from_owned_fd).transpose()?;
+        let err_rx = stderr.map(pipe::Receiver::from_owned_fd).transpose()?;
+        let (o, t, p) = (output.clone(), tx.clone(), park.clone());
+        let stdout = tokio::spawn(async move {
+            match out_rx {
+                Some(r) => pump_unix(r, o, t, None, p).await,
+                None => None,
+            }
+        });
+        let stderr = tokio::spawn(async move {
+            match err_rx {
+                Some(r) => pump_unix(r, output, tx, stderr_mirror, park).await,
+                None => None,
+            }
+        });
+        Ok(Tee { stdout, stderr })
+    }
+    #[cfg(windows)]
+    {
+        let (o, t, p) = (output.clone(), tx.clone(), park.clone());
+        let stdout = tokio::spawn(async move {
+            match stdout {
+                Some(r) => {
+                    pump_async(r, o, t, None, p).await;
+                    None
+                }
+                None => None,
+            }
+        });
+        let stderr = tokio::spawn(async move {
+            match stderr {
+                Some(r) => {
+                    pump_async(r, output, tx, stderr_mirror, park).await;
+                    None
+                }
+                None => None,
+            }
+        });
+        Ok(Tee { stdout, stderr })
+    }
 }
 
 /// Spawn a task and start its tee (unit tests and simple callers): the
@@ -490,7 +616,8 @@ fn test_pump_stall() -> Option<(u64, std::time::Duration)> {
     Some((bytes.parse().ok()?, std::time::Duration::from_millis(ms.parse().ok()?)))
 }
 
-async fn pump(
+#[cfg(unix)]
+async fn pump_unix(
     mut reader: pipe::Receiver,
     out: Arc<Mutex<OutputState>>,
     tx: mpsc::Sender<OutputChunk>,
@@ -527,6 +654,45 @@ async fn pump(
         let next_cursor = out.lock().unwrap().append(&chunk);
         if tx.send(OutputChunk { bytes: chunk, next_cursor }).await.is_err() {
             return None;
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn pump_async(
+    mut reader: TeeSource,
+    out: Arc<Mutex<OutputState>>,
+    tx: mpsc::Sender<OutputChunk>,
+    mut mirror: Option<File>,
+    mut park: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut buf = [0u8; READ_CHUNK];
+    let mut stall = test_pump_stall();
+    let mut read_total = 0u64;
+    loop {
+        let n = tokio::select! {
+            biased;
+            _ = parked(&mut park) => return,
+            r = reader.read(&mut buf) => match r {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(_) => return,
+            },
+        };
+        if let Some((after, d)) = stall {
+            read_total += n as u64;
+            if read_total >= after {
+                stall = None;
+                tokio::time::sleep(d).await;
+            }
+        }
+        let chunk = buf[..n].to_vec();
+        if let Some(f) = mirror.as_mut() {
+            let _ = f.write_all(&chunk);
+        }
+        let next_cursor = out.lock().unwrap().append(&chunk);
+        if tx.send(OutputChunk { bytes: chunk, next_cursor }).await.is_err() {
+            return;
         }
     }
 }
@@ -627,6 +793,7 @@ pub fn read_file_range(path: &Path, offset: u64, max: usize) -> io::Result<(Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
 
@@ -834,6 +1001,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn spawn_captures_merged_output_and_exit() {
         let dir = unique_dir("echo");
         std::fs::create_dir_all(&dir).unwrap();
@@ -877,6 +1045,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn signal_group_kills_whole_tree() {
         let dir = unique_dir("kill");
         let out_path = dir.join("t.output");
@@ -1030,6 +1199,7 @@ mod tests {
     /// (a) Multi-MB child output must not inflate the in-memory ring past 64KB;
     /// disk + `total_size` still reflect the full stream.
     #[tokio::test]
+    #[cfg(unix)]
     async fn large_output_keeps_ring_capped() {
         let dir = unique_dir("large");
         let out_path = dir.join("t.output");
@@ -1062,6 +1232,7 @@ mod tests {
 
     /// (b) After exit + drain, chunk receiver is closed and tee pumps are gone.
     #[tokio::test]
+    #[cfg(unix)]
     async fn tee_pumps_finish_after_exit() {
         let dir = unique_dir("tee-join");
         let out_path = dir.join("t.output");
@@ -1077,6 +1248,7 @@ mod tests {
 
     /// (d) Short-lived start/stop cycles must not panic; rings stay capped.
     #[tokio::test]
+    #[cfg(unix)]
     async fn repeated_start_stop_stress() {
         let dir = unique_dir("stress");
         let env = HashMap::new();
@@ -1117,6 +1289,7 @@ mod tests {
     /// `cargo test -p pi-famulus rss_stays_bounded_after_large_output -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "RSS sampling is coarse; run manually on Darwin/Linux"]
+    #[cfg(unix)]
     async fn rss_stays_bounded_after_large_output() {
         let before = crate::sys::max_rss_bytes();
         let dir = unique_dir("rss");

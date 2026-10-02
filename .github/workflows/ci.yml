@@ -37,8 +37,8 @@ jobs:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
 
-  # No Windows job: the manager is unix-only, and the extension reaches it
-  # over a unix socket path (manager/TESTING.md, Deferrals).
+  # Windows manager is covered by the native-packages matrix (win32-*).
+  # Extension unit tests still run on Ubuntu; Windows named-pipe path is unit-tested.
   extension-compat:
     name: extension (pi ${{ matrix.pi-version }})
     strategy:

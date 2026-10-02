@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Shared black-box scaffolding for the adversarial lifecycle suites.
 //!
 //! Everything here talks to the compiled `pi-famulus` binary over its unix

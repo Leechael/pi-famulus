@@ -141,11 +141,25 @@ export function getFamulusHome(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".pi", "agent", "pi-famulus");
 }
 
+/** FNV-1a 64-bit — must match manager `sys::fnv1a64` for named-pipe identity. */
+export function fnv1a64(input: string): string {
+  let h = 0xcbf29ce484222325n;
+  for (let i = 0; i < input.length; i++) {
+    h ^= BigInt(input.charCodeAt(i));
+    h = (h * 0x0100000001b3n) & 0xffffffffffffffffn;
+  }
+  return h.toString(16);
+}
+
 /** Well-known paths inside the pi-famulus home directory (design doc §3.1). */
-export function famulusPaths(home: string) {
+export function famulusPaths(home: string, platform: NodeJS.Platform = process.platform) {
+  const socket =
+    platform === "win32"
+      ? `\\\\.\\pipe\\pi-famulus-${fnv1a64(home)}`
+      : join(home, "manager.sock");
   return {
     home,
-    socket: join(home, "manager.sock"),
+    socket,
     pidFile: join(home, "manager.pid"),
     spawnLock: join(home, "manager.spawn.lock"),
     log: join(home, "manager.log"),

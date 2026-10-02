@@ -10,6 +10,8 @@ export const PLATFORMS = [
   ['linux', 'arm64', 'aarch64-unknown-linux-musl'],
   ['darwin', 'x64', 'x86_64-apple-darwin'],
   ['darwin', 'arm64', 'aarch64-apple-darwin'],
+  ['win32', 'x64', 'x86_64-pc-windows-msvc'],
+  ['win32', 'arm64', 'aarch64-pc-windows-msvc'],
 ].map(([os, arch, target]) => ({ os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}` }));
 
 function isUtcCalendarDay(yyyymmdd) {
@@ -80,7 +82,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const args = process.argv.slice(2);
     assert.ok(args.length === 0 || (args.length === 2 && args[0] === '--tag'), 'usage: validate-release.mjs [--tag vX.Y.Z]');
     const tag = args[1];
-    validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
-    console.log(`Validated all five packages${tag ? ` for ${tag}` : ''}`);
+    const packages = validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
+    if (tag !== undefined) validateGitTag(process.cwd(), tag);
+    console.log(`Validated all ${packages.length} packages${tag ? ` for ${tag}` : ''}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

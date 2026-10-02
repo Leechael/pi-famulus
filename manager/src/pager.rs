@@ -5,8 +5,12 @@
 //! arguments runs as given. An empty value is treated as unset and falls
 //! through to the next choice; `cat` means no pager, so does `--no-pager`.
 
-use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
+use std::process::Child;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 pub struct Pager {
     child: Child,
@@ -68,6 +72,13 @@ fn program_exists(cmd: &str) -> bool {
 /// Point stdout at a pager when stdout is a terminal. Returns None when no
 /// pager runs (not a terminal, disabled, or it failed to start).
 pub fn start() -> Option<Pager> {
+    #[cfg(windows)]
+    {
+        let _ = command(|k| std::env::var(k).ok());
+        return None;
+    }
+    #[cfg(unix)]
+    {
     // SAFETY: isatty only inspects the descriptor.
     if unsafe { libc::isatty(1) } != 1 {
         return None;
@@ -91,6 +102,7 @@ pub fn start() -> Option<Pager> {
     // SAFETY: setting a signal disposition to SIG_IGN.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
     Some(Pager { child })
+    }
 }
 
 impl Pager {
@@ -98,9 +110,14 @@ impl Pager {
     pub fn finish(mut self) {
         use std::io::Write;
         let _ = std::io::stdout().flush();
+        #[cfg(unix)]
         if let Ok(null) = std::fs::File::open("/dev/null") {
             // SAFETY: replaces fd 1 (the pipe's last write end) with /dev/null.
             unsafe { libc::dup2(null.as_raw_fd(), 1) };
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::fs::File::open("NUL");
         }
         let _ = self.child.wait();
     }

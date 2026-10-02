@@ -6,14 +6,12 @@
 use crate::proto::{
     ProtoError, TaskKind, TaskRecord, TaskStatus, E_FORBIDDEN, E_NOT_FOUND,
 };
-use crate::task::OutputState;
+use crate::task::{OutputState, RunnerProc, StatusRx, TeeSource};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use crate::task::RunnerProc;
-use tokio::net::unix::pipe;
 use tokio::sync::watch;
 
 // ---------------------------------------------------------------------------
@@ -56,7 +54,7 @@ pub struct TaskEntry {
     /// spawn time; None for records loaded from disk.
     pub child: Option<RunnerProc>,
     /// Read end of the runner's status pipe, taken with `child`.
-    pub status_rx: Option<pipe::Receiver>,
+    pub status_rx: Option<StatusRx>,
     pub output: Arc<Mutex<OutputState>>,
     /// Status broadcast for `wait` waiters; receives the terminal status once.
     pub status_tx: watch::Sender<TaskStatus>,
@@ -79,8 +77,8 @@ pub struct TaskEntry {
     pub kill_grace_until_ms: Option<u64>,
     /// stdout / stderr pipe read ends while no pump reads them (before the
     /// tee starts, and while parked). None once that pipe hit EOF.
-    pub stdout_fd: Option<std::os::fd::OwnedFd>,
-    pub stderr_fd: Option<std::os::fd::OwnedFd>,
+    pub stdout_fd: Option<TeeSource>,
+    pub stderr_fd: Option<TeeSource>,
     /// The running tee pumps and output fanout, while started.
     pub tee: Option<crate::task::Tee>,
     pub fanout: Option<tokio::task::JoinHandle<()>>,

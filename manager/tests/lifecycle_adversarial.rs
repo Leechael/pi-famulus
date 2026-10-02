@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Adversarial black-box lifecycle tests for pi-famulus.
 //!
 //! Each test targets one cell of the state-transition table in

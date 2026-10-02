@@ -641,7 +641,7 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 - Detached subagent runner (ChildRunner seam reserved)
 - Worktree isolation, workflow-script sandbox, watchdog, missions
 - Compatibility with pi-subagents / pi-intercom
-- Full Windows support (code paths reserved, unverified)
+- Windows support: named-pipe IPC, Job Objects (KILL_ON_JOB_CLOSE lifeline), `cmd /c`; in-place `exec` upgrade remains Unix-only
 
 ## Appendix A: TS pure-function signature contract (shared basis for implementation and tests)
 

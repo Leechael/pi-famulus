@@ -10,7 +10,7 @@
     "directory": "extension"
   },
   "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" },
-  "os": ["linux", "darwin"],
+  "os": ["linux", "darwin", "win32"],
   "cpu": ["x64", "arm64"],
   "files": ["src", "bin", "README.md"],
   "bin": { "pi-famulus": "./bin/pi-famulus.js" },
@@ -18,7 +18,9 @@
     "pi-famulus-linux-x64": "0.1.2",
     "pi-famulus-linux-arm64": "0.1.2",
     "pi-famulus-darwin-x64": "0.1.2",
-    "pi-famulus-darwin-arm64": "0.1.2"
+    "pi-famulus-darwin-arm64": "0.1.2",
+    "pi-famulus-win32-x64": "0.1.2",
+    "pi-famulus-win32-arm64": "0.1.2"
   },
   "pi": {
     "extensions": ["./src/index.ts"]

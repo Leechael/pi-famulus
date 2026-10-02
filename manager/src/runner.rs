@@ -49,8 +49,11 @@
 //! moment the child unblocks it. SIGKILL takes the runner down with the
 //! group; the daemon then falls back to the runner's own wait status.
 
-use crate::sys::{self, RUNNER_LIFELINE_FD, RUNNER_STATUS_FD};
+use crate::sys;
+#[cfg(unix)]
+use crate::sys::{RUNNER_LIFELINE_FD, RUNNER_STATUS_FD};
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
@@ -67,6 +70,18 @@ const GUARD_POLL_SLOW: Duration = Duration::from_secs(1);
 const GUARD_STABLE_FOR: Duration = Duration::from_secs(1);
 
 pub fn main(command: &OsStr) -> i32 {
+    #[cfg(unix)]
+    {
+        unix_main(command)
+    }
+    #[cfg(windows)]
+    {
+        windows_main(command)
+    }
+}
+
+#[cfg(unix)]
+fn unix_main(command: &OsStr) -> i32 {
     // Neither descriptor may reach the command.
     let _ = sys::set_cloexec(RUNNER_LIFELINE_FD);
     let _ = sys::set_cloexec(RUNNER_STATUS_FD);
@@ -127,6 +142,65 @@ pub fn main(command: &OsStr) -> i32 {
     0
 }
 
+#[cfg(windows)]
+fn windows_main(command: &OsStr) -> i32 {
+    use std::io::Write;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    let mut status_file = std::env::var("PI_FAMULUS_STATUS_HANDLE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|h| {
+            // SAFETY: the parent created this inheritable write end for us.
+            let handle = unsafe { OwnedHandle::from_raw_handle(h as RawHandle) };
+            std::fs::File::from(handle)
+        });
+    let report = |what: &str, alone: bool, f: &mut Option<std::fs::File>| {
+        let line = format!("{what} {}\n", if alone { "alone" } else { "linger" });
+        if let Some(file) = f.as_mut() {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+    };
+
+    let me = sys::getpid();
+    let comspec = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let mut cmd = std::process::Command::new(&comspec);
+    cmd.arg("/C").arg(command);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pi-famulus: cannot run cmd: {e}");
+            report("exit 127", alone(me), &mut status_file);
+            return 127;
+        }
+    };
+    let st = match child.wait() {
+        Ok(s) => s,
+        Err(_) => {
+            report("exit 0", alone(me), &mut status_file);
+            return 0;
+        }
+    };
+    let what = match st.code() {
+        Some(c) if c == 128 + sys::SIGTERM => format!("signal {}", sys::SIGTERM),
+        Some(c) if c == 128 + sys::SIGKILL => format!("signal {}", sys::SIGKILL),
+        Some(c) => format!("exit {c}"),
+        None => "exit 0".to_string(),
+    };
+    let alone_now = alone(me);
+    report(&what, alone_now, &mut status_file);
+    if !alone_now {
+        let mut stable = Duration::ZERO;
+        while !alone(me) {
+            let poll = if stable >= GUARD_STABLE_FOR { GUARD_POLL_SLOW } else { GUARD_POLL };
+            std::thread::sleep(poll);
+            stable += poll;
+        }
+    }
+    0
+}
+
+#[cfg(unix)]
 fn report(what: &str, alone: bool) {
     report_usage(what, alone, None);
 }
@@ -158,6 +232,7 @@ fn alone(me: u32) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn watch_lifeline(me: u32) {
     let mut buf = [0u8; 64];
     loop {
