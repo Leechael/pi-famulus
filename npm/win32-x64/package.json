@@ -5,9 +5,9 @@
   "license": "MIT",
   "os": ["win32"],
   "cpu": ["x64"],
-  "main": "./bin/pi-famulus",
-  "exports": { "./package.json": "./package.json", "./bin/pi-famulus": "./bin/pi-famulus" },
-  "files": ["bin/pi-famulus", "README.md"],
+  "main": "./bin/pi-famulus.exe",
+  "exports": { "./package.json": "./package.json", "./bin/pi-famulus": "./bin/pi-famulus.exe" },
+  "files": ["bin/pi-famulus.exe", "README.md"],
   "repository": {
     "type": "git",
     "url": "https://github.com/Leechael/pi-famulus",

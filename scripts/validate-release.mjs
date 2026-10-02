@@ -12,7 +12,11 @@ export const PLATFORMS = [
   ['darwin', 'arm64', 'aarch64-apple-darwin'],
   ['win32', 'x64', 'x86_64-pc-windows-msvc'],
   ['win32', 'arm64', 'aarch64-pc-windows-msvc'],
-].map(([os, arch, target]) => ({ os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}` }));
+].map(([os, arch, target]) => ({
+  os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}`,
+  // Windows can only start a PE image whose name ends in .exe.
+  binary: os === 'win32' ? 'bin/pi-famulus.exe' : 'bin/pi-famulus',
+}));
 
 function isUtcCalendarDay(yyyymmdd) {
   const y = Number(yyyymmdd.slice(0, 4));
@@ -45,11 +49,12 @@ export function validateMetadata(root, { tag, repository = REPOSITORY } = {}) {
     assert.equal(m.repository?.directory, p.directory, `repository directory: ${p.name}`);
     for (const hook of ['preinstall', 'install', 'postinstall']) assert.ok(!m.scripts?.[hook], `install hook forbidden: ${p.name}`);
     if (p.os) {
-      assert.equal(m.main, './bin/pi-famulus', `native main: ${p.name}`);
-      assert.deepEqual(m.exports, { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, `native exports: ${p.name}`);
+      // `./bin/pi-famulus` is the OS-agnostic subpath resolvers ask for.
+      assert.equal(m.main, `./${p.binary}`, `native main: ${p.name}`);
+      assert.deepEqual(m.exports, { './package.json': './package.json', './bin/pi-famulus': `./${p.binary}` }, `native exports: ${p.name}`);
       assert.deepEqual(m.os, [p.os], `native os: ${p.name}`);
       assert.deepEqual(m.cpu, [p.arch], `native cpu: ${p.name}`);
-      assert.ok(Array.isArray(m.files) && m.files.includes('bin/pi-famulus') && m.files.every(f => ['bin/pi-famulus', 'README.md'].includes(f)), `native files must whitelist binary and optional README: ${p.name}`);
+      assert.ok(Array.isArray(m.files) && m.files.includes(p.binary) && m.files.every(f => [p.binary, 'README.md'].includes(f)), `native files must whitelist binary and optional README: ${p.name}`);
       for (const key of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) assert.equal(Object.keys(m[key] ?? {}).length, 0, `native dependencies forbidden: ${p.name}`);
     }
   }

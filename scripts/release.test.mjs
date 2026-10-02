@@ -24,7 +24,7 @@ function fixture(t, fixtureVersion = version) {
   put('extension/bin/pi-famulus.js', '#!/usr/bin/env node\nconsole.log("pi-famulus");');
   put('extension/README.md', 'Test package');
   put('manager/Cargo.toml', `[package]\nname = "pi-famulus"\nversion = "${fixtureVersion}"\n`);
-  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version: fixtureVersion, main: './bin/pi-famulus', exports: { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, files: ['bin/pi-famulus'], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
+  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version: fixtureVersion, main: `./${p.binary}`, exports: { './package.json': './package.json', './bin/pi-famulus': `./${p.binary}` }, files: [p.binary], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
   return { root, put };
 }
 function packAll(t, fixtureVersion = version) {
@@ -181,8 +181,8 @@ test('all packed packages include the approved MIT license', t => {
     put(`${p.directory}/package.json`, p.metadata);
     put(`${p.directory}/LICENSE`, packageLicense);
     if (p.os) {
-      put(`${p.directory}/bin/pi-famulus`, '#!/bin/sh\necho license-pack-fixture\n');
-      chmodSync(join(root, p.directory, 'bin/pi-famulus'), 0o755);
+      put(`${p.directory}/${p.binary}`, '#!/bin/sh\necho license-pack-fixture\n');
+      chmodSync(join(root, p.directory, p.binary), 0o755);
     }
     const [pack] = JSON.parse(npmSync(['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8', stdio: 'pipe' }));
     const packedLicense = execFileSync('tar', ['-xOzf', join(destination, pack.filename), 'package/LICENSE'], { encoding: 'utf8', stdio: 'pipe' });

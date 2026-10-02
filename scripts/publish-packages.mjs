@@ -19,7 +19,7 @@ export function validateArtifacts(root, directory, options) {
     const artifact = join(directory, `${p.name}-${p.metadata.version}.tgz`);
     const unpack = path => execFileSync('tar', ['-xOzf', artifact, `package/${path}`], { maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     assert.deepEqual(JSON.parse(unpack('package.json')), p.metadata, `artifact metadata mismatch: ${p.name}`);
-    for (const path of p.os ? ['bin/pi-famulus'] : ['bin/pi-famulus.js', 'src/native-manager.js', 'src/config.ts', 'README.md']) assert.ok(unpack(path).length, `artifact missing ${path}: ${p.name}`);
+    for (const path of p.os ? [p.binary] : ['bin/pi-famulus.js', 'src/native-manager.js', 'src/config.ts', 'README.md']) assert.ok(unpack(path).length, `artifact missing ${path}: ${p.name}`);
     const integrity = `sha512-${createHash('sha512').update(readFileSync(artifact)).digest('base64')}`;
     return { ...p, artifact, integrity };
   });

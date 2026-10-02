@@ -250,6 +250,9 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
   return config;
 }
 
+/** File name of the manager in <home>/bin and on PATH: Windows only starts `.exe` images. */
+export const MANAGER_FILE_NAME = process.platform === "win32" ? "pi-famulus.exe" : "pi-famulus";
+
 /** Return why a candidate is unusable, or null for an executable regular file. */
 function managerCandidateProblem(path: string): string | null {
   try {
@@ -285,14 +288,15 @@ export function describeManagerSearch(
   tried.push(nativeName
     ? `npm ${nativeName}${native ? ` ${native}` : " (missing or unusable, ignored)"}`
     : `npm native manager (unsupported ${process.platform}/${process.arch})`);
-  tried.push(describeCandidate(join(home, "bin", "pi-famulus")));
+  tried.push(describeCandidate(join(home, "bin", MANAGER_FILE_NAME)));
   tried.push("pi-famulus on PATH");
   return tried.join("; ");
 }
 
 /**
  * Resolve an executable regular pi-famulus binary, or null if none is usable.
- * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > npm native package > <home>/bin/pi-famulus > PATH.
+ * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > npm native package > <home>/bin/pi-famulus > PATH
+ * (`pi-famulus.exe` on Windows).
  */
 export function resolveManagerPath(
   config: FamulusConfig,
@@ -304,11 +308,11 @@ export function resolveManagerPath(
   if (envPath && managerCandidateProblem(envPath) === null) return envPath;
   const native = resolveNativeManagerPath();
   if (native) return native;
-  const bundled = join(home, "bin", "pi-famulus");
+  const bundled = join(home, "bin", MANAGER_FILE_NAME);
   if (managerCandidateProblem(bundled) === null) return bundled;
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const candidate = join(dir, "pi-famulus");
+    const candidate = join(dir, MANAGER_FILE_NAME);
     if (managerCandidateProblem(candidate) === null) return candidate;
   }
   return null;

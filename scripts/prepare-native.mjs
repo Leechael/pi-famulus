@@ -32,13 +32,13 @@ export function prepareNative(root, platform, destination) {
   mkdirSync(binDir, { recursive: true });
   // A new inode is essential on macOS: overwriting a previously executed
   // Mach-O file in place can invalidate its code-signing cache.
-  // npm package always exposes `bin/pi-famulus` (no .exe) so the resolver is OS-agnostic.
+  // Resolvers ask for the `./bin/pi-famulus` export, which maps to p.binary.
   const stage = mkdtempSync(join(binDir, '.stage-'));
   try {
-    const stagedBinary = join(stage, 'pi-famulus');
+    const stagedBinary = join(stage, exeName);
     copyFileSync(binary, stagedBinary);
     if (p.os !== 'win32') chmodSync(stagedBinary, 0o755);
-    renameSync(stagedBinary, join(binDir, 'pi-famulus'));
+    renameSync(stagedBinary, join(root, p.directory, p.binary));
   } finally {
     rmSync(stage, { recursive: true, force: true });
   }
@@ -47,7 +47,7 @@ export function prepareNative(root, platform, destination) {
   const [pack] = JSON.parse(npmSync(['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8' }));
   assert.equal(pack.name, p.name);
   assert.equal(pack.version, version);
-  assert.ok(pack.files.some(f => f.path === 'bin/pi-famulus' && f.size > 0), 'packed artifact must contain native binary');
+  assert.ok(pack.files.some(f => f.path === p.binary && f.size > 0), 'packed artifact must contain native binary');
   return join(destination, pack.filename);
 }
 

@@ -33,6 +33,8 @@ The npm package also exposes the `pi-famulus` CLI (`npx pi-famulus --help`). The
 4. Executable `~/.pi/agent/pi-famulus/bin/pi-famulus` (or the equivalent beneath `PI_FAMULUS_HOME`).
 5. Executable `pi-famulus` on `PATH`.
 
+On Windows the file name in steps 4 and 5 (and inside the native package) is `pi-famulus.exe`.
+
 Configuration and runtime state remain in `~/.pi/agent/pi-famulus`. Installing/updating the npm package does not move that state or copy a binary into the shared home. The npm CLI uses the package's native executable; use the extension configuration above when intentionally running a separately built manager.
 
 If optional dependencies were omitted, reinstall with them enabled. The CLI reports an actionable error; the extension can still discover an explicitly installed manager and otherwise enters degraded mode. An arbitrary different-version native npm package is never substituted.

@@ -2,7 +2,17 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, describeManagerSearch, getFamulusHome, famulusPaths, resolveManagerPath } from "../../src/config";
+import {
+  DEFAULT_CONFIG,
+  MANAGER_FILE_NAME,
+  describeManagerSearch,
+  getFamulusHome,
+  famulusPaths,
+  resolveManagerPath,
+} from "../../src/config";
+
+// Windows has no execute bit: X_OK only checks existence there.
+const itPosix = it.skipIf(process.platform === "win32");
 
 describe("degraded-startup manager search description", () => {
   it("names every place looked and flags configured paths that do not exist", () => {
@@ -13,7 +23,7 @@ describe("degraded-startup manager search description", () => {
     );
     expect(text).toContain("config managerPath /nope/pi-famulus (missing, ignored)");
     expect(text).toContain("PI_FAMULUS_MANAGER_PATH /also/missing (missing, ignored)");
-    expect(text).toContain("/home/u/.pi/agent/pi-famulus/bin/pi-famulus");
+    expect(text).toContain(join("/home/u/.pi/agent/pi-famulus", "bin", MANAGER_FILE_NAME));
     expect(text).toContain("pi-famulus on PATH");
   });
 });
@@ -55,8 +65,8 @@ describe("Famulus home and binary lookup", () => {
     root = mkdtempSync(join(tmpdir(), "pi-famulus-search-"));
     const home = join(root, "home");
     const pathDir = join(root, "path");
-    const bundled = join(home, "bin", "pi-famulus");
-    const onPath = join(pathDir, "pi-famulus");
+    const bundled = join(home, "bin", MANAGER_FILE_NAME);
+    const onPath = join(pathDir, MANAGER_FILE_NAME);
     const envBinary = join(root, "env-binary");
     const configured = join(root, "configured-binary");
     mkdirSync(join(home, "bin"), { recursive: true });
@@ -71,16 +81,17 @@ describe("Famulus home and binary lookup", () => {
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { ...env, PI_FAMULUS_MANAGER_PATH: "/missing" })).toBe(bundled);
     rmSync(bundled);
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { PATH: pathDir })).toBe(onPath);
+    if (process.platform === "win32") return;
     chmodSync(onPath, 0o644);
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { PATH: pathDir })).toBeNull();
   });
 
-  it("skips a stale non-executable home/bin candidate in favor of executable PATH", () => {
+  itPosix("skips a stale non-executable home/bin candidate in favor of executable PATH", () => {
     root = mkdtempSync(join(tmpdir(), "pi-famulus-search-"));
     const home = join(root, "home");
     const pathDir = join(root, "path");
-    const bundled = join(home, "bin", "pi-famulus");
-    const onPath = join(pathDir, "pi-famulus");
+    const bundled = join(home, "bin", MANAGER_FILE_NAME);
+    const onPath = join(pathDir, MANAGER_FILE_NAME);
     mkdirSync(join(home, "bin"), { recursive: true });
     mkdirSync(pathDir);
     writeFileSync(bundled, "");
@@ -96,10 +107,10 @@ describe("Famulus home and binary lookup", () => {
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { PATH: pathDir })).toBeNull();
   });
 
-  it.each(["config", "env"])("skips a non-executable %s candidate", (source) => {
+  itPosix.each(["config", "env"])("skips a non-executable %s candidate", (source) => {
     root = mkdtempSync(join(tmpdir(), "pi-famulus-search-"));
     const candidate = join(root, "stale-binary");
-    const onPath = join(root, "pi-famulus");
+    const onPath = join(root, MANAGER_FILE_NAME);
     writeFileSync(candidate, "");
     chmodSync(candidate, 0o644);
     writeFileSync(onPath, "");
@@ -117,12 +128,12 @@ describe("Famulus home and binary lookup", () => {
     const pathDir = join(root, "path");
     const fallbackDir = join(root, "fallback");
     const candidate = source === "home/bin"
-      ? join(home, "bin", "pi-famulus")
-      : source === "PATH" ? join(pathDir, "pi-famulus") : join(root, "candidate");
+      ? join(home, "bin", MANAGER_FILE_NAME)
+      : source === "PATH" ? join(pathDir, MANAGER_FILE_NAME) : join(root, "candidate");
     mkdirSync(candidate, { recursive: true });
     chmodSync(candidate, 0o755);
     mkdirSync(fallbackDir);
-    const fallback = join(fallbackDir, "pi-famulus");
+    const fallback = join(fallbackDir, MANAGER_FILE_NAME);
     writeFileSync(fallback, "");
     chmodSync(fallback, 0o755);
     const config = { ...DEFAULT_CONFIG, managerPath: source === "config" ? candidate : null };
