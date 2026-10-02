@@ -367,6 +367,11 @@ impl Drop for Home {
         if std::thread::panicking() && std::env::var_os("PI_FAMULUS_TEST_ARTIFACTS").is_some() {
             self.dump_processes();
         }
+        // Windows reuses a finished task's pid within seconds, so killing
+        // recorded pids there can hit another test's live process. Killing
+        // the daemon below is enough: its kill-on-close jobs take every task
+        // tree with it.
+        #[cfg(unix)]
         for r in self.records() {
             if let Some(pid) = r["pid"].as_u64() {
                 kill_group(pid as u32, SIGKILL);
@@ -738,14 +743,6 @@ mod win {
         }
     }
 
-    /// `pid` and every descendant still linked to it by parent pid.
-    pub fn kill_tree(pid: u32) {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .output();
-        kill_pid(pid);
-    }
-
     pub fn working_set_bytes(pid: u32) -> Option<u64> {
         let p = Proc::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
         // SAFETY: zeroed POD out-struct with its size set.
@@ -812,11 +809,6 @@ pub fn pid_running(pid: u32) -> bool {
 #[cfg(windows)]
 pub fn kill_pid(pid: u32, _sig: i32) {
     win::kill_pid(pid)
-}
-/// Windows has no process groups: kill the tree hanging off `pid`.
-#[cfg(windows)]
-pub fn kill_group(pid: u32, _sig: i32) {
-    win::kill_tree(pid)
 }
 #[cfg(windows)]
 pub fn rss_bytes(pid: u32) -> Option<u64> {
