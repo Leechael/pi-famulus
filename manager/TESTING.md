@@ -345,6 +345,15 @@ paths (framing, chunking, records). They stay in the Unix suites; `f1`,
 | The daemon inherited the auto-spawning CLI's stdio: a reader of the CLI's output (`pi-famulus ls \| findstr`, the test harness) saw EOF only when the daemon idled out. | Clear the inherit flag on the CLI's standard handles before the spawn. | `cli2`, `cli1`, `d1`, `d10`, `h1` |
 | The extension's local fallback ran `$SHELL` or `/bin/bash` instead of pi's shell. | Use pi's `getShellConfig()`. | `impl-bash-killed` "runs the command in pi's POSIX shell" |
 
+Two Windows-only test-harness bugs also showed up as flakes (`d6`, `x1`).
+Windows gives a freed pid to a new process within seconds. `Home::drop`
+ran `taskkill /T` on every recorded task pid, finished ones included, and
+killed live processes of tests running alongside; it now relies on killing
+the daemon, whose kill-on-close jobs take every tree. Liveness probes by
+bare pid could find a newcomer alive in place of a stopped task; the
+harness now `track`s each pid a test is told about and probes it through a
+handle held for that test (`test_scope`).
+
 ### Resource benchmark
 
 `tests/resource_bench.rs` drives one real daemon (release build, real
