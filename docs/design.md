@@ -54,7 +54,7 @@ pi instance C (session c) ──┘                                ├─ proces
 
 ### 3.1 Singleton and startup
 
-Conventional paths (Unix; Windows uses named pipe `\\.\pipe\pi-famulus`). **The base directory can be overridden with `PI_FAMULUS_HOME`** (essential for tests and multi-instance debugging; the CLI also supports the global flag `--home <dir>`, with priority: flag > env > default):
+Conventional paths (Unix; Windows uses the named pipe `\\.\pipe\pi-famulus-<fnv1a64>` instead of `manager.sock`, hashed over the UTF-8 of the absolute home with `\` separators, no trailing separator, lower-cased, so every spelling of one home reaches one daemon). **The base directory can be overridden with `PI_FAMULUS_HOME`** (essential for tests and multi-instance debugging; the CLI also supports the global flag `--home <dir>`, with priority: flag > env > default):
 
 ```
 ~/.pi/agent/pi-famulus/

@@ -27,7 +27,6 @@ pub struct LocalTime {
 }
 
 /// FNV-1a 64-bit, shared with the extension so named-pipe identities match.
-#[allow(dead_code)] // used on Windows (`windows_pipe_ident`); kept shared for parity
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {

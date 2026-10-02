@@ -38,17 +38,26 @@ pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
     home.join(".pi").join("agent").join("pi-famulus")
 }
 
-/// Namespaced pipe identity (no `\\.\pipe\` prefix). Shared with the extension.
-#[cfg(windows)]
+/// Namespaced pipe identity (no `\\.\pipe\` prefix), shared with the
+/// extension's `famulusPaths`: FNV-1a over the UTF-8 of the home spelled
+/// one way. Windows paths are case-insensitive and take either separator,
+/// so `C:/Users/Me/x/` and `c:\users\me\x` must name one pipe, or a second
+/// daemon starts for the same home and cannot take its lock.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn windows_pipe_ident(home: &Path) -> String {
-    let h = crate::sys::fnv1a64(home.to_string_lossy().as_bytes());
+    let mut s = home.to_string_lossy().replace('/', "\\");
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    let h = crate::sys::fnv1a64(s.to_lowercase().as_bytes());
     format!("pi-famulus-{h:x}")
 }
 
 pub fn socket_path(home: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        PathBuf::from(format!(r"\\.\pipe\{}", windows_pipe_ident(home)))
+        let home = std::path::absolute(home).unwrap_or_else(|_| home.to_path_buf());
+        PathBuf::from(format!(r"\\.\pipe\{}", windows_pipe_ident(&home)))
     }
     #[cfg(not(windows))]
     {
@@ -425,7 +434,6 @@ mod tests {
     }
 
     /// Same vectors as the extension's `famulusPaths(home, "win32")` test.
-    #[cfg(windows)]
     #[test]
     fn windows_pipe_ident_vectors() {
         for (home, hash) in [

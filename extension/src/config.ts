@@ -6,7 +6,7 @@
  */
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, win32 } from "node:path";
 import { nativePackageName, resolveNativeManagerPath } from "./native-manager.js";
 
 export interface FamulusConfig {
@@ -141,21 +141,32 @@ export function getFamulusHome(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".pi", "agent", "pi-famulus");
 }
 
-/** FNV-1a 64-bit — must match manager `sys::fnv1a64` for named-pipe identity. */
+/** FNV-1a 64-bit over UTF-8 bytes — must match manager `sys::fnv1a64`. */
 export function fnv1a64(input: string): string {
   let h = 0xcbf29ce484222325n;
-  for (let i = 0; i < input.length; i++) {
-    h ^= BigInt(input.charCodeAt(i));
+  for (const byte of Buffer.from(input, "utf8")) {
+    h ^= BigInt(byte);
     h = (h * 0x0100000001b3n) & 0xffffffffffffffffn;
   }
   return h.toString(16);
+}
+
+/**
+ * Named-pipe identity of a home — must match manager `lifecycle::socket_path`:
+ * one spelling per directory (absolute, `\` separators, no trailing
+ * separator, lower case), since Windows paths are case-insensitive.
+ */
+export function windowsPipeName(home: string): string {
+  let s = win32.resolve(home).replaceAll("/", "\\");
+  while (s.length > 3 && s.endsWith("\\")) s = s.slice(0, -1);
+  return `\\\\.\\pipe\\pi-famulus-${fnv1a64(s.toLowerCase())}`;
 }
 
 /** Well-known paths inside the pi-famulus home directory (design doc §3.1). */
 export function famulusPaths(home: string, platform: NodeJS.Platform = process.platform) {
   const socket =
     platform === "win32"
-      ? `\\\\.\\pipe\\pi-famulus-${fnv1a64(home)}`
+      ? windowsPipeName(home)
       : join(home, "manager.sock");
   return {
     home,

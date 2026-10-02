@@ -885,10 +885,16 @@ pub fn cpu_time_ms(pid: u32) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 /// Named-pipe identity of a home, as the manager derives it: FNV-1a 64 of
-/// the home path string, exactly as passed with `--home`.
+/// the absolute home path with `\` separators, no trailing separator, in
+/// lower case.
 pub fn pipe_name(home: &Path) -> String {
+    let home = std::path::absolute(home).unwrap_or_else(|_| home.to_path_buf());
+    let mut s = home.to_string_lossy().replace('/', "\\");
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in home.to_string_lossy().as_bytes() {
+    for b in s.to_lowercase().as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
