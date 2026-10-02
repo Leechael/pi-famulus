@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::sync::OnceLock;
@@ -517,47 +516,59 @@ pub fn start_tee(
     tx: mpsc::Sender<OutputChunk>,
     park: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<Tee> {
+    let open = Arc::new(AtomicUsize::new(2));
     #[cfg(unix)]
     {
         let out_rx = stdout.map(pipe::Receiver::from_owned_fd).transpose()?;
         let err_rx = stderr.map(pipe::Receiver::from_owned_fd).transpose()?;
-        let (o, t, p) = (output.clone(), tx.clone(), park.clone());
+        let (o, t, p, n) = (output.clone(), tx.clone(), park.clone(), open.clone());
         let stdout = tokio::spawn(async move {
-            match out_rx {
-                Some(r) => pump_unix(r, o, t, None, p).await,
+            let parked = match out_rx {
+                Some(r) => pump_unix(r, o.clone(), t, None, p).await,
                 None => None,
-            }
+            };
+            pump_done(&n, &o, parked.is_some());
+            parked
         });
         let stderr = tokio::spawn(async move {
-            match err_rx {
-                Some(r) => pump_unix(r, output, tx, stderr_mirror, park).await,
+            let parked = match err_rx {
+                Some(r) => pump_unix(r, output.clone(), tx, stderr_mirror, park).await,
                 None => None,
-            }
+            };
+            pump_done(&open, &output, parked.is_some());
+            parked
         });
         Ok(Tee { stdout, stderr })
     }
     #[cfg(windows)]
     {
-        let (o, t, p) = (output.clone(), tx.clone(), park.clone());
+        let (o, t, p, n) = (output.clone(), tx.clone(), park.clone(), open.clone());
         let stdout = tokio::spawn(async move {
-            match stdout {
-                Some(r) => {
-                    pump_async(r, o, t, None, p).await;
-                    None
-                }
-                None => None,
-            }
+            let parked = match stdout {
+                Some(r) => pump_async(r, o.clone(), t, None, p).await,
+                None => false,
+            };
+            pump_done(&n, &o, parked);
+            None
         });
         let stderr = tokio::spawn(async move {
-            match stderr {
-                Some(r) => {
-                    pump_async(r, output, tx, stderr_mirror, park).await;
-                    None
-                }
-                None => None,
-            }
+            let parked = match stderr {
+                Some(r) => pump_async(r, output.clone(), tx, stderr_mirror, park).await,
+                None => false,
+            };
+            pump_done(&open, &output, parked);
+            None
         });
         Ok(Tee { stdout, stderr })
+    }
+}
+
+/// A finished task stays in the registry until gc evicts it, so its output
+/// writer is closed once both pipes are drained rather than with the
+/// record. A parked pump keeps it: the tee resumes after the handover.
+fn pump_done(open: &AtomicUsize, output: &Mutex<OutputState>, parked: bool) {
+    if open.fetch_sub(1, Ordering::SeqCst) == 1 && !parked {
+        output.lock().unwrap().file = None;
     }
 }
 
@@ -665,18 +676,18 @@ async fn pump_async(
     tx: mpsc::Sender<OutputChunk>,
     mut mirror: Option<File>,
     mut park: tokio::sync::watch::Receiver<bool>,
-) {
+) -> bool {
     let mut buf = [0u8; READ_CHUNK];
     let mut stall = test_pump_stall();
     let mut read_total = 0u64;
     loop {
         let n = tokio::select! {
             biased;
-            _ = parked(&mut park) => return,
+            _ = parked(&mut park) => return true,
             r = reader.read(&mut buf) => match r {
-                Ok(0) => return,
+                Ok(0) => return false,
                 Ok(n) => n,
-                Err(_) => return,
+                Err(_) => return false,
             },
         };
         if let Some((after, d)) = stall {
@@ -692,7 +703,7 @@ async fn pump_async(
         }
         let next_cursor = out.lock().unwrap().append(&chunk);
         if tx.send(OutputChunk { bytes: chunk, next_cursor }).await.is_err() {
-            return;
+            return false;
         }
     }
 }
