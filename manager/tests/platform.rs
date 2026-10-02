@@ -881,11 +881,15 @@ fn cli1_start_wait_output_ls_show_stop() {
 }
 
 /// §3.1 step 3: the daemon a CLI call spawns is detached: it keeps serving
-/// after that CLI process has exited, and runs tasks started later.
+/// after that CLI process has exited, and runs tasks started later. It holds
+/// none of the CLI's stdio: a reader of the CLI's output sees EOF when the
+/// CLI exits, not when the daemon does.
 fn cli2_auto_spawned_daemon_outlives_the_cli() {
     let home = Home::new("w-cli2");
+    let t0 = Instant::now();
     let out = home.cli(&["ls"], S(15));
     assert!(out.status.success(), "{}{}", out.stdout, out.stderr);
+    assert!(t0.elapsed() < S(4), "the CLI's output stayed open for {:?}", t0.elapsed());
     let pid = home.pidfile_pid().expect("spawned daemon");
     std::thread::sleep(MS(500));
     assert!(pid_running(pid), "the spawned daemon died with its CLI");
