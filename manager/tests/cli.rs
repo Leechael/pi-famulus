@@ -246,7 +246,10 @@ fn doctor_resolves_the_new_home_and_environment_contract() {
     let flag_home = root.join("flag");
     let doctor = |home_env: Option<&str>, flag: bool| {
         let mut cmd = Command::new(BIN);
-        cmd.env("HOME", &root).env_remove("PI_FAMULUS_HOME");
+        // resolve_home uses USERPROFILE on Windows, HOME on Unix.
+        cmd.env("HOME", &root)
+            .env("USERPROFILE", &root)
+            .env_remove("PI_FAMULUS_HOME");
         if let Some(value) = home_env {
             cmd.env("PI_FAMULUS_HOME", value);
         }
