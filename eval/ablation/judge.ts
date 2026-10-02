@@ -4,13 +4,14 @@
  * verdict cannot be parsed. Programmatic graders stay authoritative.
  */
 import { spawn } from "node:child_process";
-import { PI_BIN } from "../lib/paths.ts";
+import { piCommand } from "../lib/paths.ts";
 
 export async function judge(model: string, question: string, excerpt: string): Promise<boolean | null> {
   const prompt =
     `${question}\n\nAnswer with exactly one word: YES or NO.\n\n<transcript>\n${excerpt.slice(-12_000)}\n</transcript>`;
   const out = await new Promise<string>((resolve) => {
-    const p = spawn(PI_BIN, ["-p", "-ne", "-ns", "-np", "-nc", "-nt", "--no-session", "--offline", "--model", model, prompt], {
+    const [bin, args] = piCommand(["-p", "-ne", "-ns", "-np", "-nc", "-nt", "--no-session", "--offline", "--model", model, prompt]);
+    const p = spawn(bin, args, {
       stdio: ["ignore", "pipe", "ignore"],
     });
     let text = "";

@@ -31,11 +31,23 @@ function windowsFakeNative(dir: string, exit: number): void {
     `  process.exit(${exit});`,
     "}",
   ].join("\n"));
+  if (!nodeOptionsSaved) {
+    savedNodeOptions = process.env.NODE_OPTIONS;
+    nodeOptionsSaved = true;
+  }
   process.env.NODE_OPTIONS = `--require ${JSON.stringify(join(dir, "fake.cjs"))}`;
 }
 
+/** Prior NODE_OPTIONS from before any windowsFakeNative call in this file. */
+let savedNodeOptions: string | undefined;
+let nodeOptionsSaved = false;
+
 afterEach(() => {
-  delete process.env.NODE_OPTIONS;
+  if (!nodeOptionsSaved) return;
+  if (savedNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+  else process.env.NODE_OPTIONS = savedNodeOptions;
+  savedNodeOptions = undefined;
+  nodeOptionsSaved = false;
 });
 
 function consumer(native = true, exit = 0, nativeText?: string) {

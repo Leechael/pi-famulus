@@ -14,7 +14,7 @@ export const PLATFORMS = [
   ['win32', 'arm64', 'aarch64-pc-windows-msvc'],
 ].map(([os, arch, target]) => ({
   os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}`,
-  // Windows can only start a PE image whose name ends in .exe.
+  // CreateProcess needs an explicit extension for lpApplicationName; this package ships `.exe`.
   binary: os === 'win32' ? 'bin/pi-famulus.exe' : 'bin/pi-famulus',
 }));
 

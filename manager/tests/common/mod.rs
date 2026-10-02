@@ -295,7 +295,7 @@ impl Home {
     }
     /// Spawn `pi-famulus --home H daemon` as a direct child of the test.
     pub fn spawn_daemon(&self) -> Child {
-        Command::new(BIN)
+        let child = Command::new(BIN)
             .arg("--home")
             .arg(&self.path)
             .env("PI_FAMULUS_TEST_CLOCK", self.clock_env())
@@ -305,7 +305,10 @@ impl Home {
             .stdout(Stdio::piped())
             .stderr(self.daemon_stderr())
             .spawn()
-            .expect("spawn daemon")
+            .expect("spawn daemon");
+        // Bind later Drop/kill_pid probes to this process handle (Windows PID reuse).
+        track(child.id());
+        child
     }
     /// A private copy of the binary under this home, so a test can replace
     /// it (in-place upgrade) without touching the one other tests use.
@@ -332,6 +335,7 @@ impl Home {
             cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawn daemon");
+        track(child.id());
         // The first run of a freshly copied binary is slow on macOS (code
         // signature assessment), hence the longer wait.
         assert!(
@@ -380,13 +384,24 @@ impl Drop for Home {
         for p in &self.extra_pids {
             kill_pid(*p, SIGKILL);
         }
-        if let Some(pid) = self.pidfile_pid() {
-            kill_pid(pid, SIGKILL);
+        // Windows reuses PIDs quickly: never TerminateProcess a bare pidfile
+        // value unless we already hold a handle from spawn (`track`) or can
+        // still prove the process is this home's daemon via its command line.
+        #[cfg(windows)]
+        {
+            let pidfile = self.pidfile_pid();
+            let tracked_ok = pidfile.is_some_and(|pid| win::kill_if_tracked(pid));
+            if !tracked_ok {
+                for pid in daemon_pids_for(&self.path) {
+                    kill_pid(pid, SIGKILL);
+                }
+            }
         }
-        // Windows: enumerating command lines costs a PowerShell start per
-        // test; a daemon without a pid file is one that never finished
-        // starting, so only look then.
-        if cfg!(unix) || self.pidfile_pid().is_none() {
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.pidfile_pid() {
+                kill_pid(pid, SIGKILL);
+            }
             for pid in daemon_pids_for(&self.path) {
                 kill_pid(pid, SIGKILL);
             }
@@ -774,6 +789,19 @@ mod win {
         with_proc(pid, PROCESS_TERMINATE, |p| unsafe { TerminateProcess(p.0, 137) });
     }
 
+    /// Terminate only through a handle opened while this test still knew the
+    /// pid belonged to its process. Returns false when nothing was tracked
+    /// (caller must fall back to command-line matching).
+    pub fn kill_if_tracked(pid: u32) -> bool {
+        let map = tracked().lock().unwrap();
+        let Some(p) = map.get(&(super::test_scope(), pid)) else {
+            return false;
+        };
+        // SAFETY: handle opened with PROCESS_TERMINATE in `track`.
+        unsafe { TerminateProcess(p.0, 137) };
+        true
+    }
+
     pub fn working_set_bytes(pid: u32) -> Option<u64> {
         let p = Proc::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
         // SAFETY: zeroed POD out-struct with its size set.
@@ -817,8 +845,13 @@ mod win {
             .lines()
             .filter_map(|l| {
                 let (pid, cmd) = l.split_once('\t')?;
-                let words: Vec<&str> = cmd.split_whitespace().map(|w| w.trim_matches('"')).collect();
-                if words.iter().any(|w| *w == home_s) && words.iter().any(|w| *w == "daemon") {
+                // Homes with spaces are quoted on the command line; strip
+                // quotes and match the path as one contiguous substring so
+                // split_whitespace cannot break it apart.
+                let flat: String = cmd.chars().filter(|&c| c != '"').collect();
+                let home_flat: String = home_s.chars().filter(|&c| c != '"').collect();
+                let has_daemon = flat.split_whitespace().any(|w| w == "daemon");
+                if flat.contains(&home_flat) && has_daemon {
                     let pid: u32 = pid.trim().parse().ok()?;
                     pid_alive(pid).then_some(pid)
                 } else {

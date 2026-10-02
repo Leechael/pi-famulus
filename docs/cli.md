@@ -322,7 +322,7 @@ pi-famulus start --kind monitor --background 'while true; do date; sleep 1; done
 | `--cwd` | process cwd | Working directory |
 | `--timeout-ms` | none | Hard kill ceiling (`end_reason: timeout`) |
 | `--background` | off | Semantic marker only |
-| `<COMMAND>` | required | Run via `sh -c` (Windows: pi's bash, see design §3 rulings) |
+| `<COMMAND>` | required | Run via `sh -c` (Windows: pi's bash when available, else `cmd.exe /d /s /c`; see design §3 rulings) |
 
 Prints `task_id=sh_… pid=12345`.
 

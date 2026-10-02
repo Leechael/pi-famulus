@@ -13,8 +13,8 @@ use std::os::windows::io::{OwnedHandle, RawHandle};
 use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, DUPLICATE_SAME_ACCESS,
+    CloseHandle, DuplicateHandle, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, SYSTEMTIME, WAIT_OBJECT_0, DUPLICATE_SAME_ACCESS,
 };
 use windows_sys::Win32::System::Console::{
     GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
@@ -30,6 +30,7 @@ use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
+use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
 /// Same numbers as POSIX so the protocol (`"SIGTERM"` / `"SIGKILL"`) is unchanged.
 pub const SIGTERM: i32 = 15;
@@ -150,37 +151,44 @@ pub fn own_job_members() -> io::Result<Vec<u32>> {
 /// the tree gets a `conhost.exe` in the same job, which lives as long as the
 /// console and is not part of the task.
 fn job_members(job: HANDLE) -> io::Result<Vec<u32>> {
-    // NumberOfAssignedProcesses + NumberOfProcessIdsInList + up to 256 ids.
-    #[repr(C)]
-    struct List {
-        assigned: u32,
-        in_list: u32,
-        pids: [usize; 256],
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST: assigned, in_list, then ULONG_PTR ids[].
+    // Grow until in_list covers assigned (a truncated success must not look
+    // like an empty / finished tree to callers).
+    let mut capacity = 256usize;
+    loop {
+        let mut buf = vec![0usize; 2 + capacity];
+        let mut ret = 0u32;
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicProcessIdList,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * std::mem::size_of::<usize>()) as u32,
+                &mut ret,
+            )
+        };
+        if ok == 0 {
+            let e = io::Error::last_os_error();
+            // ERROR_MORE_DATA: buffer too small for the id list.
+            if e.raw_os_error() == Some(234) {
+                capacity = capacity.saturating_mul(2).max(512);
+                continue;
+            }
+            return Err(e);
+        }
+        let assigned = buf[0] as usize;
+        let in_list = buf[1] as usize;
+        if in_list < assigned {
+            capacity = assigned.max(capacity.saturating_mul(2));
+            continue;
+        }
+        let n = in_list.min(buf.len().saturating_sub(2));
+        return Ok(buf[2..2 + n]
+            .iter()
+            .map(|p| *p as u32)
+            .filter(|p| *p != 0 && !is_console_host(*p))
+            .collect());
     }
-    let mut list = List {
-        assigned: 0,
-        in_list: 0,
-        pids: [0; 256],
-    };
-    let mut ret = 0u32;
-    let ok = unsafe {
-        QueryInformationJobObject(
-            job,
-            JobObjectBasicProcessIdList,
-            std::ptr::from_mut(&mut list).cast(),
-            std::mem::size_of::<List>() as u32,
-            &mut ret,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let n = list.in_list.min(256) as usize;
-    Ok(list.pids[..n]
-        .iter()
-        .map(|p| *p as u32)
-        .filter(|p| *p != 0 && !is_console_host(*p))
-        .collect())
 }
 
 fn is_console_host(pid: u32) -> bool {
@@ -366,8 +374,7 @@ pub fn waitpid_nohang(pid: u32) -> io::Result<Option<std::process::ExitStatus>> 
     }
 }
 
-pub fn localtime(secs: i64) -> LocalTime {
-    // Prefer UTC for the CLI clock display when local conversion is unavailable.
+fn civil_utc(secs: i64) -> LocalTime {
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400) as u32;
     let hour = tod / 3600;
@@ -391,6 +398,35 @@ pub fn localtime(secs: i64) -> LocalTime {
         hour,
         min,
         sec,
+    }
+}
+
+pub fn localtime(secs: i64) -> LocalTime {
+    // FILETIME: 100ns since 1601-01-01 UTC. Unix epoch is 11_644_473_600 s later.
+    let ticks = (secs as i128 + 11_644_473_600) * 10_000_000;
+    if !(0..=u64::MAX as i128).contains(&ticks) {
+        return civil_utc(secs);
+    }
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    unsafe {
+        let mut utc: SYSTEMTIME = std::mem::zeroed();
+        let mut local: SYSTEMTIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&ft, &mut utc) == 0
+            || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0
+        {
+            return civil_utc(secs);
+        }
+        LocalTime {
+            year: local.wYear as i32,
+            month: local.wMonth as u32,
+            day: local.wDay as u32,
+            hour: local.wHour as u32,
+            min: local.wMinute as u32,
+            sec: local.wSecond as u32,
+        }
     }
 }
 

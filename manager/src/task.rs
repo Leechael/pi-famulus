@@ -530,7 +530,13 @@ pub fn start_tee(
     tx: mpsc::Sender<OutputChunk>,
     park: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<Tee> {
-    let open = Arc::new(AtomicUsize::new(2));
+    // Only count pipes that exist: a None source finishing must not be the
+    // "last" decrement that closes the file while its sibling is parked.
+    let n_open = stdout.is_some() as usize + stderr.is_some() as usize;
+    let open = Arc::new(AtomicUsize::new(n_open));
+    if n_open == 0 {
+        output.lock().unwrap().file = None;
+    }
     #[cfg(unix)]
     {
         let out_rx = stdout.map(pipe::Receiver::from_owned_fd).transpose()?;
@@ -538,18 +544,24 @@ pub fn start_tee(
         let (o, t, p, n) = (output.clone(), tx.clone(), park.clone(), open.clone());
         let stdout = tokio::spawn(async move {
             let parked = match out_rx {
-                Some(r) => pump_unix(r, o.clone(), t, None, p).await,
+                Some(r) => {
+                    let parked = pump_unix(r, o.clone(), t, None, p).await;
+                    pump_done(&n, &o, parked.is_some());
+                    parked
+                }
                 None => None,
             };
-            pump_done(&n, &o, parked.is_some());
             parked
         });
         let stderr = tokio::spawn(async move {
             let parked = match err_rx {
-                Some(r) => pump_unix(r, output.clone(), tx, stderr_mirror, park).await,
+                Some(r) => {
+                    let parked = pump_unix(r, output.clone(), tx, stderr_mirror, park).await;
+                    pump_done(&open, &output, parked.is_some());
+                    parked
+                }
                 None => None,
             };
-            pump_done(&open, &output, parked.is_some());
             parked
         });
         Ok(Tee { stdout, stderr })
@@ -558,19 +570,23 @@ pub fn start_tee(
     {
         let (o, t, p, n) = (output.clone(), tx.clone(), park.clone(), open.clone());
         let stdout = tokio::spawn(async move {
-            let parked = match stdout {
-                Some(r) => pump_async(r, o.clone(), t, None, p).await,
-                None => false,
-            };
-            pump_done(&n, &o, parked);
+            match stdout {
+                Some(r) => {
+                    let parked = pump_async(r, o.clone(), t, None, p).await;
+                    pump_done(&n, &o, parked);
+                }
+                None => {}
+            }
             None
         });
         let stderr = tokio::spawn(async move {
-            let parked = match stderr {
-                Some(r) => pump_async(r, output.clone(), tx, stderr_mirror, park).await,
-                None => false,
-            };
-            pump_done(&open, &output, parked);
+            match stderr {
+                Some(r) => {
+                    let parked = pump_async(r, output.clone(), tx, stderr_mirror, park).await;
+                    pump_done(&open, &output, parked);
+                }
+                None => {}
+            }
             None
         });
         Ok(Tee { stdout, stderr })

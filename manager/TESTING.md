@@ -290,9 +290,11 @@ added while fixing and were also run against the pre-fix code: all red.
 
 ## Windows
 
-Nobody on the team runs Windows, so CI is the only Windows test bed. Every
-scenario below runs on `windows-latest` in both clock modes, next to Linux
-and macOS:
+Nobody on the team runs Windows, so CI is the only Windows test bed. The
+manager `tests/platform.rs` suite runs on `windows-latest` in both clock
+modes (real time and `--features test-clock`); the resource benchmark uses
+the real clock only; extension and e2e jobs run once. Coverage next to
+Linux and macOS:
 
 | Where | What |
 |---|---|
@@ -320,7 +322,7 @@ POSIX-only mechanisms have a Windows counterpart or none:
 | T6c–T6e | The runner keeps its job alive while any non-`conhost` member remains; shutdown, `stop` and a natural exit act on the job | `t6c`, `t6d`, `t6e` |
 | T7 | Kill-on-job-close: the daemon's job handles close when it dies, and every tree goes with them | `t7` |
 | T10 | Nothing to forward: the command starts inside its job (the runner waits for the gate before it spawns) | `t4`, `x1` |
-| T14 (inherited fds) | The status pipe is handed to the runner as a non-inheritable duplicate; the CLI's stdio is never inherited by the daemon it spawns | `cli2`, `t6c` |
+| T14 (inherited handles) | The status pipe is handed to the runner as a non-inheritable duplicate; the CLI's stdio is never inherited by the daemon it spawns | `cli2`, `t6c` |
 | D14, D16 | No signals; the daemon is spawned in a new process group, out of the caller's job when breakaway is allowed | `cli2` |
 | Upgrade | `upgrade` is refused; the daemon keeps its pid and tasks | `u1` |
 | Task shell | pi's shell: `PI_FAMULUS_SHELL`, Git Bash, a non-WSL `bash.exe` on PATH, else `cmd.exe /d /s /c` with the command verbatim | `q1`, `q2`, `q3`, unit `task_shell_follows_pi` |

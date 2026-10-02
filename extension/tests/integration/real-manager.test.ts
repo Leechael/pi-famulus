@@ -24,6 +24,21 @@ if (RUN && !existsSync(BIN)) {
   throw new Error(`Requested pi-famulus integration binary does not exist: ${BIN}`);
 }
 
+/** Fixtures use sleep/printf; require bash (Git Bash on Windows). Manager falls back to cmd.exe without it. */
+function bashAvailable(): boolean {
+  if (process.platform !== "win32") return true;
+  try {
+    execFileSync("where.exe", ["bash.exe"], { stdio: "ignore", windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+const HAS_BASH = bashAvailable();
+if (RUN && !HAS_BASH) {
+  console.warn("real-manager integration skipped: bash.exe not on PATH (needed for sleep/printf fixtures)");
+}
+
 // Tasks get what the extension sends: the real cwd and pi's environment
 // (Git Bash on Windows needs PATH and SystemRoot).
 const TASK_CWD = tmpdir();
@@ -35,7 +50,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-describe.skipIf(!RUN)("real pi-famulus integration", () => {
+describe.skipIf(!RUN || !HAS_BASH)("real pi-famulus integration", () => {
   const home = mkdtempSync(join(tmpdir(), "pi-famulus-integ-"));
   const paths = famulusPaths(home);
   const events: ManagerEvent[] = [];

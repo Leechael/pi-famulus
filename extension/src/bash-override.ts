@@ -185,7 +185,11 @@ async function executeLocal(
         stdio: [viaStdin ? "pipe" : "ignore", "pipe", "pipe"],
         windowsHide: true,
       });
-      if (viaStdin) child.stdin?.end(params.command);
+      if (viaStdin) {
+        // Swallow EPIPE if the shell exits before consuming stdin (pi's runner does the same).
+        child.stdin?.on("error", () => {});
+        child.stdin?.end(params.command);
+      }
       const chunks: Buffer[] = [];
       let settled = false;
       let timedOut = false;

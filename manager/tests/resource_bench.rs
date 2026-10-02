@@ -45,26 +45,26 @@ struct Sample {
 
 fn sample(pid: u32) -> Sample {
     Sample {
-        rss: rss_bytes(pid).unwrap_or(0),
-        handles: open_handles(pid).unwrap_or(0),
-        cpu_ms: cpu_time_ms(pid).unwrap_or(0),
+        rss: rss_bytes(pid).expect("rss probe failed"),
+        handles: open_handles(pid).expect("handle probe failed"),
+        cpu_ms: cpu_time_ms(pid).expect("cpu probe failed"),
     }
 }
 
 /// CPU milliseconds `pid` burns over `d` of wall time.
 fn cpu_over(pid: u32, d: Duration) -> u64 {
-    let a = cpu_time_ms(pid).unwrap_or(0);
+    let a = cpu_time_ms(pid).expect("cpu probe failed");
     std::thread::sleep(d);
-    cpu_time_ms(pid).unwrap_or(0).saturating_sub(a)
+    cpu_time_ms(pid).expect("cpu probe failed").saturating_sub(a)
 }
 
 /// Wait until the daemon's handle count stops moving (exit watchers, pumps
 /// and job handles are released asynchronously), then return it.
 fn settled_handles(pid: u32) -> u64 {
-    let mut last = open_handles(pid).unwrap_or(0);
+    let mut last = open_handles(pid).expect("handle probe failed");
     for _ in 0..20 {
         std::thread::sleep(MS(250));
-        let now = open_handles(pid).unwrap_or(0);
+        let now = open_handles(pid).expect("handle probe failed");
         if now == last {
             return now;
         }
@@ -143,7 +143,7 @@ fn resource_usage() {
     }
     std::thread::sleep(S(1));
     let busy = sample(pid);
-    let runner_rss: u64 = running.iter().map(|(_, p)| rss_bytes(*p).unwrap_or(0)).sum::<u64>() / n;
+    let runner_rss: u64 = running.iter().map(|(_, p)| rss_bytes(*p).expect("runner rss probe failed")).sum::<u64>() / n;
     r.metric("running20.daemon_rss", busy.rss as f64 / MIB, "MiB", Some(64.0));
     r.metric(
         "running20.daemon_handles_per_task",
@@ -153,9 +153,9 @@ fn resource_usage() {
     );
     r.metric("running20.runner_rss_avg", runner_rss as f64 / MIB, "MiB", Some(16.0));
     r.metric("running20.daemon_cpu_3s", cpu_over(pid, S(3)) as f64, "ms", Some(150.0));
-    let runners_cpu: u64 = running.iter().map(|(_, p)| cpu_time_ms(*p).unwrap_or(0)).sum();
+    let runners_cpu: u64 = running.iter().map(|(_, p)| cpu_time_ms(*p).expect("runner cpu probe failed")).sum();
     std::thread::sleep(S(3));
-    let runners_cpu_after: u64 = running.iter().map(|(_, p)| cpu_time_ms(*p).unwrap_or(0)).sum();
+    let runners_cpu_after: u64 = running.iter().map(|(_, p)| cpu_time_ms(*p).expect("runner cpu probe failed")).sum();
     r.metric("running20.runners_cpu_3s", runners_cpu_after.saturating_sub(runners_cpu) as f64, "ms", Some(150.0));
     for (id, _) in &running {
         c.request_ok(json!({"type":"stop","task_id":id}));
@@ -194,17 +194,24 @@ fn resource_usage() {
         let sampler = s.spawn(|| {
             let mut peak = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                peak = peak.max(rss_bytes(pid).unwrap_or(0));
+                peak = peak.max(rss_bytes(pid).expect("rss probe failed"));
                 std::thread::sleep(MS(20));
             }
             peak
         });
+        // Always release the sampler, even if wait_terminal panics/times out.
+        struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _stop_guard = Stop(&stop);
         let t0 = Instant::now();
         let (id, _) = c.start(&kit(&["bytes", &BIG.to_string()]));
         let t = c.wait_terminal(&id, S(120)).expect("large output task did not finish");
         let secs = t0.elapsed().as_secs_f64();
         assert_eq!(t["output_size"], BIG, "{t}");
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         (secs, sampler.join().unwrap())
     });
     r.metric("output128m.throughput", (BIG as f64 / MIB) / secs, "MiB/s", None);

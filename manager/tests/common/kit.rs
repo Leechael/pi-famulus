@@ -52,6 +52,7 @@ pub fn bytes_pattern(n: usize) -> Vec<u8> {
 /// filters (substring, or exact with `--exact`).
 fn run_tests(tests: &[(&'static str, TestFn)], args: &[String]) -> i32 {
     let mut filters = Vec::new();
+    let mut skips = Vec::new();
     let mut threads = std::env::var("RUST_TEST_THREADS").ok().and_then(|v| v.parse().ok());
     let (mut exact, mut list) = (false, false);
     let mut it = args.iter();
@@ -60,15 +61,25 @@ fn run_tests(tests: &[(&'static str, TestFn)], args: &[String]) -> i32 {
             "--test-threads" => threads = it.next().and_then(|v| v.parse().ok()),
             "--exact" => exact = true,
             "--list" => list = true,
+            "--skip" => {
+                if let Some(v) = it.next() {
+                    skips.push(v.to_string());
+                }
+            }
             "--ignored" | "--include-ignored" => {}
             s if s.starts_with("--test-threads=") => threads = s["--test-threads=".len()..].parse().ok(),
+            s if s.starts_with("--skip=") => skips.push(s["--skip=".len()..].to_string()),
             s if s.starts_with('-') => {}
             s => filters.push(s.to_string()),
         }
     }
     let selected: Vec<&(&str, TestFn)> = tests
         .iter()
-        .filter(|(name, _)| filters.is_empty() || filters.iter().any(|f| if exact { name == f } else { name.contains(f.as_str()) }))
+        .filter(|(name, _)| {
+            let pass = filters.is_empty() || filters.iter().any(|f| if exact { name == f } else { name.contains(f.as_str()) });
+            let skipped = skips.iter().any(|s| if exact { name == s } else { name.contains(s.as_str()) });
+            pass && !skipped
+        })
         .collect();
     if list {
         for (name, _) in &selected {

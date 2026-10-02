@@ -1,18 +1,42 @@
 import assert from 'node:assert/strict';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PLATFORMS, validateMetadata } from './validate-release.mjs';
 
 /** `execFileSync('npm')` is ENOENT on Windows; the shim is `npm.cmd`. */
 export const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
+/**
+ * Invoke npm without a shell. On Windows, `.cmd` shims need `shell:true`, which
+ * reopens argument-injection risk; prefer `node path/to/npm-cli.js` instead.
+ */
+function resolveNpm() {
+  if (process.platform !== 'win32') {
+    return { command: 'npm', prefix: [] };
+  }
+  const candidates = [];
+  if (process.env.npm_execpath) candidates.push(process.env.npm_execpath);
+  for (const dir of (process.env.PATH || '').split(delimiter)) {
+    if (!dir) continue;
+    candidates.push(join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js'));
+    candidates.push(join(dirname(dir), 'node_modules', 'npm', 'bin', 'npm-cli.js'));
+    candidates.push(join(dir, 'npm-cli.js'));
+  }
+  for (const cli of candidates) {
+    if (cli && existsSync(cli)) {
+      return { command: process.execPath, prefix: [cli] };
+    }
+  }
+  throw new Error('cannot locate npm-cli.js; set npm_execpath or put npm on PATH');
+}
+
 export function npmSync(args, options = {}) {
-  return execFileSync(npmCommand, args, {
+  const { command, prefix } = resolveNpm();
+  return execFileSync(command, [...prefix, ...args], {
     ...options,
-    // Batch shims need a shell; keep Unix on execFile's no-shell path.
-    shell: process.platform === 'win32' ? true : options.shell,
+    shell: false,
   });
 }
 

@@ -4,7 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { npmCommand } from './prepare-native.mjs';
+import { npmSync } from './prepare-native.mjs';
 import { validateMetadata, validateTag, REPOSITORY } from './validate-release.mjs';
 import { distTagForVersion } from './next-release.mjs';
 
@@ -51,7 +51,13 @@ export async function publishPackages(root, directory, { tag, dryRun = true, rep
   for (const p of pending) {
     const distTag = distTagForVersion(p.metadata.version);
     console.log(`${dryRun ? 'Dry run' : 'Publish'}: ${p.name}@${p.metadata.version} --tag ${distTag}`);
-    run(npmCommand, ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit' });
+    // Prefer npmSync (node + npm-cli.js on Windows) so .cmd is never shell-parsed.
+    // `run` stays injectable for tests that capture the argv vector.
+    if (run === execFileSync) {
+      npmSync(['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit' });
+    } else {
+      run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit', shell: process.platform === 'win32' });
+    }
   }
   if (dryRun) console.log('Dry run validates packaging only; it does NOT prove OIDC authentication or trusted-publisher bindings.');
 }

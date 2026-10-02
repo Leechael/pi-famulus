@@ -93,7 +93,8 @@ fn program_exists(cmd: &str) -> bool {
 pub fn start() -> Option<Pager> {
     #[cfg(windows)]
     {
-        let _ = command(|k| std::env::var(k).ok());
+        // Known gap this PR: no portable dup2 onto a pager pipe on Windows yet.
+        // Listings print unpaged; PI_FAMULUS_PAGER / PAGER are ignored here.
         return None;
     }
     #[cfg(unix)]
@@ -133,10 +134,6 @@ impl Pager {
         if let Ok(null) = std::fs::File::open("/dev/null") {
             // SAFETY: replaces fd 1 (the pipe's last write end) with /dev/null.
             unsafe { libc::dup2(null.as_raw_fd(), 1) };
-        }
-        #[cfg(windows)]
-        {
-            let _ = std::fs::File::open("NUL");
         }
         let _ = self.child.wait();
     }

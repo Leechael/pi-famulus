@@ -530,7 +530,11 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 #[cfg(windows)]
                 {
                     let _ = &upgrade_notify;
-                    if let Some(ready) = state.lock().unwrap().upgrade_ready.take() {
+                    // Take the ready value out of the lock before fail_unsupported
+                    // re-locks the same non-reentrant Mutex (edition 2021 temporary scope
+                    // would otherwise hold the guard across that call).
+                    let ready = state.lock().unwrap().upgrade_ready.take();
+                    if let Some(ready) = ready {
                         let _ = crate::handover::fail_unsupported(&state, ready);
                     }
                 }
@@ -548,7 +552,15 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
                 #[cfg(windows)]
                 {
-                    let _ = ctrl_c.as_mut().await;
+                    // Only Ok(()) is a real Ctrl-C. An Err (listener registration
+                    // failure) must not enter the shutdown branch.
+                    match ctrl_c.as_mut().await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            lifecycle::log_line(&home, &format!("Ctrl-C listener error: {e}"));
+                            std::future::pending::<()>().await;
+                        }
+                    }
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, if cfg!(windows) { "received Ctrl-C" } else { "received SIGTERM" });

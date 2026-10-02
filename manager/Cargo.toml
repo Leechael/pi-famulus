@@ -28,6 +28,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_System_Time",
 ] }
 
 # Portable black-box suite and resource benchmark. Each binary is also its

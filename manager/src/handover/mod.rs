@@ -20,6 +20,7 @@ pub(crate) const CHECK_PREFIX: &str = "pi-famulus-handover";
 
 /// The install executable path used for upgrades. Re-resolve it when npm
 /// retires its directory so a newly installed stable sibling becomes usable.
+/// On Linux, also strip the procfs " (deleted)" marker when present.
 pub fn exe_path() -> std::io::Result<PathBuf> {
     static INSTALL_EXE: std::sync::OnceLock<Mutex<Option<PathBuf>>> = std::sync::OnceLock::new();
     let mut cached = INSTALL_EXE.get_or_init(|| Mutex::new(None)).lock().unwrap();
@@ -58,16 +59,20 @@ fn current_exe_path() -> Option<PathBuf> {
     std::env::current_exe().ok().map(strip_deleted_suffix)
 }
 
+/// Only strip the Linux procfs " (deleted)" marker, and only for absolute paths.
 pub(crate) fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let Some(original) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
             return path;
         };
-        return PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()));
+        if original.starts_with(b"/") && !original.is_empty() {
+            return PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()));
+        }
+        return path;
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         path
     }
