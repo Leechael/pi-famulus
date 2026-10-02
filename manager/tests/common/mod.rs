@@ -698,8 +698,10 @@ pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
 
 #[cfg(windows)]
 mod win {
+    use std::collections::HashMap;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::{Mutex, OnceLock};
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::{
@@ -727,20 +729,49 @@ mod win {
         }
     }
 
+    // SAFETY: a process handle is a process-wide kernel object.
+    unsafe impl Send for Proc {}
+
+    /// Handles to processes the tests were told about, by pid. Windows gives
+    /// a freed pid to the next new process within seconds, so a probe by pid
+    /// alone can find a stranger alive in place of a task that was killed
+    /// (or kill that stranger). A handle stays bound to the original process.
+    fn tracked() -> &'static Mutex<HashMap<(usize, u32), Proc>> {
+        static T: OnceLock<Mutex<HashMap<(usize, u32), Proc>>> = OnceLock::new();
+        T.get_or_init(Default::default)
+    }
+
+    pub fn track(scope: usize, pid: u32) {
+        if let Some(p) = Proc::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE) {
+            tracked().lock().unwrap().insert((scope, pid), p);
+        }
+    }
+
+    pub fn forget(scope: usize) {
+        tracked().lock().unwrap().retain(|(s, _), _| *s != scope);
+    }
+
+    fn with_proc<R>(pid: u32, access: u32, f: impl FnOnce(&Proc) -> R) -> Option<R> {
+        if let Some(p) = tracked().lock().unwrap().get(&(super::test_scope(), pid)) {
+            return Some(f(p));
+        }
+        Proc::open(pid, access).map(|p| f(&p))
+    }
+
     /// The process exists and has not exited. A process that exited but
     /// still has open handles reports its exit code, so it counts as dead.
     pub fn pid_alive(pid: u32) -> bool {
-        let Some(p) = Proc::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else { return false };
-        let mut code = 0u32;
-        // SAFETY: valid handle, out pointer to a local.
-        unsafe { GetExitCodeProcess(p.0, &mut code) != 0 && code == STILL_ACTIVE }
+        with_proc(pid, PROCESS_QUERY_LIMITED_INFORMATION, |p| {
+            let mut code = 0u32;
+            // SAFETY: valid handle, out pointer to a local.
+            unsafe { GetExitCodeProcess(p.0, &mut code) != 0 && code == STILL_ACTIVE }
+        })
+        .unwrap_or(false)
     }
 
     pub fn kill_pid(pid: u32) {
-        if let Some(p) = Proc::open(pid, PROCESS_TERMINATE) {
-            // SAFETY: valid handle with terminate access.
-            unsafe { TerminateProcess(p.0, 137) };
-        }
+        // SAFETY: valid handle with terminate access.
+        with_proc(pid, PROCESS_TERMINATE, |p| unsafe { TerminateProcess(p.0, 137) });
     }
 
     pub fn working_set_bytes(pid: u32) -> Option<u64> {
@@ -798,6 +829,37 @@ mod win {
     }
 }
 
+/// Bind this test's later probes of `pid` (`pid_alive`, `pid_running`,
+/// `kill_pid`) to the process that has it now; see `win::track`. Unix keeps
+/// a killed child's pid until its parent reaps it, and allocates pids in
+/// order.
+pub fn track(pid: u32) -> u32 {
+    #[cfg(windows)]
+    win::track(test_scope(), pid);
+    pid
+}
+
+thread_local! {
+    static TEST_SCOPE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The test this thread works for. Two tests running at once can each be
+/// told about a process with the same (reused) pid; tracking is per test so
+/// each probes its own. A thread a test spawns must `enter_test_scope` too.
+pub fn test_scope() -> usize {
+    TEST_SCOPE.with(|s| s.get())
+}
+
+pub fn enter_test_scope(scope: usize) {
+    TEST_SCOPE.with(|s| s.set(scope));
+}
+
+/// Drop this thread's test scope and the processes it tracked.
+pub fn end_test_scope() {
+    #[cfg(windows)]
+    win::forget(test_scope());
+    enter_test_scope(0);
+}
 #[cfg(windows)]
 pub fn pid_alive(pid: u32) -> bool {
     win::pid_alive(pid)
@@ -1132,7 +1194,7 @@ impl Conn {
         let r = self.request_ok(req);
         (
             r["task_id"].as_str().unwrap().to_string(),
-            r["pid"].as_u64().unwrap() as u32,
+            track(r["pid"].as_u64().unwrap() as u32),
         )
     }
 
@@ -1282,7 +1344,7 @@ impl HelperClient {
                 let mut it = rest.split_whitespace();
                 let id = it.next().unwrap().to_string();
                 let pid: u32 = it.next().unwrap().parse().unwrap();
-                tasks.push((id, pid));
+                tasks.push((id, track(pid)));
             } else if line.contains("PI_FAMULUS_TEST_HELPER_READY") {
                 break;
             }
@@ -1346,7 +1408,7 @@ pub fn wait_for_pids(c: &mut Conn, task_id: &str, n: usize) -> Vec<u32> {
         let r = c.request_ok(json!({"type":"output","task_id":task_id,"cursor":0,"max_bytes":65536}));
         let p = pids_in(r["chunk"].as_str().unwrap_or(""));
         if p.len() >= n {
-            Some(p)
+            Some(p.into_iter().map(track).collect())
         } else {
             None
         }

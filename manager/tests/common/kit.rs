@@ -89,7 +89,9 @@ fn run_tests(tests: &[(&'static str, TestFn)], args: &[String]) -> i32 {
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 let Some((name, f)) = selected.get(i) else { break };
                 let t0 = Instant::now();
+                super::enter_test_scope(i + 1);
                 let ok = catch_unwind(AssertUnwindSafe(f)).is_ok();
+                super::end_test_scope();
                 let took = t0.elapsed().as_secs_f64();
                 println!("test {name} ... {} ({took:.1}s)", if ok { "ok" } else { "FAILED" });
                 if !ok {

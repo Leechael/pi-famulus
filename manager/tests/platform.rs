@@ -594,11 +594,13 @@ fn x1_concurrent_starts_and_stops_finish_promptly() {
     let home = Home::new("w-x1");
     let _d = home.start_daemon();
     let _keeper = ext(&home, "keeper");
+    let scope = test_scope();
     let started: Vec<(String, Vec<u32>, bool)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..4)
             .map(|t| {
                 let home = &home;
                 s.spawn(move || {
+                    enter_test_scope(scope);
                     let mut c = ext(home, &format!("sess-x{t}"));
                     let mut v = Vec::new();
                     for i in 0..8 {
