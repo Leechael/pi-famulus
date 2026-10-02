@@ -73,6 +73,15 @@ fn settled_handles(pid: u32) -> u64 {
     last
 }
 
+/// Handles the daemon keeps once its idle tokio blocking threads have exited
+/// (10 s keep-alive). On Windows every pipe read of a running task holds a
+/// blocking thread, and every thread holds handles: right after a burst the
+/// count reflects the pool, not a leak.
+fn handles_after_pool_idle(pid: u32) -> u64 {
+    std::thread::sleep(S(11));
+    settled_handles(pid)
+}
+
 fn percentile(v: &mut [u64], p: f64) -> u64 {
     v.sort_unstable();
     v[((v.len() as f64 - 1.0) * p).round() as usize]
@@ -163,14 +172,16 @@ fn resource_usage() {
             assert!(c.wait_terminal(id, S(20)).is_some(), "churn {chunk}: {id} did not finish");
         }
     }
-    let after_churn = settled_handles(pid);
+    let warm = settled_handles(pid);
+    r.metric("churn200.handle_growth_warm", warm.saturating_sub(base_handles) as f64, "", None);
+    let after_churn = handles_after_pool_idle(pid);
     r.metric("churn200.handle_growth", after_churn.saturating_sub(base_handles) as f64, "", Some(24.0));
     let ids: Vec<String> = (0..20).map(|_| c.start(&kit(&["leave", "300"])).0).collect();
     for id in &ids {
         assert!(c.wait_terminal(id, S(20)).is_some(), "{id} did not finish");
     }
     std::thread::sleep(S(2));
-    let after_leftovers = settled_handles(pid);
+    let after_leftovers = handles_after_pool_idle(pid);
     r.metric("leftovers20.handle_growth", after_leftovers.saturating_sub(base_handles) as f64, "", Some(24.0));
     r.metric("churn.rss_after", sample(pid).rss as f64 / MIB, "MiB", Some(64.0));
 
