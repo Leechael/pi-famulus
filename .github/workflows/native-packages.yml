@@ -112,12 +112,25 @@ jobs:
           echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
       # Keep real-time timing canaries AND manually stepped daemon clock coverage.
-      # On Windows, integration suites that assume Unix sockets/shells are cfg-gated.
+      # tests/platform.rs is the portable lifecycle suite (named pipes, Job
+      # Objects and the task shell on Windows); the sh-based suites are Unix-only.
       - run: cargo test --locked
         working-directory: manager
       - run: cargo test --locked --features test-clock
         working-directory: manager
-        if: runner.os != 'Windows'
+      - name: Resource usage benchmark
+        shell: bash
+        env:
+          PI_FAMULUS_BENCH: '1'
+          PI_FAMULUS_BENCH_OUT: ${{ runner.temp }}/bench-${{ matrix.platform }}.json
+        run: cargo test --locked --release --test resource_bench
+        working-directory: manager
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resource-bench-${{ matrix.platform }}
+          path: ${{ runner.temp }}/bench-${{ matrix.platform }}.json
+          if-no-files-found: ignore
       - name: Build release binary
         shell: bash
         run: |
@@ -141,17 +154,18 @@ jobs:
           node scripts/prepare-native.mjs "$PLATFORM" "$RUNNER_TEMP/packages"
           npm pack ./extension --pack-destination "$RUNNER_TEMP/packages"
       - name: Install tarballs and verify automatic CLI and extension resolution
-        if: runner.os != 'Windows'
+        shell: bash
         run: |
           sandbox=$(mktemp -d "$RUNNER_TEMP/npm-smoke.XXXXXX")
-          export HOME="$sandbox/home"
+          export HOME="$sandbox/home" USERPROFILE="$sandbox/home"
           mkdir -p "$HOME" "$sandbox/project"
           unset PI_FAMULUS_MANAGER_PATH PI_FAMULUS_HOME
           cd "$sandbox/project"
           npm init -y
-          version=$(node -p "JSON.parse(require('fs').readFileSync('$GITHUB_WORKSPACE/extension/package.json')).version")
+          # Paths via process.env: a Windows workspace path is not a valid JS string literal.
+          version=$(node -p "require(require('path').join(process.env.GITHUB_WORKSPACE, 'extension/package.json')).version")
           # Use the same exact pi version as source tests, not the latest peer.
-          pi_version=$(node -p "JSON.parse(require('fs').readFileSync('$GITHUB_WORKSPACE/extension/package-lock.json')).packages['node_modules/@earendil-works/pi-coding-agent'].version")
+          pi_version=$(node -p "require(require('path').join(process.env.GITHUB_WORKSPACE, 'extension/package-lock.json')).packages['node_modules/@earendil-works/pi-coding-agent'].version")
           npm install --ignore-scripts --no-audit --no-fund \
             "@earendil-works/pi-coding-agent@$pi_version" \
             "$RUNNER_TEMP/packages/pi-famulus-$version.tgz" \
@@ -166,30 +180,36 @@ jobs:
           const root = resolve('node_modules/pi-famulus');
           const { nativePackageName, resolveNativeManagerPath } = await import(pathToFileURL(`${root}/src/native-manager.js`));
           const name = nativePackageName(process.platform, process.arch);
-          const expected = resolve(`node_modules/${name}/bin/pi-famulus`);
+          // Windows can only start a PE image whose name ends in .exe.
+          const exe = process.platform === 'win32' ? 'pi-famulus.exe' : 'pi-famulus';
+          const expected = resolve(`node_modules/${name}/bin/${exe}`);
           assert.equal(resolveNativeManagerPath(), expected);
           // jiti is pi's actual TypeScript loader: Node cannot strip TS in node_modules.
           const piRequire = createRequire(import.meta.resolve('@earendil-works/pi-coding-agent'));
           const { createJiti } = piRequire('jiti');
           const jiti = createJiti(import.meta.url);
           const { DEFAULT_CONFIG, resolveManagerPath } = await jiti.import(`${root}/src/config.ts`);
-          const home = `${process.env.HOME}/.pi/agent/pi-famulus`;
+          const home = resolve(process.env.HOME, '.pi/agent/pi-famulus');
+          const homeBinary = resolve(home, 'bin', exe);
           assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, {}), expected);
-          assert.equal(existsSync(`${home}/bin/pi-famulus`), false);
+          assert.equal(existsSync(homeBinary), false);
           assert.equal(resolveManagerPath({ ...DEFAULT_CONFIG, managerPath: process.execPath }, home, {}), process.execPath);
           assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, { PI_FAMULUS_MANAGER_PATH: process.execPath }), process.execPath);
           mkdirSync(`${home}/bin`, { recursive: true });
-          writeFileSync(`${home}/bin/pi-famulus`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+          writeFileSync(homeBinary, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
           assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, {}), expected, 'package wins over old home installation');
-          try {
-            chmodSync(expected, 0o644);
-            assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, {}), `${home}/bin/pi-famulus`, 'unusable native permits manual fallback');
-          } finally { chmodSync(expected, 0o755); }
+          // Windows has no execute bit to take away.
+          if (process.platform !== 'win32') {
+            try {
+              chmodSync(expected, 0o644);
+              assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, {}), homeBinary, 'unusable native permits manual fallback');
+            } finally { chmodSync(expected, 0o755); }
+          }
           NODE
           ./node_modules/.bin/pi-famulus --help
           ./node_modules/.bin/pi-famulus --version | grep -F "pi-famulus $version"
           # Exercise the actual packaged daemon/runner (including musl), not just --help.
-          manager_home=$(mktemp -d /tmp/native-XXXXXX)
+          manager_home=$(mktemp -d "$RUNNER_TEMP/native-XXXXXX")
           trap './node_modules/.bin/pi-famulus --home "$manager_home" shutdown || true' EXIT
           line=$(./node_modules/.bin/pi-famulus --home "$manager_home" start 'printf native-package-roundtrip')
           id=${line#task_id=}; id=${id%% *}
