@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ExitNotifyGate } from "../../src/exit-notify-gate";
+import { famulusPaths } from "../../src/config";
 import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
 
 function encodeFrame(message: Record<string, unknown>): Buffer {
@@ -30,7 +31,7 @@ describe("wait done:false and task_exited in one read", () => {
 
   it("still delivers the wake when the exit is processed before the mark", async () => {
     home = mkdtempSync(join(tmpdir(), "pi-famulus-exit-race-"));
-    const socketPath = join(home, "manager.sock");
+    const socketPath = famulusPaths(home).socket;
     server = net.createServer((socket) => {
       let buf = Buffer.alloc(0);
       socket.on("data", (data) => {

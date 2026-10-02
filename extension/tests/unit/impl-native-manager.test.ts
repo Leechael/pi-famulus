@@ -52,7 +52,8 @@ describe("installed native manager", () => {
     expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBe(binary);
   });
 
-  it("rejects a non-executable native file rather than shadowing a working manual binary", () => {
+  // Windows has no execute bit to clear.
+  it.skipIf(process.platform === "win32")("rejects a non-executable native file rather than shadowing a working manual binary", () => {
     const { binary, resolve } = installed();
     chmodSync(binary, 0o644);
     expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();

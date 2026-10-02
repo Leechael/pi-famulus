@@ -6,11 +6,38 @@ import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import pkg from "../../package.json";
 
+const WINDOWS = process.platform === "win32";
+const itPosix = it.skipIf(WINDOWS);
+
 let root = "";
 afterEach(() => {
   if (root) rmSync(root, { recursive: true, force: true });
   root = "";
 });
+/**
+ * Windows only starts `.exe` images, so the fake native there is a copy of
+ * node renamed pi-famulus.exe, whose behaviour comes from a preload (passed
+ * in NODE_OPTIONS, inert in any other node). Node resolves the first
+ * argument as its script path, hence the basename.
+ */
+function windowsFakeNative(dir: string, exit: number): void {
+  copyFileSync(process.execPath, join(dir, "bin", "pi-famulus.exe"));
+  writeFileSync(join(dir, "fake.cjs"), [
+    'const { basename } = require("node:path");',
+    'const { writeSync } = require("node:fs");',
+    'if (basename(process.execPath).toLowerCase() === "pi-famulus.exe") {',
+    "  const args = process.argv.length > 1 ? [basename(process.argv[1]), ...process.argv.slice(2)] : [];",
+    '  for (const a of args) writeSync(1, a + "\\n");',
+    `  process.exit(${exit});`,
+    "}",
+  ].join("\n"));
+  process.env.NODE_OPTIONS = `--require ${JSON.stringify(join(dir, "fake.cjs"))}`;
+}
+
+afterEach(() => {
+  delete process.env.NODE_OPTIONS;
+});
+
 function consumer(native = true, exit = 0, nativeText?: string) {
   root = realpathSync(mkdtempSync(join(tmpdir(), "cli-test-")));
   const main = join(root, "node_modules", "pi-famulus");
@@ -23,12 +50,17 @@ function consumer(native = true, exit = 0, nativeText?: string) {
     const name = `pi-famulus-${process.platform}-${process.arch}`;
     const dir = join(root, "node_modules", name);
     mkdirSync(join(dir, "bin"), { recursive: true });
+    const file = WINDOWS ? "./bin/pi-famulus.exe" : "./bin/pi-famulus";
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name, version: pkg.version,
-      exports: { "./package.json": "./package.json", "./bin/pi-famulus": "./bin/pi-famulus" },
+      exports: { "./package.json": "./package.json", "./bin/pi-famulus": file },
     }));
-    const binary = join(dir, "bin", "pi-famulus");
-    writeFileSync(binary, nativeText ?? `#!/bin/sh\nprintf '%s\\n' "$@"\nexit ${exit}\n`);
-    chmodSync(binary, 0o755);
+    if (WINDOWS) {
+      windowsFakeNative(dir, exit);
+    } else {
+      const binary = join(dir, "bin", "pi-famulus");
+      writeFileSync(binary, nativeText ?? `#!/bin/sh\nprintf '%s\\n' "$@"\nexit ${exit}\n`);
+      chmodSync(binary, 0o755);
+    }
   }
   return join(main, "bin", "pi-famulus.js");
 }
@@ -46,14 +78,15 @@ it("npm CLI preserves native failure exit codes", () => {
   expect(result.stdout).toBe("status\n");
 });
 
-it.each(["SIGTERM", "SIGINT", "SIGHUP", "SIGKILL"])("preserves native termination by %s", (signal) => {
+// POSIX signals: Windows has no termination by signal to forward or preserve.
+itPosix.each(["SIGTERM", "SIGINT", "SIGHUP", "SIGKILL"])("preserves native termination by %s", (signal) => {
   const script = `#!/usr/bin/env node\nprocess.kill(process.pid, ${JSON.stringify(signal)});\n`;
   const result = spawnSync(process.execPath, [consumer(true, 0, script)], { encoding: "utf8" });
   expect(result.status).toBeNull();
   expect(result.signal).toBe(signal);
 });
 
-it("forwards supervisor SIGTERM to a long-running native command without leaving it alive", async () => {
+itPosix("forwards supervisor SIGTERM to a long-running native command without leaving it alive", async () => {
   const script = '#!/usr/bin/env node\nprocess.on("SIGTERM", () => process.exit(23));\nconsole.log(process.pid);\nsetInterval(() => {}, 1000);\n';
   const child = spawn(process.execPath, [consumer(true, 0, script)], { stdio: ["ignore", "pipe", "pipe"] });
   let nativePid = 0;
