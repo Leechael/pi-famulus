@@ -151,19 +151,23 @@ pub fn own_job_members() -> io::Result<Vec<u32>> {
 /// the tree gets a `conhost.exe` in the same job, which lives as long as the
 /// console and is not part of the task.
 fn job_members(job: HANDLE) -> io::Result<Vec<u32>> {
-    // JOBOBJECT_BASIC_PROCESS_ID_LIST: assigned, in_list, then ULONG_PTR ids[].
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORD counts, then ULONG_PTR ids.
     // Grow until in_list covers assigned (a truncated success must not look
     // like an empty / finished tree to callers).
     let mut capacity = 256usize;
     loop {
-        let mut buf = vec![0usize; 2 + capacity];
+        let width = std::mem::size_of::<usize>();
+        // 8-byte header (two DWORDs) plus one ULONG_PTR per slot. Allocate as
+        // usizes so the buffer is pointer-aligned for the id array.
+        let nbytes = 8 + capacity * width;
+        let mut buf = vec![0usize; nbytes / width];
         let mut ret = 0u32;
         let ok = unsafe {
             QueryInformationJobObject(
                 job,
                 JobObjectBasicProcessIdList,
                 buf.as_mut_ptr().cast(),
-                (buf.len() * std::mem::size_of::<usize>()) as u32,
+                nbytes as u32,
                 &mut ret,
             )
         };
@@ -176,18 +180,22 @@ fn job_members(job: HANDLE) -> io::Result<Vec<u32>> {
             }
             return Err(e);
         }
-        let assigned = buf[0] as usize;
-        let in_list = buf[1] as usize;
-        if in_list < assigned {
-            capacity = assigned.max(capacity.saturating_mul(2));
-            continue;
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), nbytes) };
+        match super::parse_basic_process_id_list(bytes) {
+            Err(need) => {
+                let next = need.max(capacity.saturating_mul(2));
+                if next <= capacity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "job process id list did not grow",
+                    ));
+                }
+                capacity = next;
+            }
+            Ok(pids) => {
+                return Ok(pids.into_iter().filter(|p| *p != 0 && !is_console_host(*p)).collect());
+            }
         }
-        let n = in_list.min(buf.len().saturating_sub(2));
-        return Ok(buf[2..2 + n]
-            .iter()
-            .map(|p| *p as u32)
-            .filter(|p| *p != 0 && !is_console_host(*p))
-            .collect());
     }
 }
 
