@@ -261,8 +261,13 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
-    crate::sys::apply_new_session_std(&mut cmd);
-    cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
+    #[cfg(windows)]
+    crate::sys::spawn_detached_std(&mut cmd).map_err(|e| format!("spawn daemon: {e}"))?;
+    #[cfg(unix)]
+    {
+        crate::sys::apply_new_session_std(&mut cmd);
+        cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
+    }
     Ok(())
 }
 

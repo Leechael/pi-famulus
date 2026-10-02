@@ -9,7 +9,7 @@
 use super::LocalTime;
 use std::collections::HashMap;
 use std::io;
-use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{OwnedHandle, RawHandle};
 use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
@@ -24,8 +24,8 @@ use windows_sys::Win32::System::JobObjects::{
     TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
-    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
@@ -34,8 +34,8 @@ pub const SIGTERM: i32 = 15;
 pub const SIGKILL: i32 = 9;
 
 const STILL_ACTIVE: u32 = 259;
-const WINDOWS_DETACH_FLAGS: u32 =
-    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB | CREATE_UNICODE_ENVIRONMENT;
+const ERROR_ACCESS_DENIED: i32 = 5;
+const DETACH_FLAGS: u32 = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
 
 struct Job(HANDLE);
 
@@ -55,11 +55,26 @@ fn jobs() -> &'static Mutex<HashMap<u32, Job>> {
 }
 
 pub fn apply_new_session_std(cmd: &mut std::process::Command) {
-    cmd.creation_flags(WINDOWS_DETACH_FLAGS);
+    cmd.creation_flags(DETACH_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
 }
 
+/// Spawn the daemon out of the caller's job (a terminal or IDE may kill its
+/// job when it closes), or inside it when that job forbids breakaway.
+pub fn spawn_detached_std(cmd: &mut std::process::Command) -> io::Result<std::process::Child> {
+    apply_new_session_std(cmd);
+    match cmd.spawn() {
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            cmd.creation_flags(DETACH_FLAGS);
+            cmd.spawn()
+        }
+        r => r,
+    }
+}
+
+/// Runners stay in the daemon's job (if any): the daemon puts each one in a
+/// nested job of its own right after spawn.
 pub fn apply_runner_setup_tokio(cmd: &mut tokio::process::Command) {
-    cmd.creation_flags(WINDOWS_DETACH_FLAGS);
+    cmd.creation_flags(DETACH_FLAGS);
 }
 
 pub fn getpid() -> u32 {
@@ -105,6 +120,19 @@ pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
     let Some(job) = jobs.get(&pgid) else {
         return Ok(Vec::new());
     };
+    job_members(job.0)
+}
+
+/// Processes of the job this process is in (the innermost one when nested):
+/// how a runner sees its own task tree.
+pub fn own_job_members() -> io::Result<Vec<u32>> {
+    job_members(std::ptr::null_mut())
+}
+
+/// The processes of `job`, minus console hosts: every console program in
+/// the tree gets a `conhost.exe` in the same job, which lives as long as the
+/// console and is not part of the task.
+fn job_members(job: HANDLE) -> io::Result<Vec<u32>> {
     // NumberOfAssignedProcesses + NumberOfProcessIdsInList + up to 256 ids.
     #[repr(C)]
     struct List {
@@ -120,7 +148,7 @@ pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
     let mut ret = 0u32;
     let ok = unsafe {
         QueryInformationJobObject(
-            job.0,
+            job,
             JobObjectBasicProcessIdList,
             std::ptr::from_mut(&mut list).cast(),
             std::mem::size_of::<List>() as u32,
@@ -131,7 +159,114 @@ pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
         return Err(io::Error::last_os_error());
     }
     let n = list.in_list.min(256) as usize;
-    Ok(list.pids[..n].iter().map(|p| *p as u32).filter(|p| *p != 0).collect())
+    Ok(list.pids[..n]
+        .iter()
+        .map(|p| *p as u32)
+        .filter(|p| *p != 0 && !is_console_host(*p))
+        .collect())
+}
+
+fn is_console_host(pid: u32) -> bool {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let name = path.rsplit(['\\', '/']).next().unwrap_or("");
+        name.eq_ignore_ascii_case("conhost.exe")
+    }
+}
+
+/// Give `process` its own copy of `handle` (not inheritable, so it does not
+/// leak into what that process starts), closing ours. Returns the handle
+/// value as seen by `process`.
+pub fn hand_over(handle: OwnedHandle, process: RawHandle) -> io::Result<usize> {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::Foundation::DUPLICATE_CLOSE_SOURCE;
+    let mut theirs: HANDLE = std::ptr::null_mut();
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle.into_raw_handle() as HANDLE,
+            process as HANDLE,
+            &mut theirs,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(theirs as usize)
+}
+
+/// How a task's command line is run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShellKind {
+    /// `<shell> -c <command>`: bash and other POSIX shells.
+    Posix,
+    /// `cmd /d /s /c "<command>"`, the command line passed through verbatim.
+    Cmd,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskShell {
+    pub program: std::path::PathBuf,
+    pub kind: ShellKind,
+}
+
+/// The shell tasks run in, resolved once per daemon. Commands come from pi's
+/// bash tool, so this follows pi's own choice on Windows: `PI_FAMULUS_SHELL`
+/// if set, else Git Bash where Git for Windows installs it, else `bash.exe`
+/// on PATH (not WSL's `System32\bash.exe`, which runs Linux processes the
+/// task's job cannot see), else `cmd.exe`.
+pub fn task_shell() -> &'static TaskShell {
+    static SHELL: OnceLock<TaskShell> = OnceLock::new();
+    SHELL.get_or_init(|| resolve_task_shell(|k| std::env::var_os(k), |p| p.is_file()))
+}
+
+pub fn resolve_task_shell(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> TaskShell {
+    use std::path::{Path, PathBuf};
+    let kind_of = |p: &Path| {
+        let stem = p.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase());
+        if stem.as_deref() == Some("cmd") { ShellKind::Cmd } else { ShellKind::Posix }
+    };
+    if let Some(s) = var("PI_FAMULUS_SHELL").filter(|s| !s.is_empty()) {
+        let program = PathBuf::from(s);
+        return TaskShell { kind: kind_of(&program), program };
+    }
+    for root in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(dir) = var(root) {
+            let bash = Path::new(&dir).join("Git").join("bin").join("bash.exe");
+            if exists(&bash) {
+                return TaskShell { program: bash, kind: ShellKind::Posix };
+            }
+        }
+    }
+    if let Some(path) = var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let bash = dir.join("bash.exe");
+            let lower = bash.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+            let wsl = lower.ends_with("\\system32\\bash.exe") || lower.ends_with("\\sysnative\\bash.exe");
+            if !wsl && exists(&bash) {
+                return TaskShell { program: bash, kind: ShellKind::Posix };
+            }
+        }
+    }
+    let program = var("COMSPEC").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cmd.exe"));
+    TaskShell { program, kind: ShellKind::Cmd }
 }
 
 pub fn group_has_others(pgid: u32) -> bool {
@@ -261,26 +396,6 @@ pub fn stdout_tty_columns() -> Option<usize> {
     }
 }
 
-/// Duplicate a handle into an owned `std::fs::File` (async-capable via tokio).
-pub fn file_from_handle(handle: RawHandle) -> io::Result<std::fs::File> {
-    unsafe {
-        let mut dup: HANDLE = std::ptr::null_mut();
-        let ok = DuplicateHandle(
-            GetCurrentProcess(),
-            handle as HANDLE,
-            GetCurrentProcess(),
-            &mut dup,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        );
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(std::fs::File::from(OwnedHandle::from_raw_handle(dup as RawHandle)))
-    }
-}
-
 pub fn random_bytes(buf: &mut [u8]) -> bool {
     use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
     unsafe {
@@ -296,4 +411,35 @@ pub fn random_bytes(buf: &mut [u8]) -> bool {
 #[cfg(test)]
 pub fn max_rss_bytes() -> u64 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    fn resolve(vars: &[(&str, &str)], files: &[&str]) -> TaskShell {
+        let vars: HashMap<String, OsString> = vars.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect();
+        let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+        resolve_task_shell(|k| vars.get(k).cloned(), |p: &Path| files.iter().any(|f| f == p))
+    }
+
+    #[test]
+    fn task_shell_follows_pi() {
+        let git = r"C:\Program Files\Git\bin\bash.exe";
+        let s = resolve(&[("ProgramFiles", r"C:\Program Files"), ("PATH", r"C:\msys64\usr\bin")], &[git, r"C:\msys64\usr\bin\bash.exe"]);
+        assert_eq!((s.program, s.kind), (PathBuf::from(git), ShellKind::Posix));
+
+        let s = resolve(&[("PATH", r"C:\Windows\System32;C:\msys64\usr\bin")], &[r"C:\Windows\System32\bash.exe", r"C:\msys64\usr\bin\bash.exe"]);
+        assert_eq!(s.program, PathBuf::from(r"C:\msys64\usr\bin\bash.exe"), "WSL bash must be skipped");
+
+        let s = resolve(&[("COMSPEC", r"C:\Windows\system32\cmd.exe"), ("PATH", r"C:\Windows\System32")], &[r"C:\Windows\System32\bash.exe"]);
+        assert_eq!((s.program, s.kind), (PathBuf::from(r"C:\Windows\system32\cmd.exe"), ShellKind::Cmd));
+
+        let s = resolve(&[("PI_FAMULUS_SHELL", "cmd.exe"), ("ProgramFiles", r"C:\Program Files")], &[git]);
+        assert_eq!((s.program, s.kind), (PathBuf::from("cmd.exe"), ShellKind::Cmd));
+        let s = resolve(&[("PI_FAMULUS_SHELL", r"D:\tools\sh.exe")], &[]);
+        assert_eq!((s.program, s.kind), (PathBuf::from(r"D:\tools\sh.exe"), ShellKind::Posix));
+    }
 }

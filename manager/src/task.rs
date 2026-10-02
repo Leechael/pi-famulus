@@ -427,38 +427,29 @@ fn spawn_process_unix(command: &str, cwd: &str, env: &HashMap<String, String>) -
 
 #[cfg(windows)]
 fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>) -> io::Result<ProcessParts> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use tokio::io::AsyncWriteExt;
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Pipes::CreatePipe;
-    use windows_sys::Win32::Foundation::SetHandleInformation;
 
+    // Neither end is inheritable: std only keeps handles out of concurrently
+    // spawned children for the stdio pipes it creates under its own spawn
+    // lock. The write end reaches the runner through `sys::hand_over`.
     let mut read_h: HANDLE = std::ptr::null_mut();
     let mut write_h: HANDLE = std::ptr::null_mut();
-    // SECURITY_ATTRIBUTES with bInheritHandle = TRUE for the write end.
-    let mut sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
-    };
-    let ok = unsafe { CreatePipe(&mut read_h, &mut write_h, &mut sa, 0) };
+    let ok = unsafe { CreatePipe(&mut read_h, &mut write_h, std::ptr::null(), 0) };
     if ok == 0 || read_h.is_null() || write_h.is_null() || read_h == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    // Parent read end must not be inherited.
-    unsafe {
-        SetHandleInformation(read_h, HANDLE_FLAG_INHERIT, 0);
-    }
     let status_read = unsafe { OwnedHandle::from_raw_handle(read_h as RawHandle) };
     let status_write = unsafe { OwnedHandle::from_raw_handle(write_h as RawHandle) };
-    let write_raw = status_write.as_raw_handle() as usize;
 
     let runner = runner_exe()?;
     let mut cmd = Command::new(&runner);
     cmd.arg("__run").arg(command);
     cmd.current_dir(cwd);
     cmd.env_clear().envs(env);
-    cmd.env("PI_FAMULUS_STATUS_HANDLE", write_raw.to_string());
-    cmd.stdin(Stdio::null());
+    cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     crate::sys::apply_runner_setup_tokio(&mut cmd);
@@ -466,14 +457,37 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
     let mut child = cmd.spawn().map_err(|e| {
         io::Error::new(e.kind(), format!("cannot spawn runner {}: {e}", runner.display()))
     })?;
-    drop(status_write); // child inherited a copy
     let pid = child.id().unwrap_or(0);
-    if let Some(h) = child.raw_handle() {
-        crate::sys::assign_job(pid, h)?;
-    }
-    let status_file = crate::sys::file_from_handle(status_read.as_raw_handle())?;
-    drop(status_read);
-    let status = tokio::fs::File::from_std(status_file);
+    let process = child
+        .raw_handle()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "runner exited at spawn"))?;
+    // The runner waits on stdin for the gate, so nothing has started yet.
+    let gate = crate::sys::assign_job(pid, process).and_then(|()| {
+        let theirs = crate::sys::hand_over(status_write, process)?;
+        let shell = crate::sys::task_shell();
+        let kind = match shell.kind {
+            crate::sys::ShellKind::Posix => "posix",
+            crate::sys::ShellKind::Cmd => "cmd",
+        };
+        Ok(format!("{theirs}\n{kind}\n{}\n", shell.program.display()))
+    });
+    let gate = match gate {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = child.start_kill();
+            crate::sys::drop_job(pid);
+            return Err(e);
+        }
+    };
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stdin pipe missing"))?;
+    tokio::spawn(async move {
+        let _ = stdin.write_all(gate.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    });
+    let status = tokio::fs::File::from_std(std::fs::File::from(status_read));
     let stdout = child
         .stdout
         .take()

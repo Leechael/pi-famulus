@@ -142,42 +142,79 @@ fn unix_main(command: &OsStr) -> i32 {
     0
 }
 
+/// What the daemon writes to a Windows runner's stdin once the runner is in
+/// its task's job: `<status handle>\n<posix|cmd>\n<shell program>\n`, then
+/// EOF. Until then the runner starts nothing, so every process of the task
+/// is born inside the job (a child started before the assignment would
+/// escape both stop and the kill-on-close lifeline).
+#[cfg(windows)]
+struct Gate {
+    status: usize,
+    shell: sys::TaskShell,
+}
+
+#[cfg(windows)]
+fn parse_gate(text: &str) -> Option<Gate> {
+    let mut lines = text.lines();
+    let status = lines.next()?.trim().parse().ok()?;
+    let kind = match lines.next()?.trim() {
+        "posix" => sys::ShellKind::Posix,
+        "cmd" => sys::ShellKind::Cmd,
+        _ => return None,
+    };
+    let program = lines.next().filter(|p| !p.is_empty())?.into();
+    Some(Gate { status, shell: sys::TaskShell { program, kind } })
+}
+
+/// Windows: the task's Job Object stands in for the process group and its
+/// kill-on-close for the lifeline; the status pipe arrives through the gate.
 #[cfg(windows)]
 fn windows_main(command: &OsStr) -> i32 {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
-    let mut status_file = std::env::var("PI_FAMULUS_STATUS_HANDLE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|h| {
-            // SAFETY: the parent created this inheritable write end for us.
-            let handle = unsafe { OwnedHandle::from_raw_handle(h as RawHandle) };
-            std::fs::File::from(handle)
-        });
-    let report = |what: &str, alone: bool, f: &mut Option<std::fs::File>| {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let mut text = String::new();
+    let _ = std::io::stdin().lock().read_to_string(&mut text);
+    let Some(gate) = parse_gate(&text) else {
+        eprintln!("pi-famulus: __run is started by the manager");
+        return 127;
+    };
+    // SAFETY: the daemon duplicated this handle into us for our sole use.
+    let mut status_file = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(gate.status as RawHandle) });
+    let mut report = |what: &str, alone: bool| {
         let line = format!("{what} {}\n", if alone { "alone" } else { "linger" });
-        if let Some(file) = f.as_mut() {
-            let _ = file.write_all(line.as_bytes());
-            let _ = file.flush();
-        }
+        let _ = status_file.write_all(line.as_bytes());
+        let _ = status_file.flush();
     };
 
     let me = sys::getpid();
-    let comspec = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-    let mut cmd = std::process::Command::new(&comspec);
-    cmd.arg("/C").arg(command);
+    let mut cmd = std::process::Command::new(&gate.shell.program);
+    match gate.shell.kind {
+        sys::ShellKind::Posix => {
+            cmd.arg("-c").arg(command);
+        }
+        sys::ShellKind::Cmd => {
+            let mut line = std::ffi::OsString::from("/d /s /c \"");
+            line.push(command);
+            line.push("\"");
+            cmd.raw_arg(line);
+        }
+    }
+    cmd.stdin(Stdio::null());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("pi-famulus: cannot run cmd: {e}");
-            report("exit 127", alone(me), &mut status_file);
+            eprintln!("pi-famulus: cannot run {}: {e}", gate.shell.program.display());
+            report("exit 127", alone(me));
             return 127;
         }
     };
     let st = match child.wait() {
         Ok(s) => s,
         Err(_) => {
-            report("exit 0", alone(me), &mut status_file);
+            report("exit 0", alone(me));
             return 0;
         }
     };
@@ -188,7 +225,7 @@ fn windows_main(command: &OsStr) -> i32 {
         None => "exit 0".to_string(),
     };
     let alone_now = alone(me);
-    report(&what, alone_now, &mut status_file);
+    report(&what, alone_now);
     if !alone_now {
         let mut stable = Duration::ZERO;
         while !alone(me) {
@@ -226,7 +263,11 @@ fn status_line(what: &str, alone: bool, usage: Option<Usage>) -> String {
 /// guarding (and the daemon keeps probing the group) rather than let a
 /// leftover escape both watchers.
 fn alone(me: u32) -> bool {
-    match sys::group_members(me) {
+    #[cfg(unix)]
+    let members = sys::group_members(me);
+    #[cfg(windows)]
+    let members = sys::own_job_members();
+    match members {
         Ok(pids) => pids.iter().all(|p| *p == me),
         Err(_) => false,
     }
@@ -374,5 +415,22 @@ mod tests {
         let line = status_line("signal 9", false, Some(Usage { cpu_user_us: 1, cpu_sys_us: 2, max_rss_kb: 3 }));
         let head: Vec<&str> = line.split_whitespace().take(3).collect();
         assert_eq!(head, ["signal", "9", "linger"]);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn gate_lines() {
+        let g = parse_gate("1234\nposix\nC:\\Program Files\\Git\\bin\\bash.exe\n").unwrap();
+        assert_eq!(g.status, 1234);
+        assert_eq!(g.shell.kind, sys::ShellKind::Posix);
+        assert_eq!(g.shell.program, std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        assert_eq!(parse_gate("8\ncmd\ncmd.exe").unwrap().shell.kind, sys::ShellKind::Cmd);
+        for bad in ["", "x\nposix\nbash\n", "8\nzsh\nbash\n", "8\nposix\n\n", "8\nposix\n"] {
+            assert!(parse_gate(bad).is_none(), "{bad:?}");
+        }
     }
 }
