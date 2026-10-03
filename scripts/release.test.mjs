@@ -30,11 +30,12 @@ function fixture(t, fixtureVersion = version) {
 function packAll(t, fixtureVersion = version) {
   const f = fixture(t, fixtureVersion);
   for (const p of PLATFORMS) {
-    const exeName = p.os === 'win32' ? 'pi-famulus.exe' : 'pi-famulus';
-    const binary = join(f.root, 'manager', 'target', p.target, 'release', exeName);
-    f.put(binary.slice(f.root.length + 1), `#!/bin/sh\necho pi-famulus ${fixtureVersion}+fixture\n`);
-    chmodSync(binary, 0o755);
-    prepareNative(f.root, p.id, join(f.root, 'dist'));
+    // Artifact validation needs bytes, not runnable cross-platform binaries.
+    // Stage directly instead of executing a shell script disguised as .exe.
+    f.put(`${p.directory}/${p.binary}`, `native fixture ${p.id} ${fixtureVersion}\n`);
+    chmodSync(join(f.root, p.directory, p.binary), 0o755);
+    mkdirSync(join(f.root, 'dist'), { recursive: true });
+    npmSync(['pack', '--json', '--pack-destination', join(f.root, 'dist')], { cwd: join(f.root, p.directory), stdio: 'pipe' });
   }
   npmSync(['pack', '--json', '--pack-destination', join(f.root, 'dist')], { cwd: join(f.root, 'extension'), stdio: 'pipe' });
   return f;
@@ -236,7 +237,9 @@ test('tag must be the checked-out commit and an ancestor of main (real git)', t 
   assert.throws(() => validateGitTag(root, 'v0.2.0'), /origin\/main.*missing|fetch.*origin\/main/);
 });
 
-test('prepare fails for missing/nonexecutable/wrong-version binary; real npm tarball contains binary', t => {
+// These two tests exercise Unix executable bits/inodes with real sh fixtures.
+// Windows prepareNative is exercised with the real PE binary in native CI.
+test('prepare fails for missing/nonexecutable/wrong-version binary; real npm tarball contains binary', { skip: process.platform === 'win32' }, t => {
   const { root, put } = fixture(t);
   const p = PLATFORMS[0];
   const path = `manager/target/${p.target}/release/pi-famulus`;
@@ -250,7 +253,7 @@ test('prepare fails for missing/nonexecutable/wrong-version binary; real npm tar
   assert.match(execFileSync('tar', ['-tzf', artifact], { encoding: 'utf8' }), /package\/bin\/pi-famulus/);
 });
 
-test('re-preparing a native package atomically replaces its executable inode', t => {
+test('re-preparing a native package atomically replaces its executable inode', { skip: process.platform === 'win32' }, t => {
   const { root, put } = fixture(t);
   const p = PLATFORMS[0];
   const source = `manager/target/${p.target}/release/pi-famulus`;
