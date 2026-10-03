@@ -4,7 +4,7 @@ The packages are one release set: users install the root extension and receive t
 
 ## Language
 
-**Root package**: `pi-famulus`, the pi extension and npm CLI that declares six exact-version optional dependencies.
+**Root package**: `pi-famulus`, the pi extension and npm CLI that declares five exact-version optional dependencies.
 _Avoid_: using "manager package" for the root.
 
 **Native package**: One os/cpu-specific package containing the executable built for that platform.
@@ -21,7 +21,7 @@ _Avoid_: treating workflow permissions or a dry run as proof that this remote bi
 
 ## Customer invariants
 
-1. Only Linux/macOS/Windows x64/arm64 native packages are selected, at exactly the root version.
+1. Only Linux/macOS x64/arm64 and Windows x64 native packages are selected, at exactly the root version. Windows ARM64 is excluded until its release producer exists.
 2. Installation and discovery never move runtime history or overwrite a shared-home manager.
 3. A non-executable/directory/malformed native candidate never shadows a usable configured or manual executable.
 4. Published version bytes are never overwritten or silently accepted with differing integrity.
