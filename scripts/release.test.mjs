@@ -12,6 +12,9 @@ import { bumpRelease } from './bump-release.mjs';
 
 const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
+// Git's Windows checkout may use CRLF. Workflow syntax assertions should
+// inspect the same logical text on every host, not the checkout line endings.
+const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 function fixture(t, fixtureVersion = version) {
   const root = mkdtempSync(join(tmpdir(), 'famulus-release-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -95,7 +98,7 @@ test('bump-release writes every versioned manifest including prerelease', t => {
 });
 
 test('publication guards cannot be satisfied by comments or other jobs', () => {
-  const publish = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+  const publish = workflow('publish');
   assertPublishingAuthority(publish);
   assert.throws(() => assertPublishingAuthority(publish.replace('  queue: max', '  # queue: max')), /release queue/);
   assert.throws(() => assertPublishingAuthority(publish.replace("    if: github.ref == 'refs/heads/main'", "    # if: github.ref == 'refs/heads/main'")), /validate job/);
@@ -110,7 +113,7 @@ function assertExtensionSourceInstall(ci) {
 }
 
 test('extension source install guard cannot be satisfied by other jobs', () => {
-  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const ci = workflow('ci');
   assertExtensionSourceInstall(ci);
   const missingSourceInstall = ci.replace('      - run: npm ci\n      - run: npx tsc --noEmit\n', '      - run: npx tsc --noEmit\n');
   assert.ok(missingSourceInstall.includes('- run: npm ci\n'), 'other jobs still install dependencies');
@@ -171,7 +174,7 @@ test('release checkout paths with spaces and percent signs run the actual CLI re
 test('all packed packages include the approved MIT license', t => {
   const source = fileURLToPath(new URL('../', import.meta.url));
   const license = readFileSync(join(source, 'LICENSE'), 'utf8');
-  assert.match(license, /^MIT License\n/);
+  assert.match(license, /^MIT License\r?\n/);
   const { root, put } = fixture(t);
   const destination = join(root, 'licensed-packs');
   mkdirSync(destination);
@@ -350,7 +353,7 @@ test('real npm publish dry-run validates all packed artifacts without publicatio
 });
 
 test('e2e redirects temp only on Windows so failure artifact paths match', () => {
-  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const ci = workflow('ci');
   const steps = ci.split(/(?=^      - )/m).filter(step => /^      - run: npm run test:e2e$/m.test(step));
   assert.equal(steps.length, 2, 'separate Windows and Unix e2e steps');
   const unix = steps.find(step => step.includes("if: runner.os != 'Windows'"));
@@ -362,7 +365,6 @@ test('e2e redirects temp only on Windows so failure artifact paths match', () =>
 });
 
 test('workflow literal security, release graph and host/target contracts', () => {
-  const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8');
   const native = workflow('native-packages');
   for (const p of PLATFORMS) {
     assert.ok(native.includes(`platform: ${p.id}`), p.id);
