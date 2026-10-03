@@ -534,6 +534,7 @@ pub fn max_rss_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
