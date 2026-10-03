@@ -161,7 +161,7 @@ jobs:
           $imports = & $dumpbin /dependents "manager/target/$env:TARGET/release/pi-famulus.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect release dependencies' }
           $imports | Write-Output
-          if ($imports -match '(?i)^\s*(vcruntime|msvcp|msvcr|concrt)[\w.]*\.dll\s*$') {
+          if ($imports -match '(?i)^\s*(vcruntime|msvcp|msvcr|concrt|ucrtbase|api-ms-win-crt-)[\w.-]*\.dll\s*$') {
             throw 'Release binary must statically link the VC runtime'
           }
       - name: Prepare and pack actual native and root tarballs

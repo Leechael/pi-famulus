@@ -364,6 +364,19 @@ test('e2e redirects temp only on Windows so failure artifact paths match', () =>
   assert.match(windows, /TMP: \$\{\{ runner.temp \}\}/);
 });
 
+test('Windows dependency guard rejects VC and Universal CRT imports', () => {
+  const native = workflow('native-packages');
+  const pattern = native.match(/if \(\$imports -match '([^']+)'\)/)?.[1];
+  assert.ok(pattern, 'release workflow must inspect DLL dependencies');
+  const forbidden = new RegExp(pattern.replace('(?i)', ''), 'i');
+  for (const dll of ['VCRUNTIME140.dll', 'vcruntime140_1.dll', 'MSVCP140.dll', 'MSVCR120.dll', 'CONCRT140.dll', 'ucrtbase.dll', 'api-ms-win-crt-runtime-l1-1-0.dll', 'api-ms-win-crt-stdio-l1-1-0.dll']) {
+    assert.match(`    ${dll}`, forbidden, dll);
+  }
+  for (const dll of ['KERNEL32.dll', 'ntdll.dll', 'WS2_32.dll', 'api-ms-win-core-synch-l1-2-0.dll']) {
+    assert.doesNotMatch(`    ${dll}`, forbidden, dll);
+  }
+});
+
 test('workflow literal security, release graph and host/target contracts', () => {
   const native = workflow('native-packages');
   for (const p of PLATFORMS) {
