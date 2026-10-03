@@ -46,6 +46,8 @@ export function validateMetadata(root, { tag, repository = REPOSITORY } = {}) {
   assert.deepEqual(pkg.optionalDependencies, Object.fromEntries(PLATFORMS.map(p => [p.name, version])), 'root optional native dependencies must match version exactly');
   const cargo = readFileSync(join(root, 'manager/Cargo.toml'), 'utf8').match(/\[package\]([\s\S]*?)(?=\n\[|$)/)?.[1];
   assert.equal(cargo?.match(/^version\s*=\s*"([^"]+)"/m)?.[1], version, 'Cargo version mismatch');
+  const managerClient = readFileSync(join(root, 'extension/src/manager-client.ts'), 'utf8');
+  assert.equal(managerClient.match(/^const EXTENSION_VERSION = "([^"]+)";$/m)?.[1], version, 'extension src version mismatch');
   return packages;
 }
 

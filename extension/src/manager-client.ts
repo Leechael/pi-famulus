@@ -16,7 +16,7 @@ import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
-const EXTENSION_VERSION = "0.1.1";
+const EXTENSION_VERSION = "0.1.2";
 // 3: speaks in-place upgrade (resends on reconnect, start keys).
 const PROTOCOL = 3;
 const HELLO_TIMEOUT_MS = 5000;
