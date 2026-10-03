@@ -791,15 +791,28 @@ mod win {
 
     /// Terminate only through a handle opened while this test still knew the
     /// pid belonged to its process. Returns false when nothing was tracked
-    /// (caller must fall back to command-line matching).
+    /// or termination failed (caller must fall back to command-line matching).
     pub fn kill_if_tracked(pid: u32) -> bool {
         let map = tracked().lock().unwrap();
         let Some(p) = map.get(&(super::test_scope(), pid)) else {
             return false;
         };
         // SAFETY: handle opened with PROCESS_TERMINATE in `track`.
-        unsafe { TerminateProcess(p.0, 137) };
-        true
+        unsafe { TerminateProcess(p.0, 137) != 0 }
+    }
+
+    #[test]
+    fn tracked_termination_failure_requests_fallback() {
+        let pid = std::process::id();
+        let key = (super::test_scope(), pid);
+        // Query-only access deliberately makes TerminateProcess fail; this
+        // handle cannot terminate the test process.
+        let process = Proc::open(pid, PROCESS_QUERY_LIMITED_INFORMATION).unwrap();
+        tracked().lock().unwrap().insert(key, process);
+        let killed = kill_if_tracked(pid);
+        tracked().lock().unwrap().remove(&key);
+        assert!(!killed, "failed TerminateProcess must not suppress fallback cleanup");
+        assert!(!kill_if_tracked(pid), "an untracked pid must request fallback too");
     }
 
     pub fn working_set_bytes(pid: u32) -> Option<u64> {
