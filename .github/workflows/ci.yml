@@ -189,10 +189,14 @@ jobs:
       - run: npm run test:graders
         working-directory: eval
         if: runner.os != 'Windows'
-      # Windows: keep the sandboxes on the workspace drive; upload-artifact
-      # cannot collect files from another drive.
       - run: npm run test:e2e
         working-directory: eval
+        if: runner.os != 'Windows'
+      # Windows: keep the sandboxes on the workspace drive; upload-artifact
+      # cannot collect files from another drive. Unix keeps /tmp.
+      - run: npm run test:e2e
+        working-directory: eval
+        if: runner.os == 'Windows'
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}

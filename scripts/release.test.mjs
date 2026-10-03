@@ -346,6 +346,18 @@ test('real npm publish dry-run validates all packed artifacts without publicatio
   } });
 });
 
+test('e2e redirects temp only on Windows so failure artifact paths match', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const steps = ci.split(/(?=^      - )/m).filter(step => /^      - run: npm run test:e2e$/m.test(step));
+  assert.equal(steps.length, 2, 'separate Windows and Unix e2e steps');
+  const unix = steps.find(step => step.includes("if: runner.os != 'Windows'"));
+  const windows = steps.find(step => step.includes("if: runner.os == 'Windows'"));
+  assert.ok(unix && windows);
+  assert.doesNotMatch(unix, /TEMP:|TMP:/, 'Unix must retain its ordinary temp directory');
+  assert.match(windows, /TEMP: \$\{\{ runner.temp \}\}/);
+  assert.match(windows, /TMP: \$\{\{ runner.temp \}\}/);
+});
+
 test('workflow literal security, release graph and host/target contracts', () => {
   const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8');
   const native = workflow('native-packages');
