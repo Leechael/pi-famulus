@@ -369,6 +369,10 @@ test('workflow literal security, release graph and host/target contracts', () =>
     assert.ok(native.includes(`runner: ${runner}\n`), runner);
   }
   assert.ok(native.includes('cargo test --locked\n'));
+  const windowsCrt = readFileSync(new URL('../manager/.cargo/config.toml', import.meta.url), 'utf8');
+  assert.match(windowsCrt, /\[target\.x86_64-pc-windows-msvc\]\s*rustflags = \["-C", "target-feature=\+crt-static"\]/);
+  assert.ok(native.includes('$imports = & $dumpbin /dependents "manager/target/$env:TARGET/release/pi-famulus.exe"'));
+  assert.ok(native.includes("throw 'Release binary must statically link the VC runtime'"));
   assert.ok(native.includes('cargo test --locked --features test-clock'));
   assert.ok(native.includes('resolveManagerPath(DEFAULT_CONFIG'));
   assert.ok(native.includes("packages['node_modules/@earendil-works/pi-coding-agent'].version"));
