@@ -1374,7 +1374,7 @@ impl HelperClient {
             .env("PI_FAMULUS_TEST_HELPER_CMDS", commands.join("\n"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn helper client");
         let mut rd = BufReader::new(child.stdout.take().unwrap());
@@ -1425,7 +1425,11 @@ pub fn helper_main() {
     };
     let session = std::env::var("PI_FAMULUS_TEST_HELPER_SESSION").unwrap();
     let cmds = std::env::var("PI_FAMULUS_TEST_HELPER_CMDS").unwrap_or_default();
-    let stream = Transport::connect(Path::new(&home)).expect("helper connect");
+    // Like Home::connect: the readiness probe may have just consumed the
+    // only available Windows pipe instance. Wait for the accept loop to
+    // replenish it rather than treating transient PIPE_BUSY as a crash.
+    let stream = poll_until(Duration::from_secs(3), || Transport::connect(Path::new(&home)).ok())
+        .expect("helper connect");
     let mut c = Conn::new(stream);
     let h = c.hello_ext(&session);
     assert_eq!(h["ok"], json!(true), "helper hello: {h}");
