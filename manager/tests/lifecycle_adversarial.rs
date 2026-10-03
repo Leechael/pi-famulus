@@ -1544,11 +1544,18 @@ fn t2_exit_status_mapping() {
     c.hello_ext("sess-a");
     let (ok, _) = c.start("true");
     let (bad, _) = c.start("exit 3");
+    let (termish, _) = c.start("exit 143");
+    let (killish, _) = c.start("exit 137");
     let (sig, _) = c.start("kill -KILL $$");
     let r = c.wait_terminal(&ok, S(3)).unwrap();
     assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("completed"), Some(0)));
     let r = c.wait_terminal(&bad, S(3)).unwrap();
     assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("failed"), Some(3)));
+    for (id, code) in [(&termish, 143i64), (&killish, 137)] {
+        let r = c.wait_terminal(id, S(3)).unwrap();
+        assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("failed"), Some(code)), "{r}");
+        assert!(r["signal"].is_null(), "{r}");
+    }
     let r = c.wait_terminal(&sig, S(3)).unwrap();
     assert_eq!(r["status"], "failed", "{r}");
     assert!(r["exit_code"].is_null() && r["signal"] == "SIGKILL", "{r}");

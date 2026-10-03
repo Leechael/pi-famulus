@@ -218,12 +218,11 @@ fn windows_main(command: &OsStr) -> i32 {
             return 0;
         }
     };
-    let what = match st.code() {
-        Some(c) if c == 128 + sys::SIGTERM => format!("signal {}", sys::SIGTERM),
-        Some(c) if c == 128 + sys::SIGKILL => format!("signal {}", sys::SIGKILL),
-        Some(c) => format!("exit {c}"),
-        None => "exit 0".to_string(),
-    };
+    // A waited child that exited 137 or 143 (for example `exit /b 143`)
+    // exited; it was not signaled. Manager-initiated job termination kills
+    // the runner with the job, so the daemon reports that from the runner's
+    // own wait status (`Outcome::of`) and never sees this line.
+    let what = child_exit_word(st.code());
     let alone_now = alone(me);
     report(&what, alone_now);
     if !alone_now {
@@ -339,6 +338,15 @@ pub struct Reported {
     pub usage: Option<Usage>,
 }
 
+/// Status word for a waited child. Exit codes 137 and 143 stay exit codes.
+#[cfg(any(windows, test))]
+fn child_exit_word(code: Option<i32>) -> String {
+    match code {
+        Some(c) => format!("exit {c}"),
+        None => "exit 0".to_string(),
+    }
+}
+
 pub fn parse_status(line: &str) -> Option<Reported> {
     let mut it = line.split_whitespace();
     let kind = it.next()?;
@@ -415,6 +423,14 @@ mod tests {
         let line = status_line("signal 9", false, Some(Usage { cpu_user_us: 1, cpu_sys_us: 2, max_rss_kb: 3 }));
         let head: Vec<&str> = line.split_whitespace().take(3).collect();
         assert_eq!(head, ["signal", "9", "linger"]);
+    }
+
+    #[test]
+    fn waited_child_exit_137_and_143_stay_exit_codes() {
+        for code in [0, 3, 137, 143] {
+            assert_eq!(child_exit_word(Some(code)), format!("exit {code}"));
+        }
+        assert_eq!(child_exit_word(None), "exit 0");
     }
 }
 

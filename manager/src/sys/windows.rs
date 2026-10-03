@@ -7,9 +7,8 @@
 //! dies, every assigned tree dies with it (design §3.2 / §3.4).
 
 use super::LocalTime;
-use std::collections::HashMap;
 use std::io;
-use std::os::windows::io::{OwnedHandle, RawHandle};
+use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
 use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
@@ -52,9 +51,41 @@ impl Drop for Job {
     }
 }
 
-fn jobs() -> &'static Mutex<HashMap<u32, Job>> {
-    static JOBS: OnceLock<Mutex<HashMap<u32, Job>>> = OnceLock::new();
-    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Job plus a duplicated runner handle. The handle stays open for the whole
+/// time the job is retained, so Windows cannot recycle that pid underneath
+/// the map key. `job` is dropped first (kill-on-close) while the pid is
+/// still reserved.
+struct RetainedJob {
+    job: Job,
+    /// Open for the job's lifetime so Windows cannot recycle the pid.
+    /// Not read: the handle itself is the pin.
+    #[allow(dead_code)]
+    runner: OwnedHandle,
+}
+
+fn jobs() -> &'static Mutex<crate::sys::JobTable<RetainedJob>> {
+    static JOBS: OnceLock<Mutex<crate::sys::JobTable<RetainedJob>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(crate::sys::JobTable::new()))
+}
+
+fn duplicate_runner(process: RawHandle) -> io::Result<OwnedHandle> {
+    let mut out: HANDLE = std::ptr::null_mut();
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            process as HANDLE,
+            GetCurrentProcess(),
+            &mut out,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 || out.is_null() || out == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: DuplicateHandle gave us an owned, non-inheritable handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(out as RawHandle) })
 }
 
 pub fn apply_new_session_std(cmd: &mut std::process::Command) {
@@ -99,13 +130,20 @@ pub fn getpid() -> u32 {
     std::process::id()
 }
 
-/// Assign `process` to a new kill-on-close job keyed by `pid`.
-pub fn assign_job(pid: u32, process: RawHandle) -> io::Result<()> {
+/// Assign `process` to a new kill-on-close job.
+///
+/// The returned generation is the only handle that may later drop this job.
+/// The runner's pid is not an identity: Windows reuses it once every handle
+/// to that process is closed. A duplicated handle is retained with the job
+/// so the pid cannot be recycled while the job is still in the table, and
+/// `drop_job` ignores a stale generation if it was.
+pub fn assign_job(pid: u32, process: RawHandle) -> io::Result<u64> {
+    let runner = duplicate_runner(process)?;
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() || job == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
     unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job.is_null() || job == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let ok = SetInformationJobObject(
@@ -124,21 +162,40 @@ pub fn assign_job(pid: u32, process: RawHandle) -> io::Result<()> {
             CloseHandle(job);
             return Err(e);
         }
-        jobs().lock().unwrap().insert(pid, Job(job));
-        Ok(())
+    }
+    let retained = RetainedJob { job: Job(job), runner };
+    let mut table = jobs().lock().unwrap();
+    match table.insert(pid, retained) {
+        Ok(generation) => Ok(generation),
+        Err(stale) => {
+            drop(table);
+            // Closing this new job kills only the process just assigned to
+            // it. The previously retained job stays.
+            drop(stale);
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "pid still names a retained job",
+            ))
+        }
     }
 }
 
-pub fn drop_job(pid: u32) {
-    jobs().lock().unwrap().remove(&pid);
+/// Drop the job for `generation` only. A cleanup that captured an older
+/// generation (the runner pid was recycled) does not close the new job.
+pub fn drop_job(pid: u32, generation: u64) {
+    let removed = {
+        let mut table = jobs().lock().unwrap();
+        table.remove(pid, generation)
+    };
+    drop(removed);
 }
 
 pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
     let jobs = jobs().lock().unwrap();
-    let Some(job) = jobs.get(&pgid) else {
+    let Some(retained) = jobs.get(pgid) else {
         return Ok(Vec::new());
     };
-    job_members(job.0)
+    job_members(retained.job.0)
 }
 
 /// Processes of the job this process is in (the innermost one when nested):
@@ -350,8 +407,8 @@ pub fn kill_pid(pid: u32, sig: i32) -> io::Result<()> {
 pub fn signal_group(pid: u32, sig: i32) -> io::Result<()> {
     let code = exit_code_for(sig);
     let jobs = jobs().lock().unwrap();
-    if let Some(job) = jobs.get(&pid) {
-        let _ = unsafe { TerminateJobObject(job.0, code) };
+    if let Some(retained) = jobs.get(pid) {
+        let _ = unsafe { TerminateJobObject(retained.job.0, code) };
         return Ok(());
     }
     drop(jobs);

@@ -39,25 +39,34 @@ pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
 }
 
 /// Namespaced pipe identity (no `\\.\pipe\` prefix), shared with the
-/// extension's `famulusPaths`: FNV-1a over the UTF-8 of the home spelled
-/// one way. Windows paths are case-insensitive and take either separator,
-/// so `C:/Users/Me/x/` and `c:\users\me\x` must name one pipe, or a second
+/// extension's `famulusPaths`: FNV-1a over one absolute lexical spelling of
+/// the home. Relative homes (`.famulus`), `..`, and repeated separators are
+/// resolved against the cwd first, so two processes that pass the same
+/// relative home from different directories do not share a pipe. This is
+/// lexical (`path.win32.resolve`), not a junction or symlink canonicalization.
+/// Windows paths are case-insensitive and take either separator, so
+/// `C:/Users/Me/x/` and `c:\users\me\x` must name one pipe, or a second
 /// daemon starts for the same home and cannot take its lock.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn windows_pipe_ident(home: &Path) -> String {
-    let mut s = home.to_string_lossy().replace('/', "\\");
-    while s.len() > 3 && s.ends_with('\\') {
-        s.pop();
-    }
-    let h = crate::sys::fnv1a64(s.to_lowercase().as_bytes());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let key = windows_pipe_key(home.to_string_lossy().as_ref(), cwd.to_string_lossy().as_ref());
+    let h = crate::sys::fnv1a64(key.as_bytes());
     format!("pi-famulus-{h:x}")
 }
+
+/// Absolute lexical home used as the pipe hash input. `cwd` is the directory
+/// a relative `home` is resolved against. See [`crate::winpath`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_pipe_key(home: &str, cwd: &str) -> String {
+    crate::winpath::pipe_key(home, cwd)
+}
+
 
 pub fn socket_path(home: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        let home = std::path::absolute(home).unwrap_or_else(|_| home.to_path_buf());
-        PathBuf::from(format!(r"\\.\pipe\{}", windows_pipe_ident(&home)))
+        PathBuf::from(format!(r"\\.\pipe\{}", windows_pipe_ident(home)))
     }
     #[cfg(not(windows))]
     {
@@ -445,6 +454,30 @@ mod tests {
         ] {
             assert_eq!(windows_pipe_ident(Path::new(home)), format!("pi-famulus-{hash}"), "{home}");
         }
+    }
+
+    /// Relative homes and lexical `..` / repeated separators name the same
+    /// pipe as their absolute form, and the same relative home from two
+    /// cwds does not.
+    #[test]
+    fn relative_homes_are_lexical_and_cwd_isolated() {
+        let a = windows_pipe_key(r".famulus", r"C:\work\a");
+        let b = windows_pipe_key(r".famulus", r"C:\work\b");
+        assert_eq!(a, r"c:\work\a\.famulus");
+        assert_ne!(a, b, "two cwds must not share a pipe");
+        assert_eq!(a, windows_pipe_key(r"C:\work\a\.famulus", r"D:\other"));
+        assert_eq!(
+            windows_pipe_key(r"C:\work\a\proj\..\..\..\famulus", r"C:\work\a"),
+            windows_pipe_key(r"C:\famulus", r"D:\unused")
+        );
+        assert_eq!(
+            windows_pipe_key(r"C:\work\\a\.\famulus\", r"C:\other"),
+            windows_pipe_key(r"C:\work\a\famulus", r"D:\unused")
+        );
+        assert_ne!(
+            format!("pi-famulus-{:x}", crate::sys::fnv1a64(a.as_bytes())),
+            format!("pi-famulus-{:x}", crate::sys::fnv1a64(b.as_bytes()))
+        );
     }
 
     #[test]

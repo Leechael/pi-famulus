@@ -369,6 +369,9 @@ pub struct ProcessParts {
     /// Windows: async readers — no in-place upgrade).
     pub stdout: TeeSource,
     pub stderr: TeeSource,
+    /// Windows job generation from [`crate::sys::assign_job`]. Zero on Unix,
+    /// where the process group id is not recycled out from under us.
+    pub job_generation: u64,
 }
 
 /// Spawn `<runner> __run <command>` as a session leader (setsid in
@@ -422,7 +425,7 @@ fn spawn_process_unix(command: &str, cwd: &str, env: &HashMap<String, String>) -
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stderr pipe missing"))?
         .into_owned_fd()?;
     let pid = child.id().unwrap_or(0);
-    Ok(ProcessParts { child, status, pid, stdout, stderr })
+    Ok(ProcessParts { child, status, pid, stdout, stderr, job_generation: 0 })
 }
 
 #[cfg(windows)]
@@ -462,20 +465,27 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
         .raw_handle()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "runner exited at spawn"))?;
     // The runner waits on stdin for the gate, so nothing has started yet.
-    let gate = crate::sys::assign_job(pid, process).and_then(|()| {
+    let generation = match crate::sys::assign_job(pid, process) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = child.start_kill();
+            return Err(e);
+        }
+    };
+    let gate = (|| {
         let theirs = crate::sys::hand_over(status_write, process)?;
         let shell = crate::sys::task_shell();
         let kind = match shell.kind {
             crate::sys::ShellKind::Posix => "posix",
             crate::sys::ShellKind::Cmd => "cmd",
         };
-        Ok(format!("{theirs}\n{kind}\n{}\n", shell.program.display()))
-    });
+        Ok::<_, io::Error>(format!("{theirs}\n{kind}\n{}\n", shell.program.display()))
+    })();
     let gate = match gate {
         Ok(g) => g,
         Err(e) => {
             let _ = child.start_kill();
-            crate::sys::drop_job(pid);
+            crate::sys::drop_job(pid, generation);
             return Err(e);
         }
     };
@@ -502,6 +512,7 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
         pid,
         stdout: Box::new(stdout),
         stderr: Box::new(stderr),
+        job_generation: generation,
     })
 }
 
@@ -597,7 +608,15 @@ pub fn start_tee(
 /// writer is closed once both pipes are drained rather than with the
 /// record. A parked pump keeps it: the tee resumes after the handover.
 fn pump_done(open: &AtomicUsize, output: &Mutex<OutputState>, parked: bool) {
-    if open.fetch_sub(1, Ordering::SeqCst) == 1 && !parked {
+    // A parked pump is not a closed source. Decrementing it lets a sibling
+    // that hit EOF (the last decrement, and not itself parked) drop the
+    // merged writer. After a failed upgrade the parked pipe is restarted
+    // against the same OutputState, which does not reopen that writer, so
+    // disk output would stop.
+    if parked {
+        return;
+    }
+    if open.fetch_sub(1, Ordering::SeqCst) == 1 {
         output.lock().unwrap().file = None;
     }
 }
@@ -1360,4 +1379,77 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// One pump parks and the sibling hits EOF. The parked pump is the one
+    /// a failed upgrade resumes; the merged output file must still receive
+    /// what it writes afterwards.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mixed_park_and_eof_keeps_the_output_file() {
+        let dir = unique_dir("park-eof");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_path = dir.join("t.output");
+        let (out_file, _) = open_output_files(&out_path).unwrap();
+        let output = Arc::new(Mutex::new(OutputState::new(Some(out_file), 0)));
+        let open = Arc::new(AtomicUsize::new(2));
+        let (park_tx, park_rx) = tokio::sync::watch::channel(false);
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+        });
+
+        let (mut stderr_w, stderr_r) = tokio::net::unix::pipe::pipe().unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stderr_w, b"err-before\n").await.unwrap();
+        let output_e = output.clone();
+        let open_e = open.clone();
+        let tx_e = tx.clone();
+        let stderr_pump = tokio::spawn(async move {
+            let parked = pump_unix(stderr_r, output_e.clone(), tx_e, None, park_rx).await;
+            pump_done(&open_e, &output_e, parked.is_some());
+            parked
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let on_disk = std::fs::read(&out_path).unwrap_or_default();
+            if on_disk.windows(b"err-before\n".len()).any(|w| w == b"err-before\n") {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "stderr pump did not write");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        park_tx.send(true).unwrap();
+        let parked = stderr_pump.await.unwrap();
+        assert!(parked.is_some(), "stderr pump should park with the write end still open");
+        assert!(output.lock().unwrap().file.is_some());
+
+        // Sibling reaches EOF after the park. Park is cleared so this pump
+        // observes EOF instead of parking too; it is the last close.
+        let stdout_park = park_tx.subscribe();
+        park_tx.send(false).unwrap();
+        let (mut stdout_w, stdout_r) = tokio::net::unix::pipe::pipe().unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut stdout_w, b"out-before\n").await.unwrap();
+        drop(stdout_w);
+        let parked_out = pump_unix(stdout_r, output.clone(), tx.clone(), None, stdout_park).await;
+        assert!(parked_out.is_none(), "stdout should hit EOF");
+        pump_done(&open, &output, false);
+        assert!(
+            output.lock().unwrap().file.is_some(),
+            "a parked sibling must keep the merged writer"
+        );
+
+        // Resume the parked pipe (what start_task_io does after a failed
+        // upgrade) and write more. The writer was not reopened.
+        tokio::io::AsyncWriteExt::write_all(&mut stderr_w, b"err-after\n").await.unwrap();
+        drop(stderr_w);
+        let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(parked.unwrap()).unwrap();
+        let parked_again = pump_unix(reader, output.clone(), tx, None, park_tx.subscribe()).await;
+        assert!(parked_again.is_none());
+        drop(output);
+        let text = String::from_utf8(std::fs::read(&out_path).unwrap()).unwrap();
+        assert!(text.contains("err-before\n"), "{text:?}");
+        assert!(text.contains("out-before\n"), "{text:?}");
+        assert!(text.contains("err-after\n"), "{text:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }

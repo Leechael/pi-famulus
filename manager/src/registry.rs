@@ -98,6 +98,10 @@ pub struct TaskEntry {
     /// still ours to kill on stop/shutdown (§3.2: background work must not
     /// outlive the manager); the runner's exit clears the flag.
     pub group_lingering: bool,
+    /// Generation of the Windows job for `record.pid`. Cleanup must pass
+    /// this back; a recycled pid alone is not the job's identity. Zero on
+    /// Unix and for records that never owned a job.
+    pub job_generation: u64,
 }
 
 impl TaskEntry {
@@ -157,6 +161,7 @@ impl TaskEntry {
             delivered_cursor: 0,
             watch_sessions: Vec::new(),
             group_lingering: false,
+            job_generation: 0,
         }
     }
 
@@ -175,6 +180,7 @@ impl TaskEntry {
         e.stderr_fd = Some(parts.stderr);
         e.timeout_deadline_ms = timeout_ms.map(|ms| e.record.started_at + ms);
         e.exit_phase = ExitPhase::AwaitReport;
+        e.job_generation = parts.job_generation;
         e
     }
 

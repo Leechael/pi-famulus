@@ -19,8 +19,7 @@
     "pi-famulus-linux-arm64": "0.1.2",
     "pi-famulus-darwin-x64": "0.1.2",
     "pi-famulus-darwin-arm64": "0.1.2",
-    "pi-famulus-win32-x64": "0.1.2",
-    "pi-famulus-win32-arm64": "0.1.2"
+    "pi-famulus-win32-x64": "0.1.2"
   },
   "pi": {
     "extensions": ["./src/index.ts"]

@@ -9,6 +9,8 @@ import {
   getFamulusHome,
   famulusPaths,
   resolveManagerPath,
+  windowsHomeKey,
+  windowsPipeName,
 } from "../../src/config";
 
 // Windows has no execute bit: X_OK only checks existence there.
@@ -59,6 +61,18 @@ describe("Famulus home and binary lookup", () => {
     ["D:/famulus\\\\", "44a0c6fb5c0148ee"],
   ])("names the Windows pipe of %s like the manager does", (home, hash) => {
     expect(famulusPaths(home, "win32").socket).toBe(`\\\\.\\pipe\\pi-famulus-${hash}`);
+  });
+
+  it("resolves relative homes lexically and isolates cwds", () => {
+    const a = windowsHomeKey(".famulus", "C:\\work\\a");
+    const b = windowsHomeKey(".famulus", "C:\\work\\b");
+    expect(a).toBe("c:\\work\\a\\.famulus");
+    expect(b).not.toBe(a);
+    expect(a).toBe(windowsHomeKey("C:\\work\\a\\.famulus", "D:\\other"));
+    expect(windowsHomeKey("C:\\work\\a\\proj\\..\\..\\..\\famulus", "C:\\work\\a")).toBe("c:\\famulus");
+    expect(windowsHomeKey("C:\\work\\\\a\\.\\famulus\\", "C:\\other")).toBe("c:\\work\\a\\famulus");
+    expect(windowsPipeName(".famulus", "C:\\work\\a")).not.toBe(windowsPipeName(".famulus", "C:\\work\\b"));
+    expect(windowsPipeName(".famulus", "C:\\work\\a")).toBe(windowsPipeName("C:\\work\\a\\.famulus", "D:\\other"));
   });
 
   it("looks up pi-famulus in config, env, home/bin, then executable PATH order", () => {

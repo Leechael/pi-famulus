@@ -74,6 +74,82 @@ fn parse_basic_process_id_list(buf: &[u8]) -> Result<Vec<u32>, usize> {
     Ok(pids)
 }
 
+/// A retained process-control object keyed by pid, but not *identified* by
+/// pid. Windows recycles a pid as soon as the last handle to that process
+/// closes, so a long-lived job must not be replaced or removed just because
+/// a new process was given the same number.
+///
+/// `insert` refuses to drop an existing slot. `remove` drops a slot only
+/// when `generation` is the one `insert` returned for it.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(crate) struct JobTable<T> {
+    next: u64,
+    slots: std::collections::HashMap<u32, JobSlot<T>>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(crate) struct JobSlot<T> {
+    pub generation: u64,
+    pub value: T,
+}
+
+#[cfg(any(windows, test))]
+impl<T> JobTable<T> {
+    pub(crate) fn new() -> Self {
+        Self { next: 1, slots: std::collections::HashMap::new() }
+    }
+
+    /// Returns the generation that [`remove`](Self::remove) must pass.
+    /// `Err(value)` if `pid` still names a retained slot: replacing it would
+    /// drop that slot.
+    pub(crate) fn insert(&mut self, pid: u32, value: T) -> Result<u64, T> {
+        if self.slots.contains_key(&pid) {
+            return Err(value);
+        }
+        let generation = self.next;
+        self.next = self.next.wrapping_add(1).max(1);
+        self.slots.insert(pid, JobSlot { generation, value });
+        Ok(generation)
+    }
+
+    pub(crate) fn get(&self, pid: u32) -> Option<&T> {
+        self.slots.get(&pid).map(|s| &s.value)
+    }
+
+    pub(crate) fn remove(&mut self, pid: u32, generation: u64) -> Option<T> {
+        match self.slots.get(&pid) {
+            Some(s) if s.generation == generation => self.slots.remove(&pid).map(|s| s.value),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_table_tests {
+    use super::JobTable;
+
+    #[test]
+    fn pid_reuse_does_not_drop_or_clean_up_the_wrong_generation() {
+        let mut jobs = JobTable::new();
+        let g1 = jobs.insert(7, "job-old").unwrap();
+        // A recycled pid must not replace the retained job.
+        assert_eq!(jobs.insert(7, "job-new").unwrap_err(), "job-new");
+        assert_eq!(jobs.get(7).copied(), Some("job-old"));
+        // Stale cleanup from the previous generation is a no-op.
+        assert!(jobs.remove(7, g1.wrapping_add(9)).is_none());
+        assert_eq!(jobs.get(7).copied(), Some("job-old"));
+        assert_eq!(jobs.remove(7, g1).unwrap(), "job-old");
+        let g2 = jobs.insert(7, "job-new").unwrap();
+        assert_ne!(g1, g2);
+        // The old watcher's drop runs after the pid was reused.
+        assert!(jobs.remove(7, g1).is_none());
+        assert_eq!(jobs.get(7).copied(), Some("job-new"));
+        assert_eq!(jobs.remove(7, g2).unwrap(), "job-new");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_basic_process_id_list;

@@ -346,8 +346,7 @@ test('real npm publish dry-run validates all packed artifacts without publicatio
 test('workflow literal security, release graph and host/target contracts', () => {
   const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8');
   const native = workflow('native-packages');
-  // win32-arm64 is packaged for release metadata but not yet on a CI runner.
-  for (const p of PLATFORMS.filter(p => p.id !== 'win32-arm64')) {
+  for (const p of PLATFORMS) {
     assert.ok(native.includes(`platform: ${p.id}`), p.id);
     assert.ok(native.includes(`target: ${p.target}`), p.target);
   }

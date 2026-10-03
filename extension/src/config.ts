@@ -152,14 +152,21 @@ export function fnv1a64(input: string): string {
 }
 
 /**
- * Named-pipe identity of a home — must match manager `lifecycle::socket_path`:
- * one spelling per directory (absolute, `\` separators, no trailing
- * separator, lower case), since Windows paths are case-insensitive.
+ * Named-pipe identity of a home — must match manager `lifecycle::windows_pipe_ident`.
+ * The home is made absolute lexically (`path.win32.resolve` against `cwd`):
+ * `.` / `..` and repeated separators collapse, symlinks and junctions are
+ * not expanded. One spelling per directory (backslashes, no trailing
+ * separator except a drive root, lower case). The same relative home from
+ * two working directories must not share a pipe.
  */
-export function windowsPipeName(home: string): string {
-  let s = win32.resolve(home).replaceAll("/", "\\");
+export function windowsHomeKey(home: string, cwd: string = process.cwd()): string {
+  let s = win32.resolve(cwd, home);
   while (s.length > 3 && s.endsWith("\\")) s = s.slice(0, -1);
-  return `\\\\.\\pipe\\pi-famulus-${fnv1a64(s.toLowerCase())}`;
+  return s.toLowerCase();
+}
+
+export function windowsPipeName(home: string, cwd: string = process.cwd()): string {
+  return `\\\\.\\pipe\\pi-famulus-${fnv1a64(windowsHomeKey(home, cwd))}`;
 }
 
 /** Well-known paths inside the pi-famulus home directory (design doc §3.1). */

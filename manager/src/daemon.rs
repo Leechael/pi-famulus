@@ -471,6 +471,27 @@ fn reap_disconnected_agent_permits(st: &mut DaemonState) {
     });
 }
 
+/// Ctrl-C, or an injected stand-in. Pin the returned future once, outside
+/// the accept loop. A registration error completes the inner future with
+/// `Err`; polling that future again panics, so the `Err` is turned into a
+/// pending wait here and that wait must survive later iterations.
+#[cfg(any(windows, test))]
+fn ctrl_c_or_pending(
+    home: &std::path::Path,
+    ctrl_c: impl std::future::Future<Output = std::io::Result<()>>,
+) -> impl std::future::Future<Output = ()> {
+    let home = home.to_path_buf();
+    async move {
+        match ctrl_c.await {
+            Ok(()) => {}
+            Err(e) => {
+                lifecycle::log_line(&home, &format!("Ctrl-C listener error: {e}"));
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 /// The accept loop, shared by a fresh daemon and one restored after an
 /// in-place upgrade. Also runs the upgrade itself when asked.
 async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
@@ -498,7 +519,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
     #[cfg(unix)]
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
     #[cfg(windows)]
-    let ctrl_c = tokio::signal::ctrl_c();
+    let ctrl_c = ctrl_c_or_pending(&home, tokio::signal::ctrl_c());
     #[cfg(windows)]
     tokio::pin!(ctrl_c);
 
@@ -552,15 +573,10 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
                 #[cfg(windows)]
                 {
-                    // Only Ok(()) is a real Ctrl-C. An Err (listener registration
-                    // failure) must not enter the shutdown branch.
-                    match ctrl_c.as_mut().await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            lifecycle::log_line(&home, &format!("Ctrl-C listener error: {e}"));
-                            std::future::pending::<()>().await;
-                        }
-                    }
+                    // The adapter is pinned outside the loop. A fresh wrapper
+                    // here would poll the already-completed signal future
+                    // after a registration error and panic the daemon.
+                    (&mut ctrl_c).await;
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, if cfg!(windows) { "received Ctrl-C" } else { "received SIGTERM" });
@@ -1803,6 +1819,8 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
+        #[cfg(windows)]
+        crate::sys::drop_job(pid, parts.job_generation);
         return Err(ProtoError::new(E_INTERNAL, format!("persist failed: {e}")));
     }
 
@@ -2113,9 +2131,10 @@ fn arm_kill_reaper(
 }
 
 /// Track a process group whose leader exited while members remain, until the
-/// group empties. Polling keeps the pgid ours: POSIX does not reuse a pid
-/// while a group with that id exists.
-pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
+/// group empties. On POSIX the pid is not reused while that group exists.
+/// On Windows `job_generation` is the job assigned for this pid; a later
+/// task may reuse the pid, and a stale watcher must not drop that job.
+pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32, job_generation: u64) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     let clock = state.lock().unwrap().clock.clone();
@@ -2129,7 +2148,9 @@ pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
                 e.group_lingering = false;
             }
             #[cfg(windows)]
-            crate::sys::drop_job(pgid);
+            crate::sys::drop_job(pgid, job_generation);
+            #[cfg(not(windows))]
+            let _ = job_generation;
             break;
         }
     });
@@ -3238,7 +3259,7 @@ async fn run_exit_watch(state: Shared, tid: String) {
         e.group_lingering = false;
         e.exit_phase = registry::ExitPhase::Done;
         #[cfg(windows)]
-        crate::sys::drop_job(e.record.pid);
+        crate::sys::drop_job(e.record.pid, e.job_generation);
     }
 }
 
@@ -3300,7 +3321,7 @@ fn usage_ms(us: u64) -> u64 {
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Leftover) {
-    let mut lingering = None;
+    let mut lingering: Option<(u32, u64)> = None;
     let (sid, event) = {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
@@ -3309,6 +3330,8 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         };
         #[cfg(windows)]
         let job_pid = entry.record.pid;
+        #[cfg(windows)]
+        let job_generation = entry.job_generation;
         if entry.record.status.is_terminal() {
             return; // already finalized (e.g. shutdown force-pass)
         }
@@ -3351,16 +3374,16 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         match leftover {
             Leftover::None => {
                 #[cfg(windows)]
-                crate::sys::drop_job(job_pid);
+                crate::sys::drop_job(job_pid, job_generation);
             }
             Leftover::Guarded => entry.group_lingering = true,
             Leftover::Probe => {
                 if crate::sys::group_has_others(pgid) {
                     entry.group_lingering = true;
-                    lingering = Some(pgid);
+                    lingering = Some((pgid, entry.job_generation));
                 } else {
                     #[cfg(windows)]
-                    crate::sys::drop_job(job_pid);
+                    crate::sys::drop_job(job_pid, job_generation);
                 }
             }
         }
@@ -3382,8 +3405,8 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         let _ = entry.status_tx.send(entry.record.status);
         (sid, event)
     };
-    if let Some(pgid) = lingering {
-        spawn_group_watcher(state, task_id, pgid);
+    if let Some((pgid, generation)) = lingering {
+        spawn_group_watcher(state, task_id, pgid, generation);
     }
     send_event_to_session(state, &sid, event);
 }
@@ -4013,5 +4036,51 @@ mod tests {
         );
         assert_eq!(outcome.code, None);
         assert_eq!(outcome.signal, Some(task::SIGTERM));
+    }
+
+    /// A Ctrl-C registration error must not complete the shutdown branch, and
+    /// the next accepted connection must not poll that future again.
+    #[tokio::test]
+    async fn ctrl_c_registration_error_survives_the_next_connection() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct OnceErr {
+            polled: bool,
+        }
+        impl Future for OnceErr {
+            type Output = std::io::Result<()>;
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                assert!(!self.polled, "ctrl-c future polled after it completed");
+                self.polled = true;
+                Poll::Ready(Err(std::io::Error::other("ctrl-c handler already registered")))
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!("pi-famulus-ctrlc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        let ctrl = super::ctrl_c_or_pending(&home, OnceErr { polled: false });
+        tokio::pin!(ctrl);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<&'static str>(2);
+        tx.try_send("conn").unwrap();
+        let mut accepted = 0u32;
+        for _ in 0..4 {
+            tokio::select! {
+                biased;
+                _ = &mut ctrl => panic!("registration failure must not shut the daemon down"),
+                msg = rx.recv() => {
+                    assert_eq!(msg, Some("conn"));
+                    accepted += 1;
+                    if accepted == 1 {
+                        tx.try_send("conn").unwrap();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(accepted, 2);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

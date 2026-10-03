@@ -247,12 +247,20 @@ fn t1_exit_codes_output_and_events() {
     let mut c = ext(&home, "sess-a");
     let (ok, _) = c.start(&kit(&["echo", "hello", "world"]));
     let (bad, _) = c.start(&format!("{} && {}", kit(&["echo", "before"]), kit(&["exit", "3"])));
+    // 137 and 143 are real exit codes (`exit /b 143`), not SIGKILL/SIGTERM.
+    let (termish, _) = c.start(&kit(&["exit", "143"]));
+    let (killish, _) = c.start(&kit(&["exit", "137"]));
     let r = c.wait_terminal(&ok, S(10)).unwrap();
     assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("completed"), Some(0)), "{r}");
     assert_eq!(lf(&output_of(&mut c, &ok)), "hello world\n");
     let r = c.wait_terminal(&bad, S(10)).unwrap();
     assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("failed"), Some(3)), "{r}");
     assert!(r["signal"].is_null(), "{r}");
+    for (id, code) in [(&termish, 143i64), (&killish, 137)] {
+        let r = c.wait_terminal(id, S(10)).unwrap();
+        assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("failed"), Some(code)), "{r}");
+        assert!(r["signal"].is_null(), "{r}");
+    }
     assert_eq!(lf(&output_of(&mut c, &bad)), "before\n");
     let w = c.request_ok(json!({"type":"wait","task_id":bad,"budget_ms":100}));
     assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(3)));

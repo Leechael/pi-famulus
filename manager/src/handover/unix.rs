@@ -539,7 +539,7 @@ pub fn live_ids(r: &Restored) -> HashSet<String> {
 /// Re-arm what the old image had pending for a restored task: the rest of a
 /// stop's kill grace, and the poll of a leftover group no runner guards.
 pub fn rearm_timers(state: &Shared, id: &str) {
-    let (grace, lingering_unguarded, pid) = {
+    let (grace, lingering_unguarded, pid, job_generation) = {
         let st = state.lock().unwrap();
         let now = st.clock.now_ms();
         let Some(e) = st.registry.tasks.get(id) else { return };
@@ -547,12 +547,13 @@ pub fn rearm_timers(state: &Shared, id: &str) {
             e.kill_grace_until_ms.map(|d| d.saturating_sub(now)),
             e.group_lingering && e.exit_phase == ExitPhase::Done,
             e.record.pid,
+            e.job_generation,
         )
     };
     if let Some(left) = grace {
         daemon::rearm_kill_reaper(state, id, pid, Duration::from_millis(left));
     }
     if lingering_unguarded {
-        daemon::spawn_group_watcher(state, id, pid);
+        daemon::spawn_group_watcher(state, id, pid, job_generation);
     }
 }

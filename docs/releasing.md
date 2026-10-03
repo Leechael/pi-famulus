@@ -11,12 +11,11 @@ The main extension and native manager packages form one versioned release. The p
 | `pi-famulus-darwin-x64` | `x86_64-apple-darwin` | `macos-15-intel` |
 | `pi-famulus-darwin-arm64` | `aarch64-apple-darwin` | `macos-15` |
 | `pi-famulus-win32-x64` | `x86_64-pc-windows-msvc` | `windows-latest` |
-| `pi-famulus-win32-arm64` | `aarch64-pc-windows-msvc` | (packaged; CI build optional) |
 | `pi-famulus` | TypeScript extension + JS CLI/resolver | `ubuntu-24.04` |
 
-Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Windows builds use the MSVC toolchain. Node/pi's runtime requirements still apply. In-place upgrade (`exec` handover) remains Unix-only; on Windows, replace the binary and restart the manager.
+Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Windows x64 builds use the MSVC toolchain with the CRT linked statically (`manager/.cargo/config.toml`, `target.x86_64-pc-windows-msvc` `+crt-static`). The package job sets `RUSTFLAGS` only on Linux, so that cargo config is what the Windows release binary is linked with. Node/pi's runtime requirements still apply. In-place upgrade (`exec` handover) remains Unix-only; on Windows, replace the binary and restart the manager.
 
-CI builds the Unix targets on native-architecture hosts and `win32-x64` on `windows-latest`, runs the ordinary and (Unix) manual-clock Rust suites, and verifies actual root/native npm tarball installation on Unix hosts and Windows x64. `win32-arm64` is packaged in release metadata but built outside the GitHub-hosted matrix for now. Installation smoke tests explicitly select the pi version pinned in the extension lockfile rather than an unbounded latest peer. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
+CI builds the Unix targets on native-architecture hosts and `win32-x64` on `windows-latest`, runs the ordinary and (Unix) manual-clock Rust suites, and verifies actual root/native npm tarball installation on Unix hosts and Windows x64. Windows ARM64 is not part of the required release set until a CI producer exists. Installation smoke tests explicitly select the pi version pinned in the extension lockfile rather than an unbounded latest peer. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
 
 ## Exact release metadata
 
@@ -73,7 +72,7 @@ Repository configuration does not create npm packages or their trusted-publisher
 for package in \
   pi-famulus-linux-x64 pi-famulus-linux-arm64 \
   pi-famulus-darwin-x64 pi-famulus-darwin-arm64 \
-  pi-famulus-win32-x64 pi-famulus-win32-arm64 \
+  pi-famulus-win32-x64 \
   pi-famulus
 do
   npm trust github "$package" --file publish.yml \
