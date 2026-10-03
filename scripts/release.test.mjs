@@ -270,12 +270,14 @@ test('dry run uses all real packed candidates, natives first/root last, and neve
   const calls = [];
   await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', repository, dryRun: true, fetchImpl: () => { throw Error('network forbidden'); }, run: (...args) => calls.push(args) });
   assert.equal(calls.length, PLATFORMS.length + 1);
-  assert.match(calls.at(-1)[1][1], /pi-famulus-0.1.0.tgz$/);
-  for (const [, args] of calls) {
+  const lastArgs = calls.at(-1)[1];
+  assert.match(lastArgs[lastArgs.indexOf('publish') + 1], /pi-famulus-0.1.0.tgz$/);
+  for (const [, args, options] of calls) {
     assert.ok(args.includes('--dry-run'));
     assert.ok(args.includes('--provenance'));
     assert.ok(args.includes('--access'));
     assert.equal(args[args.indexOf('--tag') + 1], 'latest');
+    assert.equal(options.shell, false);
   }
 });
 
@@ -302,7 +304,8 @@ test('partial retry skips only byte-identical integrity; mismatch/network errors
   const fetchImpl = async url => url.endsWith('/0.1.0') ? (url.includes('linux-x64') ? response(200, { dist: { integrity: `sha512-${integrity}` } }) : response(404, {})) : response(200, {});
   await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl, run: (...args) => calls.push(args) });
   assert.equal(calls.length, PLATFORMS.length);
-  assert.match(calls.at(-1)[1][1], /pi-famulus-0.1.0.tgz$/);
+  const lastArgs = calls.at(-1)[1];
+  assert.match(lastArgs[lastArgs.indexOf('publish') + 1], /pi-famulus-0.1.0.tgz$/);
   await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl: async () => response(200, { dist: { integrity: 'sha512-other' } }), run: () => assert.fail('publish') }), /integrity/);
   await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl: async () => response(503, {}), run: () => assert.fail('publish') }), /503/);
 });

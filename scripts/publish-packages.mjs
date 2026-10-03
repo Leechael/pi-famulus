@@ -51,13 +51,9 @@ export async function publishPackages(root, directory, { tag, dryRun = true, rep
   for (const p of pending) {
     const distTag = distTagForVersion(p.metadata.version);
     console.log(`${dryRun ? 'Dry run' : 'Publish'}: ${p.name}@${p.metadata.version} --tag ${distTag}`);
-    // Prefer npmSync (node + npm-cli.js on Windows) so .cmd is never shell-parsed.
-    // `run` stays injectable for tests that capture the argv vector.
-    if (run === execFileSync) {
-      npmSync(['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit' });
-    } else {
-      run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit', shell: process.platform === 'win32' });
-    }
+    // Tests inject only the execution boundary, not a different npm launch path.
+    const args = ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])];
+    npmSync(args, { cwd: root, stdio: 'inherit' }, run);
   }
   if (dryRun) console.log('Dry run validates packaging only; it does NOT prove OIDC authentication or trusted-publisher bindings.');
 }

@@ -5,9 +5,6 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PLATFORMS, validateMetadata } from './validate-release.mjs';
 
-/** `execFileSync('npm')` is ENOENT on Windows; the shim is `npm.cmd`. */
-export const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-
 /**
  * Invoke npm without a shell. On Windows, `.cmd` shims need `shell:true`, which
  * reopens argument-injection risk; prefer `node path/to/npm-cli.js` instead.
@@ -17,7 +14,10 @@ function resolveNpm() {
     return { command: 'npm', prefix: [] };
   }
   const candidates = [];
-  if (process.env.npm_execpath) candidates.push(process.env.npm_execpath);
+  // npm 9's npx can export npx-cli.js here; it is not an npm launcher.
+  if (process.env.npm_execpath && /(?:^|[\\/])npm-cli\.js$/i.test(process.env.npm_execpath)) {
+    candidates.push(process.env.npm_execpath);
+  }
   for (const dir of (process.env.PATH || '').split(delimiter)) {
     if (!dir) continue;
     candidates.push(join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js'));
@@ -32,9 +32,9 @@ function resolveNpm() {
   throw new Error('cannot locate npm-cli.js; set npm_execpath or put npm on PATH');
 }
 
-export function npmSync(args, options = {}) {
+export function npmSync(args, options = {}, run = execFileSync) {
   const { command, prefix } = resolveNpm();
-  return execFileSync(command, [...prefix, ...args], {
+  return run(command, [...prefix, ...args], {
     ...options,
     shell: false,
   });
