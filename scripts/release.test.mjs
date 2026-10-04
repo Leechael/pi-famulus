@@ -18,6 +18,7 @@ function fixture(t, fixtureVersion = version) {
   const repo = directory => ({ type: 'git', url: `https://github.com/${repository}`, directory });
   put('extension/package.json', { name: 'pi-famulus', version: fixtureVersion, type: 'module', repository: repo('extension'), files: ['src', 'bin', 'README.md'], bin: { 'pi-famulus': './bin/pi-famulus.js' }, optionalDependencies: Object.fromEntries(PLATFORMS.map(p => [p.name, fixtureVersion])) });
   put('extension/src/config.ts', 'export const config = true;');
+  put('extension/src/manager-client.ts', `const EXTENSION_VERSION = "${fixtureVersion}";\n`);
   put('extension/src/native-manager.js', 'export const native = true;');
   put('extension/bin/pi-famulus.js', '#!/usr/bin/env node\nconsole.log("pi-famulus");');
   put('extension/README.md', 'Test package');
