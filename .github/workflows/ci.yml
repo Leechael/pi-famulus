@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger from any branch, mirroring the roamresearch-cli pattern:
+  # pick a ref (branch, tag, or SHA) and run the full CI suite against it.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build and test (empty uses the selected branch)
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
