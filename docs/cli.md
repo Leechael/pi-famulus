@@ -2,7 +2,7 @@
 
 Standalone operations manual for the `pi-famulus` binary.
 
-The pi extension talks to the daemon over a socket. These subcommands are the human and scripting surface for inspection, debugging, and smoke tests. Human-readable tables are **not** a wire contract; use `--json` (on `status`, `sessions`, `ls`, `show`, `events`) for scripts.
+The pi extension talks to the daemon over a socket. These subcommands are the human and scripting surface for inspection, debugging, and smoke tests. Human-readable tables are **not** a wire contract; use `--json` (on `status`, `sessions`, `ls`, `show`, `stats`, `events`) for scripts.
 
 From the CLI alone you can answer: what is each session doing and where (cwd), what is running or just finished, why did it end, what did this subagent do, why didn't a notification arrive, and is the system healthy.
 
@@ -182,7 +182,7 @@ TOTAL                                    46  1h13m  3h45m    3.0           1    
 - **WALL** sums the tasks' durations (a running task's so far). **CPU** sums user + system CPU of the measured tasks only, and **CORES** divides it by the wall time of those same tasks. **UNMEASURED** counts tasks without a CPU measurement (still running, SIGKILLed with their runner by `--timeout-ms` or after a stop's grace, or recorded by an older manager); `-` means no task in the row was measured. See `ls` for what CPU covers.
 - **KILLED** / **KILLED-WALL**: tasks that ended `killed` and the wall time they ran before that.
 
-Every retained task record counts, including finished work of gone sessions (`ls` leaves those out); rows are sorted by CPU, then wall time, with a `TOTAL` row last. Filters as in `ls`: `--session PREFIX`, `--cwd DIR`, `--since DUR` (tasks running at some point within it). `--json` prints the groups with raw milliseconds (`wall_ms`, `cpu_user_ms`, `cpu_sys_ms`, `cpu_ms`, `measured`, `measured_wall_ms`, `killed`, `killed_wall_ms`, and `avg_cores` when anything was measured). Never starts the daemon.
+Every retained task record counts, including finished work of gone sessions (`ls` leaves those out); rows are sorted by CPU, then wall time, with a `TOTAL` row last. Filters as in `ls`: `--session PREFIX`, `--cwd DIR`, `--since DUR` (tasks running at some point within it). `--json` prints the groups with raw milliseconds (`wall_ms`, `cpu_user_ms`, `cpu_sys_ms`, `cpu_ms`, `measured`, `measured_wall_ms`, `killed`, `killed_wall_ms`, and `avg_cores` when measured wall time is nonzero). Never starts the daemon.
 
 ### `agent`
 
