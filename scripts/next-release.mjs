@@ -10,8 +10,6 @@ export const REGISTRY = 'https://registry.npmjs.org';
 export const ROOT_PACKAGE = 'pi-famulus';
 
 const STABLE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
-const BETA = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-beta\.(0|[1-9]\d*)$/;
-const NIGHTLY = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-nightly\.(\d{8})(?:\.(0|[1-9]\d*))?$/;
 
 export function distTagForVersion(version) {
   if (version.includes('-beta.')) return 'beta';
