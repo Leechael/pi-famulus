@@ -149,6 +149,22 @@ export function formatFamulusWake(details: FamulusWake, leadIn: string = FAMULUS
   return { customType: FAMULUS_WAKE_CUSTOM_TYPE, content, details };
 }
 
+/** Task/child/monitor ids a wake is about (event log `ids`). */
+export function wakeIds(details: { kind?: string }): string[] {
+  const d = details as {
+    kind?: string;
+    id?: string;
+    taskId?: string;
+    tasks?: { id: string }[];
+    children?: { childId: string }[];
+    childId?: string;
+    from?: string;
+  };
+  if (d.kind === "task") return (d.tasks ?? []).map((task) => task.id);
+  if (d.kind === "subagent-done") return (d.children ?? []).map((child) => child.childId);
+  return [d.id ?? d.taskId ?? d.childId ?? d.from].filter((id): id is string => Boolean(id));
+}
+
 /** UTC, second precision: the model needs how old a snapshot is, not milliseconds. */
 export function wakeTimestamp(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");

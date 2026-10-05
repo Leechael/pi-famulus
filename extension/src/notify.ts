@@ -14,7 +14,7 @@
  *   ever delivered once.
  */
 import { formatMonitorEvent, formatTaskNotification, type TaskExitInfo } from "./format";
-import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, type WakeItem } from "./wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, wakeIds, type WakeItem } from "./wake";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 
@@ -208,13 +208,9 @@ export class NotifyCenter {
     // Wakes built here (task batches, monitor events) are stamped now.
     message = stampWakeAsOf(message, this.clock.now());
     const msg = { ...message, display: true };
-    const details = message.details as { kind?: string; id?: string; taskId?: string; tasks?: { id: string }[]; children?: { childId: string }[]; childId?: string; from?: string; eventCount?: number } | undefined;
+    const details = message.details as { kind?: string; eventCount?: number } | undefined;
     if (details?.kind) {
-      const ids = details.kind === "task"
-        ? (details.tasks ?? []).map((task) => task.id)
-        : details.kind === "subagent-done"
-          ? (details.children ?? []).map((child) => child.childId)
-          : [details.id ?? details.taskId ?? details.childId ?? details.from].filter((id): id is string => Boolean(id));
+      const ids = wakeIds(details);
       this.deps.logEvent?.("wake.emit", {
         kind: details.kind,
         ids,
