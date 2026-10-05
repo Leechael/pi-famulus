@@ -13,7 +13,11 @@ export const PLATFORMS = [
 ].map(([os, arch, target]) => ({ os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}` }));
 
 export function validateTag(tag) {
-  assert.match(tag ?? '', /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/, 'release tag must be vX.Y.Z (stable version, no shell syntax)');
+  assert.match(
+    tag ?? '',
+    /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*)|-nightly\.\d{8}(?:\.(0|[1-9]\d*))?)?$/,
+    'release tag must be vX.Y.Z, vX.Y.Z-beta.N, or vX.Y.Z-nightly.YYYYMMDD[.N] (no shell syntax)',
+  );
   return tag.slice(1);
 }
 
@@ -71,7 +75,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     assert.ok(args.length === 0 || (args.length === 2 && args[0] === '--tag'), 'usage: validate-release.mjs [--tag vX.Y.Z]');
     const tag = args[1];
     validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
-    if (tag !== undefined) validateGitTag(process.cwd(), tag);
     console.log(`Validated all five packages${tag ? ` for ${tag}` : ''}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

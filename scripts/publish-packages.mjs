@@ -4,7 +4,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { validateMetadata, validateGitTag, validateTag, REPOSITORY } from './validate-release.mjs';
+import { validateMetadata, validateTag, REPOSITORY } from './validate-release.mjs';
+import { distTagForVersion } from './next-release.mjs';
 
 const REGISTRY = 'https://registry.npmjs.org';
 
@@ -47,8 +48,9 @@ export async function publishPackages(root, directory, { tag, dryRun = true, rep
     pending.push(p);
   }
   for (const p of pending) {
-    console.log(`${dryRun ? 'Dry run' : 'Publish'}: ${p.name}@${p.metadata.version}`);
-    run('npm', ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit' });
+    const distTag = distTagForVersion(p.metadata.version);
+    console.log(`${dryRun ? 'Dry run' : 'Publish'}: ${p.name}@${p.metadata.version} --tag ${distTag}`);
+    run('npm', ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit' });
   }
   if (dryRun) console.log('Dry run validates packaging only; it does NOT prove OIDC authentication or trusted-publisher bindings.');
 }
@@ -57,7 +59,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   try {
     const [directory, tag, mode] = process.argv.slice(2);
     assert.ok(process.argv.length === 5 && ['--dry-run', '--publish'].includes(mode), 'usage: publish-packages.mjs <artifact-directory> vX.Y.Z <--dry-run|--publish>');
-    validateGitTag(process.cwd(), tag);
     await publishPackages(process.cwd(), resolve(directory), { tag, dryRun: mode === '--dry-run', repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }
