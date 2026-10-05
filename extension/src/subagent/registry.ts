@@ -47,6 +47,8 @@ export interface RunRecord {
     result?: ChildResult;
     startedAt: number;
     endedAt?: number;
+    /** User turns so far: 1 for the launch, +1 per accepted resume. */
+    turn?: number;
   }[];
   status: "running" | "completed" | "partial" | "failed" | "interrupted";
   createdAt: number;
@@ -109,6 +111,7 @@ interface InternalChild {
   result?: ChildResult;
   startedAt: number;
   endedAt?: number;
+  turn: number;
   handle?: ChildHandle;
   shouldStart?: () => boolean;
 }
@@ -307,6 +310,7 @@ export class SubagentRegistry implements RunRegistry {
       agent: info.agent,
       status: "pending",
       startedAt: this.now(),
+      turn: 1,
     };
     run.children.push(child);
     this.children.set(child.childId, child);
@@ -415,7 +419,13 @@ export class SubagentRegistry implements RunRegistry {
     const handle = child.handle;
     if (!handle) throw new Error(`subagent ${childId} has no live session to resume`);
     const queuedBehind = this.activeSlots >= this.maxChildren ? this.slotWaiters.length : null;
-    const previous = { status: child.status, result: child.result, startedAt: child.startedAt, endedAt: child.endedAt };
+    const previous = {
+      status: child.status,
+      result: child.result,
+      startedAt: child.startedAt,
+      endedAt: child.endedAt,
+      turn: child.turn,
+    };
     const accepted = handle.resume(message, opts);
     // Mark the child queued before awaiting: with a free slot, admitChild's
     // continuation can run first and move it to running, which must win.
@@ -423,6 +433,7 @@ export class SubagentRegistry implements RunRegistry {
     child.result = undefined;
     child.endedAt = undefined;
     child.startedAt = this.now();
+    child.turn += 1;
     try {
       await accepted;
     } catch (err) {
@@ -625,6 +636,7 @@ function snapshot(run: InternalRun): RunRecord {
       result: c.result,
       startedAt: c.startedAt,
       endedAt: c.endedAt,
+      turn: c.turn,
     })),
   };
 }

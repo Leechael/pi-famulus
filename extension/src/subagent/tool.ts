@@ -295,12 +295,20 @@ export function createSubagentTool(
     return registry;
   };
 
+  /** Last terminal state a subagent-done was sent for, per run. */
+  const runDoneSent = new Map<string, string>();
   const notifyRunCompleted = (registry: SubagentRegistry, runId: string): void => {
     const record = registry.get(runId);
     if (!record) return;
     // A resumed child can outlive the run's first-launch completion. The
     // run is not done while it runs; its own settle sends this wake.
     if (record.children.some((c) => c.status === "pending" || c.status === "running")) return;
+    // Several observers (first-launch completion, each resumed turn's settle)
+    // can see the same all-terminal state. One subagent-done per terminal
+    // state, identified by every child's turn number.
+    const terminalKey = record.children.map((c) => `${c.childId}:${c.turn ?? 1}`).join("|");
+    if (runDoneSent.get(runId) === terminalKey) return;
+    runDoneSent.set(runId, terminalKey);
     deps.getNotifyCenter()?.notify(formatSubagentNotification(toNotificationInfo(record, clock.now())));
   };
 
