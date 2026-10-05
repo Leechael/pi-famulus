@@ -618,6 +618,17 @@ fn looks_like_target(a: &str) -> bool {
 /// Pytest-style flags whose value is a path that is not a target.
 const PATH_VALUE_FLAGS: &[&str] = &["--ignore", "--deselect", "--rootdir", "--basetemp", "-c", "--confcutdir", "--junitxml", "--cov", "--cov-report", "-p", "-o", "--log-file"];
 
+/// A test-selection flag in any spelling: `-k expr`, `-k=expr`, `-kexpr`,
+/// `--testNamePattern=x`.
+fn selects_tests(a: &str) -> bool {
+    let key = a.split_once('=').map_or(a, |(k, _)| k);
+    if matches!(key, "-k" | "-m" | "--lf" | "--last-failed" | "-t" | "--testNamePattern" | "--grep" | "-g" | "--run") {
+        return true;
+    }
+    // Attached short form: pytest `-kauth`, `-mslow`; jest/vitest `-tname`.
+    !a.starts_with("--") && a.len() > 2 && ["-k", "-m", "-t", "-g"].iter().any(|f| a.starts_with(f))
+}
+
 /// A test runner run: the whole suite, or a targeted subset.
 fn test_kind(args: &[&str], fed_by_xargs: bool) -> WorkKind {
     if fed_by_xargs {
@@ -626,7 +637,7 @@ fn test_kind(args: &[&str], fed_by_xargs: bool) -> WorkKind {
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if matches!(a, "-k" | "-m" | "--lf" | "--last-failed" | "-t" | "--testNamePattern" | "--grep" | "-g" | "--run") {
+        if selects_tests(a) {
             return WorkKind::Test;
         }
         if PATH_VALUE_FLAGS.contains(&a) {
@@ -657,7 +668,9 @@ fn cargo_test_kind(args: &[&str]) -> WorkKind {
             prev_takes_value = false;
             continue;
         }
-        if matches!(a, "--test" | "--bin" | "--example" | "--bench") {
+        // `--test=observability` selects like `--test observability`.
+        let key = a.split_once('=').map_or(a, |(k, _)| k);
+        if matches!(key, "--test" | "--bin" | "--example" | "--bench") {
             return WorkKind::Test;
         }
         if matches!(a, "-p" | "--package" | "--features" | "-F" | "--target" | "--profile" | "-j" | "--jobs" | "--manifest-path" | "--target-dir") {
@@ -770,6 +783,27 @@ mod tests {
         assert_eq!(k("npm --prefix web run build"), Build);
         assert_eq!(k("pnpm --filter api lint"), LintType);
         assert_eq!(k("uv run --directory backend ruff check ."), LintType);
+    }
+
+    /// Selection flags in their attached forms (`-kexpr`, `-k=expr`,
+    /// `--key=value`) select like the separated ones.
+    #[test]
+    fn attached_selection_flags_target_tests() {
+        for cmd in [
+            "pytest -k=auth",
+            "pytest -kauth",
+            "pytest -mslow",
+            "pytest --last-failed",
+            "npx jest --testNamePattern=login",
+            "cargo test --test=observability",
+            "cargo test --bin=pi-famulus",
+            "cargo test --package=pi-famulus status_lines",
+        ] {
+            assert_eq!(k(cmd), Test, "{cmd}");
+        }
+        for cmd in ["pytest -q -n4", "pytest --ignore=tests/slow", "cargo test --package=pi-famulus", "cargo test --features=test-clock"] {
+            assert_eq!(k(cmd), TestSuite, "{cmd}");
+        }
     }
 
     #[test]
