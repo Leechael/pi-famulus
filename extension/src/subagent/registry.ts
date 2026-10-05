@@ -428,7 +428,6 @@ export class SubagentRegistry implements RunRegistry {
       result: child.result,
       startedAt: child.startedAt,
       endedAt: child.endedAt,
-      turn: child.turn,
     };
     const accepted = handle.resume(message, opts);
     // Mark the child queued before awaiting: with a free slot, admitChild's
@@ -441,7 +440,15 @@ export class SubagentRegistry implements RunRegistry {
     try {
       await accepted;
     } catch (err) {
-      if (child.status === "pending") Object.assign(child, previous);
+      // Undo this attempt's +1 even if a concurrent accepted resume has
+      // already moved the child to running (the pending guard would skip).
+      child.turn -= 1;
+      if (child.status === "pending") {
+        child.status = previous.status;
+        child.result = previous.result;
+        child.startedAt = previous.startedAt;
+        child.endedAt = previous.endedAt;
+      }
       throw err;
     }
     // Wired at request time, not admission: a turn that never gets a slot

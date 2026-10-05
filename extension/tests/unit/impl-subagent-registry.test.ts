@@ -217,6 +217,41 @@ describe("SubagentRegistry", () => {
     const record = registry.get(run.runId)!;
     expect(record.status).toBe("completed");
     expect(record.children[0].result?.text).toBe("second");
+    expect(record.children[0].turn).toBe(2);
+  });
+
+  it("a concurrent rejected resume does not inflate turn", async () => {
+    // handle.resume is async: a second overlapping resumeChild rejects
+    // (still pending) as a promise, after it has already incremented turn.
+    // Admission of the first can set the child running before that rejection
+    // is caught; rolling back only when status is still pending would leave
+    // turn at 3 for one accepted resume.
+    const { registry, factory } = makeStack();
+    const run = registry.createRun("tasks");
+    const req = addReq(registry, run.runId, "a");
+    const handle = await registry.startChild(req);
+    await handle.result;
+    expect(registry.get(run.runId)!.children[0].turn).toBe(1);
+
+    factory.sessions[0].autoComplete = null;
+    const first = registry.resumeChild(req.childId, "one");
+    const second = registry.resumeChild(req.childId, "two");
+    await expect(second).rejects.toThrow(/still pending|use steer/);
+    await first;
+    await tick();
+    expect(registry.get(run.runId)!.children[0].status).toBe("running");
+    expect(registry.get(run.runId)!.children[0].turn).toBe(2);
+  });
+
+  it("a rejected resume of a running child restores turn and status", async () => {
+    const { registry, factory } = makeStack();
+    factory.autoComplete = null;
+    const run = registry.createRun("tasks");
+    const req = addReq(registry, run.runId, "a");
+    await registry.startChild(req);
+    expect(registry.get(run.runId)!.children[0]).toMatchObject({ status: "running", turn: 1 });
+    await expect(registry.resumeChild(req.childId, "nope")).rejects.toThrow(/still running|use steer/);
+    expect(registry.get(run.runId)!.children[0]).toMatchObject({ status: "running", turn: 1 });
   });
 
   it("disposeRun interrupts children, disposes sessions, and removes the run", async () => {
