@@ -33,7 +33,13 @@
 //! orphaned because its parent died first; init reaps those), anything
 //! still running when `sh` exits (the `linger` set), and every task whose
 //! runner is SIGKILLed with its group (stop after the grace, `timeout_ms`):
-//! that runner writes no status line at all.
+//! that runner writes no status line at all. On macOS only, a process that
+//! reaped children and then called exec loses those children's times
+//! (measured; POSIX asks exec to keep them, and the Linux branch of
+//! `task::runner_usage_across_exec_is_platform_dependent` checks it), so
+//! `make; exec foo` reports only `foo`. macOS `/bin/sh` does not exec the
+//! last command of a list (`a; b`), only a lone simple command, so this
+//! needs an explicit `exec` or a program that execs after waiting.
 //!
 //! The runner blocks SIGTERM, so a group SIGTERM (stop, shutdown) reaches
 //! the command while the runner lives to report how the command ended. The

@@ -777,6 +777,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A process that reaps a child and then execs: POSIX says exec keeps
+    /// the children's times, and Linux does; macOS drops them (measured:
+    /// `sh -c "<burn>; exec true"` reports 0.00 s user under
+    /// `/usr/bin/time -l`, 0.42 s without the `exec`). Pinned per platform
+    /// so a change in either shows up.
+    #[tokio::test]
+    async fn runner_usage_across_exec_is_platform_dependent() {
+        let dir = unique_dir("cpuexec");
+        let env = HashMap::new();
+        let mut t = spawn(&format!("{BURN}; exec true"), "/", &env, &dir.join("t.output")).unwrap();
+        let u = reported(&mut t).await.usage.expect("usage reported");
+        if cfg!(target_os = "macos") {
+            assert!(u.cpu_user_us < BURN_FLOOR_US, "macOS kept CPU across exec: {u:?}");
+        } else {
+            assert!(u.cpu_user_us >= BURN_FLOOR_US, "CPU lost across exec: {u:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The documented gap: work nobody waits for before `sh` exits is not
     /// in the report (the runner reports when `sh` ends).
     #[tokio::test]
