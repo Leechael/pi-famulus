@@ -631,11 +631,11 @@ export function createSubagentTool(
     // resume
     if (!params.message) throw new Error("message is required for resume");
     const child = resolveSingleTerminalChild(record, params.child_id);
-    const handle = registry.handle(child.childId);
-    if (!handle) throw new Error(`subagent ${child.childId} has no live session to resume`);
     // A resume is a new turn with its own soft budget: timeout_ms when given,
-    // else the child's spawn budget (the runner's default).
-    await handle.resume(
+    // else the child's spawn budget (the runner's default). Returns once the
+    // request is accepted; it never waits for an admission slot.
+    const { queuedBehind } = await registry.resumeChild(
+      child.childId,
       params.message,
       params.timeout_ms === undefined ? {} : { timeoutMs: clampTimeout(params.timeout_ms, deps.defaultTimeoutMs) },
     );
@@ -657,7 +657,7 @@ export function createSubagentTool(
             "otherwise via <pi-famulus-wake kind=\"subagent-done\"> when it completes. Do not poll.",
         },
       ],
-      details: { run_id: record.runId, child_id: child.childId },
+      details: { run_id: record.runId, child_id: child.childId, queued_behind: queuedBehind },
     };
   };
 

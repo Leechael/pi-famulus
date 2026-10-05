@@ -205,7 +205,8 @@ describe("SubagentRegistry", () => {
     expect(registry.get(run.runId)!.status).toBe("completed");
 
     factory.sessions[0].autoComplete = null;
-    await handle.resume("continue");
+    await registry.resumeChild(req.childId, "continue");
+    await tick();
     expect(registry.get(run.runId)!.status).toBe("running");
     expect(registry.get(run.runId)!.children[0].status).toBe("running");
 

@@ -566,3 +566,104 @@ describe("subagent tool — resume lifecycle", () => {
     expect(done.children.map((c) => `${c.name} ${c.status}`)).toEqual(["alpha completed", "beta completed"]);
   });
 });
+
+describe("subagent tool — resume never waits for an admission slot", () => {
+  /** Run A's only child has finished; run B's child holds the only slot. */
+  async function fullQueue() {
+    const stack = makeStack({ autoComplete: null, maxConcurrentChildren: 1 });
+    const a = await stack.exec({ tasks: [{ prompt: "a", name: "alpha" }], async: true });
+    const runA = (a.details as { run_id: string }).run_id;
+    await flushMicrotasks();
+    stack.factory.sessions[0].complete("alpha done");
+    await flushMicrotasks();
+    const b = await stack.exec({ tasks: [{ prompt: "b", name: "beta" }], async: true });
+    const runB = (b.details as { run_id: string }).run_id;
+    await flushMicrotasks();
+    stack.notify.mockClear();
+    return { ...stack, runA, runB };
+  }
+
+  /** Start a tool call and report whether it returned within a microtask flush. */
+  async function returnsPromptly(call: Promise<unknown>): Promise<{ returned: boolean; value?: unknown }> {
+    let out: { returned: boolean; value?: unknown } = { returned: false };
+    void call.then((value) => {
+      out = { returned: true, value };
+    });
+    await flushMicrotasks();
+    return out;
+  }
+
+  it("the parent's resume call returns while every slot is busy; the child shows queued", async () => {
+    const { exec, registry, factory, runA } = await fullQueue();
+    const res = await returnsPromptly(exec({ action: "resume", run_id: runA, child_id: "alpha", message: "more" }));
+    expect(res.returned).toBe(true);
+    expect((res.value as { details: { queued_behind: number | null } }).details.queued_behind).toBe(0);
+    expect(registry.get(runA)!.children[0].status).toBe("pending");
+    expect(registry.get(runA)!.status).toBe("running");
+    expect(factory.sessions[0].prompts).toEqual(["a"]); // admission still gates the turn
+  });
+
+  it("a second queued resume reports how many are ahead of it", async () => {
+    const { exec, factory, runA } = await fullQueue();
+    // A third run whose child is also finished.
+    const c = await exec({ tasks: [{ prompt: "c", name: "gamma" }], async: true });
+    const runC = (c.details as { run_id: string }).run_id;
+    await flushMicrotasks(); // queued behind beta: no session yet
+    expect(factory.sessions).toHaveLength(2);
+    const first = await exec({ action: "resume", run_id: runA, child_id: "alpha", message: "more" });
+    expect((first.details as { queued_behind: number }).queued_behind).toBe(1); // gamma's launch is ahead
+    expect(runC).toMatch(/^run_/);
+  });
+
+  it("interrupting a queued resume settles it once and it never runs", async () => {
+    const { exec, registry, factory, notify, runA, runB } = await fullQueue();
+    const seen: string[] = [];
+    registry.onTransition((run) => {
+      if (run.runId === runA) seen.push(run.children[0].status);
+    });
+    await exec({ action: "resume", run_id: runA, child_id: "alpha", message: "more" });
+    await exec({ action: "interrupt", run_id: runA, child_id: "alpha" });
+    await flushMicrotasks();
+    expect(registry.get(runA)!.children[0]).toMatchObject({ status: "interrupted" });
+    expect(registry.get(runA)!.children[0].result?.text).toBe("");
+
+    factory.sessions[1].complete("beta done"); // the slot reaches alpha's stale admission
+    await flushMicrotasks();
+    expect(factory.sessions[0].prompts).toEqual(["a"]);
+    expect(seen).not.toContain("running");
+    const wakes = notify.mock.calls.map((call) => {
+      const d = call[0].details as { kind: string; runId: string };
+      return `${d.kind} ${d.runId}`;
+    });
+    expect(wakes).toEqual([`subagent-done ${runA}`, `subagent-done ${runB}`]);
+
+    // The slot was handed on, not leaked: a new launch gets it at once.
+    await exec({ tasks: [{ prompt: "d", name: "delta" }], async: true });
+    await flushMicrotasks();
+    expect(factory.sessions.map((s) => s.prompts[0])).toEqual(["a", "b", "d"]);
+  });
+
+  it("a dead session found after the call returned is reported by a wake, not a tool error", async () => {
+    const stack = makeStack({ autoComplete: null, hardTimeoutMs: 1_000 });
+    stack.factory.configure = (session) => {
+      session.hungAbort = true;
+    };
+    const started = await stack.exec({ tasks: [{ prompt: "a", name: "alpha" }], async: true });
+    const runId = (started.details as { run_id: string }).run_id;
+    await flushMicrotasks();
+    stack.clock.advanceBy(1_000); // hard ceiling: interrupted, abort never finishes
+    await flushMicrotasks();
+    stack.notify.mockClear();
+
+    const res = await stack.exec({ action: "resume", run_id: runId, child_id: "alpha", message: "more" });
+    expect(res.content[0].type === "text" && res.content[0].text).toContain("alpha");
+    stack.clock.advanceBy(0); // drain bound (stallMs 0 in this stack) expires
+    await flushMicrotasks();
+    expect(stack.notify).toHaveBeenCalledTimes(1);
+    const wake = stack.notify.mock.calls[0][0].details as { kind: string; children: { status: string; error?: string }[] };
+    expect(wake.kind).toBe("subagent-done");
+    expect(wake.children[0].status).toBe("failed");
+    expect(wake.children[0].error).toMatch(/did not go idle/);
+    expect(stack.clock.pendingTimers).toBe(0);
+  });
+});
