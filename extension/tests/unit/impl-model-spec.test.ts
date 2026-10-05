@@ -162,6 +162,18 @@ describe("thinking-suffix fallback (pi core parity)", () => {
     expect(msg).toContain('"zzz"');
   });
 
+  it("valid suffix with an unknown base fails without a suffix hint", () => {
+    const res = resolveModelSpec("zzz:high", CANDIDATES);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect(res).not.toHaveProperty("suffixHint");
+  });
+
+  it("trailing colon does not trigger the suffix retry", () => {
+    const res = resolveModelSpec("claude-haiku-4-5:", CANDIDATES);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect(res).not.toHaveProperty("suffixHint");
+  });
+
   it("ambiguous retried base reports the ambiguity, not the raw no-match", () => {
     const dupes: ModelCandidate[] = [
       { provider: "a", id: "same" },
