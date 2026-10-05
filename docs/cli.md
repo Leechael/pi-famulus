@@ -66,6 +66,7 @@ pi-famulus status [--json]
 pi-famulus sessions [--json]
 pi-famulus ls [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
 pi-famulus show <id> [--json]
+pi-famulus stats [--by agent|kind|agent,kind] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]
 pi-famulus agent <ch_id> [--full] [-f]
 pi-famulus events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
 pi-famulus log [-f] [-n 100] [ID] [--stderr]
@@ -89,7 +90,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show` and `stats` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
@@ -162,6 +163,26 @@ Everything about one id, any kind:
 - **run (`run_…`):** its children as an `ls` table.
 
 `--json` prints the underlying records, the output tail, and the related events.
+
+### `stats`
+
+Where shell time and CPU went, grouped by the subagent that ran each task, by the task's work kind, or both:
+
+```text
+$ pi-famulus stats --by agent,kind
+AGENT                     KIND        TASKS   WALL     CPU  CORES  UNMEASURED  KILLED  KILLED-WALL
+wave2-kms (ch_1f1f7f0e)   test-suite      4  1h06m  3h41m    3.3           1       1       20m14s
+wave2-kms (ch_1f1f7f0e)   lint/type       3  6m10s  4m02s    0.7           0       0          0ms
+main 01a10bda             git            39  1m02s   3.1s    0.1           0       0          0ms
+TOTAL                                    46  1h13m  3h45m    3.0           1       1       20m14s
+```
+
+- **AGENT** is the subagent in the task's `origin.child_id`, named from its agent record (`name (ch_…)`; the bare id when the record is gone). Tasks a session's main agent ran itself are `main <session>`.
+- **KIND** is the task's `work_kind` (see `ls`): `test-suite`, `test`, `build`, `lint/type`, `git`, `read/search`, `other`, or `monitor`. Not the shell/monitor `KIND` of `ls`.
+- **WALL** sums the tasks' durations (a running task's so far). **CPU** sums user + system CPU of the measured tasks only, and **CORES** divides it by the wall time of those same tasks. **UNMEASURED** counts tasks without a CPU measurement (still running, SIGKILLed with their runner by `--timeout-ms` or after a stop's grace, or recorded by an older manager); `-` means no task in the row was measured. See `ls` for what CPU covers.
+- **KILLED** / **KILLED-WALL**: tasks that ended `killed` and the wall time they ran before that.
+
+Every retained task record counts, including finished work of gone sessions (`ls` leaves those out); rows are sorted by CPU, then wall time, with a `TOTAL` row last. Filters as in `ls`: `--session PREFIX`, `--cwd DIR`, `--since DUR` (tasks running at some point within it). `--json` prints the groups with raw milliseconds (`wall_ms`, `cpu_user_ms`, `cpu_sys_ms`, `cpu_ms`, `measured`, `measured_wall_ms`, `killed`, `killed_wall_ms`, and `avg_cores` when anything was measured). Never starts the daemon.
 
 ### `agent`
 

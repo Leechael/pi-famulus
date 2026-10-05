@@ -54,7 +54,7 @@ fn help_and_version_are_served_by_the_cli_framework() {
         commands.contains("completion") && commands.contains("help"),
         "ungrouped commands stay with the built-in help: {help}"
     );
-    for name in ["status", "sessions", "list", "show", "agent", "events", "log", "tail", "doctor"]
+    for name in ["status", "sessions", "list", "show", "stats", "agent", "events", "log", "tail", "doctor"]
     {
         assert!(
             section_has_command(inspection, name),

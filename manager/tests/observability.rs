@@ -287,6 +287,9 @@ fn p4_cpu_usage_on_record_event_and_list() {
     let shown = cli_ok(&home, &["show", &a]).stdout;
     let line = shown.lines().find(|l| l.starts_with("cpu:")).unwrap_or_else(|| panic!("no cpu line:\n{shown}"));
     assert!(line.contains("cores avg") && line.contains("peak rss"), "{line}");
+    let st: Value = serde_json::from_str(&cli_ok(&home, &["stats", "--json", "--session", "sess-p4"]).stdout).unwrap();
+    assert_eq!(st[0]["agent"], "main sess-p4", "{st}");
+    assert_eq!(st[0]["cpu_user_ms"].as_u64(), Some(cpu), "stats from the live daemon: {st}");
 
     // A stop whose SIGTERM the command obeys: the runner survives it and
     // reports what was spent before.
@@ -631,6 +634,68 @@ fn c1_ls_columns_filters_json_and_cjk() {
     assert!(agent.get("work_kind").is_none(), "{agent}");
     let bad = home.cli(&["ls", "--since", "10x"], S(5));
     assert!(!bad.status.success());
+}
+
+/// `stats` from records on disk (no daemon, and it starts none): every
+/// retained session counts, gone ones included; tasks group by their
+/// child (named from its agent record) or the session's main agent, and by
+/// work kind; CPU sums measured tasks, the rest are UNMEASURED.
+#[test]
+fn c11_stats_by_agent_and_kind() {
+    let home = Home::new("c11");
+    let now = now_ms();
+    let child = |c: &str| json!({"via":"child-bash","child_id":c,"run_id":"run_0000d001"});
+    record_fixture(&home, "0199dddd-1111", "sh_0000d001", now - 60_000, json!({"command":"cd x && pdm run test > log 2>&1; tail -n 50 log",
+        "origin":child("ch_0000d001"),"ended_at":now - 20_000,"cpu_user_ms":150_000,"cpu_sys_ms":10_000,"max_rss_kb":900_000}));
+    record_fixture(&home, "0199dddd-1111", "sh_0000d002", now - 50_000, json!({"command":"pytest tests/a.py",
+        "origin":child("ch_0000d001"),"ended_at":now - 40_000,"status":"killed","end_reason":"timeout"}));
+    record_fixture(&home, "0199dddd-1111", "sh_0000d003", now - 30_000, json!({"command":"git status",
+        "ended_at":now - 29_000,"cpu_user_ms":5,"cpu_sys_ms":5,"max_rss_kb":10}));
+    record_fixture(&home, "0199dddd-2222", "sh_0000d004", now - 3 * 3_600_000, json!({"command":"rg foo",
+        "origin":child("ch_0000d002"),"cpu_user_ms":20,"cpu_sys_ms":0,"max_rss_kb":10}));
+    agent_fixture(&home, "0199dddd-1111", json!({"child_id":"ch_0000d001","run_id":"run_0000d001","session_id":"0199dddd-1111",
+        "name":"wave2-kms","agent":"worker","status":"completed","started_at":now - 70_000}));
+
+    let json_of = |args: &[&str]| -> Vec<Value> {
+        let out = cli_ok(&home, args);
+        serde_json::from_str::<Value>(&out.stdout).unwrap().as_array().unwrap().clone()
+    };
+    let g = json_of(&["stats", "--by", "agent,kind", "--json"]);
+    let find = |agent: &str, kind: &str| g.iter().find(|r| r["agent"] == agent && r["kind"] == kind).cloned()
+        .unwrap_or_else(|| panic!("no {agent}/{kind} in {g:#?}"));
+    let suite = find("wave2-kms (ch_0000d001)", "test-suite");
+    assert_eq!((suite["tasks"].as_u64(), suite["cpu_ms"].as_u64(), suite["wall_ms"].as_u64()), (Some(1), Some(160_000), Some(40_000)));
+    assert_eq!(suite["avg_cores"].as_f64(), Some(4.0));
+    let killed = find("wave2-kms (ch_0000d001)", "test");
+    assert_eq!((killed["measured"].as_u64(), killed["killed"].as_u64(), killed["killed_wall_ms"].as_u64()), (Some(0), Some(1), Some(10_000)));
+    assert!(killed.get("avg_cores").is_none(), "nothing measured: {killed}");
+    let main = g.iter().find(|r| r["kind"] == "git").unwrap();
+    assert!(main["agent"].as_str().unwrap().starts_with("main 0199dddd-1"), "{main}");
+    assert!(main.get("child_id").is_none(), "{main}");
+    // The gone session's task counts too; its child has no record: the id.
+    find("ch_0000d002", "read/search");
+    assert_eq!(g[0]["kind"], "test-suite", "sorted by CPU");
+
+    let by_agent = json_of(&["stats", "--json"]);
+    let kms = by_agent.iter().find(|r| r["child_id"] == "ch_0000d001").unwrap();
+    assert_eq!((kms["tasks"].as_u64(), kms["measured"].as_u64(), kms["killed"].as_u64()), (Some(2), Some(1), Some(1)));
+    assert!(kms.get("kind").is_none());
+
+    assert_eq!(json_of(&["stats", "--by", "kind", "--json", "--session", "0199dddd-2"]).len(), 1);
+    let recent = json_of(&["stats", "--by", "kind", "--json", "--since", "1h"]);
+    assert!(recent.iter().all(|r| r["kind"] != "read/search"), "--since drops the 3h-old task: {recent:#?}");
+
+    let text = cli_ok(&home, &["stats", "--by", "kind"]).stdout;
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), ["KIND", "TASKS", "WALL", "CPU", "CORES", "UNMEASURED", "KILLED", "KILLED-WALL"]);
+    let suite_line: Vec<&str> = lines.iter().find(|l| l.starts_with("test-suite")).unwrap().split_whitespace().collect();
+    assert_eq!(suite_line[1..], ["1", "40s", "2m40s", "4.0", "0", "0", "0ms"], "{text}");
+    let total: Vec<&str> = lines.last().unwrap().split_whitespace().collect();
+    assert_eq!(total[..2], ["TOTAL", "4"], "{text}");
+
+    let bad = home.cli(&["stats", "--by", "model"], S(5));
+    assert!(!bad.status.success() && bad.stderr.contains("bad --by"), "{}", bad.stderr);
+    assert!(!home.sock().exists(), "stats must not start the daemon");
 }
 
 /// Run the CLI with its stdout on a pseudo-terminal (script(1)), the way a

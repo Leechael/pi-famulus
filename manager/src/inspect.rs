@@ -542,7 +542,7 @@ fn term_width() -> Option<usize> {
     Some(std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(tty))
 }
 
-fn normalize_dir(d: &str) -> String {
+pub fn normalize_dir(d: &str) -> String {
     let expanded = if let Some(rest) = d.strip_prefix('~') {
         format!("{}{rest}", std::env::var("HOME").unwrap_or_default())
     } else {
@@ -552,7 +552,7 @@ fn normalize_dir(d: &str) -> String {
     p.to_string_lossy().trim_end_matches('/').to_string()
 }
 
-fn under_dir(cwd: &str, dir: &str) -> bool {
+pub fn under_dir(cwd: &str, dir: &str) -> bool {
     let c = normalize_dir(cwd);
     c == dir || c.starts_with(&format!("{dir}/"))
 }
