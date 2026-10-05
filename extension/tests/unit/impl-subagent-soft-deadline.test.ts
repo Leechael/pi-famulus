@@ -231,6 +231,56 @@ describe("soft deadline", () => {
     }
   });
 
+  // Owner decision on PR #34: while the child waits on need_decision the
+  // parent already holds a supervisor-request wake for it. Reminders are
+  // held until the decision resolves; the budget is not reset.
+  describe("pending need_decision", () => {
+    type Pausable = { pauseStall(): void; resumeStall(): void };
+
+    it("holds the first reminder until the decision resolves, then sends it at once", async () => {
+      const handle = await runner().start(makeReq());
+      clock.advanceBy(800);
+      (handle as unknown as Pausable).pauseStall(); // contact_supervisor need_decision
+      clock.advanceBy(2_000); // deadline (1000) and several repeats pass
+      expect(ticks).toHaveLength(0);
+      expect(handle.status()).toBe("running");
+      (handle as unknown as Pausable).resumeStall(); // parent replied at t=2800
+      clock.advanceBy(0);
+      expect(ticks).toEqual([expect.objectContaining({ reminder: 1, elapsedMs: 2_800, budgetMs: 1_000 })]);
+      clock.advanceBy(300);
+      expect(ticks[1]).toMatchObject({ reminder: 2, elapsedMs: 3_100 });
+    });
+
+    it("holds repeats too, and does not restart the budget", async () => {
+      const handle = await runner().start(makeReq());
+      clock.advanceBy(1_000); // reminder 1
+      (handle as unknown as Pausable).pauseStall();
+      clock.advanceBy(10_000);
+      expect(ticks).toHaveLength(1);
+      (handle as unknown as Pausable).resumeStall();
+      clock.advanceBy(0);
+      expect(ticks[1]).toMatchObject({ reminder: 2, elapsedMs: 11_000, budgetMs: 1_000 });
+    });
+
+    it("a decision that resolves inside the budget changes nothing", async () => {
+      const handle = await runner().start(makeReq());
+      (handle as unknown as Pausable).pauseStall();
+      clock.advanceBy(500);
+      (handle as unknown as Pausable).resumeStall();
+      clock.advanceBy(499);
+      expect(ticks).toHaveLength(0);
+      clock.advanceBy(1);
+      expect(ticks[0]).toMatchObject({ reminder: 1, elapsedMs: 1_000 });
+    });
+
+    it("the hard ceiling still fires while a decision is pending", async () => {
+      const handle = await runner({ hardTimeoutMs: 2_000 }).start(makeReq());
+      (handle as unknown as Pausable).pauseStall();
+      clock.advanceBy(2_000);
+      expect(await handle.result).toMatchObject({ status: "interrupted", error: "timeout" });
+    });
+  });
+
   describe("hard ceiling (opt-in hardTimeoutMs)", () => {
     it("is off by default: hours past the budget the child still runs", async () => {
       const handle = await runner().start(makeReq());

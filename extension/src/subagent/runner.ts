@@ -239,7 +239,10 @@ class InProcessChildHandle implements DisposableChildHandle {
     return this.resolvedModel_ ?? this.session?.resolvedModel;
   }
 
-  /** Pause the stall watchdog (need_decision). Nested with tool execution. */
+  /**
+   * need_decision pending: pause the stall watchdog (nested with tool
+   * execution) and hold overrun reminders. The soft budget keeps counting.
+   */
   pauseStall(): void {
     this.decisionPaused = true;
     this.clearStall();
@@ -249,6 +252,9 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.decisionPaused = false;
     this.lastEvent = this.clock.now();
     if (this.status_ === "running" && this.toolDepth === 0) this.armStall(this.generation);
+    // Deliver a reminder held during the decision (due now, so it fires at
+    // once); otherwise this re-arms the unchanged schedule.
+    if (this.status_ === "running" && !this.settledFlag) this.armSoftDeadline(this.generation);
   }
 
   conversation() {
@@ -647,6 +653,10 @@ class InProcessChildHandle implements DisposableChildHandle {
       // Deliberately NOT isCurrent(): during a stall's retry delay the child
       // is still running from the parent's view, so the reminder is due.
       if (this.settledFlag || this.disposed || gen !== this.generation) return;
+      // A pending need_decision already put a supervisor-request wake in
+      // front of the parent: hold the reminder (nextReminderAt stays due)
+      // until resumeStall() re-arms it when the decision resolves.
+      if (this.decisionPaused) return;
       this.fireOverrun(gen);
     }, delay) ?? null;
   }
