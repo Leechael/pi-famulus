@@ -15,6 +15,12 @@
  *   Body becomes the system prompt (trimmed; may be empty).
  */
 
+import {
+  isValidThinkingLevel,
+  VALID_THINKING_LEVELS,
+  type ThinkingLevel,
+} from "../thinking-levels";
+
 export interface AgentDefinition {
   /** Must match ^[a-z][a-z0-9-]*$ */
   name: string;
@@ -24,7 +30,8 @@ export interface AgentDefinition {
   tools: string[];
   /** "provider:id" or bare id. */
   model?: string;
-  thinking?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  /** Thinking level (pi core parity; src/thinking-levels.ts). */
+  thinking?: ThinkingLevel;
   /** Frontmatter body, trimmed. Empty body → "". */
   systemPrompt: string;
   source: "builtin" | "user" | "project";
@@ -35,8 +42,6 @@ export interface AgentDefinition {
 export const DEFAULT_AGENT_TOOLS: readonly string[] = ["read", "bash", "edit", "write"];
 
 const NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
-const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"] as const;
-type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 type Fail = (reason: string) => never;
 
@@ -178,12 +183,13 @@ export function parseAgentMarkdown(
   let thinking: ThinkingLevel | undefined;
   if (fields.thinking !== undefined) {
     const value = parseScalar(fields.thinking, "thinking", fail);
-    if (!(THINKING_LEVELS as readonly string[]).includes(value)) {
+    if (isValidThinkingLevel(value)) {
+      thinking = value;
+    } else {
       fail(
-        `invalid thinking level "${value}" (expected one of: ${THINKING_LEVELS.join(", ")})`,
+        `invalid thinking level "${value}" (expected one of: ${VALID_THINKING_LEVELS.join(", ")})`,
       );
     }
-    thinking = value as ThinkingLevel;
   }
 
   return {

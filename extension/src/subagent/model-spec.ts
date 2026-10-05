@@ -6,14 +6,16 @@
  * candidate set (scopedModels whitelist when non-empty, else all available).
  *
  * Spec grammar: `[provider/|provider:]id[:thinking]`
- *   - thinking suffix: one of VALID_THINKING_LEVELS (pi core parity; the pi
- *     SDK does not export its list, so keep this in sync with pi's
- *     VALID_THINKING_LEVELS). Unrecognized suffixes are NOT silently kept
- *     in the id: when the full spec fails to match, the resolver retries
- *     without the trailing ":suffix" and adapts with a warning — the same
- *     semantics as pi's parseModelPattern(allowInvalidThinkingLevelFallback).
- *     Literal ids containing a colon (e.g. OpenRouter's ":exacto") still
- *     win: the full spec matches them first, so the retry never fires.
+ *   - thinking suffix: one of VALID_THINKING_LEVELS (pi core parity;
+ *     src/thinking-levels.ts is the single source of truth). Unrecognized
+ *     suffixes are NOT silently kept in the id: when the full spec fails to
+ *     match, the resolver retries without the trailing ":suffix" and adapts
+ *     with a warning — the same semantics as pi's
+ *     parseModelPattern(allowInvalidThinkingLevelFallback). The retry only
+ *     fires on a full-spec no-match, so literal ids whose trailing ':segment'
+ *     is not a valid level (OpenRouter ":exacto") still win at exact match.
+ *     Note the converse: an id literally ending in a valid level (":high")
+ *     is read as a thinking override, never as a literal id.
  *   - provider prefix: "provider/id" or "provider:id" both accepted
  *   - bare id: exact unique match, else case-insensitive substring on id/name
  */
@@ -36,19 +38,11 @@ export type ModelResolution =
     };
 
 /**
- * Thinking levels pi core accepts — parity with pi's VALID_THINKING_LEVELS.
- * The pi SDK does not export the list, so this is a maintained copy; the
- * parity test in impl-model-spec.test.ts pins every level.
+ * Thinking levels pi core accepts — re-exported from the single source of
+ * truth (src/thinking-levels.ts) for convenience of resolver callers.
  */
-export const VALID_THINKING_LEVELS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
+export { VALID_THINKING_LEVELS } from "../thinking-levels";
+import { VALID_THINKING_LEVELS } from "../thinking-levels";
 
 const THINKING_LEVELS = new Set<string>(VALID_THINKING_LEVELS);
 
@@ -122,13 +116,13 @@ export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): Mo
   const trimmed = spec.trim();
   const { base, thinking } = splitThinkingSuffix(trimmed);
   const first = matchBase(base, candidates);
-  if (first.ok || thinking !== undefined) {
-    // Valid thinking suffix (or immediate match): result is final. Attach the
-    // parsed thinking level; failures here mean the base itself is unknown.
+  if (first.ok || thinking !== undefined || first.error === "ambiguous") {
+    // Success, a valid thinking suffix, or an ambiguity: all final. Ambiguity
+    // is semantic, not syntax — report it instead of adapting past it.
     return { ...first, thinking };
   }
 
-  // Unknown trailing ":suffix": mirror pi core's
+  // Unknown trailing ":suffix" on a no-match: mirror pi core's
   // parseModelPattern(allowInvalidThinkingLevelFallback) — strip the suffix,
   // retry, and adapt with a warning instead of failing the whole call. The
   // retry only fires when the full spec matched nothing, so literal ids
@@ -160,15 +154,20 @@ export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): Mo
 export function modelResolutionError(spec: string, res: ModelResolution & { ok: false }): string {
   const list = res.candidates.slice(0, 20).join(", ");
   const more = res.candidates.length > 20 ? `, … +${res.candidates.length - 20} more` : "";
+  const hint = res.suffixHint ? ` (${res.suffixHint})` : "";
   if (res.error === "ambiguous") {
+    // With a suffixHint the ambiguity belongs to the retried base, not the
+    // full spec — say so, and name the dropped suffix either way.
     return (
-      `model spec "${spec}" is ambiguous (matches: ${list}${more}). ` +
+      (res.suffixHint
+        ? `model spec "${spec}" is ambiguous on the retried base`
+        : `model spec "${spec}" is ambiguous`) +
+      ` (matches: ${list}${more}).${hint} ` +
       `Qualify with "provider/<id>".`
     );
   }
-  const hint = res.suffixHint ? `(${res.suffixHint}) ` : "";
   return (
-    `model spec "${spec}" matched nothing. ${hint}` +
+    `model spec "${spec}" matched nothing.${hint} ` +
     `Available: ${list || "none"}${more}. ` +
     `Use subagent({action:"models"}) to list selectable models.`
   );

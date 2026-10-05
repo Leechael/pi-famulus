@@ -15,6 +15,7 @@
  */
 import { Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { VALID_THINKING_LEVELS } from "../thinking-levels";
 import { formatSubagentHandover, formatSubagentNotification, truncateTail } from "../format";
 import { realClock, type Clock, type ClockTimer } from "../clock";
 
@@ -73,8 +74,9 @@ const subagentParameters = Type.Object({
     Type.String({
       description:
         'Model override for all subagents: fuzzy ("haiku"), qualified ("provider/id"), ' +
-        'optionally with ":<thinking>" suffix (off, minimal, low, medium, high, xhigh, max; ' +
-        'an unknown suffix is dropped with a warning, not an error). Default: current model. ' +
+        `optionally with ":<thinking>" suffix (${VALID_THINKING_LEVELS.join(", ")}; ` +
+        'an unknown suffix is dropped with a warning when the base resolves; ' +
+        'an unknown base still errors). Default: current model. ' +
         'Use action:"models" to list selectable values.',
     }),
   ),

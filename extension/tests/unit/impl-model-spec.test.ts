@@ -162,6 +162,32 @@ describe("thinking-suffix fallback (pi core parity)", () => {
     expect(msg).toContain('"zzz"');
   });
 
+  it("does not adapt past a full-spec ambiguity (ambiguity is semantic)", () => {
+    const candidates: ModelCandidate[] = [
+      { provider: "a", id: "m1", name: "x:foo one" },
+      { provider: "b", id: "m2", name: "x:foo two" },
+      { provider: "c", id: "x" },
+    ];
+    const res = resolveModelSpec("x:foo", candidates);
+    expect(res).toMatchObject({ ok: false, error: "ambiguous" });
+    expect((res as { candidates: string[] }).candidates.sort()).toEqual(["a/m1", "b/m2"]);
+    expect(res).not.toHaveProperty("suffixHint");
+  });
+
+  it("ambiguous retried base names the dropped suffix in the error", () => {
+    const dupes: ModelCandidate[] = [
+      { provider: "a", id: "same" },
+      { provider: "b", id: "same" },
+    ];
+    const res = resolveModelSpec("same:highest", dupes);
+    expect(res).toMatchObject({ ok: false, error: "ambiguous" });
+    const msg = modelResolutionError("same:highest", res as never);
+    expect(msg).toContain("ambiguous on the retried base");
+    expect(msg).toContain('":highest"');
+    expect(msg).toContain('"same"');
+    expect(msg).toContain("provider/<id>");
+  });
+
   it("valid suffix with an unknown base fails without a suffix hint", () => {
     const res = resolveModelSpec("zzz:high", CANDIDATES);
     expect(res).toMatchObject({ ok: false, error: "no-match" });

@@ -16,7 +16,9 @@ export interface AgentDefinition {
   description: string; // required, non-empty
   tools: string[]; // default ["read","bash","edit","write"]
   model?: string; // "provider:id" | bare id
-  thinking?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  // Mirror of src/agents/definition.ts — keep in sync with
+  // src/thinking-levels.ts (VALID_THINKING_LEVELS), the single source.
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   systemPrompt: string; // frontmatter body, trimmed
   source: "builtin" | "user" | "project";
   path?: string; // builtins have no path

@@ -480,7 +480,7 @@ subagent({
 - Candidate set: nonempty `ctx.scopedModels` → scoped only (respect user whitelist); otherwise `modelRegistry.getAvailable()`
 - Matching algorithm (pure function `resolveModelSpec(spec, candidates)`): ① exact (`provider/id` or a unique bare-id match) → ② case-insensitive id/display-name substring; 0 matches → error listing candidates; multiple matches → error listing matches, suggesting a `provider/` prefix to disambiguate
 - Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing. Valid levels mirror pi core's `VALID_THINKING_LEVELS` (`off, minimal, low, medium, high, xhigh, max`; the SDK does not export the list, so `model-spec.ts` maintains a parity-pinned copy)
-- Unknown `:<suffix>` handling mirrors pi's `parseModelPattern(allowInvalidThinkingLevelFallback)`: when the full spec matches nothing, the resolver retries without the trailing suffix; a resolvable base adapts with a **warning** on the child result (never silent), while a still-unresolvable base fails hard with the invalid suffix named in the error. Literal ids containing a colon (OpenRouter `:exacto`) always win — the full spec matches them first, so the retry never fires
+- Unknown `:<suffix>` handling mirrors pi's `parseModelPattern(allowInvalidThinkingLevelFallback)`: on a full-spec **no-match** with an unrecognized suffix, the resolver retries without the suffix; a resolvable base adapts with a **warning** on the child result (never silent), while a still-unresolvable base fails hard with the invalid suffix named in the error. A full-spec **ambiguity never retries** — ambiguity is semantic, not syntax. Literal ids whose trailing `:segment` is not a valid level (OpenRouter `:exacto`) win because the full spec matches them before the retry fires; conversely, an id literally ending in a valid level (`:high`) is read as a thinking override, never as a literal id
 - Tool parameter `model` resolution failure → **hard error** (list candidates, LLM can retry); agent-definition file `model` resolution failure → **fall back to parent model** + warning in result details (user-authored files can become invalid across machines; do not fail hard)
 - Unspecified: child inherits parent's current model (`ctx.model`)
 - `action:"models"` returns one candidate per line, `provider/id — display name`, marking the parent model `(current)` and whitelist source `(scoped)`
@@ -519,7 +519,7 @@ name: explorer
 description: Fast codebase exploration — finds files, symbols, answers structure questions
 tools: [read, bash, grep, find, ls]     # or `read, bash, grep, find, ls`; default = [read, bash, edit, write]
 model: anthropic:claude-haiku-4-5       # optional; "provider:id" or bare id
-thinking: high                          # optional: minimal|low|medium|high|xhigh
+thinking: high                          # optional: off|minimal|low|medium|high|xhigh|max (src/thinking-levels.ts)
 ---
 
 You are an explorer agent. ... (body = appended system prompt segment)
@@ -629,13 +629,21 @@ export function formatMonitorEvent(description: string, taskId: string, batchTex
 ## Appendix B: M3-M5 interface signature contract (shared basis for subagent / comms / agents)
 
 ```ts
+// ---------- extension/src/thinking-levels.ts (pure module, zero pi dependencies) ----------
+export const VALID_THINKING_LEVELS = ["off","minimal","low","medium","high","xhigh","max"];
+export type ThinkingLevel = typeof VALID_THINKING_LEVELS[number];
+export function isValidThinkingLevel(level: string): level is ThinkingLevel;
+                              // single source of truth (pi SDK does not export the list; parity tests
+                              // pin the levels). Consumed by agents/definition.ts and subagent/
+                              // (model-spec.ts, tool.ts); subagent/types.ts mirrors the union
+
 // ---------- extension/src/agents/ (M5, pure modules, zero pi dependencies) ----------
 export interface AgentDefinition {
   name: string;                 // ^[a-z][a-z0-9-]*$
   description: string;          // required, nonempty
   tools: string[];              // default ["read","bash","edit","write"]
   model?: string;               // "provider:id" | bare id
-  thinking?: "minimal"|"low"|"medium"|"high"|"xhigh";
+  thinking?: ThinkingLevel;      // off|minimal|low|medium|high|xhigh|max (src/thinking-levels.ts)
   systemPrompt: string;         // frontmatter body, trimmed
   source: "builtin"|"user"|"project";
   path?: string;                // no path for builtin
@@ -656,10 +664,14 @@ export type ModelResolution =
 export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): ModelResolution;
   // ① Strip ":<thinking>" suffix (VALID_THINKING_LEVELS = off|minimal|low|medium|high|xhigh|max, pi core parity)
   // ② Exact "provider/id" → unique exact bare id → case-insensitive id/name substring
-  // ③ Full-spec failure with an unrecognized suffix: strip it and retry (pi's
+  // ③ Full-spec no-match with an unrecognized suffix: strip it and retry (pi's
   //   allowInvalidThinkingLevelFallback); resolvable base → ok + warning on the result,
-  //   still-unresolvable → the retried no-match/ambiguous, with suffixHint naming the bad suffix
-  // ④ Literal ids containing a colon (OpenRouter ":exacto") match at ② before ③ ever fires
+  //   still-unresolvable → the retried no-match/ambiguous, with suffixHint naming the bad
+  //   suffix (modelResolutionError renders the hint in BOTH error shapes)
+  // ④ Full-spec ambiguity never retries — ambiguity is semantic, not syntax
+  // ⑤ Literal ids whose trailing ':segment' is NOT a valid level (OpenRouter ":exacto")
+  //   match at ② before ③ ever fires; ids ending in a valid level (":high") are read as
+  //   thinking overrides, never as literal ids
 
 // ---------- extension/src/subagent/types.ts (M3 core types) ----------
 export type ChildStatus = "pending"|"running"|"completed"|"failed"|"interrupted";
