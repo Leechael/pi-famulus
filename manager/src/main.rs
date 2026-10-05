@@ -20,6 +20,7 @@ mod registry;
 mod runner;
 mod sys;
 mod task;
+mod workkind;
 
 use cli::{Cli, Sub};
 

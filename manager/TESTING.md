@@ -281,6 +281,7 @@ fixtures in the contract's format, because the extension side may land later.
 | pager: on a terminal (script(1) pty) listings go through `PI_FAMULUS_PAGER`, else `PAGER`; not with `--no-pager`, `cat`, or piped stdout; a bare `less` runs as `less -FRX` | `c10`, unit `pager::*` |
 | `ls`: columns, running-only default, `-a` (connected sessions' finished work), running first then newest first, an agent's TIME = its last transcript message, agents included, SESSION shortest unique prefix ≥ 8, CJK display-width truncation, `--json`, `--session`/`--cwd`/`--since`, bad duration rejected | `c1`, `c1b`, unit `fmt::*`, `inspect::*` |
 | `show` for sh_/ch_/run_ (header, origin, backgrounded, wake emitted→delivered, last 10 lines; agent error/tool calls/shells/prompt/result tail 20), fuzzy + `--json`, one-line not-found with closest match | `c2` |
+| `work_kind` on task rows of `ls --json` and in `show` (agents: none); the classifier on compound commands from a real run (heaviest simple command wins, `bash -c` recursion, heredoc bodies skipped, `$(…)` not surfaced, suite vs targeted) | `c1`, `c2`, unit `workkind::*` (red when the last simple command wins instead of the heaviest) |
 | `agent` (preamble hidden, `--full`), `log`/`tail -f` on ch_ ids, `output`/`wait` on ch_, `stop` on an agent refused with the contract message | `c3` |
 | `stop` → `stopped:cli`; "already finished (<reason>)" | `c4` |
 | `sessions`: connected only, gone sessions hidden but `show`/`events` still reach them, counts, `--json`, no spawn | `c5` |

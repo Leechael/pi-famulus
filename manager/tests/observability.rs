@@ -608,6 +608,10 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let row = v.as_array().unwrap().iter().find(|r| r["id"] == b).unwrap();
     assert_eq!((row["kind"].as_str(), row["status"].as_str(), row["title"].as_str()), (Some("shell"), Some("running"), Some("sleep 300")));
+    // A task's work kind (only setup noise here: `other`); agents have none.
+    assert_eq!(row["work_kind"], "other", "{row}");
+    let agent = v.as_array().unwrap().iter().find(|r| r["id"] == "ch_0000b001").unwrap();
+    assert!(agent.get("work_kind").is_none(), "{agent}");
     let bad = home.cli(&["ls", "--since", "10x"], S(5));
     assert!(!bad.status.success());
 }
@@ -785,6 +789,7 @@ fn c2_show_task_agent_and_run() {
     for want in [
         format!("id:           {t}"),
         "kind:         shell".into(),
+        "work:         other".into(),
         "status:       running".into(),
         format!("session:      {sid} (connected, pi pid {})", std::process::id()),
         "cwd:          /tmp".into(),
@@ -802,6 +807,7 @@ fn c2_show_task_agent_and_run() {
     let out = cli_ok(&home, &["show", &t[3..], "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["task"]["task_id"], t);
+    assert_eq!(v["work_kind"], "other");
     assert_eq!(v["output_tail"].as_array().unwrap().len(), 10);
     assert_eq!(v["events"].as_array().unwrap().len(), 2 + 2, "task.start/background + wake.*: {v}");
 

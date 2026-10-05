@@ -378,6 +378,9 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
     pub title: String,
+    /// A task's work kind (`crate::workkind`), or `monitor`; agents: none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,6 +392,15 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub running: bool,
+}
+
+/// What a task's command does (`crate::workkind`). A monitor's wall time
+/// is watching, not work, so monitors are their own kind.
+pub fn work_kind(t: &TaskRecord) -> &'static str {
+    match t.kind {
+        TaskKind::Monitor => "monitor",
+        TaskKind::Shell => crate::workkind::classify(&t.command).label(),
+    }
 }
 
 fn status_str<T: Serialize>(v: &T) -> String {
@@ -414,6 +426,7 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         signal: t.signal.clone(),
         end_reason: t.end_reason.clone(),
         title: fmt::first_line(&t.command).to_string(),
+        work_kind: Some(work_kind(t).to_string()),
         pid: Some(t.pid),
         origin: t.origin.clone(),
         backgrounded_at: t.backgrounded_at,
@@ -442,6 +455,7 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         signal: None,
         end_reason: a.end_reason.clone().or_else(|| a.stale.then(|| "session-gone".to_string())),
         title: a.title(),
+        work_kind: None,
         pid: None,
         origin: None,
         backgrounded_at: None,
@@ -725,6 +739,7 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             if json_out {
                 let v = json!({
                     "task": t,
+                    "work_kind": work_kind(&t),
                     "stderr_path": err_path,
                     "session": snap.sessions.get(&t.session_id),
                     "output_tail": tail,
@@ -736,6 +751,7 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             let r = task_row(&t, now);
             kv("id", &t.task_id);
             kv("kind", &r.kind);
+            kv("work", work_kind(&t));
             let exit = if r.running { String::new() } else { format!(" ({})", exit_col(&r)) };
             kv("status", format!("{}{exit}", r.status));
             if let Some(reason) = &t.end_reason {
