@@ -2206,6 +2206,13 @@ async fn wait_tee_drained(state: &Shared, tid: &str, alone: bool) {
     }
 }
 
+/// Runner microseconds to the record's milliseconds. Round up so a
+/// sub-millisecond measurement is 1 ms rather than 0: `Some(0)` still
+/// counts as measured in `stats` and would drag `avg_cores` toward 0.
+fn usage_ms(us: u64) -> u64 {
+    us.div_ceil(1000)
+}
+
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Leftover) {
@@ -2223,8 +2230,8 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         let now = now_ms();
         entry.record.exit_code = code;
         if let Some(u) = usage {
-            entry.record.cpu_user_ms = Some(u.cpu_user_us / 1000);
-            entry.record.cpu_sys_ms = Some(u.cpu_sys_us / 1000);
+            entry.record.cpu_user_ms = Some(usage_ms(u.cpu_user_us));
+            entry.record.cpu_sys_ms = Some(usage_ms(u.cpu_sys_us));
             entry.record.max_rss_kb = Some(u.max_rss_kb);
         }
         entry.record.signal = signal.map(signal_name);
@@ -2468,6 +2475,15 @@ mod tests {
         assert!(!valid_session_id("a/b"));
         assert!(!valid_session_id("a b"));
         assert!(!valid_session_id(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn sub_millisecond_cpu_rounds_up_to_one_ms() {
+        assert_eq!(usage_ms(0), 0);
+        assert_eq!(usage_ms(1), 1);
+        assert_eq!(usage_ms(999), 1);
+        assert_eq!(usage_ms(1000), 1);
+        assert_eq!(usage_ms(1001), 2);
     }
 
     #[test]
