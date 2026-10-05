@@ -16,9 +16,13 @@
  *     is not a valid level (OpenRouter ":exacto") still win at exact match.
  *     Note the converse: an id literally ending in a valid level (":high")
  *     is read as a thinking override, never as a literal id.
- *     The retry never strips a "provider:id" separator: when the trailing
- *     ':' is the spec's first separator and its prefix is a known provider,
- *     an unknown id stays a hard no-match ("openai:nonexistent").
+ *     A "provider:id" separator is never a thinking suffix: when the
+ *     trailing ':' is the spec's first separator and its prefix is a known
+ *     provider (case-insensitive; candidate.provider or the first '/' segment
+ *     of candidate.id), the colon is left in the base ("openai:off" /
+ *     "openai:max" / "openai:nonexistent" stay hard no-matches). Detection
+ *     runs before valid-level splitting so a recognized level cannot bypass
+ *     the guard. Bare "gpt-5.2:off" and "openai:gpt-5.2:off" still split.
  *   - provider prefix: "provider/id" or "provider:id" both accepted
  *   - bare id: exact unique match, else case-insensitive substring on id/name
  */
@@ -75,16 +79,35 @@ function splitProviderPrefix(spec: string): { provider: string; id: string } | n
 }
 
 /**
+ * Provider names the separator guard recognizes: each candidate's `provider`
+ * field, plus the first `/` segment of its id. OpenRouter ids look like
+ * `openai/gpt-5.2:exacto`; if the scoped whitelist omits the openai provider
+ * itself, that nested prefix still has to count, or `openai:nonexistent`
+ * retries as `openai` and unique-fuzzy-matches the OpenRouter id.
+ */
+function knownProviders(candidates: ModelCandidate[]): string[] {
+  const out: string[] = [];
+  for (const c of candidates) {
+    out.push(c.provider);
+    const slash = c.id.indexOf("/");
+    if (slash > 0) out.push(c.id.slice(0, slash));
+  }
+  return out;
+}
+
+/**
  * True when the ':' at `idx` is the "provider:id" separator rather than a
  * thinking suffix: it is the spec's first separator and the text before it
- * names a known provider. Stripping it would retry the bare provider name,
- * which fuzzy-matches unrelated ids (e.g. "openai:nonexistent" → the
- * OpenRouter id "openai/gpt-5.2:exacto") and silently drops the requested id.
+ * names a known provider (case-insensitive). Stripping it would retry the
+ * bare provider name, which fuzzy-matches unrelated ids (e.g.
+ * "openai:nonexistent" → the OpenRouter id "openai/gpt-5.2:exacto") and
+ * silently drops the requested id.
  */
-function isProviderSeparator(spec: string, idx: number, candidates: ModelCandidate[]): boolean {
+function isProviderSeparator(spec: string, idx: number, providers: readonly string[]): boolean {
   const provider = spec.slice(0, idx);
   if (/[/:]/.test(provider)) return false;
-  return candidates.some((c) => c.provider === provider);
+  const needle = provider.toLowerCase();
+  return providers.some((p) => p.toLowerCase() === needle);
 }
 
 /** The three matching rules, shared by both resolution passes. */
@@ -130,7 +153,19 @@ function matchBase(base: string, candidates: ModelCandidate[]): ModelResolution 
 
 export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): ModelResolution {
   const trimmed = spec.trim();
-  const { base, thinking } = splitThinkingSuffix(trimmed);
+  const providers = knownProviders(candidates);
+  const lastColon = trimmed.lastIndexOf(":");
+  // Known-provider / first-colon detection runs BEFORE valid thinking-suffix
+  // splitting. Otherwise a recognized level (off/max, newly in this PR's
+  // parity list) strips the separator, matchBase("openai") fuzzy-matches an
+  // unrelated id, and the retry guard at the bottom never sees the spec.
+  const skipThinkingSplit =
+    lastColon > 0 &&
+    lastColon < trimmed.length - 1 &&
+    isProviderSeparator(trimmed, lastColon, providers);
+  const { base, thinking } = skipThinkingSplit
+    ? { base: trimmed, thinking: undefined }
+    : splitThinkingSuffix(trimmed);
   const first = matchBase(base, candidates);
   if (first.ok || thinking !== undefined || first.error === "ambiguous") {
     // Success, a valid thinking suffix, or an ambiguity: all final. Ambiguity
@@ -145,7 +180,7 @@ export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): Mo
   // containing a colon (OpenRouter ":exacto") are unaffected.
   const idx = trimmed.lastIndexOf(":");
   if (idx <= 0 || idx === trimmed.length - 1) return first;
-  if (isProviderSeparator(trimmed, idx, candidates)) return first;
+  if (isProviderSeparator(trimmed, idx, providers)) return first;
   const suffix = trimmed.slice(idx + 1);
   const retriedBase = trimmed.slice(0, idx);
   const retried = matchBase(retriedBase, candidates);

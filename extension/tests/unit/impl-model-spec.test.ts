@@ -210,9 +210,67 @@ describe("thinking-suffix fallback (pi core parity)", () => {
     expect(res).not.toHaveProperty("warning");
   });
 
+  it("provider:<valid thinking> is a hard no-match, not a thinking split", () => {
+    // off/max are newly recognized levels; without the provider-separator
+    // check BEFORE splitThinkingSuffix they bypass the retry guard, and
+    // matchBase("openai") unique-fuzzy-matches the OpenRouter id.
+    for (const spec of ["openai:off", "openai:max"]) {
+      const res = resolveModelSpec(spec, CANDIDATES);
+      expect(res, spec).toMatchObject({ ok: false, error: "no-match" });
+      expect(res, spec).not.toHaveProperty("thinking");
+      expect(res, spec).not.toHaveProperty("warning");
+      expect(res, spec).not.toHaveProperty("suffixHint");
+    }
+  });
+
+  it("bare id with a valid thinking suffix still resolves (gpt-5.2:off)", () => {
+    const res = resolveModelSpec("gpt-5.2:off", CANDIDATES);
+    expect(res).toMatchObject({
+      ok: true,
+      provider: "openai",
+      id: "gpt-5.2",
+      thinking: "off",
+    });
+  });
+
+  it("provider:id:thinking still resolves (openai:gpt-5.2:off)", () => {
+    const res = resolveModelSpec("openai:gpt-5.2:off", CANDIDATES);
+    expect(res).toMatchObject({
+      ok: true,
+      provider: "openai",
+      id: "gpt-5.2",
+      thinking: "off",
+    });
+  });
+
   it("provider:id with an unknown id fails even when the provider has one model", () => {
     const res = resolveModelSpec("openrouter:bogus", CANDIDATES);
     expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect(res).not.toHaveProperty("suffixHint");
+  });
+
+  it("provider-separator detection is case-insensitive", () => {
+    // matchBase's qualified check is exact-case, so OpenAI:gpt-5.2 already
+    // hard-fails; the guard must not then strip ":nonexistent" / ":off" and
+    // fuzzy-match an unrelated id just because the provider casing differs.
+    for (const spec of ["OpenAI:nonexistent", "OpenAI:off"]) {
+      const res = resolveModelSpec(spec, CANDIDATES);
+      expect(res, spec).toMatchObject({ ok: false, error: "no-match" });
+      expect(res, spec).not.toHaveProperty("warning");
+      expect(res, spec).not.toHaveProperty("thinking");
+    }
+  });
+
+  it("openai:nonexistent is a hard no-match when openai is only an OpenRouter id prefix", () => {
+    // Scoped whitelist omits the openai provider; the OpenRouter id still
+    // contains "openai", so a retry of the bare prefix would unique-fuzzy-match
+    // it. Nested id prefixes count as known providers so the separator holds.
+    const scoped: ModelCandidate[] = [
+      { provider: "openrouter", id: "openai/gpt-5.2:exacto" },
+    ];
+    const res = resolveModelSpec("openai:nonexistent", scoped);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect(res).not.toHaveProperty("warning");
     expect(res).not.toHaveProperty("suffixHint");
   });
 
