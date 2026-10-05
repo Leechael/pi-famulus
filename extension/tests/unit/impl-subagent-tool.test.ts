@@ -645,7 +645,7 @@ describe("subagent tool — resume never waits for an admission slot", () => {
 
   it("a second queued resume reports how many are ahead of it", async () => {
     const { exec, factory, runA } = await fullQueue();
-    // A third run whose child is also finished.
+    // A third run: gamma is queued behind beta, which holds the only slot.
     const c = await exec({ tasks: [{ prompt: "c", name: "gamma" }], async: true });
     const runC = (c.details as { run_id: string }).run_id;
     await flushMicrotasks(); // queued behind beta: no session yet
