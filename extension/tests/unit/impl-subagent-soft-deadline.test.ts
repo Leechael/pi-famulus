@@ -165,6 +165,47 @@ describe("soft deadline", () => {
       expect(ticks).toHaveLength(2);
     });
 
+    // Review P2 (PR #34): a delivery that resolves after its turn ended must
+    // not move a later turn's schedule.
+    for (const via of ["steer", "followUp"] as const) {
+      it(`a ${via} still in flight across resume does not shift the new turn's reminders`, async () => {
+        const handle = await runner().start(makeReq());
+        const session = factory.sessions[0];
+        clock.advanceBy(1_000); // reminder 1 of turn 1
+        session.deliveryGateOpen = false;
+        const late = handle[via]("old instruction");
+        clock.advanceBy(100);
+        session.complete("done");
+        await handle.result;
+        await handle.resume("next turn", { timeoutMs: 5_000 }); // t=1100, deadline 6100
+        ticks = [];
+        clock.advanceBy(5_000); // reminder 1 of turn 2 at 6100, next due 6400
+        expect(ticks).toHaveLength(1);
+        clock.advanceBy(100); // t=6200: the old delivery lands now
+        session.openDeliveryGate();
+        await late;
+        clock.advanceBy(199); // t=6399
+        expect(ticks).toHaveLength(1);
+        clock.advanceBy(1); // t=6400: on the turn-2 schedule, not 6200 + 300
+        expect(ticks[1]).toMatchObject({ reminder: 2, elapsedMs: 5_300 });
+      });
+
+      it(`a ${via} still in flight when the child settles changes nothing`, async () => {
+        const handle = await runner().start(makeReq());
+        const session = factory.sessions[0];
+        clock.advanceBy(1_000);
+        session.deliveryGateOpen = false;
+        const late = handle[via]("old instruction");
+        session.complete("done");
+        await handle.result;
+        session.openDeliveryGate();
+        await late;
+        expect(clock.pendingTimers).toBe(0);
+        clock.advanceBy(10_000);
+        expect(ticks).toHaveLength(1);
+      });
+    }
+
     // Review P2 (PR #34): a steer right after extend must not pull the next
     // reminder in front of the extended deadline ("past budget" while inside it).
     for (const via of ["steer", "followUp"] as const) {

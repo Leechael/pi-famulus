@@ -268,8 +268,9 @@ class InProcessChildHandle implements DisposableChildHandle {
       // The previous generation was aborted; delivery would be undefined.
       throw new Error(`subagent ${this.req.childId} is restarting after a stall; retry shortly`);
     }
+    const gen = this.generation;
     await this.session.steer(message);
-    this.parentActed();
+    this.parentActed(gen);
   }
 
   async followUp(message: string): Promise<void> {
@@ -279,8 +280,9 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (this.retiredGen !== null) {
       throw new Error(`subagent ${this.req.childId} is restarting after a stall; retry shortly`);
     }
+    const gen = this.generation;
     await this.session.followUp(message);
-    this.parentActed();
+    this.parentActed(gen);
   }
 
   /**
@@ -310,7 +312,10 @@ class InProcessChildHandle implements DisposableChildHandle {
    * future: the child is inside its budget again, and the next wake belongs
    * at that deadline, not one repeat from now.
    */
-  private parentActed(): void {
+  private parentActed(gen: number): void {
+    // The delivery was awaited: if its turn settled (and maybe a resume
+    // started a new one) meanwhile, it must not move the new schedule.
+    if (gen !== this.generation || this.settledFlag) return;
     if (this.reminders === 0 || this.status_ !== "running") return;
     const now = this.now();
     if (this.softDeadlineAt !== null && now < this.softDeadlineAt) return;

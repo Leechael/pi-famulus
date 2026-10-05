@@ -105,12 +105,28 @@ export class FakeChildSession implements ChildSessionAdapter {
     for (const l of [...this.listeners]) l(e);
   }
 
+  /** When closed, steer()/followUp() resolve only after openDeliveryGate(). */
+  deliveryGateOpen = true;
+  private deliveryWaiters: (() => void)[] = [];
+
+  openDeliveryGate(): void {
+    this.deliveryGateOpen = true;
+    for (const w of this.deliveryWaiters.splice(0)) w();
+  }
+
+  private async deliveryGate(): Promise<void> {
+    if (this.deliveryGateOpen) return;
+    await new Promise<void>((resolve) => this.deliveryWaiters.push(resolve));
+  }
+
   async steer(text: string): Promise<void> {
     this.steers.push(text);
+    await this.deliveryGate();
   }
 
   async followUp(text: string): Promise<void> {
     this.followUps.push(text);
+    await this.deliveryGate();
   }
 
   async abort(): Promise<void> {
