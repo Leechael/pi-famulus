@@ -48,6 +48,27 @@ export class FakeChildSession implements ChildSessionAdapter {
   private readonly listeners = new Set<(e: { type: string }) => void>();
   private idleWaiters: (() => void)[] = [];
   private abortGateWaiters: (() => void)[] = [];
+  /** Signals of tools still executing; abort() aborts them (pi semantics). */
+  private readonly runningTools = new Set<AbortController>();
+
+  /**
+   * Start a tool call, as pi does: tool_execution_start, and the tool gets an
+   * AbortSignal that session.abort() fires. Child bash stops its manager
+   * shell on that signal (`task.stop reason=tool`), so `signal.aborted` is the
+   * observable for "the child's foreground shell was stopped".
+   */
+  runTool(): { signal: AbortSignal; end: () => void } {
+    const controller = new AbortController();
+    this.runningTools.add(controller);
+    this.emit({ type: "tool_execution_start" });
+    return {
+      signal: controller.signal,
+      end: () => {
+        if (!this.runningTools.delete(controller)) return;
+        this.emit({ type: "tool_execution_end" });
+      },
+    };
+  }
 
   async prompt(text: string): Promise<void> {
     this.prompts.push(text);
@@ -94,6 +115,8 @@ export class FakeChildSession implements ChildSessionAdapter {
 
   async abort(): Promise<void> {
     this.aborts++;
+    for (const tool of this.runningTools) tool.abort();
+    this.runningTools.clear();
     if (this.hungAbort) {
       // The hung stream never unwinds: abort() never resolves.
       await new Promise<never>(() => {});
