@@ -474,7 +474,7 @@ subagent({
 - **Unified clock and generation timer ownership**: the extension creates one `Clock` and injects it into time-dependent services. `ManualClock` deterministically runs timers by deadline, then insertion order for ties; already-due timers created during `advance()` also run, clearing a timer inside a callback prevents later execution, and intervals crossed by a large advance fire once per due point. Each child generation owns a `TimerScope`; settle, interrupt, resume, or dispose clears all timeouts in that scope, preventing expired generations from affecting later state. No Effect-TS required; the rejected pilot's rationale and measurements are in `docs/decisions/effect-child-runner-pilot.md`.
 - Child bash: `child-bash.ts` forbids backgrounding—schema has no `run_in_background`; execute uses manager start + wait (full timeout_ms), SIGKILLs on expiry and returns a timeout error (never backgrounds); bare-sleep interception matches main bash
 - Limits: global concurrency 8 (across runs); stall watchdog—no child events for `stallMs` (default 5min) → abort and automatically continue on the **same session** (continuation prompt, transcript preserved), up to `stallRetries` (default 1), only then mark `failed (stalled)`; session spawn budget 32 children/hour, error on excess
-- Management actions: `list` (all runs + state in this session), `get` (run_id → full results), `status` (run_id → each child's state/elapsed time/last event), `interrupt` (abort a child or entire run), `steer` (running child → `session.steer(message)`), `extend` (running child → new soft deadline `now + timeout_ms`, default the child's spawn budget), `resume` (ended child → continue with `session.prompt(message)`, new turn with budget `timeout_ms` or the spawn budget, notify again on completion), **`models` (list selectable models for a pre-call check)**
+- Management actions: `list` (all runs + state in this session), `get` (run_id → full results), `status` (run_id → each child's state/elapsed time/last event), `interrupt` (abort a child or entire run), `steer` (running child → `session.steer(message)`), `extend` (running child → new soft deadline `now + timeout_ms`, default the child's spawn budget), `resume` (ended child → continue with `session.prompt(message)`, new turn with budget `timeout_ms` or the spawn budget, notify again on completion; returns at once, and says when the child is queued for an admission slot), **`models` (list selectable models for a pre-call check)**
 
 **Child lifecycle (state machine)** (runner.ts; decision record: `docs/decisions/subagent-soft-deadline.md`)
 
@@ -508,13 +508,18 @@ All of these are turn-level fields. Each generation (first prompt, stall retry, 
 | Hard ceiling (`hardTimeoutMs > 0`, timer) | running (incl. restarting) | interrupted (`timeout`) | Today's behaviour: settle, then abort the session, which aborts the running tool and stops the child's foreground shell (`task.stop reason=tool`). Also checked when a generation (re)starts: already past → settle without prompting. |
 | `interrupt` (tool, `/tasks`) | pending / running | interrupted | settle, then abort |
 | `dispose` (run teardown, session shutdown) | any | interrupted (`disposed`) | Clear timers, dispose the session. |
-| `resume(message, timeout_ms?)` (tool) | completed / failed / interrupted | pending → running | New user turn: `turnBudgetMs = timeout_ms ?? spawn budget`, `reminders = 0`, stall budget reset; wait for a still-unwinding abort (bounded), then admission. |
+| `resume(message, timeout_ms?)` (tool): **requested** | completed / failed / interrupted | pending (**queued**) | Checked at once (not disposed, has a session); the tool call returns here and never waits for a slot. New user turn: `turnBudgetMs = timeout_ms ?? spawn budget`, `reminders = 0`, stall budget reset, a fresh result promise. The registry shows the child `pending` with the previous turn's result cleared. No timers. |
+| Abort drain, then admission (background) | pending (queued) | running | Waits for a still-unwinding abort (bounded by `stallMs`), then for an admission slot (FIFO behind every other waiter, first launches included). Granted: same as "Admission granted" above (`turnBudgetStart = now`, timers armed, prompt). |
+| Abort drain does not finish within `stallMs` | pending (queued) | failed | settle (`session did not go idle after the abort; cannot resume`). The parent learns it from the settle wake, not from the tool call. |
+| `interrupt` / `dispose` while queued | pending (queued) | interrupted | settle. When the slot reaches the child later, admission sees the settled turn and hands the slot on at once; the child never shows `running`. |
 
 Invariants:
 
 - **settle** (every terminal transition) clears every timer of the generation scope: soft deadline, reminder, hard ceiling, stall watchdog, retry delay. Timer callbacks also check `settled || disposed || gen !== generation`, so no overrun wake fires after settle.
 - The overrun and hard-ceiling timers deliberately do not use `isCurrent()`: during a stall's retry delay the child is still running from the parent's view, so a reminder is still due, and a spent hard ceiling must still settle.
 - Without `hardTimeoutMs`, nothing in this table aborts a child for running long. Only the stall watchdog (no session events, outside tool execution), `interrupt` and `dispose` abort it.
+- Admission gates generations, never tool calls. Before this, `resume` awaited the slot inside the parent's tool call: with every slot busy the parent sat in one tool call for up to 1375 s and handled no wake, steer or message meanwhile (chief session of 2026-10-05).
+- **One wake per settle.** Each settle of a backgrounded or resumed child produces exactly one wake: `subagent-handover` while another child of the run is pending or running, otherwise `subagent-done`. The run-level `subagent-done` is never sent while a child of the run is pending or running; a first-launch run whose last first-generation result arrives while a resumed sibling still runs sends nothing, and that sibling's settle sends the `subagent-done`.
 
 **Model resolution** (pi multi-provider verified: `modelRegistry.getAvailable()` / `find(provider,id)`; whitelist = settings `enabledModels` / `--models` → `ctx.scopedModels`):
 
@@ -745,8 +750,9 @@ export interface ChildHandle {
   steer(message: string): Promise<void>;          // running; terminal → throw
   followUp(message: string): Promise<void>;       // same, queued delivery
   resume(message: string, opts?: { timeoutMs?: number }): Promise<void>;
-                                                  // terminal → continue; does result become pending again afterwards? No:
-                                                  // resume returns a new Promise<ChildResult> via registry.getResult()
+                                                  // terminal → continue. Resolves once the request is accepted (queued),
+                                                  // not when the turn starts: abort drain and admission run afterwards.
+                                                  // The new turn's result is a new Promise<ChildResult> (registry.getResult())
                                                   // opts.timeoutMs: the new turn's soft budget (default: spawn budget)
   extend(timeoutMs?: number): { deadlineAt: number; hardDeadlineAt: number | null };
                                                   // running → soft deadline = now + timeoutMs (default: spawn budget);
