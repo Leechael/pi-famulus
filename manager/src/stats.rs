@@ -11,6 +11,17 @@
 //! Unmeasured tasks (running, SIGKILLed with their runner, older records)
 //! still count in TASKS/WALL and are shown in their own column, so a
 //! group's CPU is never silently a partial sum.
+//!
+//! deferred: live sampling of a running task's process-group CPU (Linux
+//! `/proc/<pid>/stat` utime+stime+cutime+cstime per member; macOS
+//! `proc_listpgrppids` + `proc_pid_rusage`, whose time units on Apple
+//! Silicon must be checked against getrusage first) | impact: running
+//! tasks show `-`, and tasks whose runner is SIGKILLed (`timeout_ms`, a
+//! stop past its grace) stay UNMEASURED; in the 2026-10-05 run the 22
+//! killed tasks held 4h11m of wall time, though a stop whose SIGTERM the
+//! command obeys is measured | trigger: a run where UNMEASURED tasks hold
+//! a large share of a group's wall time, or someone needs CPU of a task
+//! while it still runs.
 
 use crate::fmt;
 use crate::inspect::{self, Live};
