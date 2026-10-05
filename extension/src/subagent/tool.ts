@@ -295,9 +295,23 @@ export function createSubagentTool(
     return registry;
   };
 
+  /** Last terminal state a subagent-done was sent for, per run. */
+  const runDoneSent = new Map<string, string>();
   const notifyRunCompleted = (registry: SubagentRegistry, runId: string): void => {
     const record = registry.get(runId);
-    if (!record) return;
+    if (!record) {
+      runDoneSent.delete(runId);
+      return;
+    }
+    // A resumed child can outlive the run's first-launch completion. The
+    // run is not done while it runs; its own settle sends this wake.
+    if (record.children.some((c) => c.status === "pending" || c.status === "running")) return;
+    // Several observers (first-launch completion, each resumed turn's settle)
+    // can see the same all-terminal state. One subagent-done per terminal
+    // state, identified by every child's turn number.
+    const terminalKey = record.children.map((c) => `${c.childId}:${c.turn ?? 1}`).join("|");
+    if (runDoneSent.get(runId) === terminalKey) return;
+    runDoneSent.set(runId, terminalKey);
     deps.getNotifyCenter()?.notify(formatSubagentNotification(toNotificationInfo(record, clock.now())));
   };
 
@@ -628,11 +642,11 @@ export function createSubagentTool(
     // resume
     if (!params.message) throw new Error("message is required for resume");
     const child = resolveSingleTerminalChild(record, params.child_id);
-    const handle = registry.handle(child.childId);
-    if (!handle) throw new Error(`subagent ${child.childId} has no live session to resume`);
     // A resume is a new turn with its own soft budget: timeout_ms when given,
-    // else the child's spawn budget (the runner's default).
-    await handle.resume(
+    // else the child's spawn budget (the runner's default). Returns once the
+    // request is accepted; it never waits for an admission slot.
+    const { queuedBehind } = await registry.resumeChild(
+      child.childId,
       params.message,
       params.timeout_ms === undefined ? {} : { timeoutMs: clampTimeout(params.timeout_ms, deps.defaultTimeoutMs) },
     );
@@ -650,11 +664,12 @@ export function createSubagentTool(
           type: "text",
           text:
             `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
+            queuedText(queuedBehind) +
             "You will be notified via <pi-famulus-wake kind=\"subagent-handover\"> if others are still running, " +
             "otherwise via <pi-famulus-wake kind=\"subagent-done\"> when it completes. Do not poll.",
         },
       ],
-      details: { run_id: record.runId, child_id: child.childId },
+      details: { run_id: record.runId, child_id: child.childId, queued_behind: queuedBehind },
     };
   };
 
@@ -737,6 +752,13 @@ export function createSubagentTool(
   };
 }
 
+/** Resume result clause for a turn waiting for an admission slot ("" when it started at once). */
+function queuedText(queuedBehind: number | null): string {
+  if (queuedBehind === null) return "";
+  const ahead = queuedBehind === 0 ? "" : ` and ${queuedBehind} subagent(s) are waiting ahead of it`;
+  return `Every subagent slot is busy${ahead}, so it is queued and starts when a slot frees. `;
+}
+
 function resolveSingleActiveChild(
   registry: SubagentRegistry,
   record: RunRecord,
@@ -770,6 +792,14 @@ function resolveSingleTerminalChild(record: RunRecord, childIdOrName: string | u
     if (!child) {
       const known = record.children.map((c) => `${c.name} (${c.childId})`).join(", ");
       throw new Error(`no child "${childIdOrName}" in run ${record.runId} (children: ${known})`);
+    }
+    if (child.status === "pending") {
+      // Queued for an admission slot (a launch or an earlier resume): steer
+      // would fail too, and a second resume adds nothing.
+      throw new Error(
+        `subagent ${child.name} (${child.childId}) is already queued and starts when a subagent slot frees; ` +
+          "its result arrives as a wake when it finishes. Do not resume it again.",
+      );
     }
     if (!matches(child)) {
       throw new Error(`subagent ${child.name} (${child.childId}) is still ${child.status}; use steer instead`);

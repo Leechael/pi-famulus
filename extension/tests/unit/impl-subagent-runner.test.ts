@@ -288,6 +288,7 @@ describe("InProcessRunner", () => {
       expect(handle.status()).toBe("interrupted");
       emit({ type: "tool_execution_end" });
       await handle.resume("again");
+      await tick(); // the ceiling's abort drains, then the turn starts
       emit({ type: "tool_execution_end" });
       clock.advanceBy(50);
       expect(handle.status()).toBe("failed");
@@ -722,11 +723,12 @@ describe("InProcessRunner", () => {
       const first = await handle.result;
       expect(first.error).toBe("stalled");
 
-      const resumePromise = handle.resume("try again");
+      await handle.resume("try again"); // accepted; the drain runs in the background
       await tick();
+      expect(handle.status()).toBe("pending");
       expect(factory.sessions[0].prompts).toHaveLength(1); // waits for the abort
       factory.sessions[0].openAbortGate();
-      await resumePromise;
+      await tick();
       expect(factory.sessions[0].prompts).toHaveLength(2);
       factory.sessions[0].complete("recovered");
       const second = await handle.result;
@@ -734,7 +736,7 @@ describe("InProcessRunner", () => {
       expect(second.text).toBe("recovered");
     });
 
-    it("resume rejects when the abort never completes (hung session)", async () => {
+    it("a resumed turn settles failed when the abort never completes (hung session)", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
       factory.configure = (session) => {
@@ -749,9 +751,16 @@ describe("InProcessRunner", () => {
       const handle = await runner.start(makeReq());
       clock.advanceBy(500); // stall → failed(stalled), abort never resolves
       expect((await handle.result).error).toBe("stalled");
-      const resumePromise = handle.resume("try again");
+      // The caller is not held by the drain: resume() resolves at once, and
+      // the dead session is reported through the turn's result.
+      await handle.resume("try again");
+      expect(handle.status()).toBe("pending");
       clock.advanceBy(500); // bound (stallMs) expires
-      await expect(resumePromise).rejects.toThrow(/did not go idle/);
+      const second = await handle.result;
+      expect(second).toMatchObject({ status: "failed", text: "" });
+      expect(second.error).toMatch(/did not go idle/);
+      expect(factory.sessions[0].prompts).toHaveLength(1);
+      expect(clock.pendingTimers).toBe(0);
     });
 
     it("lastEventAt tracks session events", async () => {

@@ -7,7 +7,7 @@ import {
   formatTaskNotification,
   type TaskExitInfo,
 } from "../../src/format";
-import { formatFamulusWake, FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
+import { formatFamulusWake, stampWakeAsOf, FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
 import { registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests, visibleWidth } from "../../src/tui/pi-tui-load";
 
@@ -26,6 +26,41 @@ describe("pi-famulus-wake envelope", () => {
       expect(wake.content).toContain(`<pi-famulus-wake kind="${wake.details.kind}"`);
       expect(wake.content).toContain("</pi-famulus-wake>");
     }
+  });
+
+  it("renders details.asOf as the last root attribute, UTC to the second", () => {
+    const wake = formatFamulusWake({
+      kind: "supervisor-update",
+      from: "ch_a",
+      name: "worker",
+      message: "ready",
+      asOf: Date.UTC(2026, 9, 5, 12, 27, 26, 999),
+    });
+    expect(wake.content).toContain(
+      '<pi-famulus-wake kind="supervisor-update" from="ch_a" name="worker" as-of="2026-10-05T12:27:26Z">',
+    );
+  });
+
+  it("stampWakeAsOf leaves details unstamped when content has no root tag", () => {
+    const asOf = Date.UTC(2026, 9, 5, 12, 27, 26, 61);
+    const wake = formatFamulusWake({
+      kind: "supervisor-update",
+      from: "ch_a",
+      name: "worker",
+      message: "ready",
+    });
+    const broken = stampWakeAsOf(
+      { customType: wake.customType, content: "no wake tag here", details: { ...wake.details } },
+      asOf,
+    );
+    expect(broken.content).toBe("no wake tag here");
+    expect((broken.details as { asOf?: number }).asOf).toBeUndefined();
+    const stamped = stampWakeAsOf(
+      { customType: wake.customType, content: wake.content, details: { ...wake.details } },
+      asOf,
+    );
+    expect(stamped.content).toContain('as-of="2026-10-05T12:27:26Z"');
+    expect((stamped.details as { asOf?: number }).asOf).toBe(asOf);
   });
 
   it("wraps a task batch in one envelope and keeps a comma inside an item title", () => {

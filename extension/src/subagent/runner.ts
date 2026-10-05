@@ -67,6 +67,12 @@ export function stallRetryPrompt(stallMs: number): string {
   );
 }
 
+/** Identity of one generation's slot request (see InProcessRunnerOptions.acquire). */
+export interface AdmissionTicket {
+  /** False once the requesting generation settled or was superseded. */
+  current: () => boolean;
+}
+
 export interface InProcessRunnerOptions {
   createSession: CreateSessionFn;
   /** Stall watchdog timeout (ms). Default 10 minutes. */
@@ -93,7 +99,7 @@ export interface InProcessRunnerOptions {
    * resolved releaser is called when the generation settles. Rejecting
    * cancels the generation as {status:"interrupted", error}.
    */
-  acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<() => void>;
   /**
    * Called after the child's conversation may have changed (a message or
    * tool finished, or the generation settled). Used to persist transcripts.
@@ -130,7 +136,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly hardTimeoutMs: number;
   private readonly onOverrun?: (tick: OverrunTick) => void;
   private readonly clock: Clock;
-  private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  private readonly acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<() => void>;
   private readonly onActivity?: (childId: string) => void;
 
   private session: ChildSessionAdapter | null = null;
@@ -331,6 +337,13 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.armSoftDeadline(this.generation);
   }
 
+  /**
+   * Start a new user turn. Resolves once the request is accepted, not when
+   * the turn starts: draining a still-unwinding abort and waiting for an
+   * admission slot run in the background, so the parent's tool call never
+   * waits for a slot. Until admission the child is "pending" (queued).
+   * Failures after acceptance settle the new turn instead of rejecting.
+   */
   async resume(message: string, opts: { timeoutMs?: number } = {}): Promise<void> {
     if (this.status_ === "running" || this.status_ === "pending") {
       throw new Error(
@@ -343,19 +356,6 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (!this.session) {
       throw new Error(`subagent ${this.req.childId} has no session to resume`);
     }
-    // Drain a stall/timeout abort that is still unwinding (real pi rejects
-    // prompt() while the aborted run is active). Bounded: a hung abort means
-    // the session is dead and cannot be resumed.
-    const pendingAbort = this.abortPromise;
-    this.abortPromise = null;
-    if (pendingAbort && !(await this.awaitAbortBounded(pendingAbort))) {
-      throw new Error(
-        `subagent ${this.req.childId} session did not go idle after the abort; cannot resume`,
-      );
-    }
-    if (this.disposed) {
-      throw new Error(`subagent ${this.req.childId} has been disposed`);
-    }
     // A new user turn gets a fresh stall budget and a fresh soft budget:
     // the one passed with resume, else the spawn budget.
     this.stallAttempts = 0;
@@ -363,19 +363,50 @@ class InProcessChildHandle implements DisposableChildHandle {
       opts.timeoutMs !== undefined && opts.timeoutMs > 0 ? opts.timeoutMs : this.req.timeoutMs;
     this.reminders = 0;
     this.runStartedAt = this.clock.now();
-    // Swap in the new generation's result promise synchronously so that
-    // registry.getResult() observes it before/while admission runs.
+    // The turn's generation exists from here: interrupt()/dispose() while it
+    // is queued settle it, and its result promise is observable through
+    // registry.getResult() before admission.
+    const gen = ++this.generation;
+    this.settledFlag = false;
+    this.retiredGen = null;
+    this.status_ = "pending";
+    this.startedAt = this.runStartedAt;
+    this.lastEvent = this.runStartedAt;
     this.resultPromise = new Promise((resolve) => {
       this.resolveResult = resolve;
     });
-    await this.beginGeneration(message, false);
+    const pendingAbort = this.abortPromise;
+    this.abortPromise = null;
+    void this.startResumedTurn(gen, message, pendingAbort);
+  }
+
+  /**
+   * Background half of resume(): drain a stall/timeout abort that is still
+   * unwinding (real pi rejects prompt() while the aborted run is active),
+   * then admission and prompt. Bounded: a hung abort means the session is
+   * dead, and the turn settles failed.
+   */
+  private async startResumedTurn(gen: number, message: string, pendingAbort: Promise<void> | null): Promise<void> {
+    if (pendingAbort && !(await this.awaitAbortBounded(pendingAbort))) {
+      this.settle(gen, {
+        status: "failed",
+        text: "",
+        error: `subagent ${this.req.childId} session did not go idle after the abort; cannot resume`,
+        durationMs: this.now() - this.runStartedAt,
+      });
+      return;
+    }
+    if (this.disposed || this.isSettled(gen)) return;
+    await this.beginGeneration(message, false, false, gen);
   }
 
   async interrupt(): Promise<void> {
     if (this.status_ !== "running" && this.status_ !== "pending") return;
     this.settle(this.generation, {
       status: "interrupted",
-      text: this.partialText(),
+      // A pending turn has produced nothing yet; the last assistant text
+      // belongs to the previous turn.
+      text: this.status_ === "pending" ? "" : this.partialText(),
       durationMs: this.now() - this.startedAt,
     });
     try {
@@ -418,8 +449,14 @@ class InProcessChildHandle implements DisposableChildHandle {
    * slot acquired by the stalled generation is still held (no settle happened),
    * so admission is not re-run and the slot is not double-counted.
    */
-  private async beginGeneration(prompt: string, first: boolean, reuseSlot = false): Promise<void> {
-    const gen = ++this.generation;
+  private async beginGeneration(
+    prompt: string,
+    first: boolean,
+    reuseSlot = false,
+    resumedGen?: number,
+  ): Promise<void> {
+    // A resumed turn allocated its generation when it was requested.
+    const gen = resumedGen ?? ++this.generation;
     this.retiredGen = null;
     this.clearRetryTimer();
     this.timerScope?.dispose();
@@ -435,7 +472,12 @@ class InProcessChildHandle implements DisposableChildHandle {
 
     if (this.acquire && !reuseSlot) {
       try {
-        this.releaseSlot = await this.acquire(this.req);
+        // The ticket ties the slot request to THIS generation: a request
+        // whose generation settled while queued (interrupt, then a new
+        // resume) must not admit the child's next generation.
+        this.releaseSlot = await this.acquire(this.req, {
+          current: () => !this.disposed && !this.isSettled(gen),
+        });
       } catch (err) {
         // Admission denied (e.g. fail_fast cancellation while queued).
         this.settle(gen, {

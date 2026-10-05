@@ -28,6 +28,7 @@ import type { TaskExitInfo } from "./format";
 import { ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { NotifyCenter } from "./notify";
+import { onWakeMessageEnd, registryStatusLookup } from "./wake-delivery";
 import { createChildBashTool } from "./subagent/child-bash";
 import { ChildShellTracker, createOverrunNotifier } from "./subagent/overrun";
 import {
@@ -558,7 +559,7 @@ export default function (pi: ExtensionAPI): void {
       stallRetryDelayMs: subagentConfig.stallRetryDelayMs,
       overrunRepeatMs: subagentConfig.overrunRepeatMs,
       hardTimeoutMs: subagentConfig.hardTimeoutMs,
-      acquire: (req) => registry.admitChild(req.childId),
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
       onActivity: (childId) => {
         syncTranscript(childId);
       },
@@ -716,6 +717,16 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("agent_settled", async () => {
     notifyCenter?.settled();
+  });
+
+  // A wake entering the model's context (steer / triggerTurn); see wake-delivery.ts.
+  pi.on("message_end", async (event) => {
+    const message = onWakeMessageEnd(event.message, {
+      now: () => clock.now(),
+      logEvent,
+      lookup: () => (subagentRegistry ? registryStatusLookup(subagentRegistry) : null),
+    });
+    return message ? { message } : undefined;
   });
 
   pi.on("before_agent_start", async (event) => {

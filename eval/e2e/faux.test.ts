@@ -6,6 +6,8 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { type FauxEpisode, runFaux } from "./run-faux.ts";
 import { followedByAssistant, type Item, toolResults, wakes } from "../lib/transcript.ts";
@@ -51,6 +53,23 @@ function assertScriptConsumedExactly(ep: FauxEpisode, n: number) {
 
 const bashResult = (items: Item[]) => toolResults(items).find((r) => r.toolName === "bash");
 
+/** Extension events from the episode's session events.jsonl files. */
+function extensionEvents(ep: FauxEpisode): Array<Record<string, unknown> & { type: string }> {
+  const sessions = join(ep.sandbox.famulusHome, "sessions");
+  if (!existsSync(sessions)) return [];
+  const out: Array<Record<string, unknown> & { type: string }> = [];
+  for (const sid of readdirSync(sessions)) {
+    const file = join(sessions, sid, "events.jsonl");
+    if (!existsSync(file)) continue;
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      const e = JSON.parse(line) as Record<string, unknown> & { type: string };
+      if (e.src === "extension") out.push(e);
+    }
+  }
+  return out;
+}
+
 describe("faux e2e", { concurrency: true }, () => {
   it("(a) command over the foreground budget is backgrounded and notifies exactly once", async () => {
     const ep = await runFaux({
@@ -86,6 +105,18 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.equal(last?.kind, "assistant");
     assert.match((last as { text: string }).text, /WAKE-HANDLED saw-canary/);
     assertScriptConsumedExactly(ep, 3);
+
+    // Real pi emits extension message_end for the triggered wake: the
+    // extension logs when it entered the context and how long it waited.
+    const injects = extensionEvents(ep).filter((e) => e.type === "wake.inject");
+    assert.equal(injects.length, 1, `expected one wake.inject\n${JSON.stringify(injects)}`);
+    assert.equal(injects[0].kind, "task");
+    assert.deepEqual(injects[0].ids, [taskId]);
+    assert.equal(typeof injects[0].as_of, "number");
+    assert.ok(typeof injects[0].lag_ms === "number" && injects[0].lag_ms >= 0, JSON.stringify(injects[0]));
+    // ...and the model's request carried the wake with its age at injection.
+    const seen = JSON.stringify(ep.calls.at(-1)?.messages ?? []);
+    assert.match(seen, /<pi-famulus-wake kind=\\"task\\" as-of=\\"[0-9T:-]+Z\\" age-ms=\\"\d+\\">/, seen.slice(-1500));
   });
 
   it("(b) command within the foreground budget returns inline and produces no notification", async () => {

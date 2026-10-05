@@ -10,8 +10,10 @@
  * - lineage: v1 = same runId.
  *
  * Wiring contract: the runner must be constructed with
- * `acquire: (req) => registry.admitChild(req.childId)` so every generation
- * (initial start and resume) passes through admission. startChild() wires the
+ * `acquire: (req, ticket) => registry.admitChild(req.childId, ticket)` so every
+ * generation (initial start and resume) passes through admission. Forward the
+ * ticket: without it admitChild falls back to the handle's current status and
+ * a stale queued request can admit a newer resume. startChild() wires the
  * first generation's result; admitChild() wires subsequent generations.
  *
  * Zero pi dependency.
@@ -47,6 +49,8 @@ export interface RunRecord {
     result?: ChildResult;
     startedAt: number;
     endedAt?: number;
+    /** User turns so far: 1 for the launch, +1 per accepted resume. */
+    turn?: number;
   }[];
   status: "running" | "completed" | "partial" | "failed" | "interrupted";
   createdAt: number;
@@ -109,6 +113,7 @@ interface InternalChild {
   result?: ChildResult;
   startedAt: number;
   endedAt?: number;
+  turn: number;
   handle?: ChildHandle;
   shouldStart?: () => boolean;
 }
@@ -307,6 +312,7 @@ export class SubagentRegistry implements RunRegistry {
       agent: info.agent,
       status: "pending",
       startedAt: this.now(),
+      turn: 1,
     };
     run.children.push(child);
     this.children.set(child.childId, child);
@@ -364,7 +370,7 @@ export class SubagentRegistry implements RunRegistry {
    * and wires result settlement for resumed generations. Returns the slot
    * releaser.
    */
-  async admitChild(childId: string): Promise<() => void> {
+  async admitChild(childId: string, ticket?: { current: () => boolean }): Promise<() => void> {
     await this.acquireSlot();
     let released = false;
     const release = () => {
@@ -381,6 +387,15 @@ export class SubagentRegistry implements RunRegistry {
       release();
       throw new ChildCancelledError();
     }
+    // The generation that queued this request settled while it waited
+    // (interrupt/dispose; maybe a newer resume is queued behind other
+    // children): hand the slot on, without touching the child's status.
+    // Without a ticket, fall back to the handle's status.
+    const stale = ticket ? !ticket.current() : (child.handle?.status() ?? "pending") !== "pending";
+    if (stale) {
+      release();
+      throw new ChildCancelledError("settled while queued");
+    }
     this.transitionChild(child, "running");
     const handle = child.handle;
     if (handle) {
@@ -389,6 +404,64 @@ export class SubagentRegistry implements RunRegistry {
       handle.result.then((result) => this.settleChild(childId, result));
     }
     return release;
+  }
+
+  /**
+   * Resume an ended child: a new user turn on its session. Returns once the
+   * request is accepted; admission runs in the background (design.md §4.6
+   * "Child lifecycle", resume rows). Until a slot is granted the child is
+   * pending. `queuedBehind` is null when a slot was free at request time,
+   * otherwise how many children were already waiting for one.
+   */
+  async resumeChild(
+    childId: string,
+    message: string,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<{ queuedBehind: number | null }> {
+    const child = this.children.get(childId);
+    if (!child) throw new Error(`unknown child ${childId}`);
+    const handle = child.handle;
+    if (!handle) throw new Error(`subagent ${childId} has no live session to resume`);
+    const queuedBehind = this.activeSlots >= this.maxChildren ? this.slotWaiters.length : null;
+    const previous = {
+      status: child.status,
+      result: child.result,
+      startedAt: child.startedAt,
+      endedAt: child.endedAt,
+    };
+    const accepted = handle.resume(message, opts);
+    // Mark the child queued before awaiting: with a free slot, admitChild's
+    // continuation can run first and move it to running, which must win.
+    child.status = "pending";
+    child.result = undefined;
+    child.endedAt = undefined;
+    child.startedAt = this.now();
+    child.turn += 1;
+    try {
+      await accepted;
+    } catch (err) {
+      // Undo this attempt's +1 even if a concurrent accepted resume has
+      // already moved the child to running (the pending guard would skip).
+      child.turn -= 1;
+      if (child.status === "pending") {
+        child.status = previous.status;
+        child.result = previous.result;
+        child.startedAt = previous.startedAt;
+        child.endedAt = previous.endedAt;
+      }
+      throw err;
+    }
+    // Wired at request time, not admission: a turn that never gets a slot
+    // (interrupt/dispose while queued, abort drain bound) still settles here.
+    handle.result.then((result) => this.settleChild(childId, result));
+    if (child.status === "pending") {
+      const run = this.runs.get(child.runId);
+      if (run) {
+        this.recomputeRunStatus(run);
+        this.emit(run);
+      }
+    }
+    return { queuedBehind };
   }
 
   /** Current generation's result promise for a child (post-resume aware). */
@@ -574,6 +647,7 @@ function snapshot(run: InternalRun): RunRecord {
       result: c.result,
       startedAt: c.startedAt,
       endedAt: c.endedAt,
+      turn: c.turn,
     })),
   };
 }

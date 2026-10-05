@@ -174,7 +174,11 @@ Renders the transcript `sessions/<sid>/agents/<ch>.jsonl` (one JSON object per m
 ```text
 2026-09-23 14:03:22.123 0199aaaa manager   task.exit          sh_3f2a91c0 exit_code=0 end_reason=exited duration_ms=64012
 2026-09-23 14:03:22.140 0199aaaa extension wake.emit          - kind=task ids=["sh_3f2a91c0"] batch=1
+2026-09-23 14:03:22.140 0199aaaa extension wake.deliver       - kind=task mode=steer
+2026-09-23 14:03:31.502 0199aaaa extension wake.inject        - kind=task ids=["sh_3f2a91c0"] as_of=1790143402140 lag_ms=9362
 ```
+
+`wake.deliver` is when the extension handed the wake to pi; `wake.inject` is when it entered the model's context, and `lag_ms` how long it waited in between (a steered wake waits for the parent's current tool calls and turn). Passive wakes (`mode=passive`) have no `wake.inject`: pi appends them when they are sent.
 
 The event log, merged and time-ordered across every session (plus daemon events). Filters: `--session PREFIX`, `--id ID` (matches `id`, `child_id`, or an entry of `ids`), `--since DUR`. `--json` prints one raw event per line with a `session` field added. `-f` follows all files, including sessions that appear later. Malformed lines are skipped, with a count on stderr.
 

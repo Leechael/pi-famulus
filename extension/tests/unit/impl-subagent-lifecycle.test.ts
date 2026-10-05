@@ -27,7 +27,7 @@ function makeStack() {
     stallMs: 5 * MIN,
     stallRetries: 1,
     stallRetryDelayMs: 5_000,
-    acquire: (req) => registry.admitChild(req.childId),
+    acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
   });
   registry.setRunner(runner);
   const transitions: string[] = [];

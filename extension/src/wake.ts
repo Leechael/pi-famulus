@@ -29,10 +29,15 @@ export interface TaskWake {
   signal?: string;
 }
 
+export type WakeChildStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
+
 export interface SubagentDoneChild {
   childId: string;
   name: string;
-  status: "pending" | "running" | "completed" | "failed" | "interrupted";
+  /** Status when the model sees the wake (re-checked at injection). */
+  status: WakeChildStatus;
+  /** Set when the status changed after as-of: the status in the snapshot. */
+  statusAsOf?: WakeChildStatus;
   prompt: string;
   result: string;
   error?: string;
@@ -55,7 +60,25 @@ export interface OverrunShell {
   growing: boolean | null;
 }
 
-export type FamulusWake =
+/**
+ * When the wake's content was generated (design.md §4.5): stamped by the
+ * NotifyCenter when it receives or builds the wake. A steered wake can wait
+ * minutes before the model sees it; the model needs to know how old the
+ * snapshot is.
+ */
+export interface WakeTiming {
+  /** Epoch ms. Rendered as the root attribute as-of (UTC, seconds). */
+  asOf?: number;
+  /**
+   * How old the wake was when it entered the model's context (ms). Set at
+   * injection (wake-delivery.ts), rendered as the root attribute age-ms.
+   */
+  ageMs?: number;
+}
+
+export type FamulusWake = FamulusWakeBody & WakeTiming;
+
+type FamulusWakeBody =
   | { kind: "task"; stillRunning: WakeItem[]; tasks: TaskWake[] }
   | {
       kind: "monitor";
@@ -71,7 +94,10 @@ export type FamulusWake =
       runId: string;
       childId: string;
       name: string;
-      status: "completed" | "failed" | "interrupted";
+      /** The settle this wake reports; pending/running only when re-checked at injection. */
+      status: WakeChildStatus;
+      /** Set when the status changed after as-of: the status in the snapshot. */
+      statusAsOf?: WakeChildStatus;
       stillRunning: WakeItem[];
       summary: string;
       prompt: string;
@@ -83,6 +109,8 @@ export type FamulusWake =
       kind: "subagent-done";
       runId: string;
       status: "completed" | "partial" | "failed" | "interrupted";
+      /** Set at injection when a child is pending or running again: the run's status then. */
+      runStatusNow?: string;
       durationMs: number;
       summary: string;
       children: SubagentDoneChild[];
@@ -136,7 +164,79 @@ export function formatFamulusWake(details: FamulusWake, leadIn: string = FAMULUS
   return { customType: FAMULUS_WAKE_CUSTOM_TYPE, content, details };
 }
 
+/** Task/child/monitor ids a wake is about (event log `ids`). */
+export function wakeIds(details: { kind?: string }): string[] {
+  const d = details as {
+    kind?: string;
+    id?: string;
+    taskId?: string;
+    tasks?: { id: string }[];
+    children?: { childId: string }[];
+    childId?: string;
+    from?: string;
+  };
+  if (d.kind === "task") return (d.tasks ?? []).map((task) => task.id);
+  if (d.kind === "subagent-done") return (d.children ?? []).map((child) => child.childId);
+  return [d.id ?? d.taskId ?? d.childId ?? d.from].filter((id): id is string => Boolean(id));
+}
+
+/** UTC, second precision: the model needs how old a snapshot is, not milliseconds. */
+export function wakeTimestamp(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** Append attributes to the root <pi-famulus-wake …> tag of rendered content. */
+function addRootAttrs(content: string, attrs: string[]): string {
+  if (attrs.length === 0) return content;
+  // `\s`: the lead-in mentions a bare <pi-famulus-wake>; the root tag has attributes.
+  const root = /<pi-famulus-wake\s[^>]*>/.exec(content);
+  if (!root) return content;
+  const end = root.index + root[0].length - 1;
+  return `${content.slice(0, end)} ${attrs.join(" ")}${content.slice(end)}`;
+}
+
+function timingAttrs(details: WakeTiming): string[] {
+  const attrs: string[] = [];
+  if (details.asOf !== undefined) attrs.push(`as-of="${wakeTimestamp(details.asOf)}"`);
+  if (details.ageMs !== undefined) attrs.push(`age-ms="${Math.round(details.ageMs)}"`);
+  return attrs;
+}
+
+/** The <pi-famulus-wake> element for `details` (no lead-in). */
+export function renderWakeXml(details: FamulusWake): string {
+  return renderWake(details);
+}
+
+/** Index of the root <pi-famulus-wake …> tag in content, or -1. */
+export function wakeRootIndex(content: string): number {
+  return content.search(/<pi-famulus-wake\s/);
+}
+
+/**
+ * Stamp a wake with the time it was generated. Leaves non-wake messages and
+ * already-stamped wakes alone, so a wake held for later delivery keeps the
+ * time it was built.
+ */
+export function stampWakeAsOf<M extends { customType: string; content: string; details?: unknown }>(
+  message: M,
+  asOf: number,
+): M {
+  if (message.customType !== FAMULUS_WAKE_CUSTOM_TYPE) return message;
+  const details = message.details as (WakeTiming & { kind?: string }) | undefined;
+  if (!details || typeof details !== "object" || !details.kind || details.asOf !== undefined) return message;
+  const stamped = { ...details, asOf };
+  const content = addRootAttrs(message.content, timingAttrs(stamped));
+  // addRootAttrs is a no-op when the root tag is missing; keep details in
+  // sync with content so wakeAtInjection does not reject a phantom stamp.
+  if (content === message.content) return message;
+  return { ...message, content, details: stamped };
+}
+
 function renderWake(details: FamulusWake): string {
+  return addRootAttrs(renderWakeBody(details), timingAttrs(details));
+}
+
+function renderWakeBody(details: FamulusWake): string {
   switch (details.kind) {
     case "task":
       return renderTask(details);
@@ -207,10 +307,20 @@ function renderHandover(details: Extract<FamulusWake, { kind: "subagent-handover
     `name="${escapeXmlAttr(details.name)}"`,
     `status="${escapeXmlAttr(details.status)}"`,
   ];
+  if (details.statusAsOf) attrs.push(`status-as-of="${escapeXmlAttr(details.statusAsOf)}"`);
   const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`];
   const still = stillRunningXml(details.stillRunning);
   if (still) parts.push(still);
   parts.push(`  <summary>${escapeXml(details.summary)}</summary>`);
+  if (details.statusAsOf) {
+    const active = details.status === "pending" || details.status === "running";
+    parts.push(
+      `  <changed-since-as-of>${escapeXml(
+        `${details.name} (${details.childId}): ${details.statusAsOf} → ${details.status}.` +
+          (active ? " Its result arrives as a new wake when it finishes." : ""),
+      )}</changed-since-as-of>`,
+    );
+  }
   parts.push(`  <prompt>${escapeXml(details.prompt)}</prompt>`);
   if (details.error) parts.push(`  <error>${escapeXml(details.error)}</error>`);
   if (details.warning) parts.push(`  <warning>${escapeXml(details.warning)}</warning>`);
@@ -226,10 +336,22 @@ function renderDone(details: Extract<FamulusWake, { kind: "subagent-done" }>): s
     `status="${escapeXmlAttr(details.status)}"`,
     `duration-ms="${Math.round(details.durationMs)}"`,
   ];
+  if (details.runStatusNow) attrs.push(`status-now="${escapeXmlAttr(details.runStatusNow)}"`);
   const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <summary>${escapeXml(details.summary)}</summary>`];
-  for (const child of details.children) {
+  const changed = details.children.filter((child) => child.statusAsOf !== undefined);
+  if (changed.length > 0) {
+    const list = changed.map((c) => `${c.name} (${c.childId}): ${c.statusAsOf} → ${c.status}`).join("; ");
+    const active = details.children.some((c) => c.status === "pending" || c.status === "running");
     parts.push(
-      `  <child id="${escapeXmlAttr(child.childId)}" name="${escapeXmlAttr(child.name)}" status="${escapeXmlAttr(child.status)}">`,
+      `  <changed-since-as-of>${escapeXml(
+        `${list}.` + (active ? " The run is active again; another subagent-done arrives when it finishes." : ""),
+      )}</changed-since-as-of>`,
+    );
+  }
+  for (const child of details.children) {
+    const asOf = child.statusAsOf ? ` status-as-of="${escapeXmlAttr(child.statusAsOf)}"` : "";
+    parts.push(
+      `  <child id="${escapeXmlAttr(child.childId)}" name="${escapeXmlAttr(child.name)}" status="${escapeXmlAttr(child.status)}"${asOf}>`,
     );
     parts.push(`    <prompt>${escapeXml(child.prompt)}</prompt>`);
     if (child.error) parts.push(`    <error>${escapeXml(child.error)}</error>`);
