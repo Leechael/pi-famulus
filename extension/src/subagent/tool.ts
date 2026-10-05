@@ -225,6 +225,7 @@ function toNotificationInfo(record: RunRecord, now: number) {
       status: c.status,
       text: c.result?.text ?? "",
       error: c.result?.error,
+      ...(c.result?.warning !== undefined ? { warning: c.result.warning } : {}),
       ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
     })),
   };
@@ -323,6 +324,7 @@ export function createSubagentTool(
         prompt: child.prompt ?? "",
         text: child.result?.text ?? "",
         ...(child.result?.error !== undefined ? { error: child.result.error } : {}),
+        ...(child.result?.warning !== undefined ? { warning: child.result.warning } : {}),
         stillRunning,
       }),
     );
