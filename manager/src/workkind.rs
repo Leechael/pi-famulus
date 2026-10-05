@@ -347,8 +347,15 @@ const TEST: &[&str] = &[
 const SCRIPT_RUNNERS: &[&str] = &["pdm", "uv", "poetry", "pipenv", "hatch", "rye", "npm", "pnpm", "yarn", "bun", "just", "task", "make"];
 
 fn simple_kind(words: &[String], depth: usize) -> Option<WorkKind> {
+    simple_kind_fed(words, depth, false)
+}
+
+/// `fed_by_xargs`: an `xargs` further out supplies arguments on stdin, so
+/// a test runner reached through more wrappers (`xargs uv run python -m
+/// pytest`) is still a targeted run.
+fn simple_kind_fed(words: &[String], depth: usize, fed_by_xargs: bool) -> Option<WorkKind> {
     let mut w: Vec<&str> = words.iter().map(String::as_str).collect();
-    let mut fed_by_xargs = false;
+    let mut fed_by_xargs = fed_by_xargs;
     loop {
         // Assignments and compound-command leaders before the program.
         while let Some(first) = w.first() {
@@ -481,7 +488,7 @@ fn program_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKin
                 WorkKind::Build
             }
         }
-        _ => wrapped_kind(prog, args).unwrap_or(WorkKind::Other),
+        _ => wrapped_kind(prog, args, fed_by_xargs).unwrap_or(WorkKind::Other),
     })
 }
 
@@ -489,7 +496,7 @@ fn program_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKin
 /// function or script used as a wrapper (`run_check fmt pdm run
 /// fmt-check`, `retry 3 cargo test`). Interpreters are excluded: their
 /// arguments are code or scripts, not commands.
-fn wrapped_kind(prog: &str, args: &[&str]) -> Option<WorkKind> {
+fn wrapped_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKind> {
     if ["python", "node", "ruby", "perl", "deno", "bun"].iter().any(|p| prog.starts_with(p)) {
         return None;
     }
@@ -498,7 +505,7 @@ fn wrapped_kind(prog: &str, args: &[&str]) -> Option<WorkKind> {
     };
     let at = args.iter().position(|a| heavy(base(a)))?;
     let words: Vec<String> = args[at..].iter().map(|s| s.to_string()).collect();
-    simple_kind(&words, 0).filter(|k| *k > WorkKind::Other)
+    simple_kind_fed(&words, 0, fed_by_xargs).filter(|k| *k > WorkKind::Other)
 }
 
 /// `pdm run X`, `npm run X`, `make X`, …: X is a script/target name or a
@@ -520,7 +527,7 @@ fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
         ("uv", "sync" | "lock" | "pip" | "add" | "build") | ("pdm" | "poetry" | "hatch" | "rye", "build") => return WorkKind::Build,
         ("npm" | "pnpm" | "yarn" | "bun", "exec" | "dlx" | "x") => {
             let rest: Vec<String> = after.iter().map(|s| s.to_string()).collect();
-            return simple_kind(&rest, 0).unwrap_or(WorkKind::Other);
+            return simple_kind_fed(&rest, 0, fed_by_xargs).unwrap_or(WorkKind::Other);
         }
         _ => {}
     }
@@ -542,7 +549,7 @@ fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
     // matched above, `uv run ruff`, `pdm run python -m mypy`).
     let mut words = vec![name.to_string()];
     words.extend(script_args.iter().map(|s| s.to_string()));
-    match simple_kind(&words, 0) {
+    match simple_kind_fed(&words, 0, fed_by_xargs) {
         Some(k) => k,
         None if runner == "make" || runner == "just" => WorkKind::Build,
         None => WorkKind::Other,
@@ -803,6 +810,23 @@ mod tests {
         }
         for cmd in ["pytest -q -n4", "pytest --ignore=tests/slow", "cargo test --package=pi-famulus", "cargo test --features=test-clock"] {
             assert_eq!(k(cmd), TestSuite, "{cmd}");
+        }
+    }
+
+    /// Targets fed by xargs stay targets however many wrappers sit between
+    /// xargs and the test runner.
+    #[test]
+    fn xargs_context_survives_nested_wrappers() {
+        for cmd in [
+            "xargs pytest",
+            "xargs uv run python -m pytest -q",
+            "xargs pdm run pytest -n 10",
+            "xargs -n 50 env PYTHONPATH=. uv run pytest",
+            "xargs npx vitest run",
+            "xargs npm exec vitest run",
+            "xargs retry 3 pytest",
+        ] {
+            assert_eq!(k(cmd), Test, "{cmd}");
         }
     }
 
