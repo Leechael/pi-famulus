@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatSubagentHandover, formatSubagentNotification } from "../../src/format";
+import { expandedWakeText } from "../../src/tui/message-renderers";
 
 describe("formatSubagentNotification", () => {
   it("produces one subagent-done child per result", () => {
@@ -89,5 +90,49 @@ describe("formatSubagentHandover", () => {
     expect(text).toContain("<result>loader reads mtime</result>");
     expect(text).toContain('<item id="ch_2">worker-2</item>');
     expect(text).toContain('child-id="ch_1"');
+  });
+});
+
+describe("child warnings in subagent wakes", () => {
+  const warning = 'unknown thinking level "highest" in model spec "haiku:highest"; using the model\'s default thinking';
+
+  it("subagent-done renders a child's warning before its result", () => {
+    const wake = formatSubagentNotification({
+      runId: "run_x",
+      status: "completed",
+      durationMs: 1,
+      children: [
+        { childId: "ch_a", name: "a", status: "completed", text: "ok", warning },
+        { childId: "ch_b", name: "b", status: "completed", text: "ok" },
+      ],
+    });
+    expect(wake.content).toContain(`<warning>${warning}</warning>\n    <result>ok</result>`);
+    expect(wake.content.match(/<warning>/g)).toHaveLength(1);
+    expect(wake.details).toMatchObject({ kind: "subagent-done", children: [{ warning }, {}] });
+    expect(expandedWakeText(wake.details, wake.content)).toContain(`Warning: ${warning}`);
+  });
+
+  it("subagent-handover renders the child's warning before its result", () => {
+    const wake = formatSubagentHandover({
+      runId: "run_a",
+      childId: "ch_1",
+      name: "worker-1",
+      status: "completed",
+      prompt: "p",
+      text: "r",
+      warning,
+      stillRunning: [{ id: "ch_2", title: "worker-2" }],
+    });
+    expect(wake.content).toContain(`<warning>${warning}</warning>\n  <result>r</result>`);
+    expect(wake.details).toMatchObject({ kind: "subagent-handover", warning });
+    expect(expandedWakeText(wake.details, wake.content)).toContain(`Warning: ${warning}`);
+  });
+
+  it("omits the element when there is no warning", () => {
+    const wake = formatSubagentHandover({
+      runId: "run_a", childId: "ch_1", name: "w", status: "completed", prompt: "p", text: "r", stillRunning: [],
+    });
+    expect(wake.content).not.toContain("<warning>");
+    expect(wake.details).not.toHaveProperty("warning");
   });
 });

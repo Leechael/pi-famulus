@@ -133,9 +133,9 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
     case "monitor":
       return [`Monitor: ${details.description}`, `Task: ${details.id}`, ...(details.status ? [`Status: ${details.status}`] : []), `Event: ${details.event}`, ...(details.eventCount ? [`Events: ${details.eventCount}`] : []), ...(details.droppedLines ? [`Dropped lines: ${details.droppedLines}`] : [])].join("\n");
     case "subagent-handover":
-      return [`Subagent handover: ${details.name} (${details.status})`, `Run: ${details.runId}`, `Child: ${details.childId}`, `Task prompt: ${details.prompt}`, `Result: ${details.result}`, ...(details.error ? [`Error: ${details.error}`] : []), ...(details.stillRunning.length ? [`Still running: ${details.stillRunning.map((item) => `${item.id} ${item.title}`).join(", ")}`] : [])].join("\n\n");
+      return [`Subagent handover: ${details.name} (${details.status})`, `Run: ${details.runId}`, `Child: ${details.childId}`, `Task prompt: ${details.prompt}`, `Result: ${details.result}`, ...(details.error ? [`Error: ${details.error}`] : []), ...(details.warning ? [`Warning: ${details.warning}`] : []), ...(details.stillRunning.length ? [`Still running: ${details.stillRunning.map((item) => `${item.id} ${item.title}`).join(", ")}`] : [])].join("\n\n");
     case "subagent-done":
-      return [`Subagent run: ${details.runId} (${details.status})`, `Duration: ${formatDuration(details.durationMs)}`, ...details.children.map((child) => [`${child.name} (${child.childId}) · ${child.status}`, `Task prompt: ${child.prompt}`, `Result: ${child.result}`, ...(child.error ? [`Error: ${child.error}`] : [])].join("\n"))].join("\n\n");
+      return [`Subagent run: ${details.runId} (${details.status})`, `Duration: ${formatDuration(details.durationMs)}`, ...details.children.map((child) => [`${child.name} (${child.childId}) · ${child.status}`, `Task prompt: ${child.prompt}`, `Result: ${child.result}`, ...(child.error ? [`Error: ${child.error}`] : []), ...(child.warning ? [`Warning: ${child.warning}`] : [])].join("\n"))].join("\n\n");
     case "supervisor-request":
       return [`Decision requested by ${details.name} (${details.from})`, `Request: ${details.message}`, `Reply with /reply ${details.from} <decision>`].join("\n");
     case "supervisor-update":

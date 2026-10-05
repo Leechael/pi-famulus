@@ -426,8 +426,8 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 |---|---|---|---|
 | `task` | (none; still-running is not an attribute) | Optional `<still-running><item id>`; one or more `<task id kind status duration-ms exit-code? signal?>`, containing `summary` `command` `output-file` `preview` | `{ kind:"task"; stillRunning: {id,title}[]; tasks: [{ id, taskKind, status, summary, command, outputPath, preview, durationMs, exitCode: number\|null, signal?: string }] }` |
 | `monitor` | `id` `description` `status?` | `<event>` | `{ kind:"monitor"; id; description; status?; event }` |
-| `subagent-handover` | `run-id` `child-id` `name` `status` | Optional `<still-running>`; `summary` `prompt` `result`; optional `error` | `{ kind:"subagent-handover"; runId; childId; name; status; stillRunning: {id,title}[]; summary; prompt; result; error? }` |
-| `subagent-done` | `run-id` `status` `duration-ms` | `summary`, then one `<child id name status>` per child, containing `prompt` (head capped at 2000), optional `error`, `result` (tail capped at 2000) | `{ kind:"subagent-done"; runId; status; durationMs; summary; children: [{ childId, name, status, prompt, result, error? }] }` |
+| `subagent-handover` | `run-id` `child-id` `name` `status` | Optional `<still-running>`; `summary` `prompt` `result`; optional `error`, `warning` | `{ kind:"subagent-handover"; runId; childId; name; status; stillRunning: {id,title}[]; summary; prompt; result; error?; warning? }` |
+| `subagent-done` | `run-id` `status` `duration-ms` | `summary`, then one `<child id name status>` per child, containing `prompt` (head capped at 2000), optional `error`, optional `warning`, `result` (tail capped at 2000) | `{ kind:"subagent-done"; runId; status; durationMs; summary; children: [{ childId, name, status, prompt, result, error?, warning? }] }` |
 | `supervisor-request` | `from` `name` | `message`, `reply-with` | `{ kind:"supervisor-request"; from; name; message }` |
 | `supervisor-update` | `from` `name` | `message` | `{ kind:"supervisor-update"; from; name; message }` |
 
