@@ -98,6 +98,12 @@ function collapsedText(details: FamulusWake, theme: Theme): string {
       const { color, glyph } = statusGlyph(bad ? "failed" : details.status);
       return `${theme.fg(color, glyph)} ${theme.fg("muted", "subagent")} ${countStatuses(details.children.map((child) => child.status))}`;
     }
+    case "subagent-overrun": {
+      const shell = details.shell
+        ? ` · shell ${formatDuration(details.shell.elapsedMs)}${details.shell.growing === null ? "" : details.shell.growing ? " (output growing)" : " (output idle)"}`
+        : "";
+      return `${theme.fg("warning", "!")} ${theme.fg("muted", "overrun")} ${details.name} ${formatDuration(details.elapsedMs)} / ${formatDuration(details.budgetMs)} budget · still running${shell}`;
+    }
     case "supervisor-request":
       return [
         `${theme.fg("warning", "?")} ${theme.fg("muted", `decision for ${details.name}`)} ${details.message.slice(0, 100)}`,
@@ -136,6 +142,27 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
       return [`Subagent handover: ${details.name} (${details.status})`, `Run: ${details.runId}`, `Child: ${details.childId}`, `Task prompt: ${details.prompt}`, `Result: ${details.result}`, ...(details.error ? [`Error: ${details.error}`] : []), ...(details.warning ? [`Warning: ${details.warning}`] : []), ...(details.stillRunning.length ? [`Still running: ${details.stillRunning.map((item) => `${item.id} ${item.title}`).join(", ")}`] : [])].join("\n\n");
     case "subagent-done":
       return [`Subagent run: ${details.runId} (${details.status})`, `Duration: ${formatDuration(details.durationMs)}`, ...details.children.map((child) => [`${child.name} (${child.childId}) · ${child.status}`, `Task prompt: ${child.prompt}`, `Result: ${child.result}`, ...(child.error ? [`Error: ${child.error}`] : []), ...(child.warning ? [`Warning: ${child.warning}`] : [])].join("\n"))].join("\n\n");
+    case "subagent-overrun": {
+      const shell = details.shell;
+      return [
+        `Subagent past its budget: ${details.name} (still running, reminder ${details.reminder})`,
+        `Run: ${details.runId}`,
+        `Child: ${details.childId}`,
+        `Elapsed this turn: ${formatDuration(details.elapsedMs)} of ${formatDuration(details.budgetMs)}`,
+        `Last activity (${formatDuration(details.lastActivity.agoMs)} ago): ${details.lastActivity.text}`,
+        ...(shell
+          ? [
+              [
+                `Shell ${shell.taskId} · ${formatDuration(shell.elapsedMs)}`,
+                `$ ${shell.command}`,
+                `Output: ${shell.outputPath}${shell.outputBytes !== null ? ` (${shell.outputBytes} bytes)` : ""}`,
+                ...(shell.outputIdleMs !== null ? [`Last output: ${formatDuration(shell.outputIdleMs)} ago`] : []),
+              ].join("\n"),
+            ]
+          : []),
+        `Next reminder in ${formatDuration(details.nextReminderMs)} unless you extend, steer, or interrupt it.`,
+      ].join("\n\n");
+    }
     case "supervisor-request":
       return [`Decision requested by ${details.name} (${details.from})`, `Request: ${details.message}`, `Reply with /reply ${details.from} <decision>`].join("\n");
     case "supervisor-update":
