@@ -18,8 +18,10 @@ mod pager;
 mod proto;
 mod registry;
 mod runner;
+mod stats;
 mod sys;
 mod task;
+mod workkind;
 
 use cli::{Cli, Sub};
 
@@ -82,6 +84,22 @@ async fn async_main() {
             run_client(inspect::cmd_ls(&home, opts)).await
         }
         Sub::Show { id, json } => run_client(inspect::cmd_show(&home, &id, json)).await,
+        Sub::Stats {
+            by,
+            session,
+            cwd,
+            since,
+            json,
+        } => {
+            let opts = stats::StatsOpts {
+                by,
+                session,
+                cwd,
+                since,
+                json,
+            };
+            run_client(stats::cmd_stats(&home, opts)).await
+        }
         Sub::Agent { id, full, follow } => {
             run_client(inspect::cmd_agent(&home, &id, full, follow)).await
         }

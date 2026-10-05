@@ -431,6 +431,27 @@ pub fn pid_alive(pid: u32) -> bool {
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// CPU and peak memory of every child this process has waited for, and of
+/// every descendant those children waited for in turn (`RUSAGE_CHILDREN`).
+/// Returns `(user_us, sys_us, max_rss_kb)`. `max_rss_kb` is the peak of the
+/// single largest such process, not a sum. A process nobody waited for (one
+/// that was orphaned and reaped by init, or still runs) is not included.
+/// `ru_maxrss` is KiB on Linux and bytes on Darwin; this returns KiB.
+pub fn children_usage() -> io::Result<(u64, u64, u64)> {
+    // SAFETY: getrusage fills a stack-allocated rusage; no aliasing.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        usage
+    };
+    let us = |tv: libc::timeval| (tv.tv_sec.max(0) as u64) * 1_000_000 + tv.tv_usec.max(0) as u64;
+    let rss = usage.ru_maxrss.max(0) as u64;
+    let rss_kb = if cfg!(target_os = "macos") || cfg!(target_os = "ios") { rss / 1024 } else { rss };
+    Ok((us(usage.ru_utime), us(usage.ru_stime), rss_kb))
+}
+
 /// Peak resident set size for this process (bytes on Darwin, KiB on Linux).
 /// Used only by optional leak/RSS regression tests.
 #[cfg(test)]

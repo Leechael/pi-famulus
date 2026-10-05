@@ -746,6 +746,82 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A fixed amount of CPU work (no sleep: its duration is not CPU, and
+    /// macOS CI rounds sleeps). About 0.4 s of user time on an M-series Mac.
+    pub(crate) const BURN: &str = "awk 'BEGIN{for(i=0;i<10000000;i++)s+=i}'";
+    /// Well under BURN's cost on any machine, well over two idle shells'.
+    pub(crate) const BURN_FLOOR_US: u64 = 100_000;
+
+    async fn reported(t: &mut SpawnedTask) -> crate::runner::Reported {
+        let _ = wait_and_drain(t).await;
+        let mut line = String::new();
+        t.status.read_to_string(&mut line).await.unwrap();
+        crate::runner::parse_status(&line).unwrap_or_else(|| panic!("status line: {line:?}"))
+    }
+
+    /// The runner's usage covers the whole wait chain under `sh`: here the
+    /// CPU is spent only by a grandchild (two shells that cannot exec away
+    /// stand between it and the runner).
+    #[tokio::test]
+    async fn runner_reports_cpu_of_waited_for_descendants() {
+        let dir = unique_dir("cpu");
+        let env = HashMap::new();
+        let cmd = format!("sh -c \"{}\"; true", BURN.replace('"', "\\\""));
+        let cmd = format!("sh -c '{}'; true", cmd.replace('\'', "'\\''"));
+        let mut t = spawn(&cmd, "/", &env, &dir.join("t.output")).unwrap();
+        let r = reported(&mut t).await;
+        assert_eq!(r.code, Some(0), "{cmd}");
+        let u = r.usage.expect("usage reported");
+        assert!(u.cpu_user_us >= BURN_FLOOR_US, "grandchild CPU missing: {u:?} for {cmd}");
+        assert!(u.max_rss_kb > 0, "{u:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A process that reaps a child and then execs: POSIX says exec keeps
+    /// the children's times, and Linux does; macOS drops them (measured:
+    /// `sh -c "<burn>; exec true"` reports 0.00 s user under
+    /// `/usr/bin/time -l`, 0.42 s without the `exec`). Pinned per platform
+    /// so a change in either shows up.
+    #[tokio::test]
+    async fn runner_usage_across_exec_is_platform_dependent() {
+        let dir = unique_dir("cpuexec");
+        let env = HashMap::new();
+        let mut t = spawn(&format!("{BURN}; exec true"), "/", &env, &dir.join("t.output")).unwrap();
+        let u = reported(&mut t).await.usage.expect("usage reported");
+        if cfg!(target_os = "macos") {
+            assert!(u.cpu_user_us < BURN_FLOOR_US, "macOS kept CPU across exec: {u:?}");
+        } else {
+            assert!(u.cpu_user_us >= BURN_FLOOR_US, "CPU lost across exec: {u:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The documented gap: work nobody waits for before `sh` exits is not
+    /// in the report (the runner reports when `sh` ends).
+    #[tokio::test]
+    async fn runner_usage_excludes_unwaited_background_work() {
+        let dir = unique_dir("cpubg");
+        let env = HashMap::new();
+        let mut t = spawn(&format!("{BURN} & exit 0"), "/", &env, &dir.join("t.output")).unwrap();
+        let pid = t.pid;
+        let mut chunks = std::mem::replace(&mut t.chunks, mpsc::channel(1).1);
+        tokio::spawn(async move { drain_chunks(&mut chunks).await });
+        let mut line = Vec::new();
+        let mut buf = [0u8; 256];
+        while !line.contains(&b'\n') {
+            let n = t.status.read(&mut buf).await.unwrap();
+            assert!(n > 0, "no status line");
+            line.extend_from_slice(&buf[..n]);
+        }
+        let r = crate::runner::parse_status(std::str::from_utf8(&line).unwrap()).unwrap();
+        signal_group(pid, SIGKILL).ok();
+        let _ = t.child.wait().await;
+        assert!(r.linger, "the burn should still run: {r:?}");
+        let u = r.usage.expect("usage reported");
+        assert!(u.cpu_user_us < BURN_FLOOR_US, "background work counted: {u:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// (a) Multi-MB child output must not inflate the in-memory ring past 64KB;
     /// disk + `total_size` still reflect the full stream.
     #[tokio::test]

@@ -248,6 +248,71 @@ fn p3_hello_protocol_and_status() {
     assert_eq!(st["sessions"][0]["connected_at"].as_u64(), Some(since));
 }
 
+/// A fixed amount of CPU work, never a sleep (wall time is not CPU, and
+/// macOS CI rounds sleeps). About 0.4 s of user time on an M-series Mac.
+const BURN: &str = "awk 'BEGIN{for(i=0;i<10000000;i++)s+=i}'";
+/// Well under BURN's cost, well over what the idle shells around it use.
+const BURN_FLOOR_MS: u64 = 100;
+
+fn cpu_user_ms(v: &Value) -> Option<u64> {
+    v["cpu_user_ms"].as_u64()
+}
+
+/// Exit-time CPU accounting: the record (live and on disk) and the
+/// `task.exit` line carry the CPU of the command's whole wait chain, a
+/// cooperative stop still reports it, and a runner SIGKILLed by the hard
+/// timeout reports nothing (absent, not zero).
+#[test]
+fn p4_cpu_usage_on_record_event_and_list() {
+    let home = Home::new("p4");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-p4", "/tmp");
+
+    // Only a grandchild burns: neither shell above it can exec away.
+    let (a, _) = start(&mut c, &format!("sh -c \"{BURN}; true\"; true"), json!({}));
+    let t = c.wait_terminal(&a, S(30)).unwrap();
+    assert_eq!(t["status"], "completed", "{t}");
+    let cpu = cpu_user_ms(&t).unwrap_or_else(|| panic!("no cpu_user_ms: {t}"));
+    assert!(cpu >= BURN_FLOOR_MS, "grandchild CPU missing: {t}");
+    assert!(t["cpu_sys_ms"].is_u64() && t["max_rss_kb"].as_u64().unwrap_or(0) > 0, "{t}");
+    let disk = home.record(&a).unwrap();
+    assert_eq!(cpu_user_ms(&disk), Some(cpu), "persisted: {disk}");
+    let exit = wait_event(&home, "sess-p4", "task.exit", Some(&a));
+    assert_eq!(cpu_user_ms(&exit), Some(cpu), "{exit}");
+    assert_eq!(exit["max_rss_kb"], t["max_rss_kb"], "{exit}");
+    let rows: Value = serde_json::from_str(&cli_ok(&home, &["ls", "--all", "--json"]).stdout).unwrap();
+    let row = rows.as_array().unwrap().iter().find(|r| r["id"] == a).unwrap();
+    assert_eq!(cpu_user_ms(row), Some(cpu), "ls --json: {row}");
+    let shown = cli_ok(&home, &["show", &a]).stdout;
+    let line = shown.lines().find(|l| l.starts_with("cpu:")).unwrap_or_else(|| panic!("no cpu line:\n{shown}"));
+    assert!(line.contains("cores avg") && line.contains("peak rss"), "{line}");
+    let st: Value = serde_json::from_str(&cli_ok(&home, &["stats", "--json", "--session", "sess-p4"]).stdout).unwrap();
+    assert_eq!(st[0]["agent"], "main sess-p4", "{st}");
+    assert_eq!(st[0]["cpu_user_ms"].as_u64(), Some(cpu), "stats from the live daemon: {st}");
+
+    // A stop whose SIGTERM the command obeys: the runner survives it and
+    // reports what was spent before.
+    let (b, _) = start(&mut c, &format!("{BURN}; echo burned; sleep 300"), json!({}));
+    assert!(poll_true(S(30), || c.task(&b).unwrap()["output_size"].as_u64().unwrap_or(0) > 0));
+    c.request_ok(json!({"type":"stop","task_id":b,"reason":"cli"}));
+    let t = c.wait_terminal(&b, S(5)).unwrap();
+    assert_eq!(t["status"], "killed", "{t}");
+    assert!(cpu_user_ms(&t).unwrap_or(0) >= BURN_FLOOR_MS, "stopped task lost its CPU: {t}");
+
+    // The hard timeout SIGKILLs the whole group, runner included: no report.
+    let (x, _) = start(&mut c, "sleep 300", json!({"timeout_ms": 200}));
+    let t = c.wait_terminal(&x, S(5)).unwrap();
+    assert_eq!(t["end_reason"], "timeout", "{t}");
+    for k in ["cpu_user_ms", "cpu_sys_ms", "max_rss_kb"] {
+        assert!(t.get(k).is_none(), "{k} without a report: {t}");
+    }
+    let exit = wait_event(&home, "sess-p4", "task.exit", Some(&x));
+    assert!(exit.get("cpu_user_ms").is_none(), "{exit}");
+    let shown = cli_ok(&home, &["show", &x]).stdout;
+    assert!(shown.contains("cpu:          not measured"), "{shown}");
+}
+
 // ===========================================================================
 // events.jsonl (manager writes)
 // ===========================================================================
@@ -511,7 +576,7 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let out = cli_ok(&home, &["ls", "--all"]);
     let lines: Vec<&str> = out.stdout.lines().collect();
     let header: Vec<&str> = lines[0].split_whitespace().collect();
-    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "EXIT", "REASON", "TITLE"]);
+    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "EXIT", "REASON", "TITLE"]);
     let rows: Vec<&str> = lines[1..].to_vec();
     // The connected session's work, running and finished. 0199aaaa-1111 never
     // connected, so its finished task is not listed (still reachable via show).
@@ -530,6 +595,15 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let title = &cjk_row[cjk_row.char_indices().nth(lines[0][..title_start].chars().count()).unwrap().0..];
     assert!(width(title) <= 60, "title {} columns: {title}", width(title));
     assert!(cjk_row.contains("exited") && cjk_row.contains(" 0 "), "{cjk_row}");
+    // CPU / CORES: measured for the finished task, "-" while running.
+    let cols = |row: &str| -> (String, String) {
+        let f: Vec<&str> = row.split_whitespace().collect();
+        (f[7].to_string(), f[8].to_string())
+    };
+    let (cpu, cores) = cols(cjk_row);
+    assert!(cpu.ends_with('s') && cpu[..cpu.len() - 1].parse::<f64>().is_ok(), "CPU {cpu:?}: {cjk_row}");
+    assert!(cores.parse::<f64>().is_ok(), "CORES {cores:?}: {cjk_row}");
+    assert_eq!(cols(running), ("-".to_string(), "-".to_string()), "{running}");
 
     // filters
     let ids = |args: &[&str]| -> Vec<String> {
@@ -554,8 +628,80 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let row = v.as_array().unwrap().iter().find(|r| r["id"] == b).unwrap();
     assert_eq!((row["kind"].as_str(), row["status"].as_str(), row["title"].as_str()), (Some("shell"), Some("running"), Some("sleep 300")));
+    // A task's work kind (only setup noise here: `other`); agents have none.
+    assert_eq!(row["work_kind"], "other", "{row}");
+    let agent = v.as_array().unwrap().iter().find(|r| r["id"] == "ch_0000b001").unwrap();
+    assert!(agent.get("work_kind").is_none(), "{agent}");
     let bad = home.cli(&["ls", "--since", "10x"], S(5));
     assert!(!bad.status.success());
+}
+
+/// `stats` from records on disk (no daemon, and it starts none): every
+/// retained session counts, gone ones included; tasks group by their
+/// child (named from its agent record) or the session's main agent, and by
+/// work kind; CPU sums measured tasks, the rest are UNMEASURED.
+#[test]
+fn c11_stats_by_agent_and_kind() {
+    let home = Home::new("c11");
+    let now = now_ms();
+    let child = |c: &str| json!({"via":"child-bash","child_id":c,"run_id":"run_0000d001"});
+    record_fixture(&home, "0199dddd-1111", "sh_0000d001", now - 60_000, json!({"command":"cd x && pdm run test > log 2>&1; tail -n 50 log",
+        "origin":child("ch_0000d001"),"ended_at":now - 20_000,"cpu_user_ms":150_000,"cpu_sys_ms":10_000,"max_rss_kb":900_000}));
+    record_fixture(&home, "0199dddd-1111", "sh_0000d002", now - 50_000, json!({"command":"pytest tests/a.py",
+        "origin":child("ch_0000d001"),"ended_at":now - 40_000,"status":"killed","end_reason":"timeout"}));
+    record_fixture(&home, "0199dddd-1111", "sh_0000d003", now - 30_000, json!({"command":"git status",
+        "ended_at":now - 29_000,"cpu_user_ms":5,"cpu_sys_ms":5,"max_rss_kb":10}));
+    record_fixture(&home, "0199dddd-2222", "sh_0000d004", now - 3 * 3_600_000, json!({"command":"rg foo",
+        "origin":child("ch_0000d002"),"cpu_user_ms":20,"cpu_sys_ms":0,"max_rss_kb":10}));
+    agent_fixture(&home, "0199dddd-1111", json!({"child_id":"ch_0000d001","run_id":"run_0000d001","session_id":"0199dddd-1111",
+        "name":"wave2-kms","agent":"worker","status":"completed","started_at":now - 70_000}));
+
+    let json_of = |args: &[&str]| -> Vec<Value> {
+        let out = cli_ok(&home, args);
+        serde_json::from_str::<Value>(&out.stdout).unwrap().as_array().unwrap().clone()
+    };
+    let g = json_of(&["stats", "--by", "agent,kind", "--json"]);
+    let find = |agent: &str, kind: &str| g.iter().find(|r| r["agent"] == agent && r["kind"] == kind).cloned()
+        .unwrap_or_else(|| panic!("no {agent}/{kind} in {g:#?}"));
+    let suite = find("wave2-kms (ch_0000d001)", "test-suite");
+    assert_eq!((suite["tasks"].as_u64(), suite["cpu_ms"].as_u64(), suite["wall_ms"].as_u64()), (Some(1), Some(160_000), Some(40_000)));
+    assert_eq!(suite["avg_cores"].as_f64(), Some(4.0));
+    let killed = find("wave2-kms (ch_0000d001)", "test");
+    assert_eq!((killed["measured"].as_u64(), killed["killed"].as_u64(), killed["killed_wall_ms"].as_u64()), (Some(0), Some(1), Some(10_000)));
+    assert!(killed.get("avg_cores").is_none(), "nothing measured: {killed}");
+    let main = g.iter().find(|r| r["kind"] == "git").unwrap();
+    assert!(main["agent"].as_str().unwrap().starts_with("main 0199dddd-1"), "{main}");
+    assert!(main.get("child_id").is_none(), "{main}");
+    // The gone session's task counts too; its child has no record: the id.
+    find("ch_0000d002", "read/search");
+    assert_eq!(g[0]["kind"], "test-suite", "sorted by CPU");
+
+    let by_agent = json_of(&["stats", "--json"]);
+    let kms = by_agent.iter().find(|r| r["child_id"] == "ch_0000d001").unwrap();
+    assert_eq!((kms["tasks"].as_u64(), kms["measured"].as_u64(), kms["killed"].as_u64()), (Some(2), Some(1), Some(1)));
+    assert!(kms.get("kind").is_none());
+    // The killed, unmeasured task's 10 s must not dilute CORES: 160 s of
+    // CPU over the 40 s of measured wall, not over all 50 s.
+    assert_eq!(kms["avg_cores"].as_f64(), Some(4.0), "{kms}");
+    let text = cli_ok(&home, &["stats"]).stdout;
+    let kms_line: Vec<&str> = text.lines().find(|l| l.starts_with("wave2-kms")).unwrap().split_whitespace().collect();
+    assert_eq!(kms_line[2..], ["2", "50s", "2m40s", "4.0", "1", "1", "10s"], "{text}");
+
+    assert_eq!(json_of(&["stats", "--by", "kind", "--json", "--session", "0199dddd-2"]).len(), 1);
+    let recent = json_of(&["stats", "--by", "kind", "--json", "--since", "1h"]);
+    assert!(recent.iter().all(|r| r["kind"] != "read/search"), "--since drops the 3h-old task: {recent:#?}");
+
+    let text = cli_ok(&home, &["stats", "--by", "kind"]).stdout;
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), ["KIND", "TASKS", "WALL", "CPU", "CORES", "UNMEASURED", "KILLED", "KILLED-WALL"]);
+    let suite_line: Vec<&str> = lines.iter().find(|l| l.starts_with("test-suite")).unwrap().split_whitespace().collect();
+    assert_eq!(suite_line[1..], ["1", "40s", "2m40s", "4.0", "0", "0", "0ms"], "{text}");
+    let total: Vec<&str> = lines.last().unwrap().split_whitespace().collect();
+    assert_eq!(total[..2], ["TOTAL", "4"], "{text}");
+
+    let bad = home.cli(&["stats", "--by", "model"], S(5));
+    assert!(!bad.status.success() && bad.stderr.contains("bad --by"), "{}", bad.stderr);
+    assert!(!home.sock().exists(), "stats must not start the daemon");
 }
 
 /// Run the CLI with its stdout on a pseudo-terminal (script(1)), the way a
@@ -731,6 +877,7 @@ fn c2_show_task_agent_and_run() {
     for want in [
         format!("id:           {t}"),
         "kind:         shell".into(),
+        "work:         other".into(),
         "status:       running".into(),
         format!("session:      {sid} (connected, pi pid {})", std::process::id()),
         "cwd:          /tmp".into(),
@@ -748,6 +895,7 @@ fn c2_show_task_agent_and_run() {
     let out = cli_ok(&home, &["show", &t[3..], "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["task"]["task_id"], t);
+    assert_eq!(v["work_kind"], "other");
     assert_eq!(v["output_tail"].as_array().unwrap().len(), 10);
     assert_eq!(v["events"].as_array().unwrap().len(), 2 + 2, "task.start/background + wake.*: {v}");
 

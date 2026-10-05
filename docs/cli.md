@@ -2,7 +2,7 @@
 
 Standalone operations manual for the `pi-famulus` binary.
 
-The pi extension talks to the daemon over a socket. These subcommands are the human and scripting surface for inspection, debugging, and smoke tests. Human-readable tables are **not** a wire contract; use `--json` (on `status`, `sessions`, `ls`, `show`, `events`) for scripts.
+The pi extension talks to the daemon over a socket. These subcommands are the human and scripting surface for inspection, debugging, and smoke tests. Human-readable tables are **not** a wire contract; use `--json` (on `status`, `sessions`, `ls`, `show`, `stats`, `events`) for scripts.
 
 From the CLI alone you can answer: what is each session doing and where (cwd), what is running or just finished, why did it end, what did this subagent do, why didn't a notification arrive, and is the system healthy.
 
@@ -66,6 +66,7 @@ pi-famulus status [--json]
 pi-famulus sessions [--json]
 pi-famulus ls [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
 pi-famulus show <id> [--json]
+pi-famulus stats [--by agent|kind|agent,kind] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]
 pi-famulus agent <ch_id> [--full] [-f]
 pi-famulus events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
 pi-famulus log [-f] [-n 100] [ID] [--stderr]
@@ -89,7 +90,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show` and `stats` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
@@ -129,35 +130,59 @@ Connected sessions only (a gone session is listed while it still runs something)
 
 ```text
 $ pi-famulus ls
-ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
-sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
-ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
+ID           KIND    SESSION   CWD        STATUS    TIME     DUR    CPU   CORES EXIT    REASON       TITLE
+sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -     -     -       -            npm test
+ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -     -     -       -            review (worker) m1
 
 $ pi-famulus ls --all
-ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
-sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
-ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
-mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    SIGTERM stopped:tui  tail -f log
-ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -       model-error  broken (worker) m1
+ID           KIND    SESSION   CWD        STATUS    TIME     DUR    CPU   CORES EXIT    REASON       TITLE
+sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -     -     -       -            npm test
+ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -     -     -       -            review (worker) m1
+sh_51d0c3aa  shell   0199aaaa  ~/src/app  completed 14:01:40 41s    2m28s 3.6   0       exited       cargo test
+mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    0.0s  0.0   SIGTERM stopped:tui  tail -f log
+ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -     -     -       model-error  broken (worker) m1
 ```
 
-By default only running work, anywhere (a live process is never hidden, even in a gone session). `-a`/`--all` adds the finished work of connected sessions; a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Running rows come first, then finished ones, each newest first. `TIME` is a task's start and an agent's **last transcript message** (a long-running agent that just spoke sorts as recent; its start is in `show`). Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (TIME within). `--json` prints the rows in the same order as an array of objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `active_at` (= TIME), `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, `running`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
+By default only running work, anywhere (a live process is never hidden, even in a gone session). `-a`/`--all` adds the finished work of connected sessions; a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Running rows come first, then finished ones, each newest first. `TIME` is a task's start and an agent's **last transcript message** (a long-running agent that just spoke sorts as recent; its start is in `show`). Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (TIME within). `--json` prints the rows in the same order as an array of objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `active_at` (= TIME), `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, `running`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known, and a task's `work_kind`).
 
+- `CPU` is a finished task's user + system CPU time, `CORES` that divided by its wall time (how many cores it kept busy on average). Both cover the command and every descendant that was waited for by its parent (pytest's xdist workers, a compiler under make), measured when the command exits. `-` while it runs, for agents, and when it was not measured: the hard timeout (`--timeout-ms`) and a stop that outlives its 2s grace SIGKILL the runner with the group, so nothing reports. Never counted: processes that escaped the wait chain (`setsid`, `cmd &` never waited for, a worker orphaned because its parent died first) and anything still running when the command exits. On macOS, a process that reaps children and then `exec`s loses their CPU (`make; exec foo` shows only `foo`). `--json` carries the raw `cpu_user_ms`, `cpu_sys_ms` and `max_rss_kb` (peak RSS of the single largest process, not a sum).
 - `EXIT` is the exit code, a signal name (`SIGTERM`, `SIGKILL`, …), or `-`.
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.
 - `TITLE` is the command's first line (agents: `name (agent) model`), truncated by **display width** so CJK and emoji keep the table aligned: to the terminal width on a tty, to 60 columns otherwise.
 
 `end_reason` values: `exited` (the process exited on its own, any code) · `timeout` (`timeout_ms` ceiling or a stop with reason timeout) · `stopped:tui` / `stopped:cli` / `stopped:tool` (a stop request, by who) · `rate-limit` · `session-end` · `manager-shutdown` · `manager-crash` (the manager died without shutting down, e.g. `kill -9`; its task was taken down with it, and the next daemon marked the record `orphaned`).
 
+`work_kind` (a task's, in `--json` and `show`) is a guess from the command text: `test-suite`, `test`, `build`, `lint/type`, `git`, `read/search` or `other`; monitors are `monitor`. Agents write compound commands, so the heaviest simple command wins (test-suite > test > build > lint/type > other > git > read/search): `cd x && pdm run test > log 2>&1; tail -n 100 log` is a `test-suite`, not a read. `sh/bash -c '…'` is looked into, heredoc bodies are not, and wrappers (`pdm run`, `uv run`, `npx`, `xargs`, `env`, `timeout`, `python -m`) are peeled. A test runner with no target is a whole suite; a path, a node id, `-k`/`-m`/`--lf`, a `$` expansion, or targets fed by `xargs` make it `test`. It is computed when read, never stored, so a better rule also applies to old records. Runner options and their values (`npm --prefix web test`) are skipped, and selection flags count in any spelling (`-kauth`, `--test=name`). `pdm run py-compile`-style scripts count as `build` and `awk` as `read/search`, by choice. Project-specific script names that say nothing (`pdm run go`) land in `other`; per-project overrides are not supported yet.
+
 ### `show`
 
 Everything about one id, any kind:
 
-- **task / monitor:** status, exit, reason, session (state, pi pid), full command, cwd, pid, start/end/duration, when it was moved to the background, who spawned it (`origin`: `bash-fg`, `bash-bg`, `child-bash` with child and run, `monitor`), output and stderr paths, wake notification emitted → delivered (from the extension's events), and the last 10 output lines.
+- **task / monitor:** status, exit, reason, session (state, pi pid), full command, cwd, pid, start/end/duration, when it was moved to the background, who spawned it (`origin`: `bash-fg`, `bash-bg`, `child-bash` with child and run, `monitor`), output and stderr paths, wake notification emitted → delivered (from the extension's events), its `work_kind`, CPU (user/sys, average cores, peak RSS, or why it was not measured), and the last 10 output lines.
 - **agent (`ch_…`):** name/agent/model, run, status and end reason, error, start/end/duration, tool-call count, shells it spawned (tasks whose `origin.child_id` is this agent), transcript path, the task prompt, and the last 20 lines of its result.
 - **run (`run_…`):** its children as an `ls` table.
 
 `--json` prints the underlying records, the output tail, and the related events.
+
+### `stats`
+
+Where shell time and CPU went, grouped by the subagent that ran each task, by the task's work kind, or both:
+
+```text
+$ pi-famulus stats --by agent,kind
+AGENT                     KIND        TASKS   WALL     CPU  CORES  UNMEASURED  KILLED  KILLED-WALL
+wave2-kms (ch_1f1f7f0e)   test-suite      4  1h06m  3h41m    3.3           1       1       20m14s
+wave2-kms (ch_1f1f7f0e)   lint/type       3  6m10s  4m02s    0.7           0       0          0ms
+main 01a10bda             git            39  1m02s   3.1s    0.1           0       0          0ms
+TOTAL                                    46  1h13m  3h45m    3.0           1       1       20m14s
+```
+
+- **AGENT** is the subagent in the task's `origin.child_id`, named from its agent record (`name (ch_…)`; the bare id when the record is gone). Tasks a session's main agent ran itself are `main <session>`.
+- **KIND** is the task's `work_kind` (see `ls`): `test-suite`, `test`, `build`, `lint/type`, `git`, `read/search`, `other`, or `monitor`. Not the shell/monitor `KIND` of `ls`.
+- **WALL** sums the tasks' durations (a running task's so far). **CPU** sums user + system CPU of the measured tasks only, and **CORES** divides it by the wall time of those same tasks. **UNMEASURED** counts tasks without a CPU measurement (still running, SIGKILLed with their runner by `--timeout-ms` or after a stop's grace, or recorded by an older manager); `-` means no task in the row was measured. See `ls` for what CPU covers.
+- **KILLED** / **KILLED-WALL**: tasks that ended `killed` and the wall time they ran before that.
+
+Every retained task record counts, including finished work of gone sessions (`ls` leaves those out); rows are sorted by CPU, then wall time, with a `TOTAL` row last. Filters as in `ls`: `--session PREFIX`, `--cwd DIR`, `--since DUR` (tasks running at some point within it). `--json` prints the groups with raw milliseconds (`wall_ms`, `cpu_user_ms`, `cpu_sys_ms`, `cpu_ms`, `measured`, `measured_wall_ms`, `killed`, `killed_wall_ms`, and `avg_cores` when measured wall time is nonzero). Never starts the daemon.
 
 ### `agent`
 
@@ -172,7 +197,7 @@ Renders the transcript `sessions/<sid>/agents/<ch>.jsonl` (one JSON object per m
 ### `events`
 
 ```text
-2026-09-23 14:03:22.123 0199aaaa manager   task.exit          sh_3f2a91c0 exit_code=0 end_reason=exited duration_ms=64012
+2026-09-23 14:03:22.123 0199aaaa manager   task.exit          sh_3f2a91c0 cpu_sys_ms=9214 cpu_user_ms=201330 duration_ms=64012 end_reason=exited exit_code=0 max_rss_kb=412880
 2026-09-23 14:03:22.140 0199aaaa extension wake.emit          - kind=task ids=["sh_3f2a91c0"] batch=1
 2026-09-23 14:03:22.140 0199aaaa extension wake.deliver       - kind=task mode=steer
 2026-09-23 14:03:31.502 0199aaaa extension wake.inject        - kind=task ids=["sh_3f2a91c0"] as_of=1790143402140 lag_ms=9362

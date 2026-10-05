@@ -247,7 +247,7 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
 
 /// A CLI newer than the running daemon reads what the old daemon reports:
 /// columns it never recorded (a session's CWD, SINCE) stay empty.
-fn warn_if_older_daemon(snap: &Snapshot) {
+pub(crate) fn warn_if_older_daemon(snap: &Snapshot) {
     if let Some(d) = &snap.daemon {
         if d.protocol < crate::proto::PROTOCOL {
             eprintln!(
@@ -378,6 +378,16 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
     pub title: String,
+    /// A task's work kind (`crate::workkind`), or `monitor`; agents: none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_kind: Option<String>,
+    /// A finished task's CPU, as its record has it (absent: not measured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_user_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_sys_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rss_kb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,6 +399,15 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub running: bool,
+}
+
+/// What a task's command does (`crate::workkind`). A monitor's wall time
+/// is watching, not work, so monitors are their own kind.
+pub fn work_kind(t: &TaskRecord) -> &'static str {
+    match t.kind {
+        TaskKind::Monitor => "monitor",
+        TaskKind::Shell => crate::workkind::classify(&t.command).label(),
+    }
 }
 
 fn status_str<T: Serialize>(v: &T) -> String {
@@ -414,6 +433,10 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         signal: t.signal.clone(),
         end_reason: t.end_reason.clone(),
         title: fmt::first_line(&t.command).to_string(),
+        work_kind: Some(work_kind(t).to_string()),
+        cpu_user_ms: t.cpu_user_ms,
+        cpu_sys_ms: t.cpu_sys_ms,
+        max_rss_kb: t.max_rss_kb,
         pid: Some(t.pid),
         origin: t.origin.clone(),
         backgrounded_at: t.backgrounded_at,
@@ -442,6 +465,10 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         signal: None,
         end_reason: a.end_reason.clone().or_else(|| a.stale.then(|| "session-gone".to_string())),
         title: a.title(),
+        work_kind: None,
+        cpu_user_ms: None,
+        cpu_sys_ms: None,
+        max_rss_kb: None,
         pid: None,
         origin: None,
         backgrounded_at: None,
@@ -466,6 +493,28 @@ pub fn sort_rows(rows: &mut [Row]) {
     rows.sort_by(|a, b| {
         (!a.running, std::cmp::Reverse(a.active_at), &a.id).cmp(&(!b.running, std::cmp::Reverse(b.active_at), &b.id))
     });
+}
+
+/// User + system CPU, when measured.
+pub fn cpu_ms(user: Option<u64>, sys: Option<u64>) -> Option<u64> {
+    Some(user? + sys?)
+}
+
+/// CPU seconds: "0.4s", "12.3s", then "3m04s" style past a minute.
+pub fn cpu_text(ms: Option<u64>) -> String {
+    match ms {
+        None => "-".into(),
+        Some(ms) if ms < 60_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        Some(ms) => fmt::human_duration(ms),
+    }
+}
+
+/// Average cores busy over the wall time: CPU / wall.
+pub fn cores_text(cpu_ms: Option<u64>, wall_ms: u64) -> String {
+    match cpu_ms {
+        Some(c) if wall_ms > 0 => format!("{:.1}", c as f64 / wall_ms as f64),
+        _ => "-".into(),
+    }
 }
 
 fn exit_col(r: &Row) -> String {
@@ -493,7 +542,7 @@ fn term_width() -> Option<usize> {
     Some(std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(tty))
 }
 
-fn normalize_dir(d: &str) -> String {
+pub fn normalize_dir(d: &str) -> String {
     let expanded = if let Some(rest) = d.strip_prefix('~') {
         format!("{}{rest}", std::env::var("HOME").unwrap_or_default())
     } else {
@@ -503,7 +552,7 @@ fn normalize_dir(d: &str) -> String {
     p.to_string_lossy().trim_end_matches('/').to_string()
 }
 
-fn under_dir(cwd: &str, dir: &str) -> bool {
+pub fn under_dir(cwd: &str, dir: &str) -> bool {
     let c = normalize_dir(cwd);
     c == dir || c.starts_with(&format!("{dir}/"))
 }
@@ -553,16 +602,19 @@ pub fn filter_rows(
     Ok(rows)
 }
 
-pub const LS_COLUMNS: [&str; 10] = [
-    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "EXIT", "REASON", "TITLE",
+pub const LS_COLUMNS: [&str; 12] = [
+    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "EXIT", "REASON", "TITLE",
 ];
+/// Columns before TITLE.
+const LS_FIXED: usize = LS_COLUMNS.len() - 1;
 
 /// Render the ls table. TITLE is truncated to fit `width` (display columns,
 /// CJK-aware); without a terminal it is capped at 60 columns.
 pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, width: Option<usize>) -> Vec<String> {
-    let cells: Vec<[String; 9]> = rows
+    let cells: Vec<[String; LS_FIXED]> = rows
         .iter()
         .map(|r| {
+            let cpu = cpu_ms(r.cpu_user_ms, r.cpu_sys_ms);
             [
                 r.id.clone(),
                 r.kind.clone(),
@@ -571,12 +623,14 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
                 r.status.clone(),
                 r.active_at.map(|s| fmt::short_time(s, now)).unwrap_or_else(|| "-".into()),
                 r.duration_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into()),
+                cpu_text(cpu),
+                cores_text(cpu, r.duration_ms.unwrap_or(0)),
                 exit_col(r),
                 r.end_reason.clone().unwrap_or_else(|| "-".into()),
             ]
         })
         .collect();
-    let mut widths: Vec<usize> = LS_COLUMNS[..9].iter().map(|h| fmt::display_width(h)).collect();
+    let mut widths: Vec<usize> = LS_COLUMNS[..LS_FIXED].iter().map(|h| fmt::display_width(h)).collect();
     for c in &cells {
         for (i, v) in c.iter().enumerate() {
             widths[i] = widths[i].max(fmt::display_width(v));
@@ -587,7 +641,7 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
         Some(w) => w.saturating_sub(used).max(20),
         None => 60,
     };
-    let line = |vals: [&str; 9], title: &str| {
+    let line = |vals: [&str; LS_FIXED], title: &str| {
         let mut s = String::new();
         for (i, v) in vals.iter().enumerate() {
             s.push_str(&fmt::pad(v, widths[i]));
@@ -597,10 +651,10 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
         s.trim_end().to_string()
     };
     let mut out = Vec::new();
-    let h: [&str; 9] = LS_COLUMNS[..9].try_into().unwrap();
+    let h: [&str; LS_FIXED] = LS_COLUMNS[..LS_FIXED].try_into().unwrap();
     out.push(line(h, "TITLE"));
     for (r, c) in rows.iter().zip(cells.iter()) {
-        let vals: [&str; 9] = std::array::from_fn(|i| c[i].as_str());
+        let vals: [&str; LS_FIXED] = std::array::from_fn(|i| c[i].as_str());
         out.push(line(vals, &r.title));
     }
     out
@@ -725,6 +779,7 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             if json_out {
                 let v = json!({
                     "task": t,
+                    "work_kind": work_kind(&t),
                     "stderr_path": err_path,
                     "session": snap.sessions.get(&t.session_id),
                     "output_tail": tail,
@@ -736,6 +791,7 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             let r = task_row(&t, now);
             kv("id", &t.task_id);
             kv("kind", &r.kind);
+            kv("work", work_kind(&t));
             let exit = if r.running { String::new() } else { format!(" ({})", exit_col(&r)) };
             kv("status", format!("{}{exit}", r.status));
             if let Some(reason) = &t.end_reason {
@@ -763,6 +819,21 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
                 kv("ended", fmt::datetime(e));
             }
             kv("duration", fmt::human_duration(r.duration_ms.unwrap_or(0)));
+            match cpu_ms(t.cpu_user_ms, t.cpu_sys_ms) {
+                Some(c) => kv(
+                    "cpu",
+                    format!(
+                        "{} (user {}, sys {}), {} cores avg, peak rss {}",
+                        cpu_text(Some(c)),
+                        cpu_text(t.cpu_user_ms),
+                        cpu_text(t.cpu_sys_ms),
+                        cores_text(Some(c), r.duration_ms.unwrap_or(0)),
+                        t.max_rss_kb.map(|k| format!("{} MiB", k / 1024)).unwrap_or_else(|| "?".into())
+                    ),
+                ),
+                None if r.running => {}
+                None => kv("cpu", "not measured (no runner report: SIGKILLed with its group, or an older record)"),
+            }
             if let Some(b) = t.backgrounded_at {
                 kv("backgrounded", format!("after {}", fmt::human_duration(b.saturating_sub(t.started_at))));
             }

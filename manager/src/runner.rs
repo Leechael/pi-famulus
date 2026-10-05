@@ -18,7 +18,28 @@
 //!
 //! Status line (the daemon/runner contract; keep it stable, since a daemon
 //! may spawn a newer runner binary after an in-place upgrade):
-//!   `exit <code> <alone|linger>\n` or `signal <n> <alone|linger>\n`
+//!   `exit <code> <alone|linger>[ <key>=<value>...]\n` or
+//!   `signal <n> <alone|linger>[ <key>=<value>...]\n`
+//! The optional tail carries the command's resource usage
+//! (`cpu_user_us=`, `cpu_sys_us=`, `max_rss_kb=`). Readers ignore keys they
+//! do not know, and a reader that predates the tail stops after the third
+//! token, so either side may be the newer binary.
+//!
+//! Resource usage is `getrusage(RUSAGE_CHILDREN)` taken right after `sh` is
+//! reaped. The runner has exactly one child, so that is `sh` plus every
+//! descendant that was waited for by its own parent (pytest reaping its
+//! xdist workers, make reaping its compilers). Not counted: a process that
+//! escaped the wait chain (`setsid`, `cmd &` never waited for, a worker
+//! orphaned because its parent died first; init reaps those), anything
+//! still running when `sh` exits (the `linger` set), and every task whose
+//! runner is SIGKILLed with its group (stop after the grace, `timeout_ms`):
+//! that runner writes no status line at all. On macOS only, a process that
+//! reaped children and then called exec loses those children's times
+//! (measured; POSIX asks exec to keep them, and the Linux branch of
+//! `task::runner_usage_across_exec_is_platform_dependent` checks it), so
+//! `make; exec foo` reports only `foo`. macOS `/bin/sh` does not exec the
+//! last command of a list (`a; b`), only a lone simple command, so this
+//! needs an explicit `exec` or a program that execs after waiting.
 //!
 //! The runner blocks SIGTERM, so a group SIGTERM (stop, shutdown) reaches
 //! the command while the runner lives to report how the command ended. The
@@ -85,8 +106,14 @@ pub fn main(command: &OsStr) -> i32 {
         (None, Some(s)) => format!("signal {s}"),
         (None, None) => "exit 0".to_string(),
     };
+    // `sh` is our only child and is reaped now: this is its whole tree.
+    let usage = sys::children_usage().ok().map(|(cpu_user_us, cpu_sys_us, max_rss_kb)| Usage {
+        cpu_user_us,
+        cpu_sys_us,
+        max_rss_kb,
+    });
     let alone_now = alone(me);
-    report(&what, alone_now);
+    report_usage(&what, alone_now, usage);
     if !alone_now {
         // Guardian: hold the lifeline until everything the command left
         // behind is gone (or the lifeline breaks and takes the group down).
@@ -101,8 +128,23 @@ pub fn main(command: &OsStr) -> i32 {
 }
 
 fn report(what: &str, alone: bool) {
-    let line = format!("{what} {}\n", if alone { "alone" } else { "linger" });
-    let _ = sys::write_raw(RUNNER_STATUS_FD, line.as_bytes());
+    report_usage(what, alone, None);
+}
+
+fn report_usage(what: &str, alone: bool, usage: Option<Usage>) {
+    let _ = sys::write_raw(RUNNER_STATUS_FD, status_line(what, alone, usage).as_bytes());
+}
+
+fn status_line(what: &str, alone: bool, usage: Option<Usage>) -> String {
+    let mut line = format!("{what} {}", if alone { "alone" } else { "linger" });
+    if let Some(u) = usage {
+        line.push_str(&format!(
+            " cpu_user_us={} cpu_sys_us={} max_rss_kb={}",
+            u.cpu_user_us, u.cpu_sys_us, u.max_rss_kb
+        ));
+    }
+    line.push('\n');
+    line
 }
 
 /// No member of our group but us. If the group cannot be enumerated the
@@ -158,6 +200,16 @@ fn watch_lifeline(me: u32) {
     std::process::exit(137);
 }
 
+/// The command's resource usage as the runner measured it (see the module
+/// doc for what it covers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub cpu_user_us: u64,
+    pub cpu_sys_us: u64,
+    /// Peak RSS of the single largest process measured, in KiB.
+    pub max_rss_kb: u64,
+}
+
 /// Parsed status line. `None` for anything malformed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reported {
@@ -165,6 +217,10 @@ pub struct Reported {
     pub signal: Option<i32>,
     /// The command left other processes in the group.
     pub linger: bool,
+    /// Absent from a runner that predates it, or when any of its three
+    /// values is missing or malformed. Never makes the line itself invalid:
+    /// the exit status is what the daemon cannot do without.
+    pub usage: Option<Usage>,
 }
 
 pub fn parse_status(line: &str) -> Option<Reported> {
@@ -176,9 +232,24 @@ pub fn parse_status(line: &str) -> Option<Reported> {
         "linger" => true,
         _ => return None,
     };
+    let (mut user, mut sys, mut rss) = (None, None, None);
+    for tok in it {
+        let Some((k, v)) = tok.split_once('=') else { continue };
+        let v = v.parse::<u64>().ok();
+        match k {
+            "cpu_user_us" => user = v,
+            "cpu_sys_us" => sys = v,
+            "max_rss_kb" => rss = v,
+            _ => {}
+        }
+    }
+    let usage = match (user, sys, rss) {
+        (Some(cpu_user_us), Some(cpu_sys_us), Some(max_rss_kb)) => Some(Usage { cpu_user_us, cpu_sys_us, max_rss_kb }),
+        _ => None,
+    };
     match kind {
-        "exit" => Some(Reported { code: Some(n), signal: None, linger }),
-        "signal" => Some(Reported { code: None, signal: Some(n), linger }),
+        "exit" => Some(Reported { code: Some(n), signal: None, linger, usage }),
+        "signal" => Some(Reported { code: None, signal: Some(n), linger, usage }),
         _ => None,
     }
 }
@@ -189,10 +260,44 @@ mod tests {
 
     #[test]
     fn status_lines() {
-        assert_eq!(parse_status("exit 3 alone\n"), Some(Reported { code: Some(3), signal: None, linger: false }));
-        assert_eq!(parse_status("signal 9 linger"), Some(Reported { code: None, signal: Some(9), linger: true }));
+        assert_eq!(parse_status("exit 3 alone\n"), Some(Reported { code: Some(3), signal: None, linger: false, usage: None }));
+        assert_eq!(parse_status("signal 9 linger"), Some(Reported { code: None, signal: Some(9), linger: true, usage: None }));
         assert_eq!(parse_status("exit x alone"), None);
         assert_eq!(parse_status("exit 1"), None);
         assert_eq!(parse_status("boom 1 alone"), None);
+    }
+
+    /// The usage tail is optional and lenient: a line without it (a runner
+    /// from before it existed, carried across an in-place upgrade) and a
+    /// line with a broken tail both keep their exit status.
+    #[test]
+    fn status_lines_with_usage() {
+        let u = Usage { cpu_user_us: 1_500_000, cpu_sys_us: 20_000, max_rss_kb: 4096 };
+        let line = status_line("exit 0", true, Some(u));
+        assert_eq!(line, "exit 0 alone cpu_user_us=1500000 cpu_sys_us=20000 max_rss_kb=4096\n");
+        assert_eq!(parse_status(&line), Some(Reported { code: Some(0), signal: None, linger: false, usage: Some(u) }));
+        assert_eq!(status_line("signal 15", false, None), "signal 15 linger\n");
+        // Unknown keys (a newer runner) are ignored; order does not matter.
+        let r = parse_status("exit 1 linger max_rss_kb=7 future=x cpu_sys_us=2 cpu_user_us=3").unwrap();
+        assert_eq!((r.code, r.linger), (Some(1), true));
+        assert_eq!(r.usage, Some(Usage { cpu_user_us: 3, cpu_sys_us: 2, max_rss_kb: 7 }));
+        // Missing or malformed values: no usage, status intact.
+        for bad in [
+            "exit 2 alone cpu_user_us=3 cpu_sys_us=2",
+            "exit 2 alone cpu_user_us=x cpu_sys_us=2 max_rss_kb=1",
+            "exit 2 alone junk",
+        ] {
+            let r = parse_status(bad).unwrap_or_else(|| panic!("{bad}: status lost"));
+            assert_eq!((r.code, r.usage), (Some(2), None), "{bad}");
+        }
+    }
+
+    /// An older daemon reads the line with the parser it has, which takes
+    /// the first three tokens: they must not change.
+    #[test]
+    fn usage_tail_keeps_the_first_three_tokens() {
+        let line = status_line("signal 9", false, Some(Usage { cpu_user_us: 1, cpu_sys_us: 2, max_rss_kb: 3 }));
+        let head: Vec<&str> = line.split_whitespace().take(3).collect();
+        assert_eq!(head, ["signal", "9", "linger"]);
     }
 }

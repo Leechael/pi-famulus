@@ -31,7 +31,7 @@ impl Sub {
     /// Listings and dumps a person reads; not a follow, not an action.
     pub(crate) fn pages(&self) -> bool {
         match self {
-            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } => true,
+            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } => true,
             Sub::Agent { follow, .. } | Sub::Events { follow, .. } | Sub::Log { follow, .. } => {
                 !follow
             }
@@ -91,6 +91,31 @@ pub(crate) enum Sub {
     Show {
         /// Task, monitor, agent, or run id (fuzzy match ok).
         id: String,
+        /// Machine-readable JSON on stdout.
+        #[usage(long)]
+        json: bool,
+    },
+    /// Shell tasks' wall time and CPU, grouped by agent and/or work kind.
+    ///
+    /// Covers every retained task record, finished work of gone sessions
+    /// included. AGENT is the subagent that ran the task (`main <session>`
+    /// for the parent); KIND is the command's work kind (test-suite, test,
+    /// build, lint/type, git, read/search, other, monitor), not shell/monitor.
+    /// CPU sums measured tasks only; UNMEASURED counts the rest.
+    #[usage(display_order = 45, help_heading = "Inspection")]
+    Stats {
+        /// Group by: agent, kind, or agent,kind.
+        #[usage(long, default = "agent")]
+        by: String,
+        /// Only sessions whose id starts with this prefix.
+        #[usage(long)]
+        session: Option<String>,
+        /// Only work whose cwd is this directory or below it.
+        #[usage(long)]
+        cwd: Option<String>,
+        /// Only tasks running at some point within this long (e.g. 10m, 2h, 1d).
+        #[usage(long)]
+        since: Option<String>,
         /// Machine-readable JSON on stdout.
         #[usage(long)]
         json: bool,

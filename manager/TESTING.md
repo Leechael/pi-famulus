@@ -11,7 +11,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
 | `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g14) |
-| `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c9) |
+| `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI, CPU accounting and `stats` (p1–p4, e1–e5, c1–c11, g1, g15, g15b) |
 | `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/cli.rs` | black box | CLI help/version, completion scripts, strict parser errors (no daemon / no `--home`) |
@@ -273,6 +273,7 @@ fixtures in the contract's format, because the extension side may land later.
 | `manager-shutdown`, `manager-crash` | `p2` |
 | hello `extension_version`/`protocol` stored per session; `status.protocol`; `connected_at` kept across reconnects; `last_seen` | `p3` |
 | manager writes `session.connect/disconnect`, `task.start` (command ≤ 200 chars, origin, pid), `task.background`, `task.stop`, `task.exit`, `daemon.start/shutdown` | `e1` |
+| CPU accounting: `cpu_user_ms`/`cpu_sys_ms`/`max_rss_kb` on the live and persisted record and on `task.exit`, covering CPU spent only by a grandchild; kept through a cooperative stop; absent (not zero) after the hard timeout; `ls` CPU/CORES columns (`-` while running), `ls --json`, `show`'s cpu line and its "not measured" | `p4`, `c1` (red when the record takes the wrong runner value), unit `runner::*`, `task::runner_*` (red with `RUSAGE_SELF`) |
 | a task event line is on disk before anyone can see the state it records, in causal order (`task.start` < `task.exit`) | `e5` |
 | every line < 4 KiB, oversized fields truncated (`truncated:true`), ids never cut | `e2`, unit `events::*` |
 | concurrent appends (8 extension-style writers × 300 lines of 1–3.5 KiB, plus the manager) never interleave or lose lines | `e3` |
@@ -280,6 +281,8 @@ fixtures in the contract's format, because the extension side may land later.
 | pager: on a terminal (script(1) pty) listings go through `PI_FAMULUS_PAGER`, else `PAGER`; not with `--no-pager`, `cat`, or piped stdout; a bare `less` runs as `less -FRX` | `c10`, unit `pager::*` |
 | `ls`: columns, running-only default, `-a` (connected sessions' finished work), running first then newest first, an agent's TIME = its last transcript message, agents included, SESSION shortest unique prefix ≥ 8, CJK display-width truncation, `--json`, `--session`/`--cwd`/`--since`, bad duration rejected | `c1`, `c1b`, unit `fmt::*`, `inspect::*` |
 | `show` for sh_/ch_/run_ (header, origin, backgrounded, wake emitted→delivered, last 10 lines; agent error/tool calls/shells/prompt/result tail 20), fuzzy + `--json`, one-line not-found with closest match | `c2` |
+| `stats`: grouping by agent (child record name, bare id, `main <session>`), kind, and both; CPU sums measured tasks only and CORES divides by their wall alone; UNMEASURED/KILLED/KILLED-WALL; gone sessions count; `--session`/`--since`/`--json`; text header and TOTAL; bad `--by` rejected; never starts the daemon; live daemon numbers | `c11`, `p4`, unit `stats::*` (both red when CORES divides by all wall time: unit 2.3 vs 3.2, `c11` 3.2 vs 4.0) |
+| `work_kind` on task rows of `ls --json` and in `show` (agents: none); the classifier on compound commands from a real run (heaviest simple command wins, `bash -c` recursion, heredoc bodies skipped, `$(…)` not surfaced, suite vs targeted) | `c1`, `c2`, unit `workkind::*` (red when the last simple command wins instead of the heaviest) |
 | `agent` (preamble hidden, `--full`), `log`/`tail -f` on ch_ ids, `output`/`wait` on ch_, `stop` on an agent refused with the contract message | `c3` |
 | `stop` → `stopped:cli`; "already finished (<reason>)" | `c4` |
 | `sessions`: connected only, gone sessions hidden but `show`/`events` still reach them, counts, `--json`, no spawn | `c5` |
@@ -512,6 +515,8 @@ No removal turned a test red.
 - resolved (ci-github-actions): `task_exited.output_size` and the terminal record now cover every byte. The exit watch waits for the pumps to drain before finalizing (restored after the rebase lost it, `t15`), and the output fanout no longer moves a finished record's `output_size` back to its own lagging cursor.
 - deferred: the extension's `list` (own session only) is not paged | impact: a single pi session with more than ~4 MiB of task records (thousands of tasks, or very long commands) gets `E_INTERNAL` from `task_list` and its reconnect reconcile | trigger: a session that long-lived, or `task_list` failing with the frame-limit error
 - deferred: one record larger than a frame (a command near 4 MiB) still fails a paged `list`, since a page always carries at least one record | impact: `ls`/`sessions`/`show` fail while that record is retained | trigger: a start request with a multi-MiB command
+- deferred: live CPU sampling of running tasks (see `src/stats.rs` header) | impact: running tasks show no CPU; tasks whose runner is SIGKILLed (`timeout_ms`, a stop past its grace) stay unmeasured | trigger: unmeasured tasks holding a large share of a group's wall time in `stats`, or a need for CPU while a task runs
+- deferred: per-project work-kind overrides (see `src/workkind.rs` header) | impact: opaque project script names land in `other` | trigger: `other` holding a large CPU/wall share a person can pin on a known script
 - resolved (manager-lifeline): re-adoption by pid liveness is gone. A crashed daemon's tasks die with it (lifeline), and the next startup only marks their records; it never signals a recorded pid (`d4b`).
 
 ## Lifeline and runner (manager-lifeline)

@@ -373,6 +373,9 @@ mod tests {
             origin: None,
             backgrounded_at: None,
             end_reason: None,
+            cpu_user_ms: None,
+            cpu_sys_ms: None,
+            max_rss_kb: None,
         }
     }
 

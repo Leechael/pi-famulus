@@ -1315,6 +1315,9 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         origin: origin.clone(),
         backgrounded_at: None,
         end_reason: None,
+        cpu_user_ms: None,
+        cpu_sys_ms: None,
+        max_rss_kb: None,
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -1948,14 +1951,22 @@ async fn run_output_fanout(
 struct Outcome {
     code: Option<i32>,
     signal: Option<i32>,
+    /// Only the runner's status line carries it (see `crate::runner`).
+    usage: Option<crate::runner::Usage>,
 }
 
 impl Outcome {
+    /// The runner's own wait status: it wrote no report, so no usage.
     fn of(status: Option<std::process::ExitStatus>) -> Self {
         Outcome {
             code: status.and_then(|s| s.code()),
             signal: status.and_then(|s| s.signal()),
+            usage: None,
         }
+    }
+
+    fn reported(r: &crate::runner::Reported) -> Self {
+        Outcome { code: r.code, signal: r.signal, usage: r.usage }
     }
 }
 
@@ -1964,8 +1975,8 @@ fn normalize_killed_outcome(kill_requested: bool, outcome: Outcome) -> Outcome {
         return outcome;
     }
     match outcome.code {
-        Some(code) if code == 128 + task::SIGTERM => Outcome { code: None, signal: Some(task::SIGTERM) },
-        Some(code) if code == 128 + task::SIGKILL => Outcome { code: None, signal: Some(task::SIGKILL) },
+        Some(code) if code == 128 + task::SIGTERM => Outcome { code: None, signal: Some(task::SIGTERM), ..outcome },
+        Some(code) if code == 128 + task::SIGKILL => Outcome { code: None, signal: Some(task::SIGKILL), ..outcome },
         _ => outcome,
     }
 }
@@ -2101,7 +2112,7 @@ async fn run_exit_watch(state: Shared, tid: String) {
         };
         match first {
             FirstSeen::Report(Some(r)) => {
-                let outcome = Outcome { code: r.code, signal: r.signal };
+                let outcome = Outcome::reported(&r);
                 let leftover = if r.linger { Leftover::Guarded } else { Leftover::None };
                 wait_tee_drained(&state, &tid, !r.linger).await;
                 finalize_exit(&state, &tid, outcome, leftover);
@@ -2121,7 +2132,7 @@ async fn run_exit_watch(state: Shared, tid: String) {
                     Some(r) => {
                         let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
                         wait_tee_drained(&state, &tid, !r.linger).await;
-                        finalize_exit(&state, &tid, Outcome { code: r.code, signal: r.signal }, leftover);
+                        finalize_exit(&state, &tid, Outcome::reported(&r), leftover);
                     }
                     None => {
                         wait_tee_drained(&state, &tid, false).await;
@@ -2195,6 +2206,13 @@ async fn wait_tee_drained(state: &Shared, tid: &str, alone: bool) {
     }
 }
 
+/// Runner microseconds to the record's milliseconds. Round up so a
+/// sub-millisecond measurement is 1 ms rather than 0: `Some(0)` still
+/// counts as measured in `stats` and would drag `avg_cores` toward 0.
+fn usage_ms(us: u64) -> u64 {
+    us.div_ceil(1000)
+}
+
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Leftover) {
@@ -2208,9 +2226,14 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         if entry.record.status.is_terminal() {
             return; // already finalized (e.g. shutdown force-pass)
         }
-        let Outcome { code, signal } = normalize_killed_outcome(entry.kill_requested, outcome);
+        let Outcome { code, signal, usage } = normalize_killed_outcome(entry.kill_requested, outcome);
         let now = now_ms();
         entry.record.exit_code = code;
+        if let Some(u) = usage {
+            entry.record.cpu_user_ms = Some(usage_ms(u.cpu_user_us));
+            entry.record.cpu_sys_ms = Some(usage_ms(u.cpu_sys_us));
+            entry.record.max_rss_kb = Some(u.max_rss_kb);
+        }
         entry.record.signal = signal.map(signal_name);
         entry.record.ended_at = Some(now);
         entry.record.output_size = entry.output.lock().unwrap().total_size;
@@ -2251,7 +2274,7 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         // anyone can see the task as finished (`wait`, `list`), `task.exit`
         // is on disk, ahead of whatever that observer does next.
         let sid = entry.record.session_id.clone();
-        log_task_exit(&home, &sid, &event);
+        log_task_exit(&home, &sid, &event, &entry.record);
         let _ = entry.status_tx.send(entry.record.status);
         (sid, event)
     };
@@ -2261,8 +2284,9 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
     send_event_to_session(state, &sid, event);
 }
 
-/// events.jsonl `task.exit` from a task_exited event.
-fn log_task_exit(home: &std::path::Path, sid: &str, ev: &EventKind) {
+/// events.jsonl `task.exit` from a task_exited event, plus the record's
+/// resource usage when the runner reported it (absent keys otherwise).
+fn log_task_exit(home: &std::path::Path, sid: &str, ev: &EventKind, rec: &TaskRecord) {
     if let EventKind::TaskExited {
         task_id,
         exit_code,
@@ -2272,18 +2296,22 @@ fn log_task_exit(home: &std::path::Path, sid: &str, ev: &EventKind) {
         ..
     } = ev
     {
-        crate::events::emit(
-            home,
-            Some(sid),
-            "task.exit",
-            Some(task_id),
-            serde_json::json!({
-                "exit_code": exit_code,
-                "signal": signal,
-                "end_reason": end_reason,
-                "duration_ms": duration_ms,
-            }),
-        );
+        let mut fields = serde_json::json!({
+            "exit_code": exit_code,
+            "signal": signal,
+            "end_reason": end_reason,
+            "duration_ms": duration_ms,
+        });
+        for (k, v) in [
+            ("cpu_user_ms", rec.cpu_user_ms),
+            ("cpu_sys_ms", rec.cpu_sys_ms),
+            ("max_rss_kb", rec.max_rss_kb),
+        ] {
+            if let Some(v) = v {
+                fields[k] = v.into();
+            }
+        }
+        crate::events::emit(home, Some(sid), "task.exit", Some(task_id), fields);
     }
 }
 
@@ -2397,7 +2425,7 @@ async fn graceful_shutdown(state: &Shared) {
                     ts: now,
                     end_reason: e.record.end_reason.clone(),
                 };
-                log_task_exit(&home, &e.record.session_id, &ev);
+                log_task_exit(&home, &e.record.session_id, &ev, &e.record);
                 let _ = e.status_tx.send(TaskStatus::Killed);
             }
         }
@@ -2450,8 +2478,17 @@ mod tests {
     }
 
     #[test]
+    fn sub_millisecond_cpu_rounds_up_to_one_ms() {
+        assert_eq!(usage_ms(0), 0);
+        assert_eq!(usage_ms(1), 1);
+        assert_eq!(usage_ms(999), 1);
+        assert_eq!(usage_ms(1000), 1);
+        assert_eq!(usage_ms(1001), 2);
+    }
+
+    #[test]
     fn killed_shell_exit_code_143_is_reported_as_sigterm() {
-        let outcome = normalize_killed_outcome(true, Outcome { code: Some(143), signal: None });
+        let outcome = normalize_killed_outcome(true, Outcome { code: Some(143), signal: None, usage: None });
         assert_eq!(outcome.code, None);
         assert_eq!(outcome.signal, Some(task::SIGTERM));
     }

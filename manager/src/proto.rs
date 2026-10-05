@@ -198,6 +198,18 @@ pub struct TaskRecord {
     /// See [`end_reason`]; set when the task reaches a terminal status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
+    /// CPU time of the command and every descendant it waited for, set at
+    /// exit from the runner's report (`crate::runner`). Absent while the
+    /// task runs, for records from older managers, and when the runner
+    /// could not report (it was SIGKILLed with its group: `timeout_ms`, a
+    /// stop that outlived its grace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_user_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_sys_ms: Option<u64>,
+    /// Peak RSS of the single largest process in that set, in KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rss_kb: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
