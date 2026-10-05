@@ -68,14 +68,14 @@ impl WorkKind {
 
 /// The kind of the heaviest simple command in `command`.
 pub fn classify(command: &str) -> WorkKind {
-    classify_depth(command, 0).unwrap_or(WorkKind::Other)
+    classify_depth(command, 0, false).unwrap_or(WorkKind::Other)
 }
 
 /// `None` when every simple command is setup noise.
-fn classify_depth(command: &str, depth: usize) -> Option<WorkKind> {
+fn classify_depth(command: &str, depth: usize, fed_by_xargs: bool) -> Option<WorkKind> {
     split_simple_commands(command)
         .iter()
-        .filter_map(|words| simple_kind(words, depth))
+        .filter_map(|words| simple_kind_fed(words, depth, fed_by_xargs))
         .max()
 }
 
@@ -355,13 +355,9 @@ const TEST: &[&str] = &[
 /// `pdm run X` style runners: X is a script name or a program.
 const SCRIPT_RUNNERS: &[&str] = &["pdm", "uv", "poetry", "pipenv", "hatch", "rye", "npm", "pnpm", "yarn", "bun", "just", "task", "make"];
 
-fn simple_kind(words: &[String], depth: usize) -> Option<WorkKind> {
-    simple_kind_fed(words, depth, false)
-}
-
 /// `fed_by_xargs`: an `xargs` further out supplies arguments on stdin, so
 /// a test runner reached through more wrappers (`xargs uv run python -m
-/// pytest`) is still a targeted run.
+/// pytest`, `xargs sh -c 'pytest'`) is still a targeted run.
 fn simple_kind_fed(words: &[String], depth: usize, fed_by_xargs: bool) -> Option<WorkKind> {
     let mut w: Vec<&str> = words.iter().map(String::as_str).collect();
     let mut fed_by_xargs = fed_by_xargs;
@@ -405,7 +401,7 @@ fn simple_kind_fed(words: &[String], depth: usize, fed_by_xargs: bool) -> Option
                     }
                     if a.starts_with('-') && a.contains('c') && !a.starts_with("--") {
                         return match rest.get(i + 1) {
-                            Some(script) if depth < 8 => classify_depth(script, depth + 1),
+                            Some(script) if depth < 8 => classify_depth(script, depth + 1, fed_by_xargs),
                             _ => Some(WorkKind::Other),
                         };
                     }
@@ -886,6 +882,9 @@ mod tests {
             "xargs npx vitest run",
             "xargs npm exec vitest run",
             "xargs retry 3 pytest",
+            "xargs sh -c 'pytest'",
+            "xargs sh -c 'pytest -q'",
+            "xargs bash -c 'pytest -q'",
         ] {
             assert_eq!(k(cmd), Test, "{cmd}");
         }
