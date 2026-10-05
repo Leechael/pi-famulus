@@ -25,7 +25,7 @@ function makeStack() {
   const factory = new SessionFactory();
   const runner = new InProcessRunner({
     createSession: factory.fn,
-    acquire: (req) => registry.admitChild(req.childId),
+    acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
   });
   registry.setRunner(runner);
   const notifications: { customType: string; content: string; details?: unknown }[] = [];
@@ -213,7 +213,7 @@ describe("subagent tool with the real agents loader", () => {
     const factory = new SessionFactory(); // autoComplete "done"
     const runner = new InProcessRunner({
       createSession: factory.fn,
-      acquire: (req) => registry.admitChild(req.childId),
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
     });
     registry.setRunner(runner);
 

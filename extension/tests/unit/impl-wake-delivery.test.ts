@@ -100,7 +100,7 @@ describe("subagent wakes re-check statuses when the model sees them", () => {
       createSession: factory.fn,
       clock,
       stallMs: 0,
-      acquire: (req) => registry.admitChild(req.childId),
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
     });
     registry.setRunner(runner);
     const sent: { customType: string; content: string; details?: unknown }[] = [];

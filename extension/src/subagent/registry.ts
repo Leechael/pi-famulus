@@ -368,7 +368,7 @@ export class SubagentRegistry implements RunRegistry {
    * and wires result settlement for resumed generations. Returns the slot
    * releaser.
    */
-  async admitChild(childId: string): Promise<() => void> {
+  async admitChild(childId: string, ticket?: { current: () => boolean }): Promise<() => void> {
     await this.acquireSlot();
     let released = false;
     const release = () => {
@@ -385,12 +385,14 @@ export class SubagentRegistry implements RunRegistry {
       release();
       throw new ChildCancelledError();
     }
-    // A resumed turn interrupted or disposed while queued is already settled:
-    // hand the slot on without ever showing the child as running.
-    const queued = child.handle?.status();
-    if (queued !== undefined && queued !== "pending") {
+    // The generation that queued this request settled while it waited
+    // (interrupt/dispose; maybe a newer resume is queued behind other
+    // children): hand the slot on, without touching the child's status.
+    // Without a ticket, fall back to the handle's status.
+    const stale = ticket ? !ticket.current() : (child.handle?.status() ?? "pending") !== "pending";
+    if (stale) {
       release();
-      throw new ChildCancelledError(`settled while queued (${queued})`);
+      throw new ChildCancelledError("settled while queued");
     }
     this.transitionChild(child, "running");
     const handle = child.handle;

@@ -27,7 +27,7 @@ function makeStack(
     overrunRepeatMs: 60_000,
     hardTimeoutMs: opts.hardTimeoutMs,
     onOverrun: (t) => overruns.push(t),
-    acquire: (req) => registry.admitChild(req.childId),
+    acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
   });
   registry.setRunner(runner);
   const notify = vi.fn();
@@ -684,6 +684,36 @@ describe("subagent tool — resume never waits for an admission slot", () => {
     await exec({ tasks: [{ prompt: "d", name: "delta" }], async: true });
     await flushMicrotasks();
     expect(factory.sessions.map((s) => s.prompts[0])).toEqual(["a", "b", "d"]);
+  });
+
+  it("an interrupted queued resume's stale slot request cannot admit the child's next resume", async () => {
+    // Review of #36: resume1 queued, interrupted, gamma queued behind it,
+    // resume2 queued behind gamma. When beta frees the slot it reaches
+    // resume1's obsolete request first, which used to mark alpha running
+    // (registry) while its handle stayed pending and gamma got the slot.
+    const { exec, registry, factory, runA } = await fullQueue();
+    const alphaId = registry.get(runA)!.children[0].childId;
+    await exec({ action: "resume", run_id: runA, child_id: "alpha", message: "resume1" });
+    await exec({ action: "interrupt", run_id: runA, child_id: "alpha" });
+    await flushMicrotasks();
+    const g = await exec({ tasks: [{ prompt: "c", name: "gamma" }], async: true });
+    const runC = (g.details as { run_id: string }).run_id;
+    await flushMicrotasks();
+    await exec({ action: "resume", run_id: runA, child_id: "alpha", message: "resume2" });
+    await flushMicrotasks();
+
+    factory.sessions[1].complete("beta done"); // frees the slot
+    await flushMicrotasks();
+    expect(registry.get(runC)!.children[0].status).toBe("running"); // gamma was ahead of resume2
+    expect(registry.get(runA)!.children[0].status).toBe("pending");
+    expect(registry.handle(alphaId)!.status()).toBe("pending");
+    expect(factory.sessions[0].prompts).toEqual(["a"]);
+
+    factory.sessions[2].complete("gamma done");
+    await flushMicrotasks();
+    expect(factory.sessions[0].prompts).toEqual(["a", "resume2"]);
+    expect(registry.get(runA)!.children[0].status).toBe("running");
+    expect(registry.handle(alphaId)!.status()).toBe("running");
   });
 
   it("a dead session found after the call returned is reported by a wake, not a tool error", async () => {

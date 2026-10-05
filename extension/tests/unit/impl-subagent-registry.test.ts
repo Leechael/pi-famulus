@@ -16,7 +16,7 @@ function makeStack(opts: { maxConcurrentChildren?: number; spawnBudgetPerHour?: 
   const runner = new InProcessRunner({
     createSession: factory.fn,
     clock,
-    acquire: (req) => registry.admitChild(req.childId),
+    acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
   });
   registry.setRunner(runner);
   return { registry, factory, runner };

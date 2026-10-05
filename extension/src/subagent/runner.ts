@@ -67,6 +67,12 @@ export function stallRetryPrompt(stallMs: number): string {
   );
 }
 
+/** Identity of one generation's slot request (see InProcessRunnerOptions.acquire). */
+export interface AdmissionTicket {
+  /** False once the requesting generation settled or was superseded. */
+  current: () => boolean;
+}
+
 export interface InProcessRunnerOptions {
   createSession: CreateSessionFn;
   /** Stall watchdog timeout (ms). Default 10 minutes. */
@@ -93,7 +99,7 @@ export interface InProcessRunnerOptions {
    * resolved releaser is called when the generation settles. Rejecting
    * cancels the generation as {status:"interrupted", error}.
    */
-  acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<() => void>;
   /**
    * Called after the child's conversation may have changed (a message or
    * tool finished, or the generation settled). Used to persist transcripts.
@@ -130,7 +136,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly hardTimeoutMs: number;
   private readonly onOverrun?: (tick: OverrunTick) => void;
   private readonly clock: Clock;
-  private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  private readonly acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<() => void>;
   private readonly onActivity?: (childId: string) => void;
 
   private session: ChildSessionAdapter | null = null;
@@ -466,7 +472,12 @@ class InProcessChildHandle implements DisposableChildHandle {
 
     if (this.acquire && !reuseSlot) {
       try {
-        this.releaseSlot = await this.acquire(this.req);
+        // The ticket ties the slot request to THIS generation: a request
+        // whose generation settled while queued (interrupt, then a new
+        // resume) must not admit the child's next generation.
+        this.releaseSlot = await this.acquire(this.req, {
+          current: () => !this.disposed && !this.isSettled(gen),
+        });
       } catch (err) {
         // Admission denied (e.g. fail_fast cancellation while queued).
         this.settle(gen, {

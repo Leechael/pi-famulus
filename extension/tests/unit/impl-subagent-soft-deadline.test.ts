@@ -417,7 +417,7 @@ describe("soft deadline, as the parent sees it (registry + runner + overrun noti
       stallMs: 5 * 60_000,
       overrunRepeatMs: 10 * 60_000,
       hardTimeoutMs,
-      acquire: (req) => registry.admitChild(req.childId),
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
       onOverrun: createOverrunNotifier({
         now: () => clock.now(),
         registry,

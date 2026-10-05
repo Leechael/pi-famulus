@@ -559,7 +559,7 @@ export default function (pi: ExtensionAPI): void {
       stallRetryDelayMs: subagentConfig.stallRetryDelayMs,
       overrunRepeatMs: subagentConfig.overrunRepeatMs,
       hardTimeoutMs: subagentConfig.hardTimeoutMs,
-      acquire: (req) => registry.admitChild(req.childId),
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
       onActivity: (childId) => {
         syncTranscript(childId);
       },

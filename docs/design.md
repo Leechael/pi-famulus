@@ -515,7 +515,7 @@ All of these are turn-level fields. Each generation (first prompt, stall retry, 
 | `resume(message, timeout_ms?)` (tool): **requested** | completed / failed / interrupted | pending (**queued**) | Checked at once (not disposed, has a session); the tool call returns here and never waits for a slot. New user turn: `turnBudgetMs = timeout_ms ?? spawn budget`, `reminders = 0`, stall budget reset, a fresh result promise. The registry shows the child `pending` with the previous turn's result cleared. No timers. |
 | Abort drain, then admission (background) | pending (queued) | running | Waits for a still-unwinding abort (bounded by `stallMs`), then for an admission slot (FIFO behind every other waiter, first launches included). Granted: same as "Admission granted" above (`turnBudgetStart = now`, timers armed, prompt). |
 | Abort drain does not finish within `stallMs` | pending (queued) | failed | settle (`session did not go idle after the abort; cannot resume`). The parent learns it from the settle wake, not from the tool call. |
-| `interrupt` / `dispose` while queued | pending (queued) | interrupted | settle. When the slot reaches the child later, admission sees the settled turn and hands the slot on at once; the child never shows `running`. |
+| `interrupt` / `dispose` while queued | pending (queued) | interrupted | settle. When the slot later reaches that turn's request, admission sees (through the request's generation ticket, not the handle's current status) that its generation settled and hands the slot on at once, even if a newer resume of the same child is queued meanwhile; the child never shows `running` for it. |
 
 Invariants:
 
