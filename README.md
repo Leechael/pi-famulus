@@ -72,6 +72,8 @@ subagent({ action: "list|get|status|interrupt|resume|steer|extend|models", run_i
 - Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<pi-famulus-wake kind="subagent-done">`. **Never poll.**
 - `model` accepts fuzzy specs (`"haiku"`, `"openai/gpt-5.2"`, `"luna:high"`); the candidate set respects pi's whitelist (`enabledModels` / `--models`). Use `action:"models"` to list selectable values before choosing.
 - Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a no-background bash variant. The stall watchdog is 5 minutes of inactivity, paused while a tool is executing or a `need_decision` is pending. Each child turn has a 30-minute soft budget (`timeout_ms`): past it the child keeps running, its shell is not stopped, and the parent gets `<pi-famulus-wake kind="subagent-overrun">` (repeated every 10 minutes) to `extend`, steer, or `interrupt` it. `resume` takes `timeout_ms` for the new turn. An aborting ceiling, `hardTimeoutMs`, is opt-in. A decision request waits 10 minutes.
+- `resume` returns at once. When all `maxConcurrentChildren` slots are busy the child is queued (shown `pending`, the result says how many are ahead) and starts when a slot frees; its result arrives as a wake as usual.
+- Every wake carries `as-of` (when it was generated). Steered and turn-triggering wakes get `age-ms` (how old they are) when they enter the model's context, and subagent wakes re-check child statuses then: a child resumed since the snapshot shows its current status with `status-as-of`.
 
 ### monitor
 ```
@@ -141,7 +143,7 @@ Operations manual (every subcommand, fuzzy ids, output formats): **[docs/cli.md]
 | What is running / just finished? | `pi-famulus ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits drops its finished rows from `ls` at once, and drops out of `sessions` too once nothing of it is still running; either way its running work stays listed until it ends, and its records stay reachable by id for `goneSessionRetention` (default 24h) |
 | Why did this end? What did it print? | `pi-famulus show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
 | What did this subagent do? | `pi-famulus agent <ch_id> [-f] [--full]` (live transcript) |
-| Why didn't a notification arrive? | `pi-famulus events [-f] [--id X]` (task lifecycle + wake emit/deliver/dedupe/drop) |
+| Why didn't a notification arrive? | `pi-famulus events [-f] [--id X]` (task lifecycle + wake emit/deliver/inject/dedupe/drop; `wake.inject lag_ms` = how long a wake waited before the model saw it) |
 | Follow output | `pi-famulus tail <id>`, `pi-famulus log -f <id> [--stderr]` |
 
 Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pi-famulus/` (`PI_FAMULUS_HOME` / `--home`).
