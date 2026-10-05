@@ -612,7 +612,7 @@ fn script_name_kind(name: &str, args: &[&str], fed_by_xargs: bool) -> Option<Wor
     let n = name.to_ascii_lowercase();
     let parts: Vec<&str> = n.split(|c: char| !c.is_ascii_alphanumeric()).collect();
     let has = |k: &str| parts.contains(&k);
-    if n.contains("test") {
+    if has("test") {
         return Some(test_kind(args, fed_by_xargs));
     }
     let lint_words = ["format", "type", "types", "mypy", "ruff", "clippy", "prek", "precommit", "style", "check"];
@@ -774,6 +774,19 @@ mod tests {
         assert_eq!(k(function_wrapper), LintType, "a shell function wrapping known tools");
         assert_eq!(k("retry 3 cargo test"), TestSuite);
         assert_eq!(k("python tools/run.py pytest"), Other, "interpreter arguments are not commands");
+    }
+
+    /// Script names match `test` as a whole token (`test`, `test:unit`,
+    /// `e2e-test`), not as a substring (`latest`, `attest`, `contest`).
+    #[test]
+    fn script_name_test_is_a_whole_token() {
+        for cmd in ["npm run test", "npm run test:unit", "npm run test-e2e", "make e2e-test"] {
+            assert_eq!(k(cmd), TestSuite, "{cmd}");
+        }
+        for cmd in ["npm run latest", "npm run attest", "npm run contest"] {
+            assert_eq!(k(cmd), Other, "{cmd}");
+        }
+        assert_eq!(k("pdm run pytest"), TestSuite, "pytest still lands via TEST");
     }
 
     /// A wrapper option's value is not the subcommand or program
