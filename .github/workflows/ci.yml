@@ -18,6 +18,10 @@ on:
         description: Git ref to build and test
         type: string
         default: ''
+      version:
+        description: If set, rewrite release metadata to this version before packing
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -31,6 +35,7 @@ jobs:
     uses: ./.github/workflows/native-packages.yml
     with:
       ref: ${{ inputs.ref || '' }}
+      version: ${{ inputs.version || '' }}
 
   # No Windows job: the manager is unix-only, and the extension reaches it
   # over a unix socket path (manager/TESTING.md, Deferrals).

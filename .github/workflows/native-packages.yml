@@ -8,10 +8,18 @@ on:
         description: Git ref to build and test (empty uses the selected branch)
         type: string
         default: ''
+      version:
+        description: If set, rewrite release metadata to this version before packing
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
         description: Git ref to build and test (empty uses the caller's ref)
+        type: string
+        default: ''
+      version:
+        description: If set, rewrite release metadata to this version before packing
         type: string
         default: ''
 
@@ -28,6 +36,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Apply computed release version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: node scripts/bump-release.mjs "$RELEASE_VERSION"
       - run: node scripts/validate-release.mjs
       - run: node --test scripts/*.test.mjs
       - name: Pack root extension
@@ -73,6 +86,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Apply computed release version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: node scripts/bump-release.mjs "$RELEASE_VERSION"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

@@ -1,13 +1,20 @@
 name: Publish npm packages
 
 on:
-  # Select main as the workflow ref; the release tag is an explicit build input.
+  # Select main as the workflow ref. The version is computed from the
+  # channel: npm registry, git tags, and package.json, not typed by hand.
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing release tag to test or publish (vX.Y.Z)
+      channel:
+        description: Version bump (auto-detected from npm, git tags, and package.json)
         required: true
-        type: string
+        type: choice
+        options:
+          - beta
+          - nightly
+          - patch
+          - minor
+          - major
       dry_run:
         description: Validate tarballs without publishing (does not test OIDC)
         required: true
@@ -29,50 +36,53 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     outputs:
-      tag: ${{ steps.input.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      dist_tag: ${{ steps.release.outputs.dist_tag }}
       dry_run: ${{ steps.input.outputs.dry_run }}
       sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Validate event input before using it as a Git ref
+      - name: Validate event input before using it
         id: input
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          CHANNEL: ${{ inputs.channel }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { appendFileSync } from 'node:fs';
-          import { validateTag } from './scripts/validate-release.mjs';
-          validateTag(process.env.RELEASE_TAG);
+          import { CHANNELS } from './scripts/next-release.mjs';
+          assert.ok(CHANNELS.includes(process.env.CHANNEL), 'channel must be beta|nightly|patch|minor|major');
           assert.ok(['true', 'false'].includes(process.env.DRY_RUN));
-          appendFileSync(process.env.GITHUB_OUTPUT, `tag=${process.env.RELEASE_TAG}\ndry_run=${process.env.DRY_RUN}\n`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `channel=${process.env.CHANNEL}\ndry_run=${process.env.DRY_RUN}\n`);
           NODE
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.input.outputs.tag }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Require exact versions, repository and main ancestry
+      - name: Compute the next version
+        id: release
         env:
-          RELEASE_TAG: ${{ steps.input.outputs.tag }}
-        run: node scripts/validate-release.mjs --tag "$RELEASE_TAG"
+          CHANNEL: ${{ steps.input.outputs.channel }}
+        run: node scripts/next-release.mjs --channel "$CHANNEL"
       - id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   # Same full PR/main pipeline: manager real+manual clocks on four hosts,
   # extension tests, real pi e2e, tarball install smoke tests, all five packs.
+  # `version` rewrites release metadata in the CI working tree so artifacts
+  # match the computed version without committing to main.
   tests:
     needs: validate
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.validate.outputs.sha }}
+      version: ${{ needs.validate.outputs.version }}
 
   publish:
     needs: [validate, tests]
@@ -85,6 +95,7 @@ jobs:
       id-token: write
     env:
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
       DRY_RUN: ${{ needs.validate.outputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
@@ -112,8 +123,10 @@ jobs:
           pattern: npm-*
           path: ${{ runner.temp }}/packages
           merge-multiple: true
-      - name: Revalidate tagged checkout before publication
-        run: node scripts/validate-release.mjs --tag "$RELEASE_TAG"
+      - name: Apply computed version and revalidate before publication
+        run: |
+          node scripts/bump-release.mjs "$RELEASE_VERSION"
+          node scripts/validate-release.mjs --tag "$RELEASE_TAG"
       - name: Check OIDC availability (never log tokens)
         if: needs.validate.outputs.dry_run == 'false'
         run: |

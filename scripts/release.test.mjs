@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './validate-release.mjs';
 import { prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
+import { bumpRelease } from './bump-release.mjs';
 
 const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
@@ -63,6 +64,33 @@ function assertPublishingAuthority(publish) {
   const validate = publish.match(/^  validate:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
   assert.match(validate, /^    if: github\.ref == 'refs\/heads\/main'$/m, 'validate job must require main');
 }
+
+test('bump-release writes every versioned manifest including prerelease', t => {
+  const { root, put } = fixture(t);
+  put('manager/Cargo.lock', '[[package]]\nname = "pi-famulus"\nversion = "0.1.0"\n');
+  put('extension/package-lock.json', {
+    name: 'pi-famulus',
+    version: '0.1.0',
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'pi-famulus', version: '0.1.0', optionalDependencies: Object.fromEntries(PLATFORMS.map(p => [p.name, '0.1.0'])) },
+      ...Object.fromEntries(PLATFORMS.map(p => [`../npm/${p.id}`, { name: p.name, version: '0.1.0' }])),
+    },
+  });
+  bumpRelease(root, '0.1.3-beta.0');
+  assert.equal(JSON.parse(readFileSync(join(root, 'extension/package.json'))).version, '0.1.3-beta.0');
+  assert.equal(JSON.parse(readFileSync(join(root, 'extension/package.json'))).optionalDependencies['pi-famulus-linux-x64'], '0.1.3-beta.0');
+  assert.equal(JSON.parse(readFileSync(join(root, 'npm/linux-x64/package.json'))).version, '0.1.3-beta.0');
+  assert.match(readFileSync(join(root, 'manager/Cargo.toml'), 'utf8'), /version = "0\.1\.3-beta\.0"/);
+  assert.match(readFileSync(join(root, 'manager/Cargo.lock'), 'utf8'), /name = "pi-famulus"\nversion = "0\.1\.3-beta\.0"/);
+  assert.match(readFileSync(join(root, 'extension/src/manager-client.ts'), 'utf8'), /EXTENSION_VERSION = "0\.1\.3-beta\.0"/);
+  const lock = JSON.parse(readFileSync(join(root, 'extension/package-lock.json')));
+  assert.equal(lock.version, '0.1.3-beta.0');
+  assert.equal(lock.packages[''].version, '0.1.3-beta.0');
+  assert.deepEqual(lock.packages[''].optionalDependencies, Object.fromEntries(PLATFORMS.map(p => [p.name, '0.1.3-beta.0'])));
+  for (const p of PLATFORMS) assert.equal(lock.packages[`../npm/${p.id}`].version, '0.1.3-beta.0');
+  validateMetadata(root, { tag: 'v0.1.3-beta.0', repository });
+});
 
 test('publication guards cannot be satisfied by comments or other jobs', () => {
   const publish = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
@@ -163,7 +191,13 @@ test('all five packed packages include the approved MIT license', t => {
 test('release versions, literal repository and all four metadata contracts', t => {
   const { root, put } = fixture(t);
   assert.equal(validateMetadata(root, { tag: 'v0.1.0', repository }).length, 5);
-  for (const bad of ['v01.1.0', '0.1.0', 'v1.2.3;echo pwn', 'v1.2.3\n', 'v1.2.3-beta']) assert.throws(() => validateTag(bad));
+  for (const bad of ['v01.1.0', '0.1.0', 'v1.2.3;echo pwn', 'v1.2.3\n', 'v1.2.3-beta', 'v1.2.3-nightly', 'v1.2.3-rc.1']) assert.throws(() => validateTag(bad));
+  assert.equal(validateTag('v1.2.3-beta.0'), '1.2.3-beta.0');
+  assert.equal(validateTag('v1.2.3-nightly.20261006'), '1.2.3-nightly.20261006');
+  assert.equal(validateTag('v1.2.3-nightly.20261006.1'), '1.2.3-nightly.20261006.1');
+  assert.throws(() => validateTag('v1.2.3-nightly.20250231'), /calendar day/);
+  assert.throws(() => validateTag('v1.2.3-nightly.20251301'), /calendar day/);
+  assert.throws(() => validateTag('v1.2.3-nightly.20251131'), /calendar day/);
   assert.throws(() => validateMetadata(root, { tag: 'v0.2.0', repository }), /version/);
   assert.throws(() => validateMetadata(root, { repository: 'other/repo' }), /repository/);
   const path = 'npm/linux-x64/package.json';
@@ -235,7 +269,12 @@ test('dry run uses all real packed candidates, natives first/root last, and neve
   await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', repository, dryRun: true, fetchImpl: () => { throw Error('network forbidden'); }, run: (...args) => calls.push(args) });
   assert.equal(calls.length, 5);
   assert.match(calls.at(-1)[1][1], /pi-famulus-0.1.0.tgz$/);
-  for (const [, args] of calls) { assert.ok(args.includes('--dry-run')); assert.ok(args.includes('--provenance')); assert.ok(args.includes('--access')); }
+  for (const [, args] of calls) {
+    assert.ok(args.includes('--dry-run'));
+    assert.ok(args.includes('--provenance'));
+    assert.ok(args.includes('--access'));
+    assert.equal(args[args.indexOf('--tag') + 1], 'latest');
+  }
 });
 
 test('real release preflights all names before publish; bootstrap absence actionable', async t => {
@@ -325,6 +364,13 @@ test('workflow literal security, release graph and four host/target contracts', 
   assertPublishingAuthority(publish);
   assert.ok(!/^  release:/m.test(publish), 'tag-triggered workflows cannot use the main-only publishing environment');
   assert.ok(publish.includes('default: true'));
+  assert.ok(publish.includes('type: choice'));
+  for (const channel of ['beta', 'nightly', 'patch', 'minor', 'major']) {
+    assert.match(publish, new RegExp(`^          - ${channel}$`, 'm'), channel);
+  }
+  assert.ok(publish.includes('scripts/next-release.mjs'));
+  assert.ok(publish.includes('scripts/bump-release.mjs'));
+  assert.ok(!publish.includes('Existing release tag'));
   assert.equal((publish.match(/id-token: write/g) ?? []).length, 1);
   assert.equal((publish.match(/^    environment: npm$/gm) ?? []).length, 1);
   assert.ok(!/NPM_TOKEN|NODE_AUTH_TOKEN|npm whoami|npm login/.test(publish));

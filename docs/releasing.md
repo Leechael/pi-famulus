@@ -63,7 +63,7 @@ Repository configuration does not create npm packages or their trusted-publisher
 
 1. Confirm the public license/ownership and all five npm names before the first public release.
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
-3. Verify the `npm` environment's main-only deployment policy. Create the matching main-ancestor tag (for example `v0.1.0`). Run `publish.yml` via **workflow_dispatch** from **main**, selecting that tag as the input and leaving **dry_run=true**. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
+3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and leaving **dry_run=true**. The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
 4. Download all five `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the four native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
 5. Configure the table above under each package's npm Access / Trusted publishing settings. With current npm, the equivalent authenticated commands are:
 
@@ -85,17 +85,27 @@ The repository's `npm` GitHub environment was created and its single `main` bran
 
 ## Subsequent tokenless releases
 
-`publish.yml` accepts stable tags only. A tag must resolve to the checked-out commit, match all five package/Cargo versions, and be an ancestor of `origin/main`. The workflow pins that SHA for full CI and publication, revalidates it, and downloads the five artifacts from that same workflow run.
+`publish.yml` does not take a version or tag. Dispatch from **main** and choose a channel:
+
+| Channel | Version | npm dist-tag |
+|---|---|---|
+| `patch` / `minor` / `major` | next stable `X.Y.Z` | `latest` |
+| `beta` | `{next-patch}-beta.N` | `beta` |
+| `nightly` | `{next-patch}-nightly.YYYYMMDD` (`.N` if that day already exists) | `nightly` |
+
+The next version is the bump of `max(package.json, npm published stables, git tags vX.Y.Z)`. Prerelease counters come from existing npm versions and git tags. You never type the number.
+
+CI rewrites release metadata in the job workspace (package manifests, Cargo, `EXTENSION_VERSION`, lockfiles) so packed tarballs carry that version. It does **not** commit the bump to `main`. After a real publish, npm is the source of truth for the next increment even if git still shows the previous version.
 
 Publication is explicitly dispatched from **main**; publishing a GitHub release does not itself trigger npm publication. A tag-triggered workflow runs under a tag ref, not main, and is deliberately incompatible with the main-only environment gate.
 
 ```sh
-gh workflow run publish.yml --ref main -f tag=vX.Y.Z -f dry_run=true
+gh workflow run publish.yml --ref main -f channel=patch -f dry_run=true
 # After reviewing the artifacts and trust bindings:
-gh workflow run publish.yml --ref main -f tag=vX.Y.Z -f dry_run=false
+gh workflow run publish.yml --ref main -f channel=patch -f dry_run=false
 ```
 
-`dry_run=true` builds/tests and invokes real `npm publish --dry-run`; `dry_run=false` explicitly requests publication.
+`dry_run=true` builds/tests and invokes real `npm publish --dry-run`; `dry_run=false` explicitly requests publication. Repeating `patch` after a successful publish computes the next patch; repeating it after only a dry run computes the same unpublished version again.
 
 A dry run proves package validity, **not** OIDC authentication or npm-side trust. For real publication, safe diagnostics assert OIDC request credentials are present without logging them. Successful OIDC/provenance must be verified from the publishing logs and npm metadata. Re-running an identical bootstrap version may skip every publish call; that is **not** an OIDC authentication test. Verify on a subsequent new version.
 
