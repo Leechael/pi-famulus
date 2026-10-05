@@ -12,12 +12,18 @@ export const PLATFORMS = [
   ['darwin', 'arm64', 'aarch64-apple-darwin'],
 ].map(([os, arch, target]) => ({ os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}` }));
 
+function isUtcCalendarDay(yyyymmdd) {
+  const y = Number(yyyymmdd.slice(0, 4));
+  const m = Number(yyyymmdd.slice(4, 6));
+  const d = Number(yyyymmdd.slice(6, 8));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
 export function validateTag(tag) {
-  assert.match(
-    tag ?? '',
-    /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*)|-nightly\.\d{8}(?:\.(0|[1-9]\d*))?)?$/,
-    'release tag must be vX.Y.Z, vX.Y.Z-beta.N, or vX.Y.Z-nightly.YYYYMMDD[.N] (no shell syntax)',
-  );
+  const m = /^(v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))(?:-beta\.(?:0|[1-9]\d*)|-nightly\.(\d{8})(?:\.(?:0|[1-9]\d*))?)?$/.exec(tag ?? '');
+  assert.ok(m, 'release tag must be vX.Y.Z, vX.Y.Z-beta.N, or vX.Y.Z-nightly.YYYYMMDD[.N] (no shell syntax)');
+  if (m[2]) assert.ok(isUtcCalendarDay(m[2]), `nightly date ${m[2]} is not a real UTC calendar day`);
   return tag.slice(1);
 }
 

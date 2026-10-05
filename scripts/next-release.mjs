@@ -128,8 +128,8 @@ export function readGitTags(root) {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     return out.split('\n').map(s => s.trim()).filter(Boolean);
-  } catch {
-    return [];
+  } catch (cause) {
+    throw new Error('git tag --list failed; refusing to compute a version without the tag set', { cause });
   }
 }
 

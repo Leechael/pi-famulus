@@ -87,7 +87,8 @@ test('bump-release writes every versioned manifest including prerelease', t => {
   const lock = JSON.parse(readFileSync(join(root, 'extension/package-lock.json')));
   assert.equal(lock.version, '0.1.3-beta.0');
   assert.equal(lock.packages[''].version, '0.1.3-beta.0');
-  assert.equal(lock.packages['../npm/linux-x64'].version, '0.1.3-beta.0');
+  assert.deepEqual(lock.packages[''].optionalDependencies, Object.fromEntries(PLATFORMS.map(p => [p.name, '0.1.3-beta.0'])));
+  for (const p of PLATFORMS) assert.equal(lock.packages[`../npm/${p.id}`].version, '0.1.3-beta.0');
   validateMetadata(root, { tag: 'v0.1.3-beta.0', repository });
 });
 
@@ -194,6 +195,9 @@ test('release versions, literal repository and all four metadata contracts', t =
   assert.equal(validateTag('v1.2.3-beta.0'), '1.2.3-beta.0');
   assert.equal(validateTag('v1.2.3-nightly.20261006'), '1.2.3-nightly.20261006');
   assert.equal(validateTag('v1.2.3-nightly.20261006.1'), '1.2.3-nightly.20261006.1');
+  assert.throws(() => validateTag('v1.2.3-nightly.20250231'), /calendar day/);
+  assert.throws(() => validateTag('v1.2.3-nightly.20251301'), /calendar day/);
+  assert.throws(() => validateTag('v1.2.3-nightly.20251131'), /calendar day/);
   assert.throws(() => validateMetadata(root, { tag: 'v0.2.0', repository }), /version/);
   assert.throws(() => validateMetadata(root, { repository: 'other/repo' }), /repository/);
   const path = 'npm/linux-x64/package.json';

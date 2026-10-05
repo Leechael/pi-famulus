@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CHANNELS, compareStable, distTagForVersion, resolveNextVersion } from './next-release.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CHANNELS, compareStable, distTagForVersion, readGitTags, resolveNextVersion } from './next-release.mjs';
 
 test('patch/minor/major increment from package.json when nothing is published', () => {
   assert.deepEqual(resolveNextVersion({ channel: 'patch', packageVersion: '0.1.2' }), {
@@ -62,4 +65,10 @@ test('unknown channels and non-stable package versions are rejected', () => {
   assert.throws(() => resolveNextVersion({ channel: 'patch', packageVersion: '0.1.2-beta.0' }), /stable/);
   assert.ok(CHANNELS.includes('beta'));
   assert.equal(compareStable('0.2.0', '0.1.9'), 1);
+});
+
+test('readGitTags fails closed when git cannot list tags', t => {
+  const root = mkdtempSync(join(tmpdir(), 'famulus-not-git-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  assert.throws(() => readGitTags(root), /git tag/);
 });
