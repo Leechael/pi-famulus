@@ -247,7 +247,7 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
 
 /// A CLI newer than the running daemon reads what the old daemon reports:
 /// columns it never recorded (a session's CWD, SINCE) stay empty.
-fn warn_if_older_daemon(snap: &Snapshot) {
+pub(crate) fn warn_if_older_daemon(snap: &Snapshot) {
     if let Some(d) = &snap.daemon {
         if d.protocol < crate::proto::PROTOCOL {
             eprintln!(

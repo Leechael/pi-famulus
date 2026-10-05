@@ -242,6 +242,7 @@ pub fn render(groups: &[Group], by: By) -> Vec<String> {
 pub async fn cmd_stats(home: &Path, o: StatsOpts) -> Result<(), String> {
     let by = By::parse(&o.by)?;
     let snap = inspect::snapshot(home, Live::IfRunning).await?;
+    inspect::warn_if_older_daemon(&snap);
     let since = match &o.since {
         Some(s) => Some(snap.now.saturating_sub(fmt::parse_duration(s)?)),
         None => None,
