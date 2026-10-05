@@ -606,6 +606,9 @@ describe("subagent tool — resume never waits for an admission slot", () => {
     expect(registry.get(runA)!.children[0].status).toBe("pending");
     expect(registry.get(runA)!.status).toBe("running");
     expect(factory.sessions[0].prompts).toEqual(["a"]); // admission still gates the turn
+    await expect(exec({ action: "resume", run_id: runA, child_id: "alpha", message: "again" })).rejects.toThrow(
+      "is already queued and starts when a subagent slot frees; its result arrives as a wake when it finishes. Do not resume it again.",
+    );
   });
 
   it("a second queued resume reports how many are ahead of it", async () => {

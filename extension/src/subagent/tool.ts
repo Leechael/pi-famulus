@@ -782,6 +782,14 @@ function resolveSingleTerminalChild(record: RunRecord, childIdOrName: string | u
       const known = record.children.map((c) => `${c.name} (${c.childId})`).join(", ");
       throw new Error(`no child "${childIdOrName}" in run ${record.runId} (children: ${known})`);
     }
+    if (child.status === "pending") {
+      // Queued for an admission slot (a launch or an earlier resume): steer
+      // would fail too, and a second resume adds nothing.
+      throw new Error(
+        `subagent ${child.name} (${child.childId}) is already queued and starts when a subagent slot frees; ` +
+          "its result arrives as a wake when it finishes. Do not resume it again.",
+      );
+    }
     if (!matches(child)) {
       throw new Error(`subagent ${child.name} (${child.childId}) is still ${child.status}; use steer instead`);
     }
