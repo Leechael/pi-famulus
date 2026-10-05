@@ -21,7 +21,14 @@ function deps(clock: ManualClock, overrides: Partial<OverrunInfoDeps> = {}): Ove
   };
 }
 
-const tick = { childId: "ch_a", elapsedMs: 30 * MIN, budgetMs: 30 * MIN, reminder: 1, nextReminderMs: 10 * MIN };
+const tick = {
+  childId: "ch_a",
+  elapsedMs: 30 * MIN,
+  budgetMs: 30 * MIN,
+  reminder: 1,
+  nextReminderMs: 10 * MIN,
+  hardRemainingMs: null,
+};
 
 describe("buildOverrunInfo", () => {
   it("names the child's run, turn time, and last transcript activity", () => {
@@ -37,6 +44,12 @@ describe("buildOverrunInfo", () => {
       nextReminderMs: 10 * MIN,
       lastActivity: { agoMs: 3 * MIN, text: "assistant: Running the suite." },
     });
+  });
+
+  it("carries the time left to a configured hard ceiling", () => {
+    const clock = new ManualClock();
+    const info = buildOverrunInfo(deps(clock), { ...tick, lastEventAt: 0, hardRemainingMs: 90_000 });
+    expect(info?.hardCeilingMs).toBe(90_000);
   });
 
   it("returns undefined once the child's run is gone (no wake for a disposed run)", () => {

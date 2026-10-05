@@ -299,6 +299,8 @@ export interface SubagentOverrunInfo {
   budgetMs: number;
   reminder: number;
   nextReminderMs: number;
+  /** Time left until the opt-in hard ceiling aborts the child. Absent when none is set. */
+  hardCeilingMs?: number;
   lastActivity: { agoMs: number; text: string };
   shell?: OverrunShell;
 }
@@ -327,6 +329,7 @@ export function formatSubagentOverrun(info: SubagentOverrunInfo): FormattedWake 
     budgetMs: info.budgetMs,
     reminder: info.reminder,
     nextReminderMs: info.nextReminderMs,
+    ...(info.hardCeilingMs !== undefined ? { hardCeilingMs: info.hardCeilingMs } : {}),
     summary,
     lastActivity: { agoMs: info.lastActivity.agoMs, text: text || "(no output yet)" },
     ...(info.shell ? { shell: { ...info.shell, command: shellWakeTitle(info.shell.command) } } : {}),

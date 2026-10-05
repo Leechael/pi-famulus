@@ -58,6 +58,8 @@ export interface OverrunTick {
   reminder: number;
   nextReminderMs: number;
   lastEventAt: number;
+  /** Time left until the opt-in hard ceiling aborts the child; null when none is set. */
+  hardRemainingMs: number | null;
 }
 
 export interface OverrunInfoDeps {
@@ -110,6 +112,7 @@ export function buildOverrunInfo(deps: OverrunInfoDeps, tick: OverrunTick): Suba
     budgetMs: tick.budgetMs,
     reminder: tick.reminder,
     nextReminderMs: tick.nextReminderMs,
+    ...(tick.hardRemainingMs !== null ? { hardCeilingMs: tick.hardRemainingMs } : {}),
     lastActivity: {
       agoMs: Math.max(0, deps.now() - tick.lastEventAt),
       text: lastActivityText(deps.conversation(tick.childId)),

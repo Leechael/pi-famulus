@@ -109,6 +109,37 @@ describe("subagent-overrun wake", () => {
   });
 });
 
+describe("subagent-overrun wake under an opt-in hard ceiling (review P2, PR #34)", () => {
+  const options = (content: string) => /<options>([\s\S]*)<\/options>/.exec(content)![1];
+
+  it("soft 60s, hard 90s, repeat 10m: says the ceiling stops it in 30s, no promise of another reminder", () => {
+    const wake = formatSubagentOverrun(
+      info({ elapsedMs: 60_000, budgetMs: 60_000, nextReminderMs: 10 * MIN, hardCeilingMs: 30_000 }),
+    );
+    expect(wake.content).toContain('reminder="1" hard-ceiling-ms="30000">');
+    expect(wake.details).toMatchObject({ hardCeilingMs: 30_000 });
+    const text = options(wake.content);
+    expect(text).toContain("the configured hard ceiling stops it in 30s, and extend does not move that ceiling");
+    expect(text).toContain("If you do none of these, it keeps running until the hard ceiling stops it.");
+    expect(text).not.toContain("reminder arrives again");
+    expect(text).not.toContain("It has not been stopped. ");
+  });
+
+  it("names the next reminder when it comes before the ceiling", () => {
+    const wake = formatSubagentOverrun(info({ nextReminderMs: 10 * MIN, hardCeilingMs: 25 * MIN }));
+    expect(options(wake.content)).toContain(
+      "If you do none of these, it keeps running and this reminder arrives again in 10m, until the hard ceiling stops it in 25m.",
+    );
+  });
+
+  it("without a ceiling the text and attributes are unchanged", () => {
+    const wake = formatSubagentOverrun(info());
+    expect(wake.content).not.toContain("hard-ceiling-ms");
+    expect(wake.details).not.toHaveProperty("hardCeilingMs");
+    expect(options(wake.content)).toContain("If you do none of these, it keeps running and this reminder arrives again in 10m");
+  });
+});
+
 describe("behavior guidelines on the overrun wake", () => {
   it("say the subagent was not stopped, name the three actions, and the no-action outcome", () => {
     const bullet = BEHAVIOR_GUIDELINES.split("\n").find((l) => l.includes('kind="subagent-overrun"'));

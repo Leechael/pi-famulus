@@ -53,7 +53,15 @@ describe("soft deadline", () => {
     expect(ticks).toHaveLength(0);
     clock.advanceBy(1);
     expect(ticks).toEqual([
-      { childId: "ch_soft", elapsedMs: 1_000, budgetMs: 1_000, reminder: 1, nextReminderMs: 300, lastEventAt: 0 },
+      {
+        childId: "ch_soft",
+        elapsedMs: 1_000,
+        budgetMs: 1_000,
+        reminder: 1,
+        nextReminderMs: 300,
+        lastEventAt: 0,
+        hardRemainingMs: null,
+      },
     ]);
     expect(handle.status()).toBe("running");
     expect(factory.sessions[0].aborts).toBe(0);
@@ -496,6 +504,9 @@ describe("soft deadline, as the parent sees it (registry + runner + overrun noti
     const handle = await registry.startChild(req);
     clock.advanceBy(45 * 60_000); // reminders at 30 and 40 min, ceiling at 45
     expect(wakes.map((w) => (w.details as { reminder: number }).reminder)).toEqual([1, 2]);
+    // Review P2 (PR #34): the wake must not promise the child keeps running.
+    expect(wakes.map((w) => (w.details as { hardCeilingMs?: number }).hardCeilingMs)).toEqual([15 * 60_000, 5 * 60_000]);
+    expect(wakes[1].content).toContain("the configured hard ceiling stops it in 5m");
     expect(await handle.result).toMatchObject({ status: "interrupted", error: "timeout" });
     await tick();
     expect(registry.get(runId)!.children[0].status).toBe("interrupted");

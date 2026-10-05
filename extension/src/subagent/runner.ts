@@ -673,6 +673,8 @@ class InProcessChildHandle implements DisposableChildHandle {
         reminder: this.reminders,
         nextReminderMs: this.overrunRepeatMs,
         lastEventAt: this.lastEvent,
+        hardRemainingMs:
+          this.hardTimeoutMs > 0 ? Math.max(0, this.turnBudgetStart + this.hardTimeoutMs - now) : null,
       });
     } catch {
       // overrun observers must not break the schedule

@@ -160,6 +160,9 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
               ].join("\n"),
             ]
           : []),
+        ...(details.hardCeilingMs !== undefined
+          ? [`Hard ceiling stops it in ${formatDuration(details.hardCeilingMs)} (extend does not move it).`]
+          : []),
         `Next reminder in ${formatDuration(details.nextReminderMs)} unless you extend, steer, or interrupt it.`,
       ].join("\n\n");
     }

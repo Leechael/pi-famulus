@@ -100,6 +100,8 @@ export type FamulusWake =
       reminder: number;
       /** When the next reminder is due if the parent does nothing. */
       nextReminderMs: number;
+      /** Time left until the opt-in hard ceiling aborts the child; absent when none is set. */
+      hardCeilingMs?: number;
       summary: string;
       lastActivity: { agoMs: number; text: string };
       shell?: OverrunShell;
@@ -258,6 +260,7 @@ function renderOverrun(details: Extract<FamulusWake, { kind: "subagent-overrun" 
     `budget-ms="${Math.round(details.budgetMs)}"`,
     `reminder="${details.reminder}"`,
   ];
+  if (details.hardCeilingMs !== undefined) attrs.push(`hard-ceiling-ms="${Math.round(details.hardCeilingMs)}"`);
   const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <summary>${escapeXml(details.summary)}</summary>`];
   parts.push(
     `  <last-activity ago-ms="${Math.round(details.lastActivity.agoMs)}">${escapeXml(details.lastActivity.text)}</last-activity>`,
@@ -281,13 +284,31 @@ function renderOverrun(details: Extract<FamulusWake, { kind: "subagent-overrun" 
 /** The parent's three actions and what happens if it takes none. */
 function overrunOptions(details: Extract<FamulusWake, { kind: "subagent-overrun" }>): string {
   const ids = `run_id: "${details.runId}", child_id: "${details.childId}"`;
-  return (
-    "It has not been stopped. Choose one: " +
+  const actions =
     `give it more time with subagent({ action: "extend", ${ids}, timeout_ms: <ms from now> }); ` +
     `redirect it with agent_message({ action: "send", to: "${details.childId}", message: "<instruction>" }); ` +
-    `or stop it with subagent({ action: "interrupt", ${ids} }). ` +
-    `If you do none of these, it keeps running and this reminder arrives again in ${wakeDuration(details.nextReminderMs)}; ` +
-    "its result arrives as usual when it finishes."
+    `or stop it with subagent({ action: "interrupt", ${ids} }). `;
+  const hard = details.hardCeilingMs;
+  if (hard === undefined) {
+    return (
+      "It has not been stopped. Choose one: " +
+      actions +
+      `If you do none of these, it keeps running and this reminder arrives again in ${wakeDuration(details.nextReminderMs)}; ` +
+      "its result arrives as usual when it finishes."
+    );
+  }
+  // Opt-in hard ceiling: never promise "keeps running" past it.
+  const ceiling = wakeDuration(hard);
+  const noAction =
+    details.nextReminderMs < hard
+      ? `If you do none of these, it keeps running and this reminder arrives again in ${wakeDuration(details.nextReminderMs)}, until the hard ceiling stops it in ${ceiling}.`
+      : "If you do none of these, it keeps running until the hard ceiling stops it.";
+  return (
+    `It has not been stopped yet, but the configured hard ceiling stops it in ${ceiling}, and extend does not move that ceiling. ` +
+    "Choose one: " +
+    actions +
+    noAction +
+    " Its result, or the interruption, arrives as a wake."
   );
 }
 
