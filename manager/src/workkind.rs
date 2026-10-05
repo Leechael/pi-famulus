@@ -18,7 +18,15 @@
 //! A test runner with no target is a whole suite (`pdm run test -n 4`,
 //! `cargo test`, `npm test`); a path, a node id, `-k`/`-m`/`--lf`, a `$`
 //! expansion standing in for targets, or targets fed by `xargs` make it
-//! targeted (`test`).
+//! targeted (`test`), in any spelling (`-k auth`, `-k=auth`, `-kauth`,
+//! `--test=name`), through any number of wrappers after the `xargs`.
+//! A runner's own option values (`npm --prefix web`, `uv run --directory
+//! backend`, `make -C dir`) are skipped, never taken as the program.
+//!
+//! Two deliberate calls (owner decision on #35): a script whose name
+//! contains `compile` (`pdm run py-compile`) is `build`, though it only
+//! checks syntax; `awk` is `read/search`, though it can compute, because
+//! agents use it to slice logs and listings.
 //!
 //! Computed when read, never stored: a better rule applies to old records
 //! too, and nothing on the wire depends on it.
