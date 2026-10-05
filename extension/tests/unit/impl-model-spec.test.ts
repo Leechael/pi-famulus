@@ -30,6 +30,14 @@ describe("splitThinkingSuffix", () => {
       thinking: undefined,
     });
   });
+  it("accepts every level pi core supports (parity with VALID_THINKING_LEVELS)", () => {
+    for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+      expect(splitThinkingSuffix(`claude-haiku-4-5:${level}`)).toEqual({
+        base: "claude-haiku-4-5",
+        thinking: level,
+      });
+    }
+  });
   it("ignores trailing/leading colons", () => {
     expect(splitThinkingSuffix(":")).toEqual({ base: ":" });
     expect(splitThinkingSuffix("model:")).toEqual({ base: "model:" });
@@ -110,6 +118,58 @@ describe("resolveModelSpec", () => {
       error: "no-match",
       candidates: [],
     });
+  });
+});
+
+describe("thinking-suffix fallback (pi core parity)", () => {
+  it("adapts an unknown suffix when the base resolves, with a warning", () => {
+    const res = resolveModelSpec("claude-haiku-4-5:highest", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, provider: "anthropic", id: "claude-haiku-4-5" });
+    expect(res).not.toHaveProperty("thinking");
+    const warning = (res as { warning?: string }).warning ?? "";
+    expect(warning).toContain('"highest"');
+    expect(warning).toContain("off");
+    expect(warning).toContain("max");
+    expect(warning.toLowerCase()).toContain("default");
+  });
+
+  it("adapts an unknown suffix on provider-qualified specs", () => {
+    const res = resolveModelSpec("openai/gpt-5.2:highest", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, provider: "openai", id: "gpt-5.2" });
+    expect((res as { warning?: string }).warning).toContain('"highest"');
+  });
+
+  it("adapts an unknown suffix on a fuzzy base", () => {
+    const res = resolveModelSpec("haiku:highest", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, id: "claude-haiku-4-5" });
+  });
+
+  it("prefers a literal id containing a colon over suffix stripping", () => {
+    const res = resolveModelSpec("openai/gpt-5.2:exacto", CANDIDATES);
+    expect(res).toMatchObject({
+      ok: true,
+      provider: "openrouter",
+      id: "openai/gpt-5.2:exacto",
+    });
+    expect((res as { warning?: string }).warning).toBeUndefined();
+  });
+
+  it("no-match error names the invalid suffix and the retried base", () => {
+    const res = resolveModelSpec("zzz:highest", CANDIDATES);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    const msg = modelResolutionError("zzz:highest", res as never);
+    expect(msg).toContain('":highest"');
+    expect(msg).toContain('"zzz"');
+  });
+
+  it("ambiguous retried base reports the ambiguity, not the raw no-match", () => {
+    const dupes: ModelCandidate[] = [
+      { provider: "a", id: "same" },
+      { provider: "b", id: "same" },
+    ];
+    const res = resolveModelSpec("same:highest", dupes);
+    expect(res).toMatchObject({ ok: false, error: "ambiguous" });
+    expect((res as { candidates: string[] }).candidates).toEqual(["a/same", "b/same"]);
   });
 });
 

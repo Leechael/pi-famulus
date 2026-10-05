@@ -73,7 +73,8 @@ const subagentParameters = Type.Object({
     Type.String({
       description:
         'Model override for all subagents: fuzzy ("haiku"), qualified ("provider/id"), ' +
-        'optionally with ":<thinking>" suffix. Default: current model. ' +
+        'optionally with ":<thinking>" suffix (off, minimal, low, medium, high, xhigh, max; ' +
+        'an unknown suffix is dropped with a warning, not an error). Default: current model. ' +
         'Use action:"models" to list selectable values.',
     }),
   ),

@@ -479,7 +479,8 @@ subagent({
 
 - Candidate set: nonempty `ctx.scopedModels` → scoped only (respect user whitelist); otherwise `modelRegistry.getAvailable()`
 - Matching algorithm (pure function `resolveModelSpec(spec, candidates)`): ① exact (`provider/id` or a unique bare-id match) → ② case-insensitive id/display-name substring; 0 matches → error listing candidates; multiple matches → error listing matches, suggesting a `provider/` prefix to disambiguate
-- Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing
+- Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing. Valid levels mirror pi core's `VALID_THINKING_LEVELS` (`off, minimal, low, medium, high, xhigh, max`; the SDK does not export the list, so `model-spec.ts` maintains a parity-pinned copy)
+- Unknown `:<suffix>` handling mirrors pi's `parseModelPattern(allowInvalidThinkingLevelFallback)`: when the full spec matches nothing, the resolver retries without the trailing suffix; a resolvable base adapts with a **warning** on the child result (never silent), while a still-unresolvable base fails hard with the invalid suffix named in the error. Literal ids containing a colon (OpenRouter `:exacto`) always win — the full spec matches them first, so the retry never fires
 - Tool parameter `model` resolution failure → **hard error** (list candidates, LLM can retry); agent-definition file `model` resolution failure → **fall back to parent model** + warning in result details (user-authored files can become invalid across machines; do not fail hard)
 - Unspecified: child inherits parent's current model (`ctx.model`)
 - `action:"models"` returns one candidate per line, `provider/id — display name`, marking the parent model `(current)` and whitelist source `(scoped)`
@@ -650,12 +651,15 @@ export function resolveAgent(defs: AgentDefinition[], name: string | undefined):
 // ---------- extension/src/subagent/model-spec.ts (pure function, zero pi dependencies) ----------
 export interface ModelCandidate { provider: string; id: string; name?: string }
 export type ModelResolution =
-  | { ok: true; provider: string; id: string; thinking?: string }
-  | { ok: false; error: "no-match"|"ambiguous"; candidates: string[]; thinking?: string };
+  | { ok: true; provider: string; id: string; thinking?: string; warning?: string }
+  | { ok: false; error: "no-match"|"ambiguous"; candidates: string[]; thinking?: string; suffixHint?: string };
 export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): ModelResolution;
-  // ① Strip ":<thinking>" suffix (recognize only minimal|low|medium|high|xhigh; otherwise treat as part of id)
+  // ① Strip ":<thinking>" suffix (VALID_THINKING_LEVELS = off|minimal|low|medium|high|xhigh|max, pi core parity)
   // ② Exact "provider/id" → unique exact bare id → case-insensitive id/name substring
-  // ③ 0 matches: no-match (candidates=all), >1 matches: ambiguous (candidates=matches)
+  // ③ Full-spec failure with an unrecognized suffix: strip it and retry (pi's
+  //   allowInvalidThinkingLevelFallback); resolvable base → ok + warning on the result,
+  //   still-unresolvable → the retried no-match/ambiguous, with suffixHint naming the bad suffix
+  // ④ Literal ids containing a colon (OpenRouter ":exacto") match at ② before ③ ever fires
 
 // ---------- extension/src/subagent/types.ts (M3 core types) ----------
 export type ChildStatus = "pending"|"running"|"completed"|"failed"|"interrupted";
