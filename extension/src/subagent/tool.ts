@@ -299,7 +299,10 @@ export function createSubagentTool(
   const runDoneSent = new Map<string, string>();
   const notifyRunCompleted = (registry: SubagentRegistry, runId: string): void => {
     const record = registry.get(runId);
-    if (!record) return;
+    if (!record) {
+      runDoneSent.delete(runId);
+      return;
+    }
     // A resumed child can outlive the run's first-launch completion. The
     // run is not done while it runs; its own settle sends this wake.
     if (record.children.some((c) => c.status === "pending" || c.status === "running")) return;
