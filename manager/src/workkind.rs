@@ -349,7 +349,8 @@ const BUILD: &[&str] = &[
     "webpack", "vite", "esbuild", "rollup", "tsup",
 ];
 const TEST: &[&str] = &[
-    "pytest", "py.test", "vitest", "jest", "mocha", "ava", "tox", "nox", "rspec", "ctest", "phpunit", "behave",
+    "pytest", "py.test", "unittest", "vitest", "jest", "mocha", "ava", "tox", "nox", "rspec", "ctest", "phpunit",
+    "behave",
 ];
 /// `pdm run X` style runners: X is a script name or a program.
 const SCRIPT_RUNNERS: &[&str] = &["pdm", "uv", "poetry", "pipenv", "hatch", "rye", "npm", "pnpm", "yarn", "bun", "just", "task", "make"];
@@ -727,6 +728,8 @@ mod tests {
     #[test]
     fn test_suites_versus_targeted_runs() {
         assert_eq!(k("pytest"), TestSuite);
+        assert_eq!(k("python -m unittest"), TestSuite);
+        assert_eq!(k("python -m unittest tests.test_foo"), Test);
         assert_eq!(k("pytest -q -n 10"), TestSuite);
         assert_eq!(k("pdm run test -n 4"), TestSuite);
         assert_eq!(k("npm test"), TestSuite);
