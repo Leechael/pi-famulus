@@ -381,6 +381,7 @@ describe("subagent tool — management actions", () => {
     factory.sessions[0].autoComplete = null;
     const resumed = await exec({ action: "resume", run_id: runId, message: "now do more" });
     expect(resumed.content[0].type === "text" && resumed.content[0].text).toContain("Resumed");
+    expect(resumed.content[0].type === "text" && resumed.content[0].text).not.toContain("queued");
     expect(factory.sessions[0].prompts).toEqual(["a", "now do more"]);
 
     factory.sessions[0].complete("second result");
@@ -597,7 +598,11 @@ describe("subagent tool — resume never waits for an admission slot", () => {
     const { exec, registry, factory, runA } = await fullQueue();
     const res = await returnsPromptly(exec({ action: "resume", run_id: runA, child_id: "alpha", message: "more" }));
     expect(res.returned).toBe(true);
-    expect((res.value as { details: { queued_behind: number | null } }).details.queued_behind).toBe(0);
+    const value = res.value as { content: { text: string }[]; details: { queued_behind: number | null } };
+    expect(value.details.queued_behind).toBe(0);
+    expect(value.content[0].text).toContain(
+      "Every subagent slot is busy, so it is queued and starts when a slot frees. You will be notified via",
+    );
     expect(registry.get(runA)!.children[0].status).toBe("pending");
     expect(registry.get(runA)!.status).toBe("running");
     expect(factory.sessions[0].prompts).toEqual(["a"]); // admission still gates the turn
@@ -612,6 +617,9 @@ describe("subagent tool — resume never waits for an admission slot", () => {
     expect(factory.sessions).toHaveLength(2);
     const first = await exec({ action: "resume", run_id: runA, child_id: "alpha", message: "more" });
     expect((first.details as { queued_behind: number }).queued_behind).toBe(1); // gamma's launch is ahead
+    expect(first.content[0].type === "text" && first.content[0].text).toContain(
+      "Every subagent slot is busy and 1 subagent(s) are waiting ahead of it, so it is queued",
+    );
     expect(runC).toMatch(/^run_/);
   });
 

@@ -653,6 +653,7 @@ export function createSubagentTool(
           type: "text",
           text:
             `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
+            queuedText(queuedBehind) +
             "You will be notified via <pi-famulus-wake kind=\"subagent-handover\"> if others are still running, " +
             "otherwise via <pi-famulus-wake kind=\"subagent-done\"> when it completes. Do not poll.",
         },
@@ -738,6 +739,13 @@ export function createSubagentTool(
       return startRun(params, signal);
     },
   };
+}
+
+/** Resume result clause for a turn waiting for an admission slot ("" when it started at once). */
+function queuedText(queuedBehind: number | null): string {
+  if (queuedBehind === null) return "";
+  const ahead = queuedBehind === 0 ? "" : ` and ${queuedBehind} subagent(s) are waiting ahead of it`;
+  return `Every subagent slot is busy${ahead}, so it is queued and starts when a slot frees. `;
 }
 
 function resolveSingleActiveChild(
