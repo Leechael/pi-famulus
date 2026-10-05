@@ -542,4 +542,27 @@ describe("subagent tool — resume lifecycle", () => {
     expect(notify.mock.calls[2][0].content).toContain("alpha again");
     expect(clock.pendingTimers).toBe(0);
   });
+
+  it("run-level subagent-done waits for a resumed child that is still running", async () => {
+    const { exec, factory, notify, registry } = makeStack({ autoComplete: null });
+    const started = await exec({ tasks: [{ prompt: "a", name: "alpha" }, { prompt: "b", name: "beta" }], async: true });
+    const runId = (started.details as { run_id: string }).run_id;
+    await flushMicrotasks();
+    factory.sessions[0].complete("alpha done"); // beta still running → handover
+    await flushMicrotasks();
+    await exec({ action: "resume", run_id: runId, child_id: "alpha", message: "more" });
+    await flushMicrotasks();
+
+    factory.sessions[1].complete("beta done"); // alpha (resumed) still running
+    await flushMicrotasks();
+    const kinds = () => notify.mock.calls.map((c) => (c[0].details as { kind: string }).kind);
+    expect(kinds()).toEqual(["subagent-handover", "subagent-handover"]);
+    expect(registry.get(runId)!.children.map((c) => c.status)).toEqual(["running", "completed"]);
+
+    factory.sessions[0].complete("alpha again");
+    await flushMicrotasks();
+    expect(kinds()).toEqual(["subagent-handover", "subagent-handover", "subagent-done"]);
+    const done = notify.mock.calls[2][0].details as { children: { name: string; status: string; result: string }[] };
+    expect(done.children.map((c) => `${c.name} ${c.status}`)).toEqual(["alpha completed", "beta completed"]);
+  });
 });
