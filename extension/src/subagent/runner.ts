@@ -284,22 +284,23 @@ class InProcessChildHandle implements DisposableChildHandle {
   }
 
   /**
-   * Parent action on an overrun: move the soft deadline to now + timeoutMs.
-   * The reminder count continues; the hard ceiling (if any) does not move.
+   * Parent action on an overrun: move the soft deadline to now + timeoutMs
+   * (default: the spawn budget). The reminder count continues; the hard
+   * ceiling (if any) does not move.
    */
-  extend(timeoutMs: number): void {
+  extend(timeoutMs?: number): { deadlineAt: number; hardDeadlineAt: number | null } {
     if (this.status_ !== "running") {
       throw new Error(`subagent ${this.req.childId} is not running (status: ${this.status_})`);
     }
-    if (!(timeoutMs > 0)) throw new Error("extend needs a positive timeout_ms");
-    this.softDeadlineAt = this.now() + timeoutMs;
+    const ms = timeoutMs ?? this.req.timeoutMs;
+    if (!(ms > 0)) throw new Error("extend needs a positive timeout_ms");
+    this.softDeadlineAt = this.now() + ms;
     this.nextReminderAt = this.softDeadlineAt;
     this.armSoftDeadline(this.generation);
-  }
-
-  /** Absolute hard ceiling of this turn, or null when off. For tool result text. */
-  hardDeadlineAt(): number | null {
-    return this.hardTimeoutMs > 0 ? this.turnBudgetStart + this.hardTimeoutMs : null;
+    return {
+      deadlineAt: this.softDeadlineAt,
+      hardDeadlineAt: this.hardTimeoutMs > 0 ? this.turnBudgetStart + this.hardTimeoutMs : null,
+    };
   }
 
   /**

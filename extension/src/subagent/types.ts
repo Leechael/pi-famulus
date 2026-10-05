@@ -75,8 +75,11 @@ export interface ChildHandle {
   followUp(message: string): Promise<void>; // same, queued delivery
   /** terminal -> continue running; opts.timeoutMs is the new turn's soft budget (default: spawn budget). */
   resume(message: string, opts?: { timeoutMs?: number }): Promise<void>;
-  /** running -> soft deadline = now + timeoutMs; otherwise throws. */
-  extend(timeoutMs: number): void;
+  /**
+   * running -> soft deadline = now + timeoutMs (default: spawn budget);
+   * otherwise throws. Returns the new deadline and the unmoved hard ceiling.
+   */
+  extend(timeoutMs?: number): { deadlineAt: number; hardDeadlineAt: number | null };
   interrupt(): Promise<void>; // abort; result resolves as interrupted
   status(): ChildStatus;
   lastEventAt(): number; // for the stall watchdog / status display

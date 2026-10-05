@@ -747,7 +747,9 @@ export interface ChildHandle {
                                                   // terminal → continue; does result become pending again afterwards? No:
                                                   // resume returns a new Promise<ChildResult> via registry.getResult()
                                                   // opts.timeoutMs: the new turn's soft budget (default: spawn budget)
-  extend(timeoutMs: number): void;                // running → soft deadline = now + timeoutMs; otherwise throw
+  extend(timeoutMs?: number): { deadlineAt: number; hardDeadlineAt: number | null };
+                                                  // running → soft deadline = now + timeoutMs (default: spawn budget);
+                                                  // otherwise throw. The hard ceiling never moves.
   interrupt(): Promise<void>;                     // abort; result resolves as interrupted
   status(): ChildStatus;
   lastEventAt(): number;                          // for watchdog

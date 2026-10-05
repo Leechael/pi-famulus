@@ -5,20 +5,28 @@ import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
 import { createSubagentTool } from "../../src/subagent/tool";
 import { FAMULUS_WAKE_CUSTOM_TYPE } from "../../src/wake";
+import type { OverrunTick } from "../../src/subagent/overrun";
 import { SessionFactory, tick } from "./subagent-fakes";
 
 async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 16; i++) await Promise.resolve();
 }
 
-function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {}) {
+function makeStack(
+  opts: { budgetMs?: number; autoComplete?: string | null; hardTimeoutMs?: number } = {},
+) {
   const clock = new ManualClock();
   const registry = new SubagentRegistry({ clock });
   const factory = new SessionFactory();
   factory.autoComplete = opts.autoComplete === undefined ? "done" : opts.autoComplete;
+  const overruns: OverrunTick[] = [];
   const runner = new InProcessRunner({
     createSession: factory.fn,
     clock,
+    stallMs: 0,
+    overrunRepeatMs: 60_000,
+    hardTimeoutMs: opts.hardTimeoutMs,
+    onOverrun: (t) => overruns.push(t),
     acquire: (req) => registry.admitChild(req.childId),
   });
   registry.setRunner(runner);
@@ -34,7 +42,7 @@ function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {
   const ctx = { cwd: "/tmp" } as ExtensionToolContext;
   const exec = (params: Record<string, unknown>, signal?: AbortSignal) =>
     tool.execute("tc", params as never, signal, undefined, ctx);
-  return { registry, factory, notify, exec, clock };
+  return { registry, factory, notify, exec, clock, overruns };
 }
 
 describe("subagent tool — validation", () => {
@@ -393,5 +401,58 @@ describe("subagent tool — management actions", () => {
       exec({ action: "resume", run_id: runId, child_id: "worker-1", message: "x" }),
     ).rejects.toThrow(/still running/);
     factory.sessions[0].complete("done");
+  });
+});
+
+describe("subagent tool — extend (soft deadline)", () => {
+  async function runningChild(opts: { hardTimeoutMs?: number } = {}) {
+    const stack = makeStack({ autoComplete: null, ...opts });
+    const started = await stack.exec({ tasks: [{ prompt: "a", name: "tester" }], async: true, timeout_ms: 10_000 });
+    const runId = (started.details as { run_id: string }).run_id;
+    await flushMicrotasks();
+    return { ...stack, runId };
+  }
+
+  it("re-arms a running child's deadline at now + timeout_ms", async () => {
+    const { exec, clock, overruns, runId, registry } = await runningChild();
+    clock.advanceBy(10_000);
+    expect(overruns).toHaveLength(1);
+    const res = await exec({ action: "extend", run_id: runId, child_id: "tester", timeout_ms: 120_000 });
+    const text = res.content[0].type === "text" ? res.content[0].text : "";
+    expect(text).toContain("Extended subagent tester");
+    expect(text).toContain('the next <pi-famulus-wake kind="subagent-overrun"> comes in 2m0s if it is still running');
+    expect(text).not.toContain("hard ceiling");
+    clock.advanceBy(119_999);
+    expect(overruns).toHaveLength(1); // the 60s repeat was replaced by the new deadline
+    clock.advanceBy(1);
+    expect(overruns[1]).toMatchObject({ reminder: 2, budgetMs: 130_000 });
+    expect(registry.get(runId)!.children[0].status).toBe("running");
+  });
+
+  it("without timeout_ms gives the child its spawn budget again", async () => {
+    const { exec, clock, overruns, runId } = await runningChild();
+    clock.advanceBy(10_000);
+    await exec({ action: "extend", run_id: runId }); // the only running child
+    clock.advanceBy(9_999);
+    expect(overruns).toHaveLength(1);
+    clock.advanceBy(1);
+    expect(overruns).toHaveLength(2);
+  });
+
+  it("says when a configured hard ceiling still applies", async () => {
+    const { exec, clock, runId } = await runningChild({ hardTimeoutMs: 600_000 });
+    clock.advanceBy(10_000);
+    const res = await exec({ action: "extend", run_id: runId, timeout_ms: 3_600_000 });
+    const text = res.content[0].type === "text" ? res.content[0].text : "";
+    expect(text).toContain("The configured hard ceiling (hardTimeoutMs) is not moved: it stops this subagent in 9m50s.");
+  });
+
+  it("errors for a finished child", async () => {
+    const { exec, factory, runId } = await runningChild();
+    factory.sessions[0].complete("done");
+    await flushMicrotasks();
+    await expect(exec({ action: "extend", run_id: runId, child_id: "tester", timeout_ms: 60_000 })).rejects.toThrow(
+      /not running/,
+    );
   });
 });

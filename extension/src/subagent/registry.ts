@@ -157,7 +157,7 @@ class FailedChildHandle implements ChildHandle {
     return Promise.reject(this.dead());
   }
 
-  extend(): void {
+  extend(): never {
     throw this.dead();
   }
 

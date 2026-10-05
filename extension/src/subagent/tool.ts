@@ -95,13 +95,16 @@ const subagentParameters = Type.Object({
         Type.Literal("interrupt"),
         Type.Literal("resume"),
         Type.Literal("steer"),
+        Type.Literal("extend"),
         Type.Literal("models"),
       ],
       { description: "Manage an existing run (or list selectable models) instead of starting a new one" },
     ),
   ),
   run_id: Type.Optional(Type.String({ description: "Target run for action" })),
-  child_id: Type.Optional(Type.String({ description: "Target child (id or name) for steer/interrupt/resume" })),
+  child_id: Type.Optional(
+    Type.String({ description: "Target child (id or name) for steer/interrupt/resume/extend" }),
+  ),
   message: Type.Optional(Type.String({ description: "Message content for steer/resume" })),
 });
 
@@ -113,7 +116,7 @@ type SubagentParams = {
   fail_fast?: boolean;
   model?: string;
   timeout_ms?: number;
-  action?: "list" | "get" | "status" | "interrupt" | "resume" | "steer" | "models";
+  action?: "list" | "get" | "status" | "interrupt" | "resume" | "steer" | "extend" | "models";
   run_id?: string;
   child_id?: string;
   message?: string;
@@ -592,6 +595,30 @@ export function createSubagentTool(
       return {
         content: [{ type: "text", text: `Steered subagent in run ${record.runId}: delivered "${params.message}".` }],
         details: { run_id: record.runId },
+      };
+    }
+
+    if (action === "extend") {
+      const handle = resolveSingleActiveChild(registry, record, params.child_id, "extend");
+      const child = record.children.find((c) => c.childId === handle.childId);
+      const ms = params.timeout_ms === undefined ? undefined : clampTimeout(params.timeout_ms, deps.defaultTimeoutMs);
+      const { deadlineAt, hardDeadlineAt } = handle.extend(ms);
+      const now = clock.now();
+      const hard =
+        hardDeadlineAt === null
+          ? ""
+          : ` The configured hard ceiling (hardTimeoutMs) is not moved: it stops this subagent in ${formatDurationMs(Math.max(0, hardDeadlineAt - now))}.`;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Extended subagent ${child?.name ?? handle.childId} (${handle.childId}) in run ${record.runId}: ` +
+              `the next <pi-famulus-wake kind="subagent-overrun"> comes in ${formatDurationMs(deadlineAt - now)} if it is still running. ` +
+              `Its result arrives as a wake when it finishes; do not poll.${hard}`,
+          },
+        ],
+        details: { run_id: record.runId, child_id: handle.childId, deadline_at: deadlineAt, hard_deadline_at: hardDeadlineAt },
       };
     }
 
