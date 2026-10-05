@@ -441,7 +441,7 @@ fn program_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKin
         return None;
     }
     if TEST.contains(&prog) {
-        return Some(test_kind(args, fed_by_xargs));
+        return Some(test_kind(prog, args, fed_by_xargs));
     }
     if SCRIPT_RUNNERS.contains(&prog) {
         return Some(runner_kind(prog, args, fed_by_xargs));
@@ -489,7 +489,7 @@ fn program_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKin
             Some("build" | "buildx") => WorkKind::Build,
             _ => WorkKind::Other,
         },
-        "node" | "deno" if args.iter().any(|a| *a == "--test" || *a == "test") => test_kind(args, fed_by_xargs),
+        "node" | "deno" if args.iter().any(|a| *a == "--test" || *a == "test") => test_kind(prog, args, fed_by_xargs),
         "mvn" | "mvnw" => {
             if args.iter().any(|a| *a == "test" || *a == "verify") {
                 WorkKind::TestSuite
@@ -529,7 +529,7 @@ fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
     };
     let after: Vec<&str> = args[1..].to_vec();
     match (runner, sub) {
-        ("npm" | "pnpm" | "yarn" | "bun", "test" | "t") => return test_kind(&after, fed_by_xargs),
+        ("npm" | "pnpm" | "yarn" | "bun", "test" | "t") => return test_kind(runner, &after, fed_by_xargs),
         ("npm" | "pnpm" | "yarn" | "bun" | "pdm" | "poetry" | "pipenv", "ci" | "install" | "i" | "add" | "sync" | "lock" | "update") => {
             return WorkKind::Build
         }
@@ -613,7 +613,7 @@ fn script_name_kind(name: &str, args: &[&str], fed_by_xargs: bool) -> Option<Wor
     let parts: Vec<&str> = n.split(|c: char| !c.is_ascii_alphanumeric()).collect();
     let has = |k: &str| parts.contains(&k);
     if has("test") {
-        return Some(test_kind(args, fed_by_xargs));
+        return Some(test_kind(name, args, fed_by_xargs));
     }
     let lint_words = ["format", "type", "types", "mypy", "ruff", "clippy", "prek", "precommit", "style", "check"];
     if n.contains("lint") || n.contains("typecheck") || n.contains("fmt") || lint_words.iter().any(|k| has(k)) {
@@ -635,25 +635,51 @@ fn looks_like_target(a: &str) -> bool {
 const PATH_VALUE_FLAGS: &[&str] = &["--ignore", "--deselect", "--rootdir", "--basetemp", "-c", "--confcutdir", "--junitxml", "--cov", "--cov-report", "-p", "-o", "--log-file"];
 
 /// A test-selection flag in any spelling: `-k expr`, `-k=expr`, `-kexpr`,
-/// `--testNamePattern=x`.
-fn selects_tests(a: &str) -> bool {
+/// `--testNamePattern=x`. Attached `-t`/`-g` are runner-specific: mocha's
+/// `-t`/`--timeout` is not a filter (`mocha -t5000` is a whole suite).
+fn selects_tests(a: &str, runner: &str) -> bool {
     let key = a.split_once('=').map_or(a, |(k, _)| k);
-    if matches!(key, "-k" | "-m" | "--lf" | "--last-failed" | "-t" | "--testNamePattern" | "--grep" | "-g" | "--run") {
+    if matches!(key, "-k" | "-m" | "--lf" | "--last-failed" | "--run") {
         return true;
     }
-    // Attached short form: pytest `-kauth`, `-mslow`; jest/vitest `-tname`.
-    !a.starts_with("--") && a.len() > 2 && ["-k", "-m", "-t", "-g"].iter().any(|f| a.starts_with(f))
+    let jestish = matches!(runner, "jest" | "vitest");
+    match runner {
+        "mocha" => {
+            if matches!(key, "-g" | "--grep") {
+                return true;
+            }
+        }
+        "jest" | "vitest" => {
+            if matches!(key, "-t" | "--testNamePattern" | "-g" | "--grep") {
+                return true;
+            }
+        }
+        _ => {
+            // Unknown runner (`npm test`, a script name): exact `-t`/`-g`
+            // still select; attached `-t5000` does not (mocha's timeout).
+            if matches!(key, "-t" | "--testNamePattern" | "-g" | "--grep") {
+                return true;
+            }
+        }
+    }
+    if a.starts_with("--") || a.len() <= 2 {
+        return false;
+    }
+    a.starts_with("-k")
+        || a.starts_with("-m")
+        || (jestish && a.starts_with("-t"))
+        || (matches!(runner, "mocha" | "jest" | "vitest") && a.starts_with("-g"))
 }
 
 /// A test runner run: the whole suite, or a targeted subset.
-fn test_kind(args: &[&str], fed_by_xargs: bool) -> WorkKind {
+fn test_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
     if fed_by_xargs {
         return WorkKind::Test; // targets arrive on stdin
     }
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if selects_tests(a) {
+        if selects_tests(a, runner) {
             return WorkKind::Test;
         }
         if PATH_VALUE_FLAGS.contains(&a) {
@@ -834,6 +860,17 @@ mod tests {
         }
         for cmd in ["pytest -q -n4", "pytest --ignore=tests/slow", "cargo test --package=pi-famulus", "cargo test --features=test-clock"] {
             assert_eq!(k(cmd), TestSuite, "{cmd}");
+        }
+    }
+
+    /// mocha's `-t`/`--timeout` is not a name filter; jest/vitest `-t` is.
+    #[test]
+    fn mocha_timeout_is_not_a_targeted_run() {
+        for cmd in ["mocha -t5000", "mocha -t 5000", "mocha --timeout 5000"] {
+            assert_eq!(k(cmd), TestSuite, "{cmd}");
+        }
+        for cmd in ["mocha -g foo", "mocha -gfoo", "npx jest -tlogin", "npx vitest -tlogin"] {
+            assert_eq!(k(cmd), Test, "{cmd}");
         }
     }
 
