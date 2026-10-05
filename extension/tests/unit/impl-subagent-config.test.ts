@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   DEFAULT_SUBAGENT_CONFIG,
+  loadConfig,
   MAX_TIMER_DELAY_MS,
   resolveSubagentConfig,
 } from "../../src/config";
@@ -53,5 +57,37 @@ describe("resolveSubagentConfig stall retries", () => {
     );
     expect(resolved.stallRetries).toBe(2);
     expect(resolved.stallRetryDelayMs).toBe(5000); // negative ignored
+  });
+});
+
+describe("resolveSubagentConfig soft deadline", () => {
+  it("defaults: 30 min soft budget, reminder every 10 min, no hard ceiling", () => {
+    const resolved = resolveSubagentConfig(makeConfig());
+    expect(resolved.timeoutMs).toBe(1_800_000);
+    expect(resolved.overrunRepeatMs).toBe(600_000);
+    expect(resolved.hardTimeoutMs).toBe(0);
+  });
+
+  it("reads overrunRepeatMs and hardTimeoutMs from the subagent section", () => {
+    const resolved = resolveSubagentConfig(makeConfig({ overrunRepeatMs: 120_000, hardTimeoutMs: 7_200_000 }));
+    expect(resolved.overrunRepeatMs).toBe(120_000);
+    expect(resolved.hardTimeoutMs).toBe(7_200_000);
+  });
+
+  it("loads both keys from config.json", () => {
+    const home = mkdtempSync(join(tmpdir(), "famulus-cfg-"));
+    writeFileSync(join(home, "config.json"), JSON.stringify({ subagent: { overrunRepeatMs: 300_000, hardTimeoutMs: 5_400_000 } }));
+    const resolved = resolveSubagentConfig(loadConfig(home));
+    expect(resolved.overrunRepeatMs).toBe(300_000);
+    expect(resolved.hardTimeoutMs).toBe(5_400_000);
+  });
+
+  it("keeps the defaults for invalid values and caps timer delays", () => {
+    const bad = resolveSubagentConfig(makeConfig({ overrunRepeatMs: 0, hardTimeoutMs: -1 }));
+    expect(bad.overrunRepeatMs).toBe(600_000); // 0 would mean a reminder storm
+    expect(bad.hardTimeoutMs).toBe(0);
+    const huge = resolveSubagentConfig(makeConfig({ overrunRepeatMs: 1e308, hardTimeoutMs: 1e308 }));
+    expect(huge.overrunRepeatMs).toBe(MAX_TIMER_DELAY_MS);
+    expect(huge.hardTimeoutMs).toBe(MAX_TIMER_DELAY_MS);
   });
 });
