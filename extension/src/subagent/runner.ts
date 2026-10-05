@@ -201,7 +201,9 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.onStall = opts.onStall;
     const rawRepeat = opts.overrunRepeatMs ?? DEFAULT_OVERRUN_REPEAT_MS;
     this.overrunRepeatMs =
-      Number.isFinite(rawRepeat) && rawRepeat > 0 ? Math.floor(rawRepeat) : DEFAULT_OVERRUN_REPEAT_MS;
+      Number.isFinite(rawRepeat) && rawRepeat > 0
+        ? Math.max(1, Math.floor(rawRepeat))
+        : DEFAULT_OVERRUN_REPEAT_MS;
     const rawHard = opts.hardTimeoutMs ?? 0;
     this.hardTimeoutMs = Number.isFinite(rawHard) && rawHard > 0 ? Math.floor(rawHard) : 0;
     this.onOverrun = opts.onOverrun;

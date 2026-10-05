@@ -430,7 +430,7 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 | `subagent-done` | `run-id` `status` `duration-ms` | `summary`, then one `<child id name status>` per child, containing `prompt` (head capped at 2000), optional `error`, optional `warning`, `result` (tail capped at 2000) | `{ kind:"subagent-done"; runId; status; durationMs; summary; children: [{ childId, name, status, prompt, result, error?, warning? }] }` |
 | `supervisor-request` | `from` `name` | `message`, `reply-with` | `{ kind:"supervisor-request"; from; name; message }` |
 | `supervisor-update` | `from` `name` | `message` | `{ kind:"supervisor-update"; from; name; message }` |
-| `subagent-overrun` | `run-id` `child-id` `name` `elapsed-ms` `budget-ms` `reminder` `hard-ceiling-ms?` (time left to an opt-in `hardTimeoutMs`) | `summary`; `last-activity` (attr `ago-ms`); optional `<shell task-id elapsed-ms output-bytes output-idle-ms growing>` containing `command` (head, one line) and `output-file`; `options` (the three actions and the no-action outcome) | `{ kind:"subagent-overrun"; runId; childId; name; elapsedMs; budgetMs; reminder; nextReminderMs; hardCeilingMs?; summary; lastActivity: { agoMs; text }; shell?: { taskId; command; elapsedMs; outputPath; outputBytes: number\|null; outputIdleMs: number\|null; growing: boolean\|null } }` |
+| `subagent-overrun` | `run-id` `child-id` `name` `elapsed-ms` `budget-ms` `reminder` `hard-ceiling-ms?` (time left to an opt-in `hardTimeoutMs`) | `summary`; `last-activity` (attr `ago-ms`); optional `<shell task-id elapsed-ms output-bytes? output-idle-ms? growing?>` containing `command` (head, one line) and `output-file` (the element itself is omitted when the child is not waiting on a foreground shell; the three trailing attributes are omitted when the output-file cannot be stat'd); `options` (the three actions and the no-action outcome) | `{ kind:"subagent-overrun"; runId; childId; name; elapsedMs; budgetMs; reminder; nextReminderMs; hardCeilingMs?; summary; lastActivity: { agoMs; text }; shell?: { taskId; command; elapsedMs; outputPath; outputBytes: number\|null; outputIdleMs: number\|null; growing: boolean\|null } }` |
 
 - Omit the `exit-code` attribute when `exitCode === null`; details always uses `number | null`. `signal` is a signal-name string (`"SIGTERM"` | `"SIGKILL"`), omitted if absent, not a number.
 - `reply-with` text is `agent_message { action: "reply", to: "<childId>", message: "<your decision>" }`, not included in `message`.
@@ -482,9 +482,9 @@ subagent({
 
 Per user turn (launch, or a `resume`), the runner keeps:
 
-- `budgetMs`: the turn's soft budget, `timeout_ms` at spawn, or the `timeout_ms` passed to `resume` (default: the spawn budget).
+- `turnBudgetMs`: the turn's soft budget, `timeout_ms` at spawn, or the `timeout_ms` passed to `resume` (default: the spawn budget). The overrun wake still reports this as `budgetMs` / `budget-ms`. Distinct from config `subagent.budgetMs` (the 45s synchronous-wait budget).
 - `turnBudgetStart`: set once admission and session creation finish (queue time is not budget). Stall retries do not reset it.
-- `softDeadlineAt = turnBudgetStart + budgetMs`; `extend` moves it to `now + timeout_ms`.
+- `softDeadlineAt = turnBudgetStart + turnBudgetMs`; `extend` moves it to `now + timeout_ms`.
 - `reminders` (count) and `nextReminderAt`: the overrun reminder schedule.
 - `hardDeadlineAt = turnBudgetStart + hardTimeoutMs`, only when `hardTimeoutMs > 0` (config, default off). Nothing the model can call moves it.
 
@@ -508,7 +508,7 @@ All of these are turn-level fields. Each generation (first prompt, stall retry, 
 | Hard ceiling (`hardTimeoutMs > 0`, timer) | running (incl. restarting) | interrupted (`timeout`) | Today's behaviour: settle, then abort the session, which aborts the running tool and stops the child's foreground shell (`task.stop reason=tool`). Also checked when a generation (re)starts: already past → settle without prompting. |
 | `interrupt` (tool, `/tasks`) | pending / running | interrupted | settle, then abort |
 | `dispose` (run teardown, session shutdown) | any | interrupted (`disposed`) | Clear timers, dispose the session. |
-| `resume(message, timeout_ms?)` (tool) | completed / failed / interrupted | pending → running | New user turn: `budgetMs = timeout_ms ?? spawn budget`, `reminders = 0`, stall budget reset; wait for a still-unwinding abort (bounded), then admission. |
+| `resume(message, timeout_ms?)` (tool) | completed / failed / interrupted | pending → running | New user turn: `turnBudgetMs = timeout_ms ?? spawn budget`, `reminders = 0`, stall budget reset; wait for a still-unwinding abort (bounded), then admission. |
 
 Invariants:
 

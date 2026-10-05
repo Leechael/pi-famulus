@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { BEHAVIOR_GUIDELINES } from "../../src/behavior-guidelines";
 import { formatSubagentOverrun, type SubagentOverrunInfo } from "../../src/format";
-import { registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
+import { expandedWakeText, registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests } from "../../src/tui/pi-tui-load";
 import { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
 
@@ -71,7 +71,7 @@ describe("subagent-overrun wake", () => {
     );
     expect(options).toContain('agent_message({ action: "send", to: "ch_a", message: "&lt;instruction&gt;" })');
     expect(options).toContain('subagent({ action: "interrupt", run_id: "run_a", child_id: "ch_a" })');
-    expect(options).toContain("If you do none of these, it keeps running and this reminder arrives again in 10m");
+    expect(options).toContain("If you do none of these, it keeps running and the next reminder is scheduled in 10m");
     expect(options.toLowerCase()).not.toContain("keep working");
   });
 
@@ -121,14 +121,14 @@ describe("subagent-overrun wake under an opt-in hard ceiling (review P2, PR #34)
     const text = options(wake.content);
     expect(text).toContain("the configured hard ceiling stops it in 30s, and extend does not move that ceiling");
     expect(text).toContain("If you do none of these, it keeps running until the hard ceiling stops it.");
-    expect(text).not.toContain("reminder arrives again");
+    expect(text).not.toContain("reminder is scheduled");
     expect(text).not.toContain("It has not been stopped. ");
   });
 
   it("names the next reminder when it comes before the ceiling", () => {
     const wake = formatSubagentOverrun(info({ nextReminderMs: 10 * MIN, hardCeilingMs: 25 * MIN }));
     expect(options(wake.content)).toContain(
-      "If you do none of these, it keeps running and this reminder arrives again in 10m, until the hard ceiling stops it in 25m.",
+      "If you do none of these, it keeps running and the next reminder is scheduled in 10m, until the hard ceiling stops it in 25m.",
     );
   });
 
@@ -136,7 +136,23 @@ describe("subagent-overrun wake under an opt-in hard ceiling (review P2, PR #34)
     const wake = formatSubagentOverrun(info());
     expect(wake.content).not.toContain("hard-ceiling-ms");
     expect(wake.details).not.toHaveProperty("hardCeilingMs");
-    expect(options(wake.content)).toContain("If you do none of these, it keeps running and this reminder arrives again in 10m");
+    expect(options(wake.content)).toContain("If you do none of these, it keeps running and the next reminder is scheduled in 10m");
+  });
+
+  it("expanded TUI does not promise a reminder when the hard ceiling is sooner", () => {
+    const wake = formatSubagentOverrun(
+      info({ elapsedMs: 60_000, budgetMs: 60_000, nextReminderMs: 10 * MIN, hardCeilingMs: 30_000 }),
+    );
+    const text = expandedWakeText(wake.details, wake.content);
+    expect(text).toContain("Hard ceiling stops it in 30.0s (extend does not move it).");
+    expect(text).not.toContain("Next reminder");
+  });
+
+  it("expanded TUI names the next reminder when it comes before the ceiling", () => {
+    const wake = formatSubagentOverrun(info({ nextReminderMs: 10 * MIN, hardCeilingMs: 25 * MIN }));
+    const text = expandedWakeText(wake.details, wake.content);
+    expect(text).toContain("Hard ceiling stops it in 25m0s (extend does not move it).");
+    expect(text).toContain("Next reminder in 10m0s unless you extend, steer, or interrupt it.");
   });
 });
 
@@ -145,6 +161,7 @@ describe("behavior guidelines on the overrun wake", () => {
     const bullet = BEHAVIOR_GUIDELINES.split("\n").find((l) => l.includes('kind="subagent-overrun"'));
     expect(bullet).toBeDefined();
     expect(bullet).toContain("is not stopped");
+    expect(bullet).toContain("if it is waiting on a foreground shell");
     expect(bullet).toContain('subagent({action:"extend", run_id, child_id, timeout_ms})');
     expect(bullet).toContain("agent_message to steer it");
     expect(bullet).toContain('subagent({action:"interrupt", run_id, child_id})');

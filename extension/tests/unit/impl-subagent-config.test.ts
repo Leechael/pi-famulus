@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -76,10 +76,14 @@ describe("resolveSubagentConfig soft deadline", () => {
 
   it("loads both keys from config.json", () => {
     const home = mkdtempSync(join(tmpdir(), "famulus-cfg-"));
-    writeFileSync(join(home, "config.json"), JSON.stringify({ subagent: { overrunRepeatMs: 300_000, hardTimeoutMs: 5_400_000 } }));
-    const resolved = resolveSubagentConfig(loadConfig(home));
-    expect(resolved.overrunRepeatMs).toBe(300_000);
-    expect(resolved.hardTimeoutMs).toBe(5_400_000);
+    try {
+      writeFileSync(join(home, "config.json"), JSON.stringify({ subagent: { overrunRepeatMs: 300_000, hardTimeoutMs: 5_400_000 } }));
+      const resolved = resolveSubagentConfig(loadConfig(home));
+      expect(resolved.overrunRepeatMs).toBe(300_000);
+      expect(resolved.hardTimeoutMs).toBe(5_400_000);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("keeps the defaults for invalid values and caps timer delays", () => {

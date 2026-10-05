@@ -163,7 +163,11 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
         ...(details.hardCeilingMs !== undefined
           ? [`Hard ceiling stops it in ${formatDuration(details.hardCeilingMs)} (extend does not move it).`]
           : []),
-        `Next reminder in ${formatDuration(details.nextReminderMs)} unless you extend, steer, or interrupt it.`,
+        // Same condition as overrunOptions in wake.ts: do not promise a
+        // reminder that the hard ceiling will stop the child before.
+        ...(details.hardCeilingMs === undefined || details.nextReminderMs < details.hardCeilingMs
+          ? [`Next reminder in ${formatDuration(details.nextReminderMs)} unless you extend, steer, or interrupt it.`]
+          : []),
       ].join("\n\n");
     }
     case "supervisor-request":

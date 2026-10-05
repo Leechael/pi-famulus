@@ -73,6 +73,16 @@ describe("soft deadline", () => {
     expect(result.error).toBeUndefined();
   });
 
+  it("clamps a sub-millisecond overrunRepeatMs to 1ms so reminders do not storm", async () => {
+    const handle = await runner({ overrunRepeatMs: 0.5 }).start(makeReq());
+    clock.advanceBy(1_000);
+    expect(ticks).toHaveLength(1);
+    expect(ticks[0].nextReminderMs).toBe(1);
+    clock.advanceBy(5);
+    expect(ticks).toHaveLength(6);
+    expect(handle.status()).toBe("running");
+  });
+
   it("repeats every overrunRepeatMs while the child runs, numbering the reminders", async () => {
     const handle = await runner().start(makeReq());
     clock.advanceBy(1_000 + 300 * 3);
@@ -500,8 +510,11 @@ describe("soft deadline, as the parent sees it (registry + runner + overrun noti
   });
 
   it("with a hard ceiling the parent still sees the overrun first, then the child settles interrupted", async () => {
-    const { clock, registry, wakes, req, runId } = stack(45 * 60_000);
+    const { clock, registry, factory, wakes, req, runId } = stack(45 * 60_000);
     const handle = await registry.startChild(req);
+    // Keep a tool in flight so the 5-minute stall watchdog stays paused;
+    // an idle child would stall long before the 45-minute ceiling.
+    factory.sessions[0].runTool();
     clock.advanceBy(45 * 60_000); // reminders at 30 and 40 min, ceiling at 45
     expect(wakes.map((w) => (w.details as { reminder: number }).reminder)).toEqual([1, 2]);
     // Review P2 (PR #34): the wake must not promise the child keeps running.

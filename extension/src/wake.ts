@@ -293,7 +293,7 @@ function overrunOptions(details: Extract<FamulusWake, { kind: "subagent-overrun"
     return (
       "It has not been stopped. Choose one: " +
       actions +
-      `If you do none of these, it keeps running and this reminder arrives again in ${wakeDuration(details.nextReminderMs)}; ` +
+      `If you do none of these, it keeps running and the next reminder is scheduled in ${wakeDuration(details.nextReminderMs)}; ` +
       "its result arrives as usual when it finishes."
     );
   }
@@ -301,7 +301,7 @@ function overrunOptions(details: Extract<FamulusWake, { kind: "subagent-overrun"
   const ceiling = wakeDuration(hard);
   const noAction =
     details.nextReminderMs < hard
-      ? `If you do none of these, it keeps running and this reminder arrives again in ${wakeDuration(details.nextReminderMs)}, until the hard ceiling stops it in ${ceiling}.`
+      ? `If you do none of these, it keeps running and the next reminder is scheduled in ${wakeDuration(details.nextReminderMs)}, until the hard ceiling stops it in ${ceiling}.`
       : "If you do none of these, it keeps running until the hard ceiling stops it.";
   return (
     `It has not been stopped yet, but the configured hard ceiling stops it in ${ceiling}, and extend does not move that ceiling. ` +
