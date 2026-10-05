@@ -456,3 +456,31 @@ describe("subagent tool — extend (soft deadline)", () => {
     );
   });
 });
+
+describe("subagent tool — resume honours timeout_ms", () => {
+  async function finishedChild() {
+    const stack = makeStack({ autoComplete: null });
+    const started = await stack.exec({ tasks: [{ prompt: "a", name: "tester" }], async: true, timeout_ms: 10_000 });
+    const runId = (started.details as { run_id: string }).run_id;
+    await flushMicrotasks();
+    stack.factory.sessions[0].complete("first");
+    await flushMicrotasks();
+    return { ...stack, runId };
+  }
+
+  it("the resumed turn gets the timeout_ms passed with resume", async () => {
+    const { exec, clock, overruns, runId } = await finishedChild();
+    await exec({ action: "resume", run_id: runId, child_id: "tester", message: "more", timeout_ms: 30_000 });
+    clock.advanceBy(29_999);
+    expect(overruns).toHaveLength(0);
+    clock.advanceBy(1);
+    expect(overruns[0]).toMatchObject({ reminder: 1, budgetMs: 30_000 });
+  });
+
+  it("without timeout_ms the resumed turn gets the spawn budget, not the default", async () => {
+    const { exec, clock, overruns, runId } = await finishedChild();
+    await exec({ action: "resume", run_id: runId, child_id: "tester", message: "more" });
+    clock.advanceBy(10_000);
+    expect(overruns[0]).toMatchObject({ reminder: 1, budgetMs: 10_000 });
+  });
+});

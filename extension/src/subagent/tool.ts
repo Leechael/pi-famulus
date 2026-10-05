@@ -627,7 +627,12 @@ export function createSubagentTool(
     const child = resolveSingleTerminalChild(record, params.child_id);
     const handle = registry.handle(child.childId);
     if (!handle) throw new Error(`subagent ${child.childId} has no live session to resume`);
-    await handle.resume(params.message);
+    // A resume is a new turn with its own soft budget: timeout_ms when given,
+    // else the child's spawn budget (the runner's default).
+    await handle.resume(
+      params.message,
+      params.timeout_ms === undefined ? {} : { timeoutMs: clampTimeout(params.timeout_ms, deps.defaultTimeoutMs) },
+    );
     // Resume is asynchronous. If siblings are still running, hand this child
     // back as soon as it finishes; otherwise the run-complete wake covers it.
     const handedOver = new Set<string>();
