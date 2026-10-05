@@ -200,6 +200,28 @@ describe("thinking-suffix fallback (pi core parity)", () => {
     expect(res).not.toHaveProperty("suffixHint");
   });
 
+  it("provider:id with an unknown id is a hard error, not a suffix retry", () => {
+    // Without the guard, the retry reads ":nonexistent" as a thinking suffix,
+    // retries the bare provider "openai", and fuzzy-matches the OpenRouter id
+    // "openai/gpt-5.2:exacto" — silently swapping in an unrequested model.
+    const res = resolveModelSpec("openai:nonexistent", CANDIDATES);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect(res).not.toHaveProperty("suffixHint");
+    expect(res).not.toHaveProperty("warning");
+  });
+
+  it("provider:id with an unknown id fails even when the provider has one model", () => {
+    const res = resolveModelSpec("openrouter:bogus", CANDIDATES);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect(res).not.toHaveProperty("suffixHint");
+  });
+
+  it("provider:id:<unknown suffix> still adapts (the last colon is not the separator)", () => {
+    const res = resolveModelSpec("openai:gpt-5.2:highest", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, provider: "openai", id: "gpt-5.2" });
+    expect((res as { warning?: string }).warning).toContain('"highest"');
+  });
+
   it("ambiguous retried base reports the ambiguity, not the raw no-match", () => {
     const dupes: ModelCandidate[] = [
       { provider: "a", id: "same" },

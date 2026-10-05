@@ -480,7 +480,7 @@ subagent({
 - Candidate set: nonempty `ctx.scopedModels` → scoped only (respect user whitelist); otherwise `modelRegistry.getAvailable()`
 - Matching algorithm (pure function `resolveModelSpec(spec, candidates)`): ① exact (`provider/id` or a unique bare-id match) → ② case-insensitive id/display-name substring; 0 matches → error listing candidates; multiple matches → error listing matches, suggesting a `provider/` prefix to disambiguate
 - Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing. Valid levels mirror pi core's `VALID_THINKING_LEVELS` (`off, minimal, low, medium, high, xhigh, max`; the SDK does not export the list, so `src/thinking-levels.ts` keeps the parity-pinned copy, re-exported by `model-spec.ts`)
-- Unknown `:<suffix>` handling mirrors pi's `parseModelPattern(allowInvalidThinkingLevelFallback)`: on a full-spec **no-match** with an unrecognized suffix, the resolver retries without the suffix; a resolvable base adapts with a **warning** on the child result (never silent), while a still-unresolvable base fails hard with the invalid suffix named in the error. A full-spec **ambiguity never retries** — ambiguity is semantic, not syntax. Literal ids whose trailing `:segment` is not a valid level (OpenRouter `:exacto`) win because the full spec matches them before the retry fires; conversely, an id literally ending in a valid level (`:high`) is read as a thinking override, never as a literal id
+- Unknown `:<suffix>` handling mirrors pi's `parseModelPattern(allowInvalidThinkingLevelFallback)`: on a full-spec **no-match** with an unrecognized suffix, the resolver retries without the suffix; a resolvable base adapts with a **warning** on the child result (never silent), while a still-unresolvable base fails hard with the invalid suffix named in the error. A full-spec **ambiguity never retries** — ambiguity is semantic, not syntax. Literal ids whose trailing `:segment` is not a valid level (OpenRouter `:exacto`) win because the full spec matches them before the retry fires; conversely, an id literally ending in a valid level (`:high`) is read as a thinking override, never as a literal id. The retry never strips a `provider:id` separator: when the trailing `:` is the spec's first separator and its prefix is a known provider, an unknown id stays a hard no-match (`openai:nonexistent` must not retry as `openai` and fuzzy-match an unrelated id)
 - Tool parameter `model` resolution failure → **hard error** (list candidates, LLM can retry); agent-definition file `model` resolution failure → **fall back to parent model** + warning in result details (user-authored files can become invalid across machines; do not fail hard)
 - Unspecified: child inherits parent's current model (`ctx.model`)
 - `action:"models"` returns one candidate per line, `provider/id — display name`, marking the parent model `(current)` and whitelist source `(scoped)`
@@ -672,6 +672,9 @@ export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): Mo
   // ⑤ Literal ids whose trailing ':segment' is NOT a valid level (OpenRouter ":exacto")
   //   match at ② before ③ ever fires; ids ending in a valid level (":high") are read as
   //   thinking overrides, never as literal ids
+  // ⑥ ③ never strips a "provider:id" separator: a trailing ':' that is the spec's first
+  //   separator, with a known provider before it, is not a suffix ("openai:nonexistent"
+  //   stays a hard no-match instead of retrying the bare provider name)
 
 // ---------- extension/src/subagent/types.ts (M3 core types) ----------
 export type ChildStatus = "pending"|"running"|"completed"|"failed"|"interrupted";

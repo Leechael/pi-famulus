@@ -16,6 +16,9 @@
  *     is not a valid level (OpenRouter ":exacto") still win at exact match.
  *     Note the converse: an id literally ending in a valid level (":high")
  *     is read as a thinking override, never as a literal id.
+ *     The retry never strips a "provider:id" separator: when the trailing
+ *     ':' is the spec's first separator and its prefix is a known provider,
+ *     an unknown id stays a hard no-match ("openai:nonexistent").
  *   - provider prefix: "provider/id" or "provider:id" both accepted
  *   - bare id: exact unique match, else case-insensitive substring on id/name
  */
@@ -69,6 +72,19 @@ function splitProviderPrefix(spec: string): { provider: string; id: string } | n
     }
   }
   return null;
+}
+
+/**
+ * True when the ':' at `idx` is the "provider:id" separator rather than a
+ * thinking suffix: it is the spec's first separator and the text before it
+ * names a known provider. Stripping it would retry the bare provider name,
+ * which fuzzy-matches unrelated ids (e.g. "openai:nonexistent" → the
+ * OpenRouter id "openai/gpt-5.2:exacto") and silently drops the requested id.
+ */
+function isProviderSeparator(spec: string, idx: number, candidates: ModelCandidate[]): boolean {
+  const provider = spec.slice(0, idx);
+  if (/[/:]/.test(provider)) return false;
+  return candidates.some((c) => c.provider === provider);
 }
 
 /** The three matching rules, shared by both resolution passes. */
@@ -129,6 +145,7 @@ export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): Mo
   // containing a colon (OpenRouter ":exacto") are unaffected.
   const idx = trimmed.lastIndexOf(":");
   if (idx <= 0 || idx === trimmed.length - 1) return first;
+  if (isProviderSeparator(trimmed, idx, candidates)) return first;
   const suffix = trimmed.slice(idx + 1);
   const retriedBase = trimmed.slice(0, idx);
   const retried = matchBase(retriedBase, candidates);
