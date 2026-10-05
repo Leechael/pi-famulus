@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { ManualClock } from "../../src/clock";
@@ -142,7 +143,7 @@ describe("child bash records the shell it is blocked on", () => {
     expect(shells.current("ch_a")).toMatchObject({
       taskId: "sh_9",
       command: "npm test",
-      outputPath: "/h/sessions/sid/tasks/sh_9.output",
+      outputPath: join("/h", "sessions", "sid", "tasks", "sh_9.output"),
     });
     release({ done: true, exit_code: 0 });
     await pending;

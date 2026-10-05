@@ -1009,7 +1009,9 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::{cut_utf8, humanize_log_line, resolve_task_id, same_file_by_path};
+    use super::{cut_utf8, humanize_log_line, resolve_task_id};
+    #[cfg(unix)]
+    use super::same_file_by_path;
 
     #[test]
     fn exact_and_typo_prefix() {

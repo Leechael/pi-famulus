@@ -241,6 +241,7 @@ fn report(what: &str, alone: bool) {
     report_usage(what, alone, None);
 }
 
+#[cfg(unix)]
 fn report_usage(what: &str, alone: bool, usage: Option<Usage>) {
     let _ = sys::write_raw(RUNNER_STATUS_FD, status_line(what, alone, usage).as_bytes());
 }
