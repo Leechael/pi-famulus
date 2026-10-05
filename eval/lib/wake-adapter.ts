@@ -18,6 +18,7 @@ export type WakeKind =
   | "monitor"
   | "subagent-handover"
   | "subagent-done"
+  | "subagent-overrun"
   | "supervisor-request"
   | "supervisor-update"
   | "unknown";
@@ -168,6 +169,9 @@ function fromDetails(customType: string, raw: string, leadIn: string, d: Details
       }));
       return { ...w, kind: "subagent-done", runId: String(d.runId), status: String(d.status), children, body: children.map((c) => `## ${c.name}\n${c.result}`).join("\n\n") };
     }
+    case "subagent-overrun":
+      // The child is still running; the wake asks the parent to decide.
+      return { ...w, kind: "subagent-overrun", runId: String(d.runId), childId: String(d.childId), childName: String(d.name), status: "running", body: String(d.summary ?? "") };
     case "supervisor-request":
     case "supervisor-update": {
       const replyWith = d.kind === "supervisor-request" ? child(raw, "reply-with") : undefined;
@@ -215,6 +219,8 @@ function fromXml(customType: string, raw: string, leadIn: string): Wake {
       }));
       return { ...w, kind: "subagent-done", runId: a["run-id"], status: a.status, children, body: children.map((c) => `## ${c.name}\n${c.result}`).join("\n\n") };
     }
+    case "subagent-overrun":
+      return { ...w, kind: "subagent-overrun", runId: a["run-id"], childId: a["child-id"], childName: a.name, status: "running", body: child(inner, "summary") ?? "" };
     case "supervisor-request":
     case "supervisor-update": {
       const replyWith = child(inner, "reply-with");
