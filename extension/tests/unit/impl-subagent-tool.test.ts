@@ -199,6 +199,38 @@ describe("subagent tool — tasks", () => {
     expect(notify.mock.calls[1][0].content).toContain("2/2 subagents completed");
   });
 
+  it("async: true carries a child's warning into the handover and done wakes", async () => {
+    // A warning only on the child result is invisible to an async parent: the
+    // wakes are all it sees unless it fetches the full record.
+    const warning = 'unknown thinking level "highest" in model spec "haiku:highest"; using the model\'s default thinking';
+    const { exec, factory, notify } = makeStack({ autoComplete: null });
+    factory.configure = (session, req) => {
+      if (req.prompt === "x") session.warning = warning;
+    };
+    await exec({ tasks: [{ prompt: "x" }, { prompt: "y" }], async: true });
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(2);
+
+    factory.sessions[0].complete("r1");
+    await flushMicrotasks();
+    expect(notify).toHaveBeenCalledTimes(1);
+    const handover = notify.mock.calls[0][0];
+    expect(handover.content).toContain('kind="subagent-handover"');
+    expect(handover.content).toContain(`<warning>${warning}</warning>`);
+    expect(handover.details).toMatchObject({ kind: "subagent-handover", warning });
+
+    factory.sessions[1].complete("r2");
+    await flushMicrotasks();
+    expect(notify).toHaveBeenCalledTimes(2);
+    const done = notify.mock.calls[1][0];
+    expect(done.content).toContain('kind="subagent-done"');
+    expect(done.content).toContain(`<warning>${warning}</warning>`);
+    expect(done.content.match(/<warning>/g)).toHaveLength(1);
+    const children = (done.details as { children: { warning?: string }[] }).children;
+    expect(children[0].warning).toBe(warning);
+    expect(children[1]).not.toHaveProperty("warning");
+  });
+
   it("an aborted sync wait backgrounds the run rather than killing it", async () => {
     const { exec, factory } = makeStack({ autoComplete: null });
     const controller = new AbortController();

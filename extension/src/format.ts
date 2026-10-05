@@ -195,6 +195,8 @@ export interface SubagentChildInfo {
   status: "pending" | "running" | "completed" | "failed" | "interrupted";
   text: string;
   error?: string;
+  /** Non-fatal caveat from the child run (e.g. an adapted model spec). */
+  warning?: string;
   /** Task prompt that was sent to this child. */
   prompt?: string;
 }
@@ -230,6 +232,7 @@ export interface SubagentHandoverInfo {
   prompt: string;
   text: string;
   error?: string;
+  warning?: string;
   /** Children that are still pending or running. Title is the agent name. */
   stillRunning: WakeItem[];
 }
@@ -251,6 +254,7 @@ export function formatSubagentNotification(info: SubagentNotificationInfo): Form
       prompt: capPrompt(child.prompt ?? ""),
       result: capTail(child.text),
       ...(child.error ? { error: child.error } : {}),
+      ...(child.warning ? { warning: child.warning } : {}),
     })),
   });
 }
@@ -272,5 +276,6 @@ export function formatSubagentHandover(info: SubagentHandoverInfo): FormattedWak
     prompt: capPrompt(info.prompt),
     result: capTail(info.text),
     ...(info.error ? { error: info.error } : {}),
+    ...(info.warning ? { warning: info.warning } : {}),
   });
 }

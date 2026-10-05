@@ -15,6 +15,7 @@ import {
   resolveAgent,
 } from "../../src/agents/definition";
 import { createAgentLoader, loadAgentDefinitions } from "../../src/agents/loader";
+import { VALID_THINKING_LEVELS } from "../../src/thinking-levels";
 
 const FULL_MD = `---
 name: scout
@@ -77,7 +78,7 @@ describe("parseAgentMarkdown", () => {
   });
 
   it("parses every thinking level", () => {
-    for (const level of ["minimal", "low", "medium", "high", "xhigh"] as const) {
+    for (const level of VALID_THINKING_LEVELS) {
       const def = parseAgentMarkdown(agentMd("a", "d", `thinking: ${level}`), "user");
       expect(def.thinking).toBe(level);
     }

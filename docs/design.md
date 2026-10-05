@@ -426,8 +426,8 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 |---|---|---|---|
 | `task` | (none; still-running is not an attribute) | Optional `<still-running><item id>`; one or more `<task id kind status duration-ms exit-code? signal?>`, containing `summary` `command` `output-file` `preview` | `{ kind:"task"; stillRunning: {id,title}[]; tasks: [{ id, taskKind, status, summary, command, outputPath, preview, durationMs, exitCode: number\|null, signal?: string }] }` |
 | `monitor` | `id` `description` `status?` | `<event>` | `{ kind:"monitor"; id; description; status?; event }` |
-| `subagent-handover` | `run-id` `child-id` `name` `status` | Optional `<still-running>`; `summary` `prompt` `result`; optional `error` | `{ kind:"subagent-handover"; runId; childId; name; status; stillRunning: {id,title}[]; summary; prompt; result; error? }` |
-| `subagent-done` | `run-id` `status` `duration-ms` | `summary`, then one `<child id name status>` per child, containing `prompt` (head capped at 2000), optional `error`, `result` (tail capped at 2000) | `{ kind:"subagent-done"; runId; status; durationMs; summary; children: [{ childId, name, status, prompt, result, error? }] }` |
+| `subagent-handover` | `run-id` `child-id` `name` `status` | Optional `<still-running>`; `summary` `prompt` `result`; optional `error`, `warning` | `{ kind:"subagent-handover"; runId; childId; name; status; stillRunning: {id,title}[]; summary; prompt; result; error?; warning? }` |
+| `subagent-done` | `run-id` `status` `duration-ms` | `summary`, then one `<child id name status>` per child, containing `prompt` (head capped at 2000), optional `error`, optional `warning`, `result` (tail capped at 2000) | `{ kind:"subagent-done"; runId; status; durationMs; summary; children: [{ childId, name, status, prompt, result, error?, warning? }] }` |
 | `supervisor-request` | `from` `name` | `message`, `reply-with` | `{ kind:"supervisor-request"; from; name; message }` |
 | `supervisor-update` | `from` `name` | `message` | `{ kind:"supervisor-update"; from; name; message }` |
 
@@ -479,7 +479,8 @@ subagent({
 
 - Candidate set: nonempty `ctx.scopedModels` → scoped only (respect user whitelist); otherwise `modelRegistry.getAvailable()`
 - Matching algorithm (pure function `resolveModelSpec(spec, candidates)`): ① exact (`provider/id` or a unique bare-id match) → ② case-insensitive id/display-name substring; 0 matches → error listing candidates; multiple matches → error listing matches, suggesting a `provider/` prefix to disambiguate
-- Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing
+- Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing. Valid levels mirror pi core's `VALID_THINKING_LEVELS` (`off, minimal, low, medium, high, xhigh, max`; the SDK does not export the list, so `src/thinking-levels.ts` keeps the parity-pinned copy, re-exported by `model-spec.ts`)
+- Unknown `:<suffix>` handling mirrors pi's `parseModelPattern(allowInvalidThinkingLevelFallback)`: on a full-spec **no-match** with an unrecognized suffix, the resolver retries without the suffix; a resolvable base adapts with a **warning** on the child result (never silent), while a still-unresolvable base fails hard with the invalid suffix named in the error. A full-spec **ambiguity never retries** — ambiguity is semantic, not syntax. Literal ids whose trailing `:segment` is not a valid level (OpenRouter `:exacto`) win because the full spec matches them before the retry fires; conversely, an id literally ending in a valid level (`:high`) is read as a thinking override, never as a literal id. A `provider:id` separator is never a thinking suffix: known-provider / first-colon detection (case-insensitive; a known provider is a candidate's `provider` field or the first `/` segment of its id, so a scoped OpenRouter whitelist of `openai/...` still protects `openai:`) runs **before** valid-level splitting, so `openai:off` / `openai:max` / `openai:nonexistent` stay hard no-matches instead of fuzzy-matching an unrelated id. Bare `id:thinking` (`gpt-5.2:off`) and `provider:id:thinking` (`openai:gpt-5.2:off`) still resolve.
 - Tool parameter `model` resolution failure → **hard error** (list candidates, LLM can retry); agent-definition file `model` resolution failure → **fall back to parent model** + warning in result details (user-authored files can become invalid across machines; do not fail hard)
 - Unspecified: child inherits parent's current model (`ctx.model`)
 - `action:"models"` returns one candidate per line, `provider/id — display name`, marking the parent model `(current)` and whitelist source `(scoped)`
@@ -518,7 +519,7 @@ name: explorer
 description: Fast codebase exploration — finds files, symbols, answers structure questions
 tools: [read, bash, grep, find, ls]     # or `read, bash, grep, find, ls`; default = [read, bash, edit, write]
 model: anthropic:claude-haiku-4-5       # optional; "provider:id" or bare id
-thinking: high                          # optional: minimal|low|medium|high|xhigh
+thinking: high                          # optional: off|minimal|low|medium|high|xhigh|max (src/thinking-levels.ts)
 ---
 
 You are an explorer agent. ... (body = appended system prompt segment)
@@ -628,13 +629,21 @@ export function formatMonitorEvent(description: string, taskId: string, batchTex
 ## Appendix B: M3-M5 interface signature contract (shared basis for subagent / comms / agents)
 
 ```ts
+// ---------- extension/src/thinking-levels.ts (pure module, zero pi dependencies) ----------
+export const VALID_THINKING_LEVELS = ["off","minimal","low","medium","high","xhigh","max"] as const;
+export type ThinkingLevel = typeof VALID_THINKING_LEVELS[number];
+export function isValidThinkingLevel(level: string): level is ThinkingLevel;
+                              // single source of truth (pi SDK does not export the list; parity tests
+                              // pin the levels). Consumed by agents/definition.ts and subagent/
+                              // (model-spec.ts, tool.ts); subagent/types.ts mirrors the union
+
 // ---------- extension/src/agents/ (M5, pure modules, zero pi dependencies) ----------
 export interface AgentDefinition {
   name: string;                 // ^[a-z][a-z0-9-]*$
   description: string;          // required, nonempty
   tools: string[];              // default ["read","bash","edit","write"]
   model?: string;               // "provider:id" | bare id
-  thinking?: "minimal"|"low"|"medium"|"high"|"xhigh";
+  thinking?: ThinkingLevel;      // off|minimal|low|medium|high|xhigh|max (src/thinking-levels.ts)
   systemPrompt: string;         // frontmatter body, trimmed
   source: "builtin"|"user"|"project";
   path?: string;                // no path for builtin
@@ -650,12 +659,24 @@ export function resolveAgent(defs: AgentDefinition[], name: string | undefined):
 // ---------- extension/src/subagent/model-spec.ts (pure function, zero pi dependencies) ----------
 export interface ModelCandidate { provider: string; id: string; name?: string }
 export type ModelResolution =
-  | { ok: true; provider: string; id: string; thinking?: string }
-  | { ok: false; error: "no-match"|"ambiguous"; candidates: string[]; thinking?: string };
+  | { ok: true; provider: string; id: string; thinking?: string; warning?: string }
+  | { ok: false; error: "no-match"|"ambiguous"; candidates: string[]; thinking?: string; suffixHint?: string };
 export function resolveModelSpec(spec: string, candidates: ModelCandidate[]): ModelResolution;
-  // ① Strip ":<thinking>" suffix (recognize only minimal|low|medium|high|xhigh; otherwise treat as part of id)
+  // ① Strip ":<thinking>" suffix (VALID_THINKING_LEVELS = off|minimal|low|medium|high|xhigh|max, pi core parity)
   // ② Exact "provider/id" → unique exact bare id → case-insensitive id/name substring
-  // ③ 0 matches: no-match (candidates=all), >1 matches: ambiguous (candidates=matches)
+  // ③ Full-spec no-match with an unrecognized suffix: strip it and retry (pi's
+  //   allowInvalidThinkingLevelFallback); resolvable base → ok + warning on the result,
+  //   still-unresolvable → the retried no-match/ambiguous, with suffixHint naming the bad
+  //   suffix (modelResolutionError renders the hint in BOTH error shapes)
+  // ④ Full-spec ambiguity never retries — ambiguity is semantic, not syntax
+  // ⑤ Literal ids whose trailing ':segment' is NOT a valid level (OpenRouter ":exacto")
+  //   match at ② before ③ ever fires; ids ending in a valid level (":high") are read as
+  //   thinking overrides, never as literal ids
+  // ⑥ A "provider:id" separator is never a thinking suffix. Known-provider /
+  //   first-colon detection (case-insensitive; candidate.provider plus the first
+  //   '/' segment of candidate.id) runs BEFORE ①, so "openai:off" / "openai:max"
+  //   / "openai:nonexistent" stay hard no-matches. "gpt-5.2:off" and
+  //   "openai:gpt-5.2:off" still take ①.
 
 // ---------- extension/src/subagent/types.ts (M3 core types) ----------
 export type ChildStatus = "pending"|"running"|"completed"|"failed"|"interrupted";

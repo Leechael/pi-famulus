@@ -137,13 +137,13 @@ function resolveModel(deps: PiRuntimeDeps, req: ChildRunRequest): ResolvedModel 
     if (!res.ok) throw new Error(modelResolutionError(req.model, res));
     const model = findModel(res.provider, res.id);
     if (!model) throw new Error(`model ${res.provider}/${res.id} is not usable in this session`);
-    return { model, thinkingOverride: res.thinking };
+    return { model, thinkingOverride: res.thinking, warning: res.warning };
   }
   if (req.agent.model !== undefined) {
     const res = resolveModelSpec(req.agent.model, candidates);
     if (res.ok) {
       const model = findModel(res.provider, res.id);
-      if (model) return { model, thinkingOverride: res.thinking };
+      if (model) return { model, thinkingOverride: res.thinking, warning: res.warning };
     }
     return {
       model: deps.getParentModel(),

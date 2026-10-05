@@ -15,6 +15,7 @@
  */
 import { Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { VALID_THINKING_LEVELS } from "../thinking-levels";
 import { formatSubagentHandover, formatSubagentNotification, truncateTail } from "../format";
 import { realClock, type Clock, type ClockTimer } from "../clock";
 
@@ -73,7 +74,9 @@ const subagentParameters = Type.Object({
     Type.String({
       description:
         'Model override for all subagents: fuzzy ("haiku"), qualified ("provider/id"), ' +
-        'optionally with ":<thinking>" suffix. Default: current model. ' +
+        `optionally with ":<thinking>" suffix (${VALID_THINKING_LEVELS.join(", ")}; ` +
+        'an unknown suffix is dropped with a warning when the base resolves; ' +
+        'an unknown base still errors). Default: current model. ' +
         'Use action:"models" to list selectable values.',
     }),
   ),
@@ -222,6 +225,7 @@ function toNotificationInfo(record: RunRecord, now: number) {
       status: c.status,
       text: c.result?.text ?? "",
       error: c.result?.error,
+      ...(c.result?.warning !== undefined ? { warning: c.result.warning } : {}),
       ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
     })),
   };
@@ -320,6 +324,7 @@ export function createSubagentTool(
         prompt: child.prompt ?? "",
         text: child.result?.text ?? "",
         ...(child.result?.error !== undefined ? { error: child.result.error } : {}),
+        ...(child.result?.warning !== undefined ? { warning: child.result.warning } : {}),
         stillRunning,
       }),
     );

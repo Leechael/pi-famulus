@@ -36,6 +36,8 @@ export interface SubagentDoneChild {
   prompt: string;
   result: string;
   error?: string;
+  /** Non-fatal caveat from the child run (e.g. an adapted model spec). */
+  warning?: string;
 }
 
 export type FamulusWake =
@@ -60,6 +62,7 @@ export type FamulusWake =
       prompt: string;
       result: string;
       error?: string;
+      warning?: string;
     }
   | {
       kind: "subagent-done";
@@ -174,6 +177,7 @@ function renderHandover(details: Extract<FamulusWake, { kind: "subagent-handover
   parts.push(`  <summary>${escapeXml(details.summary)}</summary>`);
   parts.push(`  <prompt>${escapeXml(details.prompt)}</prompt>`);
   if (details.error) parts.push(`  <error>${escapeXml(details.error)}</error>`);
+  if (details.warning) parts.push(`  <warning>${escapeXml(details.warning)}</warning>`);
   parts.push(`  <result>${escapeXml(details.result)}</result>`);
   parts.push("</pi-famulus-wake>");
   return parts.join("\n");
@@ -193,6 +197,7 @@ function renderDone(details: Extract<FamulusWake, { kind: "subagent-done" }>): s
     );
     parts.push(`    <prompt>${escapeXml(child.prompt)}</prompt>`);
     if (child.error) parts.push(`    <error>${escapeXml(child.error)}</error>`);
+    if (child.warning) parts.push(`    <warning>${escapeXml(child.warning)}</warning>`);
     parts.push(`    <result>${escapeXml(child.result)}</result>`);
     parts.push("  </child>");
   }
