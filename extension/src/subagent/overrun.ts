@@ -5,8 +5,8 @@
  *
  * Zero pi dependency; the output-file stat is injected so tests can drive it.
  */
-import type { SubagentOverrunInfo } from "../format";
-import type { OverrunShell } from "../wake";
+import { formatSubagentOverrun, type SubagentOverrunInfo } from "../format";
+import type { FormattedWake, OverrunShell } from "../wake";
 import type { ConversationTurn } from "./types";
 
 export interface ChildShell {
@@ -115,5 +115,59 @@ export function buildOverrunInfo(deps: OverrunInfoDeps, tick: OverrunTick): Suba
       text: lastActivityText(deps.conversation(tick.childId)),
     },
     ...(shell ? { shell: describeShell(deps, shell) } : {}),
+  };
+}
+
+export interface OverrunNotifierDeps {
+  now: () => number;
+  registry: {
+    list(): { runId: string; children: { childId: string; name: string }[] }[];
+    handle(childId: string): { conversation(): ConversationTurn[] } | undefined;
+  };
+  shells: ChildShellTracker;
+  stat: OverrunInfoDeps["stat"];
+  /** Parent wake (NotifyCenter.notify). */
+  notify: (wake: FormattedWake) => void;
+  logEvent: (type: string, fields: Record<string, unknown>) => void;
+}
+
+/**
+ * The runner's onOverrun: build the payload, log `agent.overrun`, wake the
+ * parent. A child whose run is already gone produces neither.
+ */
+export function createOverrunNotifier(deps: OverrunNotifierDeps): (tick: OverrunTick) => void {
+  const infoDeps: OverrunInfoDeps = {
+    now: deps.now,
+    lookupChild: (childId) => {
+      for (const run of deps.registry.list()) {
+        const child = run.children.find((c) => c.childId === childId);
+        if (child) return { runId: run.runId, name: child.name };
+      }
+      return undefined;
+    },
+    conversation: (childId) => deps.registry.handle(childId)?.conversation() ?? [],
+    shells: deps.shells,
+    stat: deps.stat,
+  };
+  return (tick) => {
+    const info = buildOverrunInfo(infoDeps, tick);
+    if (!info) return;
+    const shell = info.shell;
+    deps.logEvent("agent.overrun", {
+      child_id: info.childId,
+      run_id: info.runId,
+      reminder: info.reminder,
+      elapsed_ms: info.elapsedMs,
+      budget_ms: info.budgetMs,
+      ...(shell
+        ? {
+            shell_task_id: shell.taskId,
+            shell_elapsed_ms: shell.elapsedMs,
+            ...(shell.outputBytes !== null ? { output_bytes: shell.outputBytes } : {}),
+            ...(shell.growing !== null ? { growing: shell.growing } : {}),
+          }
+        : {}),
+    });
+    deps.notify(formatSubagentOverrun(info));
   };
 }
