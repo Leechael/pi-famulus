@@ -14,7 +14,7 @@
  *   ever delivered once.
  */
 import { formatMonitorEvent, formatTaskNotification, type TaskExitInfo } from "./format";
-import { FAMULUS_WAKE_CUSTOM_TYPE, type WakeItem } from "./wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, type WakeItem } from "./wake";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 
@@ -88,6 +88,8 @@ export class NotifyCenter {
    */
   notify(message: NotifyMessage, opts: { passive?: boolean; quietEvents?: boolean } = {}): void {
     if (this.disposed) return;
+    // Stamped on arrival: a held passive notice keeps the time it was built.
+    message = stampWakeAsOf(message, this.clock.now());
     const wake = message.details as { kind?: string; id?: string } | undefined;
     if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id, opts.quietEvents);
     if (!opts.passive) {
@@ -203,6 +205,8 @@ export class NotifyCenter {
   }
 
   private deliver(message: NotifyMessage, passive = false): void {
+    // Wakes built here (task batches, monitor events) are stamped now.
+    message = stampWakeAsOf(message, this.clock.now());
     const msg = { ...message, display: true };
     const details = message.details as { kind?: string; id?: string; taskId?: string; tasks?: { id: string }[]; children?: { childId: string }[]; childId?: string; from?: string; eventCount?: number } | undefined;
     if (details?.kind) {

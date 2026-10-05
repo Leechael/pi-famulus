@@ -28,6 +28,19 @@ describe("pi-famulus-wake envelope", () => {
     }
   });
 
+  it("renders details.asOf as the last root attribute, UTC to the second", () => {
+    const wake = formatFamulusWake({
+      kind: "supervisor-update",
+      from: "ch_a",
+      name: "worker",
+      message: "ready",
+      asOf: Date.UTC(2026, 9, 5, 12, 27, 26, 999),
+    });
+    expect(wake.content).toContain(
+      '<pi-famulus-wake kind="supervisor-update" from="ch_a" name="worker" as-of="2026-10-05T12:27:26Z">',
+    );
+  });
+
   it("wraps a task batch in one envelope and keeps a comma inside an item title", () => {
     const wake = formatFamulusWake({
       kind: "task",

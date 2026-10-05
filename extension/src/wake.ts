@@ -55,7 +55,20 @@ export interface OverrunShell {
   growing: boolean | null;
 }
 
-export type FamulusWake =
+/**
+ * When the wake's content was generated (design.md §4.5): stamped by the
+ * NotifyCenter when it receives or builds the wake. A steered wake can wait
+ * minutes before the model sees it; the model needs to know how old the
+ * snapshot is.
+ */
+export interface WakeTiming {
+  /** Epoch ms. Rendered as the root attribute as-of (UTC, seconds). */
+  asOf?: number;
+}
+
+export type FamulusWake = FamulusWakeBody & WakeTiming;
+
+type FamulusWakeBody =
   | { kind: "task"; stillRunning: WakeItem[]; tasks: TaskWake[] }
   | {
       kind: "monitor";
@@ -136,7 +149,46 @@ export function formatFamulusWake(details: FamulusWake, leadIn: string = FAMULUS
   return { customType: FAMULUS_WAKE_CUSTOM_TYPE, content, details };
 }
 
+/** UTC, second precision: the model needs how old a snapshot is, not milliseconds. */
+export function wakeTimestamp(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** Append attributes to the root <pi-famulus-wake …> tag of rendered content. */
+function addRootAttrs(content: string, attrs: string[]): string {
+  if (attrs.length === 0) return content;
+  // `\s`: the lead-in mentions a bare <pi-famulus-wake>; the root tag has attributes.
+  const root = /<pi-famulus-wake\s[^>]*>/.exec(content);
+  if (!root) return content;
+  const end = root.index + root[0].length - 1;
+  return `${content.slice(0, end)} ${attrs.join(" ")}${content.slice(end)}`;
+}
+
+function timingAttrs(details: WakeTiming): string[] {
+  return details.asOf === undefined ? [] : [`as-of="${wakeTimestamp(details.asOf)}"`];
+}
+
+/**
+ * Stamp a wake with the time it was generated. Leaves non-wake messages and
+ * already-stamped wakes alone, so a wake held for later delivery keeps the
+ * time it was built.
+ */
+export function stampWakeAsOf<M extends { customType: string; content: string; details?: unknown }>(
+  message: M,
+  asOf: number,
+): M {
+  if (message.customType !== FAMULUS_WAKE_CUSTOM_TYPE) return message;
+  const details = message.details as (WakeTiming & { kind?: string }) | undefined;
+  if (!details || typeof details !== "object" || !details.kind || details.asOf !== undefined) return message;
+  const stamped = { ...details, asOf };
+  return { ...message, content: addRootAttrs(message.content, timingAttrs(stamped)), details: stamped };
+}
+
 function renderWake(details: FamulusWake): string {
+  return addRootAttrs(renderWakeBody(details), timingAttrs(details));
+}
+
+function renderWakeBody(details: FamulusWake): string {
   switch (details.kind) {
     case "task":
       return renderTask(details);

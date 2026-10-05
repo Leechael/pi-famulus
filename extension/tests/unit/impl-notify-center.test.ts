@@ -98,3 +98,64 @@ describe("NotifyCenter monitor batching", () => {
     center.dispose();
   });
 });
+
+describe("NotifyCenter stamps every wake with as-of", () => {
+  // 2026-10-05 chief session: a subagent-done generated at 12:27:26Z reached
+  // the model 800.9 s later with nothing saying how old it was.
+  const T0 = Date.UTC(2026, 9, 5, 12, 27, 26, 61);
+
+  function center(idle: () => boolean) {
+    const clock = new ManualClock(T0);
+    const sent: { message: { customType: string; content: string; details?: unknown }; options: unknown }[] = [];
+    const c = new NotifyCenter({ sendMessage: (message, options) => sent.push({ message, options }), isIdle: idle, clock });
+    return { clock, sent, c };
+  }
+
+  it("a notified wake carries the time it was generated, in content and details", () => {
+    const { sent, c } = center(() => true);
+    const wake = formatMonitorEvent("watcher", "mon_1", "ready");
+    c.notify({ customType: wake.customType, content: wake.content, details: wake.details });
+    expect(sent[0].message.content).toContain(
+      '<pi-famulus-wake kind="monitor" id="mon_1" description="watcher" as-of="2026-10-05T12:27:26Z">',
+    );
+    expect(sent[0].message.details).toMatchObject({ kind: "monitor", asOf: T0 });
+  });
+
+  it("a held passive notice keeps the time it was built, not the time it went out", () => {
+    let idle = false;
+    const { clock, sent, c } = center(() => idle);
+    const wake = formatMonitorEvent("watcher", "mon_1", "Monitor stopped.", "stopped");
+    c.notify({ customType: wake.customType, content: wake.content, details: wake.details }, { passive: true });
+    expect(sent).toHaveLength(0);
+    clock.advanceBy(90_000);
+    idle = true;
+    c.settled();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].message.details).toMatchObject({ asOf: T0 });
+    expect(sent[0].message.content).toContain('status="stopped" as-of="2026-10-05T12:27:26Z">');
+  });
+
+  it("a task batch is stamped when it is built (window flush)", () => {
+    const { clock, sent, c } = center(() => true);
+    c.notifyTaskExit({
+      taskId: "sh_1",
+      kind: "shell",
+      command: "true",
+      status: "completed",
+      exitCode: 0,
+      durationMs: 5,
+      outputPath: "/tmp/o",
+      preview: "",
+    });
+    clock.advanceBy(1_000); // window is 200 ms; the batch is built at T0 + 200
+    expect(sent).toHaveLength(1);
+    expect(sent[0].message.details).toMatchObject({ kind: "task", asOf: T0 + 200 });
+    expect(sent[0].message.content).toContain('<pi-famulus-wake kind="task" as-of="2026-10-05T12:27:26Z">');
+  });
+
+  it("leaves non-wake messages untouched", () => {
+    const { sent, c } = center(() => true);
+    c.notify({ customType: "something-else", content: '<pi-famulus-wake kind="x">', details: { kind: "x" } });
+    expect(sent[0].message).toMatchObject({ content: '<pi-famulus-wake kind="x">', details: { kind: "x" } });
+  });
+});
