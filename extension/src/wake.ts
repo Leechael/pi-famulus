@@ -225,7 +225,11 @@ export function stampWakeAsOf<M extends { customType: string; content: string; d
   const details = message.details as (WakeTiming & { kind?: string }) | undefined;
   if (!details || typeof details !== "object" || !details.kind || details.asOf !== undefined) return message;
   const stamped = { ...details, asOf };
-  return { ...message, content: addRootAttrs(message.content, timingAttrs(stamped)), details: stamped };
+  const content = addRootAttrs(message.content, timingAttrs(stamped));
+  // addRootAttrs is a no-op when the root tag is missing; keep details in
+  // sync with content so wakeAtInjection does not reject a phantom stamp.
+  if (content === message.content) return message;
+  return { ...message, content, details: stamped };
 }
 
 function renderWake(details: FamulusWake): string {
