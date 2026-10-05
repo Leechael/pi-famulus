@@ -10,8 +10,10 @@
  * - lineage: v1 = same runId.
  *
  * Wiring contract: the runner must be constructed with
- * `acquire: (req) => registry.admitChild(req.childId)` so every generation
- * (initial start and resume) passes through admission. startChild() wires the
+ * `acquire: (req, ticket) => registry.admitChild(req.childId, ticket)` so every
+ * generation (initial start and resume) passes through admission. Forward the
+ * ticket: without it admitChild falls back to the handle's current status and
+ * a stale queued request can admit a newer resume. startChild() wires the
  * first generation's result; admitChild() wires subsequent generations.
  *
  * Zero pi dependency.
