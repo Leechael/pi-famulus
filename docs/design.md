@@ -479,7 +479,7 @@ subagent({
 
 - Candidate set: nonempty `ctx.scopedModels` → scoped only (respect user whitelist); otherwise `modelRegistry.getAvailable()`
 - Matching algorithm (pure function `resolveModelSpec(spec, candidates)`): ① exact (`provider/id` or a unique bare-id match) → ② case-insensitive id/display-name substring; 0 matches → error listing candidates; multiple matches → error listing matches, suggesting a `provider/` prefix to disambiguate
-- Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing. Valid levels mirror pi core's `VALID_THINKING_LEVELS` (`off, minimal, low, medium, high, xhigh, max`; the SDK does not export the list, so `model-spec.ts` maintains a parity-pinned copy)
+- Specs can carry a `:<thinking>` suffix (e.g. `claude-haiku-4-5:high`), overriding the agent definition's thinking after parsing. Valid levels mirror pi core's `VALID_THINKING_LEVELS` (`off, minimal, low, medium, high, xhigh, max`; the SDK does not export the list, so `src/thinking-levels.ts` keeps the parity-pinned copy, re-exported by `model-spec.ts`)
 - Unknown `:<suffix>` handling mirrors pi's `parseModelPattern(allowInvalidThinkingLevelFallback)`: on a full-spec **no-match** with an unrecognized suffix, the resolver retries without the suffix; a resolvable base adapts with a **warning** on the child result (never silent), while a still-unresolvable base fails hard with the invalid suffix named in the error. A full-spec **ambiguity never retries** — ambiguity is semantic, not syntax. Literal ids whose trailing `:segment` is not a valid level (OpenRouter `:exacto`) win because the full spec matches them before the retry fires; conversely, an id literally ending in a valid level (`:high`) is read as a thinking override, never as a literal id
 - Tool parameter `model` resolution failure → **hard error** (list candidates, LLM can retry); agent-definition file `model` resolution failure → **fall back to parent model** + warning in result details (user-authored files can become invalid across machines; do not fail hard)
 - Unspecified: child inherits parent's current model (`ctx.model`)
@@ -630,7 +630,7 @@ export function formatMonitorEvent(description: string, taskId: string, batchTex
 
 ```ts
 // ---------- extension/src/thinking-levels.ts (pure module, zero pi dependencies) ----------
-export const VALID_THINKING_LEVELS = ["off","minimal","low","medium","high","xhigh","max"];
+export const VALID_THINKING_LEVELS = ["off","minimal","low","medium","high","xhigh","max"] as const;
 export type ThinkingLevel = typeof VALID_THINKING_LEVELS[number];
 export function isValidThinkingLevel(level: string): level is ThinkingLevel;
                               // single source of truth (pi SDK does not export the list; parity tests
