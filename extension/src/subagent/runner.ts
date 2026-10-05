@@ -306,11 +306,15 @@ class InProcessChildHandle implements DisposableChildHandle {
   /**
    * steer/followUp after a reminder: the parent is handling the overrun, so
    * the next reminder waits a full interval. Before the first reminder the
-   * deadline is untouched.
+   * deadline is untouched, and so is a deadline that extend() moved into the
+   * future: the child is inside its budget again, and the next wake belongs
+   * at that deadline, not one repeat from now.
    */
   private parentActed(): void {
     if (this.reminders === 0 || this.status_ !== "running") return;
-    this.nextReminderAt = this.now() + this.overrunRepeatMs;
+    const now = this.now();
+    if (this.softDeadlineAt !== null && now < this.softDeadlineAt) return;
+    this.nextReminderAt = now + this.overrunRepeatMs;
     this.armSoftDeadline(this.generation);
   }
 

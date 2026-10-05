@@ -164,6 +164,30 @@ describe("soft deadline", () => {
       clock.advanceBy(1);
       expect(ticks).toHaveLength(2);
     });
+
+    // Review P2 (PR #34): a steer right after extend must not pull the next
+    // reminder in front of the extended deadline ("past budget" while inside it).
+    for (const via of ["steer", "followUp"] as const) {
+      for (const [label, ext] of [["long", 2_000], ["short", 200]] as const) {
+        it(`${via} right after a ${label} extend keeps the extended deadline`, async () => {
+          const handle = await runner().start(makeReq());
+          clock.advanceBy(1_000); // reminder 1 at t=1000
+          handle.extend(ext); // deadline t=1000+ext
+          await handle[via]("carry on");
+          clock.advanceBy(ext - 1);
+          expect(ticks).toHaveLength(1);
+          clock.advanceBy(1);
+          expect(ticks[1]).toMatchObject({ reminder: 2, elapsedMs: 1_000 + ext, budgetMs: 1_000 + ext });
+          // Past the extended deadline, a steer postpones the repeat as before.
+          clock.advanceBy(100);
+          await handle[via]("wrap up");
+          clock.advanceBy(299);
+          expect(ticks).toHaveLength(2);
+          clock.advanceBy(1);
+          expect(ticks[2]).toMatchObject({ reminder: 3, elapsedMs: 1_000 + ext + 400 });
+        });
+      }
+    }
   });
 
   describe("hard ceiling (opt-in hardTimeoutMs)", () => {
