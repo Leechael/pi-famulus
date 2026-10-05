@@ -129,20 +129,22 @@ Connected sessions only (a gone session is listed while it still runs something)
 
 ```text
 $ pi-famulus ls
-ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
-sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
-ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
+ID           KIND    SESSION   CWD        STATUS    TIME     DUR    CPU   CORES EXIT    REASON       TITLE
+sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -     -     -       -            npm test
+ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -     -     -       -            review (worker) m1
 
 $ pi-famulus ls --all
-ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
-sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
-ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
-mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    SIGTERM stopped:tui  tail -f log
-ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -       model-error  broken (worker) m1
+ID           KIND    SESSION   CWD        STATUS    TIME     DUR    CPU   CORES EXIT    REASON       TITLE
+sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -     -     -       -            npm test
+ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -     -     -       -            review (worker) m1
+sh_51d0c3aa  shell   0199aaaa  ~/src/app  completed 14:01:40 41s    2m28s 3.6   0       exited       cargo test
+mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    0.0s  0.0   SIGTERM stopped:tui  tail -f log
+ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -     -     -       model-error  broken (worker) m1
 ```
 
 By default only running work, anywhere (a live process is never hidden, even in a gone session). `-a`/`--all` adds the finished work of connected sessions; a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Running rows come first, then finished ones, each newest first. `TIME` is a task's start and an agent's **last transcript message** (a long-running agent that just spoke sorts as recent; its start is in `show`). Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (TIME within). `--json` prints the rows in the same order as an array of objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `active_at` (= TIME), `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, `running`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known, and a task's `work_kind`).
 
+- `CPU` is a finished task's user + system CPU time, `CORES` that divided by its wall time (how many cores it kept busy on average). Both cover the command and every descendant that was waited for by its parent (pytest's xdist workers, a compiler under make), measured when the command exits. `-` while it runs, for agents, and when it was not measured: the hard timeout (`--timeout-ms`) and a stop that outlives its 2s grace SIGKILL the runner with the group, so nothing reports. Never counted: processes that escaped the wait chain (`setsid`, `cmd &` never waited for, a worker orphaned because its parent died first) and anything still running when the command exits. On macOS, a process that reaps children and then `exec`s loses their CPU (`make; exec foo` shows only `foo`). `--json` carries the raw `cpu_user_ms`, `cpu_sys_ms` and `max_rss_kb` (peak RSS of the single largest process, not a sum).
 - `EXIT` is the exit code, a signal name (`SIGTERM`, `SIGKILL`, …), or `-`.
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.
 - `TITLE` is the command's first line (agents: `name (agent) model`), truncated by **display width** so CJK and emoji keep the table aligned: to the terminal width on a tty, to 60 columns otherwise.
@@ -155,7 +157,7 @@ By default only running work, anywhere (a live process is never hidden, even in 
 
 Everything about one id, any kind:
 
-- **task / monitor:** status, exit, reason, session (state, pi pid), full command, cwd, pid, start/end/duration, when it was moved to the background, who spawned it (`origin`: `bash-fg`, `bash-bg`, `child-bash` with child and run, `monitor`), output and stderr paths, wake notification emitted → delivered (from the extension's events), its `work_kind`, and the last 10 output lines.
+- **task / monitor:** status, exit, reason, session (state, pi pid), full command, cwd, pid, start/end/duration, when it was moved to the background, who spawned it (`origin`: `bash-fg`, `bash-bg`, `child-bash` with child and run, `monitor`), output and stderr paths, wake notification emitted → delivered (from the extension's events), its `work_kind`, CPU (user/sys, average cores, peak RSS, or why it was not measured), and the last 10 output lines.
 - **agent (`ch_…`):** name/agent/model, run, status and end reason, error, start/end/duration, tool-call count, shells it spawned (tasks whose `origin.child_id` is this agent), transcript path, the task prompt, and the last 20 lines of its result.
 - **run (`run_…`):** its children as an `ls` table.
 
@@ -174,7 +176,7 @@ Renders the transcript `sessions/<sid>/agents/<ch>.jsonl` (one JSON object per m
 ### `events`
 
 ```text
-2026-09-23 14:03:22.123 0199aaaa manager   task.exit          sh_3f2a91c0 exit_code=0 end_reason=exited duration_ms=64012
+2026-09-23 14:03:22.123 0199aaaa manager   task.exit          sh_3f2a91c0 cpu_sys_ms=9214 cpu_user_ms=201330 duration_ms=64012 end_reason=exited exit_code=0 max_rss_kb=412880
 2026-09-23 14:03:22.140 0199aaaa extension wake.emit          - kind=task ids=["sh_3f2a91c0"] batch=1
 2026-09-23 14:03:22.140 0199aaaa extension wake.deliver       - kind=task mode=steer
 2026-09-23 14:03:31.502 0199aaaa extension wake.inject        - kind=task ids=["sh_3f2a91c0"] as_of=1790143402140 lag_ms=9362
