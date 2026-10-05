@@ -115,8 +115,8 @@ export function wakeAtInjection<M extends CustomMessageLike>(
  * replacement message (same role), if any.
  */
 export function onWakeMessageEnd<M extends CustomMessageLike>(message: M, deps: WakeDeliveryDeps): M | undefined {
-  logWakeInjected(message, deps);
   try {
+    logWakeInjected(message, deps);
     return wakeAtInjection(message, deps.now(), deps.lookup?.() ?? undefined);
   } catch {
     // Never break pi's message handling over a wake annotation.

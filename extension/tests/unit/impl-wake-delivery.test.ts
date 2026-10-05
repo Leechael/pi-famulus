@@ -82,6 +82,17 @@ describe("age-ms: how old the wake is when the model sees it", () => {
     expect(events).toEqual(["wake.inject"]);
     expect(out?.content).toContain('age-ms="2000"');
   });
+
+  it("a throwing logEvent does not break message_end", () => {
+    expect(
+      onWakeMessageEnd(injected(T0), {
+        now: () => T0 + 2_000,
+        logEvent: () => {
+          throw new Error("log failed");
+        },
+      }),
+    ).toBeUndefined();
+  });
 });
 
 describe("subagent wakes re-check statuses when the model sees them", () => {
