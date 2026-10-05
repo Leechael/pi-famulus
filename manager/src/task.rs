@@ -1182,10 +1182,13 @@ mod tests {
 
     /// A fixed amount of CPU work (no sleep: its duration is not CPU, and
     /// macOS CI rounds sleeps). About 0.4 s of user time on an M-series Mac.
+    #[cfg(unix)]
     pub(crate) const BURN: &str = "awk 'BEGIN{for(i=0;i<10000000;i++)s+=i}'";
     /// Well under BURN's cost on any machine, well over two idle shells'.
+    #[cfg(unix)]
     pub(crate) const BURN_FLOOR_US: u64 = 100_000;
 
+    #[cfg(unix)]
     async fn reported(t: &mut SpawnedTask) -> crate::runner::Reported {
         let _ = wait_and_drain(t).await;
         let mut line = String::new();
@@ -1197,6 +1200,7 @@ mod tests {
     /// CPU is spent only by a grandchild (two shells that cannot exec away
     /// stand between it and the runner).
     #[tokio::test]
+    #[cfg(unix)]
     async fn runner_reports_cpu_of_waited_for_descendants() {
         let dir = unique_dir("cpu");
         let env = HashMap::new();
@@ -1217,6 +1221,7 @@ mod tests {
     /// `/usr/bin/time -l`, 0.42 s without the `exec`). Pinned per platform
     /// so a change in either shows up.
     #[tokio::test]
+    #[cfg(unix)]
     async fn runner_usage_across_exec_is_platform_dependent() {
         let dir = unique_dir("cpuexec");
         let env = HashMap::new();
@@ -1233,6 +1238,7 @@ mod tests {
     /// The documented gap: work nobody waits for before `sh` exits is not
     /// in the report (the runner reports when `sh` ends).
     #[tokio::test]
+    #[cfg(unix)]
     async fn runner_usage_excludes_unwaited_background_work() {
         let dir = unique_dir("cpubg");
         let env = HashMap::new();
