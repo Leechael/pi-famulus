@@ -82,7 +82,10 @@ const subagentParameters = Type.Object({
   ),
   timeout_ms: Type.Optional(
     Type.Number({
-      description: `Hard timeout per subagent in ms (default 1800000, max ${MAX_TIMEOUT_MS})`,
+      description:
+        `Time budget per subagent turn in ms (default 1800000, max ${MAX_TIMEOUT_MS}). ` +
+        'Passing it does not stop the subagent: you get <pi-famulus-wake kind="subagent-overrun"> ' +
+        "and choose extend, steer, or interrupt. With resume: the resumed turn's budget. With extend: the new budget from now.",
       maximum: MAX_TIMEOUT_MS,
     }),
   ),

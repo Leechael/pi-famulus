@@ -484,3 +484,20 @@ describe("subagent tool — resume honours timeout_ms", () => {
     expect(overruns[0]).toMatchObject({ reminder: 1, budgetMs: 10_000 });
   });
 });
+
+describe("subagent tool — timeout_ms description", () => {
+  it("says the budget does not stop the subagent and names the overrun wake", () => {
+    const tool = createSubagentTool({
+      getRegistry: () => null,
+      getNotifyCenter: () => null,
+      budgetMs: () => 45_000,
+      defaultTimeoutMs: 1_800_000,
+      defaultConcurrency: 4,
+    });
+    const description = (tool.parameters as unknown as { properties: { timeout_ms: { description: string } } }).properties
+      .timeout_ms.description;
+    expect(description).toContain("does not stop the subagent");
+    expect(description).toContain('kind="subagent-overrun"');
+    expect(description).not.toMatch(/hard timeout/i);
+  });
+});
