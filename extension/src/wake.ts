@@ -29,10 +29,15 @@ export interface TaskWake {
   signal?: string;
 }
 
+export type WakeChildStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
+
 export interface SubagentDoneChild {
   childId: string;
   name: string;
-  status: "pending" | "running" | "completed" | "failed" | "interrupted";
+  /** Status when the model sees the wake (re-checked at injection). */
+  status: WakeChildStatus;
+  /** Set when the status changed after as-of: the status in the snapshot. */
+  statusAsOf?: WakeChildStatus;
   prompt: string;
   result: string;
   error?: string;
@@ -89,7 +94,10 @@ type FamulusWakeBody =
       runId: string;
       childId: string;
       name: string;
-      status: "completed" | "failed" | "interrupted";
+      /** The settle this wake reports; pending/running only when re-checked at injection. */
+      status: WakeChildStatus;
+      /** Set when the status changed after as-of: the status in the snapshot. */
+      statusAsOf?: WakeChildStatus;
       stillRunning: WakeItem[];
       summary: string;
       prompt: string;
@@ -101,6 +109,8 @@ type FamulusWakeBody =
       kind: "subagent-done";
       runId: string;
       status: "completed" | "partial" | "failed" | "interrupted";
+      /** Set at injection when a child is pending or running again: the run's status then. */
+      runStatusNow?: string;
       durationMs: number;
       summary: string;
       children: SubagentDoneChild[];
@@ -293,10 +303,20 @@ function renderHandover(details: Extract<FamulusWake, { kind: "subagent-handover
     `name="${escapeXmlAttr(details.name)}"`,
     `status="${escapeXmlAttr(details.status)}"`,
   ];
+  if (details.statusAsOf) attrs.push(`status-as-of="${escapeXmlAttr(details.statusAsOf)}"`);
   const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`];
   const still = stillRunningXml(details.stillRunning);
   if (still) parts.push(still);
   parts.push(`  <summary>${escapeXml(details.summary)}</summary>`);
+  if (details.statusAsOf) {
+    const active = details.status === "pending" || details.status === "running";
+    parts.push(
+      `  <changed-since-as-of>${escapeXml(
+        `${details.name} (${details.childId}): ${details.statusAsOf} → ${details.status}.` +
+          (active ? " Its result arrives as a new wake when it finishes." : ""),
+      )}</changed-since-as-of>`,
+    );
+  }
   parts.push(`  <prompt>${escapeXml(details.prompt)}</prompt>`);
   if (details.error) parts.push(`  <error>${escapeXml(details.error)}</error>`);
   if (details.warning) parts.push(`  <warning>${escapeXml(details.warning)}</warning>`);
@@ -312,10 +332,22 @@ function renderDone(details: Extract<FamulusWake, { kind: "subagent-done" }>): s
     `status="${escapeXmlAttr(details.status)}"`,
     `duration-ms="${Math.round(details.durationMs)}"`,
   ];
+  if (details.runStatusNow) attrs.push(`status-now="${escapeXmlAttr(details.runStatusNow)}"`);
   const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <summary>${escapeXml(details.summary)}</summary>`];
-  for (const child of details.children) {
+  const changed = details.children.filter((child) => child.statusAsOf !== undefined);
+  if (changed.length > 0) {
+    const list = changed.map((c) => `${c.name} (${c.childId}): ${c.statusAsOf} → ${c.status}`).join("; ");
+    const active = details.children.some((c) => c.status === "pending" || c.status === "running");
     parts.push(
-      `  <child id="${escapeXmlAttr(child.childId)}" name="${escapeXmlAttr(child.name)}" status="${escapeXmlAttr(child.status)}">`,
+      `  <changed-since-as-of>${escapeXml(
+        `${list}.` + (active ? " The run is active again; another subagent-done arrives when it finishes." : ""),
+      )}</changed-since-as-of>`,
+    );
+  }
+  for (const child of details.children) {
+    const asOf = child.statusAsOf ? ` status-as-of="${escapeXmlAttr(child.statusAsOf)}"` : "";
+    parts.push(
+      `  <child id="${escapeXmlAttr(child.childId)}" name="${escapeXmlAttr(child.name)}" status="${escapeXmlAttr(child.status)}"${asOf}>`,
     );
     parts.push(`    <prompt>${escapeXml(child.prompt)}</prompt>`);
     if (child.error) parts.push(`    <error>${escapeXml(child.error)}</error>`);
