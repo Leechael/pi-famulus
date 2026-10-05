@@ -114,6 +114,9 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.deepEqual(injects[0].ids, [taskId]);
     assert.equal(typeof injects[0].as_of, "number");
     assert.ok(typeof injects[0].lag_ms === "number" && injects[0].lag_ms >= 0, JSON.stringify(injects[0]));
+    // ...and the model's request carried the wake with its age at injection.
+    const seen = JSON.stringify(ep.calls.at(-1)?.messages ?? []);
+    assert.match(seen, /<pi-famulus-wake kind=\\"task\\" as-of=\\"[0-9T:-]+Z\\" age-ms=\\"\d+\\">/, seen.slice(-1500));
   });
 
   it("(b) command within the foreground budget returns inline and produces no notification", async () => {

@@ -15,7 +15,7 @@
  *
  * Zero pi dependency: the handler takes the message object pi passes.
  */
-import { FAMULUS_WAKE_CUSTOM_TYPE, wakeIds, type FamulusWake } from "./wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, renderWakeXml, wakeIds, wakeRootIndex, type FamulusWake } from "./wake";
 
 export interface WakeDeliveryDeps {
   now: () => number;
@@ -35,6 +35,35 @@ export function famulusWakeDetails(message: unknown): FamulusWake | undefined {
   if (!m || m.role !== "custom" || m.customType !== FAMULUS_WAKE_CUSTOM_TYPE) return undefined;
   const details = m.details as FamulusWake | undefined;
   return details && typeof details === "object" && typeof details.kind === "string" ? details : undefined;
+}
+
+/**
+ * The wake as the model should see it on entering the context: the root
+ * gains age-ms (how old its snapshot is now). Returns undefined when nothing
+ * changes: not a wake, not stamped, or content that is not the canonical
+ * rendering of its details (never rewrite text this module did not make).
+ */
+export function wakeAtInjection<M extends CustomMessageLike>(message: M, now: number): M | undefined {
+  const details = famulusWakeDetails(message);
+  if (!details || details.asOf === undefined || typeof message.content !== "string") return undefined;
+  const root = wakeRootIndex(message.content);
+  if (root < 0 || message.content.slice(root) !== renderWakeXml(details)) return undefined;
+  const next: FamulusWake = { ...details, ageMs: Math.max(0, now - details.asOf) };
+  return { ...message, content: message.content.slice(0, root) + renderWakeXml(next), details: next };
+}
+
+/**
+ * pi `message_end` handler body: log the injection and return the
+ * replacement message (same role), if any.
+ */
+export function onWakeMessageEnd<M extends CustomMessageLike>(message: M, deps: WakeDeliveryDeps): M | undefined {
+  logWakeInjected(message, deps);
+  try {
+    return wakeAtInjection(message, deps.now());
+  } catch {
+    // Never break pi's message handling over a wake annotation.
+    return undefined;
+  }
 }
 
 /** Log `wake.inject` for a wake entering the context. Non-wake messages are ignored. */

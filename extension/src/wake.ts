@@ -64,6 +64,11 @@ export interface OverrunShell {
 export interface WakeTiming {
   /** Epoch ms. Rendered as the root attribute as-of (UTC, seconds). */
   asOf?: number;
+  /**
+   * How old the wake was when it entered the model's context (ms). Set at
+   * injection (wake-delivery.ts), rendered as the root attribute age-ms.
+   */
+  ageMs?: number;
 }
 
 export type FamulusWake = FamulusWakeBody & WakeTiming;
@@ -181,7 +186,20 @@ function addRootAttrs(content: string, attrs: string[]): string {
 }
 
 function timingAttrs(details: WakeTiming): string[] {
-  return details.asOf === undefined ? [] : [`as-of="${wakeTimestamp(details.asOf)}"`];
+  const attrs: string[] = [];
+  if (details.asOf !== undefined) attrs.push(`as-of="${wakeTimestamp(details.asOf)}"`);
+  if (details.ageMs !== undefined) attrs.push(`age-ms="${Math.round(details.ageMs)}"`);
+  return attrs;
+}
+
+/** The <pi-famulus-wake> element for `details` (no lead-in). */
+export function renderWakeXml(details: FamulusWake): string {
+  return renderWake(details);
+}
+
+/** Index of the root <pi-famulus-wake …> tag in content, or -1. */
+export function wakeRootIndex(content: string): number {
+  return content.search(/<pi-famulus-wake\s/);
 }
 
 /**
