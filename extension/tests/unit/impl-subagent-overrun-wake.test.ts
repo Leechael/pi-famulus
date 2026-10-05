@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { BEHAVIOR_GUIDELINES } from "../../src/behavior-guidelines";
 import { formatSubagentOverrun, type SubagentOverrunInfo } from "../../src/format";
 import { registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests } from "../../src/tui/pi-tui-load";
@@ -105,5 +106,18 @@ describe("subagent-overrun wake", () => {
     expect(expanded).toContain("$ cd /repo && npm test -- --runInBand");
     expect(expanded).toContain("Next reminder in 10m0s unless you extend, steer, or interrupt it.");
     expect(expanded).not.toContain("<pi-famulus-wake");
+  });
+});
+
+describe("behavior guidelines on the overrun wake", () => {
+  it("say the subagent was not stopped, name the three actions, and the no-action outcome", () => {
+    const bullet = BEHAVIOR_GUIDELINES.split("\n").find((l) => l.includes('kind="subagent-overrun"'));
+    expect(bullet).toBeDefined();
+    expect(bullet).toContain("is not stopped");
+    expect(bullet).toContain('subagent({action:"extend", run_id, child_id, timeout_ms})');
+    expect(bullet).toContain("agent_message to steer it");
+    expect(bullet).toContain('subagent({action:"interrupt", run_id, child_id})');
+    expect(bullet).toContain("If you do none of these it keeps running and the reminder comes again.");
+    expect(bullet!.toLowerCase()).not.toContain("keep working");
   });
 });
