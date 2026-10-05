@@ -666,7 +666,10 @@ export function createSubagentTool(
       "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
       "continue in the background. Each child that finishes while others are still running wakes you with " +
       "<pi-famulus-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pi-famulus-wake kind=\"subagent-done\">. " +
-      "Never poll or sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
+      "Never poll or sleep to wait. " +
+      "A subagent still running past its timeout_ms is not stopped; it wakes you with " +
+      "<pi-famulus-wake kind=\"subagent-overrun\"> so you can extend, steer, or interrupt it. " +
+      "Use action=list/get/status/interrupt/resume/steer/extend to manage existing runs.",
     promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
     promptGuidelines: [
       'When a <pi-famulus-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
