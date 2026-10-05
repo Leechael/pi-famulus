@@ -504,17 +504,10 @@ fn wrapped_kind(prog: &str, args: &[&str]) -> Option<WorkKind> {
 /// `pdm run X`, `npm run X`, `make X`, …: X is a script/target name or a
 /// program to run.
 fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
-    let mut args: Vec<&str> = args.to_vec();
-    // Runner's own flags before the subcommand (`npm --prefix x run`).
-    let sub = loop {
-        match args.first() {
-            Some(a) if a.starts_with('-') => {
-                args.remove(0);
-            }
-            Some(a) => break Some(*a),
-            None => break None,
-        }
-    };
+    // Runner's own options before the subcommand (`npm --prefix web run`,
+    // `make -C backend test`), values included.
+    let args = skip_runner_opts(runner, args);
+    let sub = args.first().copied();
     let Some(sub) = sub else {
         return if runner == "make" || runner == "just" { WorkKind::Build } else { WorkKind::Other };
     };
@@ -533,7 +526,8 @@ fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
     }
     // `run X` (or `make X`, `just X`, `pnpm X`): X names a script or a program.
     let (name, script_args): (&str, Vec<&str>) = if sub == "run" {
-        let a: Vec<&str> = after.iter().copied().skip_while(|a| a.starts_with('-')).collect();
+        // `uv run --directory backend pytest`: `run`'s options, values included.
+        let a = skip_runner_opts(runner, &after);
         match a.first() {
             Some(n) => (*n, a[1..].to_vec()),
             None => return WorkKind::Other,
@@ -553,6 +547,47 @@ fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
         None if runner == "make" || runner == "just" => WorkKind::Build,
         None => WorkKind::Other,
     }
+}
+
+/// Options of a script runner that take a separate value, before its
+/// subcommand or after `run`. The `--opt=value` and attached short forms are
+/// one word and need no entry.
+fn runner_value_opts(runner: &str) -> &'static [&'static str] {
+    match runner {
+        "npm" => &["--prefix", "-w", "--workspace", "--userconfig", "--cache", "--registry", "--loglevel"],
+        "pnpm" => &["-C", "--dir", "--filter", "-F", "--workspace-dir", "--reporter", "--loglevel"],
+        "yarn" => &["--cwd", "--cache-folder", "--modules-folder"],
+        "bun" => &["--cwd", "-c", "--config", "--filter"],
+        "uv" => &[
+            "--directory", "--project", "--python", "-p", "--with", "--with-requirements", "--with-editable",
+            "--package", "--env-file", "--extra", "--group", "--only-group", "--no-group", "--index", "--index-url",
+            "--cache-dir", "--config-file",
+        ],
+        "pdm" => &["-p", "--project", "-c", "--config"],
+        "poetry" => &["-C", "--directory", "-P", "--project"],
+        "pipenv" => &["--python"],
+        "hatch" => &["-e", "--env", "-p", "--project"],
+        "rye" => &["--pyproject"],
+        "make" => &["-C", "--directory", "-f", "--file", "--makefile", "-j", "--jobs", "-l", "--load-average", "-o", "-W"],
+        "just" => &["-f", "--justfile", "-d", "--working-directory"],
+        "task" => &["-d", "--dir", "-t", "--taskfile"],
+        _ => &[],
+    }
+}
+
+/// Drop a runner's leading options and the values of those that take one.
+fn skip_runner_opts<'a>(runner: &str, args: &[&'a str]) -> Vec<&'a str> {
+    let with_value = runner_value_opts(runner);
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with('-') {
+        let a = args[i];
+        // make's `-j`/`-l` take an optional number: `make -j test` has none.
+        let optional = runner == "make" && matches!(a, "-j" | "--jobs" | "-l" | "--load-average");
+        let has_value = with_value.contains(&a)
+            && (!optional || args.get(i + 1).is_some_and(|n| n.chars().all(|c| c.is_ascii_digit() || c == '.')));
+        i += if has_value { 2 } else { 1 };
+    }
+    args[i.min(args.len())..].to_vec()
 }
 
 /// A script or make target by its name (`test`, `type-check`,
@@ -708,6 +743,33 @@ mod tests {
         assert_eq!(k(function_wrapper), LintType, "a shell function wrapping known tools");
         assert_eq!(k("retry 3 cargo test"), TestSuite);
         assert_eq!(k("python tools/run.py pytest"), Other, "interpreter arguments are not commands");
+    }
+
+    /// A wrapper option's value is not the subcommand or program
+    /// (review of #35: `npm --prefix web run test` was `other`).
+    #[test]
+    fn wrapper_option_values_are_not_the_program() {
+        for cmd in [
+            "npm --prefix web run test",
+            "npm --prefix web test",
+            "npm --prefix=web test",
+            "npm -w packages/api test",
+            "pnpm -C web test",
+            "pnpm --dir web run test",
+            "pnpm --filter api test",
+            "yarn --cwd web test",
+            "uv run --directory backend pytest",
+            "uv --directory backend run pytest",
+            "uv run --project backend --with pytest-xdist pytest -n 4",
+            "poetry -C backend run pytest",
+            "make -C backend test",
+            "make -j 8 test",
+        ] {
+            assert_eq!(k(cmd), TestSuite, "{cmd}");
+        }
+        assert_eq!(k("npm --prefix web run build"), Build);
+        assert_eq!(k("pnpm --filter api lint"), LintType);
+        assert_eq!(k("uv run --directory backend ruff check ."), LintType);
     }
 
     #[test]
