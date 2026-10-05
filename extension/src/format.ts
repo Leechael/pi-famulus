@@ -4,7 +4,14 @@
  * These functions are the shared contract between implementation and tests.
  * Signatures must match Appendix A exactly.
  */
-import { formatFamulusWake, shellWakeTitle, type FormattedWake, type WakeItem } from "./wake";
+import {
+  formatFamulusWake,
+  shellWakeTitle,
+  wakeDuration,
+  type FormattedWake,
+  type OverrunShell,
+  type WakeItem,
+} from "./wake";
 
 export { FAMULUS_WAKE_LEAD_IN } from "./wake";
 export type { FormattedWake, WakeItem } from "./wake";
@@ -277,5 +284,54 @@ export function formatSubagentHandover(info: SubagentHandoverInfo): FormattedWak
     result: capTail(info.text),
     ...(info.error ? { error: info.error } : {}),
     ...(info.warning ? { warning: info.warning } : {}),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Soft deadline: a running child passed its budget (design doc §4.6 lifecycle)
+// ---------------------------------------------------------------------------
+
+export interface SubagentOverrunInfo {
+  runId: string;
+  childId: string;
+  name: string;
+  elapsedMs: number;
+  budgetMs: number;
+  reminder: number;
+  nextReminderMs: number;
+  /** Time left until the opt-in hard ceiling aborts the child. Absent when none is set. */
+  hardCeilingMs?: number;
+  lastActivity: { agoMs: number; text: string };
+  shell?: OverrunShell;
+}
+
+/** Last-activity text cap: enough to see what the child was doing. */
+const OVERRUN_ACTIVITY_CHARS = 300;
+
+/**
+ * A child is past its soft budget and still running. The parent decides:
+ * extend, steer, or interrupt; doing nothing leaves it running.
+ */
+export function formatSubagentOverrun(info: SubagentOverrunInfo): FormattedWake {
+  const shellBit = info.shell ? `; it is waiting on a shell command that has run ${wakeDuration(info.shell.elapsedMs)}` : "";
+  const summary =
+    `${info.name} has run ${wakeDuration(info.elapsedMs)} in this turn, past its ` +
+    `${wakeDuration(info.budgetMs)} budget, and is still running${shellBit}.`;
+  const oneLine = info.lastActivity.text.replace(/\s+/g, " ").trim();
+  const text =
+    oneLine.length > OVERRUN_ACTIVITY_CHARS ? `…${oneLine.slice(-OVERRUN_ACTIVITY_CHARS)}` : oneLine;
+  return formatFamulusWake({
+    kind: "subagent-overrun",
+    runId: info.runId,
+    childId: info.childId,
+    name: info.name,
+    elapsedMs: info.elapsedMs,
+    budgetMs: info.budgetMs,
+    reminder: info.reminder,
+    nextReminderMs: info.nextReminderMs,
+    ...(info.hardCeilingMs !== undefined ? { hardCeilingMs: info.hardCeilingMs } : {}),
+    summary,
+    lastActivity: { agoMs: info.lastActivity.agoMs, text: text || "(no output yet)" },
+    ...(info.shell ? { shell: { ...info.shell, command: shellWakeTitle(info.shell.command) } } : {}),
   });
 }

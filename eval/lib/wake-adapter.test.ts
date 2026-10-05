@@ -74,6 +74,28 @@ it("subagent-handover", () => {
   assert.equal(w.body, "ALPHA");
 });
 
+it("subagent-overrun: the child is still running; body is the summary", () => {
+  const [w] = both({
+    kind: "subagent-overrun",
+    runId: "run_1",
+    childId: "ch_1",
+    name: "one",
+    elapsedMs: 1_860_000,
+    budgetMs: 1_800_000,
+    reminder: 1,
+    nextReminderMs: 600_000,
+    summary: "one has run 31m in this turn, past its 30m budget, and is still running.",
+    lastActivity: { agoMs: 1000, text: "assistant: <running tests>" },
+    shell: { taskId: "sh_1", command: "npm test", elapsedMs: 1000, outputPath: "/o", outputBytes: 10, outputIdleMs: 5, growing: true },
+  });
+  assert.equal(w.kind, "subagent-overrun");
+  assert.equal(w.runId, "run_1");
+  assert.equal(w.childId, "ch_1");
+  assert.equal(w.childName, "one");
+  assert.equal(w.status, "running");
+  assert.equal(w.body, "one has run 31m in this turn, past its 30m budget, and is still running.");
+});
+
 it("subagent-done: one entry per <child>, error kept", () => {
   const [w] = both({
     kind: "subagent-done",

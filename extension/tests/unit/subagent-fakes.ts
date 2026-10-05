@@ -48,6 +48,27 @@ export class FakeChildSession implements ChildSessionAdapter {
   private readonly listeners = new Set<(e: { type: string }) => void>();
   private idleWaiters: (() => void)[] = [];
   private abortGateWaiters: (() => void)[] = [];
+  /** Signals of tools still executing; abort() aborts them (pi semantics). */
+  private readonly runningTools = new Set<AbortController>();
+
+  /**
+   * Start a tool call, as pi does: tool_execution_start, and the tool gets an
+   * AbortSignal that session.abort() fires. Child bash stops its manager
+   * shell on that signal (`task.stop reason=tool`), so `signal.aborted` is the
+   * observable for "the child's foreground shell was stopped".
+   */
+  runTool(): { signal: AbortSignal; end: () => void } {
+    const controller = new AbortController();
+    this.runningTools.add(controller);
+    this.emit({ type: "tool_execution_start" });
+    return {
+      signal: controller.signal,
+      end: () => {
+        if (!this.runningTools.delete(controller)) return;
+        this.emit({ type: "tool_execution_end" });
+      },
+    };
+  }
 
   async prompt(text: string): Promise<void> {
     this.prompts.push(text);
@@ -84,16 +105,34 @@ export class FakeChildSession implements ChildSessionAdapter {
     for (const l of [...this.listeners]) l(e);
   }
 
+  /** When closed, steer()/followUp() resolve only after openDeliveryGate(). */
+  deliveryGateOpen = true;
+  private deliveryWaiters: (() => void)[] = [];
+
+  openDeliveryGate(): void {
+    this.deliveryGateOpen = true;
+    for (const w of this.deliveryWaiters.splice(0)) w();
+  }
+
+  private async deliveryGate(): Promise<void> {
+    if (this.deliveryGateOpen) return;
+    await new Promise<void>((resolve) => this.deliveryWaiters.push(resolve));
+  }
+
   async steer(text: string): Promise<void> {
     this.steers.push(text);
+    await this.deliveryGate();
   }
 
   async followUp(text: string): Promise<void> {
     this.followUps.push(text);
+    await this.deliveryGate();
   }
 
   async abort(): Promise<void> {
     this.aborts++;
+    for (const tool of this.runningTools) tool.abort();
+    this.runningTools.clear();
     if (this.hungAbort) {
       // The hung stream never unwinds: abort() never resolves.
       await new Promise<never>(() => {});

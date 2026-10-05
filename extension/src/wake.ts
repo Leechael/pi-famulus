@@ -40,6 +40,21 @@ export interface SubagentDoneChild {
   warning?: string;
 }
 
+/** The foreground shell a child is blocked on when its overrun wake is built. */
+export interface OverrunShell {
+  taskId: string;
+  /** One line, capped (shellWakeTitle). */
+  command: string;
+  elapsedMs: number;
+  outputPath: string;
+  /** Output file size; null when the file could not be read. */
+  outputBytes: number | null;
+  /** Time since the output file last changed; null when unknown. */
+  outputIdleMs: number | null;
+  /** Output grew since the previous reminder, or changed in the last minute; null when unknown. */
+  growing: boolean | null;
+}
+
 export type FamulusWake =
   | { kind: "task"; stillRunning: WakeItem[]; tasks: TaskWake[] }
   | {
@@ -71,6 +86,25 @@ export type FamulusWake =
       durationMs: number;
       summary: string;
       children: SubagentDoneChild[];
+    }
+  | {
+      kind: "subagent-overrun";
+      runId: string;
+      childId: string;
+      name: string;
+      /** Time in this user turn (since admission of the launch or resume). */
+      elapsedMs: number;
+      /** The turn's soft budget (timeout_ms), extensions included. */
+      budgetMs: number;
+      /** 1 for the first wake of this turn, then 2, 3, … */
+      reminder: number;
+      /** When the next reminder is due if the parent does nothing. */
+      nextReminderMs: number;
+      /** Time left until the opt-in hard ceiling aborts the child; absent when none is set. */
+      hardCeilingMs?: number;
+      summary: string;
+      lastActivity: { agoMs: number; text: string };
+      shell?: OverrunShell;
     }
   | { kind: "supervisor-request"; from: string; name: string; message: string }
   | { kind: "supervisor-update"; from: string; name: string; message: string };
@@ -112,6 +146,8 @@ function renderWake(details: FamulusWake): string {
       return renderHandover(details);
     case "subagent-done":
       return renderDone(details);
+    case "subagent-overrun":
+      return renderOverrun(details);
     case "supervisor-request":
       return renderRequest(details);
     case "supervisor-update":
@@ -203,6 +239,77 @@ function renderDone(details: Extract<FamulusWake, { kind: "subagent-done" }>): s
   }
   parts.push("</pi-famulus-wake>");
   return parts.join("\n");
+}
+
+/** Coarse human duration for model-facing text: "45s", "12m", "1h05m". */
+export function wakeDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+function renderOverrun(details: Extract<FamulusWake, { kind: "subagent-overrun" }>): string {
+  const attrs = [
+    'kind="subagent-overrun"',
+    `run-id="${escapeXmlAttr(details.runId)}"`,
+    `child-id="${escapeXmlAttr(details.childId)}"`,
+    `name="${escapeXmlAttr(details.name)}"`,
+    `elapsed-ms="${Math.round(details.elapsedMs)}"`,
+    `budget-ms="${Math.round(details.budgetMs)}"`,
+    `reminder="${details.reminder}"`,
+  ];
+  if (details.hardCeilingMs !== undefined) attrs.push(`hard-ceiling-ms="${Math.round(details.hardCeilingMs)}"`);
+  const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <summary>${escapeXml(details.summary)}</summary>`];
+  parts.push(
+    `  <last-activity ago-ms="${Math.round(details.lastActivity.agoMs)}">${escapeXml(details.lastActivity.text)}</last-activity>`,
+  );
+  const shell = details.shell;
+  if (shell) {
+    const shellAttrs = [`task-id="${escapeXmlAttr(shell.taskId)}"`, `elapsed-ms="${Math.round(shell.elapsedMs)}"`];
+    if (shell.outputBytes !== null) shellAttrs.push(`output-bytes="${shell.outputBytes}"`);
+    if (shell.outputIdleMs !== null) shellAttrs.push(`output-idle-ms="${Math.round(shell.outputIdleMs)}"`);
+    if (shell.growing !== null) shellAttrs.push(`growing="${shell.growing ? "yes" : "no"}"`);
+    parts.push(`  <shell ${shellAttrs.join(" ")}>`);
+    parts.push(`    <command>${escapeXml(shell.command)}</command>`);
+    parts.push(`    <output-file>${escapeXml(shell.outputPath)}</output-file>`);
+    parts.push("  </shell>");
+  }
+  parts.push(`  <options>${escapeXml(overrunOptions(details))}</options>`);
+  parts.push("</pi-famulus-wake>");
+  return parts.join("\n");
+}
+
+/** The parent's three actions and what happens if it takes none. */
+function overrunOptions(details: Extract<FamulusWake, { kind: "subagent-overrun" }>): string {
+  const ids = `run_id: "${details.runId}", child_id: "${details.childId}"`;
+  const actions =
+    `give it more time with subagent({ action: "extend", ${ids}, timeout_ms: <ms from now> }); ` +
+    `redirect it with agent_message({ action: "send", to: "${details.childId}", message: "<instruction>" }); ` +
+    `or stop it with subagent({ action: "interrupt", ${ids} }). `;
+  const hard = details.hardCeilingMs;
+  if (hard === undefined) {
+    return (
+      "It has not been stopped. Choose one: " +
+      actions +
+      `If you do none of these, it keeps running and the next reminder is scheduled in ${wakeDuration(details.nextReminderMs)}; ` +
+      "its result arrives as usual when it finishes."
+    );
+  }
+  // Opt-in hard ceiling: never promise "keeps running" past it.
+  const ceiling = wakeDuration(hard);
+  const noAction =
+    details.nextReminderMs < hard
+      ? `If you do none of these, it keeps running and the next reminder is scheduled in ${wakeDuration(details.nextReminderMs)}, until the hard ceiling stops it in ${ceiling}.`
+      : "If you do none of these, it keeps running until the hard ceiling stops it.";
+  return (
+    `It has not been stopped yet, but the configured hard ceiling stops it in ${ceiling}, and extend does not move that ceiling. ` +
+    "Choose one: " +
+    actions +
+    noAction +
+    " Its result, or the interruption, arrives as a wake."
+  );
 }
 
 function renderRequest(details: Extract<FamulusWake, { kind: "supervisor-request" }>): string {

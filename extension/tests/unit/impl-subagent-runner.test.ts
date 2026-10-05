@@ -226,11 +226,13 @@ describe("InProcessRunner", () => {
       clock = new ManualClock();
     });
 
-    it("hard timeout aborts and resolves interrupted with error=timeout", async () => {
+    // timeoutMs is a soft deadline now (impl-subagent-soft-deadline.test.ts);
+    // the abort-and-settle contract below belongs to the opt-in hardTimeoutMs.
+    it("hard ceiling (hardTimeoutMs) aborts and resolves interrupted with error=timeout", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, clock });
-      const handle = await runner.start(makeReq({ timeoutMs: 1000 }));
+      const runner = new InProcessRunner({ createSession: factory.fn, clock, hardTimeoutMs: 1000 });
+      const handle = await runner.start(makeReq());
       expect(handle.status()).toBe("running");
       clock.advanceBy(1000);
       const result = await handle.result;
@@ -267,11 +269,17 @@ describe("InProcessRunner", () => {
       expect(handle.status()).toBe("failed");
     });
 
-    it("stalls generation 2 after a timeout that landed mid-tool", async () => {
+    it("stalls generation 2 after a hard ceiling that landed mid-tool", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 50, clock, stallRetries: 0 });
-      const handle = await runner.start(makeReq({ timeoutMs: 100 }));
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 50,
+        clock,
+        stallRetries: 0,
+        hardTimeoutMs: 100,
+      });
+      const handle = await runner.start(makeReq());
       const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
         factory.sessions[0],
       );
@@ -520,7 +528,9 @@ describe("InProcessRunner", () => {
       expect(factory.sessions[0].prompts).toHaveLength(1); // no retry prompt
     });
 
-    it("a timeout landing during the retry delay still fires (S1)", async () => {
+    // S1 now holds for the hard ceiling; the soft-deadline twin (a wake, and
+    // the retry still runs) is in impl-subagent-soft-deadline.test.ts.
+    it("a hard ceiling landing during the retry delay still fires (S1)", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
       const runner = new InProcessRunner({
@@ -528,8 +538,9 @@ describe("InProcessRunner", () => {
         stallMs: 500,
         stallRetryDelayMs: 5_000,
         clock,
+        hardTimeoutMs: 800,
       });
-      const handle = await runner.start(makeReq({ timeoutMs: 800 }));
+      const handle = await runner.start(makeReq());
       clock.advanceBy(500); // stall at t=500; retry would start t=5500
       clock.advanceBy(300); // t=800: the turn budget is spent mid-delay
       const result = await handle.result;
@@ -540,7 +551,7 @@ describe("InProcessRunner", () => {
       expect(factory.sessions[0].prompts).toHaveLength(1); // retry suppressed
     });
 
-    it("a stall retry arms only the remaining timeout budget (S1)", async () => {
+    it("a stall retry arms only the remaining hard ceiling (S1)", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
       const runner = new InProcessRunner({
@@ -548,8 +559,9 @@ describe("InProcessRunner", () => {
         stallMs: 500,
         stallRetryDelayMs: 100,
         clock,
+        hardTimeoutMs: 2000,
       });
-      const handle = await runner.start(makeReq({ timeoutMs: 2000 }));
+      const handle = await runner.start(makeReq());
       clock.advanceBy(500); // stall at t=500
       clock.advanceBy(100); // retry generation at t=600; budget left: 1400
       await tick();
@@ -657,7 +669,7 @@ describe("InProcessRunner", () => {
       expect(result.stalls).toBe(1);
     });
 
-    it("queue wait does not consume the timeout budget (R1)", async () => {
+    it("queue wait does not consume the hard ceiling (R1)", async () => {
       // runStartedAt is set before admission; the timeout budget must not
       // start until the admission slot and the session exist. Regression:
       // a child queued longer than timeoutMs was settled timeout before its
@@ -668,12 +680,13 @@ describe("InProcessRunner", () => {
       const runner = new InProcessRunner({
         createSession: factory.fn,
         clock,
+        hardTimeoutMs: 1000,
         acquire: () =>
           new Promise<() => void>((resolve) => {
             releaseAdmission = () => resolve(() => {});
           }),
       });
-      const startPromise = runner.start(makeReq({ timeoutMs: 1000 }));
+      const startPromise = runner.start(makeReq());
       await tick(); // reach the admission wait
       clock.advanceBy(1001); // queued past the full budget
       releaseAdmission!();

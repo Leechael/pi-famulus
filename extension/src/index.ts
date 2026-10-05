@@ -11,6 +11,7 @@ import { ExitNotifyGate } from "./exit-notify-gate";
 import { ExitWatchdog } from "./exit-watchdog";
 import { createExtensionEventLog } from "./events";
 import { readFileTail } from "./file-tail";
+import { statSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +29,7 @@ import { ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-cli
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { NotifyCenter } from "./notify";
 import { createChildBashTool } from "./subagent/child-bash";
+import { ChildShellTracker, createOverrunNotifier } from "./subagent/overrun";
 import {
   agentEndReason,
   headOf,
@@ -504,6 +506,8 @@ export default function (pi: ExtensionAPI): void {
         "warning",
       );
     }
+    // The foreground shell each child is blocked on, for its overrun wake.
+    const childShells = new ChildShellTracker();
     const createSession = createPiSessionFn({
       getModelRegistry: () => ctx?.modelRegistry ?? null,
       getModelRuntime: () => {
@@ -533,6 +537,7 @@ export default function (pi: ExtensionAPI): void {
               childId: req.childId,
               runId: req.runId,
               clock,
+              shells: childShells,
             }),
           );
         }
@@ -551,6 +556,8 @@ export default function (pi: ExtensionAPI): void {
       stallMs: subagentConfig.stallMs,
       stallRetries: subagentConfig.stallRetries,
       stallRetryDelayMs: subagentConfig.stallRetryDelayMs,
+      overrunRepeatMs: subagentConfig.overrunRepeatMs,
+      hardTimeoutMs: subagentConfig.hardTimeoutMs,
       acquire: (req) => registry.admitChild(req.childId),
       onActivity: (childId) => {
         syncTranscript(childId);
@@ -560,6 +567,22 @@ export default function (pi: ExtensionAPI): void {
         // retry budget (stallRetries) is already spent.
         logEvent("agent.stall", { child_id: childId, attempt });
       },
+      // Soft deadline: the child keeps running; the parent decides.
+      onOverrun: createOverrunNotifier({
+        now: () => clock.now(),
+        registry,
+        shells: childShells,
+        stat: (path) => {
+          try {
+            const st = statSync(path);
+            return { size: st.size, mtimeMs: st.mtimeMs };
+          } catch {
+            return null;
+          }
+        },
+        notify: (wake) => notifyCenter?.notify(wake),
+        logEvent,
+      }),
     });
     registry.setRunner(runner);
     subagentRegistry = registry;
@@ -581,6 +604,7 @@ export default function (pi: ExtensionAPI): void {
         }
         if (["completed", "failed", "interrupted"].includes(c.status) && previousStatus !== c.status) {
           const error = c.result?.error;
+          // Only the opt-in hard ceiling settles with error=timeout now.
           if (error === "timeout") logEvent("agent.timeout", { child_id: c.childId });
           logEvent("agent.settle", {
             child_id: c.childId,

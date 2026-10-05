@@ -60,6 +60,7 @@ export interface ChildRunRequest {
   taskPrompt?: string;
   agent: AgentDefinition; // already resolved
   model?: string; // subagent() parameter-level override
+  /** Soft budget per turn: reaching it wakes the parent; it does not abort. */
   timeoutMs: number;
   depth: number; // main session = 0, child = 1
 }
@@ -72,7 +73,13 @@ export interface ChildHandle {
   // current generation's promise).
   steer(message: string): Promise<void>; // while running; terminal -> throw
   followUp(message: string): Promise<void>; // same, queued delivery
-  resume(message: string): Promise<void>; // terminal -> continue running
+  /** terminal -> continue running; opts.timeoutMs is the new turn's soft budget (default: spawn budget). */
+  resume(message: string, opts?: { timeoutMs?: number }): Promise<void>;
+  /**
+   * running -> soft deadline = now + timeoutMs (default: spawn budget);
+   * otherwise throws. Returns the new deadline and the unmoved hard ceiling.
+   */
+  extend(timeoutMs?: number): { deadlineAt: number; hardDeadlineAt: number | null };
   interrupt(): Promise<void>; // abort; result resolves as interrupted
   status(): ChildStatus;
   lastEventAt(): number; // for the stall watchdog / status display

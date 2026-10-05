@@ -25,6 +25,7 @@ import type {
 import { taskOutputPath } from "../config";
 import { realClock, type Clock } from "../clock";
 import type { ManagerClient } from "../manager-client";
+import type { ChildShellTracker } from "./overrun";
 import {
   appendStatus,
   bareSleepError,
@@ -66,6 +67,8 @@ export interface ChildBashDeps {
   childId?: string;
   runId?: string;
   clock?: Clock;
+  /** Records the shell this child is blocked on, for its overrun wake. */
+  shells?: Pick<ChildShellTracker, "start" | "end">;
 }
 
 const CHILD_SLEEP_GUIDANCE =
@@ -132,52 +135,66 @@ export function createChildBashTool(
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);
 
       const clock = deps.clock ?? realClock;
-      const deadline = timeoutMs !== null ? clock.now() + timeoutMs : null;
-      let waitResult: { done: boolean; exit_code?: number | null } | null = null;
-      for (;;) {
-        const budget =
-          deadline === null
-            ? WAIT_SLICE_MS
-            : Math.min(WAIT_SLICE_MS, Math.max(1, deadline - clock.now()));
-        try {
-          waitResult = await withAbort(client.wait(start.task_id, budget), signal, () => {
-            client.stop(start.task_id, "tool").catch(() => {});
-          });
-        } catch (err) {
-          if ((err as Error).message === "aborted") {
-            throw new Error("Command aborted (task stopped)");
+      const childId = deps.childId;
+      if (childId) {
+        deps.shells?.start(childId, {
+          taskId: start.task_id,
+          command: input.command,
+          startedAt: clock.now(),
+          outputPath,
+        });
+      }
+      try {
+        const deadline = timeoutMs !== null ? clock.now() + timeoutMs : null;
+        let waitResult: { done: boolean; exit_code?: number | null } | null = null;
+        for (;;) {
+          const budget =
+            deadline === null
+              ? WAIT_SLICE_MS
+              : Math.min(WAIT_SLICE_MS, Math.max(1, deadline - clock.now()));
+          try {
+            waitResult = await withAbort(client.wait(start.task_id, budget), signal, () => {
+              client.stop(start.task_id, "tool").catch(() => {});
+            });
+          } catch (err) {
+            if ((err as Error).message === "aborted") {
+              throw new Error("Command aborted (task stopped)");
+            }
+            throw new Error(
+              `Lost contact with pi-famulus while waiting for task ${start.task_id}: ` +
+                `${(err as Error).message}. Output so far: ${outputPath}.`,
+            );
           }
-          throw new Error(
-            `Lost contact with pi-famulus while waiting for task ${start.task_id}: ` +
-              `${(err as Error).message}. Output so far: ${outputPath}.`,
-          );
+          if (waitResult.done) break;
+          if (deadline !== null && clock.now() >= deadline) {
+            await client.stop(start.task_id, "timeout").catch(() => {});
+            const collected = await collectOutput(client, start.task_id).catch(() => null);
+            const text = collected ? formatFinishedOutput(collected, outputPath).text : "";
+            throw new Error(
+              appendStatus(text, timedOutStatus(input.timeout!)),
+            );
+          }
         }
-        if (waitResult.done) break;
-        if (deadline !== null && clock.now() >= deadline) {
-          await client.stop(start.task_id, "timeout").catch(() => {});
-          const collected = await collectOutput(client, start.task_id).catch(() => null);
-          const text = collected ? formatFinishedOutput(collected, outputPath).text : "";
-          throw new Error(
-            appendStatus(text, timedOutStatus(input.timeout!)),
-          );
-        }
-      }
 
-      const collected = await collectOutput(client, start.task_id);
-      const { text, details } = formatFinishedOutput(collected, outputPath);
-      const exitCode = waitResult.exit_code ?? null;
-      if (exitCode !== 0 && exitCode !== null) {
-        throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
+        const collected = await collectOutput(client, start.task_id);
+        const { text, details } = formatFinishedOutput(collected, outputPath);
+        const exitCode = waitResult.exit_code ?? null;
+        if (exitCode !== 0 && exitCode !== null) {
+          throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
+        }
+        // No exit code: killed (timeout, stop, crash), unless the manager
+        // finished it as completed with its runner status unobservable.
+        if (exitCode === null && collected.status !== "completed") {
+          throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
+        }
+        const finalDetails = details
+          ? { ...details, task_id: start.task_id }
+          : ({ task_id: start.task_id } as FamulusChildBashDetails);
+        return { content: [{ type: "text", text }], details: finalDetails };
+      } finally {
+        // The overrun wake must not name a shell that already returned.
+        if (childId) deps.shells?.end(childId, start.task_id);
       }
-      // No exit code: killed (timeout, stop, crash), unless the manager
-      // finished it as completed with its runner status unobservable.
-      if (exitCode === null && collected.status !== "completed") {
-        throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
-      }
-      const finalDetails = details
-        ? { ...details, task_id: start.task_id }
-        : ({ task_id: start.task_id } as FamulusChildBashDetails);
-      return { content: [{ type: "text", text }], details: finalDetails };
     },
   };
 }

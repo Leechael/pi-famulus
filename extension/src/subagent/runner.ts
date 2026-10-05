@@ -9,7 +9,13 @@
  * starts a new generation on the same session):
  * - a per-generation admission slot is acquired via the optional `acquire`
  *   hook (the registry uses it for the global concurrency cap);
- * - `timeoutMs` is a hard timeout: abort -> result {status:"interrupted", error:"timeout"};
+ * - `timeoutMs` is a SOFT deadline per user turn: reaching it calls
+ *   `onOverrun` (the parent gets a subagent-overrun wake) and repeats every
+ *   `overrunRepeatMs`; the child is not aborted and its shell keeps running.
+ *   `extend()` re-arms the deadline; steer/followUp after a reminder postpone
+ *   the next one. See design.md §4.6 "Child lifecycle".
+ * - `hardTimeoutMs` (opt-in, default off) is the abort ceiling per turn:
+ *   abort -> result {status:"interrupted", error:"timeout"};
  * - a stall watchdog aborts the child after `stallMs` (default 10min) without
  *   any session event. A stall is treated as transient (a silently dropped
  *   provider stream): the child is aborted and auto-resumed on the SAME
@@ -21,9 +27,10 @@
  *   rejects prompt() while a run is still active ("Agent is already
  *   processing"). The wait is bounded by `stallMs` — an abort that never
  *   completes means the stream ignored it and the session is dead.
- * - `timeoutMs` is a budget for the whole user turn: stall retries arm only
- *   the remaining time, and a timeout landing during a retry delay still
- *   fires (it is not masked by the retired generation).
+ * - deadlines belong to the whole user turn: stall retries re-arm the soft
+ *   deadline / reminder schedule and the hard ceiling from turn-level fields,
+ *   never from the retry. A reminder landing during a retry delay is sent and
+ *   the retry still runs; a hard ceiling landing there still settles.
  * - session/prompt exceptions -> {status:"failed", error}.
  *
  * Note on pi semantics: AgentSession.prompt() resolves only after the whole
@@ -32,6 +39,7 @@
  * steer/followUp processing.
  */
 import { realClock, TimerScope, type Clock, type ClockTimer } from "../clock";
+import type { OverrunTick } from "./overrun";
 import type {
   ChildResult,
   ChildRunRequest,
@@ -48,6 +56,8 @@ export const DEFAULT_STALL_MS = 5 * 60 * 1000;
 export const DEFAULT_STALL_RETRIES = 1;
 /** Pause between the stall abort and the retry prompt (ms). */
 export const DEFAULT_STALL_RETRY_DELAY_MS = 5_000;
+/** Overrun reminder interval while a child stays past its soft budget (ms). */
+export const DEFAULT_OVERRUN_REPEAT_MS = 10 * 60 * 1000;
 
 /** Continuation prompt for a stall retry: the transcript holds the context. */
 export function stallRetryPrompt(stallMs: number): string {
@@ -67,6 +77,15 @@ export interface InProcessRunnerOptions {
   stallRetryDelayMs?: number;
   /** Called on every stall detection (before any retry), with the 1-based attempt. */
   onStall?: (childId: string, attempt: number) => void;
+  /** Overrun reminder interval (ms). Default 10 minutes. */
+  overrunRepeatMs?: number;
+  /** Abort ceiling per user turn (ms). 0/absent = off: the soft deadline never aborts. */
+  hardTimeoutMs?: number;
+  /**
+   * The child passed its soft deadline (first reminder) or is still past it
+   * (later reminders). The child keeps running; the parent decides.
+   */
+  onOverrun?: (tick: OverrunTick) => void;
   /** Shared time source and scheduler. */
   clock?: Clock;
   /**
@@ -107,6 +126,9 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly stallRetries: number;
   private readonly stallRetryDelayMs: number;
   private readonly onStall?: (childId: string, attempt: number) => void;
+  private readonly overrunRepeatMs: number;
+  private readonly hardTimeoutMs: number;
+  private readonly onOverrun?: (tick: OverrunTick) => void;
   private readonly clock: Clock;
   private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
   private readonly onActivity?: (childId: string) => void;
@@ -121,11 +143,19 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** User-turn start: reset on launch and user resume(), not on stall retries. */
   private runStartedAt: number;
   /**
-   * When the timeout budget starts counting. Set after admission and session
+   * When the turn's deadlines start counting. Set after admission and session
    * creation (queue wait must not eat the budget), and NOT reset by stall
    * retries — a stall already consumes budget time by definition.
    */
   private turnBudgetStart: number;
+  /** This turn's soft budget: spawn timeoutMs, or resume()'s timeoutMs. */
+  private turnBudgetMs: number;
+  /** Soft deadline (absolute). Moved by extend(). Null = no soft deadline. */
+  private softDeadlineAt: number | null = null;
+  /** When the soft timer fires next: softDeadlineAt, then each reminder. */
+  private nextReminderAt: number | null = null;
+  /** Overrun reminders sent this turn. */
+  private reminders = 0;
   /** Abort kicked off by the latest stall detection; awaited (bounded) by the retry. */
   private abortPromise: Promise<void> | null = null;
   private generation = 0;
@@ -140,7 +170,8 @@ class InProcessChildHandle implements DisposableChildHandle {
    * the previous turn's settle by definition).
    */
   private settleWaiters: Array<() => void> = [];
-  private timeoutTimer: ClockTimer | null = null;
+  private softTimer: ClockTimer | null = null;
+  private hardTimer: ClockTimer | null = null;
   private stallTimer: ClockTimer | null = null;
   private retryTimer: { scope: TimerScope; id: ClockTimer } | null = null;
   private timerScope: TimerScope | null = null;
@@ -168,6 +199,15 @@ class InProcessChildHandle implements DisposableChildHandle {
       ? Math.max(0, Math.floor(rawDelay))
       : DEFAULT_STALL_RETRY_DELAY_MS;
     this.onStall = opts.onStall;
+    const rawRepeat = opts.overrunRepeatMs ?? DEFAULT_OVERRUN_REPEAT_MS;
+    this.overrunRepeatMs =
+      Number.isFinite(rawRepeat) && rawRepeat > 0
+        ? Math.max(1, Math.floor(rawRepeat))
+        : DEFAULT_OVERRUN_REPEAT_MS;
+    const rawHard = opts.hardTimeoutMs ?? 0;
+    this.hardTimeoutMs = Number.isFinite(rawHard) && rawHard > 0 ? Math.floor(rawHard) : 0;
+    this.onOverrun = opts.onOverrun;
+    this.turnBudgetMs = req.timeoutMs;
     this.clock = opts.clock ?? realClock;
     this.acquire = opts.acquire;
     this.onActivity = opts.onActivity;
@@ -201,7 +241,10 @@ class InProcessChildHandle implements DisposableChildHandle {
     return this.resolvedModel_ ?? this.session?.resolvedModel;
   }
 
-  /** Pause the stall watchdog (need_decision). Nested with tool execution. */
+  /**
+   * need_decision pending: pause the stall watchdog (nested with tool
+   * execution) and hold overrun reminders. The soft budget keeps counting.
+   */
   pauseStall(): void {
     this.decisionPaused = true;
     this.clearStall();
@@ -211,6 +254,9 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.decisionPaused = false;
     this.lastEvent = this.clock.now();
     if (this.status_ === "running" && this.toolDepth === 0) this.armStall(this.generation);
+    // Deliver a reminder held during the decision (due now, so it fires at
+    // once); otherwise this re-arms the unchanged schedule.
+    if (this.status_ === "running" && !this.settledFlag) this.armSoftDeadline(this.generation);
   }
 
   conversation() {
@@ -230,7 +276,9 @@ class InProcessChildHandle implements DisposableChildHandle {
       // The previous generation was aborted; delivery would be undefined.
       throw new Error(`subagent ${this.req.childId} is restarting after a stall; retry shortly`);
     }
+    const gen = this.generation;
     await this.session.steer(message);
+    this.parentActed(gen);
   }
 
   async followUp(message: string): Promise<void> {
@@ -240,10 +288,50 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (this.retiredGen !== null) {
       throw new Error(`subagent ${this.req.childId} is restarting after a stall; retry shortly`);
     }
+    const gen = this.generation;
     await this.session.followUp(message);
+    this.parentActed(gen);
   }
 
-  async resume(message: string): Promise<void> {
+  /**
+   * Parent action on an overrun: move the soft deadline to now + timeoutMs
+   * (default: the spawn budget). The reminder count continues; the hard
+   * ceiling (if any) does not move.
+   */
+  extend(timeoutMs?: number): { deadlineAt: number; hardDeadlineAt: number | null } {
+    if (this.status_ !== "running") {
+      throw new Error(`subagent ${this.req.childId} is not running (status: ${this.status_})`);
+    }
+    const ms = timeoutMs ?? this.req.timeoutMs;
+    if (!(ms > 0)) throw new Error("extend needs a positive timeout_ms");
+    this.softDeadlineAt = this.now() + ms;
+    this.nextReminderAt = this.softDeadlineAt;
+    this.armSoftDeadline(this.generation);
+    return {
+      deadlineAt: this.softDeadlineAt,
+      hardDeadlineAt: this.hardTimeoutMs > 0 ? this.turnBudgetStart + this.hardTimeoutMs : null,
+    };
+  }
+
+  /**
+   * steer/followUp after a reminder: the parent is handling the overrun, so
+   * the next reminder waits a full interval. Before the first reminder the
+   * deadline is untouched, and so is a deadline that extend() moved into the
+   * future: the child is inside its budget again, and the next wake belongs
+   * at that deadline, not one repeat from now.
+   */
+  private parentActed(gen: number): void {
+    // The delivery was awaited: if its turn settled (and maybe a resume
+    // started a new one) meanwhile, it must not move the new schedule.
+    if (gen !== this.generation || this.settledFlag) return;
+    if (this.reminders === 0 || this.status_ !== "running") return;
+    const now = this.now();
+    if (this.softDeadlineAt !== null && now < this.softDeadlineAt) return;
+    this.nextReminderAt = now + this.overrunRepeatMs;
+    this.armSoftDeadline(this.generation);
+  }
+
+  async resume(message: string, opts: { timeoutMs?: number } = {}): Promise<void> {
     if (this.status_ === "running" || this.status_ === "pending") {
       throw new Error(
         `subagent ${this.req.childId} is still ${this.status_}; use steer for a running subagent`,
@@ -268,8 +356,12 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (this.disposed) {
       throw new Error(`subagent ${this.req.childId} has been disposed`);
     }
-    // A new user turn gets a fresh stall budget and a fresh timeout budget.
+    // A new user turn gets a fresh stall budget and a fresh soft budget:
+    // the one passed with resume, else the spawn budget.
     this.stallAttempts = 0;
+    this.turnBudgetMs =
+      opts.timeoutMs !== undefined && opts.timeoutMs > 0 ? opts.timeoutMs : this.req.timeoutMs;
+    this.reminders = 0;
     this.runStartedAt = this.clock.now();
     // Swap in the new generation's result promise synchronously so that
     // registry.getResult() observes it before/while admission runs.
@@ -414,13 +506,19 @@ class InProcessChildHandle implements DisposableChildHandle {
       return;
     }
 
-    // The timeout budget starts only after admission and session creation:
+    // The turn's deadlines start only after admission and session creation:
     // time spent queued for an admission slot is not the child's budget.
-    if (!reuseSlot) this.turnBudgetStart = this.now();
-    this.armTimeout(gen);
-    // A stall can spend the whole timeout budget before this generation
-    // starts; armTimeout settles in that case and prompting must not proceed.
+    // Stall retries (reuseSlot) keep the turn's deadlines and schedule.
+    if (!reuseSlot) {
+      this.turnBudgetStart = this.now();
+      this.softDeadlineAt = this.turnBudgetMs > 0 ? this.turnBudgetStart + this.turnBudgetMs : null;
+      this.nextReminderAt = this.softDeadlineAt;
+    }
+    this.armHardCeiling(gen);
+    // A stall can spend the whole hard budget before this generation starts;
+    // armHardCeiling settles in that case and prompting must not proceed.
     if (this.isSettled(gen)) return;
+    this.armSoftDeadline(gen);
     this.armStall(gen);
     // Tell the child which model it is — otherwise only the parent/fleet knows.
     const prompted =
@@ -541,16 +639,63 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
   }
 
-  private armTimeout(gen: number): void {
-    if (this.timeoutTimer !== null) {
-      this.timerScope?.clearTimeout(this.timeoutTimer);
-      this.timeoutTimer = null;
+  /**
+   * Soft deadline / reminder timer for the current generation scope, due at
+   * nextReminderAt (turn-level, so a stall retry re-arms the same schedule).
+   */
+  private armSoftDeadline(gen: number): void {
+    if (this.softTimer !== null) {
+      this.timerScope?.clearTimeout(this.softTimer);
+      this.softTimer = null;
     }
-    if (!(this.req.timeoutMs > 0)) return;
-    // The timeout is a budget for the whole user turn: a stall retry arms
-    // only what the stalled generation did not already consume. The budget
-    // clock starts after admission (turnBudgetStart), not at launch.
-    const remaining = this.req.timeoutMs - (this.now() - this.turnBudgetStart);
+    if (this.nextReminderAt === null) return;
+    const delay = Math.max(0, this.nextReminderAt - this.now());
+    this.softTimer = this.timerScope?.setTimeout(() => {
+      this.softTimer = null;
+      // Deliberately NOT isCurrent(): during a stall's retry delay the child
+      // is still running from the parent's view, so the reminder is due.
+      if (this.settledFlag || this.disposed || gen !== this.generation) return;
+      // A pending need_decision already put a supervisor-request wake in
+      // front of the parent: hold the reminder (nextReminderAt stays due)
+      // until resumeStall() re-arms it when the decision resolves.
+      if (this.decisionPaused) return;
+      this.fireOverrun(gen);
+    }, delay) ?? null;
+  }
+
+  private fireOverrun(gen: number): void {
+    const now = this.now();
+    this.reminders++;
+    this.nextReminderAt = now + this.overrunRepeatMs;
+    try {
+      this.onOverrun?.({
+        childId: this.req.childId,
+        elapsedMs: now - this.turnBudgetStart,
+        budgetMs: (this.softDeadlineAt ?? now) - this.turnBudgetStart,
+        reminder: this.reminders,
+        nextReminderMs: this.overrunRepeatMs,
+        lastEventAt: this.lastEvent,
+        hardRemainingMs:
+          this.hardTimeoutMs > 0 ? Math.max(0, this.turnBudgetStart + this.hardTimeoutMs - now) : null,
+      });
+    } catch {
+      // overrun observers must not break the schedule
+    }
+    this.armSoftDeadline(gen);
+  }
+
+  /**
+   * Opt-in abort ceiling (hardTimeoutMs). The ceiling is per user turn: a
+   * stall retry arms only what the stalled generation did not already
+   * consume, and the budget clock starts after admission (turnBudgetStart).
+   */
+  private armHardCeiling(gen: number): void {
+    if (this.hardTimer !== null) {
+      this.timerScope?.clearTimeout(this.hardTimer);
+      this.hardTimer = null;
+    }
+    if (!(this.hardTimeoutMs > 0)) return;
+    const remaining = this.hardTimeoutMs - (this.now() - this.turnBudgetStart);
     if (remaining <= 0) {
       this.settle(gen, {
         status: "interrupted",
@@ -560,9 +705,9 @@ class InProcessChildHandle implements DisposableChildHandle {
       });
       return;
     }
-    this.timeoutTimer = this.timerScope?.setTimeout(() => {
-      this.timeoutTimer = null;
-      // Deliberately NOT isCurrent(): a timeout landing during a stall's
+    this.hardTimer = this.timerScope?.setTimeout(() => {
+      this.hardTimer = null;
+      // Deliberately NOT isCurrent(): a ceiling landing during a stall's
       // retry delay must still fire — the retry has not started a new
       // generation, and the budget is spent.
       if (this.settledFlag || this.disposed || gen !== this.generation) return;
@@ -697,9 +842,13 @@ class InProcessChildHandle implements DisposableChildHandle {
   }
 
   private clearTimers(): void {
-    if (this.timeoutTimer !== null) {
-      this.timerScope?.clearTimeout(this.timeoutTimer);
-      this.timeoutTimer = null;
+    if (this.softTimer !== null) {
+      this.timerScope?.clearTimeout(this.softTimer);
+      this.softTimer = null;
+    }
+    if (this.hardTimer !== null) {
+      this.timerScope?.clearTimeout(this.hardTimer);
+      this.hardTimer = null;
     }
     this.clearStall();
     this.clearRetryTimer();

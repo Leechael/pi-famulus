@@ -82,7 +82,10 @@ const subagentParameters = Type.Object({
   ),
   timeout_ms: Type.Optional(
     Type.Number({
-      description: `Hard timeout per subagent in ms (default 1800000, max ${MAX_TIMEOUT_MS})`,
+      description:
+        `Time budget per subagent turn in ms (default 1800000, max ${MAX_TIMEOUT_MS}). ` +
+        'Passing it does not stop the subagent: you get <pi-famulus-wake kind="subagent-overrun"> ' +
+        "and choose extend, steer, or interrupt. With resume: the resumed turn's budget. With extend: the new budget from now.",
       maximum: MAX_TIMEOUT_MS,
     }),
   ),
@@ -95,13 +98,16 @@ const subagentParameters = Type.Object({
         Type.Literal("interrupt"),
         Type.Literal("resume"),
         Type.Literal("steer"),
+        Type.Literal("extend"),
         Type.Literal("models"),
       ],
       { description: "Manage an existing run (or list selectable models) instead of starting a new one" },
     ),
   ),
   run_id: Type.Optional(Type.String({ description: "Target run for action" })),
-  child_id: Type.Optional(Type.String({ description: "Target child (id or name) for steer/interrupt/resume" })),
+  child_id: Type.Optional(
+    Type.String({ description: "Target child (id or name) for steer/interrupt/resume/extend" }),
+  ),
   message: Type.Optional(Type.String({ description: "Message content for steer/resume" })),
 });
 
@@ -113,7 +119,7 @@ type SubagentParams = {
   fail_fast?: boolean;
   model?: string;
   timeout_ms?: number;
-  action?: "list" | "get" | "status" | "interrupt" | "resume" | "steer" | "models";
+  action?: "list" | "get" | "status" | "interrupt" | "resume" | "steer" | "extend" | "models";
   run_id?: string;
   child_id?: string;
   message?: string;
@@ -595,12 +601,41 @@ export function createSubagentTool(
       };
     }
 
+    if (action === "extend") {
+      const handle = resolveSingleActiveChild(registry, record, params.child_id, "extend");
+      const child = record.children.find((c) => c.childId === handle.childId);
+      const ms = params.timeout_ms === undefined ? undefined : clampTimeout(params.timeout_ms, deps.defaultTimeoutMs);
+      const { deadlineAt, hardDeadlineAt } = handle.extend(ms);
+      const now = clock.now();
+      const hard =
+        hardDeadlineAt === null
+          ? ""
+          : ` The configured hard ceiling (hardTimeoutMs) is not moved: it stops this subagent in ${formatDurationMs(Math.max(0, hardDeadlineAt - now))}.`;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Extended subagent ${child?.name ?? handle.childId} (${handle.childId}) in run ${record.runId}: ` +
+              `the next <pi-famulus-wake kind="subagent-overrun"> comes in ${formatDurationMs(deadlineAt - now)} if it is still running. ` +
+              `Its result arrives as a wake when it finishes; do not poll.${hard}`,
+          },
+        ],
+        details: { run_id: record.runId, child_id: handle.childId, deadline_at: deadlineAt, hard_deadline_at: hardDeadlineAt },
+      };
+    }
+
     // resume
     if (!params.message) throw new Error("message is required for resume");
     const child = resolveSingleTerminalChild(record, params.child_id);
     const handle = registry.handle(child.childId);
     if (!handle) throw new Error(`subagent ${child.childId} has no live session to resume`);
-    await handle.resume(params.message);
+    // A resume is a new turn with its own soft budget: timeout_ms when given,
+    // else the child's spawn budget (the runner's default).
+    await handle.resume(
+      params.message,
+      params.timeout_ms === undefined ? {} : { timeoutMs: clampTimeout(params.timeout_ms, deps.defaultTimeoutMs) },
+    );
     // Resume is asynchronous. If siblings are still running, hand this child
     // back as soon as it finishes; otherwise the run-complete wake covers it.
     const handedOver = new Set<string>();
@@ -631,7 +666,10 @@ export function createSubagentTool(
       "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
       "continue in the background. Each child that finishes while others are still running wakes you with " +
       "<pi-famulus-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pi-famulus-wake kind=\"subagent-done\">. " +
-      "Never poll or sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
+      "Never poll or sleep to wait. " +
+      "A subagent still running past its timeout_ms is not stopped; it wakes you with " +
+      "<pi-famulus-wake kind=\"subagent-overrun\"> so you can extend, steer, or interrupt it. " +
+      "Use action=list/get/status/interrupt/resume/steer/extend to manage existing runs.",
     promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
     promptGuidelines: [
       'When a <pi-famulus-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',

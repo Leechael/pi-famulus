@@ -25,8 +25,15 @@ export interface FamulusConfig {
 export interface FamulusSubagentConfig {
   /** Sync-wait budget before a run is moved to background (ms). Overrides top-level subagentBudgetMs. */
   budgetMs?: number;
-  /** Default per-child hard timeout (ms). */
+  /**
+   * Default per-child soft budget per turn (ms). Reaching it wakes the parent
+   * (subagent-overrun); the child keeps running.
+   */
   timeoutMs?: number;
+  /** Repeat interval of the overrun wake while a child stays past its budget (ms). Default 10 min. */
+  overrunRepeatMs?: number;
+  /** Opt-in ceiling per turn that aborts the child (ms). 0 or absent = off (default). */
+  hardTimeoutMs?: number;
   /** Stall watchdog: abort a child with no events for this long (ms). Paused during tools and need_decision. */
   stallMs?: number;
   /** Auto-resume attempts after a stall before the run settles failed (stalled). Default 1. */
@@ -47,6 +54,9 @@ export interface FamulusSubagentConfig {
 export interface ResolvedSubagentConfig {
   budgetMs: number;
   timeoutMs: number;
+  overrunRepeatMs: number;
+  /** 0 = no hard ceiling. */
+  hardTimeoutMs: number;
   stallMs: number;
   stallRetries: number;
   stallRetryDelayMs: number;
@@ -69,6 +79,8 @@ function capTimerDelay(value: number): number {
 export const DEFAULT_SUBAGENT_CONFIG: ResolvedSubagentConfig = {
   budgetMs: 45000,
   timeoutMs: 1_800_000,
+  overrunRepeatMs: 600_000,
+  hardTimeoutMs: 0,
   stallMs: 300_000,
   stallRetries: 1,
   stallRetryDelayMs: 5_000,
@@ -85,6 +97,12 @@ export function resolveSubagentConfig(config: FamulusConfig): ResolvedSubagentCo
   resolved.budgetMs = config.subagentBudgetMs > 0 ? config.subagentBudgetMs : resolved.budgetMs;
   if (typeof section.budgetMs === "number" && section.budgetMs > 0) resolved.budgetMs = section.budgetMs;
   if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) resolved.timeoutMs = section.timeoutMs;
+  if (typeof section.overrunRepeatMs === "number" && section.overrunRepeatMs > 0) {
+    resolved.overrunRepeatMs = capTimerDelay(section.overrunRepeatMs);
+  }
+  if (typeof section.hardTimeoutMs === "number" && section.hardTimeoutMs >= 0) {
+    resolved.hardTimeoutMs = capTimerDelay(section.hardTimeoutMs);
+  }
   if (typeof section.stallMs === "number" && section.stallMs > 0) {
     resolved.stallMs = capTimerDelay(section.stallMs);
   }
@@ -175,6 +193,12 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
     const subagent: FamulusSubagentConfig = {};
     if (typeof section.budgetMs === "number" && section.budgetMs > 0) subagent.budgetMs = section.budgetMs;
     if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) subagent.timeoutMs = section.timeoutMs;
+    if (typeof section.overrunRepeatMs === "number" && section.overrunRepeatMs > 0) {
+      subagent.overrunRepeatMs = capTimerDelay(section.overrunRepeatMs);
+    }
+    if (typeof section.hardTimeoutMs === "number" && section.hardTimeoutMs >= 0) {
+      subagent.hardTimeoutMs = capTimerDelay(section.hardTimeoutMs);
+    }
     if (typeof section.stallMs === "number" && section.stallMs > 0) {
       subagent.stallMs = capTimerDelay(section.stallMs);
     }

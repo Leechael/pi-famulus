@@ -43,6 +43,11 @@ export class ManualClock implements Clock {
     return this.currentTime;
   }
 
+  /** Timers still scheduled: lets tests assert that settle left nothing armed. */
+  get pendingTimers(): number {
+    return this.timers.size;
+  }
+
   setTimeout(callback: () => void, delayMs: number): ClockTimer {
     return this.schedule(callback, delayMs, null);
   }
