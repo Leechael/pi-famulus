@@ -273,6 +273,7 @@ fixtures in the contract's format, because the extension side may land later.
 | `manager-shutdown`, `manager-crash` | `p2` |
 | hello `extension_version`/`protocol` stored per session; `status.protocol`; `connected_at` kept across reconnects; `last_seen` | `p3` |
 | manager writes `session.connect/disconnect`, `task.start` (command ≤ 200 chars, origin, pid), `task.background`, `task.stop`, `task.exit`, `daemon.start/shutdown` | `e1` |
+| CPU accounting: `cpu_user_ms`/`cpu_sys_ms`/`max_rss_kb` on the live and persisted record and on `task.exit`, covering CPU spent only by a grandchild; kept through a cooperative stop; absent (not zero) after the hard timeout | `p4` (red when the record takes the wrong runner value), unit `runner::*`, `task::runner_*` (red with `RUSAGE_SELF`) |
 | a task event line is on disk before anyone can see the state it records, in causal order (`task.start` < `task.exit`) | `e5` |
 | every line < 4 KiB, oversized fields truncated (`truncated:true`), ids never cut | `e2`, unit `events::*` |
 | concurrent appends (8 extension-style writers × 300 lines of 1–3.5 KiB, plus the manager) never interleave or lose lines | `e3` |

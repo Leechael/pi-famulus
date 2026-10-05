@@ -248,6 +248,60 @@ fn p3_hello_protocol_and_status() {
     assert_eq!(st["sessions"][0]["connected_at"].as_u64(), Some(since));
 }
 
+/// A fixed amount of CPU work, never a sleep (wall time is not CPU, and
+/// macOS CI rounds sleeps). About 0.4 s of user time on an M-series Mac.
+const BURN: &str = "awk 'BEGIN{for(i=0;i<10000000;i++)s+=i}'";
+/// Well under BURN's cost, well over what the idle shells around it use.
+const BURN_FLOOR_MS: u64 = 100;
+
+fn cpu_user_ms(v: &Value) -> Option<u64> {
+    v["cpu_user_ms"].as_u64()
+}
+
+/// Exit-time CPU accounting: the record (live and on disk) and the
+/// `task.exit` line carry the CPU of the command's whole wait chain, a
+/// cooperative stop still reports it, and a runner SIGKILLed by the hard
+/// timeout reports nothing (absent, not zero).
+#[test]
+fn p4_cpu_usage_on_record_event_and_list() {
+    let home = Home::new("p4");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-p4", "/tmp");
+
+    // Only a grandchild burns: neither shell above it can exec away.
+    let (a, _) = start(&mut c, &format!("sh -c \"{BURN}; true\"; true"), json!({}));
+    let t = c.wait_terminal(&a, S(30)).unwrap();
+    assert_eq!(t["status"], "completed", "{t}");
+    let cpu = cpu_user_ms(&t).unwrap_or_else(|| panic!("no cpu_user_ms: {t}"));
+    assert!(cpu >= BURN_FLOOR_MS, "grandchild CPU missing: {t}");
+    assert!(t["cpu_sys_ms"].is_u64() && t["max_rss_kb"].as_u64().unwrap_or(0) > 0, "{t}");
+    let disk = home.record(&a).unwrap();
+    assert_eq!(cpu_user_ms(&disk), Some(cpu), "persisted: {disk}");
+    let exit = wait_event(&home, "sess-p4", "task.exit", Some(&a));
+    assert_eq!(cpu_user_ms(&exit), Some(cpu), "{exit}");
+    assert_eq!(exit["max_rss_kb"], t["max_rss_kb"], "{exit}");
+
+    // A stop whose SIGTERM the command obeys: the runner survives it and
+    // reports what was spent before.
+    let (b, _) = start(&mut c, &format!("{BURN}; echo burned; sleep 300"), json!({}));
+    assert!(poll_true(S(30), || c.task(&b).unwrap()["output_size"].as_u64().unwrap_or(0) > 0));
+    c.request_ok(json!({"type":"stop","task_id":b,"reason":"cli"}));
+    let t = c.wait_terminal(&b, S(5)).unwrap();
+    assert_eq!(t["status"], "killed", "{t}");
+    assert!(cpu_user_ms(&t).unwrap_or(0) >= BURN_FLOOR_MS, "stopped task lost its CPU: {t}");
+
+    // The hard timeout SIGKILLs the whole group, runner included: no report.
+    let (x, _) = start(&mut c, "sleep 300", json!({"timeout_ms": 200}));
+    let t = c.wait_terminal(&x, S(5)).unwrap();
+    assert_eq!(t["end_reason"], "timeout", "{t}");
+    for k in ["cpu_user_ms", "cpu_sys_ms", "max_rss_kb"] {
+        assert!(t.get(k).is_none(), "{k} without a report: {t}");
+    }
+    let exit = wait_event(&home, "sess-p4", "task.exit", Some(&x));
+    assert!(exit.get("cpu_user_ms").is_none(), "{exit}");
+}
+
 // ===========================================================================
 // events.jsonl (manager writes)
 // ===========================================================================
