@@ -63,6 +63,8 @@ pi-famulus events -f
 | 3.6 | Ask a subagent to start another subagent, or a monitor | It reports the tool is unavailable (depth cap 1; children have no `monitor` / `task_*`) |
 | 3.7 | Ask a subagent to run a 30 s command | It blocks and returns the output; nothing is backgrounded. The command shows under its run in `/tasks` and in `pi-famulus ls` |
 | 3.8 | Start background work in a second pi session (same home), then ask the first agent "what tasks, monitors and subagents are running?" (also "including finished ones") | Only the first session's own work is listed; nothing from the other session |
+| 3.9 | Put `{"subagent":{"overrunRepeatMs":30000}}` in the test home's config.json, restart pi, and ask for one subagent with `timeout_ms: 60000` that runs `for i in $(seq 1 150); do echo $i; sleep 1; done` | After ~60 s a `! overrun` pill (Ctrl+O: shell, output size, last output); the child is still running in `/tasks` and its shell is not stopped; `pi-famulus events` shows `agent.overrun`, no `task.stop`. Without an action from the agent another pill comes ~30 s later. If the agent extends, the next pill waits for the new deadline. The command finishes and the result arrives as usual |
+| 3.10 | Same, with `"hardTimeoutMs": 90000` added | Overrun pill(s) first, then at 90 s the child is `interrupted`, its shell stopped (`task.stop reason=tool`), and `agent.timeout` is logged |
 
 ## F4. `/tasks`
 

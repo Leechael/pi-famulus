@@ -11,7 +11,7 @@ A parent ran worker and reviewer subagents with the default 30-minute `timeoutMs
 - 23 `agent.timeout` events across 9 children; every one settled `interrupted (timeout)`.
 - Every timeout landed 30.0 min after that child's latest `agent.start`. The budget restarts on each `resume`, so children resumed together timed out together.
 - 21 `task.stop reason=tool` events, each within 2 s of an `agent.timeout`: the abort cancelled the child's foreground shell. Those shells had run 251.1 min in total at the moment they were stopped, 10 of them for 10 min or more (test suites).
-- The child saw only `Command aborted (task stopped)`; nothing said it was the turn budget. The parent could not lengthen a running child's budget (`timeout_ms` was fixed at spawn and `resume` ignored it).
+- The 9 timed-out children's transcripts hold 21 `Command aborted (task stopped)` tool results, one per stopped shell. The runner sent the child nothing naming the budget (it settled and aborted). The parent could not lengthen a running child's budget (`timeout_ms` was fixed at spawn and `resume` ignored it).
 
 ## Why a soft deadline
 
