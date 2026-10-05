@@ -11,7 +11,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
 | `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g14) |
-| `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c9) |
+| `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI, CPU accounting and `stats` (p1–p4, e1–e5, c1–c11, g1, g15, g15b) |
 | `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/cli.rs` | black box | CLI help/version, completion scripts, strict parser errors (no daemon / no `--home`) |
@@ -281,7 +281,7 @@ fixtures in the contract's format, because the extension side may land later.
 | pager: on a terminal (script(1) pty) listings go through `PI_FAMULUS_PAGER`, else `PAGER`; not with `--no-pager`, `cat`, or piped stdout; a bare `less` runs as `less -FRX` | `c10`, unit `pager::*` |
 | `ls`: columns, running-only default, `-a` (connected sessions' finished work), running first then newest first, an agent's TIME = its last transcript message, agents included, SESSION shortest unique prefix ≥ 8, CJK display-width truncation, `--json`, `--session`/`--cwd`/`--since`, bad duration rejected | `c1`, `c1b`, unit `fmt::*`, `inspect::*` |
 | `show` for sh_/ch_/run_ (header, origin, backgrounded, wake emitted→delivered, last 10 lines; agent error/tool calls/shells/prompt/result tail 20), fuzzy + `--json`, one-line not-found with closest match | `c2` |
-| `stats`: grouping by agent (child record name, bare id, `main <session>`), kind, and both; CPU sums measured tasks only and CORES divides by their wall alone; UNMEASURED/KILLED/KILLED-WALL; gone sessions count; `--session`/`--since`/`--json`; text header and TOTAL; bad `--by` rejected; never starts the daemon; live daemon numbers | `c11`, `p4`, unit `stats::*` (red when CORES divides by all wall time) |
+| `stats`: grouping by agent (child record name, bare id, `main <session>`), kind, and both; CPU sums measured tasks only and CORES divides by their wall alone; UNMEASURED/KILLED/KILLED-WALL; gone sessions count; `--session`/`--since`/`--json`; text header and TOTAL; bad `--by` rejected; never starts the daemon; live daemon numbers | `c11`, `p4`, unit `stats::*` (both red when CORES divides by all wall time: unit 2.3 vs 3.2, `c11` 3.2 vs 4.0) |
 | `work_kind` on task rows of `ls --json` and in `show` (agents: none); the classifier on compound commands from a real run (heaviest simple command wins, `bash -c` recursion, heredoc bodies skipped, `$(…)` not surfaced, suite vs targeted) | `c1`, `c2`, unit `workkind::*` (red when the last simple command wins instead of the heaviest) |
 | `agent` (preamble hidden, `--full`), `log`/`tail -f` on ch_ ids, `output`/`wait` on ch_, `stop` on an agent refused with the contract message | `c3` |
 | `stop` → `stopped:cli`; "already finished (<reason>)" | `c4` |

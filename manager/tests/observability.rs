@@ -680,6 +680,12 @@ fn c11_stats_by_agent_and_kind() {
     let kms = by_agent.iter().find(|r| r["child_id"] == "ch_0000d001").unwrap();
     assert_eq!((kms["tasks"].as_u64(), kms["measured"].as_u64(), kms["killed"].as_u64()), (Some(2), Some(1), Some(1)));
     assert!(kms.get("kind").is_none());
+    // The killed, unmeasured task's 10 s must not dilute CORES: 160 s of
+    // CPU over the 40 s of measured wall, not over all 50 s.
+    assert_eq!(kms["avg_cores"].as_f64(), Some(4.0), "{kms}");
+    let text = cli_ok(&home, &["stats"]).stdout;
+    let kms_line: Vec<&str> = text.lines().find(|l| l.starts_with("wave2-kms")).unwrap().split_whitespace().collect();
+    assert_eq!(kms_line[2..], ["2", "50s", "2m40s", "4.0", "1", "1", "10s"], "{text}");
 
     assert_eq!(json_of(&["stats", "--by", "kind", "--json", "--session", "0199dddd-2"]).len(), 1);
     let recent = json_of(&["stats", "--by", "kind", "--json", "--since", "1h"]);
