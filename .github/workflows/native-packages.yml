@@ -30,10 +30,10 @@ jobs:
   root-package:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - name: Apply computed release version
@@ -48,7 +48,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/packages"
           npm pack --pack-destination "$RUNNER_TEMP/packages"
         working-directory: extension
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: npm-root
           path: ${{ runner.temp }}/packages/*.tgz
@@ -80,10 +80,10 @@ jobs:
       # Avoid making the macOS runner's version the implicit runtime minimum.
       MACOSX_DEPLOYMENT_TARGET: '13.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
       - name: Capture source commit for release build
@@ -189,12 +189,12 @@ jobs:
           ./node_modules/.bin/pi-famulus --home "$manager_home" output "$id" | grep -F native-package-roundtrip
           ./node_modules/.bin/pi-famulus --home "$manager_home" status --json
           ./node_modules/.bin/pi-famulus --home "$manager_home" shutdown
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: npm-${{ matrix.platform }}
           path: ${{ runner.temp }}/packages/pi-famulus-${{ matrix.platform }}-*.tgz
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: manager-logs-${{ matrix.platform }}
