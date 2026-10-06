@@ -63,17 +63,41 @@ export function conditionError(p: Record<string, unknown>): string | undefined {
 
 export const UI_LABEL = "Export ready";
 export const UI_REF = "@e2";
+const UI_WINDOW = "Export preview";
+const UI_PREPARING = "Preparing export";
+function matchesOutline(p: Record<string, unknown>, ready: boolean): boolean {
+  const ref = trimmed(p.ref), scope = trimmed(p.scopeRef);
+  if (ref && !["@e1", "@e2", "@e3"].includes(ref)) return false;
+  if (scope && scope !== "@e1") return false;
+  const label = ready ? UI_LABEL : UI_PREPARING;
+  const nodes = ref === "@e1" ? [{ text: UI_WINDOW, roles: ["window", "axwindow"] }]
+    : ref ? [{ text: label, roles: ["statictext", "axstatictext"] }]
+    : [{ text: UI_WINDOW, roles: ["window", "axwindow"] }, { text: label, roles: ["statictext", "axstatictext"] }];
+  if (!nodes.some((node) => (!p.text || node.text.toLowerCase().includes(trimmed(p.text).toLowerCase())) &&
+    (!p.role || node.roles.includes(trimmed(p.role).toLowerCase())))) return false;
+  if (p.value && (!ready || trimmed(p.value).toLowerCase() !== UI_LABEL.toLowerCase())) return false;
+  return true;
+}
+/** Conditions are checked against the observed preparing state and its ready successor. */
 export function matchesFixtureCondition(p: Record<string, unknown>): boolean {
-  return !conditionError(p) && (!p.ref || p.ref === UI_REF) && (!p.scopeRef || p.scopeRef === "@e1") &&
-    (!p.text || UI_LABEL.toLowerCase().includes(trimmed(p.text).toLowerCase())) &&
-    (!p.role || ["statictext", "axstatictext"].includes(trimmed(p.role).toLowerCase())) &&
-    (!p.value || trimmed(p.value).toLowerCase() === UI_LABEL.toLowerCase()) &&
-    (!p.until || p.until === "present");
+  if (conditionError(p)) return false;
+  // A predicate on either returned outline is fixture-grounded, even when its
+  // legitimate wait times out or is already satisfied on the observed state.
+  return matchesOutline(p, false) || matchesOutline(p, true);
+}
+function fixtureConditionFound(p: Record<string, unknown>): boolean {
+  if (p.until !== "absent") return matchesOutline(p, false) || matchesOutline(p, true);
+  const initiallyPresent = matchesOutline(p, false);
+  const successorPresent = matchesOutline(p, true);
+  // Already absent known nodes succeed against observation; a present node must
+  // actually disappear in the ready successor. Stable nodes time out normally.
+  return (!initiallyPresent && successorPresent) || (initiallyPresent && !successorPresent);
 }
 
 /** The positive control must wait for readiness, not a preexisting broad role. */
 export function requestsReadyCondition(p: Record<string, unknown>): boolean {
-  return matchesFixtureCondition(p) && (trimmed(p.text).toLowerCase().includes("ready") || trimmed(p.value).toLowerCase() === UI_LABEL.toLowerCase());
+  return p.until !== "absent" && matchesFixtureCondition(p) && p.ref !== "@e1" &&
+    (trimmed(p.text).toLowerCase().includes("ready") || trimmed(p.value).toLowerCase() === UI_LABEL.toLowerCase());
 }
 
 /** No UI, browser, network, native helper, production actions, or wait timers. */
@@ -102,12 +126,15 @@ export function createStubUiTools(enabled: boolean, token: string) {
       const error = conditionError(params);
       if (error) throw new Error(error);
       const scope = params.ref ?? params.scopeRef;
-      if (scope && !["@e1", "@e2"].includes(scope)) throw new Error(`Condition scope ref '${scope}' is unavailable in this state.`);
-      const found = matchesFixtureCondition(params);
-      const ready = requestsReadyCondition(params);
+      if (scope && !["@e1", "@e2", "@e3"].includes(scope)) throw new Error(`Condition scope ref '${scope}' is unavailable in this state.`);
+      const validTimeout = params.timeoutMs === undefined || (typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs) && params.timeoutMs >= 100 && params.timeoutMs <= 60000);
+      if (!validTimeout) throw new Error("timeoutMs must be between 100 and 60000.");
+      const found = fixtureConditionFound(params);
+      const transitioned = params.until === "absent" && matchesOutline(params, false) && !matchesOutline(params, true);
+      const ready = transitioned || requestsReadyCondition(params);
       const successor = nextState();
       return {
-        content: [{ type: "text" as const, text: `${found ? "Condition appeared." : `Timed out after ${params.timeoutMs ?? 10000}ms waiting for condition.`}\n${outline(ready)}\nUse stateId ${successor} for subsequent actions and queries.` }],
+        content: [{ type: "text" as const, text: `${found ? (transitioned ? "Condition disappeared in successor state." : "Condition is already absent in the observed state.") : `Timed out after ${params.timeoutMs ?? 10000}ms waiting for condition.`}\n${outline(ready)}\nUse stateId ${successor} for subsequent actions and queries.` }],
         details: { tool: "wait_for", stateId: successor, baseStateId: params.stateId, view: "diff", found, timedOut: !found, text: params.text, role: params.role, value: params.value, scopeRef: scope, renderedOutline: outline(ready), fixture: FIXTURE_VERSION },
       };
     },

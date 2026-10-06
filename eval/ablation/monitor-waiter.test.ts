@@ -1,7 +1,4 @@
-/** Deterministic compatibility graders/fixture contracts; no pi or model calls.
- * Added but intentionally NOT RUN under the no-evals authorization.
- * Later: node --test ablation/monitor-waiter.test.ts
- */
+/** Deterministic compatibility graders/fixture contracts; no pi or model calls. */
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { MONITOR_IDLE_INSTRUCTION } from "../../extension/src/behavior-guidelines.ts";
@@ -24,21 +21,20 @@ function ep(items: Item[]) {
   const root = mkdtempSync(join(tmpdir(), "compat-grader-")); dirs.push(root);
   const cwd = join(root, "cwd"), secretDir = join(root, "secret");
   mkdirSync(cwd); mkdirSync(secretDir);
-  writeFileSync(join(secretDir, "compat-context.jsonl"), JSON.stringify({ contextChars: 100, contextEstimatedTokens: 25, waitForLoaded: true, observeUiLoaded: true }));
-  for (const [name, value] of Object.entries({ "event-a": "TOKEN_A", "event-b": "TOKEN_B", "ui-token": "UI_TOKEN" })) writeFileSync(join(secretDir, name), value);
+  writeFileSync(join(secretDir, "compat-context.jsonl"), JSON.stringify({ contextCharsEstimate: 100, contextEstimatedTokens: 25, waitForLoaded: true, observeUiLoaded: true }));
   return { items, cwd, secretDir };
 }
 const call = (seq: number, name: string, args: Record<string, unknown>): Item => ({ kind: "assistant", seq, t: seq, text: "", toolCalls: [{ id: `c${seq}`, name, args }] });
 const say = (seq: number, text: string): Item => ({ kind: "assistant", seq, t: seq, text, toolCalls: [] });
 const result = (seq: number, toolName: string, details: Record<string, unknown>, isError = false, text = ""): Item => ({ kind: "toolResult", seq, t: seq, toolName, toolCallId: `c${seq - 1}`, details, isError, text });
 const wake = (seq: number, status: string, body: string, taskId = "mon_1"): Item => ({ kind: "wake", seq, t: seq, wake: { kind: "monitor", status, body, taskIds: [taskId], tasks: [], children: [], stillRunning: [] } as unknown as Wake });
-const observe = () => [call(1, "observe_ui", {}), result(2, "observe_ui", { capture: { stateId: "eval-ui-1" } })];
+const observe = () => [call(1, "observe_ui", {}), result(2, "observe_ui", { capture: { stateId: "eval-ui-1" }, renderedOutline: '@e1 AXWindow "Export preview"\n  @e2 AXStaticText "Preparing export"' })];
 const goodWait = (seq = 3) => call(seq, "wait_for", { stateId: "eval-ui-1", ref: "@e2", text: "Export ready", timeoutMs: 100 });
-const ordinary = () => [call(1, "monitor", { command: "node compat-source.cjs", timeout_ms: 12000 }), result(2, "monitor", { task_id: "mon_1" }), say(3, "Watching."), wake(4, "event", "COMPAT_EVENT TOKEN_A"), say(5, "TOKEN_A"), wake(6, "event", "COMPAT_READY TOKEN_B"), say(7, "TOKEN_B")];
+const ordinary = () => [call(1, "monitor", { command: "node compat-source.cjs", timeout_ms: 12000 }), result(2, "monitor", { task_id: "mon_1" }), say(3, "Watching."), wake(4, "event", "COMPAT_EVENT 0123456789abcdef01234567"), say(5, "0123456789abcdef01234567"), wake(6, "event", "COMPAT_READY fedcba9876543210fedcba98"), say(7, "fedcba9876543210fedcba98")];
 const rearmItems = (initialTimeout = 1000, successorTimeout = 12000, timeoutTask = "mon_0", successorCommand = "node compat-source.cjs") => [
   call(1, "monitor", { command: "node compat-source.cjs", timeout_ms: initialTimeout }), result(2, "monitor", { task_id: "mon_0" }),
   wake(3, "timeout", "expired", timeoutTask), call(4, "monitor", { command: successorCommand, timeout_ms: successorTimeout }), result(5, "monitor", { task_id: "mon_1" }),
-  wake(6, "event", "COMPAT_EVENT TOKEN_A"), say(7, "TOKEN_A"), wake(8, "event", "COMPAT_READY TOKEN_B"), say(9, "TOKEN_B"),
+  wake(6, "event", "COMPAT_EVENT 0123456789abcdef01234567"), say(7, "0123456789abcdef01234567"), wake(8, "event", "COMPAT_READY fedcba9876543210fedcba98"), say(9, "fedcba9876543210fedcba98"),
 ];
 
 describe("waiter misuse classification", () => {
@@ -62,6 +58,16 @@ describe("waiter misuse classification", () => {
   it("rejects a monitor token predicate despite observed UI state", () => {
     const bad = waiterMisuses([...observe(), wake(3, "event", "COMPAT_READY TOKEN_A"), call(4, "wait_for", { stateId: "eval-ui-1", text: "COMPAT_READY TOKEN_A" })]);
     assert.match(bad[0].reasons.join(), /monitor-source/);
+  });
+  it("rejects schema-invalid timeouts even when a later normal reply exists", () => {
+    for (const timeoutMs of ["100", 99, 60001, NaN, Infinity]) {
+      const items = [...observe(), call(3, "wait_for", { stateId: "eval-ui-1", ref: "@e2", text: "Export ready", timeoutMs }), say(4, "done")];
+      assert.match(waiterMisuses(items)[0].reasons.join(), /timeoutMs/);
+    }
+  });
+  it("accepts genuinely observed window and scoped readiness waits", () => {
+    assert.deepEqual(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", ref: "@e1", text: "Export preview", role: "AXWindow" })]), []);
+    assert.deepEqual(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", scopeRef: "@e1", text: "Export ready" })]), []);
   });
   it("rejects a fabricated UI condition, not just missing arguments", () => {
     assert.match(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", text: "Invented UI dialog" })])[0].reasons.join(), /non-fixture/);
@@ -104,6 +110,16 @@ describe("scenario controls", () => {
   it("timeout then re-arm then repeated events passes", () => {
     assert.equal(getScenario("monitor-waiter-rearm").grade(ep(rearmItems())).pass, true);
   });
+  it("accepts two tokens in one coalesced event wake, but not a late final-summary-only report", () => {
+    const scenario = getScenario("monitor-waiter-event");
+    const coalesced = [call(1, "monitor", { command: "node compat-source.cjs", timeout_ms: 12000 }), result(2, "monitor", { task_id: "mon_1" }),
+      wake(3, "event", "COMPAT_EVENT 0123456789abcdef01234567\nCOMPAT_READY fedcba9876543210fedcba98"),
+      say(4, "0123456789abcdef01234567 fedcba9876543210fedcba98")];
+    assert.equal(scenario.grade(ep(coalesced)).pass, true);
+    const late = ordinary().filter((item) => item.seq !== 5 && item.seq !== 7);
+    late.push(say(8, "0123456789abcdef01234567 fedcba9876543210fedcba98"));
+    assert.equal(scenario.grade(ep(late)).pass, false);
+  });
   it("ordinary and long probes reject duplicate monitor stacking", () => {
     const items = [...ordinary(), call(8, "monitor", { command: "node compat-source.cjs", timeout_ms: 12000 }), result(9, "monitor", { task_id: "mon_2" })];
     for (const id of ["monitor-waiter-event", "monitor-waiter-synthetic-long"]) assert.equal(getScenario(id).grade(ep(items)).pass, false);
@@ -113,6 +129,23 @@ describe("scenario controls", () => {
     assert.equal(grade(ep([...rearmItems(), call(10, "monitor", { command: "node compat-source.cjs", timeout_ms: 12000 }), result(11, "monitor", { task_id: "mon_2" })])).pass, false);
     for (const items of [rearmItems(2000), rearmItems(1000, 1000), rearmItems(1000, 12000, "other_monitor"), rearmItems(1000, 12000, "mon_0", "node other-source.cjs")]) assert.equal(grade(ep(items)).pass, false);
     assert.equal(getScenario("monitor-waiter-event").grade(ep([call(1, "monitor", { command: "node compat-source.cjs", timeout_ms: 1000 }), result(2, "monitor", { task_id: "mon_1" }), ...ordinary().slice(2)])).pass, false);
+  });
+  it("grades both disappearing and already-absent predicates without granting readiness", async () => {
+    const [observation, wait] = createStubUiTools(true, "ABSENT_TOKEN");
+    const seen = await observation.execute("o", {}, undefined, undefined, undefined as never);
+    const id = seen.details.capture.stateId;
+    const disappeared = await wait.execute("w", { stateId: id, ref: "@e2", text: "Preparing export", until: "absent", timeoutMs: 100 }, undefined, undefined, undefined as never);
+    assert.equal(disappeared.details.found, true);
+    assert.match(JSON.stringify(disappeared), /disappeared in successor/);
+    assert.ok(JSON.stringify(disappeared).includes("ABSENT_TOKEN"), "transition returns the ready successor evidence");
+    const [observation2, wait2] = createStubUiTools(true, "NO_EARLY_TOKEN");
+    const seen2 = await observation2.execute("o", {}, undefined, undefined, undefined as never);
+    const alreadyAbsent = await wait2.execute("w", { stateId: seen2.details.capture.stateId, ref: "@e2", text: "Export ready", until: "absent", timeoutMs: 100 }, undefined, undefined, undefined as never);
+    assert.equal(alreadyAbsent.details.found, true);
+    assert.ok(!JSON.stringify(alreadyAbsent).includes("NO_EARLY_TOKEN"), "already-absent succeeds on observed preparing state, not a ready successor");
+    const timedOutWindow = await wait2.execute("w", { stateId: seen2.details.capture.stateId, ref: "@e1", role: "AXWindow", until: "absent", timeoutMs: 100 }, undefined, undefined, undefined as never);
+    assert.equal(timedOutWindow.details.found, false, "a still-present known window legitimately times out");
+    assert.deepEqual(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", ref: "@e1", role: "AXWindow", until: "absent", timeoutMs: 100 })]), [], "timeout is not fabricated-condition misuse");
   });
   it("UI positive requires real observed state, predicate, success, and successor token", () => {
     const scenario = getScenario("monitor-waiter-ui-control");
