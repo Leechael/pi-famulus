@@ -52,6 +52,38 @@ fn concurrent_capacity_config_sets_preserve_fields_and_valid_json() {
 }
 
 #[test]
+fn work_kind_budgets_round_trip_for_every_supported_kind() {
+    let home = std::env::temp_dir().join(format!("pi-famulus-workkind-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.json"), r#"{"maxAgents":9,"unrelated":true}"#).unwrap();
+    for (key, expected) in [
+        ("max-test-suite", "maxTestSuite"),
+        ("max-test", "maxTest"),
+        ("max-build", "maxBuild"),
+        ("max-lint/type", "maxLintType"),
+        ("max-other", "maxOther"),
+        ("max-git", "maxGit"),
+        ("max-read/search", "maxReadSearch"),
+    ] {
+        let set = run(&["--home", home.to_str().unwrap(), "config", "set", key, "3"]);
+        assert!(set.status.success(), "{key}: {}", String::from_utf8_lossy(&set.stderr));
+        let get = run(&["--home", home.to_str().unwrap(), "config", "get", key]);
+        assert!(get.status.success(), "{key}: {}", String::from_utf8_lossy(&get.stderr));
+        assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "3");
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config[expected], 3);
+        assert_eq!(config["maxAgents"], 9);
+        assert_eq!(config["unrelated"], true);
+    }
+    let zero = run(&["--home", home.to_str().unwrap(), "config", "set", "max-build", "0"]);
+    assert!(!zero.status.success());
+    let unknown = run(&["--home", home.to_str().unwrap(), "config", "get", "max-does-not-exist"]);
+    assert!(!unknown.status.success());
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn help_and_version_are_served_by_the_cli_framework() {
     let help = run(&["--help"]);
     assert!(

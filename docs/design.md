@@ -155,7 +155,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 ```
 - `extension` must carry `session_id` + `pi_pid`; thereafter this connection receives that session's events
 - `cwd` is optional (backward compatible). The extension includes the session cwd in hello; the manager stores it in the session and returns it in status/sessions. Older clients omitting it can still handshake
-- `extension_version` (string) and `protocol` (integer) are optional: the manager stores them per session and returns them in `status.sessions`; `doctor` uses them to check that each connected session's protocol matches the manager. `protocol` is a feature level: 1 = original §3.3, 2 = observability contract (origin / mark_background / stop.reason / end_reason / events.jsonl), 3 = in-place upgrade (`upgrade`, status's `generation`/`last_upgrade`/`exe`, start key, resend after reconnect), 4 = machine-wide agent admission (`acquire_agent` / `release_agent`). CLI `upgrade` sends no request to a manager below level 3 and directly asks for a one-time restart. Omitted = older extension
+- `extension_version` (string) and `protocol` (integer) are optional: the manager stores them per session and returns them in `status.sessions`; `doctor` uses them to check that each connected session's protocol matches the manager. `protocol` is a feature level: 1 = original §3.3, 2 = observability contract (origin / mark_background / stop.reason / end_reason / events.jsonl), 3 = in-place upgrade (`upgrade`, status's `generation`/`last_upgrade`/`exe`, start key, resend after reconnect), 4 = machine-wide agent admission (`acquire_agent` / `release_agent`), 5 = per-kind budgets and queued admission. The extension advertises its maximum (5); its effective level is `min(client maximum, manager maximum)` from the hello response. Below level 5 it omits `work_kind` and uses immediate v4 admission; a v5 manager also honors a v4 client's no-kind/no-queue semantics. CLI `upgrade` sends no request to a manager below level 3 and directly asks for a one-time restart. Omitted = older extension
 - Duplicate hello for the same `session_id`: new connection wins; the old connection receives `{"type":"event","event":"session_rebound"}` and is closed by the server
 - `cli` carries no session; it can access cross-session read-only/management operations
 
@@ -247,15 +247,27 @@ Ask the daemon to upgrade in place to the current file at its own path (quiesce 
 **status** (read-only, both CLI and extension):
 ```json
 → {"type":"status"}
-← {"ok":true, "version":"0.1.0+066598ae00", "pid":4321, "uptime_ms":3600000, "protocol":4,
+← {"ok":true, "version":"0.1.0+066598ae00", "pid":4321, "uptime_ms":3600000, "protocol":5,
    "generation":1, "exe":"/usr/local/bin/pi-famulus",
    "last_upgrade":{"at":1726...,"ok":true,"from_version":"0.1.0+abc1234500",
                     "to_version":"0.1.0+066598ae00","trigger":"cli"},
    "sessions":[{"session_id":"...","pi_pid":1234,"connected":true,"cwd":"/path",
                 "extension_version":"0.3.0","protocol":2,"connected_at":1726...,"last_seen":1726...}],
-   "task_counts":{"running":2,"terminal":5}}
+   "task_counts":{"running":2,"terminal":5},
+   "agent_capacity":{"used":2,"total":8,"by_kind":{"test":{"used":1,"total":2},"test-suite":{"used":1,"total":2}}}}
 ```
 `protocol` is the manager's protocol level; `connected_at` = this manager's first hello from that session (unchanged on reconnect); `last_seen` = most recent request or disconnect (current time while connected). `generation` is this pid's count of in-place upgrades, starting at 0. `last_upgrade` is the latest upgrade attempt (success or failure), omitted if none; `error` (only on failed upgrades) explains why the switch did not happen and the daemon still runs the old binary; `trigger` is `"cli"` (`pi-famulus upgrade`) or `"binary-changed"` (the daemon noticed its file was replaced). `exe` is the daemon's own binary path: an upgrade `exec()`s the current file there, which is not necessarily the requesting CLI's own path (`pi-famulus upgrade` notes when they differ).
+
+**Agent admission** (extension, protocol ≥4):
+```json
+→ {"type":"acquire_agent", "child_id":"ch_…"}  // protocol 4: immediate global grant/rejection
+→ {"type":"acquire_agent", "child_id":"ch_…", "work_kind":"test-suite"}  // protocol 5
+← {"ok":true, "granted":true}
+← {"ok":true, "granted":false, "rejection":"global_capacity"}
+→ {"type":"cancel_acquire_agent", "request_id":"<pending acquire id>", "child_id":"ch_…"}
+→ {"type":"release_agent", "child_id":"ch_…"}
+```
+Protocol 5 preserves the immediate `global_capacity` rejection when the machine budget is full. If global capacity is available but the named kind budget is full, the acquire response remains pending in a FIFO queue and is later answered using the original request id. Queued requests retain arrival order, while a new request for a different kind may use that kind's otherwise-free budget independently. Cancellation removes the pending response and cleans up a grant/cancel race. A protocol-4 client gets the immediate, global-only behavior even from a protocol-5 manager. CLI `capacity_changed` is sent after a persisted runtime budget update so an increase wakes newly eligible FIFO heads; it is CLI-only.
 
 **shutdown** (CLI): trigger the same graceful shutdown as "zero connections".
 
@@ -276,13 +288,13 @@ Note: `task_exited`'s "always" means while the daemon lives. When the crash scan
 - Each line < 4 KiB (including newline): overlong string fields are truncated (ending in `…`) with `"truncated":true`; `src`/`type`/`ts` are never truncated. Each line is written with one O_APPEND `write`, so concurrent manager/extension appends cannot interleave
 - Common fields: `ts` (ms), `src` (`"manager"` | `"extension"`), `type`, `id?` (task/child id), plus type-specific fields
 - Manager writes: `session.connect {pi_pid, cwd, extension_version, protocol}`, `session.disconnect {reason: closed|rebound}`, `task.start {kind, command(≤200 characters), origin, pid}`, `task.background {after_ms}`, `task.stop {reason}`, `task.exit {exit_code, signal, end_reason, duration_ms, cpu_user_ms?, cpu_sys_ms?, max_rss_kb?}` (including orphaned and force-ended tasks at shutdown), `daemon.start {pid, version, protocol, orphaned, loaded}` / `daemon.shutdown {pid, killed_tasks}` (also in manager.log)
-- Extension writes: `wake.emit {kind, ids[], batch}`, `wake.deliver {kind, mode: trigger|steer|passive}` (passive = `triggerTurn:false`, no new turn: clean monitor exit within 2s of an event, leftover lines and exit from a monitor stopped by the model), `wake.inject {kind, ids[], as_of?, lag_ms?}` (the wake entered the model's context: pi's extension `message_end` for the custom message, emitted right before it is pushed into the agent's context, for steered and turn-triggering wakes; `lag_ms` = inject time − `as_of`. Passive wakes never reach extension `message_end`; they are appended when sent, which the NotifyCenter does only while the agent is idle, so their `wake.deliver mode=passive` is the proxy), `wake.dedupe {id}`, `monitor.drop {id, lines}`, `monitor.stop {id, reason}`, `agent.start {child_id, run_id, name, agent, model}`, `agent.settle {child_id, status, error?, stalls?, duration_ms}`, `agent.stall {child_id, attempt}` (written on **every stall detection**, including before auto-resume; does not mean failure—use `agent.settle` with error=stalled to determine failure), `agent.overrun {child_id, run_id, reminder, elapsed_ms, budget_ms, shell_task_id?, shell_elapsed_ms?, output_bytes?, growing?}` (soft deadline passed, child keeps running; one per reminder, see §4.6 child lifecycle), `agent.timeout {child_id}` (only the opt-in hard ceiling `hardTimeoutMs`; the child was aborted), `decision.request/reply/timeout {child_id}`
+- Extension writes: `wake.emit {kind, ids[], batch}`, `wake.deliver {kind, mode: trigger|steer|passive}` (passive = `triggerTurn:false`, no new turn: clean monitor exit within 2s of an event, leftover lines and exit from a monitor stopped by the model), `wake.inject {kind, ids[], as_of?, lag_ms?}` (the wake entered the model's context: pi's extension `message_end` for the custom message, emitted right before it is pushed into the agent's context, for steered and turn-triggering wakes; `lag_ms` = inject time − `as_of`. Passive wakes never reach extension `message_end`; they are appended when sent, which the NotifyCenter does only while the agent is idle, so their `wake.deliver mode=passive` is the proxy), `wake.dedupe {id}`, `monitor.drop {id, lines}`, `monitor.stop {id, reason}`, `agent.start {child_id, run_id, name, agent, work_kind, queue_ms, model}`, `agent.settle {child_id, status, work_kind, error?, stalls?, queue_ms?, duration_ms}`, `agent.stall {child_id, attempt}` (written on **every stall detection**, including before auto-resume; does not mean failure—use `agent.settle` with error=stalled to determine failure), `agent.overrun {child_id, run_id, reminder, elapsed_ms, budget_ms, shell_task_id?, shell_elapsed_ms?, output_bytes?, growing?}` (soft deadline passed, child keeps running; one per reminder, see §4.6 child lifecycle), `agent.timeout {child_id}` (only the opt-in hard ceiling `hardTimeoutMs`; the child was aborted), `decision.request/reply/timeout {child_id}`
 - Readers (CLI `events`/`show`/`sessions`) skip unparseable lines or lines missing `ts`/`type`
 - Retention: stored with the session directory; no rotation in v1 (deferred: rotation | impact: disk growth for very long sessions | trigger: doctor reports sessions directory > 100MB)
 
 #### Agent records (extension-owned, `<home>/sessions/<sid>/agents/`)
 
-- `<ch>.json`: `{child_id, run_id, session_id, name, agent, model?, status, started_at, ended_at?, error?, attempts?(total generation count, written only if >1), end_reason?(completed|failed|model-error|stalled|timeout|interrupted|disposed), prompt_head(task prompt only, no agent preamble, ≤2000), result_tail(≤2000), tool_calls, transcript}`
+- `<ch>.json`: `{child_id, run_id, session_id, name, agent, work_kind, queue_ms?, model?, status, started_at, ended_at?, error?, attempts?(total generation count, written only if >1), end_reason?(completed|failed|model-error|stalled|timeout|interrupted|disposed), prompt_head(task prompt only, no agent preamble, ≤2000), result_tail(≤2000), tool_calls, transcript}`
 - `<ch>.jsonl` transcript: one message per line `{role, text, tool?, args?, isError?, ts}`, appended live
 - The CLI only reads these files (`ls`/`show`/`agent`/`log`); if a record says running but its owning session is disconnected, the CLI treats it as `interrupted` and `doctor` reports a stale record
 

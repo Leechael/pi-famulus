@@ -41,7 +41,7 @@ describe("machine agent admission", () => {
     const wait = vi.fn(async () => {});
     const release = await admitAgentChild({
       childId: "ch-1", reserveLocal: s.reserveLocal, manager: s.manager,
-      leases: new Set(), notice: () => {}, wait,
+      leases: new Map(), notice: () => {}, wait,
     });
     expect(wait).toHaveBeenCalledOnce();
     expect(s.manager.acquireAgent).toHaveBeenCalledTimes(2);
@@ -61,7 +61,7 @@ describe("machine agent admission", () => {
     const notice = vi.fn();
     const release = await admitAgentChild({
       childId: "ch-1", reserveLocal: s.reserveLocal, manager: s.manager,
-      leases: new Set(), notice,
+      leases: new Map(), notice,
     });
     expect(s.manager.acquireAgent).not.toHaveBeenCalled();
     expect(notice).toHaveBeenCalledWith(reason);
@@ -71,8 +71,8 @@ describe("machine agent admission", () => {
 
   it("does not reacquire a held permit on user resume; releases it at terminal settle", async () => {
     const s = setup();
-    const leases = new Set<string>();
-    const acquire = () => admitAgentChild({ childId: "ch-1", reserveLocal: s.reserveLocal, manager: s.manager, leases, notice: () => {} });
+    const leases = new Map<string, string>();
+    const acquire = () => admitAgentChild({ childId: "ch-1", workKind: "test", reserveLocal: s.reserveLocal, manager: s.manager, leases, notice: () => {} });
     const interrupted = await acquire();
     interrupted(false);
     expect(leases.has("ch-1")).toBe(true);
@@ -86,22 +86,67 @@ describe("machine agent admission", () => {
 
   it("re-registers extension-held running child ids after reconnect", async () => {
     const s = setup();
-    const leases = new Set(["ch-running"]);
+    const leases = new Map([["ch-running", "test-suite"]]);
     await reregisterAgentLeases(s.manager, leases);
     expect(s.manager.acquireAgent).toHaveBeenCalledOnce();
-    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-running");
+    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-running", "test-suite");
   });
 
   it("stops retrying a child disposed while waiting and restores remaining leases", async () => {
     const s = setup();
-    const leases = new Set(["disposed-first", "still-running"]);
+    const leases = new Map([["disposed-first", "other"], ["still-running", "build"]]);
     vi.mocked(s.manager.acquireAgent)
       .mockResolvedValueOnce({ granted: false, rejection: "global_capacity" })
       .mockResolvedValueOnce({ granted: true });
     await reregisterAgentLeases(s.manager, leases, async () => { leases.delete("disposed-first"); });
     expect(s.manager.acquireAgent).toHaveBeenCalledTimes(2);
-    expect(s.manager.acquireAgent).toHaveBeenNthCalledWith(1, "disposed-first");
-    expect(s.manager.acquireAgent).toHaveBeenNthCalledWith(2, "still-running");
+    expect(s.manager.acquireAgent).toHaveBeenNthCalledWith(1, "disposed-first", "other");
+    expect(s.manager.acquireAgent).toHaveBeenNthCalledWith(2, "still-running", "build");
+  });
+
+  it("cancels a reconnect-time queued acquire when its child settles", async () => {
+    const s = setup();
+    const leases = new Map([["ch-reregister", "test"]]);
+    const pending = new Map<string, AbortController>();
+    vi.mocked(s.manager.acquireAgent).mockImplementation(
+      (_childId, _workKind, signal) => new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("subagent admission cancelled")), { once: true });
+      }),
+    );
+    const registering = reregisterAgentLeases(s.manager, leases, async () => {}, pending);
+    const controller = pending.get("ch-reregister");
+    expect(controller).toBeDefined();
+    leases.delete("ch-reregister");
+    controller?.abort();
+    await expect(registering).resolves.toBeUndefined();
+    expect(pending.size).toBe(0);
+    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-reregister", "test", controller?.signal);
+  });
+
+  it("cancels a queued machine acquire and returns its local reservation", async () => {
+    const s = setup();
+    const controller = new AbortController();
+    vi.mocked(s.manager.acquireAgent).mockImplementation(
+      (_childId, _workKind, signal) => new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("subagent admission cancelled")), { once: true });
+      }),
+    );
+    const current = () => !controller.signal.aborted;
+    const admission = admitAgentChild({
+      childId: "ch-pending",
+      workKind: "test-suite",
+      reserveLocal: s.reserveLocal,
+      manager: s.manager,
+      leases: new Map(),
+      ticket: { current, signal: controller.signal },
+      notice: () => {},
+    });
+    await Promise.resolve();
+    expect(s.used()).toBe(1);
+    controller.abort();
+    await expect(admission).rejects.toThrow("subagent admission cancelled");
+    expect(s.used()).toBe(0);
+    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-pending", "test-suite", controller.signal);
   });
 
   it("gets the local slot before global acquire and frees it while globally denied", async () => {
@@ -117,7 +162,7 @@ describe("machine agent admission", () => {
       });
     const release = await admitAgentChild({
       childId: "ch-1", reserveLocal: s.reserveLocal, manager: s.manager,
-      leases: new Set(), notice: () => {}, wait: async () => { expect(s.used()).toBe(0); },
+      leases: new Map(), notice: () => {}, wait: async () => { expect(s.used()).toBe(0); },
     });
     expect(s.order).toEqual(["local.acquire", "local.release", "local.acquire", "local.admit"]);
     release();

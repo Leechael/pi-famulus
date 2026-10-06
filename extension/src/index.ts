@@ -79,7 +79,8 @@ export default function (pi: ExtensionAPI): void {
 
   let ctx: ExtensionContext | null = null;
   let client: ManagerClient | null = null;
-  const globalAgentLeases = new Set<string>();
+  const globalAgentLeases = new Map<string, string>();
+  const pendingAgentReregistrations = new Map<string, AbortController>();
   const capacityNotices = new Set<string>();
   const capacityNotice = (reason: "manager unavailable" | "daemon too old"): void => {
     if (capacityNotices.has(reason)) return;
@@ -436,6 +437,8 @@ export default function (pi: ExtensionAPI): void {
     fleetWidget = null;
     subagentRegistry?.disposeAll();
     subagentRegistry = null;
+    for (const controller of pendingAgentReregistrations.values()) controller.abort();
+    pendingAgentReregistrations.clear();
     globalAgentLeases.clear();
 
     client = new ManagerClient({
@@ -501,7 +504,7 @@ export default function (pi: ExtensionAPI): void {
         }
         // The registry and its child ids survive socket reconnects in this
         // extension process; held ids include resumable interrupted children.
-        await reregisterAgentLeases(manager, globalAgentLeases);
+        await reregisterAgentLeases(manager, globalAgentLeases, undefined, pendingAgentReregistrations);
       })().catch(() => {});
     });
 
@@ -580,9 +583,11 @@ export default function (pi: ExtensionAPI): void {
       hardTimeoutMs: subagentConfig.hardTimeoutMs,
       acquire: (req, ticket) => admitAgentChild({
         childId: req.childId,
+        workKind: req.workKind ?? "other",
         reserveLocal: () => registry.reserveChildSlot(req.childId, ticket),
         manager: client,
         leases: globalAgentLeases,
+        pendingReregistrations: pendingAgentReregistrations,
         ticket,
         notice: capacityNotice,
       }),
@@ -626,6 +631,8 @@ export default function (pi: ExtensionAPI): void {
             run_id: run.runId,
             name: c.name,
             agent: c.agent,
+            work_kind: c.workKind ?? "other",
+            queue_ms: c.queueMs ?? 0,
             ...(c.model ? { model: c.model } : {}),
           });
         }
@@ -637,7 +644,9 @@ export default function (pi: ExtensionAPI): void {
             child_id: c.childId,
             status: c.status,
             ...(error ? { error } : {}),
+            work_kind: c.workKind ?? "other",
             ...(c.result?.stalls ? { stalls: c.result.stalls } : {}),
+            ...(c.queueMs !== undefined ? { queue_ms: c.queueMs } : {}),
             duration_ms: c.result?.durationMs ?? Math.max(0, clock.now() - c.startedAt),
           });
         }
@@ -650,6 +659,8 @@ export default function (pi: ExtensionAPI): void {
           session_id: sid,
           name: c.name,
           agent: c.agent,
+          work_kind: c.workKind ?? "other",
+          ...(c.queueMs !== undefined ? { queue_ms: c.queueMs } : {}),
           ...(c.model !== undefined ? { model: c.model } : {}),
           status: c.status,
           started_at: c.startedAt,
@@ -681,6 +692,7 @@ export default function (pi: ExtensionAPI): void {
           runId: run.runId,
           name: c.name,
           agent: c.agent,
+          workKind: c.workKind ?? "other",
           ...(c.model !== undefined ? { model: c.model } : {}),
           cwd: startCtx.cwd,
           ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),

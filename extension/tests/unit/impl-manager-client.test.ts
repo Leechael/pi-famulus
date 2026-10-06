@@ -24,6 +24,7 @@ interface FakeManager {
   startCount(): number;
   setTasks(tasks: Record<string, unknown>[]): void;
   setProtocol(protocol: number | undefined): void;
+  holdNextAcquire(): void;
   refuseFor(ms: number): Promise<void>;
   close(): Promise<void>;
 }
@@ -45,6 +46,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   const startsByKey = new Map<string, { task_id: string; pid: number }>();
   let tasks: Record<string, unknown>[] = [];
   let protocol: number | undefined = 4;
+  let holdAcquire = false;
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -104,7 +106,13 @@ async function startFakeManager(home: string): Promise<FakeManager> {
           total_size: 13,
         };
       case "acquire_agent":
+        if (holdAcquire) {
+          holdAcquire = false;
+          return null;
+        }
         return { v: 1, id: msg.id, ok: true, granted: true };
+      case "cancel_acquire_agent":
+        return { v: 1, id: msg.id, ok: true };
       case "release_agent":
       case "stop":
       case "mark_background":
@@ -156,6 +164,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     startCount: () => startsByKey.size,
     setTasks: (value) => { tasks = value; },
     setProtocol: (value) => { protocol = value; },
+    holdNextAcquire: () => { holdAcquire = true; },
     refuseFor: async (ms) => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -207,14 +216,19 @@ describe("ManagerClient (integration, fake manager)", () => {
       session_id: "sess-1",
       pi_pid: process.pid,
       extension_version: packageVersion,
-      protocol: 4,
+      protocol: 5,
     });
   });
 
-  it("records an old daemon's maximum protocol level from hello", async () => {
+  it("negotiates the minimum of its v5 maximum and the daemon's reported maximum", async () => {
     fake.setProtocol(3);
     expect(await client.connect()).toBe(true);
     expect(client.protocolLevel()).toBe(3);
+    await client.close();
+    fake.setProtocol(9);
+    client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null });
+    expect(await client.connect()).toBe(true);
+    expect(client.protocolLevel()).toBe(5);
   });
 
   it("waits out a shutting-down hello without deleting manager files", async () => {
@@ -264,12 +278,41 @@ describe("ManagerClient (integration, fake manager)", () => {
     await expect(client.shutdownSession()).resolves.toEqual(["sh_a1b2c3d4"]);
   });
 
-  it("uses structured machine-agent acquire and release requests", async () => {
+  it("uses v4 acquire shape with an older daemon and includes work kind with v5", async () => {
     await client.connect();
-    expect(await client.acquireAgent("ch_test")).toEqual({ granted: true });
-    await client.releaseAgent("ch_test");
-    expect(fake.received.map((message) => message.type)).toContain("acquire_agent");
+    expect(client.protocolLevel()).toBe(4);
+    expect(await client.acquireAgent("ch_test", "test-suite")).toEqual({ granted: true });
+    const legacyAcquire = fake.received.find((message) => message.type === "acquire_agent");
+    expect(legacyAcquire).not.toHaveProperty("work_kind");
+
+    await client.close();
+    fake.setProtocol(5);
+    client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null });
+    await client.connect();
+    expect(await client.acquireAgent("ch_test_v5", "test-suite")).toEqual({ granted: true });
+    expect(fake.received.find((message) => message.type === "acquire_agent" && message.child_id === "ch_test_v5"))
+      .toMatchObject({ work_kind: "test-suite" });
+    await client.releaseAgent("ch_test_v5");
     expect(fake.received.map((message) => message.type)).toContain("release_agent");
+  });
+
+  it("cancels a pending acquire with its original request id when the child settles", async () => {
+    fake.setProtocol(5);
+    await client.connect();
+    expect(client.isAvailable()).toBe(true);
+    fake.holdNextAcquire();
+    const controller = new AbortController();
+    const acquire = client.acquireAgent("ch_cancel", "test", controller.signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const pending = fake.received.find((message) => message.type === "acquire_agent");
+    expect(pending).toMatchObject({ child_id: "ch_cancel", work_kind: "test" });
+    controller.abort();
+    await expect(acquire).rejects.toThrow("subagent admission cancelled");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fake.received.find((message) => message.type === "cancel_acquire_agent"))
+      .toMatchObject({ request_id: pending?.id, child_id: "ch_cancel" });
   });
 
   it("preserves upgrade generation metadata from status", async () => {

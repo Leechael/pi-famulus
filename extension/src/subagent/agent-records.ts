@@ -15,6 +15,10 @@ export interface AgentChildRecord {
   session_id: string;
   name: string;
   agent: string;
+  /** Explicit planned work class; old records default to `other`. */
+  work_kind?: string;
+  /** Time spent waiting for admission, when measured. */
+  queue_ms?: number;
   /** Resolved model id when known (param override or agent definition). */
   model?: string;
   status: "pending" | "running" | "completed" | "failed" | "interrupted";

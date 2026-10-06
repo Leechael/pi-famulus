@@ -313,11 +313,13 @@ Prints `task_id=sh_… pid=12345`.
 
 ### `config`
 
-Set or read runtime settings. `max-agents` is the machine-wide concurrent subagent budget (default 8); changes persist in `config.json` and take effect on the next admission without restarting the daemon.
+Set or read runtime settings. `max-agents` is the machine-wide concurrent subagent budget (default 8). Protocol 5 also supports per-kind keys `max-test-suite`, `max-test`, `max-build`, `max-lint/type`, `max-other`, `max-git`, and `max-read/search`; unset kinds inherit the current global limit except test/test-suite, which default to 2. Changes persist in `config.json`, take effect without restarting the daemon, and re-evaluate queued admissions. See [Machine-wide agent capacity](global-capacity.md) for the field map and scheduling behavior.
 
 ```bash
 pi-famulus config get max-agents
 pi-famulus config set max-agents 12
+pi-famulus config set max-test-suite 3
+pi-famulus config get max-test-suite
 ```
 
 ### `daemon`
