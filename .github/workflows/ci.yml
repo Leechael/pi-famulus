@@ -73,6 +73,8 @@ jobs:
       PI_BIN: ${{ github.workspace }}/eval/node_modules/.bin/pi
       # Keep every sandbox (/tmp/eval-*) so a failure can be uploaded.
       PI_FAMULUS_EVAL_KEEP: "1"
+      # real-manager integration uses its own home, not an eval sandbox.
+      PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,7 +99,7 @@ jobs:
         working-directory: extension
       - run: npm ci
         working-directory: eval
-      - run: npx vitest run tests/integration/real-manager.test.ts
+      - run: npx vitest run tests/integration/real-manager.test.ts tests/integration/contract-startup-lock-gap.test.ts
         working-directory: extension
         env:
           PI_FAMULUS_INTEG: "1"
@@ -114,6 +116,7 @@ jobs:
         with:
           name: e2e-sandboxes-${{ matrix.os }}
           path: |
+            pi-famulus-test-artifacts/
             /tmp/eval-*/h/manager.log
             /tmp/eval-*/h/events.jsonl
             /tmp/eval-*/h/config.json
