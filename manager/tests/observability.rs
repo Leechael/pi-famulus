@@ -706,6 +706,81 @@ fn c11_stats_by_agent_and_kind() {
     assert!(!home.sock().exists(), "stats must not start the daemon");
 }
 
+/// `top` is a plain-text snapshot over retained task and agent records, with
+/// CPU grouped by agent/work kind and child usage included even without tasks.
+#[test]
+fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
+    let home = Home::new("c12");
+    let now = now_ms();
+    record_fixture(
+        &home,
+        "sess-top",
+        "sh_0000e001",
+        now - 5_000,
+        json!({"command":"pdm run test", "origin":{"via":"child-bash","child_id":"ch_0000e001"},
+            "ended_at":now - 1_000,"cpu_user_ms":1_400,"cpu_sys_ms":100}),
+    );
+    record_fixture(&home, "sess-top", "sh_0000e002", now - 2_000, json!({"command":"git status","ended_at":now - 1_000,"cpu_user_ms":200,"cpu_sys_ms":50}));
+    let project = home.path.join("project");
+    std::fs::create_dir_all(project.join(".pi")).unwrap();
+    std::fs::write(project.join(".pi/famulus-kinds.json"), r#"{"version":1,"commands":{"./ci-fast":"build"}}"#).unwrap();
+    record_fixture(&home, "sess-top", "sh_0000e003", now - 3_000, json!({"command":"./ci-fast --quick","cwd":project.to_string_lossy().to_string(),"ended_at":now - 1_000,"cpu_user_ms":30,"cpu_sys_ms":5}));
+    agent_fixture(&home, "sess-top", json!({"child_id":"ch_0000e001","run_id":"run_0000e001","session_id":"sess-top",
+        "name":"worker","agent":"worker","status":"completed","tokens_input":100,"tokens_output":20,
+        "llm_ms":2000,"tool_ms":1000,"queue_ms":500,"wall_other_ms":100,"wall_approximate":true}));
+    agent_fixture(&home, "sess-top", json!({"child_id":"ch_0000e002","run_id":"run_0000e002","session_id":"sess-top",
+        "name":"idle-child","agent":"worker","status":"completed","tokens_input":50,"tokens_output":10,"llm_ms":1000}));
+
+    let report: Value = serde_json::from_str(&cli_ok(&home, &["top", "--json"]).stdout).unwrap();
+    let worker = report["agents"].as_array().unwrap().iter().find(|a| a["child_id"] == "ch_0000e001").unwrap();
+    assert_eq!((worker["tasks"].as_u64(), worker["cpu_ms"].as_u64()), (Some(1), Some(1_500)));
+    assert_eq!((worker["tokens_input"].as_u64(), worker["tokens_output"].as_u64()), (Some(100), Some(20)));
+    assert_eq!(worker["output_tokens_per_second"].as_f64(), Some(10.0));
+    assert_eq!(worker["wall_approximate"], true);
+    assert!(report["agents"].as_array().unwrap().iter().any(|a| a["child_id"] == "ch_0000e002" && a["tasks"] == 0));
+    let suite = report["work_kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "test-suite").unwrap();
+    assert_eq!((suite["tasks"].as_u64(), suite["cpu_ms"].as_u64()), (Some(1), Some(1_500)));
+    let override_kind = report["work_kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "build").unwrap();
+    assert_eq!((override_kind["tasks"].as_u64(), override_kind["cpu_ms"].as_u64()), (Some(1), Some(35)));
+    assert_eq!(report["cpu_note"].as_str().unwrap().contains("100% equals one core"), true);
+
+    let text = cli_ok(&home, &["top"]).stdout;
+    assert!(text.contains("AGENTS") && text.contains("WORK KINDS") && text.contains("10.0 output tok/s") && text.contains("test-suite"), "{text}");
+    assert!(!home.sock().exists(), "top must not start the daemon");
+}
+
+/// Real-daemon smoke test: a busy process group becomes visible as cumulative
+/// and recent CPU in the plain-text `top` command.
+#[test]
+fn c13_top_reports_live_process_group_cpu() {
+    let home = Home::new_real("c13");
+    let _daemon = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-top-live", "/tmp");
+    let child_id = "ch_0000e101";
+    let (id, _pid) = start(
+        &mut c,
+        "while :; do :; done",
+        json!({"origin":{"via":"child-bash","child_id":child_id,"run_id":"run_0000e101"}}),
+    );
+    let sampled = poll_until(S(18), || {
+        let task = c.task(&id)?;
+        let cpu = task["live_cpu_user_ms"].as_u64().unwrap_or(0) + task["live_cpu_sys_ms"].as_u64().unwrap_or(0);
+        let percent = task["live_cpu_percent"].as_f64().unwrap_or(0.0);
+        (cpu > 0 && percent > 0.0).then_some((cpu, percent))
+    })
+    .expect("daemon should publish at least two live process-group samples");
+    let out = cli_ok(&home, &["top", "--json"]);
+    let report: Value = serde_json::from_str(&out.stdout).unwrap();
+    let agent = report["agents"].as_array().unwrap().iter().find(|a| a["child_id"] == child_id).unwrap();
+    assert!(agent["cpu_ms"].as_u64().unwrap() > 0, "{agent}");
+    assert!(agent["cpu_now_percent"].as_f64().unwrap() > 0.0, "{agent}");
+    assert!(report["work_kinds"].as_array().unwrap().iter().any(|k| k["cpu_now_percent"].as_f64().unwrap_or(0.0) > 0.0));
+    println!("live top smoke: task CPU={:?}, {:?};\n{}", sampled.0, sampled.1, cli_ok(&home, &["top"]).stdout);
+    let stop = home.cli(&["stop", &id], S(10));
+    assert!(stop.status.success(), "{}{}", stop.stdout, stop.stderr);
+}
+
 /// Run the CLI with its stdout on a pseudo-terminal (script(1)), the way a
 /// person runs it, and return what reached the terminal. None when `script`
 /// isn't runnable here (missing, or no pty available), so a minimal host

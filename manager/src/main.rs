@@ -169,6 +169,7 @@ async fn async_main() {
             };
             run_client(stats::cmd_stats(&home, opts)).await
         }
+        Sub::Top { json } => run_client(stats::cmd_top(&home, json)).await,
         Sub::Agent { id, full, follow } => {
             run_client(inspect::cmd_agent(&home, &id, full, follow)).await
         }

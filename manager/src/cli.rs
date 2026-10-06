@@ -39,7 +39,7 @@ impl Sub {
     /// Listings and dumps a person reads; not a follow, not an action.
     pub(crate) fn pages(&self) -> bool {
         match self {
-            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } => true,
+            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } | Sub::Top { .. } => true,
             Sub::Agent { follow, .. } | Sub::Events { follow, .. } | Sub::Log { follow, .. } => {
                 !follow
             }
@@ -102,6 +102,15 @@ pub(crate) enum Sub {
     Show {
         /// Task, monitor, agent, or run id (fuzzy match ok).
         id: String,
+        /// Machine-readable JSON on stdout.
+        #[usage(long)]
+        json: bool,
+    },
+    /// Cumulative and live shell-task CPU by agent and work kind, with tokens.
+    ///
+    /// A plain-text snapshot; 100% NOW equals one CPU core.
+    #[usage(display_order = 43, help_heading = "Inspection")]
+    Top {
         /// Machine-readable JSON on stdout.
         #[usage(long)]
         json: bool,
