@@ -118,6 +118,8 @@ pub struct DaemonState {
     /// Recent `start` request keys ("<session>\0<key>", task id), oldest
     /// first: a retried start returns the task it already started.
     pub start_keys: std::collections::VecDeque<(String, String)>,
+    /// Agent permits keyed by session and child id.
+    pub agent_permits: HashMap<(String, String), ()>,
 }
 
 /// Bound on remembered start keys.
@@ -148,6 +150,7 @@ impl DaemonState {
             upgrade_pending: false,
             upgrade_ready: None,
             start_keys: std::collections::VecDeque::new(),
+            agent_permits: HashMap::new(),
         }
     }
 }
@@ -1801,6 +1804,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
         task_counts: TaskCounts { running, terminal },
+        agent_capacity: AgentCapacity { used: st.agent_permits.len(), total: crate::capacity::max_agents(&st.home) },
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),

@@ -432,6 +432,9 @@ pub struct SessionInfo {
     pub last_seen: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentCapacity { pub used: usize, pub total: usize }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCounts {
     pub running: usize,
@@ -445,6 +448,9 @@ pub struct StatusOk {
     pub uptime_ms: u64,
     pub sessions: Vec<SessionInfo>,
     pub task_counts: TaskCounts,
+    /// Machine-wide active subagent permits / configured maximum.
+    #[serde(default)]
+    pub agent_capacity: AgentCapacity,
     /// The manager's protocol level ([`PROTOCOL`]).
     #[serde(default)]
     pub protocol: u32,

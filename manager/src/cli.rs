@@ -27,6 +27,14 @@ pub(crate) struct Cli {
     pub(crate) cmd: Sub,
 }
 
+#[derive(usage::Subcommands)]
+pub(crate) enum ConfigAction {
+    /// Read a setting.
+    Get { key: String },
+    /// Persist and immediately apply a setting.
+    Set { key: String, value: String },
+}
+
 impl Sub {
     /// Listings and dumps a person reads; not a follow, not an action.
     pub(crate) fn pages(&self) -> bool {
@@ -45,6 +53,9 @@ impl Sub {
 // into it, and the ungrouped section is always rendered first.
 #[derive(usage::Subcommands)]
 pub(crate) enum Sub {
+    /// Read or update runtime daemon configuration.
+    #[usage(display_order = 5, help_heading = "Daemon")]
+    Config { #[usage(subcommand)] action: ConfigAction },
     /// Version, protocol, uptime, sessions, task and agent counts.
     ///
     /// Never starts the daemon ("pi-famulus is not running", exit 1).

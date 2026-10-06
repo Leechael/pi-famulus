@@ -3,6 +3,7 @@
 //! socket client (design doc §3.5).
 
 mod cli;
+mod capacity;
 mod out;
 
 mod client;
@@ -66,6 +67,19 @@ async fn async_main() {
             handover,
         } => daemon::run(home, foreground, handover).await,
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
+        Sub::Config { action } => match action {
+            cli::ConfigAction::Get { key } => {
+                if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
+                else { println!("{}", capacity::max_agents(&home)); 0 }
+            }
+            cli::ConfigAction::Set { key, value } => {
+                if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
+                else { match value.parse::<usize>() {
+                    Ok(n) => match capacity::set_max_agents(&home, n) { Ok(()) => 0, Err(e) => { eprintln!("pi-famulus: {e}"); 1 } },
+                    Err(_) => { eprintln!("max-agents must be a positive integer"); 1 }
+                }}
+            }
+        },
         Sub::Sessions { json } => run_client(inspect::cmd_sessions(&home, json)).await,
         Sub::List {
             all,
