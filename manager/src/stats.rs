@@ -306,6 +306,9 @@ mod tests {
             cpu_user_ms: cpu.map(|c| c.0),
             cpu_sys_ms: cpu.map(|c| c.1),
             max_rss_kb: cpu.map(|_| 1),
+            live_cpu_user_ms: None,
+            live_cpu_sys_ms: None,
+            live_cpu_percent: None,
         }
     }
 

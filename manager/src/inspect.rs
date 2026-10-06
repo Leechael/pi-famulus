@@ -393,6 +393,12 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rss_kb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_user_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sys_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
@@ -441,6 +447,9 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         cpu_user_ms: t.cpu_user_ms,
         cpu_sys_ms: t.cpu_sys_ms,
         max_rss_kb: t.max_rss_kb,
+        live_cpu_user_ms: t.live_cpu_user_ms,
+        live_cpu_sys_ms: t.live_cpu_sys_ms,
+        live_cpu_percent: t.live_cpu_percent,
         pid: Some(t.pid),
         origin: t.origin.clone(),
         backgrounded_at: t.backgrounded_at,
@@ -473,6 +482,9 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         cpu_user_ms: None,
         cpu_sys_ms: None,
         max_rss_kb: None,
+        live_cpu_user_ms: None,
+        live_cpu_sys_ms: None,
+        live_cpu_percent: None,
         pid: None,
         origin: None,
         backgrounded_at: None,
@@ -606,8 +618,8 @@ pub fn filter_rows(
     Ok(rows)
 }
 
-pub const LS_COLUMNS: [&str; 12] = [
-    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "EXIT", "REASON", "TITLE",
+pub const LS_COLUMNS: [&str; 13] = [
+    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "NOW", "EXIT", "REASON", "TITLE",
 ];
 /// Columns before TITLE.
 const LS_FIXED: usize = LS_COLUMNS.len() - 1;
@@ -618,7 +630,11 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
     let cells: Vec<[String; LS_FIXED]> = rows
         .iter()
         .map(|r| {
-            let cpu = cpu_ms(r.cpu_user_ms, r.cpu_sys_ms);
+            let cpu = if r.running {
+                cpu_ms(r.live_cpu_user_ms, r.live_cpu_sys_ms)
+            } else {
+                cpu_ms(r.cpu_user_ms, r.cpu_sys_ms)
+            };
             [
                 r.id.clone(),
                 r.kind.clone(),
@@ -629,6 +645,7 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
                 r.duration_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into()),
                 cpu_text(cpu),
                 cores_text(cpu, r.duration_ms.unwrap_or(0)),
+                r.live_cpu_percent.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into()),
                 exit_col(r),
                 r.end_reason.clone().unwrap_or_else(|| "-".into()),
             ]
@@ -823,20 +840,34 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
                 kv("ended", fmt::datetime(e));
             }
             kv("duration", fmt::human_duration(r.duration_ms.unwrap_or(0)));
-            match cpu_ms(t.cpu_user_ms, t.cpu_sys_ms) {
-                Some(c) => kv(
-                    "cpu",
-                    format!(
-                        "{} (user {}, sys {}), {} cores avg, peak rss {}",
-                        cpu_text(Some(c)),
-                        cpu_text(t.cpu_user_ms),
-                        cpu_text(t.cpu_sys_ms),
-                        cores_text(Some(c), r.duration_ms.unwrap_or(0)),
-                        t.max_rss_kb.map(|k| format!("{} MiB", k / 1024)).unwrap_or_else(|| "?".into())
+            if r.running {
+                if let Some(c) = cpu_ms(t.live_cpu_user_ms, t.live_cpu_sys_ms) {
+                    let current = t.live_cpu_percent.map(|p| format!(", now {p:.0}%")).unwrap_or_default();
+                    kv(
+                        "cpu",
+                        format!(
+                            "{} (live user {}, sys {}; best-effort sample{current})",
+                            cpu_text(Some(c)),
+                            cpu_text(t.live_cpu_user_ms),
+                            cpu_text(t.live_cpu_sys_ms),
+                        ),
+                    );
+                }
+            } else {
+                match cpu_ms(t.cpu_user_ms, t.cpu_sys_ms) {
+                    Some(c) => kv(
+                        "cpu",
+                        format!(
+                            "{} (user {}, sys {}), {} cores avg, peak rss {}",
+                            cpu_text(Some(c)),
+                            cpu_text(t.cpu_user_ms),
+                            cpu_text(t.cpu_sys_ms),
+                            cores_text(Some(c), r.duration_ms.unwrap_or(0)),
+                            t.max_rss_kb.map(|k| format!("{} MiB", k / 1024)).unwrap_or_else(|| "?".into())
+                        ),
                     ),
-                ),
-                None if r.running => {}
-                None => kv("cpu", "not measured (no runner report: SIGKILLed with its group, or an older record)"),
+                    None => kv("cpu", "not measured (no runner report: SIGKILLed with its group, or an older record)"),
+                }
             }
             if let Some(b) = t.backgrounded_at {
                 kv("backgrounded", format!("after {}", fmt::human_duration(b.saturating_sub(t.started_at))));

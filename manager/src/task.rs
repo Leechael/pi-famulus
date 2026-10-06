@@ -4,8 +4,7 @@
 //! Pipe creation uses `Stdio::piped()` (CLOEXEC, no raw fds). Session leadership
 //! and group signalling live in [`crate::sys`] — the only production `unsafe`.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -26,19 +25,75 @@ pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
 /// This deliberately does not pretend to include reaped descendants.
 pub fn live_group_cpu_ms(pgid: u32) -> Option<(u64, u64)> {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks <= 0 { return None; }
+    if ticks <= 0 {
+        return None;
+    }
     let mut user = 0u64;
     let mut system = 0u64;
+    let mut readable = 0usize;
     let members = crate::sys::group_members(pgid).ok()?;
-    if members.is_empty() { return None; }
     for pid in members {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let close = text.rfind(')')?;
+        // A process can exit between group enumeration and this read. Keep
+        // the rest of the group rather than dropping an otherwise useful sample.
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close) = text.rfind(')') else { continue };
         let fields: Vec<&str> = text[close + 2..].split_whitespace().collect();
-        user = user.saturating_add(fields.get(11)?.parse::<u64>().ok()?);
-        system = system.saturating_add(fields.get(12)?.parse::<u64>().ok()?);
+        let (Some(u), Some(s)) = (fields.get(11), fields.get(12)) else { continue };
+        let (Ok(u), Ok(s)) = (u.parse::<u64>(), s.parse::<u64>()) else { continue };
+        user = user.saturating_add(u);
+        system = system.saturating_add(s);
+        readable += 1;
     }
-    Some((user.saturating_mul(1000) / ticks as u64, system.saturating_mul(1000) / ticks as u64))
+    (readable > 0).then(|| (user.saturating_mul(1000) / ticks as u64, system.saturating_mul(1000) / ticks as u64))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveCpuReading {
+    pub user_ms: u64,
+    pub system_ms: u64,
+    /// Recent CPU use as a percentage of one core; multi-process groups may
+    /// exceed 100%. Absent until two samples are available.
+    pub percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveCpuSample {
+    at_ms: u64,
+    user_ms: u64,
+    system_ms: u64,
+}
+
+/// Monotonic best-effort CPU snapshots and interval rates by task id.
+#[derive(Default)]
+pub struct LiveCpuTracker {
+    previous: HashMap<String, LiveCpuSample>,
+}
+
+impl LiveCpuTracker {
+    pub fn update(&mut self, task_id: &str, at_ms: u64, user_ms: u64, system_ms: u64) -> LiveCpuReading {
+        let previous = self.previous.get(task_id).copied();
+        let user_ms = previous.map_or(user_ms, |p| p.user_ms.max(user_ms));
+        let system_ms = previous.map_or(system_ms, |p| p.system_ms.max(system_ms));
+        let percent = previous.and_then(|p| {
+            let elapsed = at_ms.saturating_sub(p.at_ms);
+            if elapsed == 0 {
+                return None;
+            }
+            let user_delta = user_ms.saturating_sub(p.user_ms);
+            let system_delta = system_ms.saturating_sub(p.system_ms);
+            Some((user_delta + system_delta) as f64 * 100.0 / elapsed as f64)
+        });
+        // Keep the monotonic envelope: /proc only covers members still
+        // visible in the group, so an exited descendant can disappear.
+        self.previous.insert(task_id.to_string(), LiveCpuSample { at_ms, user_ms, system_ms });
+        LiveCpuReading { user_ms, system_ms, percent }
+    }
+
+    pub fn retain(&mut self, active: &HashSet<String>) {
+        self.previous.retain(|task_id, _| active.contains(task_id));
+    }
 }
 
 /// §3.4: in-memory ring buffer is 64KB; the disk file keeps the full stream.
@@ -541,6 +596,23 @@ mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
+
+    #[test]
+    fn live_cpu_tracker_updates_running_totals_and_recent_rate() {
+        let mut tracker = LiveCpuTracker::default();
+        let first = tracker.update("sh_1", 1_000, 100, 20);
+        assert_eq!((first.user_ms, first.system_ms, first.percent), (100, 20, None));
+
+        let second = tracker.update("sh_1", 6_000, 300, 40);
+        assert_eq!((second.user_ms, second.system_ms), (300, 40));
+        assert_eq!(second.percent, Some(4.4));
+
+        // A process leaving /proc cannot make a live total move backwards.
+        let third = tracker.update("sh_1", 11_000, 50, 10);
+        assert_eq!((third.user_ms, third.system_ms, third.percent), (300, 40, Some(0.0)));
+        tracker.retain(&HashSet::new());
+        assert_eq!(tracker.update("sh_1", 16_000, 1, 2).percent, None);
+    }
 
     #[test]
     fn ring_buffer_caps_at_capacity() {

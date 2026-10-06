@@ -211,6 +211,16 @@ pub struct TaskRecord {
     /// Peak RSS of the single largest process in that set, in KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rss_kb: Option<u64>,
+    /// Best-effort live process-group CPU snapshot, present only in daemon
+    /// responses for running tasks (never retained on disk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_user_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sys_ms: Option<u64>,
+    /// CPU used during the last sampling interval, in percent of one core.
+    /// Process-group values can exceed 100% when several cores are busy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_percent: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

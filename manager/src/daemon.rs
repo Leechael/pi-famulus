@@ -30,6 +30,8 @@ const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
 /// Poll interval for a process group that outlived its runner (fallback
 /// only: normally the runner guards its group and its exit says "empty").
 const GROUP_POLL: Duration = Duration::from_millis(500);
+/// Best-effort live process-group CPU refresh interval.
+const LIVE_CPU_POLL: Duration = Duration::from_secs(5);
 
 type OutTx = mpsc::Sender<OutFrame>;
 
@@ -471,6 +473,7 @@ async fn serve(
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
+    let live_cpu_sampler = spawn_live_cpu_sampler(&state);
     // In-place upgrade when the binary on disk changes.
     spawn_exe_watch(&state);
     #[cfg(feature = "test-clock")]
@@ -540,8 +543,51 @@ async fn serve(
             } => break,
         }
     }
+    live_cpu_sampler.abort();
     drop(daemon_lock);
     0
+}
+
+fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut tracker = task::LiveCpuTracker::default();
+        loop {
+            tokio::time::sleep(LIVE_CPU_POLL).await;
+            let running: Vec<(String, u32)> = {
+                let st = state.lock().unwrap();
+                st.registry
+                    .tasks
+                    .values()
+                    .filter(|entry| entry.record.status == TaskStatus::Running)
+                    .map(|entry| (entry.record.task_id.clone(), entry.record.pid))
+                    .collect()
+            };
+            let active: HashSet<String> = running.iter().map(|(id, _)| id.clone()).collect();
+            tracker.retain(&active);
+            let at = now_ms();
+            let readings: Vec<(String, task::LiveCpuReading)> = running
+                .into_iter()
+                .filter_map(|(id, pgid)| {
+                    let (user, system) = task::live_group_cpu_ms(pgid)?;
+                    Some((id.clone(), tracker.update(&id, at, user, system)))
+                })
+                .collect();
+            if readings.is_empty() {
+                continue;
+            }
+            let mut st = state.lock().unwrap();
+            for (id, reading) in readings {
+                let Some(entry) = st.registry.tasks.get_mut(&id) else { continue };
+                if entry.record.status != TaskStatus::Running {
+                    continue;
+                }
+                entry.record.live_cpu_user_ms = Some(reading.user_ms);
+                entry.record.live_cpu_sys_ms = Some(reading.system_ms);
+                entry.record.live_cpu_percent = reading.percent;
+            }
+        }
+    })
 }
 
 /// Poll the resolved install path for this daemon's executable. A path change
@@ -1678,6 +1724,9 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         cpu_user_ms: None,
         cpu_sys_ms: None,
         max_rss_kb: None,
+        live_cpu_user_ms: None,
+        live_cpu_sys_ms: None,
+        live_cpu_percent: None,
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -3179,6 +3228,9 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         entry.record.ended_at = Some(now);
         entry.record.output_size = entry.output.lock().unwrap().total_size;
         entry.record.status = registry::terminal_status(entry.kill_requested, code, signal);
+        entry.record.live_cpu_user_ms = None;
+        entry.record.live_cpu_sys_ms = None;
+        entry.record.live_cpu_percent = None;
         // Why it ended: our kill's reason; otherwise a natural exit.
         entry.record.end_reason = Some(
             entry
@@ -3346,6 +3398,9 @@ async fn graceful_shutdown(state: &Shared) {
         for e in st.registry.tasks.values_mut() {
             if e.record.status == TaskStatus::Running {
                 e.record.status = TaskStatus::Killed;
+                e.record.live_cpu_user_ms = None;
+                e.record.live_cpu_sys_ms = None;
+                e.record.live_cpu_percent = None;
                 e.record.ended_at = Some(now);
                 e.record.output_size = e.output.lock().unwrap().total_size;
                 e.record.end_reason = Some(

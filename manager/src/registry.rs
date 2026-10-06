@@ -303,7 +303,11 @@ pub fn persist_record(home: &Path, record: &TaskRecord) -> io::Result<()> {
     fs::create_dir_all(&dir)?;
     let final_path = task_json_path(home, &record.session_id, &record.task_id);
     let tmp_path = dir.join(format!("{}.json.tmp", record.task_id));
-    fs::write(&tmp_path, serde_json::to_vec(record).map_err(io::Error::other)?)?;
+    let mut persisted = record.clone();
+    persisted.live_cpu_user_ms = None;
+    persisted.live_cpu_sys_ms = None;
+    persisted.live_cpu_percent = None;
+    fs::write(&tmp_path, serde_json::to_vec(&persisted).map_err(io::Error::other)?)?;
     fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
@@ -376,6 +380,9 @@ mod tests {
             cpu_user_ms: None,
             cpu_sys_ms: None,
             max_rss_kb: None,
+            live_cpu_user_ms: None,
+            live_cpu_sys_ms: None,
+            live_cpu_percent: None,
         }
     }
 

@@ -577,7 +577,7 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let out = cli_ok(&home, &["ls", "--all"]);
     let lines: Vec<&str> = out.stdout.lines().collect();
     let header: Vec<&str> = lines[0].split_whitespace().collect();
-    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "EXIT", "REASON", "TITLE"]);
+    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "NOW", "EXIT", "REASON", "TITLE"]);
     let rows: Vec<&str> = lines[1..].to_vec();
     // The connected session's work, running and finished. 0199aaaa-1111 never
     // connected, so its finished task is not listed (still reachable via show).
@@ -596,15 +596,16 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let title = &cjk_row[cjk_row.char_indices().nth(lines[0][..title_start].chars().count()).unwrap().0..];
     assert!(width(title) <= 60, "title {} columns: {title}", width(title));
     assert!(cjk_row.contains("exited") && cjk_row.contains(" 0 "), "{cjk_row}");
-    // CPU / CORES: measured for the finished task, "-" while running.
-    let cols = |row: &str| -> (String, String) {
+    // CPU / CORES: measured for the finished task, live samples for running tasks.
+    let cols = |row: &str| -> (String, String, String) {
         let f: Vec<&str> = row.split_whitespace().collect();
-        (f[7].to_string(), f[8].to_string())
+        (f[7].to_string(), f[8].to_string(), f[9].to_string())
     };
-    let (cpu, cores) = cols(cjk_row);
+    let (cpu, cores, now) = cols(cjk_row);
     assert!(cpu.ends_with('s') && cpu[..cpu.len() - 1].parse::<f64>().is_ok(), "CPU {cpu:?}: {cjk_row}");
     assert!(cores.parse::<f64>().is_ok(), "CORES {cores:?}: {cjk_row}");
-    assert_eq!(cols(running), ("-".to_string(), "-".to_string()), "{running}");
+    assert_eq!(now, "-", "terminal tasks have no recent sample: {cjk_row}");
+    assert_eq!(cols(running), ("-".to_string(), "-".to_string(), "-".to_string()), "{running}");
 
     // filters
     let ids = |args: &[&str]| -> Vec<String> {
