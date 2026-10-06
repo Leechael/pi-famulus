@@ -96,10 +96,11 @@ export interface InProcessRunnerOptions {
   clock?: Clock;
   /**
    * Per-generation admission hook. Awaited before each (re)start; the
-   * resolved releaser is called when the generation settles. Rejecting
-   * cancels the generation as {status:"interrupted", error}.
+   * releaser gets terminal=false for a resumable interruption so its local
+   * slot can be returned while the child-owned machine permit is retained.
+   * Rejecting cancels the generation as {status:"interrupted", error}.
    */
-  acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<() => void>;
+  acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<(terminal?: boolean) => void>;
   /**
    * Called after the child's conversation may have changed (a message or
    * tool finished, or the generation settled). Used to persist transcripts.
@@ -136,7 +137,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly hardTimeoutMs: number;
   private readonly onOverrun?: (tick: OverrunTick) => void;
   private readonly clock: Clock;
-  private readonly acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<() => void>;
+  private readonly acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<(terminal?: boolean) => void>;
   private readonly onActivity?: (childId: string) => void;
 
   private session: ChildSessionAdapter | null = null;
@@ -185,7 +186,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private stallAttempts = 0;
   /** Generation retired by a stall detection awaiting its retry. */
   private retiredGen: number | null = null;
-  private releaseSlot: (() => void) | null = null;
+  private releaseSlot: ((terminal?: boolean) => void) | null = null;
   private disposed = false;
   /** Nested tool_execution_start/end. Stall stays paused while > 0. */
   private toolDepth = 0;
@@ -438,6 +439,9 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
     // Never leave result waiters hanging.
     this.settle(this.generation, { status: "interrupted", text: "", error: "disposed", durationMs: 0 });
+    // settle() can be a no-op if the child was already interrupted; disposal
+    // is terminal and must still return its retained machine permit.
+    this.release(true);
   }
 
   // -------------------------------------------------------------------------
@@ -490,7 +494,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       }
     }
     if (this.disposed || this.isSettled(gen)) {
-      this.release();
+      this.release(this.disposed || this.status_ !== "interrupted");
       return;
     }
     this.status_ = "running";
@@ -656,7 +660,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       result.warning = this.session.warning;
     }
     this.status_ = result.status;
-    this.release();
+    this.release(result.status !== "interrupted" || result.error === "disposed");
     this.notifyActivity();
     this.resolveResult(result);
   }
@@ -669,12 +673,12 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
   }
 
-  private release(): void {
+  private release(terminal = true): void {
     const release = this.releaseSlot;
-    this.releaseSlot = null;
+    if (terminal) this.releaseSlot = null;
     if (release) {
       try {
-        release();
+        release(terminal);
       } catch {
         // ignore
       }

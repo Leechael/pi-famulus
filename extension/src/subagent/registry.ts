@@ -370,7 +370,10 @@ export class SubagentRegistry implements RunRegistry {
    * and wires result settlement for resumed generations. Returns the slot
    * releaser.
    */
-  async admitChild(childId: string, ticket?: { current: () => boolean }): Promise<() => void> {
+  async reserveChildSlot(
+    childId: string,
+    ticket?: { current: () => boolean },
+  ): Promise<{ admit: () => void; release: () => void }> {
     await this.acquireSlot();
     let released = false;
     const release = () => {
@@ -383,27 +386,45 @@ export class SubagentRegistry implements RunRegistry {
       release();
       throw new Error(`unknown child ${childId}`);
     }
-    if (child.shouldStart && !child.shouldStart()) {
+    const checkCurrent = () => {
+      if (child.shouldStart && !child.shouldStart()) throw new ChildCancelledError();
+      // A request settled while waiting (interrupt/dispose or a newer resume
+      // queued behind other children) must hand this local reservation on.
+      const stale = ticket ? !ticket.current() : (child.handle?.status() ?? "pending") !== "pending";
+      if (stale) throw new ChildCancelledError("settled while queued");
+    };
+    try {
+      checkCurrent();
+    } catch (error) {
       release();
-      throw new ChildCancelledError();
+      throw error;
     }
-    // The generation that queued this request settled while it waited
-    // (interrupt/dispose; maybe a newer resume is queued behind other
-    // children): hand the slot on, without touching the child's status.
-    // Without a ticket, fall back to the handle's status.
-    const stale = ticket ? !ticket.current() : (child.handle?.status() ?? "pending") !== "pending";
-    if (stale) {
-      release();
-      throw new ChildCancelledError("settled while queued");
+    let admitted = false;
+    return {
+      release,
+      admit: () => {
+        if (admitted) return;
+        checkCurrent();
+        admitted = true;
+        this.transitionChild(child, "running");
+        const handle = child.handle;
+        if (handle) {
+          // Resume generations: wire settlement only once global admission also succeeds.
+          handle.result.then((result) => this.settleChild(childId, result));
+        }
+      },
+    };
+  }
+
+  async admitChild(childId: string, ticket?: { current: () => boolean }): Promise<() => void> {
+    const reservation = await this.reserveChildSlot(childId, ticket);
+    try {
+      reservation.admit();
+      return reservation.release;
+    } catch (error) {
+      reservation.release();
+      throw error;
     }
-    this.transitionChild(child, "running");
-    const handle = child.handle;
-    if (handle) {
-      // Resume generations: the handle (and its fresh result promise) already
-      // exists, so wire settlement here. Generation 1 is wired by startChild.
-      handle.result.then((result) => this.settleChild(childId, result));
-    }
-    return release;
   }
 
   /**

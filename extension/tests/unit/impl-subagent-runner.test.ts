@@ -205,6 +205,38 @@ describe("InProcessRunner", () => {
     expect(released).toBe(2);
   });
 
+  it("keeps the machine permit across an interrupted resumable turn", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => (terminal = true) => { releases.push(terminal); },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    expect(releases).toEqual([false]);
+    factory.sessions[0].autoComplete = "resumed";
+    await handle.resume("continue");
+    expect((await handle.result).status).toBe("completed");
+    expect(releases).toEqual([false, true]);
+  });
+
+  it("releases an interrupted child's retained machine permit on disposal", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => (terminal = true) => { releases.push(terminal); },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    expect(releases).toEqual([false]);
+    handle.dispose();
+    expect(releases).toEqual([false, true]);
+  });
+
   it("cancels the child when admission rejects", async () => {
     const factory = new SessionFactory();
     const runner = new InProcessRunner({
