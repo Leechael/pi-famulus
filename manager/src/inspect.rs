@@ -761,6 +761,7 @@ fn wake_summary(evs: &[EventLine]) -> Option<String> {
             let mut parts = Vec::new();
             if let Some(e) = e { parts.push(format!("emitted {}", fmt::datetime(e.ts))); }
             if let Some(d) = d { parts.push(format!("delivered {} ({})", fmt::datetime(d.ts), d.raw.get("mode").and_then(|m| m.as_str()).unwrap_or("?"))); }
+            if e.is_some() && d.is_none() { parts.push("not delivered".to_string()); }
             if let Some(i) = i {
                 let lag = i.raw.get("lag_ms").and_then(|v| v.as_i64()).map(|ms| format!("{:.1}s", ms as f64 / 1000.0)).unwrap_or_else(|| "unknown".to_string());
                 parts.push(format!("injected {} ({} after emit)", fmt::datetime(i.ts), lag));
@@ -1383,6 +1384,22 @@ pub async fn wait_agent(home: &Path, child_id: &str, budget_ms: u64) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_summary_keeps_undelivered_hint_without_injection() {
+        let event = |ts, ty: &str| EventLine {
+            ts,
+            src: "extension".to_string(),
+            ty: ty.to_string(),
+            id: Some("wake-1".to_string()),
+            session: None,
+            raw: json!({"ts": ts, "type": ty}),
+        };
+        let summary = wake_summary(&[event(1, "wake.emit")]).unwrap();
+        assert!(summary.contains("not delivered"), "{summary}");
+        let delivered = wake_summary(&[event(1, "wake.emit"), event(2, "wake.deliver")]).unwrap();
+        assert!(!delivered.contains("not delivered"), "{delivered}");
+    }
 
     #[test]
     fn prefixes_are_unique_and_at_least_8() {
