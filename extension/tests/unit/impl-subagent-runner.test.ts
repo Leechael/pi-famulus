@@ -222,6 +222,33 @@ describe("InProcessRunner", () => {
     expect(releases).toEqual([false, true]);
   });
 
+  it("keeps the permit when admission resolves after a resumable interruption", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    let resolveAdmission!: (release: (terminal?: boolean) => void) => void;
+    let acquired = 0;
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => {
+        acquired++;
+        if (acquired === 1) return (terminal = true) => { releases.push(terminal); };
+        return new Promise((resolve) => { resolveAdmission = resolve; });
+      },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    await handle.resume("continue");
+    await tick();
+    expect(acquired).toBe(2);
+    await handle.interrupt();
+    resolveAdmission((terminal = true) => { releases.push(terminal); });
+    await tick();
+    expect(releases).toEqual([false, false, false]);
+    handle.dispose();
+    expect(releases).toEqual([false, false, false, true]);
+  });
+
   it("releases an interrupted child's retained machine permit on disposal", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
