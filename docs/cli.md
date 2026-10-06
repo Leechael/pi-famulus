@@ -116,9 +116,10 @@ uptime:   13m23s
 agent slots: 1/8 used
 sessions: 2 (1 connected)
 tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
+agent tokens: 8200 input / 460 output
 ```
 
-The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pi-famulus: pi-famulus is not running` on stderr, exit 1 (also with `--json`).
+The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `agent tokens` sums provider-reported cumulative child input/output usage; records refresh as child messages finish, and the extension also appends absolute totals in `agent.usage` events for readers of the shared event stream. `--json` prints the protocol `status` response plus `agent_counts` and `agent_tokens`. With no daemon: `pi-famulus: pi-famulus is not running` on stderr, exit 1 (also with `--json`).
 
 ### `sessions`
 
@@ -133,9 +134,9 @@ Connected sessions only (a gone session is listed while it still runs something)
 
 ```text
 $ pi-famulus ls
-ID           KIND    SESSION   CWD        STATUS    TIME     DUR    CPU   CORES EXIT    REASON       TITLE
-sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -     -     -       -            npm test
-ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -     -     -       -            review (worker) m1
+ID           KIND    SESSION   CWD        STATUS    TIME     DUR    CPU   CORES NOW EXIT    REASON       TITLE
+sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -     -     -   -    -            npm test
+ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -     -     -   -    -            review (worker) m1
 
 $ pi-famulus ls --all
 ID           KIND    SESSION   CWD        STATUS    TIME     DUR    CPU   CORES NOW EXIT    REASON       TITLE

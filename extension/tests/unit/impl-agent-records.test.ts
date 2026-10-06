@@ -6,6 +6,7 @@ import {
   formatAgentCommand,
   isAgentStatusActive,
   loadAgentChildRecords,
+  updateAgentChildTokens,
   writeAgentChildRecord,
   type AgentChildRecord,
 } from "../../src/subagent/agent-records";
@@ -43,6 +44,27 @@ describe("agent child records", () => {
     expect(formatAgentCommand(loaded[0])).toBe(
       "agent:fix-pr2153 (worker) openai-codex/gpt-5.6-sol",
     );
+  });
+
+  it("refreshes cumulative tokens on a running record without a status transition", () => {
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_usage001",
+      run_id: "run_usage001",
+      session_id: "sess-1",
+      name: "usage",
+      agent: "worker",
+      status: "running",
+      started_at: 1,
+    });
+    updateAgentChildTokens(home, "sess-1", "ch_usage001", { input: 320, output: 17 });
+    expect(loadAgentChildRecords(home)[0]).toMatchObject({
+      status: "running",
+      tokens_input: 320,
+      tokens_output: 17,
+    });
   });
 
   it("round-trips provider errors on failed agent records", () => {

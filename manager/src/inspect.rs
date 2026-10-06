@@ -1338,9 +1338,12 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let agents = load_agent_records(home, &connected);
     let a_running = agents.iter().filter(|a| !agent_status_terminal(&a.status)).count();
     let a_done = agents.len() - a_running;
+    let tokens_input: u64 = agents.iter().map(|a| a.tokens_input.unwrap_or(0)).sum();
+    let tokens_output: u64 = agents.iter().map(|a| a.tokens_output.unwrap_or(0)).sum();
     if json_out {
         let mut v = serde_json::to_value(&st).unwrap();
         v["agent_counts"] = json!({"running": a_running, "terminal": a_done});
+        v["agent_tokens"] = json!({"input": tokens_input, "output": tokens_output});
         outln!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(());
     }
@@ -1386,6 +1389,7 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         a_running,
         a_done
     );
+    outln!("agent tokens: {tokens_input} input / {tokens_output} output");
     if let Some(line) = upgrade_line(&st, now_ms()) {
         outln!("{line}");
     }

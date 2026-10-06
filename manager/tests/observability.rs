@@ -1061,8 +1061,8 @@ fn c6_status_counts_uptime_and_not_running() {
     assert_eq!(out.stderr.trim(), "pi-famulus: pi-famulus is not running");
     assert!(!home.sock().exists(), "status must not start the daemon");
 
-    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed"}));
-    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c602","session_id":"sess-c6","name":"b","agent":"w","status":"failed"}));
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed","tokens_input":35,"tokens_output":5}));
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c602","session_id":"sess-c6","name":"b","agent":"w","status":"failed","tokens_input":12,"tokens_output":4}));
     let _d = home.start_daemon();
     let mut c = home.connect();
     hello_v2(&mut c, "sess-c6", "/tmp");
@@ -1089,10 +1089,12 @@ fn c6_status_counts_uptime_and_not_running() {
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
     assert!(uptime.ends_with('s') && !uptime.contains('.'), "human uptime: {uptime}");
     assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");
+    assert!(s.contains("agent tokens: 47 input / 9 output"), "{s}");
     let out = cli_ok(&home, &["status", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["protocol"], 5);
     assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
+    assert_eq!(v["agent_tokens"], json!({"input":47,"output":9}));
 }
 
 #[test]

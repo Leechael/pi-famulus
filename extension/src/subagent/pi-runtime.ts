@@ -28,6 +28,7 @@ import {
   type ModelCandidate,
 } from "./model-spec";
 import { turnsFromMessages } from "./conversation";
+import { accumulateTokenUsage, normalizedTokenUsage } from "./usage";
 import type { ChildRunRequest, ChildSessionAdapter, CreateSessionFn } from "./types";
 
 /** Structural subset of the pi module namespace we rely on. */
@@ -189,11 +190,10 @@ function wrapSession(
       const message = (event as { message?: { usage?: { input?: number; output?: number } } }).message;
       let usage: { input: number; output: number } | undefined;
       if (event.type === "message_end" && message?.usage) {
-        const input = Number(message.usage.input) || 0;
-        const output = Number(message.usage.output) || 0;
-        tokenUsage.input += input;
-        tokenUsage.output += output;
-        usage = { input, output };
+        usage = normalizedTokenUsage(message.usage);
+        const total = accumulateTokenUsage(tokenUsage, usage);
+        tokenUsage.input = total.input;
+        tokenUsage.output = total.output;
       }
       listener({ type: event.type, ...(usage ? { usage } : {}) });
     }),

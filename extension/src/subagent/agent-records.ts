@@ -4,7 +4,7 @@
  *
  * Layout: <home>/sessions/<session_id>/agents/<child_id>.json
  */
-import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface AgentChildRecord {
@@ -94,6 +94,27 @@ export function writeAgentChildRecord(home: string, record: AgentChildRecord): v
   const dir = agentRecordsDir(home, record.session_id);
   mkdirSync(dir, { recursive: true });
   writeFileSync(agentRecordPath(home, record.session_id, record.child_id), JSON.stringify(record));
+}
+
+/** Refresh live telemetry without waiting for a child state transition. */
+export function updateAgentChildTokens(
+  home: string,
+  sessionId: string,
+  childId: string,
+  tokens: { input: number; output: number },
+): void {
+  const path = agentRecordPath(home, sessionId, childId);
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as Partial<AgentChildRecord>;
+    if (record.v !== 1 || record.kind !== "agent" || record.session_id !== sessionId || record.child_id !== childId) return;
+    writeAgentChildRecord(home, {
+      ...(record as AgentChildRecord),
+      tokens_input: tokens.input,
+      tokens_output: tokens.output,
+    });
+  } catch {
+    // A metrics refresh must never interfere with the in-process child.
+  }
 }
 
 export function removeAgentChildRecord(home: string, sessionId: string, childId: string): void {

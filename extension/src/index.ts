@@ -36,6 +36,7 @@ import {
   agentEndReason,
   headOf,
   tailOf,
+  updateAgentChildTokens,
   writeAgentChildRecord,
   type AgentChildRecord,
 } from "./subagent/agent-records";
@@ -614,6 +615,15 @@ export default function (pi: ExtensionAPI): void {
       }),
       onActivity: (childId) => {
         syncTranscript(childId);
+        const usage = registry.handle(childId)?.tokenUsage();
+        if (usage) {
+          updateAgentChildTokens(home, sessionIdForAgents(), childId, usage);
+          logEvent("agent.usage", {
+            child_id: childId,
+            tokens_input: usage.input,
+            tokens_output: usage.output,
+          });
+        }
       },
       onStall: (childId, attempt) => {
         // One event per stall detection: an auto-resume follows unless the
