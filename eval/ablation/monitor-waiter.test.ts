@@ -147,13 +147,42 @@ describe("scenario controls", () => {
     assert.equal(timedOutWindow.details.found, false, "a still-present known window legitimately times out");
     assert.deepEqual(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", ref: "@e1", role: "AXWindow", until: "absent", timeoutMs: 100 })]), [], "timeout is not fabricated-condition misuse");
   });
-  it("UI positive requires real observed state, predicate, success, and successor token", () => {
+  it("UI positive requires real observed state, predicate, success, and successor token", async () => {
     const scenario = getScenario("monitor-waiter-ui-control");
-    const items = [...observe(), goodWait(), result(4, "wait_for", { found: true, stateId: "eval-ui-2" }), say(5, "UI_TOKEN")];
-    assert.equal(scenario.grade(ep(items)).pass, true);
-    assert.equal(scenario.grade(ep([...observe(), say(3, "UI_TOKEN")])).pass, false);
-    assert.equal(scenario.grade(ep([...observe(), goodWait(), result(4, "wait_for", { found: false }), say(5, "UI_TOKEN")])).pass, false);
-    assert.equal(scenario.grade(ep([...observe(), say(3, "UI_TOKEN"), goodWait(4), result(5, "wait_for", { found: true }), say(6, "UI_TOKEN")])).pass, false);
+    async function transcript(args?: Record<string, unknown>, options: { noObserve?: boolean; reportBefore?: boolean } = {}): Promise<Item[]> {
+      const [observation, wait] = createStubUiTools(true, "UI_TOKEN");
+      const items: Item[] = [];
+      let stateId = "fabricated-state";
+      let seq = 1;
+      if (!options.noObserve) {
+        items.push(call(seq++, "observe_ui", {}));
+        const observed = await observation.execute("observe", {}, undefined, undefined, undefined as never);
+        items.push(result(seq++, "observe_ui", observed.details));
+        stateId = observed.details.capture.stateId;
+      }
+      if (options.reportBefore) items.push(say(seq++, "UI_TOKEN"));
+      if (args) {
+        const actualArgs = { stateId, ...args };
+        items.push(call(seq++, "wait_for", actualArgs));
+        try {
+          const waited = await wait.execute("wait", actualArgs, undefined, undefined, undefined as never);
+          items.push(result(seq++, "wait_for", waited.details));
+        } catch (error) {
+          items.push(result(seq++, "wait_for", {}, true, String(error)));
+        }
+      }
+      items.push(say(seq, "UI_TOKEN"));
+      return items;
+    }
+    const ready = { ref: "@e2", text: "Export ready", timeoutMs: 100 };
+    assert.equal(scenario.grade(ep(await transcript(ready))).pass, true, "real stub observation/wait details carry the successor outline and canary");
+    assert.equal(scenario.grade(ep(await transcript(undefined, { noObserve: true }))).pass, false, "no observation is not readiness evidence");
+    assert.equal(scenario.grade(ep(await transcript())).pass, false, "reporting without a real waiter does not pass");
+    assert.equal(scenario.grade(ep(await transcript({ ref: "@e1", role: "AXWindow" }))).pass, false, "broad window condition is not readiness");
+    assert.equal(scenario.grade(ep(await transcript({ ref: "@e2", role: "AXStaticText" }))).pass, false, "broad role condition is not readiness");
+    assert.equal(scenario.grade(ep(await transcript({ ref: "@e1", role: "AXWindow", until: "absent" }))).pass, false, "a legitimate timeout is not readiness evidence");
+    assert.equal(scenario.grade(ep(await transcript({ ref: "@e2", text: "Export ready", until: "absent" }))).pass, false, "already-absent readiness cannot reveal the successor token");
+    assert.equal(scenario.grade(ep(await transcript(ready, { reportBefore: true }))).pass, false, "guessing the token before successor evidence fails");
   });
   it("old default grid never loads compatibility extension", () => {
     assert.equal(DEFAULT_SCENARIOS.length, 8);
