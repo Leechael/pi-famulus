@@ -92,6 +92,18 @@ describe("machine agent admission", () => {
     expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-running");
   });
 
+  it("stops retrying a child disposed while waiting and restores remaining leases", async () => {
+    const s = setup();
+    const leases = new Set(["disposed-first", "still-running"]);
+    vi.mocked(s.manager.acquireAgent)
+      .mockResolvedValueOnce({ granted: false, rejection: "global_capacity" })
+      .mockResolvedValueOnce({ granted: true });
+    await reregisterAgentLeases(s.manager, leases, async () => { leases.delete("disposed-first"); });
+    expect(s.manager.acquireAgent).toHaveBeenCalledTimes(2);
+    expect(s.manager.acquireAgent).toHaveBeenNthCalledWith(1, "disposed-first");
+    expect(s.manager.acquireAgent).toHaveBeenNthCalledWith(2, "still-running");
+  });
+
   it("gets the local slot before global acquire and frees it while globally denied", async () => {
     const s = setup();
     vi.mocked(s.manager.acquireAgent)

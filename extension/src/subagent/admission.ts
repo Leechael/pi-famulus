@@ -101,13 +101,14 @@ export async function reregisterAgentLeases(
   wait: () => Promise<void> = defaultWait,
 ): Promise<void> {
   if (manager.protocolLevel() < 4) return;
-  for (const childId of leases) {
-    while (manager.isAvailable() && manager.protocolLevel() >= 4) {
+  for (const childId of [...leases]) {
+    while (leases.has(childId) && manager.isAvailable() && manager.protocolLevel() >= 4) {
       const admission = await manager.acquireAgent(childId);
-      if (admission.granted) {
-        if (!leases.has(childId)) void manager.releaseAgent(childId).catch(() => {});
+      if (!leases.has(childId)) {
+        if (admission.granted) void manager.releaseAgent(childId).catch(() => {});
         break;
       }
+      if (admission.granted) break;
       await wait();
     }
   }
