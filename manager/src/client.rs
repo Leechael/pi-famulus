@@ -194,15 +194,30 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
     Ok(conn)
 }
 
-/// Wait until the manager named in manager.pid has exited.
-async fn wait_for_manager_exit(home: &Path, timeout: Duration) {
-    let Some(pid) = lifecycle::read_pid_file(home).map(|p| p.pid) else {
-        return;
-    };
-    let deadline = std::time::Instant::now() + timeout;
-    while task::pid_alive(pid) && std::time::Instant::now() < deadline {
+/// Wait for shutdown without spawning against a held lifetime lock. A pid
+/// can remain a zombie or be reused, and concurrent clients may miss the
+/// brief unlocked interval when another client starts the successor. A
+/// successful hello therefore also ends the wait: it proves that a serving
+/// manager is ready. Bound each connect + hello probe so a stalled socket
+/// cannot hide a released lock or a ready successor until the outer startup
+/// deadline, which still bounds the entire wait.
+async fn wait_for_manager_exit(home: &Path, mode: &HelloMode) -> Result<Option<Conn>, String> {
+    while lifecycle::lock_held(home) {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // Use the same per-attempt budget as socket readiness; don't let
+        // one hello consume the whole 15s startup deadline.
+        match tokio::time::timeout(Duration::from_secs(2), connect_existing(home, mode)).await {
+            Ok(Ok(conn)) => return Ok(Some(conn)),
+            Ok(Err(e)) if is_shutting_down(&e) || is_disconnect(&e) || e.starts_with("connect ") => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {} // Recheck the lifetime lock after a stalled probe.
+        }
     }
+    Ok(None)
+}
+
+fn is_shutting_down(e: &str) -> bool {
+    e.strip_prefix("E_INTERNAL: ") == Some(SHUTTING_DOWN)
 }
 
 async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
@@ -244,22 +259,40 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
 /// §3.1 client startup flow: connect; on failure take the spawn lock and
 /// spawn (or wait for the in-progress spawn), then retry once. A zombie
 /// socket is handled the same way: the spawned daemon, holding manager.lock,
-/// removes it.
+/// removes it. Shutdown refusals can occur on either hello; wait for the
+/// lifetime lock before spawning a successor. Bound the whole flow, not
+/// just each wait, so a stuck or repeatedly shutting-down daemon cannot
+/// keep a CLI alive indefinitely.
 pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
-    let mut last_err = String::new();
-    for attempt in 0..2 {
-        match connect_existing(home, mode).await {
+    tokio::time::timeout(Duration::from_secs(15), connect_with_retry(home, mode))
+        .await
+        .map_err(|_| "cannot reach pi-famulus: manager did not become ready within 15s".to_string())?
+}
+
+async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
+    let mut spawned = false;
+    loop {
+        let last_err = match connect_existing(home, mode).await {
             Ok(c) => return Ok(c),
-            Err(e) => last_err = e,
+            Err(e) => e,
+        };
+        if is_shutting_down(&last_err) {
+            if let Some(conn) = wait_for_manager_exit(home, mode)
+                .await
+                .map_err(|e| format!("cannot reach pi-famulus: {e}"))?
+            {
+                return Ok(conn);
+            }
+            // A shutdown refusal on the post-spawn hello is not a failed
+            // successor: readiness may have probed the retiring socket.
+            // Reconnect first: another waiting client may have spawned it.
+            spawned = false;
+            continue;
         }
-        if last_err.contains(SHUTTING_DOWN) {
-            // A graceful shutdown takes at most the 2s kill grace. A
-            // successor can only claim manager.lock once this one is gone.
-            wait_for_manager_exit(home, Duration::from_secs(5)).await;
+        if spawned {
+            return Err(format!("cannot reach pi-famulus: {last_err}"));
         }
-        if attempt > 0 {
-            break;
-        }
+        spawned = true;
         // Clients never delete socket/pid files: only the daemon holding
         // manager.lock may (§3.1). A client cleaning up here could unlink the
         // socket of a daemon another client just spawned.
@@ -271,19 +304,18 @@ pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
                 let ok = wait_for_socket(home, Duration::from_secs(2)).await;
                 drop(guard); // release the spawn lock (§3.1 step 3)
                 if !ok {
-                    last_err = "spawned daemon did not create its socket within 2s".into();
+                    return Err("cannot reach pi-famulus: spawned daemon did not create its socket within 2s".into());
                 }
             }
             Ok(None) => {
                 // Someone else is spawning; just wait.
                 if !wait_for_socket(home, Duration::from_secs(2)).await {
-                    last_err = "another client is spawning the manager, but it did not come up".into();
+                    return Err("cannot reach pi-famulus: another client is spawning the manager, but it did not come up".into());
                 }
             }
-            Err(e) => last_err = format!("spawn lock: {e}"),
+            Err(e) => return Err(format!("cannot reach pi-famulus: spawn lock: {e}")),
         }
     }
-    Err(format!("cannot reach pi-famulus: {last_err}"))
 }
 
 // ---------------------------------------------------------------------------

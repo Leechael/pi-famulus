@@ -130,7 +130,7 @@ mechanism = "per-connection outbound queue is bounded (1024 frames) and events u
 file = "src/daemon.rs"
 find = "mpsc::channel::<OutFrame>(1024)"
 replace = "mpsc::channel::<OutFrame>(1 << 28)"
-tests = ["lifecycle_adversarial::c6_never_reading_watcher_is_bounded_and_isolated"]
+tests = ["backpressure::c6_never_reading_watcher_is_bounded_and_isolated"]
 expect = "red"
 
 [[ablation]]
@@ -139,7 +139,7 @@ mechanism = "tee -> fanout channel bounded at CHUNK_CHANNEL_CAP=64"
 file = "src/task.rs"
 find = "pub const CHUNK_CHANNEL_CAP: usize = 64;"
 replace = "pub const CHUNK_CHANNEL_CAP: usize = 1 << 28;"
-tests = ["lifecycle_adversarial::c6_never_reading_watcher_is_bounded_and_isolated"]
+tests = ["backpressure::c6_never_reading_watcher_is_bounded_and_isolated"]
 expect = "red"
 note = "load-bearing: the fanout task (state mutex + per-chunk JSON encode) lags the tee under high output rates; unbounded, RSS grew 191 MiB for 256 MiB of output"
 
@@ -541,9 +541,9 @@ expect = "red"
 id = "client-waits-out-shutdown"
 mechanism = "a client refused with 'manager is shutting down' waits for that manager to exit, then spawns a successor"
 file = "src/client.rs"
-find = "            wait_for_manager_exit(home, Duration::from_secs(5)).await;"
-replace = ""
-tests = ["lifecycle_adversarial::d8b_cli_during_shutdown_reaches_a_successor"]
+find = "        if is_shutting_down(&last_err) {"
+replace = "        if false {"
+tests = ["lifecycle_adversarial::d8c_cli_waits_for_slow_shutdown_before_spawning_successor"]
 expect = "red"
 
 [[ablation]]

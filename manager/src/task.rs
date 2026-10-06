@@ -729,12 +729,64 @@ mod tests {
         let dir = unique_dir("kill");
         let out_path = dir.join("t.output");
         let env = HashMap::new();
-        // Grandchild inside the same group; killing the group must get both.
-        let mut t = spawn("sleep 30 & sleep 30", "/", &env, &out_path).unwrap();
+        // Invariant: one group signal kills an existing process tree. Killing
+        // immediately after spawn instead races the runner's fork of sh: on
+        // macOS a half-created child can miss that signal and keep the output
+        // pipe open. Early-stop races belong to the daemon's kill_group_hard
+        // tests; here the shell acknowledges both descendants before we kill.
+        let mut t = spawn(
+            "sleep 300 & first=$!; sleep 300 & second=$!; printf '%s %s %s\\n' \"$$\" \"$first\" \"$second\"; wait",
+            "/",
+            &env,
+            &out_path,
+        )
+        .unwrap();
+        // Failure-only cleanup, including a readiness timeout during fork.
+        // The assertion below still exercises exactly one group signal.
+        struct KillOnFailure(Option<u32>);
+        impl Drop for KillOnFailure {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    for _ in 0..40 {
+                        let _ = signal_group(pid, SIGKILL);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        let mut cleanup = KillOnFailure(Some(t.pid));
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            while !bytes.contains(&b'\n') {
+                let c = t.chunks.recv().await.expect("shell exited before reporting its tree");
+                bytes.extend_from_slice(&c.bytes);
+            }
+            String::from_utf8(bytes).unwrap()
+        })
+        .await
+        .expect("shell must report its existing descendants before group kill");
+        let descendants: Vec<u32> = ready.split_whitespace().map(|p| p.parse().unwrap()).collect();
+        assert_eq!(descendants.len(), 3, "shell and two children: {ready:?}");
+        assert_ne!(descendants[1], descendants[2], "distinct children: {ready:?}");
+        let members = crate::sys::group_members(t.pid).unwrap();
+        for pid in &descendants {
+            assert_ne!(*pid, t.pid, "descendant must not be the runner");
+            assert!(pid_alive(*pid), "descendant {pid} must exist before kill");
+            assert!(members.contains(pid), "descendant {pid} not in group {}: {members:?}", t.pid);
+        }
         assert!(pid_alive(t.pid));
         signal_group(t.pid, SIGKILL).unwrap();
         let (status, _) = wait_and_drain(&mut t).await;
         assert_eq!(status.signal(), Some(SIGKILL));
+        // Reparented zombies may await init's reap; none may still run.
+        let pids = descendants.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let ps = std::process::Command::new("ps")
+            .args(["-p", &pids, "-o", "stat="])
+            .output()
+            .unwrap();
+        assert!(ps.status.success() || ps.status.code() == Some(1), "ps failed: {ps:?}");
+        let states = String::from_utf8(ps.stdout).unwrap();
+        assert!(states.lines().all(|s| s.trim_start().starts_with('Z')), "surviving descendants: {states:?}");
         // Signalling a dead group is a no-op: ESRCH is success. On macOS a
         // group whose last member (the reparented grandchild) is still an
         // unreaped zombie answers EPERM instead, which a stress run caught.
@@ -743,6 +795,7 @@ mod tests {
             assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{e}");
         }
         wait_tee_idle(&t.tee_remaining).await;
+        cleanup.0 = None;
         std::fs::remove_dir_all(&dir).ok();
     }
 
