@@ -49,6 +49,46 @@ describe("InProcessRunner", () => {
     expect(handle.status()).toBe("completed");
   });
 
+  it("attributes queued, assistant-message, and tool wall time with a fake clock", async () => {
+    const clock = new ManualClock(0);
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    let grant!: (release: (terminal?: boolean) => void) => void;
+    const admission = new Promise<(terminal?: boolean) => void>((resolve) => { grant = resolve; });
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      clock,
+      stallMs: 0,
+      acquire: async () => admission,
+    });
+    const starting = runner.start(makeReq());
+    await tick();
+    clock.advanceBy(500);
+    grant(() => {});
+    const handle = await starting;
+    const session = factory.sessions[0];
+
+    session.emitEvent({ type: "message_start", role: "assistant" });
+    clock.advanceBy(1_200);
+    session.emitEvent({ type: "message_end", role: "assistant" });
+    const tool = session.runTool();
+    clock.advanceBy(300);
+    tool.end();
+    session.emitEvent({ type: "message_start", role: "assistant" });
+    clock.advanceBy(500);
+    session.emitEvent({ type: "message_end", role: "assistant" });
+    session.complete("done");
+    await handle.result;
+
+    expect(handle.wallUsage()).toEqual({
+      llmMs: 1_700,
+      toolMs: 300,
+      queueMs: 500,
+      otherMs: 0,
+      approximate: false,
+    });
+  });
+
   it("tells the child its resolved model on the first prompt", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = "ok";

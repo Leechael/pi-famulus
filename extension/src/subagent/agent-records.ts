@@ -40,6 +40,13 @@ export interface AgentChildRecord {
   /** Provider-reported cumulative token counts (input includes cached prompt tokens). */
   tokens_input?: number;
   tokens_output?: number;
+  /** Observed assistant-message, tool-execution, and admission-queue wall time. */
+  llm_ms?: number;
+  tool_ms?: number;
+  queue_ms?: number;
+  /** Wall time that did not fit the observed phase boundaries. */
+  wall_other_ms?: number;
+  wall_approximate?: boolean;
   /** Absolute path of the live `<child_id>.jsonl` transcript. */
   transcript?: string;
 }
@@ -96,25 +103,37 @@ export function writeAgentChildRecord(home: string, record: AgentChildRecord): v
   writeFileSync(agentRecordPath(home, record.session_id, record.child_id), JSON.stringify(record));
 }
 
+export type AgentChildTelemetry = Partial<Pick<AgentChildRecord,
+  "tokens_input" | "tokens_output" | "llm_ms" | "tool_ms" | "queue_ms" | "wall_other_ms" | "wall_approximate"
+>>;
+
 /** Refresh live telemetry without waiting for a child state transition. */
+export function updateAgentChildMetrics(
+  home: string,
+  sessionId: string,
+  childId: string,
+  metrics: AgentChildTelemetry,
+): void {
+  const path = agentRecordPath(home, sessionId, childId);
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as Partial<AgentChildRecord>;
+    if (record.v !== 1 || record.kind !== "agent" || record.session_id !== sessionId || record.child_id !== childId) return;
+    writeAgentChildRecord(home, { ...(record as AgentChildRecord), ...metrics });
+  } catch {
+    // A metrics refresh must never interfere with the in-process child.
+  }
+}
+
 export function updateAgentChildTokens(
   home: string,
   sessionId: string,
   childId: string,
   tokens: { input: number; output: number },
 ): void {
-  const path = agentRecordPath(home, sessionId, childId);
-  try {
-    const record = JSON.parse(readFileSync(path, "utf8")) as Partial<AgentChildRecord>;
-    if (record.v !== 1 || record.kind !== "agent" || record.session_id !== sessionId || record.child_id !== childId) return;
-    writeAgentChildRecord(home, {
-      ...(record as AgentChildRecord),
-      tokens_input: tokens.input,
-      tokens_output: tokens.output,
-    });
-  } catch {
-    // A metrics refresh must never interfere with the in-process child.
-  }
+  updateAgentChildMetrics(home, sessionId, childId, {
+    tokens_input: tokens.input,
+    tokens_output: tokens.output,
+  });
 }
 
 export function removeAgentChildRecord(home: string, sessionId: string, childId: string): void {

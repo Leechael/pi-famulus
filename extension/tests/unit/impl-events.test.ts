@@ -26,7 +26,16 @@ describe("extension event log", () => {
     const home = mkdtempSync(join(tmpdir(), "pi-famulus-events-"));
     dirs.push(home);
     const log = createExtensionEventLog(home, () => "session-usage", new ManualClock(2000));
-    log.write("agent.usage", { child_id: "ch_1", tokens_input: 480, tokens_output: 32 });
+    log.write("agent.usage", {
+      child_id: "ch_1",
+      tokens_input: 480,
+      tokens_output: 32,
+      llm_ms: 1_200,
+      tool_ms: 300,
+      queue_ms: 50,
+      wall_other_ms: 25,
+      wall_approximate: true,
+    });
     const file = join(home, "sessions", "session-usage", "events.jsonl");
     const row = JSON.parse(readFileSync(file, "utf8").trim());
     expect(row).toMatchObject({
@@ -35,6 +44,11 @@ describe("extension event log", () => {
       child_id: "ch_1",
       tokens_input: 480,
       tokens_output: 32,
+      llm_ms: 1_200,
+      tool_ms: 300,
+      queue_ms: 50,
+      wall_other_ms: 25,
+      wall_approximate: true,
     });
   });
 

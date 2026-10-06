@@ -80,6 +80,20 @@ export interface ChildRunRequest {
   depth: number; // main session = 0, child = 1
 }
 
+export interface ChildWallUsage {
+  llmMs: number;
+  toolMs: number;
+  queueMs: number;
+  otherMs: number;
+  approximate: boolean;
+}
+
+export interface ChildSessionEvent {
+  type: string;
+  role?: string;
+  usage?: { input: number; output: number };
+}
+
 export interface ChildHandle {
   readonly childId: string;
   readonly result: Promise<ChildResult>; // resolves exactly once per generation;
@@ -104,6 +118,8 @@ export interface ChildHandle {
   conversation(): ConversationTurn[];
   /** Cumulative provider-reported input/output tokens for this child. */
   tokenUsage(): { input: number; output: number };
+  /** Cumulative observed LLM, tool, admission-queue and approximate wall time. */
+  wallUsage(): ChildWallUsage;
 }
 
 /**
@@ -132,7 +148,7 @@ export interface ChildSessionAdapter {
   getActiveToolNames?(): string[];
   getSystemPrompt?(): string;
   isStreaming(): boolean;
-  subscribe(listener: (event: { type: string; usage?: { input: number; output: number } }) => void): () => void;
+  subscribe(listener: (event: ChildSessionEvent) => void): () => void;
   dispose(): void;
 }
 

@@ -55,6 +55,16 @@ pub struct AgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_output: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_other_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wall_approximate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
     /// Set by the CLI (not on disk) when the record says running but its
     /// session is not connected: the child cannot be alive.
@@ -64,6 +74,13 @@ pub struct AgentRecord {
 
 pub fn agent_status_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "interrupted")
+}
+
+pub fn agent_output_tokens_per_second(tokens_output: Option<u64>, llm_ms: Option<u64>) -> Option<f64> {
+    match (tokens_output, llm_ms) {
+        (Some(tokens), Some(ms)) if ms > 0 => Some(tokens as f64 * 1000.0 / ms as f64),
+        _ => None,
+    }
 }
 
 impl AgentRecord {
@@ -938,7 +955,23 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
                 kv("tool calls", n.to_string());
             }
             if a.tokens_input.is_some() || a.tokens_output.is_some() {
-                kv("tokens", format!("{} input / {} output", a.tokens_input.unwrap_or(0), a.tokens_output.unwrap_or(0)));
+                let rate = agent_output_tokens_per_second(a.tokens_output, a.llm_ms)
+                    .map(|v| format!(" ({v:.1} output tok/s of LLM time)"))
+                    .unwrap_or_default();
+                kv("tokens", format!("{} input / {} output{rate}", a.tokens_input.unwrap_or(0), a.tokens_output.unwrap_or(0)));
+            }
+            if a.llm_ms.is_some() || a.tool_ms.is_some() || a.queue_ms.is_some() || a.wall_other_ms.is_some() {
+                let approx = if a.wall_approximate { " (approximate; unclassified segments are not attributed)" } else { "" };
+                kv(
+                    "wall split",
+                    format!(
+                        "LLM {} / tool {} / queued {} / unclassified {}{approx}",
+                        fmt::human_duration(a.llm_ms.unwrap_or(0)),
+                        fmt::human_duration(a.tool_ms.unwrap_or(0)),
+                        fmt::human_duration(a.queue_ms.unwrap_or(0)),
+                        fmt::human_duration(a.wall_other_ms.unwrap_or(0)),
+                    ),
+                );
             }
             if shells.is_empty() {
                 kv("shells", "none");
@@ -1340,10 +1373,17 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let a_done = agents.len() - a_running;
     let tokens_input: u64 = agents.iter().map(|a| a.tokens_input.unwrap_or(0)).sum();
     let tokens_output: u64 = agents.iter().map(|a| a.tokens_output.unwrap_or(0)).sum();
+    let llm_ms: u64 = agents.iter().map(|a| a.llm_ms.unwrap_or(0)).sum();
+    let tokens_per_second = agent_output_tokens_per_second(Some(tokens_output), Some(llm_ms));
     if json_out {
         let mut v = serde_json::to_value(&st).unwrap();
         v["agent_counts"] = json!({"running": a_running, "terminal": a_done});
-        v["agent_tokens"] = json!({"input": tokens_input, "output": tokens_output});
+        v["agent_tokens"] = json!({
+            "input": tokens_input,
+            "output": tokens_output,
+            "llm_ms": llm_ms,
+            "output_tokens_per_second": tokens_per_second,
+        });
         outln!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(());
     }
@@ -1389,7 +1429,8 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         a_running,
         a_done
     );
-    outln!("agent tokens: {tokens_input} input / {tokens_output} output");
+    let rate = tokens_per_second.map(|v| format!(" ({v:.1} output tok/s over {llm_ms} ms of LLM time)")).unwrap_or_default();
+    outln!("agent tokens: {tokens_input} input / {tokens_output} output{rate}");
     if let Some(line) = upgrade_line(&st, now_ms()) {
         outln!("{line}");
     }

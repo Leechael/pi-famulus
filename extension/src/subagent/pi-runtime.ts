@@ -187,7 +187,7 @@ function wrapSession(
     getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
     subscribe: (listener) => session.subscribe((event) => {
-      const message = (event as { message?: { usage?: { input?: number; output?: number } } }).message;
+      const message = (event as { message?: { role?: string; usage?: { input?: number; output?: number } } }).message;
       let usage: { input: number; output: number } | undefined;
       if (event.type === "message_end" && message?.usage) {
         usage = normalizedTokenUsage(message.usage);
@@ -195,7 +195,11 @@ function wrapSession(
         tokenUsage.input = total.input;
         tokenUsage.output = total.output;
       }
-      listener({ type: event.type, ...(usage ? { usage } : {}) });
+      listener({
+        type: event.type,
+        ...(typeof message?.role === "string" ? { role: message.role } : {}),
+        ...(usage ? { usage } : {}),
+      });
     }),
     dispose: () => session.dispose(),
   };

@@ -119,7 +119,7 @@ tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 agent tokens: 8200 input / 460 output
 ```
 
-The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `agent tokens` sums provider-reported cumulative child input/output usage; records refresh as child messages finish, and the extension also appends absolute totals in `agent.usage` events for readers of the shared event stream. `--json` prints the protocol `status` response plus `agent_counts` and `agent_tokens`. With no daemon: `pi-famulus: pi-famulus is not running` on stderr, exit 1 (also with `--json`).
+The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `agent tokens` sums provider-reported cumulative child input/output usage; records refresh as child messages finish, and the extension also appends absolute totals in `agent.usage` events for readers of the shared event stream. `output tok/s` is cumulative output tokens divided by observed LLM message-in-flight milliseconds; it is omitted until an LLM interval is observed. `--json` prints the protocol `status` response plus `agent_counts` and `agent_tokens`. With no daemon: `pi-famulus: pi-famulus is not running` on stderr, exit 1 (also with `--json`).
 
 ### `sessions`
 
@@ -163,7 +163,7 @@ By default only running work, anywhere (a live process is never hidden, even in 
 Everything about one id, any kind:
 
 - **task / monitor:** status, exit, reason, session (state, pi pid), full command, cwd, pid, start/end/duration, when it was moved to the background, who spawned it (`origin`: `bash-fg`, `bash-bg`, `child-bash` with child and run, `monitor`), output and stderr paths, wake notification emitted → delivered (from the extension's events), its `work_kind`, CPU (user/sys, average cores, peak RSS, or why it was not measured), and the last 10 output lines.
-- **agent (`ch_…`):** name/agent/model, run, status and end reason, error, start/end/duration, tool-call count, shells it spawned (tasks whose `origin.child_id` is this agent), transcript path, the task prompt, and the last 20 lines of its result.
+- **agent (`ch_…`):** name/agent/model, run, status and end reason, error, start/end/duration, tool-call count, shells it spawned (tasks whose `origin.child_id` is this agent), cumulative provider input/output tokens, observed wall split, transcript path, the task prompt, and the last 20 lines of its result. The split attributes assistant message-in-flight intervals to LLM, `tool_execution_start`..`tool_execution_end` intervals to tools, and admission wait to queue; unmatched or residual time is `unclassified` and sets `wall_approximate`. `output tok/s` = output tokens / LLM milliseconds × 1000; it is cumulative over observed LLM intervals, not wall time.
 - **run (`run_…`):** its children as an `ls` table.
 
 `--json` prints the underlying records, the output tail, and the related events.

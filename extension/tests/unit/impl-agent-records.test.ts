@@ -6,6 +6,7 @@ import {
   formatAgentCommand,
   isAgentStatusActive,
   loadAgentChildRecords,
+  updateAgentChildMetrics,
   updateAgentChildTokens,
   writeAgentChildRecord,
   type AgentChildRecord,
@@ -60,10 +61,22 @@ describe("agent child records", () => {
       started_at: 1,
     });
     updateAgentChildTokens(home, "sess-1", "ch_usage001", { input: 320, output: 17 });
+    updateAgentChildMetrics(home, "sess-1", "ch_usage001", {
+      llm_ms: 1_500,
+      tool_ms: 400,
+      queue_ms: 250,
+      wall_other_ms: 100,
+      wall_approximate: true,
+    });
     expect(loadAgentChildRecords(home)[0]).toMatchObject({
       status: "running",
       tokens_input: 320,
       tokens_output: 17,
+      llm_ms: 1_500,
+      tool_ms: 400,
+      queue_ms: 250,
+      wall_other_ms: 100,
+      wall_approximate: true,
     });
   });
 

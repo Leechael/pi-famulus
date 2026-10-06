@@ -1061,8 +1061,8 @@ fn c6_status_counts_uptime_and_not_running() {
     assert_eq!(out.stderr.trim(), "pi-famulus: pi-famulus is not running");
     assert!(!home.sock().exists(), "status must not start the daemon");
 
-    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed","tokens_input":35,"tokens_output":5}));
-    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c602","session_id":"sess-c6","name":"b","agent":"w","status":"failed","tokens_input":12,"tokens_output":4}));
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed","tokens_input":35,"tokens_output":5,"llm_ms":5000,"tool_ms":3000,"queue_ms":200,"wall_other_ms":500,"wall_approximate":true}));
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c602","session_id":"sess-c6","name":"b","agent":"w","status":"failed","tokens_input":12,"tokens_output":4,"llm_ms":1000,"tool_ms":100,"queue_ms":0,"wall_other_ms":0}));
     let _d = home.start_daemon();
     let mut c = home.connect();
     hello_v2(&mut c, "sess-c6", "/tmp");
@@ -1089,12 +1089,14 @@ fn c6_status_counts_uptime_and_not_running() {
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
     assert!(uptime.ends_with('s') && !uptime.contains('.'), "human uptime: {uptime}");
     assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");
-    assert!(s.contains("agent tokens: 47 input / 9 output"), "{s}");
+    assert!(s.contains("agent tokens: 47 input / 9 output (1.5 output tok/s over 6000 ms of LLM time)"), "{s}");
     let out = cli_ok(&home, &["status", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["protocol"], 5);
     assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
-    assert_eq!(v["agent_tokens"], json!({"input":47,"output":9}));
+    assert_eq!(v["agent_tokens"], json!({"input":47,"output":9,"llm_ms":6000,"output_tokens_per_second":1.5}));
+    let shown = cli_ok(&home, &["show", "ch_0000c601"]).stdout;
+    assert!(shown.contains("1.0 output tok/s of LLM time") && shown.contains("wall split") && shown.contains("approximate"), "{shown}");
 }
 
 #[test]

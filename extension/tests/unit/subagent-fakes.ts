@@ -2,7 +2,7 @@
  * Shared fakes for subagent tests: an event-driven controllable
  * ChildSessionAdapter and a CreateSessionFn factory.
  */
-import type { ChildRunRequest, ChildSessionAdapter, CreateSessionFn } from "../../src/subagent/types";
+import type { ChildRunRequest, ChildSessionAdapter, ChildSessionEvent, CreateSessionFn } from "../../src/subagent/types";
 import type { AgentDefinition } from "../../src/subagent/types";
 
 export const WORKER_AGENT: AgentDefinition = {
@@ -45,7 +45,7 @@ export class FakeChildSession implements ChildSessionAdapter {
   /** When closed, abort() blocks until openAbortGate() (async abort unwind). */
   abortGateOpen = true;
 
-  private readonly listeners = new Set<(e: { type: string }) => void>();
+  private readonly listeners = new Set<(e: ChildSessionEvent) => void>();
   private idleWaiters: (() => void)[] = [];
   private abortGateWaiters: (() => void)[] = [];
   /** Signals of tools still executing; abort() aborts them (pi semantics). */
@@ -101,7 +101,11 @@ export class FakeChildSession implements ChildSessionAdapter {
     this.emit({ type: "message_update" });
   }
 
-  private emit(e: { type: string }): void {
+  emitEvent(e: ChildSessionEvent): void {
+    this.emit(e);
+  }
+
+  private emit(e: ChildSessionEvent): void {
     for (const l of [...this.listeners]) l(e);
   }
 
@@ -178,7 +182,7 @@ export class FakeChildSession implements ChildSessionAdapter {
     return this.streaming;
   }
 
-  subscribe(listener: (e: { type: string }) => void): () => void {
+  subscribe(listener: (e: ChildSessionEvent) => void): () => void {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);

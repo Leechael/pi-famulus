@@ -26,6 +26,7 @@ import type {
   ChildRunRequest,
   ChildRunner,
   ChildStatus,
+  ChildWallUsage,
   DisposableChildHandle,
 } from "./types";
 
@@ -54,6 +55,7 @@ export interface RunRecord {
     /** User turns so far: 1 for the launch, +1 per accepted resume. */
     turn?: number;
     tokenUsage?: { input: number; output: number };
+    wallUsage?: ChildWallUsage;
   }[];
   status: "running" | "completed" | "partial" | "failed" | "interrupted";
   createdAt: number;
@@ -196,6 +198,10 @@ class FailedChildHandle implements ChildHandle {
 
   tokenUsage() {
     return { input: 0, output: 0 };
+  }
+
+  wallUsage(): ChildWallUsage {
+    return { llmMs: 0, toolMs: 0, queueMs: 0, otherMs: 0, approximate: false };
   }
 }
 
@@ -715,6 +721,7 @@ function snapshot(run: InternalRun): RunRecord {
       endedAt: c.endedAt,
       turn: c.turn,
       tokenUsage: c.handle?.tokenUsage() ?? { input: 0, output: 0 },
+      wallUsage: c.handle?.wallUsage() ?? { llmMs: 0, toolMs: 0, queueMs: 0, otherMs: 0, approximate: false },
     })),
   };
 }

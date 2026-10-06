@@ -46,6 +46,7 @@ import type {
   ChildRunner,
   ChildSessionAdapter,
   ChildStatus,
+  ChildWallUsage,
   CreateSessionFn,
   DisposableChildHandle,
 } from "./types";
@@ -197,6 +198,14 @@ class InProcessChildHandle implements DisposableChildHandle {
   private disposed = false;
   /** Nested tool_execution_start/end. Stall stays paused while > 0. */
   private toolDepth = 0;
+  private wall: ChildWallUsage = { llmMs: 0, toolMs: 0, queueMs: 0, otherMs: 0, approximate: false };
+  private generationAt: number | null = null;
+  private generationLlmMs = 0;
+  private generationToolMs = 0;
+  private generationQueueMs = 0;
+  private queueStartedAt: number | null = null;
+  private llmStartedAt: number | null = null;
+  private toolStartedAt: number | null = null;
   /** contact_supervisor need_decision. Stall stays paused while true. */
   private decisionPaused = false;
 
@@ -279,6 +288,23 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   tokenUsage() {
     return this.session?.tokenUsage() ?? { input: 0, output: 0 };
+  }
+
+  wallUsage(): ChildWallUsage {
+    const now = this.clock.now();
+    const queueMs = this.queueStartedAt === null ? 0 : Math.max(0, now - this.queueStartedAt);
+    const llmMs = this.llmStartedAt === null ? 0 : Math.max(0, now - this.llmStartedAt);
+    const toolMs = this.toolStartedAt === null ? 0 : Math.max(0, now - this.toolStartedAt);
+    const elapsed = this.generationAt === null ? 0 : Math.max(0, now - this.generationAt);
+    const accounted = this.generationQueueMs + queueMs + this.generationLlmMs + llmMs + this.generationToolMs + toolMs;
+    const otherMs = this.wall.otherMs + Math.max(0, elapsed - accounted);
+    return {
+      llmMs: this.wall.llmMs + llmMs,
+      toolMs: this.wall.toolMs + toolMs,
+      queueMs: this.wall.queueMs + queueMs,
+      otherMs,
+      approximate: this.wall.approximate || otherMs > this.wall.otherMs,
+    };
   }
 
   /** Launch generation 1. Resolves once the prompt is issued (not completed). */
@@ -481,6 +507,15 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.status_ = "pending";
     this.startedAt = this.clock.now();
     this.lastEvent = this.startedAt;
+    if (!reuseSlot) {
+      this.generationAt = this.startedAt;
+      this.generationLlmMs = 0;
+      this.generationToolMs = 0;
+      this.generationQueueMs = 0;
+      this.queueStartedAt = this.acquire ? this.startedAt : null;
+      this.llmStartedAt = null;
+      this.toolStartedAt = null;
+    }
     // A tool_execution_end from the previous generation may have been dropped
     // after settle. Don't carry that depth (or a pending decision) into this one.
     this.toolDepth = 0;
@@ -502,6 +537,7 @@ class InProcessChildHandle implements DisposableChildHandle {
         });
       } catch (err) {
         // Admission denied (e.g. fail_fast cancellation while queued).
+        this.closeQueue(this.now());
         this.settle(gen, {
           status: "interrupted",
           text: "",
@@ -516,6 +552,7 @@ class InProcessChildHandle implements DisposableChildHandle {
           if (this.admissionAbort === admissionAbort) this.admissionAbort = null;
         }
       }
+      this.closeQueue(this.now());
     }
     if (this.disposed || this.isSettled(gen)) {
       this.release(this.terminalSettle);
@@ -540,29 +577,7 @@ class InProcessChildHandle implements DisposableChildHandle {
         this.release();
         return;
       }
-      this.unsubscribe = this.session.subscribe((event) => {
-        if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "agent_end") {
-          this.notifyActivity();
-        }
-        // Track depth even after settle. A late tool_execution_end must not
-        // leak into the next resume, and must not rearm a stale generation.
-        if (event.type === "tool_execution_start") {
-          this.toolDepth++;
-          if (this.status_ === "running") this.clearStall();
-          return;
-        }
-        if (event.type === "tool_execution_end") {
-          this.toolDepth = Math.max(0, this.toolDepth - 1);
-          this.lastEvent = this.now();
-          if (this.status_ === "running" && this.toolDepth === 0 && !this.decisionPaused) {
-            this.armStall(this.generation);
-          }
-          return;
-        }
-        if (this.status_ !== "running") return;
-        this.lastEvent = this.now();
-        if (this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
-      });
+      this.unsubscribe = this.session.subscribe((event) => this.handleSessionEvent(event));
     }
 
     const session = this.session;
@@ -663,6 +678,7 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private settle(gen: number, result: ChildResult): void {
     if (gen !== this.generation || this.settledFlag) return;
+    this.finishWallGeneration(this.now());
     this.settledFlag = true;
     if (this.admissionStartedAt !== null) {
       this.generationQueueMs = Math.max(0, this.now() - this.admissionStartedAt);
@@ -704,6 +720,103 @@ class InProcessChildHandle implements DisposableChildHandle {
     } catch {
       // persistence observers must not break the child lifecycle
     }
+  }
+
+  private closeQueue(at: number): void {
+    if (this.queueStartedAt === null) return;
+    const elapsed = Math.max(0, at - this.queueStartedAt);
+    this.wall.queueMs += elapsed;
+    this.generationQueueMs += elapsed;
+    this.queueStartedAt = null;
+  }
+
+  private closeLlm(at: number): void {
+    if (this.llmStartedAt === null) return;
+    const elapsed = Math.max(0, at - this.llmStartedAt);
+    this.wall.llmMs += elapsed;
+    this.generationLlmMs += elapsed;
+    this.llmStartedAt = null;
+  }
+
+  private closeTool(at: number): void {
+    if (this.toolStartedAt === null) return;
+    const elapsed = Math.max(0, at - this.toolStartedAt);
+    this.wall.toolMs += elapsed;
+    this.generationToolMs += elapsed;
+    this.toolStartedAt = null;
+  }
+
+  private accountWallEvent(event: { type: string; role?: string; usage?: { input: number; output: number } }, at: number): void {
+    const assistant = event.role === "assistant" || (event.role === undefined && event.usage !== undefined);
+    if (event.type === "message_start" && assistant) {
+      if (this.toolDepth === 0 && this.llmStartedAt === null) this.llmStartedAt = at;
+      else this.wall.approximate = true;
+    } else if (event.type === "message_end" && assistant) {
+      if (this.llmStartedAt === null) this.wall.approximate = true;
+      else this.closeLlm(at);
+    } else if (event.type === "tool_execution_start") {
+      if (this.toolDepth === 0) {
+        if (this.llmStartedAt !== null) {
+          this.closeLlm(at);
+          this.wall.approximate = true;
+        }
+        this.toolStartedAt = at;
+      }
+    } else if (event.type === "tool_execution_end") {
+      if (this.toolDepth === 0) this.wall.approximate = true;
+      else if (this.toolDepth === 1) this.closeTool(at);
+    }
+  }
+
+  private finishWallGeneration(at: number): void {
+    this.closeQueue(at);
+    if (this.llmStartedAt !== null) {
+      this.closeLlm(at);
+      this.wall.approximate = true;
+    }
+    if (this.toolStartedAt !== null) {
+      this.closeTool(at);
+      this.wall.approximate = true;
+    }
+    if (this.generationAt !== null) {
+      const elapsed = Math.max(0, at - this.generationAt);
+      const measured = this.generationQueueMs + this.generationLlmMs + this.generationToolMs;
+      const other = Math.max(0, elapsed - measured);
+      this.wall.otherMs += other;
+      if (other > 0) this.wall.approximate = true;
+    }
+    this.generationAt = null;
+    this.generationLlmMs = 0;
+    this.generationToolMs = 0;
+    this.generationQueueMs = 0;
+    this.queueStartedAt = null;
+    this.llmStartedAt = null;
+    this.toolStartedAt = null;
+  }
+
+  private handleSessionEvent(event: { type: string; role?: string; usage?: { input: number; output: number } }): void {
+    const now = this.now();
+    const active = this.status_ === "running";
+    if (active) this.accountWallEvent(event, now);
+    if (active && ["message_start", "message_end", "tool_execution_start", "tool_execution_end", "agent_end"].includes(event.type)) {
+      this.notifyActivity();
+    }
+    // Track depth even after settle. A late tool_execution_end must not leak
+    // into the next resume, and must not rearm a stale generation.
+    if (event.type === "tool_execution_start") {
+      this.toolDepth++;
+      if (active) this.clearStall();
+      return;
+    }
+    if (event.type === "tool_execution_end") {
+      this.toolDepth = Math.max(0, this.toolDepth - 1);
+      this.lastEvent = now;
+      if (active && this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
+      return;
+    }
+    if (!active) return;
+    this.lastEvent = now;
+    if (this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
   }
 
   private release(terminal = true): void {
@@ -823,6 +936,10 @@ class InProcessChildHandle implements DisposableChildHandle {
    */
   private handleStall(gen: number): void {
     this.stallAttempts++;
+    if (this.llmStartedAt !== null) {
+      this.closeLlm(this.now());
+      this.wall.approximate = true;
+    }
     // Persist whatever the stalled generation produced before it went quiet.
     this.notifyActivity();
     try {
