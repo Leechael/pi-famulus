@@ -16,6 +16,8 @@ export interface WorkItem {
   kind: WorkKind;
   /** Daemon work-kind label for agents; shell commands are classified separately. */
   workKind?: string;
+  /** Time queued for local/machine admission before the agent started. */
+  queueMs?: number;
   status: string;
   title: string;
   command?: string;
