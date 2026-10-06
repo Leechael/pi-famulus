@@ -205,18 +205,28 @@ describe("InProcessRunner", () => {
     expect(released).toBe(2);
   });
 
-  it("cancels the child when admission rejects", async () => {
+  it("attributes cancelled admission wait to queue time, not duration", async () => {
     const factory = new SessionFactory();
+    const clock = new ManualClock();
+    let rejectAdmission!: () => void;
     const runner = new InProcessRunner({
       createSession: factory.fn,
+      clock,
       acquire: async () => {
+        await new Promise<void>((resolve) => { rejectAdmission = resolve; });
         throw new Error("cancelled (fail_fast)");
       },
     });
-    const handle = await runner.start(makeReq());
+    const startPromise = runner.start(makeReq());
+    await tick();
+    clock.advanceBy(400);
+    rejectAdmission();
+    const handle = await startPromise;
     const result = await handle.result;
     expect(result.status).toBe("interrupted");
     expect(result.error).toContain("fail_fast");
+    expect(result.durationMs).toBe(0);
+    expect(result.queueMs).toBe(400);
     expect(factory.sessions).toHaveLength(0); // no session was created
   });
 
@@ -374,6 +384,8 @@ describe("InProcessRunner", () => {
       expect(result.status).toBe("completed");
       expect(result.text).toBe("all done");
       expect(result.attempts).toBe(2);
+      expect(result.durationMs).toBe(1000);
+      expect(result.queueMs).toBe(0);
     });
 
     it("settles failed (stalled) only after the retry budget is spent", async () => {
