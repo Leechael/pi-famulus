@@ -204,7 +204,7 @@ describe("ManagerClient (integration, fake manager)", () => {
       session_id: "sess-1",
       pi_pid: process.pid,
       extension_version: packageVersion,
-      protocol: 3,
+      protocol: 4,
     });
   });
 

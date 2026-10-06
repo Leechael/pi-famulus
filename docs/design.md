@@ -145,7 +145,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 ```
 - `extension` must carry `session_id` + `pi_pid`; thereafter this connection receives that session's events
 - `cwd` is optional (backward compatible). The extension includes the session cwd in hello; the manager stores it in the session and returns it in status/sessions. Older clients omitting it can still handshake
-- `extension_version` (string) and `protocol` (integer) are optional: the manager stores them per session and returns them in `status.sessions`; `doctor` uses them to check that each connected session's protocol matches the manager. `protocol` is a feature level: 1 = original §3.3, 2 = observability contract (origin / mark_background / stop.reason / end_reason / events.jsonl), 3 = in-place upgrade (`upgrade`, status's `generation`/`last_upgrade`/`exe`, start key, resend after reconnect). CLI `upgrade` sends no request to a manager below level 3 and directly asks for a one-time restart. Omitted = older extension
+- `extension_version` (string) and `protocol` (integer) are optional: the manager stores them per session and returns them in `status.sessions`; `doctor` uses them to check that each connected session's protocol matches the manager. `protocol` is a feature level: 1 = original §3.3, 2 = observability contract (origin / mark_background / stop.reason / end_reason / events.jsonl), 3 = in-place upgrade (`upgrade`, status's `generation`/`last_upgrade`/`exe`, start key, resend after reconnect), 4 = machine-wide agent admission (`acquire_agent` / `release_agent`). CLI `upgrade` sends no request to a manager below level 3 and directly asks for a one-time restart. Omitted = older extension
 - Duplicate hello for the same `session_id`: new connection wins; the old connection receives `{"type":"event","event":"session_rebound"}` and is closed by the server
 - `cli` carries no session; it can access cross-session read-only/management operations
 
@@ -237,7 +237,7 @@ Ask the daemon to upgrade in place to the current file at its own path (quiesce 
 **status** (read-only, both CLI and extension):
 ```json
 → {"type":"status"}
-← {"ok":true, "version":"0.1.0+066598ae00", "pid":4321, "uptime_ms":3600000, "protocol":3,
+← {"ok":true, "version":"0.1.0+066598ae00", "pid":4321, "uptime_ms":3600000, "protocol":4,
    "generation":1, "exe":"/usr/local/bin/pi-famulus",
    "last_upgrade":{"at":1726...,"ok":true,"from_version":"0.1.0+abc1234500",
                     "to_version":"0.1.0+066598ae00","trigger":"cli"},

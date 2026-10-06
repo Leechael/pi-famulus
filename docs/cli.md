@@ -107,10 +107,11 @@ Generate a dynamic completion script for bash, zsh, or fish with `pi-famulus com
 ### `status`
 
 ```text
-version:  0.1.0+066598ae00 (protocol 3)
+version:  0.1.0+066598ae00 (protocol 4)
 pid:      4321
 binary:   /Users/me/.pi/agent/pi-famulus/bin/pi-famulus
 uptime:   13m23s
+agent slots: 1/8 used
 sessions: 2 (1 connected)
 tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 ```
@@ -309,6 +310,15 @@ Prints `task_id=sh_… pid=12345`.
 ---
 
 ## Daemon
+
+### `config`
+
+Set or read runtime settings. `max-agents` is the machine-wide concurrent subagent budget (default 8); changes persist in `config.json` and take effect on the next admission without restarting the daemon.
+
+```bash
+pi-famulus config get max-agents
+pi-famulus config set max-agents 12
+```
 
 ### `daemon`
 
