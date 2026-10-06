@@ -1852,6 +1852,20 @@ fn handle_shutdown(state: &Shared, conn_id: u64) -> Result<UnitOk, ProtoError> {
 /// Start (or restart) a task's tee pumps and output fanout from the
 /// descriptors in its entry. A pipe already at EOF (None) is skipped.
 pub fn start_task_io(state: &Shared, task_id: &str) {
+    start_task_io_with_tee(state, task_id, task::start_tee);
+}
+
+// Keep tee creation at a narrow seam so tests can force a real pump read
+// before the factory returns, without a global scheduling hook.
+fn start_task_io_with_tee(
+    state: &Shared,
+    task_id: &str,
+    start_tee: impl FnOnce(
+        Option<std::os::fd::OwnedFd>, Option<std::os::fd::OwnedFd>,
+        Arc<Mutex<task::OutputState>>, Option<std::fs::File>,
+        mpsc::Sender<task::OutputChunk>, tokio::sync::watch::Receiver<bool>,
+    ) -> std::io::Result<task::Tee>,
+) {
     let mut st = state.lock().unwrap();
     let park = st.park_tx.subscribe();
     let Some(e) = st.registry.tasks.get_mut(task_id) else { return };
@@ -1860,14 +1874,8 @@ pub fn start_task_io(state: &Shared, task_id: &str) {
         .ok()
         .map(|(_, err)| err);
     let (tx, rx) = tokio::sync::mpsc::channel(task::CHUNK_CHANNEL_CAP);
-    match task::start_tee(stdout, stderr, e.output.clone(), mirror, tx, park.clone()) {
-        Ok(tee) => e.tee = Some(tee),
-        Err(err) => {
-            let home = st.home.clone();
-            lifecycle::log_line(&home, &format!("tee {task_id}: {err}"));
-            return;
-        }
-    }
+    // Snapshot before starting any pump: a new read must belong only to
+    // the chunk channel, never also to this file carry.
     // What reached the file but not the watchers: after a park, the
     // incomplete UTF-8 tail the fanout held back. It is completed by the
     // next bytes, so the restarted fanout begins with it.
@@ -1881,6 +1889,14 @@ pub fn start_task_io(state: &Shared, task_id: &str) {
     } else {
         Vec::new()
     };
+    match start_tee(stdout, stderr, e.output.clone(), mirror, tx, park.clone()) {
+        Ok(tee) => e.tee = Some(tee),
+        Err(err) => {
+            let home = st.home.clone();
+            lifecycle::log_line(&home, &format!("tee {task_id}: {err}"));
+            return;
+        }
+    }
     let tid = task_id.to_string();
     let state2 = state.clone();
     e.fanout = Some(tokio::spawn(run_output_fanout(state2, tid, rx, delivered, carry, park)));
@@ -2466,6 +2482,109 @@ async fn graceful_shutdown(state: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a tee that runs before its factory returns must not have
+    /// its bytes read again as carry. Also preserve the incomplete raw byte
+    /// across the same park/restart seam used by an in-place upgrade.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn utf8_watch_output_is_not_duplicated_when_tee_starts_eagerly() {
+        use std::os::fd::AsRawFd;
+        let home = std::env::temp_dir().join(format!("pi-famulus-fanout-{}-{}", std::process::id(), now_ms()));
+        let path = registry::task_output_path(&home, "sess-utf8", "mon_utf8");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (file, _) = task::open_output_files(&path).unwrap();
+        let output = Arc::new(Mutex::new(task::OutputState::new(Some(file), 0)));
+        let record: TaskRecord = serde_json::from_value(serde_json::json!({
+            "task_id":"mon_utf8", "session_id":"sess-utf8", "kind":"monitor",
+            "command":"split UTF-8 pipe producer", "cwd":"/tmp", "pid":0,
+            "status":"running", "exit_code":null, "signal":null,
+            "started_at":0, "ended_at":null, "output_path":path, "output_size":0
+        })).unwrap();
+        let (read, write) = crate::sys::pipe_cloexec().unwrap();
+        let mut entry = TaskEntry::bare(record, output.clone());
+        entry.stdout_fd = Some(read);
+        entry.watchers.insert(1);
+        let mut registry = Registry::new(home.clone());
+        registry.tasks.insert("mon_utf8".into(), entry);
+        let state = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, false)));
+        let (tx, mut events) = mpsc::channel(8);
+        let writer = tokio::spawn(std::future::pending::<()>());
+        state.lock().unwrap().conns.insert(1, ConnHandle {
+            kind: ClientKind::Extension, session_id: Some("sess-utf8".into()), tx,
+            die: Arc::new(Notify::new()), written: Arc::new(Mutex::new(HashMap::new())),
+            writer: writer.abort_handle(),
+        });
+        // Real initial bytes, not a fabricated OutputChunk. Wait only for the
+        // actual append (with a failure watchdog), never for a fixed sleep.
+        crate::sys::write_raw(write.as_raw_fd(), b"a\xe4").unwrap();
+        let eager_tee = |expected| move |stdout, stderr, output: Arc<Mutex<task::OutputState>>, mirror, tx, park| {
+            let tee = task::start_tee(stdout, stderr, output.clone(), mirror, tx, park)?;
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            while output.lock().unwrap().total_size < expected {
+                assert!(std::time::Instant::now() < until, "real tee did not append {expected} bytes");
+                std::thread::yield_now();
+            }
+            Ok(tee)
+        };
+        start_task_io_with_tee(&state, "mon_utf8", eager_tee(2));
+        let first = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&first.bytes).unwrap();
+        assert_eq!(first["task_id"], "mon_utf8");
+        assert_eq!(first["chunk"], "a", "{first}");
+        assert_eq!(first["next_cursor"], 1);
+
+        let (tee, fanout) = {
+            let mut st = state.lock().unwrap();
+            st.park_tx.send_replace(true);
+            let e = st.registry.tasks.get_mut("mon_utf8").unwrap();
+            (e.tee.take().unwrap(), e.fanout.take().unwrap())
+        };
+        let stdout = tokio::time::timeout(Duration::from_secs(3), tee.stdout)
+            .await.expect("stdout tee did not park").unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(3), tee.stderr)
+            .await.expect("stderr tee did not park").unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(3), fanout)
+            .await.expect("fanout did not park").unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            let e = st.registry.tasks.get_mut("mon_utf8").unwrap();
+            assert_eq!(e.delivered_cursor, 1);
+            assert_eq!(e.output.lock().unwrap().total_size, 2);
+            e.stdout_fd = stdout;
+            st.park_tx.send_replace(false);
+        }
+        assert!(events.try_recv().is_err(), "incomplete byte must not flush at park");
+        crate::sys::write_raw(write.as_raw_fd(), b"\xb8\xadb\n").unwrap();
+        start_task_io_with_tee(&state, "mon_utf8", eager_tee(6));
+        drop(write);
+        let last = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+        let last: serde_json::Value = serde_json::from_slice(&last.bytes).unwrap();
+        assert_eq!(last["task_id"], "mon_utf8");
+        assert_eq!(last["chunk"], "中b\n", "{last}");
+        assert_eq!(last["next_cursor"], 6);
+        let (tee, fanout) = {
+            let mut st = state.lock().unwrap();
+            let e = st.registry.tasks.get_mut("mon_utf8").unwrap();
+            (e.tee.take().unwrap(), e.fanout.take().unwrap())
+        };
+        assert!(tokio::time::timeout(Duration::from_secs(3), tee.stdout)
+            .await.expect("stdout tee did not reach EOF").unwrap().is_none());
+        assert!(tokio::time::timeout(Duration::from_secs(3), tee.stderr)
+            .await.expect("stderr tee did not reach EOF").unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(3), fanout)
+            .await.expect("fanout did not drain at EOF").unwrap();
+        assert!(events.try_recv().is_err(), "no repeated output at EOF");
+        {
+            let st = state.lock().unwrap();
+            let e = &st.registry.tasks["mon_utf8"];
+            assert_eq!(e.delivered_cursor, 6);
+            assert_eq!(e.record.output_size, 6);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"a\xe4\xb8\xadb\n");
+        writer.abort();
+        drop(state);
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn session_id_validation() {
