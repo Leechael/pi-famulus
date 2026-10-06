@@ -434,6 +434,26 @@ describe("soft deadline, as the parent sees it (registry + runner + overrun noti
     return { clock, registry, factory, shells, wakes, events, req, runId: run.runId };
   }
 
+  it("one reminder batches two overdue children into one wake", async () => {
+    const { clock, registry, factory, wakes, events, req, runId } = stack();
+    const firstReq = { ...req, childId: registry.addChild(runId, { name: "first", agent: "worker" }), name: "first" };
+    const secondReq = { ...req, childId: registry.addChild(runId, { name: "second", agent: "worker" }), name: "second" };
+    const first = await registry.startChild(firstReq);
+    const second = await registry.startChild(secondReq);
+
+    clock.advanceBy(30 * 60_000);
+
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].details).toMatchObject({
+      kind: "subagent-overrun",
+      childId: firstReq.childId,
+      additional: [{ childId: secondReq.childId, elapsedMs: 30 * 60_000, budgetMs: 30 * 60_000 }],
+    });
+    expect(events.filter((event) => event.type === "agent.overrun")).toHaveLength(2);
+    await first.interrupt();
+    await second.interrupt();
+  });
+
   it("batch sweep does not include a decision-paused overdue child", async () => {
     const { clock, registry, factory, wakes, req, runId } = stack();
     const pausedReq = { ...req, childId: registry.addChild(runId, { name: "paused", agent: "worker" }), name: "paused" };
