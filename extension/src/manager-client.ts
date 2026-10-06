@@ -19,8 +19,8 @@ import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
 const EXTENSION_VERSION = "0.1.2";
-// 3: speaks in-place upgrade (resends on reconnect, start keys).
-const PROTOCOL = 3;
+// 4: speaks machine-wide agent admission, as well as in-place upgrade.
+const PROTOCOL = 4;
 const HELLO_TIMEOUT_MS = 5000;
 const RECONNECT_HELLO_TIMEOUT_MS = 25_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -416,6 +416,15 @@ export class ManagerClient {
     return ((res.tasks as TaskRecord[] | undefined) ?? []) as TaskRecord[];
   }
 
+  async acquireAgent(childId: string): Promise<{ granted: boolean; rejection?: string }> {
+    const res = await this.request({ type: "acquire_agent", child_id: childId });
+    return { granted: res.granted === true, ...(typeof res.rejection === "string" ? { rejection: res.rejection } : {}) };
+  }
+
+  async releaseAgent(childId: string): Promise<void> {
+    await this.request({ type: "release_agent", child_id: childId });
+  }
+
   /** Daemon status, including optional in-place upgrade metadata. */
   async status(): Promise<ManagerStatusResponse> {
     const res = await this.request({ type: "status" });
@@ -786,7 +795,7 @@ export class ManagerClient {
 
   private request(msg: Record<string, unknown>, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<Record<string, unknown>> {
     const type = String(msg.type);
-    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start"].includes(type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "release_agent"].includes(type);
     const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
       const entry: PendingRequest = {

@@ -101,6 +101,9 @@ async function startFakeManager(home: string): Promise<FakeManager> {
           exit_code: 0,
           total_size: 13,
         };
+      case "acquire_agent":
+        return { v: 1, id: msg.id, ok: true, granted: true };
+      case "release_agent":
       case "stop":
       case "mark_background":
         return { v: 1, id: msg.id, ok: true };
@@ -250,6 +253,14 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(fake.received.find((message) => message.type === "stop")).toMatchObject({ reason: "tui" });
     await expect(client.list()).resolves.toEqual([]);
     await expect(client.shutdownSession()).resolves.toEqual(["sh_a1b2c3d4"]);
+  });
+
+  it("uses structured machine-agent acquire and release requests", async () => {
+    await client.connect();
+    expect(await client.acquireAgent("ch_test")).toEqual({ granted: true });
+    await client.releaseAgent("ch_test");
+    expect(fake.received.map((message) => message.type)).toContain("acquire_agent");
+    expect(fake.received.map((message) => message.type)).toContain("release_agent");
   });
 
   it("preserves upgrade generation metadata from status", async () => {

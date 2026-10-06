@@ -17,8 +17,8 @@ pub const PROTO_VERSION: u32 = 1;
 /// returned by `status`. 1 = original §3.3; 2 = observability contract
 /// (origin, mark_background, stop.reason, end_reason, events.jsonl); 3 =
 /// in-place upgrade (`upgrade`, status `generation`/`last_upgrade`, start
-/// keys, resend on reconnect).
-pub const PROTOCOL: u32 = 3;
+/// keys, resend on reconnect); 4 = machine-wide agent admission.
+pub const PROTOCOL: u32 = 4;
 /// The first protocol level whose manager understands `upgrade`.
 pub const PROTOCOL_UPGRADE: u32 = 3;
 /// §3.3: max frame 4 MiB.
