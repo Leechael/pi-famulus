@@ -874,10 +874,13 @@ fn d8d_cli_bounds_wait_for_stuck_shutdown_without_spawning() {
             .is_some_and(|p| p.iter().any(|t| t["label"] == "shutdown-grace"))
     }), "shutdown grace was not armed");
 
-    // Do not advance the shutdown timer until the CLI has timed out.
-    let out = home.cli(&["ls"], S(20));
+    // Do not advance the shutdown timer until the CLI has timed out. The
+    // harness bound must exceed the CLI's whole-flow startup deadline (60s,
+    // see client::connect) so the CLI gives up on its own — killing it here
+    // would no longer prove boundedness.
+    let out = home.cli(&["ls"], S(90));
     assert!(!out.status.success(), "CLI unexpectedly passed a stuck shutdown");
-    assert!(out.stderr.contains("manager did not become ready within 15s"), "{}", out.stderr);
+    assert!(out.stderr.contains("manager did not become ready within 60s"), "{}", out.stderr);
     assert_eq!(home.pidfile_pid(), Some(old));
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
     assert!(!log.contains("already running"), "spawn attempted during stuck shutdown: {log}");

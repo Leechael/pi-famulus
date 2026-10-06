@@ -282,11 +282,15 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
 /// manager can also remove its endpoint before releasing the lifetime lock.
 /// Wait for that lock before spawning a successor. Bound the whole flow, not
 /// just each wait, so a stuck or repeatedly shutting-down daemon cannot
-/// keep a CLI alive indefinitely.
+/// keep a CLI alive indefinitely. The bound must comfortably exceed
+/// SPAWN_SOCKET_WAIT: d2 on a loaded CI runner showed every client hitting
+/// this deadline while the daemon was still legitimately starting (24-way
+/// contention stretches each phase; a 15s cap fired before the 30s socket
+/// wait could ever complete).
 pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
-    tokio::time::timeout(Duration::from_secs(15), connect_with_retry(home, mode))
+    tokio::time::timeout(Duration::from_secs(60), connect_with_retry(home, mode))
         .await
-        .map_err(|_| "cannot reach pi-famulus: manager did not become ready within 15s".to_string())?
+        .map_err(|_| "cannot reach pi-famulus: manager did not become ready within 60s".to_string())?
 }
 
 async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
