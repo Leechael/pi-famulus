@@ -247,7 +247,7 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
         `cold-restart connect failed; started=${connectStartedAt}; elapsed=${elapsedMs}ms; home=${home}`,
         `socket=${existsSync(paths.socket)} pidFile=${pidFile}`,
         `connectError=${connectError ?? "<none>"}`,
-        `lastError=${client2.lastError() ?? "<none>"}`,
+        `lastError=${client2.lastError() || "<none>"}`,
         `manager.log:\n${managerLog}`,
       ].join("\n")).toBe(true);
       const tasks = await client2.list();
