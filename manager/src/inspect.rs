@@ -87,6 +87,14 @@ pub fn agent_output_tokens_per_second(tokens_output: Option<u64>, llm_ms: Option
     }
 }
 
+fn token_count_label(value: Option<u64>) -> String {
+    value.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into())
+}
+
+fn sum_agent_field(agents: &[AgentRecord], field: impl Fn(&AgentRecord) -> Option<u64>) -> Option<u64> {
+    agents.iter().try_fold(0u64, |sum, agent| sum.checked_add(field(agent)?))
+}
+
 impl AgentRecord {
     pub fn title(&self) -> String {
         let model = self.model.as_deref().map(|m| format!(" {m}")).unwrap_or_default();
@@ -987,14 +995,14 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             }
             if a.tokens_input.is_some() || a.tokens_output.is_some() || a.tokens_cache_read.is_some() || a.tokens_cache_write.is_some() {
                 let cache = if a.tokens_cache_read.is_some() || a.tokens_cache_write.is_some() {
-                    format!(" (cache read {} / write {})", a.tokens_cache_read.unwrap_or(0), a.tokens_cache_write.unwrap_or(0))
+                    format!(" (cache read {} / write {})", token_count_label(a.tokens_cache_read), token_count_label(a.tokens_cache_write))
                 } else {
                     String::new()
                 };
                 let rate = agent_output_tokens_per_second(a.tokens_output, a.llm_ms)
                     .map(|v| format!(" ({v:.1} output tok/s of LLM time)"))
                     .unwrap_or_default();
-                kv("tokens", format!("{} input / {} output{cache}{rate}", a.tokens_input.unwrap_or(0), a.tokens_output.unwrap_or(0)));
+                kv("tokens", format!("{} input / {} output{cache}{rate}", token_count_label(a.tokens_input), token_count_label(a.tokens_output)));
             }
             if a.llm_ms.is_some() || a.tool_ms.is_some() || a.queue_ms.is_some() || a.wall_other_ms.is_some() {
                 let approx = if a.wall_approximate { " (approximate; unclassified segments are not attributed)" } else { "" };
@@ -1407,12 +1415,12 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let agents = load_agent_records(home, &connected);
     let a_running = agents.iter().filter(|a| !agent_status_terminal(&a.status)).count();
     let a_done = agents.len() - a_running;
-    let tokens_input: u64 = agents.iter().map(|a| a.tokens_input.unwrap_or(0)).sum();
-    let tokens_output: u64 = agents.iter().map(|a| a.tokens_output.unwrap_or(0)).sum();
-    let tokens_cache_read: u64 = agents.iter().map(|a| a.tokens_cache_read.unwrap_or(0)).sum();
-    let tokens_cache_write: u64 = agents.iter().map(|a| a.tokens_cache_write.unwrap_or(0)).sum();
-    let llm_ms: u64 = agents.iter().map(|a| a.llm_ms.unwrap_or(0)).sum();
-    let tokens_per_second = agent_output_tokens_per_second(Some(tokens_output), Some(llm_ms));
+    let tokens_input = sum_agent_field(&agents, |a| a.tokens_input);
+    let tokens_output = sum_agent_field(&agents, |a| a.tokens_output);
+    let tokens_cache_read = sum_agent_field(&agents, |a| a.tokens_cache_read);
+    let tokens_cache_write = sum_agent_field(&agents, |a| a.tokens_cache_write);
+    let llm_ms = sum_agent_field(&agents, |a| a.llm_ms);
+    let tokens_per_second = agent_output_tokens_per_second(tokens_output, llm_ms);
     if json_out {
         let mut v = serde_json::to_value(&st).unwrap();
         v["agent_counts"] = json!({"running": a_running, "terminal": a_done});
@@ -1469,8 +1477,17 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         a_running,
         a_done
     );
-    let rate = tokens_per_second.map(|v| format!(" ({v:.1} output tok/s over {llm_ms} ms of LLM time)")).unwrap_or_default();
-    outln!("agent tokens: {tokens_input} input / {tokens_output} output (cache read {tokens_cache_read} / write {tokens_cache_write}){rate}");
+    let rate = tokens_per_second
+        .zip(llm_ms)
+        .map(|(v, ms)| format!(" ({v:.1} output tok/s over {ms} ms of LLM time)"))
+        .unwrap_or_default();
+    outln!(
+        "agent tokens: {} input / {} output (cache read {} / write {}){rate}",
+        token_count_label(tokens_input),
+        token_count_label(tokens_output),
+        token_count_label(tokens_cache_read),
+        token_count_label(tokens_cache_write),
+    );
     if let Some(line) = upgrade_line(&st, now_ms()) {
         outln!("{line}");
     }
@@ -1533,6 +1550,35 @@ mod tests {
         assert_eq!(p["zzzzzzzzzzzz"], "zzzzzzzz");
         assert_eq!(p["0199aaaa-1111-7000"], "0199aaaa-1");
         assert_eq!(p["0199aaaa-2222-7000"], "0199aaaa-2");
+    }
+
+    #[test]
+    fn missing_agent_telemetry_makes_aggregate_unknown() {
+        let measured: AgentRecord = serde_json::from_value(json!({
+            "child_id": "ch_measured",
+            "session_id": "sess-1",
+            "status": "completed",
+            "tokens_input": 100,
+            "tokens_output": 20,
+            "llm_ms": 1_000
+        }))
+        .unwrap();
+        let legacy: AgentRecord = serde_json::from_value(json!({
+            "child_id": "ch_legacy",
+            "session_id": "sess-1",
+            "status": "completed"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            sum_agent_field(std::slice::from_ref(&measured), |a| a.tokens_output),
+            Some(20)
+        );
+        assert_eq!(
+            sum_agent_field(&[measured, legacy], |a| a.tokens_output),
+            None
+        );
+        assert_eq!(agent_output_tokens_per_second(None, Some(1_000)), None);
     }
 
     #[test]

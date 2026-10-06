@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -80,6 +80,26 @@ describe("agent child records", () => {
       wall_other_ms: 100,
       wall_approximate: true,
     });
+  });
+
+  it("atomically replaces live metrics without leaving temporary records", () => {
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_atomic001",
+      run_id: "run_atomic001",
+      session_id: "sess-1",
+      name: "atomic",
+      agent: "worker",
+      status: "running",
+      started_at: 1,
+    });
+    for (let output = 0; output < 100; output++) {
+      updateAgentChildMetrics(home, "sess-1", "ch_atomic001", { tokens_output: output });
+      expect(loadAgentChildRecords(home)[0]?.tokens_output).toBe(output);
+    }
+    expect(readdirSync(join(home, "sessions", "sess-1", "agents"))).toEqual(["ch_atomic001.json"]);
   });
 
   it("round-trips provider errors on failed agent records", () => {

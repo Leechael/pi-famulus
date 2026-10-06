@@ -4,7 +4,8 @@
  *
  * Layout: <home>/sessions/<session_id>/agents/<child_id>.json
  */
-import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface AgentChildRecord {
@@ -99,11 +100,22 @@ export function agentRecordPath(home: string, sessionId: string, childId: string
   return join(agentRecordsDir(home, sessionId), `${childId}.json`);
 }
 
-/** Write one child record (mkdir + overwrite). */
+/** Write one child record atomically (mkdir + same-directory temp file + rename). */
 export function writeAgentChildRecord(home: string, record: AgentChildRecord): void {
   const dir = agentRecordsDir(home, record.session_id);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(agentRecordPath(home, record.session_id, record.child_id), JSON.stringify(record));
+  const path = agentRecordPath(home, record.session_id, record.child_id);
+  const tempPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(record), { flag: "wx" });
+    renameSync(tempPath, path);
+  } finally {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      // rename consumed the temporary file, or a failed write left none.
+    }
+  }
 }
 
 export type AgentChildTelemetry = Partial<Pick<AgentChildRecord,

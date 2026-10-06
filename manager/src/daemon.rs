@@ -565,14 +565,17 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
             };
             let active: HashSet<String> = running.iter().map(|(id, _)| id.clone()).collect();
             tracker.retain(&active);
-            let at = now_ms();
+            let at = std::time::Instant::now();
+            let sampled_at = now_ms();
+            let pgids: Vec<u32> = running.iter().map(|(_, pgid)| *pgid).collect();
+            let samples = task::live_group_cpu_ms_many(&pgids);
             let readings: Vec<(String, Option<task::LiveCpuReading>)> = running
                 .into_iter()
                 .map(|(id, pgid)| {
-                    let reading = match task::live_group_cpu_ms(pgid) {
+                    let reading = match samples.get(&pgid).copied().flatten() {
                         Some((user, system)) => Some(tracker.update(&id, at, user, system)),
                         None => {
-                            tracker.mark_unavailable(&id, at);
+                            tracker.mark_unavailable(&id);
                             None
                         }
                     };
@@ -588,7 +591,7 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
                 if entry.record.status != TaskStatus::Running {
                     continue;
                 }
-                apply_live_cpu_sample(&mut entry.record, reading, at);
+                apply_live_cpu_sample(&mut entry.record, reading, sampled_at);
             }
         }
     })
@@ -597,8 +600,8 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
 fn apply_live_cpu_sample(record: &mut TaskRecord, reading: Option<task::LiveCpuReading>, sampled_at: u64) {
     match reading {
         Some(reading) => {
-            record.live_cpu_user_ms = Some(reading.user_ms);
-            record.live_cpu_sys_ms = Some(reading.system_ms);
+            record.live_cpu_user_ms = Some(record.live_cpu_user_ms.unwrap_or(0).max(reading.user_ms));
+            record.live_cpu_sys_ms = Some(record.live_cpu_sys_ms.unwrap_or(0).max(reading.system_ms));
             record.live_cpu_percent = reading.percent;
             record.live_cpu_sampled_at = Some(sampled_at);
             record.live_cpu_stale = false;
@@ -3602,6 +3605,28 @@ mod tests {
             "output_size": 0
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn post_handover_live_sample_preserves_existing_cpu_high_water() {
+        let mut record = running_record_for_cpu_test();
+        record.live_cpu_user_ms = Some(5_000);
+        record.live_cpu_sys_ms = Some(700);
+        apply_live_cpu_sample(
+            &mut record,
+            Some(task::LiveCpuReading {
+                user_ms: 120,
+                system_ms: 30,
+                percent: None,
+            }),
+            2_000,
+        );
+        assert_eq!(
+            (record.live_cpu_user_ms, record.live_cpu_sys_ms),
+            (Some(5_000), Some(700))
+        );
+        assert_eq!(record.live_cpu_sampled_at, Some(2_000));
+        assert!(!record.live_cpu_stale);
     }
 
     #[test]

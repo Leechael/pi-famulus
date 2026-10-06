@@ -98,6 +98,8 @@ export interface ChildWallUsage {
 export interface ChildSessionEvent {
   type: string;
   role?: string;
+  /** Pi's stable tool-call id, used to pair execution start/end events. */
+  toolCallId?: string;
   usage?: ChildTokenUsage;
 }
 

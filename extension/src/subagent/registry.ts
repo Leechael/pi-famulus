@@ -127,6 +127,9 @@ interface InternalChild {
   turn: number;
   handle?: ChildHandle;
   shouldStart?: () => boolean;
+  /** Initial admission wait while runner.start() has not returned its handle. */
+  queueStartedAt?: number;
+  queueMs: number;
 }
 
 interface InternalRun {
@@ -248,16 +251,17 @@ export class SubagentRegistry implements RunRegistry {
     };
     this.runs.set(run.runId, run);
     this.emit(run);
-    return snapshot(run);
+    return snapshot(run, this.now());
   }
 
   get(runId: string): RunRecord | undefined {
     const run = this.runs.get(runId);
-    return run ? snapshot(run) : undefined;
+    return run ? snapshot(run, this.now()) : undefined;
   }
 
   list(): RunRecord[] {
-    return [...this.runs.values()].map(snapshot);
+    const now = this.now();
+    return [...this.runs.values()].map((run) => snapshot(run, now));
   }
 
   handle(childId: string): ChildHandle | undefined {
@@ -338,6 +342,7 @@ export class SubagentRegistry implements RunRegistry {
       startedAt: this.now(),
       queueStartedAt: this.now(),
       turn: 1,
+      queueMs: 0,
     };
     run.children.push(child);
     this.children.set(child.childId, child);
@@ -369,7 +374,15 @@ export class SubagentRegistry implements RunRegistry {
       return this.failWithoutSession(child, (err as Error).message);
     }
 
-    const handle = await runner.start(req);
+    child.queueStartedAt = this.now();
+    let handle: ChildHandle;
+    try {
+      handle = await runner.start(req);
+    } catch (error) {
+      this.closeInitialQueue(child, this.now());
+      throw error;
+    }
+    this.closeInitialQueue(child, this.now());
     child.handle = handle;
     // Prefer the actually resolved provider/id over the request-time spec
     // (inherits parent model when neither param nor agent.model is set).
@@ -422,6 +435,7 @@ export class SubagentRegistry implements RunRegistry {
     try {
       checkCurrent();
     } catch (error) {
+      this.closeInitialQueue(child, this.now());
       release();
       throw error;
     }
@@ -431,6 +445,7 @@ export class SubagentRegistry implements RunRegistry {
       admit: () => {
         if (admitted) return;
         checkCurrent();
+        this.closeInitialQueue(child, this.now());
         admitted = true;
         this.transitionChild(child, "running");
         const handle = child.handle;
@@ -650,9 +665,15 @@ export class SubagentRegistry implements RunRegistry {
     else run.status = "partial";
   }
 
+  private closeInitialQueue(child: InternalChild, at: number): void {
+    if (child.queueStartedAt === undefined) return;
+    child.queueMs += Math.max(0, at - child.queueStartedAt);
+    child.queueStartedAt = undefined;
+  }
+
   private emit(run: InternalRun): void {
     if (this.transitionCbs.size === 0) return;
-    const record = snapshot(run);
+    const record = snapshot(run, this.now());
     for (const cb of this.transitionCbs) {
       try {
         cb(record);
@@ -701,7 +722,7 @@ export class SubagentRegistry implements RunRegistry {
   }
 }
 
-function snapshot(run: InternalRun): RunRecord {
+function snapshot(run: InternalRun, now: number): RunRecord {
   return {
     runId: run.runId,
     kind: run.kind,
@@ -722,7 +743,13 @@ function snapshot(run: InternalRun): RunRecord {
       endedAt: c.endedAt,
       turn: c.turn,
       tokenUsage: c.handle?.tokenUsage() ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      wallUsage: c.handle?.wallUsage() ?? { llmMs: 0, toolMs: 0, queueMs: 0, otherMs: 0, approximate: false },
+      wallUsage: c.handle?.wallUsage() ?? {
+        llmMs: 0,
+        toolMs: 0,
+        queueMs: c.queueMs + (c.queueStartedAt === undefined ? 0 : Math.max(0, now - c.queueStartedAt)),
+        otherMs: 0,
+        approximate: false,
+      },
     })),
   };
 }

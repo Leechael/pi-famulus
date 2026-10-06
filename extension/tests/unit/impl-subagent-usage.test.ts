@@ -17,6 +17,7 @@ describe("subagent token usage", () => {
   it("adapts cached usage into absolute message-end events across a resumed turn", () => {
     const adapter = createPiUsageAdapter();
     const recorded: Array<{ tokens_input: number; tokens_output: number; tokens_cache_read: number; tokens_cache_write: number }> = [];
+    expect(adapter.adapt({ type: "tool_execution_start", toolCallId: "tool-1" }).toolCallId).toBe("tool-1");
     const sequence = [
       { type: "message_end", message: { role: "assistant", usage: { input: 100, output: 12, cacheRead: 80, cacheWrite: 4 } } },
       // The same adapter/session survives resume(); totals continue, events remain absolute.

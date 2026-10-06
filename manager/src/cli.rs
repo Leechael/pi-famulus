@@ -106,7 +106,7 @@ pub(crate) enum Sub {
         #[usage(long)]
         json: bool,
     },
-    /// Cumulative and live shell-task CPU by agent and work kind, with tokens.
+    /// Cumulative and live task CPU (including monitors) by agent and work kind, with tokens.
     ///
     /// A plain-text snapshot; 100% NOW equals one CPU core.
     #[usage(display_order = 43, help_heading = "Inspection")]
@@ -115,7 +115,7 @@ pub(crate) enum Sub {
         #[usage(long)]
         json: bool,
     },
-    /// Shell tasks' wall time and CPU, grouped by agent and/or work kind.
+    /// Retained tasks' wall time and CPU, grouped by agent and/or work kind.
     ///
     /// Covers every retained task record, finished work of gone sessions
     /// included. AGENT is the subagent that ran the task (`main <session>`

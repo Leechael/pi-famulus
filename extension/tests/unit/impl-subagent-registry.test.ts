@@ -122,6 +122,27 @@ describe("SubagentRegistry", () => {
     await Promise.all([h2.result, h3.result]);
   });
 
+  it("reports initial admission wait before the child handle is attached", async () => {
+    const { registry, factory, clock } = makeStack({ maxConcurrentChildren: 1 });
+    factory.autoComplete = null;
+    const run = registry.createRun("tasks");
+    const first = await registry.startChild(addReq(registry, run.runId, "first"));
+    const queued = registry.startChild(addReq(registry, run.runId, "queued"));
+    await tick();
+
+    clock.advanceBy(777);
+    const snapshot = registry.get(run.runId)!.children.find((child) => child.name === "queued")!;
+    expect(snapshot.status).toBe("pending");
+    expect(snapshot.wallUsage?.queueMs).toBe(777);
+
+    factory.sessions[0].complete("first done");
+    await first.result;
+    const second = await queued;
+    expect(registry.get(run.runId)!.children.find((child) => child.name === "queued")!.wallUsage?.queueMs).toBe(777);
+    factory.sessions[1].complete("second done");
+    await second.result;
+  });
+
   it("enforces the session spawn budget per hour", async () => {
     const { registry, factory } = makeStack({ spawnBudgetPerHour: 2 });
     const run = registry.createRun("tasks");

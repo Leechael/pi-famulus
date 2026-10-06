@@ -196,8 +196,12 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** Whether the current generation's settled result is terminal for this child. */
   private terminalSettle = false;
   private disposed = false;
-  /** Nested tool_execution_start/end. Stall stays paused while > 0. */
+  /** Nested current-generation tool calls. Stall stays paused while > 0. */
   private toolDepth = 0;
+  /** Start generation by Pi toolCallId so late end events cannot close a new interval. */
+  private readonly toolCallGenerations = new Map<string, number>();
+  /** FIFO fallback for adapters that omit Pi's toolCallId (marked approximate). */
+  private readonly anonymousToolGenerations: number[] = [];
   private wall: ChildWallUsage = { llmMs: 0, toolMs: 0, queueMs: 0, otherMs: 0, approximate: false };
   private generationAt: number | null = null;
   private generationLlmMs = 0;
@@ -205,6 +209,8 @@ class InProcessChildHandle implements DisposableChildHandle {
   private generationQueueMs = 0;
   private queueStartedAt: number | null = null;
   private queueGeneration: number | null = null;
+  /** Pending-abort drain before resume is unclassified wall time. */
+  private otherStartedAt: number | null = null;
   private llmStartedAt: number | null = null;
   private toolStartedAt: number | null = null;
   /** contact_supervisor need_decision. Stall stays paused while true. */
@@ -298,7 +304,10 @@ class InProcessChildHandle implements DisposableChildHandle {
     const toolMs = this.toolStartedAt === null ? 0 : Math.max(0, now - this.toolStartedAt);
     const elapsed = this.generationAt === null ? 0 : Math.max(0, now - this.generationAt);
     const accounted = this.generationQueueMs + queueMs + this.generationLlmMs + llmMs + this.generationToolMs + toolMs;
-    const otherMs = this.wall.otherMs + Math.max(0, elapsed - accounted);
+    const otherMs =
+      this.wall.otherMs +
+      Math.max(0, elapsed - accounted) +
+      (this.otherStartedAt === null ? 0 : Math.max(0, now - this.otherStartedAt));
     return {
       llmMs: this.wall.llmMs + llmMs,
       toolMs: this.wall.toolMs + toolMs,
@@ -426,14 +435,19 @@ class InProcessChildHandle implements DisposableChildHandle {
    * dead, and the turn settles failed.
    */
   private async startResumedTurn(gen: number, message: string, pendingAbort: Promise<void> | null): Promise<void> {
-    if (pendingAbort && !(await this.awaitAbortBounded(pendingAbort))) {
-      this.settle(gen, {
-        status: "failed",
-        text: "",
-        error: `subagent ${this.req.childId} session did not go idle after the abort; cannot resume`,
-        durationMs: this.now() - this.runStartedAt,
-      });
-      return;
+    if (pendingAbort) {
+      this.otherStartedAt = this.now();
+      const idle = await this.awaitAbortBounded(pendingAbort);
+      this.closeOther(this.now());
+      if (!idle) {
+        this.settle(gen, {
+          status: "failed",
+          text: "",
+          error: `subagent ${this.req.childId} session did not go idle after the abort; cannot resume`,
+          durationMs: this.now() - this.runStartedAt,
+        });
+        return;
+      }
     }
     if (this.disposed || this.isSettled(gen)) return;
     await this.beginGeneration(message, false, false, gen);
@@ -686,7 +700,9 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private settle(gen: number, result: ChildResult): void {
     if (gen !== this.generation || this.settledFlag) return;
-    this.finishWallGeneration(this.now(), gen);
+    const at = this.now();
+    this.closeOther(at);
+    this.finishWallGeneration(at, gen);
     this.settledFlag = true;
     if (this.admissionStartedAt !== null) {
       this.generationQueueMs = Math.max(0, this.now() - this.admissionStartedAt);
@@ -755,6 +771,14 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.toolStartedAt = null;
   }
 
+  private closeOther(at: number): void {
+    if (this.otherStartedAt === null) return;
+    const elapsed = Math.max(0, at - this.otherStartedAt);
+    this.wall.otherMs += elapsed;
+    if (elapsed > 0) this.wall.approximate = true;
+    this.otherStartedAt = null;
+  }
+
   private accountWallEvent(event: { type: string; role?: string; usage?: { input: number; output: number } }, at: number): void {
     const assistant = event.role === "assistant" || (event.role === undefined && event.usage !== undefined);
     if (event.type === "message_start" && assistant) {
@@ -804,24 +828,59 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.toolStartedAt = null;
   }
 
-  private handleSessionEvent(event: { type: string; role?: string; usage?: { input: number; output: number } }): void {
+  private handleSessionEvent(event: { type: string; role?: string; toolCallId?: string; usage?: { input: number; output: number } }): void {
     const now = this.now();
     const active = this.status_ === "running";
-    if (active) this.accountWallEvent(event, now);
-    if (active && ["message_start", "message_end", "tool_execution_start", "tool_execution_end", "agent_end"].includes(event.type)) {
+    let currentToolEvent = false;
+    if (event.type === "tool_execution_start" && active) {
+      if (event.toolCallId) {
+        if (this.toolCallGenerations.has(event.toolCallId)) {
+          this.wall.approximate = true;
+        } else {
+          this.toolCallGenerations.set(event.toolCallId, this.generation);
+          currentToolEvent = true;
+        }
+      } else {
+        // Pi emits toolCallId; retain generation ownership for older adapters
+        // too, but mark their FIFO pairing as approximate.
+        this.anonymousToolGenerations.push(this.generation);
+        this.wall.approximate = true;
+        currentToolEvent = true;
+      }
+    } else if (event.type === "tool_execution_end") {
+      if (event.toolCallId) {
+        const generation = this.toolCallGenerations.get(event.toolCallId);
+        this.toolCallGenerations.delete(event.toolCallId);
+        currentToolEvent = active && generation === this.generation;
+        if (active && generation === undefined) this.wall.approximate = true;
+      } else {
+        const generation = this.anonymousToolGenerations.shift();
+        currentToolEvent = active && generation === this.generation;
+        if (active && !currentToolEvent) this.wall.approximate = true;
+      }
+    }
+    if (active && (!event.type.startsWith("tool_execution_") || currentToolEvent)) {
+      this.accountWallEvent(event, now);
+    }
+    if (
+      ["message_end", "tool_execution_end", "agent_end"].includes(event.type) ||
+      (active && ["message_start", "tool_execution_start"].includes(event.type))
+    ) {
       this.notifyActivity();
     }
-    // Track depth even after settle. A late tool_execution_end must not leak
-    // into the next resume, and must not rearm a stale generation.
     if (event.type === "tool_execution_start") {
-      this.toolDepth++;
-      if (active) this.clearStall();
+      if (currentToolEvent) {
+        this.toolDepth++;
+        this.clearStall();
+      }
       return;
     }
     if (event.type === "tool_execution_end") {
-      this.toolDepth = Math.max(0, this.toolDepth - 1);
-      this.lastEvent = now;
-      if (active && this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
+      if (currentToolEvent) {
+        this.toolDepth = Math.max(0, this.toolDepth - 1);
+        this.lastEvent = now;
+        if (this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
+      }
       return;
     }
     if (!active) return;

@@ -44,6 +44,7 @@ export function createPiUsageAdapter() {
     tokenUsage: () => totals.snapshot(),
     adapt(event: {
       type: string;
+      toolCallId?: string;
       message?: {
         role?: string;
         usage?: { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown };
@@ -57,6 +58,7 @@ export function createPiUsageAdapter() {
       }
       return {
         type: event.type,
+        ...(typeof event.toolCallId === "string" ? { toolCallId: event.toolCallId } : {}),
         ...(typeof message?.role === "string" ? { role: message.role } : {}),
         ...(usage ? { usage } : {}),
       };

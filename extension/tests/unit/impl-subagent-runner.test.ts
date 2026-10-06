@@ -89,6 +89,34 @@ describe("InProcessRunner", () => {
     });
   });
 
+  it("does not let a late old-generation tool end close a resumed tool interval", async () => {
+    const clock = new ManualClock(0);
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const runner = new InProcessRunner({ createSession: factory.fn, clock, stallMs: 0 });
+    const handle = await runner.start(makeReq());
+    const session = factory.sessions[0];
+
+    const oldTool = session.runTool();
+    clock.advanceBy(100);
+    await handle.interrupt();
+    await handle.result;
+
+    await handle.resume("continue");
+    await tick();
+    const currentTool = session.runTool();
+    clock.advanceBy(50);
+    session.emitEvent({ type: "tool_execution_end", toolCallId: oldTool.toolCallId });
+    expect(handle.wallUsage().toolMs).toBe(150);
+
+    clock.advanceBy(50);
+    currentTool.end();
+    expect(handle.wallUsage().toolMs).toBe(200);
+    session.complete("done");
+    await handle.result;
+    expect(handle.wallUsage().toolMs).toBe(200);
+  });
+
   for (const staleResult of ["grant", "reject"] as const) {
     it(`does not let a stale ${staleResult} admission callback close the next generation's queue`, async () => {
       const clock = new ManualClock(0);
@@ -227,6 +255,23 @@ describe("InProcessRunner", () => {
     // Second interrupt is a no-op.
     await handle.interrupt();
     expect(factory.sessions[0].aborts).toBe(1);
+  });
+
+  it("notifies transcript observers for terminal events that arrive after settle", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    let activities = 0;
+    const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 0, onActivity: () => activities++ });
+    const handle = await runner.start(makeReq());
+    const session = factory.sessions[0];
+    session.complete("done");
+    await handle.result;
+    const settledActivities = activities;
+
+    session.emitEvent({ type: "message_end", role: "assistant" });
+    session.emitEvent({ type: "tool_execution_end", toolCallId: "late-tool" });
+    session.emitEvent({ type: "agent_end" });
+    expect(activities).toBe(settledActivities + 3);
   });
 
   it("resume re-prompts the same session and exposes a new result promise", async () => {
@@ -401,13 +446,13 @@ describe("InProcessRunner", () => {
       factory.autoComplete = null;
       const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock, stallRetries: 0 });
       const handle = await runner.start(makeReq());
-      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string; toolCallId?: string }) => void }).emit.bind(
         factory.sessions[0],
       );
-      emit({ type: "tool_execution_start" });
+      emit({ type: "tool_execution_start", toolCallId: "stall-tool" });
       clock.advanceBy(2_000);
       expect(handle.status()).toBe("running");
-      emit({ type: "tool_execution_end" });
+      emit({ type: "tool_execution_end", toolCallId: "stall-tool" });
       clock.advanceBy(500);
       expect(handle.status()).toBe("failed");
     });
@@ -423,16 +468,16 @@ describe("InProcessRunner", () => {
         hardTimeoutMs: 100,
       });
       const handle = await runner.start(makeReq());
-      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string; toolCallId?: string }) => void }).emit.bind(
         factory.sessions[0],
       );
-      emit({ type: "tool_execution_start" });
+      emit({ type: "tool_execution_start", toolCallId: "stall-tool" });
       clock.advanceBy(100);
       expect(handle.status()).toBe("interrupted");
-      emit({ type: "tool_execution_end" });
+      emit({ type: "tool_execution_end", toolCallId: "stall-tool" });
       await handle.resume("again");
       await tick(); // the ceiling's abort drains, then the turn starts
-      emit({ type: "tool_execution_end" });
+      emit({ type: "tool_execution_end", toolCallId: "stall-tool" });
       clock.advanceBy(50);
       expect(handle.status()).toBe("failed");
       expect((await handle.result).error).toBe("stalled");
@@ -935,13 +980,17 @@ describe("InProcessRunner", () => {
       const first = await handle.result;
       expect(first.error).toBe("stalled");
 
+      const previousOtherMs = handle.wallUsage().otherMs;
       await handle.resume("try again"); // accepted; the drain runs in the background
       await tick();
       expect(handle.status()).toBe("pending");
       expect(factory.sessions[0].prompts).toHaveLength(1); // waits for the abort
+      clock.advanceBy(250);
+      expect(handle.wallUsage().otherMs).toBe(previousOtherMs + 250);
       factory.sessions[0].openAbortGate();
       await tick();
       expect(factory.sessions[0].prompts).toHaveLength(2);
+      expect(handle.wallUsage().otherMs).toBe(previousOtherMs + 250);
       factory.sessions[0].complete("recovered");
       const second = await handle.result;
       expect(second.status).toBe("completed");

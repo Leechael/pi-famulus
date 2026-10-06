@@ -120,7 +120,7 @@ tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 agent tokens: 8200 input / 460 output (cache read 6100 / write 280)
 ```
 
-The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `agent tokens` sums provider-reported cumulative child usage. `input` is exactly provider `usage.input`; `cache read` and `cache write` are separate counters (`usage.cacheRead` / `usage.cacheWrite`), not included in input. Records refresh as child messages finish, and the extension also appends absolute totals in `agent.usage` events for readers of the shared event stream. Human-readable `output tok/s` is cumulative output tokens divided by observed LLM message-in-flight milliseconds; it is omitted until an LLM interval is observed. In `--json`, `agent_tokens.output_tokens_per_second` is `null` until then; cache counters are `tokens_cache_read` and `tokens_cache_write`. `--json` prints the protocol `status` response plus `agent_counts` and `agent_tokens`. With no daemon: `pi-famulus: pi-famulus is not running` on stderr, exit 1 (also with `--json`).
+The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `agent tokens` sums provider-reported cumulative child usage. If a retained agent record lacks a counter (as in older records), that aggregate is unavailable rather than treated as zero. `input` is exactly provider `usage.input`; `cache read` and `cache write` are separate counters (`usage.cacheRead` / `usage.cacheWrite`), not included in input. Records refresh as child messages finish, and the extension also appends absolute totals in `agent.usage` events for readers of the shared event stream. Human-readable `output tok/s` is cumulative output tokens divided by observed LLM message-in-flight milliseconds; it is omitted until an LLM interval is observed. In `--json`, `agent_tokens.output_tokens_per_second` is `null` until then; cache counters are `tokens_cache_read` and `tokens_cache_write`. `--json` prints the protocol `status` response plus `agent_counts` and `agent_tokens`. With no daemon: `pi-famulus: pi-famulus is not running` on stderr, exit 1 (also with `--json`).
 
 ### `sessions`
 
@@ -175,18 +175,18 @@ A plain-text snapshot of retained task CPU grouped by agent and work kind, toget
 
 ```text
 $ pi-famulus top
-pi-famulus top — CPU totals are per-agent shell-task CPU; NOW is the latest sampled CPU rate (100% = one core).
+pi-famulus top — CPU totals are per-agent task CPU, including monitors; NOW is the latest sampled CPU rate (100% = one core).
 AGENTS
   worker (ch_1234) | CPU 12s total, 85.0% now (sample 14:04:23) | 2 task(s) | tokens 8200 in / 460 out (cache read 6100 / write 280), 24.0 output tok/s | wall LLM 19s / tool 3s / queue 500ms / unclassified 20ms
 WORK KINDS
   test-suite | 1 task(s) | CPU 10s total, 85.0% now (sample 14:04:23)
 ```
 
-`CPU total` combines final runner CPU from ended shell tasks with daemon live process-group estimates for running shell tasks attributed to the child (`origin.child_id`); it is not a measurement of remote model compute or agent runtime overhead. `NOW` is the recent sampling interval, which refreshes about every 5s; percentages can exceed 100% when multiple cores are used. A `NOW` value of `unavailable` (JSON `cpu_now_stale: true`) distinguishes a failed sample from no sample yet; `sample` is the most recent successful timestamp (`cpu_sampled_at` in JSON). Agents with usage but no shell tasks still appear. `tokens_input` is exactly provider `usage.input`; cache-read (`tokens_cache_read`) and cache-write (`tokens_cache_write`) counts are separate and not included in input. `output tok/s` is cumulative provider output tokens divided by observed assistant-message LLM milliseconds × 1000, not total elapsed time. Wall split classifies observed LLM message, tool execution, and admission queue intervals; unclassified time is approximate and is not assigned to a phase. `--json` returns `agents[]` and `work_kinds[]` with millisecond totals, separate cache counters, and optional CPU rates plus freshness fields. This command takes a snapshot; it does not refresh continuously and never starts the daemon.
+`CPU total` combines final runner CPU from ended tasks (including monitors) with daemon live process-group estimates for running tasks; shell tasks attributed to a child use `origin.child_id`, while monitor tasks without a child id appear under `main <session>`. It is not a measurement of remote model compute or agent runtime overhead. `NOW` is the recent sampling interval, which refreshes about every 5s; percentages can exceed 100% when multiple cores are used. A `NOW` value of `unavailable` (JSON `cpu_now_stale: true`) distinguishes a failed sample from no sample yet; `sample` is the most recent successful timestamp (`cpu_sampled_at` in JSON). Agents with usage but no shell tasks still appear. `tokens_input` is exactly provider `usage.input`; cache-read (`tokens_cache_read`) and cache-write (`tokens_cache_write`) counts are separate and not included in input. `output tok/s` is cumulative provider output tokens divided by observed assistant-message LLM milliseconds × 1000, not total elapsed time; it is unavailable when either value is missing. Wall split classifies observed LLM message, tool execution, and admission queue intervals; unclassified time is approximate and is not assigned to a phase. `--json` returns `agents[]` and `work_kinds[]` with millisecond totals, separate cache counters, and optional CPU rates plus freshness fields. This command takes a snapshot; it does not refresh continuously and never starts the daemon.
 
 ### `stats`
 
-Where shell time and CPU went, grouped by the subagent that ran each task, by the task's work kind, or both:
+Where retained task wall time and CPU went, grouped by the subagent that ran each task, by the task's work kind, or both:
 
 ```text
 $ pi-famulus stats --by agent,kind
@@ -197,14 +197,12 @@ main 01a10bda             git            39  1m02s   3.1s    0.1           0    
 TOTAL                                    46  1h13m  3h45m    3.0           1       1       20m14s
 ```
 
-- **AGENT** is the subagent in the task's `origin.child_id`, named from its agent record (`name (ch_…)`; the bare id when the record is gone). Tasks a session's main agent ran itself are `main <session>`.
+- **AGENT** is the subagent in the task's `origin.child_id`, named from its agent record (`name (ch_…)`; the bare id when the record is gone). Tasks a session's main agent ran itself (including monitors without a child id) are `main <session>`.
 - **KIND** is the task's `work_kind` (see `ls`): `test-suite`, `test`, `build`, `lint/type`, `git`, `read/search`, `other`, or `monitor`. Not the shell/monitor `KIND` of `ls`. `npm test -- --run` is still a whole suite (`--run` selects one-shot mode, not tests); a path or test-name filter makes it `test`.
 - **WALL** sums the tasks' durations (a running task's so far). **CPU** sums user + system CPU for tasks with a final measurement or a live process-group estimate, and **CORES** divides it by the wall time of those same tasks. **UNMEASURED** counts tasks without an available final/live measurement (e.g. SIGKILLed with their runner by `--timeout-ms` or after a stop's grace, or recorded by an older manager); `-` means no task in the row was measured. Live CPU is best-effort and sampled about every 5s; see `ls` for what CPU covers.
 - **KILLED** / **KILLED-WALL**: tasks that ended `killed` and the wall time they ran before that.
 
 Every retained task record counts, including finished work of gone sessions (`ls` leaves those out); rows are sorted by CPU, then wall time, with a `TOTAL` row last. Filters as in `ls`: `--session PREFIX`, `--cwd DIR`, `--since DUR` (tasks running at some point within it). Per-project command overrides are **not supported**; commands use the built-in classifier, so opaque scripts can land in `other`. `npm test -- --run` is classified as a whole suite (`--run` chooses one-shot mode, not test selection). `--json` prints the groups with raw milliseconds (`wall_ms`, `cpu_user_ms`, `cpu_sys_ms`, `cpu_ms`, `measured`, `measured_wall_ms`, optional `cpu_now_percent`, `cpu_now_stale`, `cpu_sampled_at`, `killed`, `killed_wall_ms`, and `avg_cores` when measured wall time is nonzero). Never starts the daemon.
-
-- deferred | per-project work-kind command overrides | impact | opaque project scripts can be grouped as `other`, obscuring their CPU/wall share | trigger | `other` repeatedly holds a material share that people can attribute to known project scripts.
 
 ### `agent`
 

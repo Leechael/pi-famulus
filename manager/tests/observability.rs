@@ -605,7 +605,16 @@ fn c1_ls_columns_filters_json_and_cjk() {
     assert!(cpu.ends_with('s') && cpu[..cpu.len() - 1].parse::<f64>().is_ok(), "CPU {cpu:?}: {cjk_row}");
     assert!(cores.parse::<f64>().is_ok(), "CORES {cores:?}: {cjk_row}");
     assert_eq!(now, "-", "terminal tasks have no recent sample: {cjk_row}");
-    assert_eq!(cols(running), ("-".to_string(), "-".to_string(), "-".to_string()), "{running}");
+    let (running_cpu, running_cores, running_now) = cols(running);
+    let running_sample = running.split_whitespace().nth(10).unwrap();
+    if running_cpu == "-" {
+        assert_eq!((running_cores.as_str(), running_now.as_str(), running_sample), ("-", "-", "-"), "{running}");
+    } else {
+        assert!(running_cpu.ends_with('s') && running_cpu[..running_cpu.len() - 1].parse::<f64>().is_ok(), "CPU {running_cpu:?}: {running}");
+        assert!(running_cores.parse::<f64>().is_ok(), "CORES {running_cores:?}: {running}");
+        assert!(running_now == "unavailable" || running_now.ends_with('%'), "NOW {running_now:?}: {running}");
+        assert_ne!(running_sample, "-", "sampled task must expose its last sample time: {running}");
+    }
 
     // filters
     let ids = |args: &[&str]| -> Vec<String> {
@@ -776,14 +785,18 @@ fn c13_top_reports_live_process_group_cpu() {
     let agent = report["agents"].as_array().unwrap().iter().find(|a| a["child_id"] == child_id).unwrap();
     assert!(agent["cpu_ms"].as_u64().unwrap() > 0, "{agent}");
     assert!(agent["cpu_now_percent"].as_f64().unwrap() > 0.0, "{agent}");
-    assert_eq!(agent["cpu_sampled_at"].as_u64(), Some(sampled.2));
+    assert!(agent["cpu_sampled_at"].as_u64().unwrap() >= sampled.2, "{agent}");
     assert_eq!(agent["cpu_now_stale"], false);
     assert_eq!((agent["tokens_input"].as_u64(), agent["tokens_output"].as_u64()), (Some(100), Some(20)));
     assert_eq!((agent["tokens_cache_read"].as_u64(), agent["tokens_cache_write"].as_u64()), (Some(75), Some(4)));
     assert!(report["work_kinds"].as_array().unwrap().iter().any(|k| k["cpu_now_percent"].as_f64().unwrap_or(0.0) > 0.0 && k["cpu_sampled_at"].as_u64().is_some()));
     let ls: Value = serde_json::from_str(&cli_ok(&home, &["ls", "--json"]).stdout).unwrap();
     let live_task = ls.as_array().unwrap().iter().find(|t| t["id"] == id).unwrap();
-    assert_eq!(live_task["live_cpu_sampled_at"].as_u64(), Some(sampled.2));
+    assert!(
+        live_task["live_cpu_sampled_at"].as_u64().unwrap()
+            >= agent["cpu_sampled_at"].as_u64().unwrap(),
+        "{live_task}"
+    );
     assert_eq!(live_task["live_cpu_stale"], false);
     let status: Value = serde_json::from_str(&cli_ok(&home, &["status", "--json"]).stdout).unwrap();
     assert_eq!(status["agent_tokens"]["tokens_cache_read"].as_u64(), Some(75));

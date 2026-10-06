@@ -215,7 +215,7 @@ impl Conn {
     /// but retained in `history`).
     fn request(&mut self, json: &str, id: &str) -> String {
         self.send(json);
-        self.read_until(id, RESPONSE_TIMEOUT)
+        self.read_until_id(id, RESPONSE_TIMEOUT)
             .unwrap_or_else(|| panic!("no response echoing id {id:?} within {RESPONSE_TIMEOUT:?}"))
     }
 

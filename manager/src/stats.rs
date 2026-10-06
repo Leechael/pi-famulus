@@ -134,7 +134,7 @@ pub struct TopAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_id: Option<String>,
     pub tasks: u64,
-    /// Cumulative shell-task CPU time (live estimate for running tasks).
+    /// Cumulative retained task CPU time, including monitors (live estimate for running tasks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_ms: Option<u64>,
     /// Sum of the daemon's most recent process-group CPU rates; 100% = one core.
@@ -143,11 +143,11 @@ pub struct TopAgent {
     pub cpu_now_stale: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_sampled_at: Option<u64>,
-    pub tokens_input: u64,
-    pub tokens_output: u64,
-    pub tokens_cache_read: u64,
-    pub tokens_cache_write: u64,
-    pub llm_ms: u64,
+    pub tokens_input: Option<u64>,
+    pub tokens_output: Option<u64>,
+    pub tokens_cache_read: Option<u64>,
+    pub tokens_cache_write: Option<u64>,
+    pub llm_ms: Option<u64>,
     pub tool_ms: u64,
     pub queue_ms: u64,
     pub wall_other_ms: u64,
@@ -372,14 +372,14 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
     let report = TopReport {
         agents,
         work_kinds,
-        cpu_note: "CPU totals include retained shell tasks attributed to each agent: final runner measurements for ended tasks and best-effort process-group estimates for running tasks. NOW is the latest daemon sampling interval; 100% equals one core. cpu_now_stale marks failed sampling; cpu_sampled_at is the last successful sample time.",
+        cpu_note: "CPU totals include retained tasks attributed to each agent (including monitors): final runner measurements for ended tasks and best-effort process-group estimates for running tasks. NOW is the latest daemon sampling interval; 100% equals one core. cpu_now_stale marks failed sampling; cpu_sampled_at is the last successful sample time.",
         output_tokens_per_second_note: "Cumulative output tokens divided by observed assistant-message LLM wall milliseconds; not divided by total elapsed wall time.",
     };
     if json {
         outln!("{}", serde_json::to_string_pretty(&report).unwrap());
         return Ok(());
     }
-    outln!("pi-famulus top — CPU totals are per-agent shell-task CPU; NOW is the latest sampled CPU rate (100% = one core).");
+    outln!("pi-famulus top — CPU totals are per-agent task CPU, including monitors; NOW is the latest sampled CPU rate (100% = one core).");
     outln!("AGENTS");
     if report.agents.is_empty() {
         outln!("  none");
@@ -397,12 +397,12 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
             now,
             sampled,
             a.tasks,
-            a.tokens_input,
-            a.tokens_output,
-            a.tokens_cache_read,
-            a.tokens_cache_write,
+            token_count_label(a.tokens_input),
+            token_count_label(a.tokens_output),
+            token_count_label(a.tokens_cache_read),
+            token_count_label(a.tokens_cache_write),
             rate,
-            fmt::human_duration(a.llm_ms),
+            duration_label(a.llm_ms),
             fmt::human_duration(a.tool_ms),
             fmt::human_duration(a.queue_ms),
             fmt::human_duration(a.wall_other_ms),
@@ -422,12 +422,20 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn token_count_label(value: Option<u64>) -> String {
+    value.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into())
+}
+
+fn duration_label(value: Option<u64>) -> String {
+    value.map(fmt::human_duration).unwrap_or_else(|| "unavailable".into())
+}
+
 fn top_agent(agent: String, child_id: Option<String>, group: Option<&Group>, record: Option<&inspect::AgentRecord>) -> TopAgent {
-    let tokens_input = record.and_then(|a| a.tokens_input).unwrap_or(0);
-    let tokens_output = record.and_then(|a| a.tokens_output).unwrap_or(0);
-    let tokens_cache_read = record.and_then(|a| a.tokens_cache_read).unwrap_or(0);
-    let tokens_cache_write = record.and_then(|a| a.tokens_cache_write).unwrap_or(0);
-    let llm_ms = record.and_then(|a| a.llm_ms).unwrap_or(0);
+    let tokens_input = record.and_then(|a| a.tokens_input);
+    let tokens_output = record.and_then(|a| a.tokens_output);
+    let tokens_cache_read = record.and_then(|a| a.tokens_cache_read);
+    let tokens_cache_write = record.and_then(|a| a.tokens_cache_write);
+    let llm_ms = record.and_then(|a| a.llm_ms);
     TopAgent {
         agent,
         child_id,
@@ -445,7 +453,7 @@ fn top_agent(agent: String, child_id: Option<String>, group: Option<&Group>, rec
         queue_ms: record.and_then(|a| a.queue_ms).unwrap_or(0),
         wall_other_ms: record.and_then(|a| a.wall_other_ms).unwrap_or(0),
         wall_approximate: record.is_some_and(|a| a.wall_approximate),
-        output_tokens_per_second: inspect::agent_output_tokens_per_second(Some(tokens_output), Some(llm_ms)),
+        output_tokens_per_second: inspect::agent_output_tokens_per_second(tokens_output, llm_ms),
     }
 }
 
