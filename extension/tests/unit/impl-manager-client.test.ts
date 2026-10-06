@@ -7,6 +7,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
 import {
   ManagerClient,
   releaseSpawnLockFile,
@@ -294,6 +295,28 @@ describe("ManagerClient (integration, fake manager)", () => {
       .toMatchObject({ work_kind: "test-suite" });
     await client.releaseAgent("ch_test_v5");
     expect(fake.received.map((message) => message.type)).toContain("release_agent");
+  });
+
+  it("retries a queued acquire at a bounded interval with the same request id", async () => {
+    fake.setProtocol(5);
+    const clock = new ManualClock();
+    client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null, clock });
+    await client.connect();
+    fake.holdNextAcquire();
+    const acquire = client.acquireAgent("ch_retry", "test", new AbortController().signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const first = fake.received.find((message) => message.type === "acquire_agent");
+    expect(first?.id).toBeTypeOf("string");
+    clock.advanceBy(3000);
+    for (let i = 0; i < 50 && fake.received.filter((message) => message.type === "acquire_agent").length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const retries = fake.received.filter((message) => message.type === "acquire_agent");
+    expect(retries).toHaveLength(2);
+    expect(retries[1]).toMatchObject({ id: first?.id, child_id: "ch_retry", work_kind: "test" });
+    await expect(acquire).resolves.toEqual({ granted: true });
   });
 
   it("cancels a pending acquire with its original request id when the child settles", async () => {
