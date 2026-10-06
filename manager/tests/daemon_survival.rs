@@ -28,7 +28,17 @@ fn start_shell(home: &Home) {
 
 fn assert_upgrade(home: &Home) {
     let out = home.cli(&["upgrade"], Duration::from_secs(40));
-    assert!(out.status.success(), "upgrade failed: {} {}", out.stdout, out.stderr);
+    assert!(
+        out.status.success(),
+        "upgrade failed: {} {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("upgraded in place"),
+        "upgrade did not hand over: {}",
+        out.stdout
+    );
 }
 
 /// Stable-layout startup followed by npm retirement, deletion and reinstall.
@@ -64,6 +74,22 @@ fn retired_layout_startup_maps_bin_executable_to_stable_sibling() {
     fs::remove_dir_all(retired.parent().unwrap().parent().unwrap()).unwrap();
     let link = fs::read_link(format!("/proc/{pid}/exe")).unwrap();
     assert!(link.to_string_lossy().ends_with(" (deleted)"), "daemon exe was not deleted: {link:?}");
+    start_shell(&home);
+    assert_upgrade(&home);
+    assert!(stable.is_file());
+    drop(daemon);
+}
+
+/// A daemon started before npm creates the stable sibling must recover its
+/// executable path after npm deletes the retired directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_started_mid_reinstall_re_resolves_its_executable() {
+    let home = Home::new("mid-reinstall");
+    let retired = install_layout(&home, ".pi-famulus-linux-x64-AWM9wakS");
+    let daemon = home.start_daemon_from(&retired, &[]);
+    fs::remove_dir_all(retired.parent().unwrap().parent().unwrap()).unwrap();
+    let stable = install_layout(&home, "pi-famulus-linux-x64");
     start_shell(&home);
     assert_upgrade(&home);
     assert!(stable.is_file());
