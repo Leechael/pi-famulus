@@ -31,14 +31,14 @@
 //! Computed when read, never stored: a better rule applies to old records
 //! too, and nothing on the wire depends on it.
 //!
-//! deferred: per-project override rules (e.g. `.pi/famulus-kinds.json`
-//! mapping a project's own scripts like `pdm run ci-fast` to a kind) |
-//! impact: a project script whose name says nothing (`pdm run go`,
-//! `./run.sh`) lands in `other`, so `stats --by kind` under-reports that
-//! project's test or build cost; no record or behaviour is wrong |
-//! trigger: a real run where `other` holds a large share of CPU or wall
-//! time that a person can attribute to a known script.
+//! Projects may override top-level command prefixes in
+//! `.pi/famulus-kinds.json`, for example
+//! `{"version":1,"commands":{"pdm run ci-fast":"test-suite"}}`.
+//! The nearest ancestor config wins; unmatched commands use the built-in
+//! heuristic.
 
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -67,16 +67,96 @@ impl WorkKind {
 }
 
 /// The kind of the heaviest simple command in `command`.
+#[cfg(test)]
 pub fn classify(command: &str) -> WorkKind {
     classify_depth(command, 0, false).unwrap_or(WorkKind::Other)
 }
 
+/// Classify with nearest-project command overrides from `.pi/famulus-kinds.json`.
+pub fn classify_for_project(cwd: &Path, command: &str) -> WorkKind {
+    let overrides = load_project_overrides(cwd);
+    classify_depth_with_overrides(command, 0, false, &overrides).unwrap_or(WorkKind::Other)
+}
+
 /// `None` when every simple command is setup noise.
+#[cfg(test)]
 fn classify_depth(command: &str, depth: usize, fed_by_xargs: bool) -> Option<WorkKind> {
+    classify_depth_with_overrides(command, depth, fed_by_xargs, &[])
+}
+
+fn classify_depth_with_overrides(
+    command: &str,
+    depth: usize,
+    fed_by_xargs: bool,
+    overrides: &[(Vec<String>, WorkKind)],
+) -> Option<WorkKind> {
     split_simple_commands(command)
         .iter()
-        .filter_map(|words| simple_kind_fed(words, depth, fed_by_xargs))
+        .filter_map(|words| configured_kind(words, overrides).or_else(|| simple_kind_fed(words, depth, fed_by_xargs, overrides)))
         .max()
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct ProjectOverrideFile {
+    version: u8,
+    commands: HashMap<String, String>,
+}
+
+impl Default for ProjectOverrideFile {
+    fn default() -> Self {
+        Self { version: 1, commands: HashMap::new() }
+    }
+}
+
+const MAX_OVERRIDE_BYTES: u64 = 64 * 1024;
+
+fn load_project_overrides(cwd: &Path) -> Vec<(Vec<String>, WorkKind)> {
+    let start = cwd
+        .canonicalize()
+        .or_else(|_| std::env::current_dir().map(|here| if cwd.is_absolute() { cwd.to_path_buf() } else { here.join(cwd) }))
+        .unwrap_or_else(|_| cwd.to_path_buf());
+    for dir in start.ancestors() {
+        let path = dir.join(".pi/famulus-kinds.json");
+        let Ok(metadata) = std::fs::metadata(&path) else { continue };
+        if metadata.len() > MAX_OVERRIDE_BYTES {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(path) else { continue };
+        let Ok(config) = serde_json::from_str::<ProjectOverrideFile>(&contents) else { continue };
+        if config.version != 1 {
+            continue;
+        }
+        let mut entries: Vec<(Vec<String>, WorkKind)> = config
+            .commands
+            .into_iter()
+            .filter_map(|(command, kind)| {
+                let kind = parse_kind(&kind)?;
+                let mut words = split_simple_commands(&command);
+                (words.len() == 1 && !words[0].is_empty()).then(|| (words.remove(0), kind))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        return entries;
+    }
+    Vec::new()
+}
+
+fn parse_kind(kind: &str) -> Option<WorkKind> {
+    match kind {
+        "test-suite" => Some(WorkKind::TestSuite),
+        "test" => Some(WorkKind::Test),
+        "build" => Some(WorkKind::Build),
+        "lint/type" => Some(WorkKind::LintType),
+        "other" => Some(WorkKind::Other),
+        "git" => Some(WorkKind::Git),
+        "read/search" => Some(WorkKind::ReadSearch),
+        _ => None,
+    }
+}
+
+fn configured_kind(words: &[String], overrides: &[(Vec<String>, WorkKind)]) -> Option<WorkKind> {
+    overrides.iter().find_map(|(pattern, kind)| words.starts_with(pattern).then_some(*kind))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +438,12 @@ const SCRIPT_RUNNERS: &[&str] = &["pdm", "uv", "poetry", "pipenv", "hatch", "rye
 /// `fed_by_xargs`: an `xargs` further out supplies arguments on stdin, so
 /// a test runner reached through more wrappers (`xargs uv run python -m
 /// pytest`, `xargs sh -c 'pytest'`) is still a targeted run.
-fn simple_kind_fed(words: &[String], depth: usize, fed_by_xargs: bool) -> Option<WorkKind> {
+fn simple_kind_fed(
+    words: &[String],
+    depth: usize,
+    fed_by_xargs: bool,
+    overrides: &[(Vec<String>, WorkKind)],
+) -> Option<WorkKind> {
     let mut w: Vec<&str> = words.iter().map(String::as_str).collect();
     let mut fed_by_xargs = fed_by_xargs;
     loop {
@@ -401,7 +486,7 @@ fn simple_kind_fed(words: &[String], depth: usize, fed_by_xargs: bool) -> Option
                     }
                     if a.starts_with('-') && a.contains('c') && !a.starts_with("--") {
                         return match rest.get(i + 1) {
-                            Some(script) if depth < 8 => classify_depth(script, depth + 1, fed_by_xargs),
+                            Some(script) if depth < 8 => classify_depth_with_overrides(script, depth + 1, fed_by_xargs, overrides),
                             _ => Some(WorkKind::Other),
                         };
                     }
@@ -510,7 +595,7 @@ fn wrapped_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKin
     };
     let at = args.iter().position(|a| heavy(base(a)))?;
     let words: Vec<String> = args[at..].iter().map(|s| s.to_string()).collect();
-    simple_kind_fed(&words, 0, fed_by_xargs).filter(|k| *k > WorkKind::Other)
+    simple_kind_fed(&words, 0, fed_by_xargs, &[]).filter(|k| *k > WorkKind::Other)
 }
 
 /// `pdm run X`, `npm run X`, `make X`, …: X is a script/target name or a
@@ -532,7 +617,7 @@ fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
         ("uv", "sync" | "lock" | "pip" | "add" | "build") | ("pdm" | "poetry" | "hatch" | "rye", "build") => return WorkKind::Build,
         ("npm" | "pnpm" | "yarn" | "bun", "exec" | "dlx" | "x") => {
             let rest: Vec<String> = after.iter().map(|s| s.to_string()).collect();
-            return simple_kind_fed(&rest, 0, fed_by_xargs).unwrap_or(WorkKind::Other);
+            return simple_kind_fed(&rest, 0, fed_by_xargs, &[]).unwrap_or(WorkKind::Other);
         }
         _ => {}
     }
@@ -554,7 +639,7 @@ fn runner_kind(runner: &str, args: &[&str], fed_by_xargs: bool) -> WorkKind {
     // matched above, `uv run ruff`, `pdm run python -m mypy`).
     let mut words = vec![name.to_string()];
     words.extend(script_args.iter().map(|s| s.to_string()));
-    match simple_kind_fed(&words, 0, fed_by_xargs) {
+    match simple_kind_fed(&words, 0, fed_by_xargs, &[]) {
         Some(k) => k,
         None if runner == "make" || runner == "just" => WorkKind::Build,
         None => WorkKind::Other,
@@ -635,7 +720,7 @@ const PATH_VALUE_FLAGS: &[&str] = &["--ignore", "--deselect", "--rootdir", "--ba
 /// `-t`/`--timeout` is not a filter (`mocha -t5000` is a whole suite).
 fn selects_tests(a: &str, runner: &str) -> bool {
     let key = a.split_once('=').map_or(a, |(k, _)| k);
-    if matches!(key, "-k" | "-m" | "--lf" | "--last-failed" | "--run") {
+    if matches!(key, "-k" | "-m" | "--lf" | "--last-failed") {
         return true;
     }
     let jestish = matches!(runner, "jest" | "vitest");
@@ -754,6 +839,34 @@ mod tests {
     }
 
     #[test]
+    fn project_command_overrides_apply_at_the_nearest_project_root() {
+        let root = std::env::temp_dir().join(format!("pi-famulus-workkind-{}", std::process::id()));
+        let nested = root.join("packages/app");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".pi")).unwrap();
+        std::fs::create_dir_all(nested.join(".pi")).unwrap();
+        std::fs::write(
+            root.join(".pi/famulus-kinds.json"),
+            serde_json::to_vec(&serde_json::json!({"version":1,"commands":{"pdm run ci-fast":"test-suite","./run.sh":"build"}})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join(".pi/famulus-kinds.json"),
+            serde_json::to_vec(&serde_json::json!({"commands":{"pdm run ci-fast":"build"}})).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(classify_for_project(&root, "pdm run ci-fast"), TestSuite);
+        assert_eq!(classify_for_project(&root, "./run.sh --quick"), Build);
+        assert_eq!(classify_for_project(&root, "pdm run ci-faster"), Other, "match whole command tokens only");
+        assert_eq!(classify_for_project(&nested, "pdm run ci-fast"), Build, "the closest project config wins");
+        assert_eq!(classify_for_project(&root, "bash -lc 'pdm run ci-fast'"), TestSuite, "overrides survive shell wrappers");
+        assert_eq!(classify_for_project(&root, "pdm run ci-fast && tail -n 2 result.log"), TestSuite);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn test_suites_versus_targeted_runs() {
         assert_eq!(k("pytest"), TestSuite);
         assert_eq!(k("python -m unittest"), TestSuite);
@@ -763,6 +876,8 @@ mod tests {
         assert_eq!(k("pytest -q -n 10"), TestSuite);
         assert_eq!(k("pdm run test -n 4"), TestSuite);
         assert_eq!(k("npm test"), TestSuite);
+        assert_eq!(k("npm test -- --run"), TestSuite, "--run selects one-shot mode, not a subset");
+        assert_eq!(k("npm test -- --run tests/a.test.ts"), Test, "the path still selects a subset");
         assert_eq!(k("npx vitest run"), TestSuite);
         assert_eq!(k("cargo test"), TestSuite);
         assert_eq!(k("cargo test -p pi-famulus --features test-clock"), TestSuite);

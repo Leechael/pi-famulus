@@ -433,7 +433,7 @@ pub struct Row {
 pub fn work_kind(t: &TaskRecord) -> &'static str {
     match t.kind {
         TaskKind::Monitor => "monitor",
-        TaskKind::Shell => crate::workkind::classify(&t.command).label(),
+        TaskKind::Shell => crate::workkind::classify_for_project(Path::new(&t.cwd), &t.command).label(),
     }
 }
 
