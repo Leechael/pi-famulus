@@ -35,7 +35,15 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
 
   afterAll(async () => {
     await client?.close();
-    rmSync(home, { recursive: true, force: true });
+    // Last test reconnects a daemon that stays up ~5s after close; rmSync
+    // then races log writes and fails ENOTEMPTY on macOS. Same cleanup as
+    // eval/lib/sandbox.ts: ask it to exit, then retry the unlink.
+    try {
+      execFileSync(BIN, ["--home", home, "shutdown"], { stdio: "ignore", timeout: 5000 });
+    } catch {
+      // already gone
+    }
+    rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   it("spawns the daemon on first connect (cold start, §3.1)", async () => {
