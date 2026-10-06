@@ -188,6 +188,9 @@ function wrapSession(
   extras: { warning?: string; resolvedModel?: string } = {},
 ): ChildSessionAdapter {
   const usageAdapter = createPiUsageAdapter();
+  // Children receive all queued steering messages in one drain/turn rather
+  // than the interactive one-at-a-time default, which can strand wake bursts.
+  session.setSteeringMode("all");
   return {
     ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
     ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
@@ -214,6 +217,7 @@ function wrapSession(
     getActiveToolNames: () => session.getActiveToolNames(),
     getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
+    getSteeringMode: () => session.steeringMode,
     subscribe: (listener) => session.subscribe((event) => {
       listener(usageAdapter.adapt(event as Parameters<typeof usageAdapter.adapt>[0]));
     }),
