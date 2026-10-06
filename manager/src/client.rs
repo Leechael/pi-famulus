@@ -198,14 +198,19 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
 /// can remain a zombie or be reused, and concurrent clients may miss the
 /// brief unlocked interval when another client starts the successor. A
 /// successful hello therefore also ends the wait: it proves that a serving
-/// manager is ready. The outer startup deadline bounds the entire wait.
+/// manager is ready. Bound each connect + hello probe so a stalled socket
+/// cannot hide a released lock or a ready successor until the outer startup
+/// deadline, which still bounds the entire wait.
 async fn wait_for_manager_exit(home: &Path, mode: &HelloMode) -> Result<Option<Conn>, String> {
     while lifecycle::lock_held(home) {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        match connect_existing(home, mode).await {
-            Ok(conn) => return Ok(Some(conn)),
-            Err(e) if is_shutting_down(&e) || is_disconnect(&e) || e.starts_with("connect ") => {}
-            Err(e) => return Err(e),
+        // Use the same per-attempt budget as socket readiness; don't let
+        // one hello consume the whole 15s startup deadline.
+        match tokio::time::timeout(Duration::from_secs(2), connect_existing(home, mode)).await {
+            Ok(Ok(conn)) => return Ok(Some(conn)),
+            Ok(Err(e)) if is_shutting_down(&e) || is_disconnect(&e) || e.starts_with("connect ") => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {} // Recheck the lifetime lock after a stalled probe.
         }
     }
     Ok(None)

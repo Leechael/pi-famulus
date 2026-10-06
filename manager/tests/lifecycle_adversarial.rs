@@ -27,6 +27,22 @@ fn helper_hold_extension_conn() {
 const S: fn(u64) -> Duration = Duration::from_secs;
 const MS: fn(u64) -> Duration = Duration::from_millis;
 
+#[cfg(feature = "test-clock")]
+struct CliGuard(Option<std::process::Child>);
+
+#[cfg(feature = "test-clock")]
+impl Drop for CliGuard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            if child.try_wait().ok().flatten().is_none() {
+                kill_pid(child.id(), libc::SIGCONT);
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
 fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
     let ok = poll_true(S(5), || {
         let r = c.request_ok(json!({"type":"output","task_id":task_id,"cursor":0,"max_bytes":65536}));
@@ -750,21 +766,48 @@ fn d8c_cli_waits_for_slow_shutdown_before_spawning_successor() {
             .is_some_and(|p| p.iter().any(|t| t["label"] == "shutdown-grace"))
     }), "shutdown grace was not armed");
 
-    let mut ls = std::process::Command::new(BIN)
+    // Observe the CLI's actual hello before starting the 6s interval.
+    // Intentionally delay launch beyond 6s: the former spawn-based interval
+    // would release shutdown before this CLI ever met the retiring daemon.
+    let retiring = home.path.join("retiring.sock");
+    std::fs::rename(home.sock(), &retiring).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(home.sock()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut ls = CliGuard(Some(std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 7; exec \"$@\"", "delayed-cli", BIN])
         .args(["--home", home.path.to_str().unwrap(), "ls"])
         .env("PI_FAMULUS_TEST_CLOCK", "manual")
         .env("PI_FAMULUS_TEST_OWNER", test_owner())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .spawn().unwrap()));
+    let (socket, _) = poll_until(S(10), || listener.accept().ok()).expect("CLI did not connect");
+    let mut proxy = Conn::new(socket);
+    let hello = match proxy.recv(Instant::now() + S(3)) {
+        Recv::Frame(f) => f,
+        _ => panic!("CLI did not send hello"),
+    };
+    assert_eq!(hello["type"], "hello");
+    let mut upstream = Conn::new(UnixStream::connect(&retiring).unwrap());
+    upstream.send(&hello);
+    let refusal = match upstream.recv(Instant::now() + S(3)) {
+        Recv::Frame(f) => f,
+        _ => panic!("retiring daemon did not answer hello"),
+    };
+    assert_eq!(refusal["error"], json!({"code":"E_INTERNAL","message":"manager is shutting down"}));
+    proxy.send(&refusal);
+    drop(proxy);
+    drop(listener);
+    std::fs::remove_file(home.sock()).unwrap();
+    std::fs::rename(&retiring, home.sock()).unwrap();
+
     // Intentionally hold a lifecycle boundary, not a readiness sleep. The
     // old code exits after 5s even though the daemon is still shutting down.
-    let exited_early = poll_true(S(6), || ls.try_wait().unwrap().is_some());
+    let exited_early = poll_true(S(6), || ls.0.as_mut().unwrap().try_wait().unwrap().is_some());
     home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(8)).is_some());
-    assert!(wait_child(&mut ls, S(10)).is_some(), "CLI did not finish after shutdown");
-    let out = ls.wait_with_output().unwrap();
+    assert!(wait_child(ls.0.as_mut().unwrap(), S(10)).is_some(), "CLI did not finish after shutdown");
+    let out = ls.0.take().unwrap().wait_with_output().unwrap();
     assert!(!exited_early && out.status.success(),
         "CLI failed before reaching a successor: {}", String::from_utf8_lossy(&out.stderr));
     assert_ne!(home.pidfile_pid().expect("a successor manager"), old);
@@ -830,18 +873,6 @@ fn d8e_concurrent_shutdown_waiters_share_the_successor() {
     std::fs::rename(home.sock(), &retiring).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(home.sock()).unwrap();
     listener.set_nonblocking(true).unwrap();
-    struct CliGuard(Option<std::process::Child>);
-    impl Drop for CliGuard {
-        fn drop(&mut self) {
-            if let Some(child) = &mut self.0 {
-                if child.try_wait().ok().flatten().is_none() {
-                    kill_pid(child.id(), libc::SIGCONT);
-                    let _ = child.kill();
-                }
-                let _ = child.wait();
-            }
-        }
-    }
     let mut b = CliGuard(Some(std::process::Command::new(BIN)
         .arg("--home").arg(&home.path).arg("ls")
         .env("PI_FAMULUS_TEST_CLOCK", "manual")
