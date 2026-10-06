@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { BEHAVIOR_GUIDELINES } from "../../src/behavior-guidelines";
-import { formatSubagentOverrun, type SubagentOverrunInfo } from "../../src/format";
+import { formatSubagentOverrun, formatSubagentOverrunBatch, type SubagentOverrunInfo } from "../../src/format";
 import { expandedWakeText, registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests } from "../../src/tui/pi-tui-load";
-import { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN, wakeIds } from "../../src/wake";
 
 const MIN = 60_000;
 
@@ -41,6 +41,16 @@ describe("subagent-overrun wake", () => {
     expect(wake.details).toMatchObject({ kind: "subagent-overrun", childId: "ch_a", runId: "run_a", reminder: 1 });
     expect(wake.content).toContain("<summary>worker-1 has run 31m in this turn, past its 30m budget, and is still running; it is waiting on a shell command that has run 12m.</summary>");
     expect(wake.content).toContain('<last-activity ago-ms="240000">Running the full test suite now.</last-activity>');
+  });
+
+  it("batches overdue children into one wake with each child's budget", () => {
+    const wake = formatSubagentOverrunBatch([
+      info(),
+      info({ childId: "ch_b", name: "worker-2", elapsedMs: 45 * MIN, budgetMs: 40 * MIN, shell: undefined }),
+    ]);
+    expect(wakeIds(wake.details)).toEqual(["ch_a", "ch_b"]);
+    expect(wake.details).toMatchObject({ additional: [{ childId: "ch_b", elapsedMs: 45 * MIN, budgetMs: 40 * MIN }] });
+    expect(wake.content).toContain('<child run-id="run_a" child-id="ch_b" name="worker-2" elapsed-ms="2700000" budget-ms="2400000" reminder="1"/>');
   });
 
   it("describes the shell the child is blocked on, with output size, idle time, and growth", () => {

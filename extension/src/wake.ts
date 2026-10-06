@@ -133,6 +133,7 @@ type FamulusWakeBody =
       summary: string;
       lastActivity: { agoMs: number; text: string };
       shell?: OverrunShell;
+      additional?: { runId: string; childId: string; name: string; elapsedMs: number; budgetMs: number; reminder: number }[];
     }
   | { kind: "supervisor-request"; from: string; name: string; message: string }
   | { kind: "supervisor-update"; from: string; name: string; message: string };
@@ -177,6 +178,7 @@ export function wakeIds(details: { kind?: string }): string[] {
   };
   if (d.kind === "task") return (d.tasks ?? []).map((task) => task.id);
   if (d.kind === "subagent-done") return (d.children ?? []).map((child) => child.childId);
+  if (d.kind === "subagent-overrun") return [d.childId, ...((d as { additional?: { childId: string }[] }).additional ?? []).map((child) => child.childId)].filter((id): id is string => Boolean(id));
   return [d.id ?? d.taskId ?? d.childId ?? d.from].filter((id): id is string => Boolean(id));
 }
 
@@ -387,6 +389,13 @@ function renderOverrun(details: Extract<FamulusWake, { kind: "subagent-overrun" 
   parts.push(
     `  <last-activity ago-ms="${Math.round(details.lastActivity.agoMs)}">${escapeXml(details.lastActivity.text)}</last-activity>`,
   );
+  if (details.additional?.length) {
+    parts.push("  <also-overdue>");
+    for (const child of details.additional) {
+      parts.push(`    <child run-id="${escapeXmlAttr(child.runId)}" child-id="${escapeXmlAttr(child.childId)}" name="${escapeXmlAttr(child.name)}" elapsed-ms="${Math.round(child.elapsedMs)}" budget-ms="${Math.round(child.budgetMs)}" reminder="${child.reminder}"/>`);
+    }
+    parts.push("  </also-overdue>");
+  }
   const shell = details.shell;
   if (shell) {
     const shellAttrs = [`task-id="${escapeXmlAttr(shell.taskId)}"`, `elapsed-ms="${Math.round(shell.elapsedMs)}"`];

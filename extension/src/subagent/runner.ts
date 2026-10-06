@@ -709,6 +709,25 @@ class InProcessChildHandle implements DisposableChildHandle {
     }, delay) ?? null;
   }
 
+  collectDueOverrun(now: number): OverrunTick | undefined {
+    if (this.settledFlag || this.disposed || this.status_ !== "running" || this.softDeadlineAt === null) return undefined;
+    if (this.softDeadlineAt > now || this.nextReminderAt === null || this.nextReminderAt > now) return undefined;
+    if (this.softTimer !== null) this.timerScope?.clearTimeout(this.softTimer);
+    this.softTimer = null;
+    this.reminders++;
+    this.nextReminderAt = now + this.overrunRepeatMs;
+    this.armSoftDeadline(this.generation);
+    return {
+      childId: this.req.childId,
+      elapsedMs: now - this.turnBudgetStart,
+      budgetMs: this.softDeadlineAt - this.turnBudgetStart,
+      reminder: this.reminders,
+      nextReminderMs: this.overrunRepeatMs,
+      lastEventAt: this.lastEvent,
+      hardRemainingMs: this.hardTimeoutMs > 0 ? Math.max(0, this.turnBudgetStart + this.hardTimeoutMs - now) : null,
+    };
+  }
+
   private fireOverrun(gen: number): void {
     const now = this.now();
     this.reminders++;

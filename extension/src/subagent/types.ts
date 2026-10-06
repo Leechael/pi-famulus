@@ -6,6 +6,8 @@
  * consumer stays testable with plain fakes.
  */
 
+import type { OverrunTick } from "./overrun";
+
 /**
  * Mirror of the M5 `AgentDefinition` (design doc Appendix B, src/agents/).
  * Structurally compatible with the M5 definition, so the real agent loader
@@ -87,6 +89,8 @@ export interface ChildHandle {
   lastEventAt(): number; // for the stall watchdog / status display
   /** Resolved `provider/id` once the child session has been constructed. */
   resolvedModel(): string | undefined;
+  /** Collect and reschedule a reminder if this child is overdue at the given time. */
+  collectDueOverrun?(now: number): OverrunTick | undefined;
   /** Live child transcript. Empty when the session never started. */
   conversation(): ConversationTurn[];
 }
