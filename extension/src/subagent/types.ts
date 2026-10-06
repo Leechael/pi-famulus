@@ -56,6 +56,8 @@ export interface ChildResult {
   /** Time waiting for local and machine-wide admission in this turn. */
   queueMs?: number;
   durationMs: number;
+  /** Time spent waiting for an admission slot before execution. */
+  queueMs?: number;
 }
 
 /** One turn of a child session, for the /tasks conversation view. */

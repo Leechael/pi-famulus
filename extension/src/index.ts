@@ -688,6 +688,7 @@ export default function (pi: ExtensionAPI): void {
             ...(c.result?.stalls ? { stalls: c.result.stalls } : {}),
             ...(c.queueMs !== undefined ? { queue_ms: c.queueMs } : {}),
             duration_ms: c.result?.durationMs ?? Math.max(0, clock.now() - c.startedAt),
+            ...(c.result?.queueMs !== undefined ? { queue_ms: c.result.queueMs } : {}),
           });
         }
         previousAgentStatus.set(c.childId, c.status);
