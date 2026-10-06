@@ -153,7 +153,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** User-turn start: reset on launch and user resume(), not on stall retries. */
   private runStartedAt: number;
   /** Timestamp when this generation acquired admission; execution duration excludes queueing. */
-  private admittedAt: number;
+  private admittedAt: number | null;
   /**
    * When the turn's deadlines start counting. Set after admission and session
    * creation (queue wait must not eat the budget), and NOT reset by stall
@@ -243,7 +243,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.onActivity = opts.onActivity;
     this.startedAt = this.clock.now();
     this.runStartedAt = this.startedAt;
-    this.admittedAt = this.startedAt;
+    this.admittedAt = null;
     this.turnBudgetStart = this.startedAt;
     this.lastEvent = this.startedAt;
     this.resultPromise = new Promise((resolve) => {
@@ -412,7 +412,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       opts.timeoutMs !== undefined && opts.timeoutMs > 0 ? opts.timeoutMs : this.req.timeoutMs;
     this.reminders = 0;
     this.runStartedAt = this.clock.now();
-    this.admittedAt = this.runStartedAt;
+    this.admittedAt = null;
     // The turn's generation exists from here: interrupt()/dispose() while it
     // is queued settle it, and its result promise is observable through
     // registry.getResult() before admission.
@@ -581,7 +581,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       this.release(this.terminalSettle);
       return;
     }
-    this.admittedAt = this.now();
+    if (!reuseSlot) this.admittedAt = this.now();
     this.status_ = "running";
 
     if (first) {
@@ -724,8 +724,12 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
     // durationMs covers admitted execution (including stalls and retry delays),
     // but excludes time waiting for an admission slot. dispose keeps its 0.
-    if (result.error !== "disposed") result.durationMs = Math.max(0, this.now() - this.admittedAt);
-    result.queueMs = Math.max(0, this.admittedAt - this.runStartedAt);
+    if (result.error !== "disposed") {
+      result.durationMs = this.admittedAt === null ? 0 : Math.max(0, this.now() - this.admittedAt);
+    }
+    result.queueMs = this.admittedAt === null
+      ? Math.max(0, this.now() - this.runStartedAt)
+      : Math.max(0, this.admittedAt - this.runStartedAt);
     if (result.stalls === undefined && this.stallAttempts > 0) {
       result.stalls = this.stallAttempts;
     }
