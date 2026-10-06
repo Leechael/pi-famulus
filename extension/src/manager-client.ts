@@ -266,6 +266,7 @@ export class ManagerClient {
   private helloWaiter: { resolve: () => void; reject: (err: Error) => void } | null = null;
   private eventHandlers = new Set<EventHandler>();
   private reconnectHandlers = new Set<() => void>();
+  private protocolLevel_ = 0;
   private state: ClientState = "disconnected";
   private intentionalClose = false;
   private rebound = false;
@@ -291,6 +292,11 @@ export class ManagerClient {
 
   isAvailable(): boolean {
     return this.state === "connected";
+  }
+
+  /** Maximum protocol level reported by the connected manager; 0 means unknown/legacy. */
+  protocolLevel(): number {
+    return this.protocolLevel_;
   }
 
   /** Last connect/reconnect failure reason (empty when never failed / currently connected). */
@@ -726,6 +732,9 @@ export class ManagerClient {
     this.pending.delete(id);
     this.clock.clearTimeout(entry.timer);
     if (msg.ok === true) {
+      if (entry.message.type === "hello") {
+        this.protocolLevel_ = typeof msg.protocol === "number" ? msg.protocol : 0;
+      }
       entry.resolve(msg);
     } else {
       entry.reject(errorFromResponse(msg));

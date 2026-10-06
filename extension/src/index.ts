@@ -27,6 +27,7 @@ import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, 
 import type { TaskExitInfo } from "./format";
 import { ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
+import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
 import { NotifyCenter } from "./notify";
 import { onWakeMessageEnd, registryStatusLookup } from "./wake-delivery";
 import { createChildBashTool } from "./subagent/child-bash";
@@ -78,6 +79,13 @@ export default function (pi: ExtensionAPI): void {
 
   let ctx: ExtensionContext | null = null;
   let client: ManagerClient | null = null;
+  const globalAgentLeases = new Set<string>();
+  const capacityNotices = new Set<string>();
+  const capacityNotice = (reason: "manager unavailable" | "daemon too old"): void => {
+    if (capacityNotices.has(reason)) return;
+    capacityNotices.add(reason);
+    console.warn(`pi-famulus: machine-wide agent capacity inactive (${reason}); using per-session limit only`);
+  };
   let notifyCenter: NotifyCenter | null = null;
   let monitorRegistry: MonitorRegistry | null = null;
   let subagentRegistry: SubagentRegistry | null = null;
@@ -428,6 +436,7 @@ export default function (pi: ExtensionAPI): void {
     fleetWidget = null;
     subagentRegistry?.disposeAll();
     subagentRegistry = null;
+    globalAgentLeases.clear();
 
     client = new ManagerClient({
       home,
@@ -484,6 +493,16 @@ export default function (pi: ExtensionAPI): void {
     });
     client.onReconnect(() => {
       void monitorRegistry?.rewatchAll().then(() => syncWithManager());
+      void (async () => {
+        const manager = client;
+        if (!manager || manager.protocolLevel() < 4) {
+          capacityNotice("daemon too old");
+          return;
+        }
+        // The registry and its child ids survive socket reconnects in this
+        // extension process; held ids include resumable interrupted children.
+        await reregisterAgentLeases(manager, globalAgentLeases);
+      })().catch(() => {});
     });
 
     // M3: subagent registry + in-process runner + fleet widget. The runner's
@@ -559,34 +578,14 @@ export default function (pi: ExtensionAPI): void {
       stallRetryDelayMs: subagentConfig.stallRetryDelayMs,
       overrunRepeatMs: subagentConfig.overrunRepeatMs,
       hardTimeoutMs: subagentConfig.hardTimeoutMs,
-      acquire: async (req, ticket) => {
-        const manager = client;
-        if (!manager) throw new Error("pi-famulus manager is not connected");
-        // Keep the existing local admission ceiling, while obtaining the
-        // machine-wide lease before a child generation starts.
-        let admission: { granted: boolean; rejection?: string };
-        do {
-          admission = await manager.acquireAgent(req.childId);
-          if (!admission.granted) {
-            if (ticket && !ticket.current()) throw new Error("subagent admission cancelled");
-            await new Promise((resolve) => setTimeout(resolve, 500));
-          }
-        } while (!admission.granted);
-        try {
-          const releaseLocal = await registry.admitChild(req.childId, ticket);
-          let released = false;
-          return () => {
-            if (released) return;
-            released = true;
-            releaseLocal();
-            // Disconnect reaping is the fallback if the daemon is already gone.
-            void manager.releaseAgent(req.childId).catch(() => {});
-          };
-        } catch (error) {
-          await manager.releaseAgent(req.childId);
-          throw error;
-        }
-      },
+      acquire: (req, ticket) => admitAgentChild({
+        childId: req.childId,
+        reserveLocal: () => registry.reserveChildSlot(req.childId, ticket),
+        manager: client,
+        leases: globalAgentLeases,
+        ticket,
+        notice: capacityNotice,
+      }),
       onActivity: (childId) => {
         syncTranscript(childId);
       },
@@ -713,7 +712,7 @@ export default function (pi: ExtensionAPI): void {
           startCtx.ui.notify(
             `pi-famulus unavailable${reason}; ${searched}. ` +
               "Bash runs locally without auto-backgrounding, task_*/monitor are disabled, " +
-              "and subagents cannot run bash. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",
+              "and subagents cannot start. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",
             "warning",
           );
         }

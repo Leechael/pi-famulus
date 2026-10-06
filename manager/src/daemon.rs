@@ -623,6 +623,7 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
                 version: crate::VERSION.to_string(),
                 pid: std::process::id(),
                 started_at,
+                protocol: PROTOCOL,
             },
         ))
         .await;
