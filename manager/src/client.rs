@@ -35,6 +35,9 @@ pub struct Conn {
     wr: WriteHalf<Stream>,
 }
 
+// Framing violations are permanent protocol failures, not disconnections.
+const PROTOCOL_FRAMING_PREFIX: &str = "protocol framing: ";
+
 impl Conn {
     /// Send one request, wait for its matching response (events and other
     /// frames are skipped — a short-lived CLI has no event consumer).
@@ -52,7 +55,13 @@ impl Conn {
             let frame = tokio::time::timeout(Duration::from_secs(30), read_frame(&mut self.rd))
                 .await
                 .map_err(|_| "response timed out".to_string())?
-                .map_err(|e| format!("recv: {e}"))?
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        format!("{PROTOCOL_FRAMING_PREFIX}{e}")
+                    } else {
+                        format!("recv: {e}")
+                    }
+                })?
                 .ok_or_else(|| "manager closed the connection".to_string())?;
             let v: serde_json::Value =
                 serde_json::from_slice(&frame).map_err(|e| format!("bad response JSON: {e}"))?;
@@ -194,7 +203,7 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
     Ok(conn)
 }
 
-/// Wait for shutdown without spawning against a held lifetime lock. A pid
+/// Wait for a lifetime-lock owner without spawning against it. A pid
 /// can remain a zombie or be reused, and concurrent clients may miss the
 /// brief unlocked interval when another client starts the successor. A
 /// successful hello therefore also ends the wait: it proves that a serving
@@ -259,8 +268,9 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
 /// §3.1 client startup flow: connect; on failure take the spawn lock and
 /// spawn (or wait for the in-progress spawn), then retry once. A zombie
 /// socket is handled the same way: the spawned daemon, holding manager.lock,
-/// removes it. Shutdown refusals can occur on either hello; wait for the
-/// lifetime lock before spawning a successor. Bound the whole flow, not
+/// removes it. Shutdown refusals can occur on either hello; a retiring
+/// manager can also remove its endpoint before releasing the lifetime lock.
+/// Wait for that lock before spawning a successor. Bound the whole flow, not
 /// just each wait, so a stuck or repeatedly shutting-down daemon cannot
 /// keep a CLI alive indefinitely.
 pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
@@ -276,7 +286,13 @@ async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, Strin
             Ok(c) => return Ok(c),
             Err(e) => e,
         };
-        if is_shutting_down(&last_err) {
+        if last_err.starts_with(PROTOCOL_FRAMING_PREFIX) {
+            return Err(format!("cannot reach pi-famulus: {last_err}"));
+        }
+        if is_shutting_down(&last_err)
+            || ((is_disconnect(&last_err) || last_err.starts_with("connect "))
+                && lifecycle::lock_held(home))
+        {
             if let Some(conn) = wait_for_manager_exit(home, mode)
                 .await
                 .map_err(|e| format!("cannot reach pi-famulus: {e}"))?

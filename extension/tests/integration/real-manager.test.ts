@@ -8,9 +8,9 @@
  * PI_FAMULUS_MANAGER_PATH overrides it. Runs in an isolated Famulus home under tmpdir.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
 import { reregisterAgentLeases } from "../../src/subagent/admission";
@@ -36,6 +36,35 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
 
   afterAll(async () => {
     await client?.close();
+    // Preserve this suite's home before shutdown/unlink, not only eval-*.
+    // The hidden cold-restart failure had no artifact or connect reason.
+    const artifacts = process.env.PI_FAMULUS_TEST_ARTIFACTS;
+    if (artifacts) {
+      try {
+        const destination = join(artifacts, basename(home));
+        cpSync(home, destination, {
+          recursive: true,
+          filter: (source) => {
+            try {
+              const stat = lstatSync(source);
+              // Never copy sockets/symlinks or unbounded task output.
+              return stat.isDirectory() || (stat.isFile() && stat.size <= 1024 * 1024);
+            } catch {
+              return false; // A daemon may remove its pid/socket concurrently.
+            }
+          },
+        });
+        const ps = execFileSync("ps", ["-eo", "pid,ppid,stat,etime,args"], {
+          encoding: "utf8", timeout: 2000,
+        });
+        const lines = ps.split("\n");
+        writeFileSync(join(destination, "processes.txt"),
+          [lines[0], ...lines.slice(1).filter((line) => line.includes(basename(home)))].join("\n"));
+      } catch (error) {
+        // Diagnostics must not mask the actual test failure or skip cleanup.
+        console.warn("Could not preserve integration diagnostics:", error);
+      }
+    }
     // Last test reconnects a daemon that stays up ~5s after close; rmSync
     // then races log writes and fails ENOTEMPTY on macOS. Same cleanup as
     // eval/lib/sandbox.ts: ask it to exit, then retry the unlink.
@@ -52,7 +81,7 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     client = new ManagerClient({ home, sessionId: "integ", managerPath: BIN });
     client.onEvent((e) => events.push(e));
     const ok = await client.connect();
-    expect(ok).toBe(true);
+    expect(ok, client.lastError() ?? undefined).toBe(true);
     expect(client.isAvailable()).toBe(true);
     expect(existsSync(paths.socket)).toBe(true);
     expect(existsSync(paths.pidFile)).toBe(true);
@@ -228,10 +257,13 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
   it("cold restart keeps finished history (records survive a daemon restart)", async () => {
     // Daemon is down now; a fresh client respawns it and sees prior tasks.
     const client2 = new ManagerClient({ home, sessionId: "integ", managerPath: BIN });
-    const ok = await client2.connect();
-    expect(ok).toBe(true);
-    const tasks = await client2.list();
-    expect(tasks.length).toBeGreaterThanOrEqual(4); // tasks from earlier its
-    await client2.close();
+    try {
+      const ok = await client2.connect();
+      expect(ok, client2.lastError() ?? undefined).toBe(true);
+      const tasks = await client2.list();
+      expect(tasks.length).toBeGreaterThanOrEqual(4); // tasks from earlier its
+    } finally {
+      await client2.close();
+    }
   }, 15000);
 });

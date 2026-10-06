@@ -847,7 +847,10 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
     }
     fs::write(home.join("config.json"), r#"{"maxAgents":2}"#).unwrap();
     let admitted = if winner_a {
-        b.request(r#"{"id":"b2","type":"acquire_agent","child_id":"ch_shared"}"#, "b2")
+        b.request(
+            r#"{"id":"p5-scale-up-b","type":"acquire_agent","child_id":"ch_shared"}"#,
+            "p5-scale-up-b",
+        )
     } else {
         a.request(r#"{"id":"a2","type":"acquire_agent","child_id":"ch_shared"}"#, "a2")
     };

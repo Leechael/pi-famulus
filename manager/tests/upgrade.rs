@@ -442,9 +442,9 @@ fn u9_cli_wait_and_follow_survive_an_upgrade() {
     assert_eq!(status(&home)["generation"], 1);
 }
 
-/// A UTF-8 character split across two pipe reads, with an upgrade between
-/// the halves: the fanout's held-back tail survives the park, so the
-/// reconnected watcher gets the whole character, never U+FFFD.
+/// Regression: a UTF-8 character split across pipe writes, with an upgrade
+/// while only its first raw byte is on disk. The held-back tail survives
+/// the park; the reconnected watcher gets no duplicate text or U+FFFD.
 #[test]
 fn u10_split_utf8_character_across_an_upgrade() {
     let home = Home::new("u10");
@@ -452,19 +452,35 @@ fn u10_split_utf8_character_across_an_upgrade() {
     let _d = home.start_daemon_from(&bin, &[]);
     let mut c = home.connect();
     hello(&mut c, "sess-u10");
-    let (t, _) = start(&mut c, "monitor", r"printf 'a\344'; sleep 2; printf '\270\255b\n'", json!({}));
-    c.wait_event(s(3), |e| e["event"] == "output" && e["task_id"] == t).expect("first half");
+    let release = home.path.join("release-utf8-tail");
+    // Each initial printf writes one byte. The continuation cannot be
+    // produced until we explicitly release it after reconnecting.
+    let command = format!("printf 'a'; printf '\\344'; while [ ! -e '{}' ]; do sleep 0.01; done; printf '\\270\\255b\\n'", release.display());
+    let (t, _) = start(&mut c, "monitor", &command, json!({}));
+    let first = c.wait_event(s(3), |e| e["event"] == "output" && e["task_id"] == t).expect("first half");
+    assert_eq!(first["chunk"], "a", "{first:?}");
+    assert_eq!(first["next_cursor"], 1);
+    let output_path = home.path.join("sessions/sess-u10/tasks").join(format!("{t}.output"));
+    assert!(poll_true(s(3), || std::fs::read(&output_path).ok().as_deref() == Some(&b"a\xe4"[..])),
+        "tee must consume the incomplete raw byte before the upgrade");
     assert!(upgrade(&home).status.success());
     assert!(c.wait_closed(s(5)), "old connection closed (and read to the end)");
     let mut c2 = home.connect();
     hello(&mut c2, "sess-u10");
-    // It may end before or after we are back: `wait` covers both (a
-    // task_exited sent while disconnected is not replayed).
+    assert_eq!(std::fs::read(&output_path).unwrap(), b"a\xe4");
+    std::fs::write(&release, b"continue").unwrap();
     c2.request_ok(json!({"type":"wait","task_id":t,"budget_ms":10000}));
     c2.drain(Duration::from_millis(300));
     let mut events = c.events.clone();
     events.extend(c2.events.clone());
     assert_eq!(event_text(&events, &t), "a中b\n", "{events:?}");
+    assert_eq!(std::fs::read(&output_path).unwrap(), b"a\xe4\xb8\xadb\n");
+    let mut cursor = 0;
+    for event in events.iter().filter(|e| e["event"] == "output" && e["task_id"] == t) {
+        cursor += event["chunk"].as_str().unwrap().len() as u64;
+        assert_eq!(event["next_cursor"].as_u64(), Some(cursor), "{event:?}");
+    }
+    assert_eq!(cursor, 6);
 }
 
 /// Upgrades back to back while a monitor streams: nothing lost or repeated.
