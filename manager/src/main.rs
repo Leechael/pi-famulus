@@ -2,8 +2,8 @@
 //! Single binary: `daemon` runs the manager; every other subcommand is a
 //! socket client (design doc §3.5).
 
-mod cli;
 mod capacity;
+mod cli;
 mod out;
 
 mod client;
@@ -71,20 +71,59 @@ async fn async_main() {
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
         Sub::Config { action } => match action {
             cli::ConfigAction::Get { key } => {
-                if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
-                else { match capacity::max_agents(&home) { Ok(n) => { println!("{n}"); 0 }, Err(e) => { eprintln!("pi-famulus: invalid config: {e}"); 1 } } }
+                if key == "max-test" {
+                    match capacity::max_kind(&home, "test") {
+                        Ok(n) => {
+                            println!("{n}");
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("pi-famulus: invalid config: {e}");
+                            1
+                        }
+                    }
+                } else if key != "max-agents" {
+                    eprintln!("unknown config key: {key}");
+                    1
+                } else {
+                    match capacity::max_agents(&home) {
+                        Ok(n) => {
+                            println!("{n}");
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("pi-famulus: invalid config: {e}");
+                            1
+                        }
+                    }
+                }
             }
             cli::ConfigAction::Set { key, value } => {
-                if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
-                else { match value.parse::<usize>() {
-                    Ok(n) => {
-                        match capacity::set_max_agents(&home, n) {
-                            Ok(_previous) => 0,
-                            Err(e) => { eprintln!("pi-famulus: {e}"); 1 }
+                if key != "max-agents" && key != "max-test" {
+                    eprintln!("unknown config key: {key}");
+                    1
+                } else {
+                    match value.parse::<usize>() {
+                        Ok(n) => {
+                            let result = if key == "max-test" {
+                                capacity::set_max_test(&home, n)
+                            } else {
+                                capacity::set_max_agents(&home, n)
+                            };
+                            match result {
+                                Ok(_previous) => 0,
+                                Err(e) => {
+                                    eprintln!("pi-famulus: {e}");
+                                    1
+                                }
+                            }
                         }
-                    },
-                    Err(_) => { eprintln!("max-agents must be a positive integer"); 1 }
-                }}
+                        Err(_) => {
+                            eprintln!("max-agents must be a positive integer");
+                            1
+                        }
+                    }
+                }
             }
         },
         Sub::Sessions { json } => run_client(inspect::cmd_sessions(&home, json)).await,
