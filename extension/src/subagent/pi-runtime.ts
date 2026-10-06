@@ -28,8 +28,8 @@ import {
   type ModelCandidate,
 } from "./model-spec";
 import { turnsFromMessages } from "./conversation";
-import { accumulateTokenUsage, normalizedTokenUsage } from "./usage";
-import type { ChildRunRequest, ChildSessionAdapter, CreateSessionFn } from "./types";
+import { createTokenUsageAccumulator, normalizedTokenUsage } from "./usage";
+import type { ChildRunRequest, ChildSessionAdapter, ChildSessionEvent, CreateSessionFn } from "./types";
 
 /** Structural subset of the pi module namespace we rely on. */
 type PiModule = typeof import("@earendil-works/pi-coding-agent");
@@ -37,6 +37,32 @@ type PiModule = typeof import("@earendil-works/pi-coding-agent");
 type PiAgentSession = Awaited<ReturnType<PiModule["createAgentSession"]>>["session"];
 
 type Model = NonNullable<ExtensionContext["model"]>;
+
+export function createPiUsageAdapter() {
+  const totals = createTokenUsageAccumulator();
+  return {
+    tokenUsage: () => totals.snapshot(),
+    adapt(event: {
+      type: string;
+      message?: {
+        role?: string;
+        usage?: { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown };
+      };
+    }): ChildSessionEvent {
+      const message = event.message;
+      let usage: ReturnType<typeof normalizedTokenUsage> | undefined;
+      if (event.type === "message_end" && message?.usage) {
+        usage = normalizedTokenUsage(message.usage);
+        totals.add(usage);
+      }
+      return {
+        type: event.type,
+        ...(typeof message?.role === "string" ? { role: message.role } : {}),
+        ...(usage ? { usage } : {}),
+      };
+    },
+  };
+}
 
 export interface PiRuntimeDeps {
   /** Parent session model registry (ctx.modelRegistry). */
@@ -159,7 +185,7 @@ function wrapSession(
   session: PiAgentSession,
   extras: { warning?: string; resolvedModel?: string } = {},
 ): ChildSessionAdapter {
-  const tokenUsage = { input: 0, output: 0 };
+  const usageAdapter = createPiUsageAdapter();
   return {
     ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
     ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
@@ -182,24 +208,12 @@ function wrapSession(
       };
     },
     getConversation: () => turnsFromMessages(session.messages),
-    tokenUsage: () => ({ ...tokenUsage }),
+    tokenUsage: () => usageAdapter.tokenUsage(),
     getActiveToolNames: () => session.getActiveToolNames(),
     getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
     subscribe: (listener) => session.subscribe((event) => {
-      const message = (event as { message?: { role?: string; usage?: { input?: number; output?: number } } }).message;
-      let usage: { input: number; output: number } | undefined;
-      if (event.type === "message_end" && message?.usage) {
-        usage = normalizedTokenUsage(message.usage);
-        const total = accumulateTokenUsage(tokenUsage, usage);
-        tokenUsage.input = total.input;
-        tokenUsage.output = total.output;
-      }
-      listener({
-        type: event.type,
-        ...(typeof message?.role === "string" ? { role: message.role } : {}),
-        ...(usage ? { usage } : {}),
-      });
+      listener(usageAdapter.adapt(event as Parameters<typeof usageAdapter.adapt>[0]));
     }),
     dispose: () => session.dispose(),
   };

@@ -37,9 +37,12 @@ export interface AgentChildRecord {
   result_tail?: string;
   /** Tool results seen in the transcript so far. */
   tool_calls?: number;
-  /** Provider-reported cumulative token counts (input includes cached prompt tokens). */
+  /** Cumulative provider usage.input and usage.output as reported. */
   tokens_input?: number;
   tokens_output?: number;
+  /** Separate cumulative provider cache counters; not folded into tokens_input. */
+  tokens_cache_read?: number;
+  tokens_cache_write?: number;
   /** Observed assistant-message, tool-execution, and admission-queue wall time. */
   llm_ms?: number;
   tool_ms?: number;
@@ -104,7 +107,7 @@ export function writeAgentChildRecord(home: string, record: AgentChildRecord): v
 }
 
 export type AgentChildTelemetry = Partial<Pick<AgentChildRecord,
-  "tokens_input" | "tokens_output" | "llm_ms" | "tool_ms" | "queue_ms" | "wall_other_ms" | "wall_approximate"
+  "tokens_input" | "tokens_output" | "tokens_cache_read" | "tokens_cache_write" | "llm_ms" | "tool_ms" | "queue_ms" | "wall_other_ms" | "wall_approximate"
 >>;
 
 /** Refresh live telemetry without waiting for a child state transition. */
@@ -128,11 +131,13 @@ export function updateAgentChildTokens(
   home: string,
   sessionId: string,
   childId: string,
-  tokens: { input: number; output: number },
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number },
 ): void {
   updateAgentChildMetrics(home, sessionId, childId, {
     tokens_input: tokens.input,
     tokens_output: tokens.output,
+    tokens_cache_read: tokens.cacheRead,
+    tokens_cache_write: tokens.cacheWrite,
   });
 }
 

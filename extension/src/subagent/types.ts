@@ -80,6 +80,13 @@ export interface ChildRunRequest {
   depth: number; // main session = 0, child = 1
 }
 
+export interface ChildTokenUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
 export interface ChildWallUsage {
   llmMs: number;
   toolMs: number;
@@ -91,7 +98,7 @@ export interface ChildWallUsage {
 export interface ChildSessionEvent {
   type: string;
   role?: string;
-  usage?: { input: number; output: number };
+  usage?: ChildTokenUsage;
 }
 
 export interface ChildHandle {
@@ -116,8 +123,8 @@ export interface ChildHandle {
   resolvedModel(): string | undefined;
   /** Live child transcript. Empty when the session never started. */
   conversation(): ConversationTurn[];
-  /** Cumulative provider-reported input/output tokens for this child. */
-  tokenUsage(): { input: number; output: number };
+  /** Cumulative provider input/output and cache counts for this child. */
+  tokenUsage(): ChildTokenUsage;
   /** Cumulative observed LLM, tool, admission-queue and approximate wall time. */
   wallUsage(): ChildWallUsage;
 }
@@ -143,7 +150,7 @@ export interface ChildSessionAdapter {
   /** Provider/model failure outcome of the last assistant turn, when any. */
   getLastAssistantFailure?(): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   getConversation(): ConversationTurn[];
-  tokenUsage(): { input: number; output: number };
+  tokenUsage(): ChildTokenUsage;
   /** Introspection for child-session orchestration and contract tests. */
   getActiveToolNames?(): string[];
   getSystemPrompt?(): string;

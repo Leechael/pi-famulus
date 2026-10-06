@@ -622,6 +622,8 @@ export default function (pi: ExtensionAPI): void {
           const metrics = {
             tokens_input: usage.input,
             tokens_output: usage.output,
+            tokens_cache_read: usage.cacheRead,
+            tokens_cache_write: usage.cacheWrite,
             llm_ms: wall.llmMs,
             tool_ms: wall.toolMs,
             queue_ms: wall.queueMs,
@@ -704,6 +706,8 @@ export default function (pi: ExtensionAPI): void {
           started_at: c.startedAt,
           tokens_input: c.tokenUsage?.input ?? 0,
           tokens_output: c.tokenUsage?.output ?? 0,
+          tokens_cache_read: c.tokenUsage?.cacheRead ?? 0,
+          tokens_cache_write: c.tokenUsage?.cacheWrite ?? 0,
           llm_ms: c.wallUsage?.llmMs ?? 0,
           tool_ms: c.wallUsage?.toolMs ?? 0,
           queue_ms: c.wallUsage?.queueMs ?? 0,

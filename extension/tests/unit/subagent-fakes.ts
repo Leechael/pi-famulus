@@ -2,7 +2,7 @@
  * Shared fakes for subagent tests: an event-driven controllable
  * ChildSessionAdapter and a CreateSessionFn factory.
  */
-import type { ChildRunRequest, ChildSessionAdapter, ChildSessionEvent, CreateSessionFn } from "../../src/subagent/types";
+import type { ChildRunRequest, ChildSessionAdapter, ChildSessionEvent, ChildTokenUsage, CreateSessionFn } from "../../src/subagent/types";
 import type { AgentDefinition } from "../../src/subagent/types";
 
 export const WORKER_AGENT: AgentDefinition = {
@@ -170,7 +170,13 @@ export class FakeChildSession implements ChildSessionAdapter {
     return this.lastAssistantFailure;
   }
 
-  tokenUsage() { return { input: 0, output: 0 }; }
+  private tokenTotals: ChildTokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+  setTokenUsage(usage: ChildTokenUsage): void {
+    this.tokenTotals = { ...usage };
+  }
+
+  tokenUsage() { return { ...this.tokenTotals }; }
 
   getConversation() {
     const turns = this.prompts.map((text) => ({ role: "user", text }));

@@ -60,7 +60,7 @@ describe("agent child records", () => {
       status: "running",
       started_at: 1,
     });
-    updateAgentChildTokens(home, "sess-1", "ch_usage001", { input: 320, output: 17 });
+    updateAgentChildTokens(home, "sess-1", "ch_usage001", { input: 320, output: 17, cacheRead: 240, cacheWrite: 9 });
     updateAgentChildMetrics(home, "sess-1", "ch_usage001", {
       llm_ms: 1_500,
       tool_ms: 400,
@@ -72,6 +72,8 @@ describe("agent child records", () => {
       status: "running",
       tokens_input: 320,
       tokens_output: 17,
+      tokens_cache_read: 240,
+      tokens_cache_write: 9,
       llm_ms: 1_500,
       tool_ms: 400,
       queue_ms: 250,
