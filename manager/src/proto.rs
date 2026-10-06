@@ -459,6 +459,8 @@ pub struct SessionInfo {
 pub struct AgentCapacity {
     pub used: usize,
     pub total: usize,
+    /// Labelled permits by work kind. Protocol-4 permits have no kind label,
+    /// so they count toward `used` but are omitted from this map.
     #[serde(default)]
     pub by_kind: HashMap<String, AgentKindCapacity>,
 }

@@ -29,12 +29,24 @@ export interface AgentAdmissionOptions {
   pendingReregistrations?: Map<string, AbortController>;
   ticket?: AdmissionTicket;
   notice(reason: "manager unavailable" | "daemon too old"): void;
-  wait?: () => Promise<void>;
+  wait?: (signal?: AbortSignal) => Promise<void>;
 }
 
-const defaultWait = () => new Promise<void>((resolve) => setTimeout(resolve, 500));
+const defaultWait = (signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+  const timer = setTimeout(() => {
+    signal?.removeEventListener("abort", onAbort);
+    resolve();
+  }, 500);
+  const onAbort = () => {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+    reject(new Error("subagent admission cancelled"));
+  };
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+});
 
-function waitForRetry(wait: () => Promise<void>, signal?: AbortSignal): Promise<void> {
+function waitForRetry(wait: (signal?: AbortSignal) => Promise<void>, signal?: AbortSignal): Promise<void> {
   if (!signal) return wait();
   if (signal.aborted) return Promise.reject(new Error("subagent admission cancelled"));
   return new Promise<void>((resolve, reject) => {
@@ -44,7 +56,7 @@ function waitForRetry(wait: () => Promise<void>, signal?: AbortSignal): Promise<
       reject(new Error("subagent admission cancelled"));
     };
     signal.addEventListener("abort", onAbort, { once: true });
-    wait().then(
+    wait(signal).then(
       () => {
         cleanup();
         resolve();

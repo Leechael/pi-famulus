@@ -26,6 +26,7 @@ interface FakeManager {
   setTasks(tasks: Record<string, unknown>[]): void;
   setProtocol(protocol: number | undefined): void;
   holdNextAcquire(): void;
+  releaseHeldAcquire(): void;
   refuseFor(ms: number): Promise<void>;
   close(): Promise<void>;
 }
@@ -48,6 +49,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   let tasks: Record<string, unknown>[] = [];
   let protocol: number | undefined = 4;
   let holdAcquire = false;
+  let heldAcquire: { message: Record<string, unknown>; socket: net.Socket } | null = null;
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -109,6 +111,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
       case "acquire_agent":
         if (holdAcquire) {
           holdAcquire = false;
+          heldAcquire = { message: msg, socket };
           return null;
         }
         return { v: 1, id: msg.id, ok: true, granted: true };
@@ -166,6 +169,11 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     setTasks: (value) => { tasks = value; },
     setProtocol: (value) => { protocol = value; },
     holdNextAcquire: () => { holdAcquire = true; },
+    releaseHeldAcquire: () => {
+      if (!heldAcquire) throw new Error("no held acquire request");
+      heldAcquire.socket.write(encodeFrame({ v: 1, id: heldAcquire.message.id, ok: true, granted: true }));
+      heldAcquire = null;
+    },
     refuseFor: async (ms) => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -319,6 +327,25 @@ describe("ManagerClient (integration, fake manager)", () => {
     await expect(acquire).resolves.toEqual({ granted: true });
   });
 
+  it("keeps a protocol-4 acquire alive so a late grant can be released", async () => {
+    await client.connect();
+    expect(client.protocolLevel()).toBe(4);
+    fake.holdNextAcquire();
+    const controller = new AbortController();
+    const acquire = client.acquireAgent("ch_v4_abort", "test", controller.signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    controller.abort();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fake.received.some((message) => message.type === "cancel_acquire_agent")).toBe(false);
+    fake.releaseHeldAcquire();
+    await expect(acquire).resolves.toEqual({ granted: true });
+    await client.releaseAgent("ch_v4_abort");
+    expect(fake.received.find((message) => message.type === "release_agent"))
+      .toMatchObject({ child_id: "ch_v4_abort" });
+  });
+
   it("cancels a pending acquire with its original request id when the child settles", async () => {
     fake.setProtocol(5);
     await client.connect();
@@ -336,6 +363,30 @@ describe("ManagerClient (integration, fake manager)", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(fake.received.find((message) => message.type === "cancel_acquire_agent"))
       .toMatchObject({ request_id: pending?.id, child_id: "ch_cancel" });
+  });
+
+  it("retries protocol-5 cancellation after aborting during reconnect", async () => {
+    fake.setProtocol(5);
+    await client.connect();
+    fake.holdNextAcquire();
+    const controller = new AbortController();
+    const acquire = client.acquireAgent("ch_disconnect_abort", "test", controller.signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const restart = fake.refuseFor(500);
+    for (let i = 0; i < 50 && client.isAvailable(); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(client.isAvailable()).toBe(false);
+    controller.abort();
+    await expect(acquire).rejects.toThrow("subagent admission cancelled");
+    await restart;
+    for (let i = 0; i < 100 && !fake.received.some((message) => message.type === "cancel_acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(fake.received.find((message) => message.type === "cancel_acquire_agent"))
+      .toMatchObject({ request_id: expect.any(String), child_id: "ch_disconnect_abort" });
   });
 
   it("preserves upgrade generation metadata from status", async () => {

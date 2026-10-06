@@ -32,18 +32,44 @@ pub fn is_work_kind(kind: &str) -> bool {
     kind_setting(kind).is_some()
 }
 
+/// Parsed capacity configuration reused across a daemon admission/status
+/// decision, avoiding repeated disk reads while scanning queued requests.
+#[derive(Clone, Debug)]
+pub struct CapacityConfig {
+    value: Value,
+}
+
+impl CapacityConfig {
+    pub fn max_agents(&self) -> Result<usize, String> {
+        max_agents_from(&self.value)
+    }
+
+    /// Return a kind budget. Unconfigured kinds inherit the machine-wide
+    /// limit; explicit test budgets default to two slots.
+    pub fn max_kind(&self, kind: &str) -> Result<usize, String> {
+        max_kind_from_value(&self.value, kind)
+    }
+}
+
+pub fn load(home: &Path) -> Result<CapacityConfig, String> {
+    Ok(CapacityConfig { value: config(&home.join("config.json"))? })
+}
+
 /// Return a kind budget. Unconfigured kinds inherit the machine-wide limit;
 /// explicit test budgets default to two slots.
 pub fn max_kind(home: &Path, kind: &str) -> Result<usize, String> {
-    let value = config(&home.join("config.json"))?;
+    load(home)?.max_kind(kind)
+}
+
+fn max_kind_from_value(value: &Value, kind: &str) -> Result<usize, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "config.json must contain a JSON object".to_string())?;
     let Some((key, default)) = kind_setting(kind) else {
-        return max_agents_from(&value);
+        return max_agents_from(value);
     };
     let default = if default == DEFAULT_MAX_AGENTS {
-        max_agents_from(&value)?
+        max_agents_from(value)?
     } else {
         default
     };
@@ -62,7 +88,7 @@ pub fn set_max_kind(home: &Path, kind: &str, count: usize) -> Result<usize, Stri
     let _lock = ConfigLock::acquire(home)?;
     let path = home.join("config.json");
     let mut value = config(&path)?;
-    let previous = max_kind(home, kind)?;
+    let previous = max_kind_from_value(&value, kind)?;
     let object = value
         .as_object_mut()
         .ok_or("config.json must contain a JSON object")?;
@@ -100,7 +126,7 @@ pub fn config(path: &Path) -> Result<Value, String> {
 }
 
 pub fn max_agents(home: &Path) -> Result<usize, String> {
-    max_agents_from(&config(&home.join("config.json"))?)
+    load(home)?.max_agents()
 }
 
 /// Set the budget under a cross-process lock and return the previous value.

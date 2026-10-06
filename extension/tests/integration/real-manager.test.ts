@@ -203,7 +203,7 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
   it("re-registers a held child lease after the real daemon restarts", async () => {
     const childId = "ch_reconnect01";
     const leases = new Map([[childId, "test"]]);
-    expect((await client.acquireAgent(childId)).granted).toBe(true);
+    expect((await client.acquireAgent(childId, "test")).granted).toBe(true);
     let signal!: () => void;
     const reconnected = new Promise<void>((resolve) => { signal = resolve; });
     client.onReconnect(() => {

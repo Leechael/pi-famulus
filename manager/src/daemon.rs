@@ -1238,7 +1238,7 @@ pub fn maybe_arm_idle_timer(state: &Shared) {
 // ---------------------------------------------------------------------------
 
 async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
-    service_unconfirmed_agent_grants(&state, conn_id, &tx);
+    let re_served_grants = service_unconfirmed_agent_grants(&state, conn_id, &tx);
     let id = req.id;
     match req.kind {
         RequestKind::Hello { .. } => {
@@ -1329,7 +1329,16 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             child_id,
             work_kind,
         } => {
-            handle_acquire_agent(&state, conn_id, &child_id, &work_kind, &id, &tx).await;
+            handle_acquire_agent(
+                &state,
+                conn_id,
+                &child_id,
+                &work_kind,
+                &id,
+                &re_served_grants,
+                &tx,
+            )
+            .await;
         }
         RequestKind::CancelAcquireAgent {
             request_id,
@@ -2065,6 +2074,7 @@ async fn handle_acquire_agent(
     child_id: &str,
     work_kind: &str,
     request_id: &str,
+    re_served_grants: &HashSet<String>,
     tx: &OutTx,
 ) {
     let session = {
@@ -2096,14 +2106,20 @@ async fn handle_acquire_agent(
         if st.cancelled_acquires.remove(&request_key) {
             (None, Vec::new())
         } else {
-            // Run older eligible waiters before considering a fresh request.
-            let wake = wake_pending(&mut st);
+            // Reuse one parsed config for this acquire and its pending-queue scan.
+            let capacity = crate::capacity::load(&st.home);
+            let wake = match &capacity {
+                Ok(capacity) => wake_pending_with_capacity(&mut st, capacity),
+                Err(_) => Vec::new(),
+            };
             let key = (sid.clone(), child_id.to_string());
             let grant_still_undelivered = st
                 .undelivered_agent_grants
                 .get(&(sid.clone(), request_id.to_string()))
                 .is_some_and(|owner| owner == child_id);
-            if st.agent_permits.contains_key(&key) && grant_still_undelivered {
+            if st.agent_permits.contains_key(&key)
+                && (grant_still_undelivered || re_served_grants.contains(request_id))
+            {
                 (None, wake)
             } else if st.agent_permits.contains_key(&key) {
                 (Some(Ok(AgentAdmissionOk { granted: true, rejection: None })), wake)
@@ -2126,9 +2142,15 @@ async fn handle_acquire_agent(
                     (None, wake)
                 }
             } else {
-                let budget = crate::capacity::max_agents(&st.home).map_err(|error| {
-                    ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
-                });
+                let budget = match &capacity {
+                    Ok(capacity) => capacity.max_agents().map_err(|error| {
+                        ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
+                    }),
+                    Err(error) => Err(ProtoError::new(
+                        E_INTERNAL,
+                        format!("invalid capacity config: {error}"),
+                    )),
+                };
                 match budget {
                     Err(error) => (Some(Err(error)), wake),
                     Ok(budget) if st.agent_permits.len() >= budget => (
@@ -2150,14 +2172,17 @@ async fn handle_acquire_agent(
                     }
                     Ok(_) => {
                         let kind = if work_kind.is_empty() { "other" } else { work_kind };
-                        match crate::capacity::max_kind(&st.home, kind) {
-                            Err(error) => (
-                                Some(Err(ProtoError::new(
-                                    E_INTERNAL,
-                                    format!("invalid capacity config: {error}"),
-                                ))),
-                                wake,
-                            ),
+                        let kind_budget = match &capacity {
+                            Ok(capacity) => capacity.max_kind(kind).map_err(|error| {
+                                ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
+                            }),
+                            Err(error) => Err(ProtoError::new(
+                                E_INTERNAL,
+                                format!("invalid capacity config: {error}"),
+                            )),
+                        };
+                        match kind_budget {
+                            Err(error) => (Some(Err(error)), wake),
                             Ok(kind_budget)
                                 if admits_kind(&st.agent_permits, kind, kind_budget) =>
                             {
@@ -2316,11 +2341,11 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
     }
 }
 
-fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) {
+fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) -> HashSet<String> {
     let pending = {
         let st = state.lock().unwrap();
         let Some(sid) = st.conns.get(&conn_id).and_then(|conn| conn.session_id.as_ref()) else {
-            return;
+            return HashSet::new();
         };
         st.undelivered_agent_grants
             .iter()
@@ -2330,6 +2355,7 @@ fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) {
             })
             .collect::<Vec<_>>()
     };
+    let mut re_served = HashSet::new();
     for (sid, request_id, child_id) in pending {
         if tx
             .try_send(encode_ok(
@@ -2339,8 +2365,10 @@ fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) {
             .is_ok()
         {
             clear_delivered_grant(state, &sid, &request_id, &child_id);
+            re_served.insert(request_id);
         }
     }
+    re_served
 }
 
 fn handle_release_agent(
@@ -2393,7 +2421,10 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         .filter(|e| e.record.status == TaskStatus::Running)
         .count();
     let terminal = st.registry.tasks.len() - running;
-    let total_agent_capacity = crate::capacity::max_agents(&st.home)
+    let capacity_config = crate::capacity::load(&st.home)
+        .map_err(|error| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}")))?;
+    let total_agent_capacity = capacity_config
+        .max_agents()
         .map_err(|error| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}")))?;
     Ok(StatusOk {
         version: crate::VERSION.to_string(),
@@ -2407,6 +2438,11 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
             by_kind: {
                 let mut kinds = HashMap::new();
                 for kind in crate::capacity::WORK_KINDS {
+                    let Ok(total) = capacity_config.max_kind(kind) else {
+                        // Per-kind values are advisory; a malformed kind should
+                        // not make the entire status endpoint unavailable.
+                        continue;
+                    };
                     kinds.insert(
                         (*kind).to_string(),
                         AgentKindCapacity {
@@ -2415,12 +2451,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
                                 .values()
                                 .filter(|permit| permit.work_kind == *kind)
                                 .count(),
-                            total: crate::capacity::max_kind(&st.home, kind).map_err(|error| {
-                                ProtoError::new(
-                                    E_INTERNAL,
-                                    format!("invalid capacity config: {error}"),
-                                )
-                            })?,
+                            total,
                         },
                     );
                 }
@@ -3176,13 +3207,24 @@ fn admits_kind(permits: &HashMap<(String, String), AgentPermit>, kind: &str, bud
 /// kind can use its independent budget. Removing an eligible index preserves
 /// FIFO order among waiters of every individual kind.
 fn wake_pending(st: &mut DaemonState) -> Vec<AgentGrant> {
+    let Ok(capacity) = crate::capacity::load(&st.home) else {
+        return Vec::new();
+    };
+    wake_pending_with_capacity(st, &capacity)
+}
+
+fn wake_pending_with_capacity(
+    st: &mut DaemonState,
+    capacity: &crate::capacity::CapacityConfig,
+) -> Vec<AgentGrant> {
     let mut wake = Vec::new();
-    let Ok(global) = crate::capacity::max_agents(&st.home) else {
+    let Ok(global) = capacity.max_agents() else {
         return wake;
     };
     while st.agent_permits.len() < global {
         let eligible = st.pending_agents.iter().position(|pending| {
-            crate::capacity::max_kind(&st.home, &pending.work_kind)
+            capacity
+                .max_kind(&pending.work_kind)
                 .is_ok_and(|budget| admits_kind(&st.agent_permits, &pending.work_kind, budget))
         });
         let Some(index) = eligible else {
