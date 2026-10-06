@@ -434,6 +434,24 @@ describe("soft deadline, as the parent sees it (registry + runner + overrun noti
     return { clock, registry, factory, shells, wakes, events, req, runId: run.runId };
   }
 
+  it("batch sweep does not include a decision-paused overdue child", async () => {
+    const { clock, registry, factory, wakes, req, runId } = stack();
+    const pausedReq = { ...req, childId: registry.addChild(runId, { name: "paused", agent: "worker" }), name: "paused" };
+    const activeReq = { ...req, childId: registry.addChild(runId, { name: "active", agent: "worker" }), name: "active" };
+    const paused = await registry.startChild(pausedReq);
+    const active = await registry.startChild(activeReq);
+    (paused as typeof paused & { pauseStall(): void }).pauseStall();
+
+    clock.advanceBy(30 * 60_000);
+
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].details).toMatchObject({ kind: "subagent-overrun", childId: activeReq.childId });
+    expect((wakes[0].details as { additional?: { childId: string }[] }).additional ?? []).toEqual([]);
+    expect(registry.handle(pausedReq.childId)!.status()).toBe("running");
+    await paused.interrupt();
+    await active.interrupt();
+  });
+
   it("a child blocked on a long test run: the parent is woken, the child and shell keep running", async () => {
     const { clock, registry, factory, shells, wakes, events, req, runId } = stack();
     const handle = await registry.startChild(req);

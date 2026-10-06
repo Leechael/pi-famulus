@@ -714,7 +714,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   }
 
   collectDueOverrun(now: number): OverrunTick | undefined {
-    if (this.settledFlag || this.disposed || this.status_ !== "running" || this.softDeadlineAt === null) return undefined;
+    if (this.settledFlag || this.disposed || this.status_ !== "running" || this.decisionPaused || this.softDeadlineAt === null) return undefined;
     if (this.softDeadlineAt > now || this.nextReminderAt === null || this.nextReminderAt > now) return undefined;
     if (this.softTimer !== null) this.timerScope?.clearTimeout(this.softTimer);
     this.softTimer = null;
