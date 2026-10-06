@@ -187,6 +187,8 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** Generation retired by a stall detection awaiting its retry. */
   private retiredGen: number | null = null;
   private releaseSlot: ((terminal?: boolean) => void) | null = null;
+  /** Whether the current generation's settled result is terminal for this child. */
+  private terminalSettle = false;
   private disposed = false;
   /** Nested tool_execution_start/end. Stall stays paused while > 0. */
   private toolDepth = 0;
@@ -466,6 +468,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.timerScope?.dispose();
     this.timerScope = new TimerScope(this.clock);
     this.settledFlag = false;
+    this.terminalSettle = false;
     this.status_ = "pending";
     this.startedAt = this.clock.now();
     this.lastEvent = this.startedAt;
@@ -494,7 +497,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       }
     }
     if (this.disposed || this.isSettled(gen)) {
-      this.release(this.disposed || this.status_ !== "interrupted");
+      this.release(this.terminalSettle);
       return;
     }
     this.status_ = "running";
@@ -660,7 +663,8 @@ class InProcessChildHandle implements DisposableChildHandle {
       result.warning = this.session.warning;
     }
     this.status_ = result.status;
-    this.release(result.status !== "interrupted" || result.error === "disposed");
+    this.terminalSettle = result.status !== "interrupted" || result.error === "disposed";
+    this.release(this.terminalSettle);
     this.notifyActivity();
     this.resolveResult(result);
   }
