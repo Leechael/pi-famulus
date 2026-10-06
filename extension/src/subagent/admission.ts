@@ -141,7 +141,7 @@ export async function reregisterAgentLeases(
   pendingReregistrations?: Map<string, AbortController>,
 ): Promise<void> {
   if (manager.protocolLevel() < 4) return;
-  for (const [childId, workKind] of [...leases]) {
+  await Promise.all([...leases].map(async ([childId, workKind]) => {
     while (leases.has(childId) && manager.isAvailable() && manager.protocolLevel() >= 4) {
       if (pendingReregistrations?.has(childId)) break;
       const controller = new AbortController();
@@ -172,5 +172,5 @@ export async function reregisterAgentLeases(
       if (admission.granted) break;
       await wait();
     }
-  }
+  }));
 }
