@@ -559,7 +559,33 @@ export default function (pi: ExtensionAPI): void {
       stallRetryDelayMs: subagentConfig.stallRetryDelayMs,
       overrunRepeatMs: subagentConfig.overrunRepeatMs,
       hardTimeoutMs: subagentConfig.hardTimeoutMs,
-      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
+      acquire: async (req, ticket) => {
+        const manager = client;
+        if (!manager) throw new Error("pi-famulus manager is not connected");
+        // Keep the existing local admission ceiling, while obtaining the
+        // machine-wide lease before a child generation starts.
+        let admission: { granted: boolean; rejection?: string };
+        do {
+          admission = await manager.acquireAgent(req.childId);
+          if (!admission.granted) {
+            if (ticket && !ticket.current()) throw new Error("subagent admission cancelled");
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        } while (!admission.granted);
+        try {
+          const releaseLocal = await registry.admitChild(req.childId, ticket);
+          let released = false;
+          return () => {
+            if (released) return;
+            released = true;
+            releaseLocal();
+            void manager.releaseAgent(req.childId);
+          };
+        } catch (error) {
+          await manager.releaseAgent(req.childId);
+          throw error;
+        }
+      },
       onActivity: (childId) => {
         syncTranscript(childId);
       },
