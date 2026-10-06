@@ -416,7 +416,6 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.settledFlag = false;
     this.retiredGen = null;
     this.status_ = "pending";
-    this.startedAt = this.runStartedAt;
     this.lastEvent = this.runStartedAt;
     this.resultPromise = new Promise((resolve) => {
       this.resolveResult = resolve;
