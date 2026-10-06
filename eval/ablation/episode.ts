@@ -6,6 +6,7 @@ import { PiRpc } from "../lib/rpc.ts";
 import { createSandbox, hasRunningWork, waitManagerReady } from "../lib/sandbox.ts";
 import { assistants, itemsFromEvents } from "../lib/transcript.ts";
 import type { Grade } from "./graders.ts";
+import { errorAfterCompatibilityGrade } from "./episode-error-policy.ts";
 import { judge } from "./judge.ts";
 import { type Variant, variantFamulusConfig } from "./manifest.ts";
 import type { Scenario } from "./scenarios.ts";
@@ -68,9 +69,9 @@ export async function runEpisode(opts: {
   const setup = scenario.setup(sb.cwd, secretDir);
   const pi = new PiRpc({
     cwd: sb.cwd,
-    env: { ...sb.env, PI_FAMULUS_ABLATE: variant.id, PI_FAMULUS_ABLATION_LOG: logPath, ...(opts.env ?? {}) },
+    env: { ...sb.env, PI_FAMULUS_ABLATE: variant.id, PI_FAMULUS_ABLATION_LOG: logPath, ...(setup.env ?? {}), ...(opts.env ?? {}) },
     model: opts.model,
-    extensions: [...(opts.extensions ?? []), ABLATION_EXT],
+    extensions: [...(scenario.extensions ?? []), ...(opts.extensions ?? []), ABLATION_EXT],
   });
   const bg = [] as Array<{ kill(sig?: NodeJS.Signals): boolean }>;
   let error: string | undefined;
@@ -111,6 +112,9 @@ export async function runEpisode(opts: {
   const providerError = assistants(items).find((a) => a.stopReason === "error" || a.stopReason === "aborted");
   if (!error && providerError && assistants(items).length === 1) error = `provider: ${providerError.errorMessage ?? providerError.stopReason}`;
   const grade = scenario.grade({ items, cwd: sb.cwd, secretDir, endedAt });
+  Object.assign(grade.metrics, setup.metadata ?? {});
+  if (scenario.optIn) grade.metrics.requestedModelSpec = opts.model;
+  error = errorAfterCompatibilityGrade(scenario, grade, error);
   if (opts.judgeModel && scenario.judgeQuestion) {
     const excerpt = items
       .map((i) =>

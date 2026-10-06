@@ -10,6 +10,7 @@
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatMonitorEvent } from "./format";
+import { MONITOR_IDLE_INSTRUCTION } from "./behavior-guidelines";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 import type { ManagerClient, ManagerEvent, TaskRecord } from "./manager-client";
@@ -43,7 +44,7 @@ const EXIT_AFTER_EVENT_MS = 2_000;
 export const MONITOR_STARTED_INSTRUCTION =
   'You will get a <pi-famulus-wake kind="monitor"> for each event, and a notice when it exits or times out. ' +
   "Do not poll it (task_list, task_output, or reading what it watches) or sleep. " +
-  "If nothing else is left to do, reply to the user now with no tool call.";
+  MONITOR_IDLE_INSTRUCTION;
 /**
  * Events for ids the registry does not know yet. The manager streams a monitor
  * from spawn, so output and even the exit can arrive before `start()` has the
@@ -475,10 +476,12 @@ export function createMonitorTool(
       "Add `-m1` to grep to stop after the first match. " +
       "Silence is not success: write the command so failures also produce lines " +
       "(e.g. grep for both success and error patterns). " +
-      "Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind=\"monitor\"> before other work. Do not poll.",
+      "Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind=\"monitor\"> before other work. Do not poll. " +
+      MONITOR_IDLE_INSTRUCTION,
     promptSnippet: "Watch a command's line stream and get injected events",
     promptGuidelines: [
       "Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.",
+      MONITOR_IDLE_INSTRUCTION,
       "When woken by a <pi-famulus-wake kind=\"monitor\">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
     ],
     parameters: monitorParameters,

@@ -8,6 +8,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Item, toolResults, wakes } from "../lib/transcript.ts";
+import { monitorWaiterScenarios } from "./monitor-waiter-scenarios.ts";
 import {
   ackAndStop,
   assistantTextBetween,
@@ -32,6 +33,10 @@ export interface EpisodeView {
 
 export interface ScenarioSetup {
   prompt: string;
+  /** Scenario-local fixture configuration, not inherited by old probes. */
+  env?: Record<string, string>;
+  /** Fixture size/version metadata copied into result metrics. */
+  metadata?: Record<string, number | string | boolean>;
   /** Started right before the prompt is sent (e.g. an external log writer). */
   background?: () => ChildProcess;
 }
@@ -39,6 +44,12 @@ export interface ScenarioSetup {
 export interface Scenario {
   id: string;
   behavior: string;
+  /** Expensive/additional-extension probes require explicit --scenarios. */
+  optIn?: boolean;
+  /** Loaded only for this scenario, before the ablation harness. */
+  extensions?: string[];
+  /** Extra context estimate per call, charged uncached for conservative planning. */
+  estContextTokens?: number;
   /** Merged into $PI_FAMULUS_HOME/config.json (variant config wins). */
   famulusConfig: Record<string, unknown>;
   /** Hard wall-clock cap per episode. */
@@ -454,7 +465,11 @@ export const SCENARIOS: Scenario[] = [
   noFabrication,
   supervisorReply,
   resumeFinished,
+  ...monitorWaiterScenarios,
 ];
+
+/** Preserve the original smoke/full grid unless explicitly selected. */
+export const DEFAULT_SCENARIOS = SCENARIOS.filter((s) => !s.optIn);
 
 export function getScenario(id: string): Scenario {
   const s = SCENARIOS.find((x) => x.id === id);

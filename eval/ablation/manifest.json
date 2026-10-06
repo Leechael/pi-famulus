@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "notes": [
     "Each segment is removed from everything the PARENT model sees (system prompt sections, <rules>, tool declarations, tool results, injected wakes) by harness/ablation-ext.ts. Texts must match the extension source exactly; e2e/ablation-harness.test.ts fails on drift, and the runner marks an episode 'vacuous' when a requested segment never matched.",
     "textFrom reads the text from an export of extension source (manifest.ts TEXT_SOURCES) instead of copying it.",
@@ -29,6 +29,9 @@
         "wake-continue",
         "still-running-continue",
         "monitor-not-sleep",
+        "monitor-waiter-event",
+        "monitor-waiter-synthetic-long",
+        "monitor-waiter-rearm",
         "handover-continue",
         "supervisor-reply"
       ]
@@ -94,12 +97,28 @@
       ]
     },
     {
+      "id": "guidelines.monitor-end-turn",
+      "kind": "text",
+      "surface": "BEHAVIOR_GUIDELINES, monitor description/promptGuidelines/start result: MONITOR_IDLE_INSTRUCTION (behavior-guidelines.ts); remove every copy",
+      "textFrom": "guidelines.MONITOR_IDLE_INSTRUCTION",
+      "affects": [
+        "monitor-not-sleep",
+        "monitor-waiter-event",
+        "monitor-waiter-synthetic-long",
+        "monitor-waiter-rearm",
+        "monitor-waiter-ui-control"
+      ]
+    },
+    {
       "id": "rules.monitor-use",
       "kind": "text",
       "surface": "system <rules>: monitor promptGuidelines (monitor.ts)",
       "text": "Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.",
       "affects": [
-        "monitor-not-sleep"
+        "monitor-not-sleep",
+        "monitor-waiter-event",
+        "monitor-waiter-synthetic-long",
+        "monitor-waiter-rearm"
       ]
     },
     {
@@ -108,7 +127,10 @@
       "surface": "system <rules>: monitor promptGuidelines",
       "text": "When woken by a <pi-famulus-wake kind=\"monitor\">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
       "affects": [
-        "monitor-not-sleep"
+        "monitor-not-sleep",
+        "monitor-waiter-event",
+        "monitor-waiter-synthetic-long",
+        "monitor-waiter-rearm"
       ]
     },
     {
@@ -179,7 +201,10 @@
       "surface": "tool declaration: monitor.description",
       "text": "Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind=\"monitor\"> before other work. Do not poll.",
       "affects": [
-        "monitor-not-sleep"
+        "monitor-not-sleep",
+        "monitor-waiter-event",
+        "monitor-waiter-synthetic-long",
+        "monitor-waiter-rearm"
       ]
     },
     {
@@ -215,9 +240,12 @@
       "id": "result.monitor-started-instruction",
       "kind": "text",
       "surface": "tool result: monitor start (monitor.ts MONITOR_STARTED_INSTRUCTION), model-facing (the row shows the first line only)",
-      "text": "\nYou will get a <pi-famulus-wake kind=\"monitor\"> for each event, and a notice when it exits or times out. Do not poll it (task_list, task_output, or reading what it watches) or sleep. If nothing else is left to do, reply to the user now with no tool call.",
+      "text": "\nYou will get a <pi-famulus-wake kind=\"monitor\"> for each event, and a notice when it exits or times out. Do not poll it (task_list, task_output, or reading what it watches) or sleep.",
       "affects": [
-        "monitor-not-sleep"
+        "monitor-not-sleep",
+        "monitor-waiter-event",
+        "monitor-waiter-synthetic-long",
+        "monitor-waiter-rearm"
       ]
     },
     {
@@ -259,6 +287,9 @@
         "still-running-continue",
         "no-fabrication",
         "monitor-not-sleep",
+        "monitor-waiter-event",
+        "monitor-waiter-synthetic-long",
+        "monitor-waiter-rearm",
         "handover-continue",
         "supervisor-reply",
         "resume-finished",
@@ -304,7 +335,8 @@
         "guidelines.wake-handling",
         "guidelines.no-fabrication",
         "guidelines.subagent-handover",
-        "guidelines.agent-message"
+        "guidelines.agent-message",
+        "guidelines.monitor-end-turn"
       ]
     },
     {
