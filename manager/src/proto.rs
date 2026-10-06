@@ -316,7 +316,7 @@ pub enum RequestKind {
         #[serde(default)]
         work_kind: String,
     },
-    /// Cancel a queued acquire by its original request id.
+    /// Cancel a queued acquire or a grant race; only its owning request id may release a permit.
     CancelAcquireAgent {
         request_id: String,
         child_id: String,

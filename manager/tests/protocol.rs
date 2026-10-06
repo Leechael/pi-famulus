@@ -3,14 +3,15 @@
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state
 //! machine, CLI). Written against the *contract*, not the implementation:
 //! each test spawns the compiled binary and speaks the wire protocol
-//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. Mostly std —
-//! libc is used only to probe the lifetime lock; no dev-dependencies or serde.
-//! JSON is asserted via substring matching
-//! (whitespace-tolerant where it matters via `compact()`).
+//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. Response ids
+//! are matched as parsed JSON fields (never substrings); other contract
+//! assertions use whitespace-tolerant `compact()` JSON text. libc is used
+//! to probe the lifetime lock.
 //!
 //! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
 //! (pi-famulus-test-<pid>-<testname>) and kills its daemon on drop.
 
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -181,14 +182,20 @@ impl Conn {
             .unwrap_or_else(|| panic!("no response echoing id {id:?} within {RESPONSE_TIMEOUT:?}"))
     }
 
-    fn read_until(&mut self, needle: &str, timeout: Duration) -> Option<String> {
-        if let Some(f) = self.history.iter().find(|f| f.contains(needle)) {
-            return Some(f.clone());
+    fn read_until(&mut self, id: &str, timeout: Duration) -> Option<String> {
+        let matches_id = |frame: &str| {
+            serde_json::from_str::<Value>(frame)
+                .ok()
+                .and_then(|value| value.get("id")?.as_str().map(str::to_owned))
+                .is_some_and(|frame_id| frame_id == id)
+        };
+        if let Some(frame) = self.history.iter().find(|frame| matches_id(frame)) {
+            return Some(frame.clone());
         }
         let deadline = Instant::now() + timeout;
         loop {
             let frame = self.read_frame(deadline)?;
-            if frame.contains(needle) {
+            if matches_id(&frame) {
                 return Some(frame);
             }
         }
@@ -1223,6 +1230,276 @@ fn p10_cancel_and_disconnect_remove_queued_acquires() {
         "p10-contender",
     );
     assert!(compact(&result).contains("\"granted\":true"), "stale pending request held the kind slot: {result}");
+}
+
+#[test]
+fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
+    let home = test_home("p16-unconfirmed-grant-retry");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    let mut waiter = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p16-holder", 5);
+    hello_ext_protocol(&mut waiter, "session-p16-waiter", 5);
+    holder.request(
+        r#"{"id":"p16-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p16-hold",
+    );
+    let acquire = r#"{"id":"p16-wait","type":"acquire_agent","child_id":"ch_wait","work_kind":"test"}"#;
+    waiter.send(acquire);
+    assert!(waiter.read_until("p16-wait", Duration::from_millis(100)).is_none());
+    for n in 0..5000 {
+        waiter.send(&format!(r#"{{"id":"p16-status-{n:04}","type":"status"}}"#));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    holder.request(
+        r#"{"id":"p16-release","type":"release_agent","child_id":"ch_hold"}"#,
+        "p16-release",
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    waiter.send(acquire); // same request id, while all status replies are unread
+    assert!(waiter.read_until("p16-wait", Duration::from_millis(100)).is_none());
+    std::thread::sleep(Duration::from_secs(3));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut next_retry = Instant::now() + Duration::from_secs(3);
+    let mut retries = 1;
+    let mut status_frames = waiter
+        .history
+        .iter()
+        .filter(|frame| frame.contains("p16-status-"))
+        .count();
+    loop {
+        if Instant::now() >= next_retry {
+            waiter.send(acquire);
+            retries += 1;
+            next_retry += Duration::from_secs(3);
+        }
+        let frame = waiter.read_frame((Instant::now() + Duration::from_millis(100)).min(deadline));
+        let Some(frame) = frame else {
+            assert!(Instant::now() < deadline, "queued acquire never received its retained grant");
+            continue;
+        };
+        let value: Value = serde_json::from_str(&frame).unwrap();
+        if value["id"] == "p16-wait" {
+            assert_eq!(value["granted"], true, "{value}");
+            assert!(retries >= 2, "grant arrived without a same-id retry after backpressure");
+            assert!(status_frames > 0, "no flooded status responses drained before grant");
+            break;
+        }
+        if value["id"].as_str().is_some_and(|id| id.starts_with("p16-status-")) {
+            status_frames += 1;
+        }
+    }
+}
+
+#[test]
+fn p12_wake_scans_for_eligible_kind_and_keeps_same_kind_fifo() {
+    let home = test_home("p12-kind-head-of-line");
+    fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":1,"maxBuild":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut test_holder = connect(&home, CONNECT_TIMEOUT);
+    let mut build_holder = connect(&home, CONNECT_TIMEOUT);
+    let mut test_waiter = connect(&home, CONNECT_TIMEOUT);
+    let mut build_waiter = connect(&home, CONNECT_TIMEOUT);
+    let mut build_fresh = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut test_holder, "session-p12-th", 5);
+    hello_ext_protocol(&mut build_holder, "session-p12-bh", 5);
+    hello_ext_protocol(&mut test_waiter, "session-p12-tw", 5);
+    hello_ext_protocol(&mut build_waiter, "session-p12-bw", 5);
+    hello_ext_protocol(&mut build_fresh, "session-p12-bf", 5);
+    test_holder.request(
+        r#"{"id":"p12-hold-test","type":"acquire_agent","child_id":"ch_th","work_kind":"test"}"#,
+        "p12-hold-test",
+    );
+    build_holder.request(
+        r#"{"id":"p12-hold-build","type":"acquire_agent","child_id":"ch_bh","work_kind":"build"}"#,
+        "p12-hold-build",
+    );
+    test_waiter.send(
+        r#"{"id":"p12-test-wait","type":"acquire_agent","child_id":"ch_tw","work_kind":"test"}"#,
+    );
+    assert!(test_waiter.read_until("p12-test-wait", Duration::from_millis(100)).is_none());
+    test_waiter.send(
+        r#"{"id":"p12-test-alias","type":"acquire_agent","child_id":"ch_tw","work_kind":"test"}"#,
+    );
+    assert!(test_waiter.read_until("p12-test-alias", Duration::from_millis(100)).is_none());
+    build_waiter.send(
+        r#"{"id":"p12-build-wait","type":"acquire_agent","child_id":"ch_bw","work_kind":"build"}"#,
+    );
+    assert!(build_waiter.read_until("p12-build-wait", Duration::from_millis(100)).is_none());
+    build_fresh.send(
+        r#"{"id":"p12-build-fresh","type":"acquire_agent","child_id":"ch_bf","work_kind":"build"}"#,
+    );
+    assert!(build_fresh.read_until("p12-build-fresh", Duration::from_millis(100)).is_none());
+
+    build_holder.request(
+        r#"{"id":"p12-release-build","type":"release_agent","child_id":"ch_bh"}"#,
+        "p12-release-build",
+    );
+    let build_grant = build_waiter.read_until("p12-build-wait", Duration::from_secs(3)).unwrap();
+    assert!(compact(&build_grant).contains("\"granted\":true"), "{build_grant}");
+    assert!(build_fresh.read_until("p12-build-fresh", Duration::from_millis(100)).is_none());
+    assert!(test_waiter.read_until("p12-test-wait", Duration::from_millis(100)).is_none());
+
+    build_waiter.request(
+        r#"{"id":"p12-release-build-wait","type":"release_agent","child_id":"ch_bw"}"#,
+        "p12-release-build-wait",
+    );
+    let fresh_grant = build_fresh.read_until("p12-build-fresh", Duration::from_secs(3)).unwrap();
+    assert!(compact(&fresh_grant).contains("\"granted\":true"), "{fresh_grant}");
+    test_holder.request(
+        r#"{"id":"p12-release-test","type":"release_agent","child_id":"ch_th"}"#,
+        "p12-release-test",
+    );
+    for id in ["p12-test-wait", "p12-test-alias"] {
+        let grant = test_waiter.read_until(id, Duration::from_secs(3)).unwrap();
+        assert!(compact(&grant).contains("\"granted\":true"), "{grant}");
+    }
+}
+
+#[test]
+fn p13_pending_queue_enforces_per_session_cap_and_child_deduplication() {
+    let home = test_home("p13-pending-session-cap");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1000,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    let mut waiter = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p13-holder", 5);
+    hello_ext_protocol(&mut waiter, "session-p13-waiter", 5);
+    holder.request(
+        r#"{"id":"p13-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p13-hold",
+    );
+    for n in 0..64 {
+        waiter.send(&format!(
+            r#"{{"id":"p13-q{n:02}","type":"acquire_agent","child_id":"ch_{n:02}","work_kind":"test"}}"#
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let overflow = waiter.request(
+        r#"{"id":"p13-overflow","type":"acquire_agent","child_id":"ch_overflow","work_kind":"test"}"#,
+        "p13-overflow",
+    );
+    assert!(compact(&overflow).contains("\"rejection\":\"capacity_queue_full\""), "{overflow}");
+
+    // A distinct request id for an already queued child aliases the same
+    // bounded waiter and receives its grant under both ids.
+    waiter.send(
+        r#"{"id":"p13-alias","type":"acquire_agent","child_id":"ch_00","work_kind":"test"}"#,
+    );
+    assert!(waiter.read_until("p13-alias", Duration::from_millis(100)).is_none());
+    let mut alias_ids = vec!["p13-q00".to_string(), "p13-alias".to_string()];
+    for n in 1..7 {
+        let id = format!("p13-alias-{n}");
+        waiter.send(&format!(
+            r#"{{"id":"{id}","type":"acquire_agent","child_id":"ch_00","work_kind":"test"}}"#
+        ));
+        alias_ids.push(id);
+    }
+    let alias_overflow = waiter.request(
+        r#"{"id":"p13-alias-overflow","type":"acquire_agent","child_id":"ch_00","work_kind":"test"}"#,
+        "p13-alias-overflow",
+    );
+    assert!(
+        compact(&alias_overflow).contains("\"rejection\":\"capacity_queue_full\""),
+        "{alias_overflow}"
+    );
+    holder.request(
+        r#"{"id":"p13-release","type":"release_agent","child_id":"ch_hold"}"#,
+        "p13-release",
+    );
+    for id in alias_ids {
+        let grant = waiter.read_until(&id, Duration::from_secs(3)).unwrap_or_else(|| {
+            panic!("missing grant for {id}; received frames: {:?}", waiter.history)
+        });
+        assert!(compact(&grant).contains("\"granted\":true"), "{grant}");
+    }
+}
+
+#[test]
+fn p14_pending_queue_enforces_daemon_global_cap() {
+    let home = test_home("p14-pending-global-cap");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1000,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p14-holder", 5);
+    holder.request(
+        r#"{"id":"p14-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p14-hold",
+    );
+    let mut sessions = Vec::new();
+    for session in 0..5 {
+        let mut conn = connect(&home, CONNECT_TIMEOUT);
+        hello_ext_protocol(&mut conn, &format!("session-p14-{session}"), 5);
+        sessions.push(conn);
+    }
+    for (session, conn) in sessions.iter_mut().take(4).enumerate() {
+        for n in 0..64 {
+            conn.send(&format!(
+                r#"{{"id":"p14-{session}-{n:02}","type":"acquire_agent","child_id":"ch_{session}_{n:02}","work_kind":"test"}}"#
+            ));
+        }
+        // This connection processes acquires in wire order; its response is
+        // a barrier proving all 64 children have reached the daemon queue.
+        conn.request(
+            &format!(r#"{{"id":"p14-barrier-{session}","type":"status"}}"#),
+            &format!("p14-barrier-{session}"),
+        );
+    }
+    let overflow = sessions[4].request(
+        r#"{"id":"p14-overflow","type":"acquire_agent","child_id":"ch_overflow","work_kind":"test"}"#,
+        "p14-overflow",
+    );
+    assert!(compact(&overflow).contains("\"rejection\":\"capacity_queue_full\""), "{overflow}");
+}
+
+#[test]
+fn p15_cancel_only_releases_its_owned_permit_and_same_id_retry_is_new() {
+    let home = test_home("p15-cancel-permit-owner");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut conn = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut conn, "session-p15", 5);
+    let first = conn.request(
+        r#"{"id":"p15-old","type":"acquire_agent","child_id":"ch_shared","work_kind":"test"}"#,
+        "p15-old",
+    );
+    assert!(compact(&first).contains("\"granted\":true"), "{first}");
+    conn.request(
+        r#"{"id":"p15-cancel-old","type":"cancel_acquire_agent","request_id":"p15-old","child_id":"ch_shared"}"#,
+        "p15-cancel-old",
+    );
+    let second = conn.request(
+        r#"{"id":"p15-new","type":"acquire_agent","child_id":"ch_shared","work_kind":"test"}"#,
+        "p15-new",
+    );
+    assert!(compact(&second).contains("\"granted\":true"), "{second}");
+    conn.request(
+        r#"{"id":"p15-stale-cancel","type":"cancel_acquire_agent","request_id":"p15-old","child_id":"ch_shared"}"#,
+        "p15-stale-cancel",
+    );
+    let status = conn.request(r#"{"id":"p15-status","type":"status"}"#, "p15-status");
+    assert!(compact(&status).contains("\"test\":{\"used\":1,\"total\":1}"), "stale cancel dropped the new permit: {status}");
+
+    conn.send(
+        r#"{"id":"p15-race-cancel","type":"cancel_acquire_agent","request_id":"p15-race","child_id":"ch_race"}"#,
+    );
+    conn.read_until("p15-race-cancel", Duration::from_secs(3)).unwrap();
+    conn.send(
+        r#"{"id":"p15-race","type":"acquire_agent","child_id":"ch_race","work_kind":"build"}"#,
+    );
+    assert!(conn.read_until("p15-race", Duration::from_millis(100)).is_none());
+    conn.send(
+        r#"{"id":"p15-race","type":"acquire_agent","child_id":"ch_race","work_kind":"build"}"#,
+    );
+    let retry = conn.read_until("p15-race", Duration::from_secs(3)).unwrap();
+    assert!(compact(&retry).contains("\"granted\":true"), "retry after consumed cancel tombstone: {retry}");
 }
 
 #[test]

@@ -167,6 +167,7 @@ interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (err: Error) => void;
   timer?: ClockTimer;
+  retryTimer?: ClockTimer;
   message: Record<string, unknown>;
   timeoutMs: number;
   retryable: boolean;
@@ -800,6 +801,7 @@ export class ManagerClient {
     if (!entry) return;
     this.pending.delete(id);
     if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+    if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
     entry.removeAbortListener?.();
     if (msg.ok === true) {
       if (entry.message.type === "hello") {
@@ -837,6 +839,7 @@ export class ManagerClient {
         if (entry.requestId) this.pending.delete(entry.requestId);
         this.queuedRequests.delete(entry);
         if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+        if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
         entry.removeAbortListener?.();
       };
       const cancelRemoteAcquire = () => {
@@ -857,6 +860,14 @@ export class ManagerClient {
           removeEntry();
           reject(new Error(`pi-famulus request timed out: ${type}`));
         }, effectiveTimeoutMs);
+      }
+      if (waitForAdmission && type === "acquire_agent") {
+        entry.retryTimer = this.clock.setInterval(() => {
+          const id = entry.requestId;
+          const socket = this.socket;
+          if (!id || this.pending.get(id) !== entry || !socket || this.state !== "connected") return;
+          socket.write(encodeFrame({ v: 1, id, ...entry.message }));
+        }, 3000);
       }
       if (signal) {
         const onAbort = () => {
@@ -879,7 +890,7 @@ export class ManagerClient {
   private sendPending(entry: PendingRequest): void {
     const socket = this.socket;
     if (!socket || this.state !== "connected") return;
-    const id = randomUUID();
+    const id = entry.requestId ?? randomUUID();
     entry.requestId = id;
     this.pending.set(id, entry);
     socket.write(encodeFrame({ v: 1, id, ...entry.message }));
@@ -899,6 +910,7 @@ export class ManagerClient {
       if (entry.retryable && !this.intentionalClose && !this.rebound) continue;
       this.pending.delete(id);
       if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+      if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
       entry.removeAbortListener?.();
       entry.reject(new Error("pi-famulus connection lost"));
     }
@@ -956,6 +968,7 @@ export class ManagerClient {
     const entries = new Set([...this.pending.values(), ...this.queuedRequests]);
     for (const entry of entries) {
       if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+      if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
       entry.removeAbortListener?.();
       entry.reject(err);
     }
