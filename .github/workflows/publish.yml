@@ -91,11 +91,12 @@ jobs:
     # allows only the main branch, so editing a non-main workflow cannot bypass it.
     environment: npm
     permissions:
-      contents: read
+      contents: write
       id-token: write
     env:
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
       RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_SHA: ${{ needs.validate.outputs.sha }}
       DRY_RUN: ${{ needs.validate.outputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
@@ -138,3 +139,27 @@ jobs:
           mode=--dry-run
           if [[ "$DRY_RUN" == false ]]; then mode=--publish; fi
           node scripts/publish-packages.mjs "$RUNNER_TEMP/packages" "$RELEASE_TAG" "$mode"
+      - name: Create GitHub tag and release
+        if: env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Resolve through the commits API so annotated tags peel to their
+          # commit sha; git/ref/tags returns the tag-object sha for them.
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha' 2>/dev/null || true)
+          if [[ -n "$tag_sha" ]]; then
+            if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "Tag $RELEASE_TAG already exists at $tag_sha, expected $RELEASE_SHA" >&2
+              exit 1
+            fi
+            echo "Tag $RELEASE_TAG already points to $RELEASE_SHA"
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "GitHub Release $RELEASE_TAG already exists"
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi
