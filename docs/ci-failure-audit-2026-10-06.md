@@ -64,6 +64,7 @@ the historical runner's cause.
 
 #40 merged `8605304` into `a79fd8d`; publish run
 [37461690429](https://github.com/Leechael/pi-famulus/actions/runs/37461690429)
-succeeded on that merge. The later UTF-8 commit `9b79647` and TS fixes were not
-part of that successful publication. A green run is evidence of that run,
-not proof that every intermittent failure has disappeared.
+succeeded on that merge. The later UTF-8 fix (`c9b3c9e` in this PR, originally
+`9b79647` before rebasing) and TS fixes were not part of that successful
+publication. A green run is evidence of that run, not proof that every
+intermittent failure has disappeared.

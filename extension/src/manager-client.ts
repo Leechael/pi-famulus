@@ -13,6 +13,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
+import { StringDecoder } from "node:string_decoder";
 import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
@@ -564,26 +565,35 @@ export class ManagerClient {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
     });
+    const streams = [child.stdout, child.stderr];
+    // Each pipe owns its partial UTF-8 bytes; interleaved streams cannot share carry.
+    const decoders = streams.map(() => new StringDecoder("utf8"));
     const attempt: SpawnAttempt = {
       contended: false,
       output: "",
       dispose: () => {
         // Keep draining detached daemon pipes without keeping pi alive.
         // Closing a live child's reader would turn a later write into SIGPIPE.
-        for (const stream of [child.stdout, child.stderr]) {
-          stream?.off("data", capture);
+        streams.forEach((stream, index) => {
+          stream?.off("data", captures[index]);
           stream?.resume();
           (stream as net.Socket | null)?.unref?.();
-        }
+        });
       },
     };
-    const capture = (data: Buffer) => { attempt.output = (attempt.output + data.toString()).slice(-2048); };
-    child.stdout?.on("data", capture);
-    child.stderr?.on("data", capture);
+    const append = (text: string) => {
+      const tail = (attempt.output + text).slice(-2048);
+      // A UTF-16 bound must not retain just the low half of a surrogate pair.
+      const first = tail.charCodeAt(0);
+      attempt.output = first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
+    };
+    const captures = decoders.map((decoder) => (data: Buffer) => append(decoder.write(data)));
+    streams.forEach((stream, index) => stream?.on("data", captures[index]));
     child.unref();
     child.on("error", (err) => { attempt.failure = new Error(`manager spawn failed: ${err.message}`); });
     // 'close' follows stdio EOF; 'exit' alone may precede the contention line.
     child.on("close", (code, signal) => {
+      for (const decoder of decoders) append(decoder.end());
       attempt.contended = code === 0 && attempt.output.includes("pi-famulus already running");
       attempt.failure = new Error(`manager exited before socket ready (code=${code}, signal=${signal}): ${attempt.output.trim()}`);
     });

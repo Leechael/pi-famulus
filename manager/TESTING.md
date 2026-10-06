@@ -67,8 +67,14 @@ cargo mutants -j 3 --timeout 150 -f src/lifecycle.rs -f src/task.rs -f src/regis
   -f src/daemon.rs -f src/sys.rs -f src/proto.rs          # mutation score (manual clock via .cargo/mutants.toml)
 ```
 
-Measured on an M-series Mac with a warm build (129 passing tests with the
-feature, 127 without; the difference is the two `clock` unit tests):
+Full-suite verification on macOS ARM64 at `b48cb28` (2026-10-06):
+218 passing tests with `test-clock`, 211 without, and two pre-existing
+ignored helpers in each mode.
+
+The following warm-build timings are historical, pre-follow-up measurements
+on an M-series Mac (129 passing tests with the feature, 127 without; at that
+snapshot the difference was the two `clock` unit tests). They are not current
+coverage totals:
 
 | | `cargo test` wall | per-test time, summed serially | `cargo mutants -f src/lifecycle.rs` (42 mutants, -j 3) |
 |---|---|---|---|

@@ -119,7 +119,8 @@ describe("startup contract", () => {
     spawn.mockImplementation(() => {
       const child = processBoundary();
       queueMicrotask(() => {
-        child.stderr.write("cannot write pid file: Permission denied\n");
+        child.stderr.write("discard-this-prefix:" + "x".repeat(8192));
+        child.stderr.write("cannot write pid file: Permission denied");
         child.emit("exit", 1, null);
         child.emit("close", 1, null);
       });
@@ -127,11 +128,60 @@ describe("startup contract", () => {
     });
     expect(await settle(client.connect())).toBe(false);
     expect(client.lastError()).toContain("code=1");
-    expect(client.lastError()).toContain("Permission denied");
+    const diagnostic = client.lastError();
+    const tail = diagnostic.split("signal=null): ")[1].split("; home=")[0];
+    expect(tail).toBe("x".repeat(2008) + "cannot write pid file: Permission denied");
+    expect(tail).toHaveLength(2048);
+    expect(diagnostic).not.toContain("discard-this-prefix:");
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(existsSync(join(home, "manager.spawn.lock"))).toBe(false);
     expect(existsSync(join(home, "manager.pid"))).toBe(false);
     expect(messages).toEqual([]);
+  });
+
+  it("regression: startup diagnostics preserve UTF-8 split independently across stdout and stderr", async () => {
+    spawn.mockImplementation(() => {
+      const child = processBoundary();
+      queueMicrotask(() => {
+        child.stdout.write(Buffer.from([0xe4]));
+        child.stderr.write(Buffer.from([0xf0, 0x9f]));
+        child.stdout.write(Buffer.from([0xb8, 0xad]));
+        child.stderr.write(Buffer.from([0x98, 0x80]));
+        child.emit("close", 1, null);
+      });
+      return child;
+    });
+    expect(await settle(client.connect())).toBe(false);
+    expect(client.lastError()).toContain("中😀");
+    expect(client.lastError()).not.toContain("\ufffd");
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("regression: the diagnostic tail does not retain half an astral character at its bound", async () => {
+    spawn.mockImplementation(() => {
+      const child = processBoundary();
+      queueMicrotask(() => {
+        child.stderr.write("😀" + "x".repeat(2047));
+        child.emit("close", 1, null);
+      });
+      return child;
+    });
+    expect(await settle(client.connect())).toBe(false);
+    const tail = client.lastError().split("signal=null): ")[1].split("; home=")[0];
+    expect(tail).toBe("x".repeat(2047));
+  });
+
+  it("regression: stdio EOF flushes a genuinely incomplete UTF-8 character", async () => {
+    spawn.mockImplementation(() => {
+      const child = processBoundary();
+      queueMicrotask(() => {
+        child.stderr.write(Buffer.from([0xe4, 0xb8, 0xad, 0xe4]));
+        child.emit("close", 1, null);
+      });
+      return child;
+    });
+    expect(await settle(client.connect())).toBe(false);
+    expect(client.lastError()).toContain("signal=null): 中\ufffd; home=");
   });
 
   it("invariant: late socket readiness and silent hello share one startup deadline", async () => {
@@ -164,8 +214,8 @@ describe("startup contract", () => {
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server!.close(() => resolve()));
     server = undefined;
-    // Let the real disconnect start reconnect before issuing the public request.
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // Observe the actual disconnect; yielding for 5ms is not a readiness signal.
+    await vi.waitFor(() => expect(client.isAvailable()).toBe(false), { timeout: 2000, interval: 1 });
     const began = clock.now();
     let finishedAt = 0;
     const result = client.list().then(
@@ -283,8 +333,7 @@ describe("startup contract", () => {
   it("regression: closing during socket readiness cannot reopen the client when the daemon becomes ready", async () => {
     spawn.mockImplementation(() => processBoundary());
     const connecting = client.connect();
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(spawn).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(1), { timeout: 2000, interval: 1 });
     await client.close();
     // Fixture cleanup can finish while the detached daemon is still starting.
     await listen();
