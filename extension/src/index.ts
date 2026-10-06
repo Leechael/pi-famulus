@@ -693,6 +693,7 @@ export default function (pi: ExtensionAPI): void {
           name: c.name,
           agent: c.agent,
           workKind: c.workKind ?? "other",
+          ...(c.queueMs !== undefined ? { queueMs: c.queueMs } : {}),
           ...(c.model !== undefined ? { model: c.model } : {}),
           cwd: startCtx.cwd,
           ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
