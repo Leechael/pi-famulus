@@ -123,6 +123,27 @@ describe("machine agent admission", () => {
     expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-reregister", "test", controller?.signal);
   });
 
+  it("re-registers different kinds independently when one child remains queued", async () => {
+    const s = setup();
+    const leases = new Map([["ch-test", "test"], ["ch-build", "build"]]);
+    const pending = new Map<string, AbortController>();
+    vi.mocked(s.manager.acquireAgent).mockImplementation((childId, _kind, signal) => {
+      if (childId === "ch-build") return Promise.resolve({ granted: true });
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("subagent admission cancelled")), { once: true });
+      });
+    });
+    const registering = reregisterAgentLeases(s.manager, leases, async () => {}, pending);
+    await Promise.resolve();
+    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-test", "test", expect.any(AbortSignal));
+    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-build", "build", expect.any(AbortSignal));
+    expect(pending.has("ch-test")).toBe(true);
+    expect(pending.has("ch-build")).toBe(false);
+    leases.delete("ch-test");
+    pending.get("ch-test")?.abort();
+    await expect(registering).resolves.toBeUndefined();
+  });
+
   it("cancels a queued machine acquire and returns its local reservation", async () => {
     const s = setup();
     const controller = new AbortController();
