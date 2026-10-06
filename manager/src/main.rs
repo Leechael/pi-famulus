@@ -75,7 +75,16 @@ async fn async_main() {
             cli::ConfigAction::Set { key, value } => {
                 if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
                 else { match value.parse::<usize>() {
-                    Ok(n) => match capacity::set_max_agents(&home, n) { Ok(()) => 0, Err(e) => { eprintln!("pi-famulus: {e}"); 1 } },
+                    Ok(n) => {
+                        let old = capacity::max_agents(&home);
+                        match capacity::set_max_agents(&home, n) {
+                            Ok(()) => {
+                                events::emit(&home, None, "capacity.changed", None, serde_json::json!({"budget":"max-agents", "previous":old, "total":n}));
+                                0
+                            }
+                            Err(e) => { eprintln!("pi-famulus: {e}"); 1 }
+                        }
+                    },
                     Err(_) => { eprintln!("max-agents must be a positive integer"); 1 }
                 }}
             }

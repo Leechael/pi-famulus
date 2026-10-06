@@ -309,6 +309,10 @@ pub enum RequestKind {
     },
     ShutdownSession,
     Status,
+    /// Request an idempotent machine-wide agent permit.
+    AcquireAgent { child_id: String },
+    /// Return the child-owned agent permit.
+    ReleaseAgent { child_id: String },
     Shutdown,
     /// CLI only: replace this daemon in place with the binary now at its
     /// executable path (exec, same pid; see `handover.rs`). Answered before
@@ -434,6 +438,14 @@ pub struct SessionInfo {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentCapacity { pub used: usize, pub total: usize }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAdmissionOk {
+    pub granted: bool,
+    /// Extensible reason code, e.g. `global_capacity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCounts {
