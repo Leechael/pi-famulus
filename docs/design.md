@@ -71,15 +71,25 @@ Conventional paths (Unix; Windows uses named pipe `\\.\pipe\pi-famulus`). **The 
 Startup flow (client side, whether extension or CLI):
 
 1. Connect to the socket; success → `hello` handshake, use it if the version is compatible
-2. Failure → attempt to acquire `manager.spawn.lock` (fd-lock, nonblocking trylock)
-3. Acquired → spawn `pi-famulus daemon` (detached) → poll until the socket is ready (2s timeout) → release the lock
+2. Transport failure → coordinate spawning through `manager.spawn.lock`. The Rust CLI first waits if the daemon lifetime lock is held, even when socket/pid files are already gone; it may instead reach a healthy successor without spawning
+3. Acquired → spawn `pi-famulus daemon` (detached) → poll until the socket is ready → release the spawn lock. Rust uses a 2s socket-readiness attempt inside its 15s startup budget; TS uses the remaining startup budget and tracks the actual child outcome
 4. Not acquired → someone else is spawning; poll until the socket is ready
 5. Socket exists but cannot be connected to (zombie socket) → same as 2–4: spawn a daemon and let it clean up. **Clients never delete socket/pid files** (otherwise they could delete the socket of a daemon another client just spawned)
 6. `hello` rejected because the manager is gracefully shutting down (§3.2) → wait for it to exit, then follow 2–4. Exact protocol (implemented by Rust CLI `client::connect`, tests `d8`/`d8b`/`d8c`/`d8d`/`d8e`/`d8f`):
    - Recognition: the `hello` response is `{"ok":false,"error":{"code":"E_INTERNAL","message":"manager is shutting down"}}` (`id` is the hello's id), then the manager closes that connection. Match exactly on `code == "E_INTERNAL"` and `message == "manager is shutting down"`; other `E_INTERNAL` errors do not qualify. This response returns immediately (the manager still accepts during shutdown), without waiting for the hello timeout
-   - Waiting: while `manager.lock` is held, retry `connect + hello` every 50ms without spawning. A successful hello ends the wait and that connection is used: another waiting client may have started a healthy successor during a brief unlocked interval. Exact shutdown refusals and transport errors continue the wait; other protocol errors are returned. The lifetime lock, not pid liveness or a fixed delay, determines when a successor can be spawned: shutdown's process scans and final cleanup can exceed the nominal 2s kill grace under load, and a dead process may remain a zombie. Delete no files
+   - Waiting: while `manager.lock` is held, retry `connect + hello` after a 50ms delay, with each probe capped at 2s, without spawning. A successful hello ends the wait and that connection is used: another waiting client may have started a healthy successor during a brief unlocked interval. Exact shutdown refusals and transport errors continue the wait; other protocol errors are returned. The lifetime lock, not pid liveness or a fixed delay, determines when a successor can be spawned: shutdown's process scans and final cleanup can exceed the nominal 2s kill grace under load, and a dead process may remain a zombie. Delete no files
    - Afterwards: when the lock is free, try connecting first; if nobody has started the successor, follow 2–4 (acquire spawn lock → spawn → wait 2s for socket), then reconnect + `hello`. A shutdown refusal on this second hello follows the same wait-and-spawn flow (a socket readiness probe may have reached the retiring daemon). Other failures after the one spawn attempt are returned normally
    - Bound: the entire connect/hello/wait/spawn flow has a 15s real-time deadline. If a daemon never releases its lock, report a startup timeout without spawning a competing daemon
+
+The TS client uses one 10s cold-start budget. A live child is not respawned
+just because the former 2s readiness interval elapsed. Only a child that exits
+zero with the daemon's explicit `pi-famulus already running` message qualifies
+for contention retries, with 100ms–1s backoff. After an exact shutdown refusal,
+it re-probes hello with a 2s cap rather than waiting on pid liveness; a healthy
+probe's actual connection is retained. Other protocol errors are fatal and
+never authorize socket/pid cleanup. Reconnect attempts share the outer 27s
+reconnect deadline, including readiness and hello. Closing the client cancels
+startup rather than permitting a later readiness event to reopen it.
 
 Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock on `manager.lock`, held from startup to exit (released by the OS on a crash; the fd is CLOEXEC and not inherited by tasks). At startup the daemon tries the lock: failure → another daemon exists, print "already running" and exit 0; success → socket/pid files must be stale, remove them, bind, and write the pid. Do not use pid liveness as identity (an unrelated process can reuse a pid). `doctor` follows the same rule: clean stale files only after acquiring the lock.
 

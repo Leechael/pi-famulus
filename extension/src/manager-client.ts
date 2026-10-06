@@ -1,7 +1,8 @@
 /**
  * pi-famulus unix socket client (design doc §4.1, protocol §3.3).
  *
- * - Implements the §3.1 startup flow: connect -> spawn via lock -> zombie cleanup.
+ * - Implements §3.1 startup: connect -> spawn via lock; only the daemon's
+ *   lifetime-lock holder cleans up stale socket/pid files.
  * - Request/response multiplexing over a single long-lived connection.
  * - Server events dispatched to registered handlers.
  * - On unexpected disconnect: immediate then exponential-backoff reconnect for 22s,
@@ -12,6 +13,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
+import { StringDecoder } from "node:string_decoder";
 import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
@@ -22,11 +24,13 @@ const PROTOCOL = 3;
 const HELLO_TIMEOUT_MS = 5000;
 const RECONNECT_HELLO_TIMEOUT_MS = 25_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
-const SOCKET_READY_TIMEOUT_MS = 2000;
+// One bounded startup budget: keep waiting for a live child, but only
+// respawn when it explicitly reports losing the daemon's lifetime lock.
+const STARTUP_WINDOW_MS = 10_000;
 const SOCKET_READY_POLL_MS = 50;
 const RECONNECT_WINDOW_MS = 27_000;
 const RETRY_COOLDOWN_MS = 30000;
-const MANAGER_SHUTDOWN_WAIT_MS = 5000;
+const SHUTDOWN_PROBE_TIMEOUT_MS = 2000;
 const MANAGER_SHUTTING_DOWN = "manager is shutting down";
 
 // ---------------------------------------------------------------------------
@@ -151,6 +155,13 @@ export interface SessionInfo {
 type ClientState = "disconnected" | "connected" | "unavailable";
 
 type EventHandler = (event: ManagerEvent) => void;
+
+interface SpawnAttempt {
+  failure?: Error;
+  contended: boolean;
+  output: string;
+  dispose(): void;
+}
 
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
@@ -338,14 +349,16 @@ export class ManagerClient {
     let run!: Promise<boolean>;
     run = (async (): Promise<boolean> => {
       try {
-        await this.connectFlow(true);
+        await this.connectFlow();
+        this.checkStartupOpen();
         this.state = "connected";
+        this.lastFailureMessage = "";
         return true;
       } catch (err) {
-        this.log(`connect failed: ${(err as Error).message}`);
-        this.state = "unavailable";
+        this.state = this.intentionalClose ? "disconnected" : "unavailable";
         this.lastFailureAt = this.now();
-        this.lastFailureMessage = (err as Error).message;
+        this.lastFailureMessage = this.startupFailureDetails((err as Error).message);
+        this.log(`connect failed: ${this.lastFailureMessage}`);
         return false;
       } finally {
         if (this.connecting === run) this.connecting = null;
@@ -446,85 +459,85 @@ export class ManagerClient {
   // Startup flow (§3.1)
   // -------------------------------------------------------------------------
 
-  private async connectFlow(allowZombieRetry: boolean, helloTimeoutMs = HELLO_TIMEOUT_MS): Promise<void> {
-    const paths = famulusPaths(this.home);
-    try {
-      await this.connectAndHello(paths.socket, helloTimeoutMs);
-      return;
-    } catch (err) {
-      if (err instanceof HelloError) {
-        if (err.message.includes(MANAGER_SHUTTING_DOWN)) {
-          // A shutdown manager refuses hello while it completes its bounded
-          // kill grace. Wait for its pid to exit before retrying/spawning.
-          await this.waitForManagerExit(paths.pidFile);
-          if (allowZombieRetry) {
-            await this.connectFlow(false, helloTimeoutMs);
-            return;
-          }
-          throw err;
-        }
-        // Socket exists but hello failed: possible zombie socket (§3.1 step 5).
-        this.handleZombie(paths.socket, paths.pidFile);
-        if (allowZombieRetry) {
-          await this.connectFlow(false, helloTimeoutMs);
-          return;
-        }
-        throw err;
-      }
-      // Connect failed: nobody listening. Try to spawn the manager.
-    }
+  private checkStartupOpen(): void {
+    if (this.intentionalClose) throw new Error("manager client closed");
+  }
 
+  private async connectFlow(helloTimeoutMs = HELLO_TIMEOUT_MS, outerDeadline = Infinity): Promise<void> {
+    const paths = famulusPaths(this.home);
+    const deadline = Math.min(outerDeadline, this.now() + Math.max(STARTUP_WINDOW_MS, helloTimeoutMs));
+    let shutdownObserved = false;
+    let retryDelayMs = 100;
+    let lastReason = "";
+    for (;;) {
+      this.checkStartupOpen();
+      if (this.now() >= deadline) throw new Error(`pi-famulus startup deadline exhausted: ${lastReason}`);
+      const probeMs = shutdownObserved ? SHUTDOWN_PROBE_TIMEOUT_MS : helloTimeoutMs;
+      try {
+        await this.connectAndHello(paths.socket, Math.min(probeMs, deadline - this.now()));
+        return;
+      } catch (err) {
+        lastReason = (err as Error).message;
+        if (!(err instanceof HelloError)) {
+          // Nobody listening: the daemon's lifetime lock safely arbitrates
+          // any spawn, including a retiring owner whose files are gone.
+          await this.ensureSocketReady(paths.socket, paths.spawnLock, deadline);
+          continue;
+        }
+        if (err.message === `E_INTERNAL: ${MANAGER_SHUTTING_DOWN}`) shutdownObserved = true;
+        else if (!shutdownObserved || !err.transportFailure) throw err;
+        // Only a known shutdown permits retrying a stalled/lost handshake.
+        // Re-probe instead of trusting pid liveness: that pid may be stale,
+        // and another client may already have started a healthy successor.
+      }
+      await delay(this.clock, Math.min(retryDelayMs, Math.max(0, deadline - this.now())));
+      retryDelayMs = Math.min(retryDelayMs * 2, 1000);
+    }
+  }
+
+  private async ensureSocketReady(socketPath: string, spawnLock: string, deadline: number): Promise<void> {
     // The home directory may not exist yet on a fresh machine.
     mkdirSync(this.home, { recursive: true });
-    const acquired = this.tryAcquireSpawnLock(paths.spawnLock);
-    if (acquired) {
+    let contentionDelayMs = 100;
+    let lastContention = "";
+    for (;;) {
+      this.checkStartupOpen();
+      if (this.now() >= deadline) throw new Error(`pi-famulus startup deadline exhausted${lastContention ? ` after contention: ${lastContention}` : ""}`);
+      const acquired = this.tryAcquireSpawnLock(spawnLock);
+      let attempt: SpawnAttempt | undefined;
       try {
-        this.spawnManager();
-        await this.waitForSocket(paths.socket, SOCKET_READY_TIMEOUT_MS);
+        if (acquired) attempt = this.spawnManager();
+        await this.waitForSocket(socketPath, deadline - this.now(), attempt);
+        break;
+      } catch (err) {
+        // A daemon that lost manager.lock exits successfully, but did NOT
+        // start our successor. Retry only this explicit contention state.
+        if (!attempt?.contended || this.now() >= deadline) throw err;
+        lastContention = attempt.failure?.message ?? "daemon lifetime lock held";
+        this.log(`startup contention: ${lastContention}; retrying after ${contentionDelayMs}ms`);
       } finally {
-        this.releaseSpawnLock(paths.spawnLock);
+        attempt?.dispose();
+        if (acquired) this.releaseSpawnLock(spawnLock);
       }
-    } else {
-      // Someone else is spawning; just wait for the socket to appear.
-      await this.waitForSocket(paths.socket, SOCKET_READY_TIMEOUT_MS);
-    }
-    await this.connectAndHello(paths.socket, helloTimeoutMs);
-  }
-
-  private async waitForManagerExit(pidFile: string): Promise<void> {
-    let pid: number;
-    try {
-      const info = JSON.parse(readFileSync(pidFile, "utf8")) as { pid?: number };
-      if (typeof info.pid !== "number") return;
-      pid = info.pid;
-    } catch {
-      return;
-    }
-    const deadline = this.now() + MANAGER_SHUTDOWN_WAIT_MS;
-    while (pidAlive(pid) && this.now() < deadline) {
-      await this.clock.sleep(SOCKET_READY_POLL_MS);
+      await delay(this.clock, Math.min(contentionDelayMs, deadline - this.now()));
+      contentionDelayMs = Math.min(contentionDelayMs * 2, 1000);
     }
   }
 
-  private handleZombie(socketPath: string, pidFile: string): void {
-    let pid: number | null = null;
+  private startupFailureDetails(reason: string): string {
+    const paths = famulusPaths(this.home);
+    let managerPid = "missing/unreadable";
+    let spawnHolder = "missing/unreadable";
+    const describePid = (pid: number) => `${pid} (${pidAlive(pid) ? "alive" : "dead"})`;
     try {
-      const info = JSON.parse(readFileSync(pidFile, "utf8")) as { pid?: number };
-      if (typeof info.pid === "number") pid = info.pid;
-    } catch {
-      // no readable pid file
-    }
-    if (pid !== null && pidAlive(pid)) {
-      // Manager is alive but rejected hello; nothing to clean up.
-      return;
-    }
-    for (const file of [socketPath, pidFile]) {
-      try {
-        unlinkSync(file);
-      } catch {
-        // already gone
-      }
-    }
+      const info = JSON.parse(readFileSync(paths.pidFile, "utf8")) as { pid?: number };
+      if (typeof info.pid === "number") managerPid = describePid(info.pid);
+    } catch { /* diagnostic only */ }
+    try {
+      const raw = readFileSync(paths.spawnLock, "utf8").trim();
+      spawnHolder = /^\d+$/.test(raw) ? describePid(Number(raw)) : "empty/non-pid";
+    } catch { /* diagnostic only */ }
+    return `${reason}; home=${this.home}; binary=${this.managerPath ?? "missing"}; socket=${existsSync(paths.socket) ? "present" : "missing"}; manager.pid=${managerPid}; spawn.lock=${spawnHolder}`;
   }
 
   /**
@@ -541,7 +554,7 @@ export class ManagerClient {
     releaseSpawnLockFile(lockPath);
   }
 
-  private spawnManager(): void {
+  private spawnManager(): SpawnAttempt {
     if (!this.managerPath) {
       throw new Error("pi-famulus binary not found (set managerPath in config.json or PI_FAMULUS_MANAGER_PATH)");
     }
@@ -549,31 +562,58 @@ export class ManagerClient {
     // this.home came from an explicit override rather than the environment.
     const child = spawn(this.managerPath, ["--home", this.home, "daemon"], {
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
     });
+    const streams = [child.stdout, child.stderr];
+    // Each pipe owns its partial UTF-8 bytes; interleaved streams cannot share carry.
+    const decoders = streams.map(() => new StringDecoder("utf8"));
+    const attempt: SpawnAttempt = {
+      contended: false,
+      output: "",
+      dispose: () => {
+        // Keep draining detached daemon pipes without keeping pi alive.
+        // Closing a live child's reader would turn a later write into SIGPIPE.
+        streams.forEach((stream, index) => {
+          stream?.off("data", captures[index]);
+          stream?.resume();
+          (stream as net.Socket | null)?.unref?.();
+        });
+      },
+    };
+    const append = (text: string) => {
+      const tail = (attempt.output + text).slice(-2048);
+      // A UTF-16 bound must not retain just the low half of a surrogate pair.
+      const first = tail.charCodeAt(0);
+      attempt.output = first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
+    };
+    const captures = decoders.map((decoder) => (data: Buffer) => append(decoder.write(data)));
+    streams.forEach((stream, index) => stream?.on("data", captures[index]));
     child.unref();
-    child.on("error", () => {}); // surfaced via waitForSocket timeout
+    child.on("error", (err) => { attempt.failure = new Error(`manager spawn failed: ${err.message}`); });
+    // 'close' follows stdio EOF; 'exit' alone may precede the contention line.
+    child.on("close", (code, signal) => {
+      for (const decoder of decoders) append(decoder.end());
+      attempt.contended = code === 0 && attempt.output.includes("pi-famulus already running");
+      attempt.failure = new Error(`manager exited before socket ready (code=${code}, signal=${signal}): ${attempt.output.trim()}`);
+    });
+    return attempt;
   }
 
-  private async waitForSocket(socketPath: string, timeoutMs: number): Promise<void> {
+  private async waitForSocket(socketPath: string, timeoutMs: number, attempt?: SpawnAttempt): Promise<void> {
     const deadline = this.now() + timeoutMs;
     for (;;) {
+      this.checkStartupOpen();
       if (existsSync(socketPath)) {
-        const ok = await new Promise<boolean>((resolve) => {
-          const probe = net.connect(socketPath);
-          probe.once("connect", () => {
-            probe.destroy();
-            resolve(true);
-          });
-          probe.once("error", () => resolve(false));
-        });
+        const ok = await this.openSocket(socketPath, Math.min(SOCKET_READY_POLL_MS, Math.max(0, deadline - this.now())))
+          .then((probe) => { probe.destroy(); return true; }, () => false);
         if (ok) return;
       }
+      if (attempt?.failure) throw attempt.failure;
       if (this.now() >= deadline) {
-        throw new Error("timed out waiting for pi-famulus socket");
+        throw new Error(`timed out waiting for pi-famulus socket (spawn=${attempt ? "running" : "other holder"}${attempt?.output ? `, output=${attempt.output.trim()}` : ""})`);
       }
-      await delay(this.clock, SOCKET_READY_POLL_MS);
+      await delay(this.clock, Math.min(SOCKET_READY_POLL_MS, deadline - this.now()));
     }
   }
 
@@ -581,18 +621,36 @@ export class ManagerClient {
   // Connection / protocol internals
   // -------------------------------------------------------------------------
 
-  private async connectAndHello(socketPath: string, helloTimeoutMs = HELLO_TIMEOUT_MS): Promise<void> {
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
-      const s = net.connect(socketPath);
-      s.once("connect", () => resolve(s));
-      s.once("error", (err) => reject(err));
+  private openSocket(socketPath: string, timeoutMs: number): Promise<net.Socket> {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(socketPath);
+      const timer = this.clock.setTimeout(() => {
+        socket.destroy();
+        reject(new Error("timed out connecting to pi-famulus socket"));
+      }, Math.max(0, timeoutMs));
+      socket.once("connect", () => { this.clock.clearTimeout(timer); resolve(socket); });
+      socket.once("error", (err) => {
+        this.clock.clearTimeout(timer);
+        socket.destroy();
+        reject(err);
+      });
     });
+  }
+
+  private async connectAndHello(socketPath: string, helloTimeoutMs = HELLO_TIMEOUT_MS): Promise<void> {
+    const deadline = this.now() + Math.max(0, helloTimeoutMs);
+    const socket = await this.openSocket(socketPath, helloTimeoutMs);
+    if (this.intentionalClose) {
+      socket.destroy();
+      this.checkStartupOpen();
+    }
     this.attachSocket(socket);
     try {
-      await this.hello(helloTimeoutMs);
+      await this.hello(Math.max(0, deadline - this.now()));
     } catch (err) {
       this.detachSocket();
-      throw new HelloError((err as Error).message);
+      const reason = err instanceof ManagerError ? `${err.code}: ${err.message}` : (err as Error).message;
+      throw new HelloError(reason, !(err instanceof ManagerError));
     }
   }
 
@@ -670,6 +728,9 @@ export class ManagerClient {
       messages = this.decoder.push(data);
     } catch (err) {
       this.log(`protocol error: ${(err as Error).message}`);
+      // Preserve the actual handshake failure before onClose replaces it
+      // with a generic connection-lost error.
+      this.helloWaiter?.reject(new ManagerError("E_PROTOCOL", (err as Error).message));
       this.detachSocket();
       this.onClose();
       return;
@@ -796,7 +857,8 @@ export class ManagerClient {
       if (nextDelayMs > 0) await delay(this.clock, Math.min(nextDelayMs, deadline - this.now()));
       if (this.intentionalClose || this.rebound) return;
       try {
-        await this.connectFlow(true, RECONNECT_HELLO_TIMEOUT_MS);
+        await this.connectFlow(RECONNECT_HELLO_TIMEOUT_MS, deadline);
+        if (this.intentionalClose || this.rebound) return;
         this.state = "connected";
         this.resendPending();
         this.log("reconnected to pi-famulus");
@@ -831,7 +893,9 @@ export class ManagerClient {
   }
 }
 
-class HelloError extends Error {}
+class HelloError extends Error {
+  constructor(message: string, readonly transportFailure: boolean) { super(message); }
+}
 
 function errorFromResponse(msg: Record<string, unknown>): ManagerError {
   const err = msg.error as { code?: string; message?: string } | undefined;
