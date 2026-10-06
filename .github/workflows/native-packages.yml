@@ -181,7 +181,7 @@ jobs:
           # Exercise the actual packaged daemon/runner (including musl), not just --help.
           manager_home=$(mktemp -d /tmp/native-XXXXXX)
           trap './node_modules/.bin/pi-famulus --home "$manager_home" shutdown || true' EXIT
-          line=$(./node_modules/.bin/pi-famulus --home "$manager_home" start 'printf native-package-roundtrip')
+          line=$(./node_modules/.bin/pi-famulus --home "$manager_home" start 'echo native-package-roundtrip')
           id=${line#task_id=}; id=${id%% *}
           ./node_modules/.bin/pi-famulus --home "$manager_home" wait "$id" --budget-ms 10000
           ./node_modules/.bin/pi-famulus --home "$manager_home" output "$id" | grep -F native-package-roundtrip
