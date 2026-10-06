@@ -14,13 +14,19 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let mut sha = git(&["rev-parse", "--short=10", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    // Uncommitted changes are invisible in HEAD; mark a dirty build so it
-    // does not look identical to the clean build of the same commit (the
-    // very case this marker exists to disambiguate).
-    if sha != "unknown" && git(&["diff-index", "--quiet", "HEAD", "--"]).is_none() {
-        sha.push_str("-dirty");
-    }
+    println!("cargo:rerun-if-env-changed=PI_FAMULUS_GIT_SHA");
+    let sha = if let Ok(sha) = std::env::var("PI_FAMULUS_GIT_SHA") {
+        sha
+    } else {
+        let mut sha = git(&["rev-parse", "--short=10", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        // Uncommitted changes are invisible in HEAD; mark a dirty build so it
+        // does not look identical to the clean build of the same commit (the
+        // very case this marker exists to disambiguate).
+        if sha != "unknown" && git(&["diff-index", "--quiet", "HEAD", "--"]).is_none() {
+            sha.push_str("-dirty");
+        }
+        sha
+    };
     println!("cargo:rustc-env=PI_FAMULUS_GIT_SHA={sha}");
     // Rebuild when HEAD moves: HEAD itself (branch switch) and the ref it
     // names (a commit). Worktrees keep HEAD in their own git dir and refs in
