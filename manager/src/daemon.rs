@@ -1792,7 +1792,8 @@ fn handle_acquire_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<
     let mut st = state.lock().unwrap();
     let sid = st.conns.get(&conn_id).and_then(|c| c.session_id.clone()).ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
     let key = (sid, child_id.to_string());
-    let budget = crate::capacity::max_agents(&st.home);
+    let budget = crate::capacity::max_agents(&st.home)
+        .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
     Ok(admit_agent(&mut st.agent_permits, key, budget))
 }
 
@@ -1834,7 +1835,11 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
         task_counts: TaskCounts { running, terminal },
-        agent_capacity: AgentCapacity { used: st.agent_permits.len(), total: crate::capacity::max_agents(&st.home) },
+        agent_capacity: AgentCapacity {
+            used: st.agent_permits.len(),
+            total: crate::capacity::max_agents(&st.home)
+                .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?,
+        },
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),
