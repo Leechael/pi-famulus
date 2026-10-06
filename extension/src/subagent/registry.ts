@@ -40,6 +40,8 @@ export interface RunRecord {
     childId: string;
     name: string;
     agent: string;
+    workKind?: string;
+    queueMs?: number;
     model?: string;
     status: ChildStatus;
     /** User-authored prompt (after chain interpolation), without injected preamble. */
@@ -94,6 +96,8 @@ export interface ActiveChildInfo {
   runId: string;
   name: string;
   agent: string;
+  workKind?: string;
+  queueMs?: number;
   model?: string;
   status: ChildStatus;
   startedAt: number;
@@ -105,6 +109,9 @@ interface InternalChild {
   runId: string;
   name: string;
   agent: string;
+  workKind?: string;
+  queueMs?: number;
+  queueStartedAt?: number;
   /** Best-effort model id for fleet / ls (set when startChild runs). */
   model?: string;
   status: ChildStatus;
@@ -302,7 +309,7 @@ export class SubagentRegistry implements RunRegistry {
   // -------------------------------------------------------------------------
 
   /** Allocate a pending child inside a run. Returns the child id. */
-  addChild(runId: string, info: { name: string; agent: string }): string {
+  addChild(runId: string, info: { name: string; agent: string; workKind?: string }): string {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`unknown run ${runId}`);
     const child: InternalChild = {
@@ -310,8 +317,10 @@ export class SubagentRegistry implements RunRegistry {
       runId,
       name: info.name,
       agent: info.agent,
+      workKind: info.workKind ?? "other",
       status: "pending",
       startedAt: this.now(),
+      queueStartedAt: this.now(),
       turn: 1,
     };
     run.children.push(child);
@@ -329,6 +338,7 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(req.childId);
     if (!child) throw new Error(`unknown child ${req.childId} (addChild first)`);
     child.shouldStart = opts?.shouldStart;
+    child.workKind = req.workKind ?? child.workKind ?? "other";
     child.prompt = req.taskPrompt ?? req.prompt;
     child.preamble = req.agent.systemPrompt || undefined;
     child.model = req.model ?? req.agent.model;
@@ -449,6 +459,8 @@ export class SubagentRegistry implements RunRegistry {
       result: child.result,
       startedAt: child.startedAt,
       endedAt: child.endedAt,
+      queueMs: child.queueMs,
+      queueStartedAt: child.queueStartedAt,
     };
     const accepted = handle.resume(message, opts);
     // Mark the child queued before awaiting: with a free slot, admitChild's
@@ -457,6 +469,8 @@ export class SubagentRegistry implements RunRegistry {
     child.result = undefined;
     child.endedAt = undefined;
     child.startedAt = this.now();
+    child.queueMs = undefined;
+    child.queueStartedAt = child.startedAt;
     child.turn += 1;
     try {
       await accepted;
@@ -469,6 +483,8 @@ export class SubagentRegistry implements RunRegistry {
         child.result = previous.result;
         child.startedAt = previous.startedAt;
         child.endedAt = previous.endedAt;
+        child.queueMs = previous.queueMs;
+        child.queueStartedAt = previous.queueStartedAt;
       }
       throw err;
     }
@@ -556,9 +572,15 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(childId);
     if (!child) return;
     if (child.status !== "pending" && child.status !== "running") return; // already terminal
+    const settledAt = this.now();
+    if (child.status === "pending" && child.queueStartedAt !== undefined) {
+      child.queueMs = Math.max(0, settledAt - child.queueStartedAt);
+      child.queueStartedAt = undefined;
+    }
+    if (child.queueMs === undefined && result.queueMs !== undefined) child.queueMs = result.queueMs;
     child.status = result.status;
     child.result = result;
-    child.endedAt = this.now();
+    child.endedAt = settledAt;
     child.shouldStart = undefined;
     const run = this.runs.get(child.runId);
     if (run) {
@@ -571,8 +593,11 @@ export class SubagentRegistry implements RunRegistry {
     if (child.status === status) return;
     child.status = status;
     if (status === "running") {
+      const startedAt = this.now();
+      child.queueMs = Math.max(0, startedAt - (child.queueStartedAt ?? child.startedAt));
+      child.queueStartedAt = undefined;
       // (Re-)start: elapsed time and any previous generation's result reset.
-      child.startedAt = this.now();
+      child.startedAt = startedAt;
       child.result = undefined;
       child.endedAt = undefined;
     }
@@ -661,6 +686,8 @@ function snapshot(run: InternalRun): RunRecord {
       childId: c.childId,
       name: c.name,
       agent: c.agent,
+      ...(c.workKind !== undefined ? { workKind: c.workKind } : {}),
+      ...(c.queueMs !== undefined ? { queueMs: c.queueMs } : {}),
       ...(c.model !== undefined ? { model: c.model } : {}),
       status: c.status,
       ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),

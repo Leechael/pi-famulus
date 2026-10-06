@@ -137,6 +137,8 @@ pub struct DaemonState {
     /// FIFO requests waiting for a per-kind slot. Responses retain the original
     /// request id so normal client multiplexing handles the daemon-initiated wake.
     pub pending_agents: std::collections::VecDeque<PendingAgent>,
+    /// Cancellation ids observed before their concurrent acquire dispatch.
+    pub cancelled_acquires: HashSet<(String, String)>,
 }
 
 /// Bound on remembered start keys.
@@ -169,6 +171,7 @@ impl DaemonState {
             start_keys: std::collections::VecDeque::new(),
             agent_permits: HashMap::new(),
             pending_agents: std::collections::VecDeque::new(),
+            cancelled_acquires: HashSet::new(),
         }
     }
 }
@@ -849,9 +852,10 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
                 if s.conn_id == Some(conn_id) {
                     s.conn_id = None; // session now disconnected (§3.2)
                     s.last_seen = now_ms();
+                    st.pending_agents.retain(|p| p.session_id != *sid);
+                    st.cancelled_acquires.retain(|(owner, _)| owner != sid);
                     if why == "closed" {
                         st.agent_permits.retain(|(owner, _), _| owner != sid);
-                        st.pending_agents.retain(|p| p.session_id != *sid);
                     }
                     crate::events::emit(
                         &home,
@@ -866,6 +870,7 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
         for t in st.registry.tasks.values_mut() {
             t.watchers.remove(&conn_id);
         }
+        send_agent_grants(wake_pending(st));
     }
 }
 
@@ -1281,13 +1286,27 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         } => {
             handle_acquire_agent(&state, conn_id, &child_id, &work_kind, &id, &tx).await;
         }
-        RequestKind::CancelAcquireAgent { request_id } => {
-            respond(
-                &tx,
-                &id,
-                handle_cancel_acquire(&state, conn_id, &request_id),
-            )
-            .await;
+        RequestKind::CancelAcquireAgent {
+            request_id,
+            child_id,
+        } => {
+            match handle_cancel_acquire(&state, conn_id, &request_id, &child_id) {
+                Ok(wake) => {
+                    respond::<UnitOk>(&tx, &id, Ok(UnitOk {})).await;
+                    send_agent_grants(wake);
+                }
+                Err(error) => respond::<UnitOk>(&tx, &id, Err(error)).await,
+            }
+        }
+        RequestKind::CapacityChanged => {
+            let result = handle_capacity_changed(&state, conn_id);
+            match result {
+                Ok(wake) => {
+                    respond::<UnitOk>(&tx, &id, Ok(UnitOk {})).await;
+                    send_agent_grants(wake);
+                }
+                Err(error) => respond::<UnitOk>(&tx, &id, Err(error)).await,
+            }
         }
         RequestKind::ReleaseAgent { child_id } => {
             respond(&tx, &id, handle_release_agent(&state, conn_id, &child_id)).await;
@@ -2003,13 +2022,15 @@ async fn handle_acquire_agent(
     request_id: &str,
     tx: &OutTx,
 ) {
-    let sid = state
-        .lock()
-        .unwrap()
-        .conns
-        .get(&conn_id)
-        .and_then(|c| c.session_id.clone());
-    let Some(sid) = sid else {
+    let session = {
+        let st = state.lock().unwrap();
+        st.conns.get(&conn_id).and_then(|c| {
+            c.session_id
+                .as_ref()
+                .map(|sid| (sid.clone(), st.sessions.get(sid).and_then(|s| s.protocol).unwrap_or(0)))
+        })
+    };
+    let Some((sid, client_protocol)) = session else {
         respond::<AgentAdmissionOk>(
             tx,
             request_id,
@@ -2023,48 +2044,66 @@ async fn handle_acquire_agent(
     };
     let result = {
         let mut st = state.lock().unwrap();
-        let key = (sid.clone(), child_id.to_string());
-        let budget =
-            crate::capacity::max_agents(&st.home).unwrap_or(crate::capacity::DEFAULT_MAX_AGENTS);
-        if st.agent_permits.contains_key(&key) {
-            Some(AgentAdmissionOk {
-                granted: true,
-                rejection: None,
-            })
-        } else if st
-            .pending_agents
-            .iter()
-            .any(|p| p.session_id == sid && p.request_id == request_id)
-        {
-            None // idempotent retry remains pending
-        } else if st.agent_permits.len() >= budget {
-            Some(AgentAdmissionOk {
-                granted: false,
-                rejection: Some("global_capacity".into()),
-            })
-        } else if admits_kind(
-            &st.agent_permits,
-            work_kind,
-            kind_budget(&st.home, work_kind),
-        ) {
-            st.agent_permits.insert(key, work_kind.to_string());
-            Some(AgentAdmissionOk {
-                granted: true,
-                rejection: None,
-            })
-        } else {
-            st.pending_agents.push_back(PendingAgent {
-                session_id: sid,
-                child_id: child_id.into(),
-                work_kind: work_kind.into(),
-                request_id: request_id.into(),
-                tx: tx.clone(),
-            });
+        let request_key = (sid.clone(), request_id.to_string());
+        if st.cancelled_acquires.remove(&request_key) {
             None
+        } else {
+            let key = (sid.clone(), child_id.to_string());
+            let budget = crate::capacity::max_agents(&st.home).map_err(|error| {
+                ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
+            });
+            match budget {
+                Err(error) => Some(Err(error)),
+                Ok(_) if st.agent_permits.contains_key(&key) => Some(Ok(AgentAdmissionOk {
+                    granted: true,
+                    rejection: None,
+                })),
+                Ok(_) if st
+                    .pending_agents
+                    .iter()
+                    .any(|p| p.session_id == sid && p.request_id == request_id) => None,
+                Ok(budget) if st.agent_permits.len() >= budget => Some(Ok(AgentAdmissionOk {
+                    granted: false,
+                    rejection: Some("global_capacity".into()),
+                })),
+                Ok(_) if client_protocol < 5 => {
+                    st.agent_permits.insert(key, String::new());
+                    Some(Ok(AgentAdmissionOk {
+                        granted: true,
+                        rejection: None,
+                    }))
+                }
+                Ok(_) => {
+                    let kind = if work_kind.is_empty() { "other" } else { work_kind };
+                    match crate::capacity::max_kind(&st.home, kind) {
+                        Err(error) => Some(Err(ProtoError::new(
+                            E_INTERNAL,
+                            format!("invalid capacity config: {error}"),
+                        ))),
+                        Ok(kind_budget) if admits_kind(&st.agent_permits, kind, kind_budget) => {
+                            st.agent_permits.insert(key, kind.to_string());
+                            Some(Ok(AgentAdmissionOk {
+                                granted: true,
+                                rejection: None,
+                            }))
+                        }
+                        Ok(_) => {
+                            st.pending_agents.push_back(PendingAgent {
+                                session_id: sid,
+                                child_id: child_id.into(),
+                                work_kind: kind.into(),
+                                request_id: request_id.into(),
+                                tx: tx.clone(),
+                            });
+                            None
+                        }
+                    }
+                }
+            }
         }
     };
     if let Some(result) = result {
-        respond(tx, request_id, Ok(result)).await;
+        respond(tx, request_id, result).await;
     }
 }
 
@@ -2072,16 +2111,60 @@ fn handle_cancel_acquire(
     state: &Shared,
     conn_id: u64,
     request_id: &str,
-) -> Result<UnitOk, ProtoError> {
+    child_id: &str,
+) -> Result<Vec<(OutTx, String)>, ProtoError> {
     let mut st = state.lock().unwrap();
     let sid = st
         .conns
         .get(&conn_id)
         .and_then(|c| c.session_id.clone())
         .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+    let request_key = (sid.clone(), request_id.to_string());
+    let permit_key = (sid.clone(), child_id.to_string());
+    let was_pending = st
+        .pending_agents
+        .iter()
+        .any(|p| p.session_id == sid && p.request_id == request_id);
+    if !was_pending && !st.agent_permits.contains_key(&permit_key) {
+        st.cancelled_acquires.insert(request_key.clone());
+        if st.cancelled_acquires.len() > 512 {
+            if let Some(oldest) = st
+                .cancelled_acquires
+                .iter()
+                .find(|entry| *entry != &request_key)
+                .cloned()
+            {
+                st.cancelled_acquires.remove(&oldest);
+            }
+        }
+    }
     st.pending_agents
         .retain(|p| !(p.session_id == sid && p.request_id == request_id));
-    Ok(UnitOk {})
+    st.agent_permits.remove(&permit_key);
+    Ok(wake_pending(&mut st))
+}
+
+fn handle_capacity_changed(
+    state: &Shared,
+    conn_id: u64,
+) -> Result<Vec<(OutTx, String)>, ProtoError> {
+    let mut st = state.lock().unwrap();
+    if !matches!(st.conns.get(&conn_id), Some(h) if h.kind == ClientKind::Cli) {
+        return Err(ProtoError::new(E_FORBIDDEN, "capacity_changed is a cli-only operation"));
+    }
+    Ok(wake_pending(&mut st))
+}
+
+fn send_agent_grants(wake: Vec<(OutTx, String)>) {
+    for (tx, id) in wake {
+        let _ = tx.try_send(encode_ok(
+            &id,
+            &AgentAdmissionOk {
+                granted: true,
+                rejection: None,
+            },
+        ));
+    }
 }
 
 fn handle_release_agent(
@@ -2099,15 +2182,7 @@ fn handle_release_agent(
         st.agent_permits.remove(&(sid, child_id.to_string()));
         wake_pending(&mut st)
     };
-    for (tx, id) in wake {
-        let _ = tx.try_send(encode_ok(
-            &id,
-            &AgentAdmissionOk {
-                granted: true,
-                rejection: None,
-            },
-        ));
-    }
+    send_agent_grants(wake);
     Ok(UnitOk {})
 }
 
@@ -2140,6 +2215,8 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         .filter(|e| e.record.status == TaskStatus::Running)
         .count();
     let terminal = st.registry.tasks.len() - running;
+    let total_agent_capacity = crate::capacity::max_agents(&st.home)
+        .map_err(|error| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}")))?;
     Ok(StatusOk {
         version: crate::VERSION.to_string(),
         pid: std::process::id(),
@@ -2148,20 +2225,36 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         task_counts: TaskCounts { running, terminal },
         agent_capacity: AgentCapacity {
             used: st.agent_permits.len(),
-            total: crate::capacity::max_agents(&st.home).map_err(|e| {
-                ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}"))
-            })?,
+            total: total_agent_capacity,
             by_kind: {
                 let mut kinds = HashMap::new();
-                for kind in st.agent_permits.values() {
-                    let entry = kinds.entry(kind.clone()).or_insert_with(|| AgentKindCapacity {
-                        used: 0,
-                        total: kind_budget(&st.home, kind),
-                    });
-                    entry.used += 1;
+                for kind in crate::capacity::WORK_KINDS {
+                    kinds.insert(
+                        (*kind).to_string(),
+                        AgentKindCapacity {
+                            used: st
+                                .agent_permits
+                                .values()
+                                .filter(|held| held.as_str() == *kind)
+                                .count(),
+                            total: crate::capacity::max_kind(&st.home, kind).map_err(|error| {
+                                ProtoError::new(
+                                    E_INTERNAL,
+                                    format!("invalid capacity config: {error}"),
+                                )
+                            })?,
+                        },
+                    );
                 }
-                kinds.entry("test".into()).or_insert(AgentKindCapacity { used: 0, total: kind_budget(&st.home, "test") });
-                kinds.entry("test-suite".into()).or_insert(AgentKindCapacity { used: 0, total: kind_budget(&st.home, "test-suite") });
+                for kind in st.agent_permits.values().filter(|kind| !kind.is_empty()) {
+                    if !kinds.contains_key(kind) {
+                        let entry = kinds.entry(kind.clone()).or_insert(AgentKindCapacity {
+                            used: 0,
+                            total: total_agent_capacity,
+                        });
+                        entry.used += 1;
+                    }
+                }
                 kinds
             },
         },
@@ -2885,23 +2978,19 @@ fn admits_kind(permits: &HashMap<(String, String), String>, kind: &str, budget: 
         < budget
 }
 
-fn kind_budget(home: &std::path::Path, kind: &str) -> usize {
-    crate::capacity::max_kind(home, kind).unwrap_or(usize::MAX)
-}
-
 fn wake_pending(st: &mut DaemonState) -> Vec<(OutTx, String)> {
     let mut wake = Vec::new();
-    let global =
-        crate::capacity::max_agents(&st.home).unwrap_or(crate::capacity::DEFAULT_MAX_AGENTS);
+    let Ok(global) = crate::capacity::max_agents(&st.home) else {
+        return wake;
+    };
     while st.agent_permits.len() < global {
         let Some(pending) = st.pending_agents.front() else {
             break;
         };
-        if !admits_kind(
-            &st.agent_permits,
-            &pending.work_kind,
-            kind_budget(&st.home, &pending.work_kind),
-        ) {
+        let Ok(kind_budget) = crate::capacity::max_kind(&st.home, &pending.work_kind) else {
+            break;
+        };
+        if !admits_kind(&st.agent_permits, &pending.work_kind, kind_budget) {
             break;
         }
         let pending = st.pending_agents.pop_front().unwrap();
@@ -2912,6 +3001,7 @@ fn wake_pending(st: &mut DaemonState) -> Vec<(OutTx, String)> {
     wake
 }
 
+#[cfg(test)]
 fn admit_agent(
     permits: &mut HashMap<(String, String), String>,
     key: (String, String),

@@ -69,47 +69,58 @@ async fn async_main() {
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
         Sub::Config { action } => match action {
             cli::ConfigAction::Get { key } => {
-                if key == "max-test" {
-                    match capacity::max_kind(&home, "test") {
-                        Ok(n) => {
-                            println!("{n}");
-                            0
-                        }
-                        Err(e) => {
-                            eprintln!("pi-famulus: invalid config: {e}");
-                            1
-                        }
+                let result = if key == "max-agents" {
+                    Some(capacity::max_agents(&home))
+                } else if let Some(kind) = key.strip_prefix("max-") {
+                    if capacity::is_work_kind(kind) {
+                        Some(capacity::max_kind(&home, kind))
+                    } else {
+                        eprintln!("unknown config key: {key}");
+                        None
                     }
-                } else if key != "max-agents" {
-                    eprintln!("unknown config key: {key}");
-                    1
                 } else {
-                    match capacity::max_agents(&home) {
-                        Ok(n) => {
-                            println!("{n}");
-                            0
-                        }
-                        Err(e) => {
-                            eprintln!("pi-famulus: invalid config: {e}");
-                            1
-                        }
+                    eprintln!("unknown config key: {key}");
+                    None
+                };
+                match result {
+                    Some(Ok(n)) => {
+                        println!("{n}");
+                        0
                     }
+                    Some(Err(e)) => {
+                        eprintln!("pi-famulus: invalid config: {e}");
+                        1
+                    }
+                    None => 1,
                 }
             }
             cli::ConfigAction::Set { key, value } => {
-                if key != "max-agents" && key != "max-test" {
+                let kind = (key != "max-agents").then(|| key.strip_prefix("max-")).flatten();
+                if key != "max-agents" && !kind.is_some_and(capacity::is_work_kind) {
                     eprintln!("unknown config key: {key}");
                     1
                 } else {
                     match value.parse::<usize>() {
                         Ok(n) => {
-                            let result = if key == "max-test" {
-                                capacity::set_max_test(&home, n)
+                            let result = if let Some(kind) = kind {
+                                capacity::set_max_kind(&home, kind, n)
                             } else {
                                 capacity::set_max_agents(&home, n)
                             };
                             match result {
-                                Ok(_previous) => 0,
+                                Ok(_previous) => {
+                                    if let Ok(mut conn) = client::connect_existing(
+                                        &home,
+                                        &client::HelloMode::Cli,
+                                    )
+                                    .await
+                                    {
+                                        let _: Result<proto::UnitOk, String> = conn
+                                            .roundtrip(proto::RequestKind::CapacityChanged)
+                                            .await;
+                                    }
+                                    0
+                                }
                                 Err(e) => {
                                     eprintln!("pi-famulus: {e}");
                                     1
@@ -117,7 +128,7 @@ async fn async_main() {
                             }
                         }
                         Err(_) => {
-                            eprintln!("max-agents must be a positive integer");
+                            eprintln!("{key} must be a positive integer");
                             1
                         }
                     }

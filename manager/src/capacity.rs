@@ -5,20 +5,68 @@ use std::{fs, path::Path};
 
 pub const DEFAULT_MAX_AGENTS: usize = 8;
 pub const DEFAULT_MAX_TEST: usize = 2;
+pub const WORK_KINDS: &[&str] = &[
+    "test-suite",
+    "test",
+    "build",
+    "lint/type",
+    "other",
+    "git",
+    "read/search",
+];
 
-pub fn set_max_test(home: &Path, count: usize) -> Result<usize, String> {
+fn kind_setting(kind: &str) -> Option<(&'static str, usize)> {
+    match kind {
+        "test-suite" => Some(("maxTestSuite", DEFAULT_MAX_TEST)),
+        "test" => Some(("maxTest", DEFAULT_MAX_TEST)),
+        "build" => Some(("maxBuild", DEFAULT_MAX_AGENTS)),
+        "lint/type" => Some(("maxLintType", DEFAULT_MAX_AGENTS)),
+        "other" => Some(("maxOther", DEFAULT_MAX_AGENTS)),
+        "git" => Some(("maxGit", DEFAULT_MAX_AGENTS)),
+        "read/search" => Some(("maxReadSearch", DEFAULT_MAX_AGENTS)),
+        _ => None,
+    }
+}
+
+pub fn is_work_kind(kind: &str) -> bool {
+    kind_setting(kind).is_some()
+}
+
+/// Return a kind budget. Unconfigured kinds inherit the machine-wide limit;
+/// explicit test budgets default to two slots.
+pub fn max_kind(home: &Path, kind: &str) -> Result<usize, String> {
+    let value = config(&home.join("config.json"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "config.json must contain a JSON object".to_string())?;
+    let Some((key, default)) = kind_setting(kind) else {
+        return max_agents_from(&value);
+    };
+    let default = if default == DEFAULT_MAX_AGENTS {
+        max_agents_from(&value)?
+    } else {
+        default
+    };
+    max_kind_from(object, key, default)
+}
+
+/// Set a per-kind budget under the cross-process config lock.
+pub fn set_max_kind(home: &Path, kind: &str, count: usize) -> Result<usize, String> {
+    let Some((key, _default)) = kind_setting(kind) else {
+        return Err(format!("unknown work kind: {kind}"));
+    };
     if count == 0 {
-        return Err("max-test must be at least 1".into());
+        return Err(format!("max-{kind} must be at least 1"));
     }
     fs::create_dir_all(home).map_err(|e| e.to_string())?;
     let _lock = ConfigLock::acquire(home)?;
     let path = home.join("config.json");
     let mut value = config(&path)?;
-    let previous = max_kind_from(&value, "maxTest", DEFAULT_MAX_TEST)?;
+    let previous = max_kind(home, kind)?;
     let object = value
         .as_object_mut()
         .ok_or("config.json must contain a JSON object")?;
-    object.insert("maxTest".into(), Value::from(count as u64));
+    object.insert(key.into(), Value::from(count as u64));
     let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
     let tmp = home.join(format!("config.json.{}.tmp", std::process::id()));
     fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
@@ -28,35 +76,19 @@ pub fn set_max_test(home: &Path, count: usize) -> Result<usize, String> {
         None,
         "capacity.changed",
         None,
-        serde_json::json!({"budget":"max-test", "previous":previous, "total":count}),
+        serde_json::json!({"budget":format!("max-{kind}"), "previous":previous, "total":count}),
     );
     Ok(previous)
 }
 
-pub fn max_kind(home: &Path, kind: &str) -> Result<usize, String> {
-    let value = config(&home.join("config.json"))?;
-    let key = match kind {
-        "test-suite" => "maxTest",
-        "test" => "maxTest",
-        _ => return Ok(usize::MAX),
+fn max_kind_from(object: &Map<String, Value>, key: &str, default: usize) -> Result<usize, String> {
+    let Some(raw) = object.get(key) else {
+        return Ok(default);
     };
-    max_kind_from(&value, key, DEFAULT_MAX_TEST)
-}
-
-fn max_kind_from(value: &Value, key: &str, default: usize) -> Result<usize, String> {
-    value
-        .get(key)
-        .and_then(Value::as_u64)
+    raw.as_u64()
         .and_then(|n| usize::try_from(n).ok())
         .filter(|n| *n > 0)
-        .map(Ok)
-        .unwrap_or_else(|| {
-            if value.get(key).is_none() {
-                Ok(default)
-            } else {
-                Err(format!("config.json {key} must be a positive integer"))
-            }
-        })
+        .ok_or_else(|| format!("config.json {key} must be a positive integer"))
 }
 
 pub fn config(path: &Path) -> Result<Value, String> {
@@ -159,7 +191,16 @@ mod tests {
         assert_eq!(max_agents(&dir).unwrap(), 8);
         set_max_agents(&dir, 12).unwrap();
         assert_eq!(max_agents(&dir).unwrap(), 12);
-        assert_eq!(config(&dir.join("config.json")).unwrap()["maxAgents"], 12);
+        assert_eq!(max_kind(&dir, "build").unwrap(), 12);
+        assert_eq!(max_kind(&dir, "test").unwrap(), DEFAULT_MAX_TEST);
+        set_max_kind(&dir, "test-suite", 3).unwrap();
+        set_max_kind(&dir, "build", 5).unwrap();
+        assert_eq!(max_kind(&dir, "test-suite").unwrap(), 3);
+        assert_eq!(max_kind(&dir, "build").unwrap(), 5);
+        let value = config(&dir.join("config.json")).unwrap();
+        assert_eq!(value["maxAgents"], 12);
+        assert_eq!(value["maxTestSuite"], 3);
+        assert_eq!(value["maxBuild"], 5);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -175,7 +216,9 @@ mod tests {
         for corrupt in ["{bad", "[]", "null", "42"] {
             fs::write(&path, corrupt).unwrap();
             assert!(max_agents(&dir).is_err(), "accepted {corrupt}");
+            assert!(max_kind(&dir, "test").is_err(), "kind accepted {corrupt}");
             assert!(set_max_agents(&dir, 12).is_err(), "rewrote {corrupt}");
+            assert!(set_max_kind(&dir, "test", 12).is_err(), "kind set rewrote {corrupt}");
             assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
         }
         fs::remove_dir_all(dir).unwrap();

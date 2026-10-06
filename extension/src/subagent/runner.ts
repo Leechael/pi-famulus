@@ -71,6 +71,8 @@ export function stallRetryPrompt(stallMs: number): string {
 export interface AdmissionTicket {
   /** False once the requesting generation settled or was superseded. */
   current: () => boolean;
+  /** Aborted when this generation settles while its admission is queued. */
+  signal: AbortSignal;
 }
 
 export interface InProcessRunnerOptions {
@@ -187,6 +189,9 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** Generation retired by a stall detection awaiting its retry. */
   private retiredGen: number | null = null;
   private releaseSlot: ((terminal?: boolean) => void) | null = null;
+  private admissionAbort: AbortController | null = null;
+  private admissionStartedAt: number | null = null;
+  private generationQueueMs = 0;
   /** Whether the current generation's settled result is terminal for this child. */
   private terminalSettle = false;
   private disposed = false;
@@ -477,13 +482,19 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.toolDepth = 0;
     this.decisionPaused = false;
 
+    this.generationQueueMs = 0;
     if (this.acquire && !reuseSlot) {
+      const admissionAbort = new AbortController();
+      this.admissionAbort = admissionAbort;
+      const queuedAt = this.now();
+      this.admissionStartedAt = queuedAt;
       try {
         // The ticket ties the slot request to THIS generation: a request
         // whose generation settled while queued (interrupt, then a new
         // resume) must not admit the child's next generation.
         this.releaseSlot = await this.acquire(this.req, {
           current: () => !this.disposed && !this.isSettled(gen),
+          signal: admissionAbort.signal,
         });
       } catch (err) {
         // Admission denied (e.g. fail_fast cancellation while queued).
@@ -494,6 +505,10 @@ class InProcessChildHandle implements DisposableChildHandle {
           durationMs: this.now() - this.startedAt,
         });
         return;
+      } finally {
+        this.generationQueueMs = Math.max(0, this.now() - queuedAt);
+        if (this.admissionStartedAt === queuedAt) this.admissionStartedAt = null;
+        if (this.admissionAbort === admissionAbort) this.admissionAbort = null;
       }
     }
     if (this.disposed || this.isSettled(gen)) {
@@ -643,6 +658,14 @@ class InProcessChildHandle implements DisposableChildHandle {
   private settle(gen: number, result: ChildResult): void {
     if (gen !== this.generation || this.settledFlag) return;
     this.settledFlag = true;
+    if (this.admissionStartedAt !== null) {
+      this.generationQueueMs = Math.max(0, this.now() - this.admissionStartedAt);
+    }
+    this.admissionAbort?.abort();
+    this.admissionAbort = null;
+    if (result.queueMs === undefined && this.generationQueueMs > 0) {
+      result.queueMs = this.generationQueueMs;
+    }
     this.clearTimers();
     // Generations run: 1 + resumes + stall retries. Forensics for the
     // incident class this exists for (a stalled child that needed retries).

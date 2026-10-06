@@ -1313,6 +1313,11 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     }
     outln!("uptime:   {}", fmt::human_duration(st.uptime_ms));
     outln!("agent slots: {}/{} used", st.agent_capacity.used, st.agent_capacity.total);
+    for kind in crate::capacity::WORK_KINDS {
+        if let Some(capacity) = st.agent_capacity.by_kind.get(*kind) {
+            outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
+        }
+    }
     outln!(
         "sessions: {} ({} connected)",
         st.sessions.len(),

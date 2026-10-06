@@ -1,9 +1,33 @@
 # Machine-wide agent capacity
 
-The manager owns `maxAgents` in `<home>/config.json` (default 8). Change it at runtime with `pi-famulus config set max-agents 12`; the manager reads the persisted value at admission time, so the change applies immediately without a restart. `pi-famulus config get max-agents` reads the same setting. `status` reports agent slots used/total. Changes are appended to the daemon event stream as `capacity.changed`.
+The daemon owns `maxAgents` in `<home>/config.json` (default 8). Change it at runtime with `pi-famulus config set max-agents 12`; `config get max-agents` reads the same setting. Protocol 5 adds optional per-work-kind budgets. The supported CLI names and JSON fields are:
 
-Admission is a request/response protocol, not a boolean semaphore: `acquire_agent(child_id)` returns `granted` or `rejection` (currently `global_capacity`); release is `release_agent(child_id)`. The permit is owned by `(session_id, child_id)` and lasts from admission until terminal settle (completed, failed, or disposed). An interrupted-but-resumable child keeps its permit; user resume reserves a local slot but does not re-acquire globally. Release is idempotent. On session disconnect, permits owned by that session are reaped. Daemon restart resets permits; after every reconnect, the extension re-registers its in-memory held child IDs (which survive socket reconnects) using idempotent acquire. The extension reserves its per-session `maxConcurrentChildren` local slot before requesting the machine permit, and releases the local reservation while backing off after a global-capacity rejection. A manager below protocol 4 or an unavailable daemon falls back to the local limit only and emits one notice per reason.
+| CLI key | Config field | Default |
+|---|---|---:|
+| `max-test-suite` | `maxTestSuite` | 2 |
+| `max-test` | `maxTest` | 2 |
+| `max-build` | `maxBuild` | current `maxAgents` |
+| `max-lint/type` | `maxLintType` | current `maxAgents` |
+| `max-other` | `maxOther` | current `maxAgents` |
+| `max-git` | `maxGit` | current `maxAgents` |
+| `max-read/search` | `maxReadSearch` | current `maxAgents` |
 
-The rejection field is extensible for stacked scheduling work, including per-work-kind limits and queued admissions that wake a waiting parent. Those are deferred; this protocol does not yet enqueue/wake jobs. Invalid/corrupt `config.json` is surfaced as an error and admission is refused; it never silently falls back to a larger default budget.
+Unconfigured kinds inherit the global limit, so they add no stricter cap. Every configured value must be a positive integer. `status` reports global used/total and used/total for each kind; JSON status includes the same data under `agent_capacity.by_kind`. Successful changes append a `capacity.changed` event and notify a running daemon, which re-evaluates eligible waiters. Invalid or non-object `config.json` is surfaced as an error; admission never silently falls back to a larger budget.
 
-Deferred resource budgets: **CPU tokens** (impact: CPU-bound agents can still saturate the host despite an agent-count cap; trigger: add measured CPU-aware scheduling) and **per-provider in-flight limits** (impact: a provider may still receive a burst from concurrent agents; trigger: provider-aware dispatch/rate limiting). Neither is implemented here.
+## Work-kind source
+
+`subagent({tasks:[...]})` items and `chain` steps may declare `work_kind` from `test-suite`, `test`, `build`, `lint/type`, `other`, `git`, or `read/search`; the default is `other`. This is an explicit planned-work annotation, not a guess from the natural-language prompt. That is the honest spawn-time boundary: `work-index.ts` and `task-tools.ts` know only that an item is an `agent`, while `manager/src/workkind.rs` classifies actual shell command text for task inspection/statistics. A subagent's future commands do not exist when its admission request is made, so prompt/name heuristics would claim evidence the extension does not have. The explicit label is retained as agent work-index metadata and in agent records/events; task-list rows keep their existing coarse `[agent]` label for compatibility. Shell-task `workkind.rs` classification remains unchanged.
+
+## Admission and queue lifecycle
+
+A v5 `acquire_agent(child_id, work_kind)` is idempotent for the child-owned permit. If the machine-wide budget is already full, it preserves the protocol-4 `global_capacity` rejection. When global capacity is available but this kind is full, the daemon holds the original request id, response writer, session id, child id, and kind in a FIFO pending queue; queued requests are granted in arrival order when both global and kind capacity allow them. A request in another kind with available budgets may be admitted independently rather than being head-of-line blocked by a waiter for a full kind. Release or a runtime budget increase wakes eligible queued requests, sending an ordinary response with the original id so the extension's normal multiplexed pending promise resolves.
+
+Budget reductions never revoke active permits and do not remove/reorder pending requests. A grant is made only if both budgets have room at wake time, so after shrinking below current use the queued requests remain FIFO until active permits drain below the new budget. The extension keeps its local reservation while awaiting a queued global response. If its child is interrupted/disposed while queued, the generation aborts the request and sends `cancel_acquire_agent(request_id, child_id)`; the daemon atomically removes a pending request (or an acquire that won the grant race), and fills any newly free slot from the remaining FIFO queue. On socket close/rebind, connection-bound pending requests are discarded. On a full session disconnect, that session's granted permits are also reaped. A daemon restart resets permits; the extension re-registers its held `(child_id, work_kind)` leases after reconnect.
+
+`queue_ms` is attributed from the child entering pending admission until it actually starts, including time waiting for local/global admission. It is written to `agent.start`, persisted agent records, and the child work-index; the usual `duration_ms` still includes queue wait.
+
+## Protocol compatibility
+
+Hello advertises a client's maximum feature level; the server hello response reports the daemon maximum. The extension uses `min(its v5 maximum, daemon maximum)` as the effective protocol. A manager below v5 is used with protocol-4 acquire requests: no kind field, no per-kind limit, no queueing, and an immediate `global_capacity` rejection when the machine budget is full. A v5 manager applies the same v4 behavior to sessions that announced protocol <5. Below protocol 4, or if the manager is unavailable, the extension falls back to its existing per-session child limit and emits one notice per reason.
+
+The permit is owned by `(session_id, child_id)` and lasts until terminal settle (completed, failed, or disposed). An interrupted-but-resumable child keeps its permit; resume reserves a local slot but does not reacquire globally. Release is idempotent. The extension reserves its per-session `maxConcurrentChildren` slot before requesting a machine permit and releases that local reservation while retrying the protocol-4 global-capacity rejection path.

@@ -84,6 +84,33 @@ describe("subagent tool — validation", () => {
 });
 
 describe("subagent tool — tasks", () => {
+  it("passes explicit work kinds from each task to the child record", async () => {
+    const { exec, registry } = makeStack();
+    await exec({ tasks: [{ prompt: "run a suite", work_kind: "test-suite" }], async: true });
+    await flushMicrotasks();
+    expect(registry.list()[0].children[0].workKind).toBe("test-suite");
+  });
+
+  it("attributes local admission wait to queue_ms", async () => {
+    const { exec, registry, factory, clock } = makeStack({ autoComplete: null, maxConcurrentChildren: 1 });
+    await exec({
+      tasks: [
+        { prompt: "first", work_kind: "test" },
+        { prompt: "second", work_kind: "build" },
+      ],
+      async: true,
+    });
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
+    clock.advanceBy(250);
+    factory.sessions[0].complete("first done");
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(2);
+    const child = registry.list()[0].children[1];
+    expect(child.queueMs).toBe(250);
+    expect(child.workKind).toBe("build");
+  });
+
   it("runs tasks in parallel and returns ordinal-preserved sections", async () => {
     const { exec, factory, notify } = makeStack();
     const result = await exec({ tasks: [{ prompt: "a" }, { prompt: "b", name: "second" }] });

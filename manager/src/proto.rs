@@ -319,7 +319,10 @@ pub enum RequestKind {
     /// Cancel a queued acquire by its original request id.
     CancelAcquireAgent {
         request_id: String,
+        child_id: String,
     },
+    /// Re-evaluate queued acquisitions after a runtime budget update.
+    CapacityChanged,
     /// Return the child-owned agent permit.
     ReleaseAgent {
         child_id: String,

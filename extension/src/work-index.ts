@@ -14,6 +14,8 @@ export const WORK_FINISHED_CAP = 50;
 export interface WorkItem {
   id: string;
   kind: WorkKind;
+  /** Daemon work-kind label for agents; shell commands are classified separately. */
+  workKind?: string;
   status: string;
   title: string;
   command?: string;
