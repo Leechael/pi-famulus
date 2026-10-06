@@ -1052,7 +1052,7 @@ fn p8_shrinking_kind_budget_keeps_queued_fifo_and_existing_permits() {
 
 #[test]
 fn p9_protocol_v4_uses_global_only_immediate_admission() {
-    let home = test_home("p9-protocol-v4-admission");
+    let home = test_home("p9-v4-admission");
     fs::write(home.join("config.json"), r#"{"maxAgents":2,"maxTest":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
@@ -1079,7 +1079,7 @@ fn p9_protocol_v4_uses_global_only_immediate_admission() {
 
 #[test]
 fn p11_capacity_increase_notifies_daemon_and_wakes_kind_queue() {
-    let home = test_home("p11-capacity-increase-wakeup");
+    let home = test_home("p11-budget-wake");
     fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
@@ -1120,7 +1120,7 @@ fn p11_capacity_increase_notifies_daemon_and_wakes_kind_queue() {
 
 #[test]
 fn p10_cancel_and_disconnect_remove_queued_acquires() {
-    let home = test_home("p10-cancel-queued-agent");
+    let home = test_home("p10-cancel-queue");
     fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
@@ -1164,7 +1164,7 @@ fn p10_cancel_and_disconnect_remove_queued_acquires() {
 
 #[test]
 fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
-    let home = test_home("p16-unconfirmed-grant-retry");
+    let home = test_home("p16-grant-retry");
     fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
@@ -1226,7 +1226,7 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
 
 #[test]
 fn p12_wake_scans_for_eligible_kind_and_keeps_same_kind_fifo() {
-    let home = test_home("p12-kind-head-of-line");
+    let home = test_home("p12-kind-scan");
     fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":1,"maxBuild":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
@@ -1292,7 +1292,7 @@ fn p12_wake_scans_for_eligible_kind_and_keeps_same_kind_fifo() {
 
 #[test]
 fn p13_pending_queue_enforces_per_session_cap_and_child_deduplication() {
-    let home = test_home("p13-pending-session-cap");
+    let home = test_home("p13-sess-cap");
     fs::write(home.join("config.json"), r#"{"maxAgents":1000,"maxTest":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
@@ -1352,7 +1352,7 @@ fn p13_pending_queue_enforces_per_session_cap_and_child_deduplication() {
 
 #[test]
 fn p14_pending_queue_enforces_daemon_global_cap() {
-    let home = test_home("p14-pending-global-cap");
+    let home = test_home("p14-glob-cap");
     fs::write(home.join("config.json"), r#"{"maxAgents":1000,"maxTest":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
@@ -1390,7 +1390,7 @@ fn p14_pending_queue_enforces_daemon_global_cap() {
 
 #[test]
 fn p15_cancel_only_releases_its_owned_permit_and_same_id_retry_is_new() {
-    let home = test_home("p15-cancel-permit-owner");
+    let home = test_home("p15-cancel-own");
     fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
