@@ -468,6 +468,8 @@ mod tests {
             live_cpu_user_ms: None,
             live_cpu_sys_ms: None,
             live_cpu_percent: None,
+            live_cpu_sampled_at: None,
+            live_cpu_stale: false,
         };
         registry::persist_record(&home, &rec).unwrap();
         let mut reg = Registry::new(home.clone());
@@ -513,6 +515,8 @@ mod tests {
             live_cpu_user_ms: None,
             live_cpu_sys_ms: None,
             live_cpu_percent: None,
+            live_cpu_sampled_at: None,
+            live_cpu_stale: false,
         };
         registry::persist_record(&home, &rec).unwrap();
         fs::write(&out, b"1\n2\n3\n").unwrap();

@@ -55,6 +55,10 @@ pub struct AgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_output: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_cache_write: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_ms: Option<u64>,
@@ -416,6 +420,9 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_cpu_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sampled_at: Option<u64>,
+    pub live_cpu_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
@@ -467,6 +474,8 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         live_cpu_user_ms: t.live_cpu_user_ms,
         live_cpu_sys_ms: t.live_cpu_sys_ms,
         live_cpu_percent: t.live_cpu_percent,
+        live_cpu_sampled_at: t.live_cpu_sampled_at,
+        live_cpu_stale: t.live_cpu_stale,
         pid: Some(t.pid),
         origin: t.origin.clone(),
         backgrounded_at: t.backgrounded_at,
@@ -502,6 +511,8 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         live_cpu_user_ms: None,
         live_cpu_sys_ms: None,
         live_cpu_percent: None,
+        live_cpu_sampled_at: None,
+        live_cpu_stale: false,
         pid: None,
         origin: None,
         backgrounded_at: None,
@@ -635,8 +646,8 @@ pub fn filter_rows(
     Ok(rows)
 }
 
-pub const LS_COLUMNS: [&str; 13] = [
-    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "NOW", "EXIT", "REASON", "TITLE",
+pub const LS_COLUMNS: [&str; 14] = [
+    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "NOW", "SAMPLE", "EXIT", "REASON", "TITLE",
 ];
 /// Columns before TITLE.
 const LS_FIXED: usize = LS_COLUMNS.len() - 1;
@@ -662,7 +673,18 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
                 r.duration_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into()),
                 cpu_text(cpu),
                 cores_text(cpu, r.duration_ms.unwrap_or(0)),
-                r.live_cpu_percent.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into()),
+                if r.live_cpu_stale {
+                    "stale".into()
+                } else {
+                    r.live_cpu_percent.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into())
+                },
+                if r.running {
+                    r.live_cpu_sampled_at
+                        .map(|t| fmt::short_time(t, now))
+                        .unwrap_or_else(|| if r.live_cpu_stale { "never".into() } else { "-".into() })
+                } else {
+                    "-".into()
+                },
                 exit_col(r),
                 r.end_reason.clone().unwrap_or_else(|| "-".into()),
             ]
@@ -858,6 +880,14 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             }
             kv("duration", fmt::human_duration(r.duration_ms.unwrap_or(0)));
             if r.running {
+                let last_sample = t.live_cpu_sampled_at.map(fmt::datetime).unwrap_or_else(|| "never".into());
+                let sample_state = if t.live_cpu_stale {
+                    "unavailable"
+                } else if t.live_cpu_sampled_at.is_some() {
+                    "available"
+                } else {
+                    "not sampled yet"
+                };
                 if let Some(c) = cpu_ms(t.live_cpu_user_ms, t.live_cpu_sys_ms) {
                     let current = t.live_cpu_percent.map(|p| format!(", now {p:.0}%")).unwrap_or_default();
                     kv(
@@ -870,6 +900,7 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
                         ),
                     );
                 }
+                kv("cpu sample", format!("{sample_state} (last successful sample {last_sample})"));
             } else {
                 match cpu_ms(t.cpu_user_ms, t.cpu_sys_ms) {
                     Some(c) => kv(
@@ -954,11 +985,16 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             if let Some(n) = a.tool_calls {
                 kv("tool calls", n.to_string());
             }
-            if a.tokens_input.is_some() || a.tokens_output.is_some() {
+            if a.tokens_input.is_some() || a.tokens_output.is_some() || a.tokens_cache_read.is_some() || a.tokens_cache_write.is_some() {
+                let cache = if a.tokens_cache_read.is_some() || a.tokens_cache_write.is_some() {
+                    format!(" (cache read {} / write {})", a.tokens_cache_read.unwrap_or(0), a.tokens_cache_write.unwrap_or(0))
+                } else {
+                    String::new()
+                };
                 let rate = agent_output_tokens_per_second(a.tokens_output, a.llm_ms)
                     .map(|v| format!(" ({v:.1} output tok/s of LLM time)"))
                     .unwrap_or_default();
-                kv("tokens", format!("{} input / {} output{rate}", a.tokens_input.unwrap_or(0), a.tokens_output.unwrap_or(0)));
+                kv("tokens", format!("{} input / {} output{cache}{rate}", a.tokens_input.unwrap_or(0), a.tokens_output.unwrap_or(0)));
             }
             if a.llm_ms.is_some() || a.tool_ms.is_some() || a.queue_ms.is_some() || a.wall_other_ms.is_some() {
                 let approx = if a.wall_approximate { " (approximate; unclassified segments are not attributed)" } else { "" };
@@ -1373,6 +1409,8 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let a_done = agents.len() - a_running;
     let tokens_input: u64 = agents.iter().map(|a| a.tokens_input.unwrap_or(0)).sum();
     let tokens_output: u64 = agents.iter().map(|a| a.tokens_output.unwrap_or(0)).sum();
+    let tokens_cache_read: u64 = agents.iter().map(|a| a.tokens_cache_read.unwrap_or(0)).sum();
+    let tokens_cache_write: u64 = agents.iter().map(|a| a.tokens_cache_write.unwrap_or(0)).sum();
     let llm_ms: u64 = agents.iter().map(|a| a.llm_ms.unwrap_or(0)).sum();
     let tokens_per_second = agent_output_tokens_per_second(Some(tokens_output), Some(llm_ms));
     if json_out {
@@ -1381,6 +1419,8 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         v["agent_tokens"] = json!({
             "input": tokens_input,
             "output": tokens_output,
+            "tokens_cache_read": tokens_cache_read,
+            "tokens_cache_write": tokens_cache_write,
             "llm_ms": llm_ms,
             "output_tokens_per_second": tokens_per_second,
         });
@@ -1430,7 +1470,7 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         a_done
     );
     let rate = tokens_per_second.map(|v| format!(" ({v:.1} output tok/s over {llm_ms} ms of LLM time)")).unwrap_or_default();
-    outln!("agent tokens: {tokens_input} input / {tokens_output} output{rate}");
+    outln!("agent tokens: {tokens_input} input / {tokens_output} output (cache read {tokens_cache_read} / write {tokens_cache_write}){rate}");
     if let Some(line) = upgrade_line(&st, now_ms()) {
         outln!("{line}");
     }

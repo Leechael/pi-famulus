@@ -221,6 +221,12 @@ pub struct TaskRecord {
     /// Process-group values can exceed 100% when several cores are busy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_cpu_percent: Option<f64>,
+    /// Unix epoch milliseconds of the latest successful live CPU sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sampled_at: Option<u64>,
+    /// The most recent sampling attempt failed; cumulative CPU may be stale.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_cpu_stale: bool,
 }
 
 // ---------------------------------------------------------------------------

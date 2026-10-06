@@ -566,11 +566,17 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
             let active: HashSet<String> = running.iter().map(|(id, _)| id.clone()).collect();
             tracker.retain(&active);
             let at = now_ms();
-            let readings: Vec<(String, task::LiveCpuReading)> = running
+            let readings: Vec<(String, Option<task::LiveCpuReading>)> = running
                 .into_iter()
-                .filter_map(|(id, pgid)| {
-                    let (user, system) = task::live_group_cpu_ms(pgid)?;
-                    Some((id.clone(), tracker.update(&id, at, user, system)))
+                .map(|(id, pgid)| {
+                    let reading = match task::live_group_cpu_ms(pgid) {
+                        Some((user, system)) => Some(tracker.update(&id, at, user, system)),
+                        None => {
+                            tracker.mark_unavailable(&id, at);
+                            None
+                        }
+                    };
+                    (id, reading)
                 })
                 .collect();
             if readings.is_empty() {
@@ -582,12 +588,26 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
                 if entry.record.status != TaskStatus::Running {
                     continue;
                 }
-                entry.record.live_cpu_user_ms = Some(reading.user_ms);
-                entry.record.live_cpu_sys_ms = Some(reading.system_ms);
-                entry.record.live_cpu_percent = reading.percent;
+                apply_live_cpu_sample(&mut entry.record, reading, at);
             }
         }
     })
+}
+
+fn apply_live_cpu_sample(record: &mut TaskRecord, reading: Option<task::LiveCpuReading>, sampled_at: u64) {
+    match reading {
+        Some(reading) => {
+            record.live_cpu_user_ms = Some(reading.user_ms);
+            record.live_cpu_sys_ms = Some(reading.system_ms);
+            record.live_cpu_percent = reading.percent;
+            record.live_cpu_sampled_at = Some(sampled_at);
+            record.live_cpu_stale = false;
+        }
+        None => {
+            record.live_cpu_percent = None;
+            record.live_cpu_stale = true;
+        }
+    }
 }
 
 /// Poll the resolved install path for this daemon's executable. A path change
@@ -1727,6 +1747,8 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         live_cpu_user_ms: None,
         live_cpu_sys_ms: None,
         live_cpu_percent: None,
+        live_cpu_sampled_at: None,
+        live_cpu_stale: false,
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -3231,6 +3253,8 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         entry.record.live_cpu_user_ms = None;
         entry.record.live_cpu_sys_ms = None;
         entry.record.live_cpu_percent = None;
+        entry.record.live_cpu_sampled_at = None;
+        entry.record.live_cpu_stale = false;
         // Why it ended: our kill's reason; otherwise a natural exit.
         entry.record.end_reason = Some(
             entry
@@ -3401,6 +3425,8 @@ async fn graceful_shutdown(state: &Shared) {
                 e.record.live_cpu_user_ms = None;
                 e.record.live_cpu_sys_ms = None;
                 e.record.live_cpu_percent = None;
+                e.record.live_cpu_sampled_at = None;
+                e.record.live_cpu_stale = false;
                 e.record.ended_at = Some(now);
                 e.record.output_size = e.output.lock().unwrap().total_size;
                 e.record.end_reason = Some(
@@ -3560,6 +3586,46 @@ fn admit_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn running_record_for_cpu_test() -> TaskRecord {
+        serde_json::from_value(json!({
+            "task_id": "sh_cpu_test",
+            "session_id": "s1",
+            "kind": "shell",
+            "command": "sleep 10",
+            "cwd": "/tmp",
+            "pid": 1234,
+            "status": "running",
+            "started_at": 1,
+            "output_path": "/tmp/output",
+            "output_size": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_live_cpu_sample_clears_rate_but_preserves_totals_and_last_timestamp() {
+        let mut record = running_record_for_cpu_test();
+        apply_live_cpu_sample(
+            &mut record,
+            Some(task::LiveCpuReading { user_ms: 120, system_ms: 30, percent: Some(24.0) }),
+            1_000,
+        );
+        assert_eq!(record.live_cpu_sampled_at, Some(1_000));
+        assert!(!record.live_cpu_stale);
+
+        apply_live_cpu_sample(&mut record, None, 6_000);
+        assert_eq!((record.live_cpu_user_ms, record.live_cpu_sys_ms), (Some(120), Some(30)));
+        assert_eq!(record.live_cpu_percent, None);
+        assert_eq!(record.live_cpu_sampled_at, Some(1_000));
+        assert!(record.live_cpu_stale);
+
+        let mut never_sampled = running_record_for_cpu_test();
+        apply_live_cpu_sample(&mut never_sampled, None, 6_000);
+        assert_eq!(never_sampled.live_cpu_sampled_at, None);
+        assert!(never_sampled.live_cpu_stale);
+    }
 
     /// Regression: a tee that runs before its factory returns must not have
     /// its bytes read again as carry. Also preserve the incomplete raw byte

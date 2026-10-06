@@ -73,6 +73,9 @@ pub struct Group {
     /// Recent CPU percentage, summed across running tasks with live samples.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_now_percent: Option<f64>,
+    pub cpu_now_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_sampled_at: Option<u64>,
     pub killed: u64,
     pub killed_wall_ms: u64,
 }
@@ -87,8 +90,16 @@ impl Group {
         self.tasks += 1;
         self.wall_ms += wall;
         let cpu = if t.status == TaskStatus::Running {
-            if let Some(percent) = t.live_cpu_percent {
-                self.cpu_now_percent = Some(self.cpu_now_percent.unwrap_or(0.0) + percent);
+            if let Some(sampled_at) = t.live_cpu_sampled_at {
+                self.cpu_sampled_at = Some(self.cpu_sampled_at.unwrap_or(0).max(sampled_at));
+            }
+            if t.live_cpu_stale {
+                self.cpu_now_stale = true;
+                self.cpu_now_percent = None;
+            } else if !self.cpu_now_stale {
+                if let Some(percent) = t.live_cpu_percent {
+                    self.cpu_now_percent = Some(self.cpu_now_percent.unwrap_or(0.0) + percent);
+                }
             }
             (t.live_cpu_user_ms, t.live_cpu_sys_ms)
         } else {
@@ -129,8 +140,13 @@ pub struct TopAgent {
     /// Sum of the daemon's most recent process-group CPU rates; 100% = one core.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_now_percent: Option<f64>,
+    pub cpu_now_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_sampled_at: Option<u64>,
     pub tokens_input: u64,
     pub tokens_output: u64,
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
     pub llm_ms: u64,
     pub tool_ms: u64,
     pub queue_ms: u64,
@@ -148,6 +164,9 @@ pub struct TopWorkKind {
     pub cpu_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_now_percent: Option<f64>,
+    pub cpu_now_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_sampled_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +175,18 @@ pub struct TopReport {
     pub work_kinds: Vec<TopWorkKind>,
     pub cpu_note: &'static str,
     pub output_tokens_per_second_note: &'static str,
+}
+
+fn cpu_now_label(percent: Option<f64>, stale: bool) -> String {
+    if stale {
+        "unavailable".into()
+    } else {
+        percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "-".into())
+    }
+}
+
+fn cpu_sample_label(sampled_at: Option<u64>) -> String {
+    sampled_at.map(fmt::datetime).unwrap_or_else(|| "never".into())
 }
 
 /// Group `tasks` (already filtered). `agent_names`: child_id -> name.
@@ -211,8 +242,16 @@ pub fn total(groups: &[Group]) -> Group {
         t.cpu_sys_ms += g.cpu_sys_ms;
         t.measured += g.measured;
         t.measured_wall_ms += g.measured_wall_ms;
-        if let Some(percent) = g.cpu_now_percent {
-            t.cpu_now_percent = Some(t.cpu_now_percent.unwrap_or(0.0) + percent);
+        if let Some(sampled_at) = g.cpu_sampled_at {
+            t.cpu_sampled_at = Some(t.cpu_sampled_at.unwrap_or(0).max(sampled_at));
+        }
+        if g.cpu_now_stale {
+            t.cpu_now_stale = true;
+            t.cpu_now_percent = None;
+        } else if !t.cpu_now_stale {
+            if let Some(percent) = g.cpu_now_percent {
+                t.cpu_now_percent = Some(t.cpu_now_percent.unwrap_or(0.0) + percent);
+            }
         }
         t.killed += g.killed;
         t.killed_wall_ms += g.killed_wall_ms;
@@ -326,12 +365,14 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
             tasks: g.tasks,
             cpu_ms: (g.measured > 0).then(|| g.cpu_ms()),
             cpu_now_percent: g.cpu_now_percent,
+            cpu_now_stale: g.cpu_now_stale,
+            cpu_sampled_at: g.cpu_sampled_at,
         })
         .collect();
     let report = TopReport {
         agents,
         work_kinds,
-        cpu_note: "CPU totals include retained shell tasks attributed to each agent: final runner measurements for ended tasks and best-effort process-group estimates for running tasks. NOW is the latest daemon sampling interval; 100% equals one core.",
+        cpu_note: "CPU totals include retained shell tasks attributed to each agent: final runner measurements for ended tasks and best-effort process-group estimates for running tasks. NOW is the latest daemon sampling interval; 100% equals one core. cpu_now_stale marks failed sampling; cpu_sampled_at is the last successful sample time.",
         output_tokens_per_second_note: "Cumulative output tokens divided by observed assistant-message LLM wall milliseconds; not divided by total elapsed wall time.",
     };
     if json {
@@ -345,17 +386,21 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
     }
     for a in &report.agents {
         let cpu = a.cpu_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into());
-        let now = a.cpu_now_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "-".into());
+        let now = cpu_now_label(a.cpu_now_percent, a.cpu_now_stale);
+        let sampled = cpu_sample_label(a.cpu_sampled_at);
         let rate = a.output_tokens_per_second.map(|v| format!("{v:.1} output tok/s")).unwrap_or_else(|| "- tok/s".into());
         let approximate = if a.wall_approximate { " (approximate)" } else { "" };
         outln!(
-            "  {} | CPU {} total, {} now | {} task(s) | tokens {} in / {} out, {} | wall LLM {} / tool {} / queue {} / unclassified {}{}",
+            "  {} | CPU {} total, {} now (sample {}) | {} task(s) | tokens {} in / {} out (cache read {} / write {}), {} | wall LLM {} / tool {} / queue {} / unclassified {}{}",
             a.agent,
             cpu,
             now,
+            sampled,
             a.tasks,
             a.tokens_input,
             a.tokens_output,
+            a.tokens_cache_read,
+            a.tokens_cache_write,
             rate,
             fmt::human_duration(a.llm_ms),
             fmt::human_duration(a.tool_ms),
@@ -370,8 +415,9 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
     }
     for k in &report.work_kinds {
         let cpu = k.cpu_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into());
-        let now = k.cpu_now_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "-".into());
-        outln!("  {} | {} task(s) | CPU {} total, {} now", k.kind, k.tasks, cpu, now);
+        let now = cpu_now_label(k.cpu_now_percent, k.cpu_now_stale);
+        let sampled = cpu_sample_label(k.cpu_sampled_at);
+        outln!("  {} | {} task(s) | CPU {} total, {} now (sample {})", k.kind, k.tasks, cpu, now, sampled);
     }
     Ok(())
 }
@@ -379,6 +425,8 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
 fn top_agent(agent: String, child_id: Option<String>, group: Option<&Group>, record: Option<&inspect::AgentRecord>) -> TopAgent {
     let tokens_input = record.and_then(|a| a.tokens_input).unwrap_or(0);
     let tokens_output = record.and_then(|a| a.tokens_output).unwrap_or(0);
+    let tokens_cache_read = record.and_then(|a| a.tokens_cache_read).unwrap_or(0);
+    let tokens_cache_write = record.and_then(|a| a.tokens_cache_write).unwrap_or(0);
     let llm_ms = record.and_then(|a| a.llm_ms).unwrap_or(0);
     TopAgent {
         agent,
@@ -386,8 +434,12 @@ fn top_agent(agent: String, child_id: Option<String>, group: Option<&Group>, rec
         tasks: group.map_or(0, |g| g.tasks),
         cpu_ms: group.and_then(|g| (g.measured > 0).then(|| g.cpu_ms())),
         cpu_now_percent: group.and_then(|g| g.cpu_now_percent),
+        cpu_now_stale: group.is_some_and(|g| g.cpu_now_stale),
+        cpu_sampled_at: group.and_then(|g| g.cpu_sampled_at),
         tokens_input,
         tokens_output,
+        tokens_cache_read,
+        tokens_cache_write,
         llm_ms,
         tool_ms: record.and_then(|a| a.tool_ms).unwrap_or(0),
         queue_ms: record.and_then(|a| a.queue_ms).unwrap_or(0),
@@ -467,6 +519,8 @@ mod tests {
             live_cpu_user_ms: None,
             live_cpu_sys_ms: None,
             live_cpu_percent: None,
+            live_cpu_sampled_at: None,
+            live_cpu_stale: false,
         }
     }
 
@@ -523,6 +577,39 @@ mod tests {
         assert_eq!(g[0].cpu_now_percent, Some(75.5));
         let all = total(&g);
         assert_eq!(all.cpu_now_percent, Some(75.5));
+    }
+
+    #[test]
+    fn failed_live_cpu_sample_is_visible_as_stale_with_last_sample_time() {
+        let sampled_at = 1_700_000_000_000;
+        let now = sampled_at + 10_000;
+        let mut running = rec("sh_stale", "s1", Some("ch_stale"), "sleep 10", 0, None, TaskStatus::Running);
+        running.ended_at = None;
+        running.live_cpu_user_ms = Some(1_200);
+        running.live_cpu_sys_ms = Some(300);
+        running.live_cpu_sampled_at = Some(sampled_at);
+        running.live_cpu_stale = true;
+
+        let groups = group(&[&running], By::Agent, &HashMap::new(), &HashMap::new(), now);
+        assert!(groups[0].cpu_now_stale);
+        assert_eq!(groups[0].cpu_now_percent, None);
+        assert_eq!(groups[0].cpu_sampled_at, Some(sampled_at));
+        let agent = top_agent("worker".into(), Some("ch_stale".into()), Some(&groups[0]), None);
+        let top = serde_json::to_value(agent).unwrap();
+        assert_eq!(top["cpu_now_stale"], true);
+        assert_eq!(top["cpu_now_percent"], serde_json::Value::Null);
+        assert_eq!(top["cpu_sampled_at"], sampled_at);
+        assert_eq!(cpu_now_label(None, true), "unavailable");
+        assert_eq!(cpu_sample_label(Some(sampled_at)), fmt::datetime(sampled_at));
+
+        let row = inspect::task_row(&running, now);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["live_cpu_stale"], true);
+        assert_eq!(json["live_cpu_sampled_at"], sampled_at);
+        let prefixes = HashMap::from([("s1".into(), "s1".into())]);
+        let ls = inspect::render_ls(&[row], &prefixes, now, Some(200));
+        assert!(ls[0].contains("SAMPLE"));
+        assert!(ls[1].contains("stale") && ls[1].contains(&fmt::short_time(sampled_at, now)), "{ls:?}");
     }
 
     #[test]

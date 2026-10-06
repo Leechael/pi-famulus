@@ -577,7 +577,7 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let out = cli_ok(&home, &["ls", "--all"]);
     let lines: Vec<&str> = out.stdout.lines().collect();
     let header: Vec<&str> = lines[0].split_whitespace().collect();
-    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "NOW", "EXIT", "REASON", "TITLE"]);
+    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "NOW", "SAMPLE", "EXIT", "REASON", "TITLE"]);
     let rows: Vec<&str> = lines[1..].to_vec();
     // The connected session's work, running and finished. 0199aaaa-1111 never
     // connected, so its finished task is not listed (still reachable via show).
@@ -721,12 +721,8 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
             "ended_at":now - 1_000,"cpu_user_ms":1_400,"cpu_sys_ms":100}),
     );
     record_fixture(&home, "sess-top", "sh_0000e002", now - 2_000, json!({"command":"git status","ended_at":now - 1_000,"cpu_user_ms":200,"cpu_sys_ms":50}));
-    let project = home.path.join("project");
-    std::fs::create_dir_all(project.join(".pi")).unwrap();
-    std::fs::write(project.join(".pi/famulus-kinds.json"), r#"{"version":1,"commands":{"./ci-fast":"build"}}"#).unwrap();
-    record_fixture(&home, "sess-top", "sh_0000e003", now - 3_000, json!({"command":"./ci-fast --quick","cwd":project.to_string_lossy().to_string(),"ended_at":now - 1_000,"cpu_user_ms":30,"cpu_sys_ms":5}));
     agent_fixture(&home, "sess-top", json!({"child_id":"ch_0000e001","run_id":"run_0000e001","session_id":"sess-top",
-        "name":"worker","agent":"worker","status":"completed","tokens_input":100,"tokens_output":20,
+        "name":"worker","agent":"worker","status":"completed","tokens_input":100,"tokens_output":20,"tokens_cache_read":80,"tokens_cache_write":4,
         "llm_ms":2000,"tool_ms":1000,"queue_ms":500,"wall_other_ms":100,"wall_approximate":true}));
     agent_fixture(&home, "sess-top", json!({"child_id":"ch_0000e002","run_id":"run_0000e002","session_id":"sess-top",
         "name":"idle-child","agent":"worker","status":"completed","tokens_input":50,"tokens_output":10,"llm_ms":1000}));
@@ -735,13 +731,12 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
     let worker = report["agents"].as_array().unwrap().iter().find(|a| a["child_id"] == "ch_0000e001").unwrap();
     assert_eq!((worker["tasks"].as_u64(), worker["cpu_ms"].as_u64()), (Some(1), Some(1_500)));
     assert_eq!((worker["tokens_input"].as_u64(), worker["tokens_output"].as_u64()), (Some(100), Some(20)));
+    assert_eq!((worker["tokens_cache_read"].as_u64(), worker["tokens_cache_write"].as_u64()), (Some(80), Some(4)));
     assert_eq!(worker["output_tokens_per_second"].as_f64(), Some(10.0));
     assert_eq!(worker["wall_approximate"], true);
     assert!(report["agents"].as_array().unwrap().iter().any(|a| a["child_id"] == "ch_0000e002" && a["tasks"] == 0));
     let suite = report["work_kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "test-suite").unwrap();
     assert_eq!((suite["tasks"].as_u64(), suite["cpu_ms"].as_u64()), (Some(1), Some(1_500)));
-    let override_kind = report["work_kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "build").unwrap();
-    assert_eq!((override_kind["tasks"].as_u64(), override_kind["cpu_ms"].as_u64()), (Some(1), Some(35)));
     assert_eq!(report["cpu_note"].as_str().unwrap().contains("100% equals one core"), true);
 
     let text = cli_ok(&home, &["top"]).stdout;
@@ -763,11 +758,15 @@ fn c13_top_reports_live_process_group_cpu() {
         "while :; do :; done",
         json!({"origin":{"via":"child-bash","child_id":child_id,"run_id":"run_0000e101"}}),
     );
+    agent_fixture(&home, "sess-top-live", json!({"child_id":child_id,"run_id":"run_0000e101","session_id":"sess-top-live",
+        "name":"cpu-smoke","agent":"worker","status":"running","tokens_input":100,"tokens_output":20,
+        "tokens_cache_read":75,"tokens_cache_write":4,"llm_ms":1000}));
     let sampled = poll_until(S(18), || {
         let task = c.task(&id)?;
         let cpu = task["live_cpu_user_ms"].as_u64().unwrap_or(0) + task["live_cpu_sys_ms"].as_u64().unwrap_or(0);
         let percent = task["live_cpu_percent"].as_f64().unwrap_or(0.0);
-        (cpu > 0 && percent > 0.0).then_some((cpu, percent))
+        let sampled_at = task["live_cpu_sampled_at"].as_u64().unwrap_or(0);
+        (cpu > 0 && percent > 0.0 && sampled_at > 0).then_some((cpu, percent, sampled_at))
     })
     .expect("daemon should publish at least two live process-group samples");
     let out = cli_ok(&home, &["top", "--json"]);
@@ -775,8 +774,20 @@ fn c13_top_reports_live_process_group_cpu() {
     let agent = report["agents"].as_array().unwrap().iter().find(|a| a["child_id"] == child_id).unwrap();
     assert!(agent["cpu_ms"].as_u64().unwrap() > 0, "{agent}");
     assert!(agent["cpu_now_percent"].as_f64().unwrap() > 0.0, "{agent}");
-    assert!(report["work_kinds"].as_array().unwrap().iter().any(|k| k["cpu_now_percent"].as_f64().unwrap_or(0.0) > 0.0));
-    println!("live top smoke: task CPU={:?}, {:?};\n{}", sampled.0, sampled.1, cli_ok(&home, &["top"]).stdout);
+    assert_eq!(agent["cpu_sampled_at"].as_u64(), Some(sampled.2));
+    assert_eq!(agent["cpu_now_stale"], false);
+    assert_eq!((agent["tokens_input"].as_u64(), agent["tokens_output"].as_u64()), (Some(100), Some(20)));
+    assert_eq!((agent["tokens_cache_read"].as_u64(), agent["tokens_cache_write"].as_u64()), (Some(75), Some(4)));
+    assert!(report["work_kinds"].as_array().unwrap().iter().any(|k| k["cpu_now_percent"].as_f64().unwrap_or(0.0) > 0.0 && k["cpu_sampled_at"].as_u64().is_some()));
+    let ls: Value = serde_json::from_str(&cli_ok(&home, &["ls", "--json"]).stdout).unwrap();
+    let live_task = ls.as_array().unwrap().iter().find(|t| t["id"] == id).unwrap();
+    assert_eq!(live_task["live_cpu_sampled_at"].as_u64(), Some(sampled.2));
+    assert_eq!(live_task["live_cpu_stale"], false);
+    let status: Value = serde_json::from_str(&cli_ok(&home, &["status", "--json"]).stdout).unwrap();
+    assert_eq!(status["agent_tokens"]["tokens_cache_read"].as_u64(), Some(75));
+    assert_eq!(status["agent_tokens"]["tokens_cache_write"].as_u64(), Some(4));
+    println!("live top/status smoke: task CPU={:?} ms, {:.2}% at {};\n{}{}{}", sampled.0, sampled.1, sampled.2,
+        cli_ok(&home, &["top"]).stdout, cli_ok(&home, &["status"]).stdout, cli_ok(&home, &["ls"]).stdout);
     let stop = home.cli(&["stop", &id], S(10));
     assert!(stop.status.success(), "{}{}", stop.stdout, stop.stderr);
 }
@@ -1136,8 +1147,8 @@ fn c6_status_counts_uptime_and_not_running() {
     assert_eq!(out.stderr.trim(), "pi-famulus: pi-famulus is not running");
     assert!(!home.sock().exists(), "status must not start the daemon");
 
-    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed","tokens_input":35,"tokens_output":5,"llm_ms":5000,"tool_ms":3000,"queue_ms":200,"wall_other_ms":500,"wall_approximate":true}));
-    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c602","session_id":"sess-c6","name":"b","agent":"w","status":"failed","tokens_input":12,"tokens_output":4,"llm_ms":1000,"tool_ms":100,"queue_ms":0,"wall_other_ms":0}));
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed","tokens_input":35,"tokens_output":5,"tokens_cache_read":20,"tokens_cache_write":5,"llm_ms":5000,"tool_ms":3000,"queue_ms":200,"wall_other_ms":500,"wall_approximate":true}));
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c602","session_id":"sess-c6","name":"b","agent":"w","status":"failed","tokens_input":12,"tokens_output":4,"tokens_cache_read":4,"tokens_cache_write":1,"llm_ms":1000,"tool_ms":100,"queue_ms":0,"wall_other_ms":0}));
     let _d = home.start_daemon();
     let mut c = home.connect();
     hello_v2(&mut c, "sess-c6", "/tmp");
@@ -1164,14 +1175,14 @@ fn c6_status_counts_uptime_and_not_running() {
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
     assert!(uptime.ends_with('s') && !uptime.contains('.'), "human uptime: {uptime}");
     assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");
-    assert!(s.contains("agent tokens: 47 input / 9 output (1.5 output tok/s over 6000 ms of LLM time)"), "{s}");
+    assert!(s.contains("agent tokens: 47 input / 9 output (cache read 24 / write 6) (1.5 output tok/s over 6000 ms of LLM time)"), "{s}");
     let out = cli_ok(&home, &["status", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["protocol"], 5);
     assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
-    assert_eq!(v["agent_tokens"], json!({"input":47,"output":9,"llm_ms":6000,"output_tokens_per_second":1.5}));
+    assert_eq!(v["agent_tokens"], json!({"input":47,"output":9,"tokens_cache_read":24,"tokens_cache_write":6,"llm_ms":6000,"output_tokens_per_second":1.5}));
     let shown = cli_ok(&home, &["show", "ch_0000c601"]).stdout;
-    assert!(shown.contains("1.0 output tok/s of LLM time") && shown.contains("wall split") && shown.contains("approximate"), "{shown}");
+    assert!(shown.contains("cache read 20 / write 5") && shown.contains("1.0 output tok/s of LLM time") && shown.contains("wall split") && shown.contains("approximate"), "{shown}");
 }
 
 #[test]

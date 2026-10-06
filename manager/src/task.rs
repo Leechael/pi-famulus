@@ -91,6 +91,14 @@ impl LiveCpuTracker {
         LiveCpuReading { user_ms, system_ms, percent }
     }
 
+    /// Exclude a failed interval from the next rate without discarding the
+    /// last cumulative CPU totals.
+    pub fn mark_unavailable(&mut self, task_id: &str, at_ms: u64) {
+        if let Some(previous) = self.previous.get_mut(task_id) {
+            previous.at_ms = at_ms;
+        }
+    }
+
     pub fn retain(&mut self, active: &HashSet<String>) {
         self.previous.retain(|task_id, _| active.contains(task_id));
     }
@@ -612,6 +620,16 @@ mod tests {
         assert_eq!((third.user_ms, third.system_ms, third.percent), (300, 40, Some(0.0)));
         tracker.retain(&HashSet::new());
         assert_eq!(tracker.update("sh_1", 16_000, 1, 2).percent, None);
+    }
+
+    #[test]
+    fn live_cpu_tracker_does_not_average_over_a_failed_interval() {
+        let mut tracker = LiveCpuTracker::default();
+        tracker.update("sh_1", 1_000, 100, 20);
+        tracker.mark_unavailable("sh_1", 6_000);
+        let reading = tracker.update("sh_1", 11_000, 200, 40);
+        assert_eq!((reading.user_ms, reading.system_ms), (200, 40));
+        assert_eq!(reading.percent, Some(2.4));
     }
 
     #[test]
