@@ -370,6 +370,10 @@ test('workflow literal security, release graph and four host/target contracts', 
   }
   assert.ok(publish.includes('scripts/next-release.mjs'));
   assert.ok(publish.includes('scripts/bump-release.mjs'));
+  assert.ok(publish.includes('--retry 3 --retry-delay 2'), 'GitHub API reads must retry transient failures');
+  assert.ok(publish.includes('if [[ "$status" == 404 ]]'), 'only a 404 may mean a missing GitHub resource');
+  assert.ok(publish.includes('release_args+=(--prerelease)'), 'beta and nightly GitHub Releases must be prereleases');
+  assert.ok(publish.includes('checking again before retrying'), 'tag and release creation retries must reuse this run\'s release tag');
   assert.ok(!publish.includes('Existing release tag'));
   assert.equal((publish.match(/id-token: write/g) ?? []).length, 1);
   assert.equal((publish.match(/^    environment: npm$/gm) ?? []).length, 1);
