@@ -261,6 +261,12 @@ describe("thinking-suffix fallback (pi core parity)", () => {
     }
   });
 
+  it("openai:high does not fuzzy-match an OpenRouter model", () => {
+    const res = resolveModelSpec("openai:high", CANDIDATES);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect(res).not.toHaveProperty("provider", "openrouter");
+  });
+
   it("openai:nonexistent is a hard no-match when openai is only an OpenRouter id prefix", () => {
     // Scoped whitelist omits the openai provider; the OpenRouter id still
     // contains "openai", so a retry of the bare prefix would unique-fuzzy-match
