@@ -28,6 +28,30 @@ fn section_has_command(section: &str, name: &str) -> bool {
 }
 
 #[test]
+fn concurrent_capacity_config_sets_preserve_fields_and_valid_json() {
+    let home = std::env::temp_dir().join(format!("pi-famulus-config-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.json"), r#"{"managerPath":"/tmp/manager","goneSessionRetention":"2h","unrelated":{"keep":true}}"#).unwrap();
+    let workers: Vec<_> = (1..=16).map(|n| {
+        let home = home.clone();
+        std::thread::spawn(move || {
+            Command::new(BIN).args(["--home", home.to_str().unwrap(), "config", "set", "max-agents", &n.to_string()]).output().unwrap()
+        })
+    }).collect();
+    for worker in workers {
+        let output = worker.join().unwrap();
+        assert!(output.status.success(), "config set failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+    assert!((1..=16).contains(&config["maxAgents"].as_u64().unwrap()));
+    assert_eq!(config["managerPath"], "/tmp/manager");
+    assert_eq!(config["goneSessionRetention"], "2h");
+    assert_eq!(config["unrelated"]["keep"], true);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
 fn help_and_version_are_served_by_the_cli_framework() {
     let help = run(&["--help"]);
     assert!(

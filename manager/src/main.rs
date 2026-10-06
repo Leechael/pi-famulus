@@ -70,18 +70,14 @@ async fn async_main() {
         Sub::Config { action } => match action {
             cli::ConfigAction::Get { key } => {
                 if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
-                else { println!("{}", capacity::max_agents(&home)); 0 }
+                else { match capacity::max_agents(&home) { Ok(n) => { println!("{n}"); 0 }, Err(e) => { eprintln!("pi-famulus: invalid config: {e}"); 1 } } }
             }
             cli::ConfigAction::Set { key, value } => {
                 if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
                 else { match value.parse::<usize>() {
                     Ok(n) => {
-                        let old = capacity::max_agents(&home);
                         match capacity::set_max_agents(&home, n) {
-                            Ok(()) => {
-                                events::emit(&home, None, "capacity.changed", None, serde_json::json!({"budget":"max-agents", "previous":old, "total":n}));
-                                0
-                            }
+                            Ok(_previous) => 0,
                             Err(e) => { eprintln!("pi-famulus: {e}"); 1 }
                         }
                     },
