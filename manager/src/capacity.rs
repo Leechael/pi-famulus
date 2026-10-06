@@ -4,6 +4,60 @@ use serde_json::{Map, Value};
 use std::{fs, path::Path};
 
 pub const DEFAULT_MAX_AGENTS: usize = 8;
+pub const DEFAULT_MAX_TEST: usize = 2;
+
+pub fn set_max_test(home: &Path, count: usize) -> Result<usize, String> {
+    if count == 0 {
+        return Err("max-test must be at least 1".into());
+    }
+    fs::create_dir_all(home).map_err(|e| e.to_string())?;
+    let _lock = ConfigLock::acquire(home)?;
+    let path = home.join("config.json");
+    let mut value = config(&path)?;
+    let previous = max_kind_from(&value, "maxTest", DEFAULT_MAX_TEST)?;
+    let object = value
+        .as_object_mut()
+        .ok_or("config.json must contain a JSON object")?;
+    object.insert("maxTest".into(), Value::from(count as u64));
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
+    let tmp = home.join(format!("config.json.{}.tmp", std::process::id()));
+    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    crate::events::emit(
+        home,
+        None,
+        "capacity.changed",
+        None,
+        serde_json::json!({"budget":"max-test", "previous":previous, "total":count}),
+    );
+    Ok(previous)
+}
+
+pub fn max_kind(home: &Path, kind: &str) -> Result<usize, String> {
+    let value = config(&home.join("config.json"))?;
+    let key = match kind {
+        "test-suite" => "maxTest",
+        "test" => "maxTest",
+        _ => return Ok(usize::MAX),
+    };
+    max_kind_from(&value, key, DEFAULT_MAX_TEST)
+}
+
+fn max_kind_from(value: &Value, key: &str, default: usize) -> Result<usize, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            if value.get(key).is_none() {
+                Ok(default)
+            } else {
+                Err(format!("config.json {key} must be a positive integer"))
+            }
+        })
+}
 
 pub fn config(path: &Path) -> Result<Value, String> {
     match fs::read(path) {

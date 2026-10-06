@@ -317,9 +317,13 @@ pub enum RequestKind {
         work_kind: String,
     },
     /// Cancel a queued acquire by its original request id.
-    CancelAcquireAgent { request_id: String },
+    CancelAcquireAgent {
+        request_id: String,
+    },
     /// Return the child-owned agent permit.
-    ReleaseAgent { child_id: String },
+    ReleaseAgent {
+        child_id: String,
+    },
     Shutdown,
     /// CLI only: replace this daemon in place with the binary now at its
     /// executable path (exec, same pid; see `handover.rs`). Answered before
@@ -332,7 +336,9 @@ pub enum RequestKind {
     ClockStatus,
     /// Test-only (`test-clock` feature): advance the manual clock.
     #[cfg(feature = "test-clock")]
-    ClockAdvance { ms: u64 },
+    ClockAdvance {
+        ms: u64,
+    },
     /// Test-only (`test-clock` feature): end the daemon on the spot the way
     /// a panic in its main future does (exit status 101, no shutdown path,
     /// no destructors). Sent without hello.
@@ -447,7 +453,15 @@ pub struct SessionInfo {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentCapacity { pub used: usize, pub total: usize }
+pub struct AgentCapacity {
+    pub used: usize,
+    pub total: usize,
+    #[serde(default)]
+    pub by_kind: HashMap<String, AgentKindCapacity>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentKindCapacity { pub used: usize, pub total: usize }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentAdmissionOk {
@@ -674,7 +688,9 @@ mod tests {
     async fn frame_over_limit_rejected() {
         let (mut a, mut b) = duplex(1024);
         // Reader rejects an announced length above 4 MiB.
-        a.write_all(&(MAX_FRAME_SIZE + 1).to_be_bytes()).await.unwrap();
+        a.write_all(&(MAX_FRAME_SIZE + 1).to_be_bytes())
+            .await
+            .unwrap();
         let err = read_frame(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // Writer refuses to send an oversized payload.
@@ -808,7 +824,10 @@ mod tests {
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&resp)).unwrap();
-        assert_eq!(v, serde_json::json!({"v": 1, "id": "x", "ok": true, "done": false}));
+        assert_eq!(
+            v,
+            serde_json::json!({"v": 1, "id": "x", "ok": true, "done": false})
+        );
     }
 
     #[test]
@@ -893,10 +912,16 @@ mod tests {
             serde_json::from_value::<TaskRecord>(v).unwrap().signal
         };
         assert_eq!(with(serde_json::json!(9)).as_deref(), Some("SIGKILL"));
-        assert_eq!(with(serde_json::json!("SIGTERM")).as_deref(), Some("SIGTERM"));
+        assert_eq!(
+            with(serde_json::json!("SIGTERM")).as_deref(),
+            Some("SIGTERM")
+        );
         assert_eq!(with(serde_json::Value::Null), None);
         // Missing field is fine too.
-        assert_eq!(serde_json::from_value::<TaskRecord>(base).unwrap().signal, None);
+        assert_eq!(
+            serde_json::from_value::<TaskRecord>(base).unwrap().signal,
+            None
+        );
         // And it serializes as the name.
         let ev = Event::new(EventKind::TaskExited {
             task_id: "sh_a".into(),
@@ -917,20 +942,31 @@ mod tests {
         let raw = r#"{"v":1,"id":"a","type":"start","kind":"shell","command":"x",
             "origin":{"via":"child-bash","child_id":"ch_1","run_id":"run_1"}}"#;
         let req: Request = serde_json::from_str(raw).unwrap();
-        let RequestKind::Start { origin, .. } = req.kind else { panic!() };
+        let RequestKind::Start { origin, .. } = req.kind else {
+            panic!()
+        };
         let o = origin.unwrap();
-        assert_eq!((o.via.as_str(), o.child_id.as_deref(), o.run_id.as_deref()), ("child-bash", Some("ch_1"), Some("run_1")));
+        assert_eq!(
+            (o.via.as_str(), o.child_id.as_deref(), o.run_id.as_deref()),
+            ("child-bash", Some("ch_1"), Some("run_1"))
+        );
         let req: Request =
-            serde_json::from_str(r#"{"id":"b","type":"mark_background","task_id":"sh_1"}"#).unwrap();
-        assert!(matches!(req.kind, RequestKind::MarkBackground { ref task_id } if task_id == "sh_1"));
+            serde_json::from_str(r#"{"id":"b","type":"mark_background","task_id":"sh_1"}"#)
+                .unwrap();
+        assert!(
+            matches!(req.kind, RequestKind::MarkBackground { ref task_id } if task_id == "sh_1")
+        );
         let req: Request =
-            serde_json::from_str(r#"{"id":"c","type":"stop","task_id":"sh_1","reason":"cli"}"#).unwrap();
+            serde_json::from_str(r#"{"id":"c","type":"stop","task_id":"sh_1","reason":"cli"}"#)
+                .unwrap();
         assert!(matches!(req.kind, RequestKind::Stop { reason: Some(ref r), .. } if r == "cli"));
         let req: Request = serde_json::from_str(
             r#"{"type":"hello","client_kind":"extension","session_id":"s","pi_pid":1,"extension_version":"0.3.0","protocol":2}"#,
         )
         .unwrap();
-        assert!(matches!(req.kind, RequestKind::Hello { protocol: Some(2), extension_version: Some(ref v), .. } if v == "0.3.0"));
+        assert!(
+            matches!(req.kind, RequestKind::Hello { protocol: Some(2), extension_version: Some(ref v), .. } if v == "0.3.0")
+        );
         // end_reason mapping
         assert_eq!(end_reason_for_stop(Some("cli")), "stopped:cli");
         assert_eq!(end_reason_for_stop(Some("tui")), "stopped:tui");
