@@ -822,15 +822,19 @@ fn kv(k: &str, v: impl AsRef<str>) {
 fn wake_summary(evs: &[EventLine]) -> Option<String> {
     let emit = evs.iter().find(|e| e.ty == "wake.emit");
     let deliver = evs.iter().find(|e| e.ty == "wake.deliver");
-    match (emit, deliver) {
-        (None, None) => None,
-        (Some(e), None) => Some(format!("emitted {} → not delivered", fmt::datetime(e.ts))),
-        (e, Some(d)) => Some(format!(
-            "{}delivered {} ({})",
-            e.map(|e| format!("emitted {} → ", fmt::datetime(e.ts))).unwrap_or_default(),
-            fmt::datetime(d.ts),
-            d.raw.get("mode").and_then(|m| m.as_str()).unwrap_or("?")
-        )),
+    let inject = evs.iter().find(|e| e.ty == "wake.inject");
+    match (emit, deliver, inject) {
+        (None, None, None) => None,
+        (e, d, i) => {
+            let mut parts = Vec::new();
+            if let Some(e) = e { parts.push(format!("emitted {}", fmt::datetime(e.ts))); }
+            if let Some(d) = d { parts.push(format!("delivered {} ({})", fmt::datetime(d.ts), d.raw.get("mode").and_then(|m| m.as_str()).unwrap_or("?"))); }
+            if let Some(i) = i {
+                let lag = i.raw.get("lag_ms").and_then(|v| v.as_i64()).map(|ms| format!("{:.1}s", ms as f64 / 1000.0)).unwrap_or_else(|| "unknown".to_string());
+                parts.push(format!("injected {} ({} after emit)", fmt::datetime(i.ts), lag));
+            }
+            Some(parts.join(" → "))
+        }
     }
 }
 
