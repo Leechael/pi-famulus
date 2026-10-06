@@ -508,6 +508,75 @@ describe("InProcessRunner", () => {
       expect(released).toBe(1);
     });
 
+    it("does not let an abandoned acquire overwrite a resumed generation's queue wait", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      let acquisitions = 0;
+      let resolveOldAcquire!: (release: () => void) => void;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        clock,
+        acquire: async () => {
+          acquisitions++;
+          if (acquisitions === 2) {
+            return new Promise<() => void>((resolve) => { resolveOldAcquire = resolve; });
+          }
+          if (acquisitions === 3) await clock.sleep(100);
+          return () => {};
+        },
+      });
+      const handle = await runner.start(makeReq());
+      await handle.interrupt();
+
+      await handle.resume("queued old generation");
+      await tick();
+      expect(acquisitions).toBe(2);
+      clock.advanceBy(500);
+      await handle.interrupt();
+
+      await handle.resume("current generation");
+      const currentResult = handle.result;
+      await tick();
+      expect(acquisitions).toBe(3);
+      clock.advanceBy(100);
+      await tick();
+      clock.advanceBy(100);
+      resolveOldAcquire(() => {});
+      await tick();
+
+      factory.sessions[0].complete("done");
+      const result = await currentResult;
+      expect(result.status).toBe("completed");
+      expect(result.queueMs).toBe(100);
+    });
+
+    it("preserves the turn's admission wait across a stall retry", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        stallRetries: 1,
+        clock,
+        acquire: async () => {
+          await clock.sleep(250);
+          return () => {};
+        },
+      });
+      const starting = runner.start(makeReq());
+      await tick();
+      clock.advanceBy(250);
+      const handle = await starting;
+      clock.advanceBy(500); // first generation stalls
+      clock.advanceBy(100); // retry reuses the held slot
+      await tick();
+      factory.sessions[0].complete("recovered");
+      const result = await handle.result;
+      expect(result.status).toBe("completed");
+      expect(result.queueMs).toBe(250);
+    });
+
     it("a completed stall retry re-arms the watchdog for the new generation", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;

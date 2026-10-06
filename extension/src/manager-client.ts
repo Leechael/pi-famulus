@@ -417,9 +417,12 @@ export class ManagerClient {
     workKind = "other",
     signal?: AbortSignal,
   ): Promise<{ granted: boolean; rejection?: string }> {
+    if (signal?.aborted) throw new Error("subagent admission cancelled");
     const message: Record<string, unknown> = { type: "acquire_agent", child_id: childId };
     if (this.protocolLevel_ >= 5) message.work_kind = workKind;
-    const res = await this.request(message, DEFAULT_REQUEST_TIMEOUT_MS, signal, true);
+    // Protocol 4 has no cancel frame. Keep its immediate acquire correlated so
+    // admission can release a grant that arrives after the generation aborts.
+    const res = await this.request(message, DEFAULT_REQUEST_TIMEOUT_MS, this.protocolLevel_ >= 5 ? signal : undefined, true);
     return { granted: res.granted === true, ...(typeof res.rejection === "string" ? { rejection: res.rejection } : {}) };
   }
 
@@ -760,7 +763,7 @@ export class ManagerClient {
     waitForAdmission = false,
   ): Promise<Record<string, unknown>> {
     const type = String(msg.type);
-    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "release_agent"].includes(type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent"].includes(type);
     const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
@@ -783,9 +786,9 @@ export class ManagerClient {
       };
       const cancelRemoteAcquire = () => {
         const requestId = entry.requestId;
-        if (type === "acquire_agent" && requestId && this.socket && this.state === "connected") {
-          // The cancel frame follows the original request on this stream.
-          // The daemon handles grant/cancel races under the same lock.
+        if (type === "acquire_agent" && this.protocolLevel_ >= 5 && requestId) {
+          // Protocol-5 cancellation is retryable across reconnects, so a grant
+          // raced with a dropped socket cannot outlive the cancelled generation.
           void this.request({
             type: "cancel_acquire_agent",
             request_id: requestId,

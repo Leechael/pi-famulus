@@ -278,6 +278,10 @@ export class SubagentRegistry implements RunRegistry {
     // "running" record (ghost agents in ls).
     for (const child of run.children) {
       if (child.status === "pending" || child.status === "running") {
+        if (child.status === "pending" && child.queueStartedAt !== undefined) {
+          child.queueMs = Math.max(0, now - child.queueStartedAt);
+          child.queueStartedAt = undefined;
+        }
         child.status = "interrupted";
         child.endedAt = now;
         child.result = {
@@ -539,6 +543,10 @@ export class SubagentRegistry implements RunRegistry {
         runId: child.runId,
         name: child.name,
         agent: child.agent,
+        workKind: child.workKind,
+        queueMs: child.queueMs ?? (child.status === "pending" && child.queueStartedAt !== undefined
+          ? Math.max(0, this.now() - child.queueStartedAt)
+          : undefined),
         model: child.model,
         status: child.status,
         startedAt: child.startedAt,

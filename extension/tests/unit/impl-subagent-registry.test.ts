@@ -19,7 +19,7 @@ function makeStack(opts: { maxConcurrentChildren?: number; spawnBudgetPerHour?: 
     acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
   });
   registry.setRunner(runner);
-  return { registry, factory, runner };
+  return { registry, factory, runner, clock };
 }
 
 function addReq(registry: SubagentRegistry, runId: string, name: string): ChildRunRequest {
@@ -254,6 +254,19 @@ describe("SubagentRegistry", () => {
     expect(registry.get(run.runId)!.children[0]).toMatchObject({ status: "running", turn: 1 });
   });
 
+  it("records elapsed admission wait when disposing a queued child", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+    let terminal: RunRecord | undefined;
+    registry.onTransition((record) => { terminal = record; });
+
+    registry.disposeRun(run.runId);
+
+    expect(terminal?.children[0]).toMatchObject({ status: "interrupted", queueMs: 75 });
+  });
+
   it("disposeRun interrupts children, disposes sessions, and removes the run", async () => {
     const { registry, factory } = makeStack();
     factory.autoComplete = null;
@@ -302,6 +315,11 @@ describe("SubagentRegistry", () => {
     const h1 = await registry.startChild(addReq(registry, run.runId, "a"));
     await registry.startChild(addReq(registry, run.runId, "b"));
     expect(registry.activeChildren().map((c) => c.name)).toEqual(["a", "b"]);
+    expect(registry.activeChildren()[0]).toMatchObject({
+      childId: h1.childId,
+      workKind: "other",
+      queueMs: 0,
+    });
     factory.sessions[0].complete();
     await h1.result;
     await tick();

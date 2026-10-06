@@ -1078,6 +1078,23 @@ fn p9_protocol_v4_uses_global_only_immediate_admission() {
 }
 
 #[test]
+fn p17_status_survives_malformed_kind_budget() {
+    let home = test_home("p17-bad-kind");
+    fs::write(home.join("config.json"), r#"{"maxAgents":2,"maxTest":"2"}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut client = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut client, "session-p17-status", 5);
+
+    let response = client.request(r#"{"id":"p17-status","type":"status"}"#, "p17-status");
+    let value: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["agent_capacity"]["total"], 2, "{value}");
+    assert!(value["agent_capacity"]["by_kind"]["test"].is_null(), "{value}");
+    assert_eq!(value["agent_capacity"]["by_kind"]["build"]["total"], 2, "{value}");
+}
+
+#[test]
 fn p11_capacity_increase_notifies_daemon_and_wakes_kind_queue() {
     let home = test_home("p11-budget-wake");
     fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":1}"#).unwrap();
@@ -1150,7 +1167,24 @@ fn p10_cancel_and_disconnect_remove_queued_acquires() {
     );
     assert!(compact(&cancel_ack).contains("\"ok\":true"), "{cancel_ack}");
     drop(disconnected);
-    std::thread::sleep(Duration::from_millis(100));
+    let disconnect_deadline = Instant::now() + RESPONSE_TIMEOUT;
+    let mut attempt = 0;
+    loop {
+        let id = format!("p10-disconnect-status-{attempt}");
+        let status = contender.request(&format!(r#"{{"id":"{id}","type":"status"}}"#), &id);
+        let value: Value = serde_json::from_str(&status).unwrap();
+        let observed = value["sessions"].as_array().is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                session["session_id"] == "session-p10-drop" && session["connected"] == false
+            })
+        });
+        if observed {
+            break;
+        }
+        assert!(Instant::now() < disconnect_deadline, "daemon did not observe disconnected session");
+        attempt += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    }
     holder.request(
         r#"{"id":"p10-release","type":"release_agent","child_id":"ch_hold"}"#,
         "p10-release",
@@ -1194,7 +1228,7 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut next_retry = Instant::now() + Duration::from_secs(3);
-    let mut retries = 1;
+    let mut same_id_retries = 1; // Count the explicit retry above.
     let mut status_frames = waiter
         .history
         .iter()
@@ -1203,7 +1237,7 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
     loop {
         if Instant::now() >= next_retry {
             waiter.send(acquire);
-            retries += 1;
+            same_id_retries += 1;
             next_retry += Duration::from_secs(3);
         }
         let frame = waiter.read_frame((Instant::now() + Duration::from_millis(100)).min(deadline));
@@ -1214,7 +1248,7 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
         let value: Value = serde_json::from_str(&frame).unwrap();
         if value["id"] == "p16-wait" {
             assert_eq!(value["granted"], true, "{value}");
-            assert!(retries >= 2, "grant arrived without a same-id retry after backpressure");
+            assert!(same_id_retries >= 1, "no same-id retry was sent after backpressure");
             assert!(status_frames > 0, "no flooded status responses drained before grant");
             break;
         }
@@ -1222,6 +1256,14 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
             status_frames += 1;
         }
     }
+    let quiet_deadline = Instant::now() + Duration::from_secs(2);
+    while waiter.read_frame(quiet_deadline).is_some() {}
+    let grant_responses = waiter
+        .history
+        .iter()
+        .filter(|frame| serde_json::from_str::<Value>(frame).ok().is_some_and(|value| value["id"] == "p16-wait"))
+        .count();
+    assert_eq!(grant_responses, 1, "same-id retry received duplicate grant frames");
 }
 
 #[test]

@@ -12,7 +12,7 @@ The daemon owns `maxAgents` in `<home>/config.json` (default 8). Change it at ru
 | `max-git` | `maxGit` | current `maxAgents` |
 | `max-read/search` | `maxReadSearch` | current `maxAgents` |
 
-Unconfigured kinds inherit the global limit, so they add no stricter cap. Every configured value must be a positive integer. `status` reports global used/total and used/total for each kind; JSON status includes the same data under `agent_capacity.by_kind`. Successful changes append a `capacity.changed` event and notify a running daemon, which re-evaluates eligible waiters. Invalid or non-object `config.json` is surfaced as an error; admission never silently falls back to a larger budget.
+Unconfigured kinds inherit the global limit, except `test-suite` and `test`, which default to 2. Every configured value must be a positive integer. `status` reports global used/total and used/total for each kind; JSON status includes the same data under `agent_capacity.by_kind`. Successful changes append a `capacity.changed` event and notify a running daemon, which re-evaluates eligible waiters. Invalid or non-object `config.json` is surfaced as an error; admission never silently falls back to a larger budget.
 
 ## Work-kind source
 

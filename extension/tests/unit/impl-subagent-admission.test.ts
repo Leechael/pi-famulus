@@ -33,6 +33,30 @@ function setup() {
 }
 
 describe("machine agent admission", () => {
+  it("clears the default retry timer when admission is aborted", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = setup();
+      vi.mocked(s.manager.acquireAgent).mockResolvedValue({ granted: false, rejection: "global_capacity" });
+      const controller = new AbortController();
+      const admission = admitAgentChild({
+        childId: "ch-abort-wait",
+        reserveLocal: s.reserveLocal,
+        manager: s.manager,
+        leases: new Map(),
+        ticket: { current: () => !controller.signal.aborted, signal: controller.signal },
+        notice: () => {},
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(1);
+      controller.abort();
+      await expect(admission).rejects.toThrow("subagent admission cancelled");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("backs off on structured rejection, frees local slot, then grants", async () => {
     const s = setup();
     vi.mocked(s.manager.acquireAgent)

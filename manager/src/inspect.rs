@@ -1318,6 +1318,18 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
             outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
         }
     }
+    let mut unknown_kinds: Vec<_> = st
+        .agent_capacity
+        .by_kind
+        .keys()
+        .filter(|kind| !crate::capacity::WORK_KINDS.contains(&kind.as_str()))
+        .collect();
+    unknown_kinds.sort();
+    for kind in unknown_kinds {
+        if let Some(capacity) = st.agent_capacity.by_kind.get(kind) {
+            outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
+        }
+    }
     outln!(
         "sessions: {} ({} connected)",
         st.sessions.len(),

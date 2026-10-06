@@ -482,7 +482,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.toolDepth = 0;
     this.decisionPaused = false;
 
-    this.generationQueueMs = 0;
+    if (!reuseSlot) this.generationQueueMs = 0;
     if (this.acquire && !reuseSlot) {
       const admissionAbort = new AbortController();
       this.admissionAbort = admissionAbort;
@@ -506,9 +506,11 @@ class InProcessChildHandle implements DisposableChildHandle {
         });
         return;
       } finally {
-        this.generationQueueMs = Math.max(0, this.now() - queuedAt);
-        if (this.admissionStartedAt === queuedAt) this.admissionStartedAt = null;
-        if (this.admissionAbort === admissionAbort) this.admissionAbort = null;
+        if (gen === this.generation) {
+          this.generationQueueMs = Math.max(0, this.now() - queuedAt);
+          if (this.admissionStartedAt === queuedAt) this.admissionStartedAt = null;
+          if (this.admissionAbort === admissionAbort) this.admissionAbort = null;
+        }
       }
     }
     if (this.disposed || this.isSettled(gen)) {
