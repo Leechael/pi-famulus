@@ -579,7 +579,8 @@ export default function (pi: ExtensionAPI): void {
             if (released) return;
             released = true;
             releaseLocal();
-            void manager.releaseAgent(req.childId);
+            // Disconnect reaping is the fallback if the daemon is already gone.
+            void manager.releaseAgent(req.childId).catch(() => {});
           };
         } catch (error) {
           await manager.releaseAgent(req.childId);
