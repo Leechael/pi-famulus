@@ -10,7 +10,7 @@ import type { Wake } from "../lib/wake-adapter.ts";
 import { isPoll, type Grade } from "./graders.ts";
 import { errorAfterCompatibilityGrade } from "./episode-error-policy.ts";
 import { compileTextSegments, loadManifest, removeSegments, resolveVariant } from "./manifest.ts";
-import { conditionError, createStubUiTools, waitForDefinition } from "./fixtures/computer-use-0.5.1.ts";
+import { conditionError, createStubUiTools, matchesFixtureCondition, waitForDefinition } from "./fixtures/computer-use-0.5.1.ts";
 import { LONG_HISTORY_TARGET_CHARS, syntheticHistory } from "./fixtures/monitor-waiter-history.ts";
 import { waiterMisuses } from "./monitor-waiter-graders.ts";
 import { DEFAULT_SCENARIOS, getScenario, SCENARIOS } from "./scenarios.ts";
@@ -86,9 +86,14 @@ describe("waiter misuse classification", () => {
     const bad = waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", ref: "@e1", role: "AXWindow", value: "Export ready" })]);
     assert.match(bad[0].reasons.join(), /fabricated\/non-fixture/);
   });
-  it("accepts genuinely observed window and scoped readiness waits", () => {
+  it("accepts genuine window/leaf scopes and excludes siblings/invalid refs", () => {
     assert.deepEqual(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", ref: "@e1", text: "Export preview", role: "AXWindow" })]), []);
     assert.deepEqual(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", scopeRef: "@e1", text: "Export ready" })]), []);
+    assert.equal(matchesFixtureCondition({ scopeRef: "@e2", role: "AXStaticText", text: "Export ready" }), true);
+    assert.equal(matchesFixtureCondition({ scopeRef: "@e2", value: "TOKEN", ref: undefined }), false);
+    assert.equal(matchesFixtureCondition({ scopeRef: "@e2", text: "TOKEN" }, "TOKEN"), false);
+    assert.equal(matchesFixtureCondition({ scopeRef: "@e3", text: "TOKEN" }, "TOKEN"), true);
+    assert.equal(matchesFixtureCondition({ scopeRef: "@bad", text: "Export ready" }), false);
   });
   it("rejects a fabricated UI condition, not just missing arguments", () => {
     assert.match(waiterMisuses([...observe(), call(3, "wait_for", { stateId: "eval-ui-1", text: "Invented UI dialog" })])[0].reasons.join(), /non-fixture/);
@@ -113,6 +118,13 @@ describe("authoritative compatibility failure/error precedence", () => {
       if (error === undefined) assert.equal("episodeError" in g.metrics, false);
       else assert.equal(g.metrics.episodeError, error);
     }
+  });
+  it("preserves a proven source-tamper failure with ancillary error without inventing waiter counts", () => {
+    const g: Grade = { pass: false, reason: "fixture source modified", metrics: { fixtureSourceIntact: false, badWaiters: 0 } };
+    assert.equal(errorAfterCompatibilityGrade(compatibility, g, "provider error"), undefined);
+    assert.equal(g.metrics.badWaiters, 0);
+    assert.equal(g.metrics.fixtureSourceIntact, false);
+    assert.equal(g.metrics.episodeError, "provider error");
   });
   it("leaves every unproved/INVALID/passing or non-compatibility error unchanged", () => {
     for (const g of [grade(false, 0), grade(false, -1), grade(false, Number.NaN), grade(false, Infinity), grade(false, "1"), grade(false, true), grade(null, 1), grade(true, 1)]) {

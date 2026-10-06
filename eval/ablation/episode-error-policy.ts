@@ -12,8 +12,9 @@ export function errorAfterCompatibilityGrade(
   error: string | undefined,
 ): string | undefined {
   const badWaiters = grade.metrics.badWaiters;
+  const provenSourceTamper = grade.metrics.fixtureSourceIntact === false;
   if (!scenario.optIn || !scenario.id.startsWith("monitor-waiter-") || grade.pass !== false ||
-      typeof badWaiters !== "number" || !Number.isFinite(badWaiters) || badWaiters <= 0) return error;
+      !(typeof badWaiters === "number" && Number.isFinite(badWaiters) && badWaiters > 0) && !provenSourceTamper) return error;
   if (error !== undefined) grade.metrics.episodeError = error;
   return undefined;
 }

@@ -57,8 +57,13 @@ describe("computer-use compatibility context protocol", () => {
       await pi.prompt("compat-protocol");
       assert.equal(await pi.waitQuiet(100, 30_000), true, pi.stderr.join(""));
       const calls = readFileSync(tracePath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { messages: Array<Record<string, unknown>> });
-      assert.equal(calls.length, 5, "one SDK cache-warming request plus observe, wait, synthetic wake, and final reply");
       const contexts = calls.map((call) => call.messages);
+      const liveContexts = contexts.filter((messages) => messages.some((message) => message.role === "user" && messageText(message) === "compat-protocol"));
+      assert.ok(liveContexts.length >= 4, "live protocol requests are identified by their prompt, independent of SDK warmup count");
+      assert.ok(liveContexts.some((messages) => toolCalls(messages, "observe_ui") > 0));
+      assert.ok(liveContexts.some((messages) => toolCalls(messages, "wait_for") > 0));
+      assert.ok(liveContexts.some((messages) => toolCalls(messages, "emit_compat_wake") > 0));
+      assert.ok(liveContexts.some((messages) => messages.some((message) => message.role === "assistant" && messageText(message).includes("faux compatibility context exercise complete"))));
       const systemRows = contexts.map((messages) => messages.filter((message) => message.role === "system"));
       assert.ok(systemRows.every((rows) => rows.length > 0), "native system prompt remains present for every request");
       assert.ok(systemRows.every((rows) => JSON.stringify(rows) === JSON.stringify(systemRows[0])), "native system prompt is unchanged across continuations");
@@ -75,6 +80,8 @@ describe("computer-use compatibility context protocol", () => {
       const items = pi.events.filter((event) => event.type === "message_end").flatMap((event) => itemFromMessage(event.message as Record<string, unknown>, event.seq, event.t));
       assert.deepEqual(toolResults(items).filter((result) => ["observe_ui", "wait_for", "emit_compat_wake"].includes(result.toolName) && result.isError).map((result) => result.text), [], "fixture tools execute through the SDK protocol");
       assert.equal(wakes(items).filter((wake) => wake.wake.kind === "monitor" && wake.wake.body === "SDK faux continuation").length, 1, "SDK delivered one synthetic wake continuation without a manager");
+      const xmlFallback = itemFromMessage({ role: "custom", customType: "pi-famulus-wake", content: `${(await import("../lib/wake-adapter.ts")).FAMULUS_WAKE_LEAD_IN}\n\n<pi-famulus-wake kind="monitor" id="compat-fixture" description="Synthetic compatibility fixture"><event>SDK faux continuation</event></pi-famulus-wake>` }, 0, 0);
+      assert.deepEqual(wakes(xmlFallback)[0]?.wake.taskIds, ["compat-fixture"], "canonical XML fallback retains monitor id when details are absent");
       assert.ok(existsSync(auditPath), "context_with_system must produce audit rows through the actual SDK lifecycle");
       const audit = readFileSync(auditPath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
       assert.equal(audit.length, calls.length, "context audit runs on each real SDK provider request, including SDK cache warming");

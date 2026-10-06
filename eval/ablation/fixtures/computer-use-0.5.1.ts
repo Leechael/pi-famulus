@@ -76,9 +76,14 @@ function fixtureNodes(ready: boolean, token: string): FixtureNode[] {
 function matchesOutline(p: Record<string, unknown>, ready: boolean, token: string): boolean {
   const ref = trimmed(p.ref), scope = trimmed(p.scopeRef);
   if (ref && !["@e1", "@e2", "@e3"].includes(ref)) return false;
-  if (scope && scope !== "@e1") return false;
+  const descendants: Record<string, readonly string[]> = {
+    "@e1": ["@e1", "@e2", "@e3"],
+    "@e2": ["@e2"],
+    "@e3": ["@e3"],
+  };
+  if (scope && !descendants[scope]) return false;
   const candidates = fixtureNodes(ready, token).filter((node) =>
-    (!ref || node.ref === ref) && (!scope || node.ref === scope || node.ref.startsWith(`${scope}.`) || (scope === "@e1" && node.ref !== "@e1")));
+    (!ref || node.ref === ref) && (!scope || descendants[scope].includes(node.ref)));
   return candidates.some((node) =>
     (!p.text || node.text.toLowerCase().includes(trimmed(p.text).toLowerCase())) &&
     (!p.role || node.role.toLowerCase() === trimmed(p.role).toLowerCase()) &&
