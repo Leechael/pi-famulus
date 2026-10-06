@@ -728,6 +728,216 @@ fn d8b_cli_during_shutdown_reaches_a_successor() {
     drop(a);
 }
 
+/// Regression (D8c, publish run 37439173913): shutdown can take longer
+/// than the client's former 5s pid wait under scheduler/process-scan load.
+/// Keep the real daemon in its manual grace for 6s: a CLI must wait for its
+/// lifetime lock to release, then reach a successor, not spawn too early
+/// and fail with E_INTERNAL "manager is shutting down".
+#[cfg(feature = "test-clock")]
+#[test]
+fn d8c_cli_waits_for_slow_shutdown_before_spawning_successor() {
+    let home = Home::new("d8c");
+    let mut daemon = home.start_daemon();
+    let old = daemon.id();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (id, _) = a.start("trap '' TERM; echo armed; sleep 300");
+    wait_output_contains(&mut a, &id, "armed");
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(poll_true(S(3), || {
+        clock_request(&home.path, json!({"type":"clock_status"}))["pending"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|t| t["label"] == "shutdown-grace"))
+    }), "shutdown grace was not armed");
+
+    let mut ls = std::process::Command::new(BIN)
+        .args(["--home", home.path.to_str().unwrap(), "ls"])
+        .env("PI_FAMULUS_TEST_CLOCK", "manual")
+        .env("PI_FAMULUS_TEST_OWNER", test_owner())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Intentionally hold a lifecycle boundary, not a readiness sleep. The
+    // old code exits after 5s even though the daemon is still shutting down.
+    let exited_early = poll_true(S(6), || ls.try_wait().unwrap().is_some());
+    home.advance("shutdown-grace", 2000);
+    assert!(wait_child(&mut daemon, S(8)).is_some());
+    assert!(wait_child(&mut ls, S(10)).is_some(), "CLI did not finish after shutdown");
+    let out = ls.wait_with_output().unwrap();
+    assert!(!exited_early && out.status.success(),
+        "CLI failed before reaching a successor: {}", String::from_utf8_lossy(&out.stderr));
+    assert_ne!(home.pidfile_pid().expect("a successor manager"), old);
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
+    assert!(!log.contains("already running"), "spawn attempted before shutdown completed: {log}");
+    drop(a);
+}
+
+/// Invariant (D8d): a shutdown that never releases its lifetime lock must
+/// hit the startup deadline, without launching a competing daemon.
+#[cfg(feature = "test-clock")]
+#[test]
+fn d8d_cli_bounds_wait_for_stuck_shutdown_without_spawning() {
+    let home = Home::new("d8d");
+    let mut daemon = home.start_daemon();
+    let old = daemon.id();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (id, _) = a.start("trap '' TERM; echo armed; sleep 300");
+    wait_output_contains(&mut a, &id, "armed");
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(poll_true(S(3), || {
+        clock_request(&home.path, json!({"type":"clock_status"}))["pending"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|t| t["label"] == "shutdown-grace"))
+    }), "shutdown grace was not armed");
+
+    // Do not advance the shutdown timer until the CLI has timed out.
+    let out = home.cli(&["ls"], S(20));
+    assert!(!out.status.success(), "CLI unexpectedly passed a stuck shutdown");
+    assert!(out.stderr.contains("manager did not become ready within 15s"), "{}", out.stderr);
+    assert_eq!(home.pidfile_pid(), Some(old));
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
+    assert!(!log.contains("already running"), "spawn attempted during stuck shutdown: {log}");
+    home.advance("shutdown-grace", 2000);
+    assert!(wait_child(&mut daemon, S(8)).is_some());
+    drop(a);
+}
+
+/// Regression (D8e): concurrent shutdown waiters may miss the brief free
+/// lifetime-lock interval when one client starts the successor. Every
+/// waiter must use that healthy successor, not wait on its new lock.
+#[cfg(feature = "test-clock")]
+#[test]
+fn d8e_concurrent_shutdown_waiters_share_the_successor() {
+    let home = Home::new("d8e");
+    let mut daemon = home.start_daemon();
+    let old = daemon.id();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (id, _) = a.start("trap '' TERM; echo armed; sleep 300");
+    wait_output_contains(&mut a, &id, "armed");
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(poll_true(S(3), || {
+        clock_request(&home.path, json!({"type":"clock_status"}))["pending"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|t| t["label"] == "shutdown-grace"))
+    }), "shutdown grace was not armed");
+
+    // Proxy one real refusal. Freeze B before delivering it so B is
+    // guaranteed to miss the unlocked interval while A starts a successor.
+    let retiring = home.path.join("retiring.sock");
+    std::fs::rename(home.sock(), &retiring).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(home.sock()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    struct CliGuard(Option<std::process::Child>);
+    impl Drop for CliGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                if child.try_wait().ok().flatten().is_none() {
+                    kill_pid(child.id(), libc::SIGCONT);
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut b = CliGuard(Some(std::process::Command::new(BIN)
+        .arg("--home").arg(&home.path).arg("ls")
+        .env("PI_FAMULUS_TEST_CLOCK", "manual")
+        .env("PI_FAMULUS_TEST_OWNER", test_owner())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().unwrap()));
+    let (socket, _) = poll_until(S(3), || listener.accept().ok()).expect("B did not connect");
+    let mut proxy = Conn::new(socket);
+    let hello = match proxy.recv(Instant::now() + S(3)) {
+        Recv::Frame(f) => f,
+        _ => panic!("B did not send hello"),
+    };
+    assert_eq!(hello["type"], "hello");
+    let mut upstream = Conn::new(UnixStream::connect(&retiring).unwrap());
+    upstream.send(&hello);
+    let refusal = match upstream.recv(Instant::now() + S(3)) {
+        Recv::Frame(f) => f,
+        _ => panic!("retiring daemon did not answer hello"),
+    };
+    assert_eq!(refusal["error"], json!({"code":"E_INTERNAL","message":"manager is shutting down"}));
+    kill_pid(b.0.as_ref().unwrap().id(), libc::SIGSTOP);
+    proxy.send(&refusal);
+    drop(proxy);
+    drop(listener);
+    std::fs::remove_file(home.sock()).unwrap();
+    std::fs::rename(&retiring, home.sock()).unwrap();
+
+    home.advance("shutdown-grace", 2000);
+    assert!(wait_child(&mut daemon, S(8)).is_some());
+    assert!(home.cli(&["ls"], S(10)).status.success(), "A could not start a successor");
+    let new = home.pidfile_pid().expect("a successor manager");
+    assert_ne!(new, old);
+    let mut check = home.connect();
+    assert_eq!(check.hello_cli()["pid"], new);
+    kill_pid(b.0.as_ref().unwrap().id(), libc::SIGCONT);
+    assert!(wait_child(b.0.as_mut().unwrap(), S(20)).is_some(), "B did not finish");
+    let out = b.0.take().unwrap().wait_with_output().unwrap();
+    assert!(out.status.success(), "B waited on a healthy successor: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(home.pidfile_pid(), Some(new), "B must use A's successor");
+    drop(a);
+}
+
+/// Regression (D8f): a socket-readiness probe can reach a retiring daemon,
+/// so the second hello can refuse shutdown too. Also exercise an unrelated
+/// E_INTERNAL mentioning shutdown: only the exact refusal is retryable.
+#[test]
+fn d8f_cli_retries_shutdown_refusal_on_the_post_spawn_hello() {
+    let home = Home::new("d8f");
+    let path = home.path.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let file = std::fs::OpenOptions::new().create(true).truncate(false)
+            .write(true).open(path.join("manager.lock")).unwrap();
+        let mut lock = fd_lock::RwLock::new(file);
+        let guard = lock.try_write().unwrap();
+        let sock = path.join("manager.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut hellos = 0;
+        while hellos < 2 {
+            let (socket, _) = poll_until(S(5), || listener.accept().ok()).expect("CLI did not reconnect");
+            let mut conn = Conn::new(socket);
+            let hello = match conn.recv(Instant::now() + S(3)) {
+                Recv::Closed => continue, // socket-readiness probe, no hello
+                Recv::Frame(f) => f,
+                Recv::Timeout => panic!("CLI did not send hello"),
+            };
+            assert_eq!(hello["type"], "hello");
+            hellos += 1;
+            let message = if hellos == 1 {
+                "unrelated failure mentions manager is shutting down"
+            } else {
+                "manager is shutting down"
+            };
+            conn.send(&json!({"v":1,"id":hello["id"],"ok":false,
+                "error":{"code":"E_INTERNAL","message":message}}));
+        }
+        // The unrelated first error took the ordinary spawn path. Keep
+        // ownership until that attempt has actually exited "already running".
+        assert!(poll_true(S(5), || std::fs::read_to_string(path.join("manager.log"))
+            .unwrap_or_default().contains("already running")), "first error was misclassified as shutdown");
+        drop(listener);
+        std::fs::remove_file(sock).unwrap();
+        drop(guard);
+    });
+    ready_rx.recv_timeout(S(5)).unwrap();
+    let out = home.cli(&["ls"], S(20));
+    peer.join().unwrap();
+    assert!(out.status.success(), "post-spawn shutdown refusal failed: {}", out.stderr);
+    let new = home.pidfile_pid().expect("a real successor manager");
+    let mut check = home.connect();
+    assert_eq!(check.hello_cli()["pid"], new);
+}
+
 /// D9: explicit `shutdown` with tasks running and an extension still
 /// connected: tasks killed (SIGKILL escalation included), records `killed`,
 /// files removed.
@@ -1142,67 +1352,8 @@ fn s3_session_survives_crash_while_others_connected_and_reattaches() {
 // Backpressure, output, framing (C6, O1-O4, F1-F3)
 // ===========================================================================
 
-/// C6: a watcher that never reads its socket must not stall the task, other
-/// clients, or grow the daemon's memory with the output volume.
-#[test]
-fn c6_never_reading_watcher_is_bounded_and_isolated() {
-    let home = Home::new("c6");
-    let d = home.start_daemon();
-    let daemon_pid = d.id();
-    let mut other = home.connect();
-    other.hello_ext("sess-other");
-    let base_rss = rss_bytes(daemon_pid).unwrap();
-
-    const TOTAL: u64 = 256 * 1024 * 1024;
-    let mut slow = home.connect();
-    slow.hello_ext("sess-slow");
-    let (id, _) = slow.start(&format!(
-        "sleep 0.3; yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c {TOTAL}"
-    ));
-    slow.request_ok(json!({"type":"watch","task_id":id}));
-    // From here on `slow` is never read again.
-
-    let mut peak = base_rss;
-    let mut worst_latency = Duration::ZERO;
-    let deadline = Instant::now() + S(90);
-    loop {
-        let t = Instant::now();
-        let r = other
-            .try_request(json!({"type":"list","all":true}), S(5))
-            .expect("other client starved by a slow watcher");
-        worst_latency = worst_latency.max(t.elapsed());
-        peak = peak.max(rss_bytes(daemon_pid).unwrap_or(0));
-        let _ = r;
-        let mut cli = home.connect();
-        cli.hello_cli();
-        let done = cli.status_of(&id).map(|s| s != "running").unwrap_or(false);
-        if done {
-            break;
-        }
-        assert!(Instant::now() < deadline, "big task stalled behind a slow watcher");
-        std::thread::sleep(MS(100));
-    }
-    let growth = peak.saturating_sub(base_rss);
-    eprintln!(
-        "c6: rss growth {} MiB, worst latency {worst_latency:?}",
-        growth >> 20
-    );
-    assert!(
-        worst_latency < S(2),
-        "other client latency {worst_latency:?} while a watcher was stuck"
-    );
-    assert!(
-        growth < 96 * 1024 * 1024,
-        "daemon RSS grew by {} MiB for {} MiB of output with a stuck watcher",
-        growth >> 20,
-        TOTAL >> 20
-    );
-    // Other clients still get full service.
-    let (e, _) = other.start("echo still-alive");
-    let w = other.request_ok(json!({"type":"wait","task_id":e,"budget_ms":3000}));
-    assert_eq!(w["done"], true);
-    drop(slow);
-}
+// C6's real-time latency/RSS canary lives in backpressure.rs so it runs in
+// a separate harness from this suite's deliberate CPU saturation (D2).
 
 /// O1: multi-MB output round-trips exactly through cursor reads; server caps
 /// a single read so a response never exceeds the 4 MiB frame.
