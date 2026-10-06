@@ -82,9 +82,13 @@ fn invoked_exe_path() -> Option<PathBuf> {
 }
 
 fn canonicalize_invoked_exe(invoked: &Path) -> Option<PathBuf> {
-    (invoked.components().count() > 1)
+    has_invoked_path_component(invoked)
         .then(|| std::fs::canonicalize(invoked).ok())
         .flatten()
+}
+
+fn has_invoked_path_component(invoked: &Path) -> bool {
+    invoked.components().count() > 1
 }
 
 fn current_exe_path() -> Option<PathBuf> {
@@ -669,8 +673,8 @@ pub fn rearm_timers(state: &Shared, id: &str) {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        canonicalize_invoked_exe, non_retired_path, retired_component_stable_name,
-        strip_deleted_suffix,
+        canonicalize_invoked_exe, has_invoked_path_component, non_retired_path,
+        retired_component_stable_name, strip_deleted_suffix,
     };
     use std::path::PathBuf;
 
@@ -692,11 +696,12 @@ mod path_tests {
 
     #[test]
     fn slashless_invoked_names_are_not_canonicalized_from_the_working_directory() {
+        assert!(!has_invoked_path_component(std::path::Path::new("pi-famulus")));
+        assert!(has_invoked_path_component(std::path::Path::new("./pi-famulus")));
         assert_eq!(
             canonicalize_invoked_exe(std::path::Path::new("pi-famulus")),
             None
         );
-        assert_eq!(PathBuf::from("./pi-famulus").components().count(), 2);
     }
 
     #[test]
