@@ -638,3 +638,17 @@ pub fn rearm_timers(state: &Shared, id: &str) {
     }
 }
 
+#[cfg(test)]
+mod path_tests {
+    use super::non_retired_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn legitimate_hidden_package_names_are_not_remapped() {
+        for name in [".pi-famulus-linux-x64", ".pi-famulus-linux-x64-short"] {
+            let original = PathBuf::from("/tmp/node_modules").join(name).join("bin/pi-famulus");
+            assert_eq!(non_retired_path(original.clone()), original, "{name}");
+        }
+    }
+}
+

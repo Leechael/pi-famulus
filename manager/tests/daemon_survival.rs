@@ -60,7 +60,10 @@ fn retired_layout_startup_maps_bin_executable_to_stable_sibling() {
     let stable = install_layout(&home, "pi-famulus-linux-x64");
     let retired = install_layout(&home, ".pi-famulus-linux-x64-AWM9wakS");
     let daemon = home.start_daemon_from(&retired, &[]);
+    let pid = home.pidfile_pid().unwrap();
     fs::remove_dir_all(retired.parent().unwrap().parent().unwrap()).unwrap();
+    let link = fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert!(link.to_string_lossy().ends_with(" (deleted)"), "daemon exe was not deleted: {link:?}");
     start_shell(&home);
     assert_upgrade(&home);
     assert!(stable.is_file());
