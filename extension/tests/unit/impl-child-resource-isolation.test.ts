@@ -144,6 +144,7 @@ describe("child resource isolation", () => {
         expect(child.getSystemPrompt?.()).toContain(CHILD_BEHAVIOR_GUIDELINES);
         expect(child.getSystemPrompt?.()).not.toContain(BEHAVIOR_GUIDELINES);
         expect(child.getSteeringMode?.()).toBe("all");
+        expect(child.effectiveThinkingLevel).toBe("off");
         expect(child.getSystemPrompt?.()).not.toContain("EXT_CANARY");
         expect(child.getSystemPrompt?.()).not.toContain("GLOBAL_CHILD_SKILL_CANARY");
         expect(child.getActiveToolNames?.()).toEqual(["read", "bash", "contact_supervisor", "agent_message"]);

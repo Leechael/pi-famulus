@@ -24,6 +24,12 @@ describe("splitThinkingSuffix", () => {
       thinking: "high",
     });
   });
+  it("normalizes thinking suffixes regardless of case", () => {
+    expect(splitThinkingSuffix("openai:gpt-5.2:HIGH")).toEqual({
+      base: "openai:gpt-5.2",
+      thinking: "high",
+    });
+  });
   it("keeps unrecognized suffixes as part of the id", () => {
     expect(splitThinkingSuffix("openai/gpt-5.2:exacto")).toEqual({
       base: "openai/gpt-5.2:exacto",
@@ -60,6 +66,15 @@ describe("resolveModelSpec", () => {
       provider: "openai",
       id: "gpt-5.2",
       thinking: undefined,
+    });
+  });
+
+  it("normalizes an uppercase thinking suffix on a provider-qualified spec", () => {
+    expect(resolveModelSpec("openai:gpt-5.2:HIGH", CANDIDATES)).toEqual({
+      ok: true,
+      provider: "openai",
+      id: "gpt-5.2",
+      thinking: "high",
     });
   });
 

@@ -148,11 +148,11 @@ class InProcessChildHandle implements DisposableChildHandle {
   private unsubscribe: (() => void) | null = null;
   private status_: ChildStatus = "pending";
   private lastEvent: number;
-  /** Generation start (reset per generation; durationMs is relative to runStartedAt). */
+  /** Session start, set once and preserved across user resumes. */
   private startedAt: number;
   /** User-turn start: reset on launch and user resume(), not on stall retries. */
   private runStartedAt: number;
-  /** Timestamp when this generation acquired admission; execution duration excludes queueing. */
+  /** Timestamp when this generation acquired admission; durationMs is measured from here. */
   private admittedAt: number | null;
   /**
    * When the turn's deadlines start counting. Set after admission and session
@@ -270,6 +270,10 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   resolvedModel(): string | undefined {
     return this.resolvedModel_ ?? this.session?.resolvedModel;
+  }
+
+  effectiveThinkingLevel(): string | undefined {
+    return this.session?.effectiveThinkingLevel;
   }
 
   /**

@@ -87,13 +87,37 @@ it("subagent-overrun: the child is still running; body is the summary", () => {
     summary: "one has run 31m in this turn, past its 30m budget, and is still running.",
     lastActivity: { agoMs: 1000, text: "assistant: <running tests>" },
     shell: { taskId: "sh_1", command: "npm test", elapsedMs: 1000, outputPath: "/o", outputBytes: 10, outputIdleMs: 5, growing: true },
+    additional: [{
+      runId: "run_2",
+      childId: "ch_2",
+      name: "two",
+      elapsedMs: 2_700_000,
+      budgetMs: 2_400_000,
+      reminder: 2,
+      nextReminderMs: 300_000,
+      hardCeilingMs: 900_000,
+      lastActivity: { agoMs: 2_000, text: "migrating" },
+      shell: { taskId: "sh_2", command: "npm run migrate", elapsedMs: 7_000, outputPath: "/m", outputBytes: 12, outputIdleMs: 5, growing: false },
+    }],
   });
   assert.equal(w.kind, "subagent-overrun");
   assert.equal(w.runId, "run_1");
   assert.equal(w.childId, "ch_1");
   assert.equal(w.childName, "one");
   assert.equal(w.status, "running");
-  assert.equal(w.body, "one has run 31m in this turn, past its 30m budget, and is still running.");
+  assert.deepEqual(w.additionalChildren, [{
+    runId: "run_2",
+    childId: "ch_2",
+    name: "two",
+    elapsedMs: 2_700_000,
+    budgetMs: 2_400_000,
+    reminder: 2,
+    nextReminderMs: 300_000,
+    hardCeilingMs: 900_000,
+    lastActivity: { agoMs: 2_000, text: "migrating" },
+    shell: { taskId: "sh_2", elapsedMs: 7_000, command: "npm run migrate", outputPath: "/m", outputBytes: 12, outputIdleMs: 5, growing: false },
+  }]);
+  assert.equal(w.body, "one has run 31m in this turn, past its 30m budget, and is still running.\nAdditional overdue: two (ch_2)");
 });
 
 it("subagent-done: one entry per <child>, error kept", () => {

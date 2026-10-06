@@ -51,6 +51,27 @@ export interface WakeChild {
   error?: string;
 }
 
+export interface WakeOverrunChild {
+  runId: string;
+  childId: string;
+  name: string;
+  elapsedMs: number;
+  budgetMs: number;
+  reminder: number;
+  nextReminderMs: number;
+  hardCeilingMs?: number;
+  lastActivity: { agoMs: number; text: string };
+  shell?: {
+    taskId: string;
+    elapsedMs: number;
+    command: string;
+    outputPath: string;
+    outputBytes: number | null;
+    outputIdleMs: number | null;
+    growing: boolean | null;
+  };
+}
+
 export interface Wake {
   kind: WakeKind;
   customType: string;
@@ -69,6 +90,7 @@ export interface Wake {
   childId?: string;
   childName?: string;
   children: WakeChild[];
+  additionalChildren: WakeOverrunChild[];
   stillRunning: WakeItem[];
   /** Payload text: previews, monitor event, handover result, done results, supervisor message. */
   body: string;
@@ -122,8 +144,71 @@ function stillRunningXml(text: string): WakeItem[] {
 
 type Details = Record<string, unknown> & { kind?: string };
 
+function normalizeOverrunChild(c: Record<string, unknown>): WakeOverrunChild {
+  const activity = (c.lastActivity as Record<string, unknown> | undefined) ?? {};
+  const shell = c.shell as Record<string, unknown> | undefined;
+  return {
+    runId: String(c.runId ?? ""),
+    childId: String(c.childId ?? ""),
+    name: String(c.name ?? ""),
+    elapsedMs: Number(c.elapsedMs ?? 0),
+    budgetMs: Number(c.budgetMs ?? 0),
+    reminder: Number(c.reminder ?? 0),
+    nextReminderMs: Number(c.nextReminderMs ?? 0),
+    ...(c.hardCeilingMs !== undefined ? { hardCeilingMs: Number(c.hardCeilingMs) } : {}),
+    lastActivity: { agoMs: Number(activity.agoMs ?? 0), text: String(activity.text ?? "") },
+    ...(shell ? {
+      shell: {
+        taskId: String(shell.taskId ?? ""),
+        elapsedMs: Number(shell.elapsedMs ?? 0),
+        command: String(shell.command ?? ""),
+        outputPath: String(shell.outputPath ?? ""),
+        outputBytes: typeof shell.outputBytes === "number" ? shell.outputBytes : null,
+        outputIdleMs: typeof shell.outputIdleMs === "number" ? Number(shell.outputIdleMs) : null,
+        growing: typeof shell.growing === "boolean" ? shell.growing : null,
+      },
+    } : {}),
+  };
+}
+
+function overrunBody(summary: string, additional: WakeOverrunChild[]): string {
+  return additional.length
+    ? `${summary}\nAdditional overdue: ${additional.map((c) => `${c.name} (${c.childId})`).join(", ")}`
+    : summary;
+}
+
+function overrunChildXml(c: { attrs: Record<string, string>; inner: string }): WakeOverrunChild {
+  const shellElement = elements(c.inner, "shell")[0];
+  const shellAttrs = shellElement?.attrs ?? {};
+  return normalizeOverrunChild({
+    runId: c.attrs["run-id"],
+    childId: c.attrs["child-id"],
+    name: c.attrs.name,
+    elapsedMs: c.attrs["elapsed-ms"],
+    budgetMs: c.attrs["budget-ms"],
+    reminder: c.attrs.reminder,
+    nextReminderMs: c.attrs["next-reminder-ms"],
+    ...(c.attrs["hard-ceiling-ms"] !== undefined ? { hardCeilingMs: c.attrs["hard-ceiling-ms"] } : {}),
+    lastActivity: {
+      agoMs: elements(c.inner, "last-activity")[0]?.attrs["ago-ms"] ?? 0,
+      text: child(c.inner, "last-activity") ?? "",
+    },
+    ...(shellElement ? {
+      shell: {
+        taskId: shellAttrs["task-id"],
+        elapsedMs: shellAttrs["elapsed-ms"],
+        command: child(shellElement.inner, "command") ?? "",
+        outputPath: child(shellElement.inner, "output-file") ?? "",
+        outputBytes: shellAttrs["output-bytes"] === undefined ? null : Number(shellAttrs["output-bytes"]),
+        outputIdleMs: shellAttrs["output-idle-ms"] === undefined ? null : Number(shellAttrs["output-idle-ms"]),
+        growing: shellAttrs.growing === undefined ? null : shellAttrs.growing === "yes",
+      },
+    } : {}),
+  });
+}
+
 function blank(customType: string, raw: string, leadIn: string, source: Wake["source"]): Wake {
-  return { kind: "unknown", customType, raw, leadIn, source, taskIds: [], tasks: [], children: [], stillRunning: [], body: "" };
+  return { kind: "unknown", customType, raw, leadIn, source, taskIds: [], tasks: [], children: [], additionalChildren: [], stillRunning: [], body: "" };
 }
 
 function fromDetails(customType: string, raw: string, leadIn: string, d: Details): Wake {
@@ -169,9 +254,21 @@ function fromDetails(customType: string, raw: string, leadIn: string, d: Details
       }));
       return { ...w, kind: "subagent-done", runId: String(d.runId), status: String(d.status), children, body: children.map((c) => `## ${c.name}\n${c.result}`).join("\n\n") };
     }
-    case "subagent-overrun":
+    case "subagent-overrun": {
       // The child is still running; the wake asks the parent to decide.
-      return { ...w, kind: "subagent-overrun", runId: String(d.runId), childId: String(d.childId), childName: String(d.name), status: "running", body: String(d.summary ?? "") };
+      const additional = ((d.additional as Array<Record<string, unknown>> | undefined) ?? []).map(normalizeOverrunChild);
+      const summary = String(d.summary ?? "");
+      return {
+        ...w,
+        kind: "subagent-overrun",
+        runId: String(d.runId),
+        childId: String(d.childId),
+        childName: String(d.name),
+        status: "running",
+        additionalChildren: additional,
+        body: overrunBody(summary, additional),
+      };
+    }
     case "supervisor-request":
     case "supervisor-update": {
       const replyWith = d.kind === "supervisor-request" ? child(raw, "reply-with") : undefined;
@@ -219,8 +316,21 @@ function fromXml(customType: string, raw: string, leadIn: string): Wake {
       }));
       return { ...w, kind: "subagent-done", runId: a["run-id"], status: a.status, children, body: children.map((c) => `## ${c.name}\n${c.result}`).join("\n\n") };
     }
-    case "subagent-overrun":
-      return { ...w, kind: "subagent-overrun", runId: a["run-id"], childId: a["child-id"], childName: a.name, status: "running", body: child(inner, "summary") ?? "" };
+    case "subagent-overrun": {
+      const alsoOverdue = elements(inner, "also-overdue")[0];
+      const additional = alsoOverdue ? elements(alsoOverdue.inner, "child").map(overrunChildXml) : [];
+      const summary = child(inner, "summary") ?? "";
+      return {
+        ...w,
+        kind: "subagent-overrun",
+        runId: a["run-id"],
+        childId: a["child-id"],
+        childName: a.name,
+        status: "running",
+        additionalChildren: additional,
+        body: overrunBody(summary, additional),
+      };
+    }
     case "supervisor-request":
     case "supervisor-update": {
       const replyWith = child(inner, "reply-with");

@@ -827,12 +827,31 @@ fn wake_summary(evs: &[EventLine]) -> Option<String> {
         (None, None, None) => None,
         (e, d, i) => {
             let mut parts = Vec::new();
-            if let Some(e) = e { parts.push(format!("emitted {}", fmt::datetime(e.ts))); }
-            if let Some(d) = d { parts.push(format!("delivered {} ({})", fmt::datetime(d.ts), d.raw.get("mode").and_then(|m| m.as_str()).unwrap_or("?"))); }
-            if e.is_some() && d.is_none() { parts.push("not delivered".to_string()); }
+            if let Some(e) = e {
+                parts.push(format!("emitted {}", fmt::datetime(e.ts)));
+            }
+            if let Some(d) = d {
+                parts.push(format!(
+                    "delivered {} ({})",
+                    fmt::datetime(d.ts),
+                    d.raw.get("mode").and_then(|m| m.as_str()).unwrap_or("?")
+                ));
+            }
+            if e.is_some() && d.is_none() && i.is_none() {
+                parts.push("not delivered".to_string());
+            }
             if let Some(i) = i {
-                let lag = i.raw.get("lag_ms").and_then(|v| v.as_i64()).map(|ms| format!("{:.1}s", ms as f64 / 1000.0)).unwrap_or_else(|| "unknown".to_string());
-                parts.push(format!("injected {} ({} after emit)", fmt::datetime(i.ts), lag));
+                let lag = i
+                    .raw
+                    .get("lag_ms")
+                    .and_then(|v| v.as_i64())
+                    .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+                    .unwrap_or_else(|| "unknown".to_string());
+                parts.push(format!(
+                    "injected {} ({} after emit)",
+                    fmt::datetime(i.ts),
+                    lag
+                ));
             }
             Some(parts.join(" → "))
         }
@@ -1561,6 +1580,44 @@ mod tests {
         assert!(summary.contains("not delivered"), "{summary}");
         let delivered = wake_summary(&[event(1, "wake.emit"), event(2, "wake.deliver")]).unwrap();
         assert!(!delivered.contains("not delivered"), "{delivered}");
+    }
+
+    #[test]
+    fn wake_summary_reports_injection_lag_and_orders_events_without_false_delivery_claims() {
+        let event = |ts, ty: &str| EventLine {
+            ts,
+            src: "extension".to_string(),
+            ty: ty.to_string(),
+            id: Some("wake-1".to_string()),
+            session: None,
+            raw: json!({"ts": ts, "type": ty}),
+        };
+        let mut known_lag = event(30_001, "wake.inject");
+        known_lag.raw = json!({"ts": 30_001, "type": "wake.inject", "lag_ms": 30_000});
+        let injected = wake_summary(&[event(1, "wake.emit"), known_lag]).unwrap();
+        assert!(injected.contains("(30.0s after emit)"), "{injected}");
+        assert!(!injected.contains("not delivered"), "{injected}");
+
+        let unknown_lag = wake_summary(&[event(1, "wake.emit"), event(2, "wake.inject")]).unwrap();
+        assert!(
+            unknown_lag.contains("(unknown after emit)"),
+            "{unknown_lag}"
+        );
+        assert!(!unknown_lag.contains("not delivered"), "{unknown_lag}");
+
+        let mut deliver = event(2, "wake.deliver");
+        deliver.raw = json!({"ts": 2, "type": "wake.deliver", "mode": "steer"});
+        let mut injected = event(3, "wake.inject");
+        injected.raw = json!({"ts": 3, "type": "wake.inject", "lag_ms": 2_000});
+        let combined = wake_summary(&[event(1, "wake.emit"), deliver, injected]).unwrap();
+        let emitted_at = combined.find("emitted").unwrap();
+        let delivered_at = combined.find("delivered").unwrap();
+        let injected_at = combined.find("injected").unwrap();
+        assert!(
+            emitted_at < delivered_at && delivered_at < injected_at,
+            "{combined}"
+        );
+        assert!(!combined.contains("not delivered"), "{combined}");
     }
 
     #[test]
