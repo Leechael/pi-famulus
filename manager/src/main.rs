@@ -30,6 +30,8 @@ use cli::{Cli, Sub};
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
 
 fn main() {
+    // Capture the installed executable path before package managers can rename it.
+    let _ = handover::exe_path();
     // `__run` is every task's process-group leader (`runner`): plain
     // threads, no async runtime, and not a user-facing subcommand.
     let mut args = std::env::args().skip(1);

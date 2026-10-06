@@ -55,15 +55,30 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long connection writers get to flush before exec.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// This daemon's executable path. Linux reports a replaced binary as
-/// "<path> (deleted)"; the upgrade wants the file now at `<path>`.
+/// The executable path captured from the invoked install path before npm can
+/// retire its package directory. `current_exe` is unsuitable after that rename.
 pub fn exe_path() -> std::io::Result<PathBuf> {
-    let p = std::env::current_exe()?;
-    let s = p.to_string_lossy();
-    Ok(match s.strip_suffix(" (deleted)") {
-        Some(orig) => PathBuf::from(orig),
-        None => p,
-    })
+    static INSTALL_EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(path) = INSTALL_EXE.get() {
+        return Ok(path.clone());
+    }
+    let invoked = std::env::args_os().next().map(PathBuf::from);
+    let path = invoked
+        .and_then(|p| std::fs::canonicalize(&p).ok())
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot locate executable"))?;
+    let path = non_retired_path(path);
+    let _ = INSTALL_EXE.set(path.clone());
+    Ok(path)
+}
+
+fn non_retired_path(path: PathBuf) -> PathBuf {
+    let Some(parent) = path.parent() else { return path };
+    let Some(name) = parent.file_name().and_then(|n| n.to_str()) else { return path };
+    if !name.starts_with(".") { return path; }
+    let Some((package, _nonce)) = name.rsplit_once('-') else { return path };
+    if !package.starts_with(".pi-famulus-") { return path; }
+    parent.parent().unwrap_or(parent).join(&package[1..]).join(path.file_name().unwrap_or_default())
 }
 
 pub fn check_line() -> String {
