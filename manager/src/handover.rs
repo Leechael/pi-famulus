@@ -63,6 +63,8 @@ pub fn exe_path() -> std::io::Result<PathBuf> {
         return Ok(path.clone());
     }
     let invoked = std::env::args_os().next().map(PathBuf::from);
+    // Canonicalization can race npm's directory retirement. In the worst case
+    // we cache a retired path, which is the pre-existing current_exe behavior.
     let path = invoked
         .and_then(|p| std::fs::canonicalize(&p).ok())
         .or_else(|| std::env::current_exe().ok())
@@ -73,12 +75,32 @@ pub fn exe_path() -> std::io::Result<PathBuf> {
 }
 
 fn non_retired_path(path: PathBuf) -> PathBuf {
-    let Some(parent) = path.parent() else { return path };
-    let Some(name) = parent.file_name().and_then(|n| n.to_str()) else { return path };
-    if !name.starts_with(".") { return path; }
-    let Some((package, _nonce)) = name.rsplit_once('-') else { return path };
-    if !package.starts_with(".pi-famulus-") { return path; }
-    parent.parent().unwrap_or(parent).join(&package[1..]).join(path.file_name().unwrap_or_default())
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            ancestor = dir.parent();
+            continue;
+        };
+        if let Some(stable_name) = retired_component_stable_name(name) {
+            let suffix = path.strip_prefix(dir).expect("ancestor prefix");
+            let candidate = dir.parent().unwrap_or(dir).join(stable_name).join(suffix);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        ancestor = dir.parent();
+    }
+    path
+}
+
+fn retired_component_stable_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(".pi-famulus-")?;
+    let (platform, nonce) = rest.rsplit_once('-')?;
+    let valid_platform = !platform.is_empty()
+        && platform.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let valid_nonce = nonce.len() >= 6
+        && nonce.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    (valid_platform && valid_nonce).then_some(&name[1..name.len() - nonce.len() - 1])
 }
 
 pub fn check_line() -> String {
