@@ -116,6 +116,8 @@ export interface ChildSessionAdapter {
   getActiveToolNames?(): string[];
   getSystemPrompt?(): string;
   isStreaming(): boolean;
+  /** Current queued steering drain mode, when supported by the runtime. */
+  getSteeringMode?(): "all" | "one-at-a-time";
   subscribe(listener: (event: { type: string }) => void): () => void;
   dispose(): void;
 }
