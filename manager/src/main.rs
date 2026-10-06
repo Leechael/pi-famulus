@@ -31,8 +31,6 @@ use cli::{Cli, Sub};
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
 
 fn main() {
-    // Capture the installed executable path before package managers can rename it.
-    let _ = handover::exe_path();
     // `__run` is every task's process-group leader (`runner`): plain
     // threads, no async runtime, and not a user-facing subcommand.
     let mut args = std::env::args().skip(1);
@@ -86,7 +84,7 @@ async fn async_main() {
                 };
                 match result {
                     Some(Ok(n)) => {
-                        println!("{n}");
+                        out::line(&n.to_string());
                         0
                     }
                     Some(Err(e)) => {
@@ -97,7 +95,9 @@ async fn async_main() {
                 }
             }
             cli::ConfigAction::Set { key, value } => {
-                let kind = (key != "max-agents").then(|| key.strip_prefix("max-")).flatten();
+                let kind = (key != "max-agents")
+                    .then(|| key.strip_prefix("max-"))
+                    .flatten();
                 if key != "max-agents" && !kind.is_some_and(capacity::is_work_kind) {
                     eprintln!("unknown config key: {key}");
                     1
@@ -111,11 +111,9 @@ async fn async_main() {
                             };
                             match result {
                                 Ok(_previous) => {
-                                    if let Ok(mut conn) = client::connect_existing(
-                                        &home,
-                                        &client::HelloMode::Cli,
-                                    )
-                                    .await
+                                    if let Ok(mut conn) =
+                                        client::connect_existing(&home, &client::HelloMode::Cli)
+                                            .await
                                     {
                                         let _: Result<proto::UnitOk, String> = conn
                                             .roundtrip(proto::RequestKind::CapacityChanged)

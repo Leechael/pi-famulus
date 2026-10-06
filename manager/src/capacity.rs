@@ -129,6 +129,53 @@ pub fn max_agents(home: &Path) -> Result<usize, String> {
     load(home)?.max_agents()
 }
 
+/// Cached parsed budget. The config is atomically replaced by `set_max_agents`,
+/// so its inode/metadata stamp invalidates the cache without parsing the file
+/// on every daemon status or admission request.
+#[derive(Default)]
+pub struct MaxAgentsCache {
+    cached: Option<(Option<ConfigStamp>, Result<usize, String>)>,
+}
+
+impl MaxAgentsCache {
+    pub fn get(&mut self, home: &Path) -> Result<usize, String> {
+        let path = home.join("config.json");
+        let stamp = config_stamp(&path)?;
+        if let Some((cached_stamp, value)) = &self.cached {
+            if *cached_stamp == stamp {
+                return value.clone();
+            }
+        }
+        let value = max_agents(home);
+        self.cached = Some((stamp, value.clone()));
+        value
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ConfigStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn config_stamp(path: &Path) -> Result<Option<ConfigStamp>, String> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(ConfigStamp {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
 /// Set the budget under a cross-process lock and return the previous value.
 pub fn set_max_agents(home: &Path, count: usize) -> Result<usize, String> {
     if count == 0 {
@@ -145,15 +192,23 @@ pub fn set_max_agents(home: &Path, count: usize) -> Result<usize, String> {
     object.insert("maxAgents".into(), Value::from(count as u64));
     let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
     let tmp = home.join(format!("config.json.{}.tmp", std::process::id()));
-    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    crate::events::emit(
-        home,
-        None,
-        "capacity.changed",
-        None,
-        serde_json::json!({"budget":"max-agents", "previous":previous, "total":count}),
-    );
+    if let Err(error) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.to_string());
+    }
+    if let Err(error) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.to_string());
+    }
+    if previous != count {
+        crate::events::emit(
+            home,
+            None,
+            "capacity.changed",
+            None,
+            serde_json::json!({"budget":"max-agents", "previous":previous, "total":count}),
+        );
+    }
     Ok(previous)
 }
 
@@ -227,6 +282,33 @@ mod tests {
         assert_eq!(value["maxAgents"], 12);
         assert_eq!(value["maxTestSuite"], 3);
         assert_eq!(value["maxBuild"], 5);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cached_budget_refreshes_after_atomic_update() {
+        let dir = std::env::temp_dir().join(format!("pi-famulus-capacity-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut cache = MaxAgentsCache::default();
+        assert_eq!(cache.get(&dir).unwrap(), 8);
+        set_max_agents(&dir, 12).unwrap();
+        assert_eq!(cache.get(&dir).unwrap(), 12);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unchanged_budget_does_not_emit_a_capacity_change() {
+        let dir = std::env::temp_dir().join(format!("pi-famulus-capacity-event-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        set_max_agents(&dir, 12).unwrap();
+        set_max_agents(&dir, 12).unwrap();
+        let events = fs::read_to_string(crate::events::daemon_events_path(&dir)).unwrap();
+        assert_eq!(events.lines().count(), 1, "{events}");
+        set_max_agents(&dir, 13).unwrap();
+        let events = fs::read_to_string(crate::events::daemon_events_path(&dir)).unwrap();
+        assert_eq!(events.lines().count(), 2, "{events}");
         fs::remove_dir_all(dir).unwrap();
     }
 

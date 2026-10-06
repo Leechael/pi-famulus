@@ -166,6 +166,9 @@ pub struct Snapshot {
     /// the manual test clock continues from here).
     #[serde(default)]
     pub clock_now_ms: u64,
+    /// Machine-wide agent permits survive an in-place exec just like tasks.
+    #[serde(default)]
+    pub agent_permits: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -548,6 +551,7 @@ fn snapshot(
         tasks,
         start_keys: st.start_keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         clock_now_ms: st.clock.now_ms(),
+        agent_permits: st.agent_permits.keys().cloned().collect(),
     })
 }
 

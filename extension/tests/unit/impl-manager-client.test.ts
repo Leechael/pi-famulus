@@ -292,7 +292,10 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(client.protocolLevel()).toBe(4);
     expect(await client.acquireAgent("ch_test", "test-suite")).toEqual({ granted: true });
     const legacyAcquire = fake.received.find((message) => message.type === "acquire_agent");
+    expect(legacyAcquire).toMatchObject({ child_id: "ch_test" });
     expect(legacyAcquire).not.toHaveProperty("work_kind");
+    await client.releaseAgent("ch_test");
+    expect(fake.received.find((message) => message.type === "release_agent")).toMatchObject({ child_id: "ch_test" });
 
     await client.close();
     fake.setProtocol(5);
@@ -374,6 +377,9 @@ describe("ManagerClient (integration, fake manager)", () => {
     for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    const acquireRequest = fake.received.find((message) => message.type === "acquire_agent");
+    const acquireId = acquireRequest?.id;
+    expect(acquireId).toEqual(expect.any(String));
     const restart = fake.refuseFor(500);
     for (let i = 0; i < 50 && client.isAvailable(); i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -386,7 +392,7 @@ describe("ManagerClient (integration, fake manager)", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect(fake.received.find((message) => message.type === "cancel_acquire_agent"))
-      .toMatchObject({ request_id: expect.any(String), child_id: "ch_disconnect_abort" });
+      .toMatchObject({ request_id: acquireId, child_id: "ch_disconnect_abort" });
   });
 
   it("preserves upgrade generation metadata from status", async () => {

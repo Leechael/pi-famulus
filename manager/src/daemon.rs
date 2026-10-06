@@ -155,6 +155,8 @@ pub struct DaemonState {
     pub undelivered_agent_grants: HashMap<(String, String), String>,
     /// One-shot cancellation tombstones for cancel/acquire dispatch races.
     pub cancelled_acquires: HashSet<(String, String, String)>,
+    /// Cached global budget; per-kind settings remain part of CapacityConfig.
+    pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
 }
 
 /// Bound on remembered start keys.
@@ -195,6 +197,7 @@ impl DaemonState {
             pending_agents: std::collections::VecDeque::new(),
             undelivered_agent_grants: HashMap::new(),
             cancelled_acquires: HashSet::new(),
+            agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
         }
     }
 }
@@ -357,6 +360,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     for (sid, key) in snap.start_keys.iter().cloned() {
         st.start_keys.push_back((sid, key));
     }
+    st.agent_permits.extend(snap.agent_permits.iter().cloned().map(|key| (key, ())));
     let clock = st.clock.clone();
     clock.resume_at(snap.clock_now_ms);
     let state: Shared = Arc::new(Mutex::new(st));
@@ -2393,6 +2397,12 @@ fn handle_release_agent(
 }
 
 fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> {
+    let (home, budget_cache) = {
+        let st = state.lock().unwrap();
+        (st.home.clone(), st.agent_budget.clone())
+    };
+    let total = budget_cache.lock().unwrap().get(&home)
+        .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
     let st = state.lock().unwrap();
     // Status is read-only. Extensions need it so task_list can drop ghost
     // agents whose session is no longer connected. Shutdown stays cli-only.
@@ -2423,18 +2433,15 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
     let terminal = st.registry.tasks.len() - running;
     let capacity_config = crate::capacity::load(&st.home)
         .map_err(|error| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}")))?;
-    let total_agent_capacity = capacity_config
-        .max_agents()
-        .map_err(|error| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}")))?;
     Ok(StatusOk {
         version: crate::VERSION.to_string(),
         pid: std::process::id(),
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
         task_counts: TaskCounts { running, terminal },
-        agent_capacity: AgentCapacity {
+        agent_capacity: Some(AgentCapacity {
             used: st.agent_permits.len(),
-            total: total_agent_capacity,
+            total,
             by_kind: {
                 let mut kinds = HashMap::new();
                 for kind in crate::capacity::WORK_KINDS {
@@ -2459,14 +2466,14 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
                     if !kinds.contains_key(&permit.work_kind) {
                         let entry = kinds.entry(permit.work_kind.clone()).or_insert(AgentKindCapacity {
                             used: 0,
-                            total: total_agent_capacity,
+                            total,
                         });
                         entry.used += 1;
                     }
                 }
                 kinds
             },
-        },
+        }),
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),

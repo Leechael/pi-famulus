@@ -24,13 +24,18 @@ export interface AgentAdmissionOptions {
   workKind?: string;
   reserveLocal(): Promise<LocalReservation>;
   manager: AgentAdmissionManager | null;
+  /** Locally held or potentially-held daemon permits, keyed by their kind. */
   leases: Map<string, string>;
+  /** Locally admitted children still waiting for a daemon permit. */
+  pendingLeases?: Set<string>;
   /** Reconnect-time acquires to abort if the child settles while queued. */
   pendingReregistrations?: Map<string, AbortController>;
   ticket?: AdmissionTicket;
   notice(reason: "manager unavailable" | "daemon too old"): void;
   wait?: (signal?: AbortSignal) => Promise<void>;
 }
+
+const MAX_REREGISTER_ATTEMPTS = 40;
 
 const defaultWait = (signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
   const timer = setTimeout(() => {
@@ -71,33 +76,52 @@ function waitForRetry(wait: (signal?: AbortSignal) => Promise<void>, signal?: Ab
 
 /** Reserve the per-session slot first, then obtain a machine-wide work-kind permit. */
 export async function admitAgentChild(options: AgentAdmissionOptions): Promise<(terminal?: boolean) => void> {
-  const { childId, reserveLocal, manager, leases, ticket, notice } = options;
-  const cancelReregistration = () => options.pendingReregistrations?.get(childId)?.abort();
+  const { childId, reserveLocal, manager, leases, pendingLeases, ticket, notice } = options;
   const workKind = options.workKind ?? "other";
   const wait = options.wait ?? defaultWait;
+  const cancelReregistration = () => options.pendingReregistrations?.get(childId)?.abort();
+  const finish = (reservation: LocalReservation) => (terminal = true) => {
+    reservation.release();
+    if (terminal) {
+      cancelReregistration();
+      pendingLeases?.delete(childId);
+      if (leases.delete(childId)) void manager?.releaseAgent(childId).catch(() => {});
+    }
+  };
+  const admitLocally = (reservation: LocalReservation) => {
+    try {
+      reservation.admit();
+    } catch (error) {
+      reservation.release();
+      throw error;
+    }
+    // Keep locally admitted fallback children in the reconciliation set too.
+    // A daemon reconnect can then acquire their permit before a later resume.
+    leases.set(childId, workKind);
+    pendingLeases?.add(childId);
+    return finish(reservation);
+  };
+
   for (;;) {
     const local = await reserveLocal();
-    const release = (terminal = true) => {
-      local.release();
-      if (terminal || !leases.has(childId)) {
-        cancelReregistration();
-        if (leases.delete(childId)) void manager?.releaseAgent(childId).catch(() => {});
-      }
-    };
-
     if (!manager?.isAvailable()) {
       notice("manager unavailable");
-      local.admit();
-      return release;
+      return admitLocally(local);
     }
     if (manager.protocolLevel() < 4) {
       notice("daemon too old");
-      local.admit();
-      return release;
+      return admitLocally(local);
     }
-    if (leases.has(childId)) {
-      local.admit();
-      return release;
+    // A local fallback lease is not yet a daemon permit. Reacquire it, while a
+    // previously granted machine permit survives normal generation resumes.
+    if (leases.has(childId) && !pendingLeases?.has(childId)) {
+      try {
+        local.admit();
+      } catch (error) {
+        local.release();
+        throw error;
+      }
+      return finish(local);
     }
 
     let admission: { granted: boolean; rejection?: string };
@@ -111,18 +135,19 @@ export async function admitAgentChild(options: AgentAdmissionOptions): Promise<(
       if (manager.isAvailable()) throw error;
       notice("manager unavailable");
       // The request may have been granted before its response was lost.
-      leases.set(childId, workKind);
+      // Remember it as pending so reconnect's idempotent acquire can reconcile
+      // that uncertain server-side result without consuming another slot.
+      let fallback: LocalReservation;
       try {
-        const fallback = await reserveLocal();
-        fallback.admit();
-        return (terminal = true) => {
-          fallback.release();
-          if (terminal) cancelReregistration();
-          if (terminal && leases.delete(childId)) void manager.releaseAgent(childId).catch(() => {});
-        };
+        fallback = await reserveLocal();
       } catch (fallbackError) {
-        cancelReregistration();
-        if (leases.delete(childId)) void manager.releaseAgent(childId).catch(() => {});
+        void manager.releaseAgent(childId).catch(() => {});
+        throw fallbackError;
+      }
+      try {
+        return admitLocally(fallback);
+      } catch (fallbackError) {
+        void manager.releaseAgent(childId).catch(() => {});
         throw fallbackError;
       }
     }
@@ -136,7 +161,8 @@ export async function admitAgentChild(options: AgentAdmissionOptions): Promise<(
         throw error;
       }
       leases.set(childId, workKind);
-      return release;
+      pendingLeases?.delete(childId);
+      return finish(local);
     }
 
     local.release();
@@ -149,13 +175,17 @@ export async function admitAgentChild(options: AgentAdmissionOptions): Promise<(
 export async function reregisterAgentLeases(
   manager: AgentAdmissionManager,
   leases: Map<string, string>,
-  wait: () => Promise<void> = defaultWait,
+  wait: (signal?: AbortSignal) => Promise<void> = defaultWait,
+  pendingLeases?: Set<string>,
   pendingReregistrations?: Map<string, AbortController>,
 ): Promise<void> {
   if (manager.protocolLevel() < 4) return;
-  await Promise.all([...leases].map(async ([childId, workKind]) => {
-    while (leases.has(childId) && manager.isAvailable() && manager.protocolLevel() >= 4) {
+  const childIds = new Set([...leases.keys(), ...(pendingLeases ?? [])]);
+  await Promise.all([...childIds].map(async (childId) => {
+    const stillHeld = () => leases.has(childId) || pendingLeases?.has(childId) === true;
+    for (let attempt = 0; attempt < MAX_REREGISTER_ATTEMPTS && stillHeld() && manager.isAvailable() && manager.protocolLevel() >= 4; attempt++) {
       if (pendingReregistrations?.has(childId)) break;
+      const workKind = leases.get(childId) ?? "other";
       const controller = new AbortController();
       pendingReregistrations?.set(childId, controller);
       let admission: { granted: boolean; rejection?: string };
@@ -164,25 +194,31 @@ export async function reregisterAgentLeases(
           ? manager.acquireAgent(childId, workKind, controller.signal)
           : manager.acquireAgent(childId, workKind));
       } catch (error) {
-        if (!leases.has(childId)) break;
+        if (!stillHeld() || controller.signal.aborted) break;
         if (
           error instanceof Error
           && error.message.startsWith("pi-famulus request timed out: acquire_agent")
           && manager.isAvailable()
         ) {
-          await wait();
+          if (attempt + 1 < MAX_REREGISTER_ATTEMPTS) await waitForRetry(wait, controller.signal);
           continue;
         }
         throw error;
       } finally {
         if (pendingReregistrations?.get(childId) === controller) pendingReregistrations.delete(childId);
       }
-      if (!leases.has(childId)) {
+      if (!stillHeld()) {
+        // The child may have settled after the grant was made but before the
+        // acquire response reached this continuation.
         if (admission.granted) void manager.releaseAgent(childId).catch(() => {});
         break;
       }
-      if (admission.granted) break;
-      await wait();
+      if (admission.granted) {
+        leases.set(childId, workKind);
+        pendingLeases?.delete(childId);
+        break;
+      }
+      if (attempt + 1 < MAX_REREGISTER_ATTEMPTS) await waitForRetry(wait, controller.signal);
     }
   }));
 }
