@@ -229,6 +229,13 @@ fn is_shutting_down(e: &str) -> bool {
     e.strip_prefix("E_INTERNAL: ") == Some(SHUTTING_DOWN)
 }
 
+/// How long a client waits for a freshly spawned daemon to publish its
+/// socket. Daemon startup on a loaded machine can take seconds (observed
+/// 5.2 s on a busy 3-core CI runner, see issue #51), far beyond the old
+/// 2 s bound; 30 s leaves wide margin while the 50 ms poll still returns
+/// as soon as the socket is connectable.
+const SPAWN_SOCKET_WAIT: Duration = Duration::from_secs(30);
+
 async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -320,15 +327,15 @@ async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, Strin
         match lifecycle::try_acquire_spawn_lock(home) {
             Ok(Some(guard)) => {
                 spawn_daemon(home)?;
-                let ok = wait_for_socket(home, Duration::from_secs(2)).await;
+                let ok = wait_for_socket(home, SPAWN_SOCKET_WAIT).await;
                 drop(guard); // release the spawn lock (§3.1 step 3)
                 if !ok {
-                    return Err("cannot reach pi-famulus: spawned daemon did not create its socket within 2s".into());
+                    return Err("cannot reach pi-famulus: spawned daemon did not create its socket in time".into());
                 }
             }
             Ok(None) => {
                 // Someone else is spawning; just wait.
-                if !wait_for_socket(home, Duration::from_secs(2)).await {
+                if !wait_for_socket(home, SPAWN_SOCKET_WAIT).await {
                     return Err("cannot reach pi-famulus: another client is spawning the manager, but it did not come up".into());
                 }
             }
