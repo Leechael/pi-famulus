@@ -46,7 +46,10 @@ pub fn set_max_agents(home: &Path, count: usize) -> Result<usize, String> {
 }
 
 fn max_agents_from(value: &Value) -> Result<usize, String> {
-    let Some(raw) = value.get("maxAgents") else {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "config.json must contain a JSON object".to_string())?;
+    let Some(raw) = object.get("maxAgents") else {
         return Ok(DEFAULT_MAX_AGENTS);
     };
     raw.as_u64()
@@ -115,10 +118,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
-        fs::write(&path, "{bad").unwrap();
-        assert!(max_agents(&dir).is_err());
-        assert!(set_max_agents(&dir, 12).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{bad");
+        for corrupt in ["{bad", "[]", "null", "42"] {
+            fs::write(&path, corrupt).unwrap();
+            assert!(max_agents(&dir).is_err(), "accepted {corrupt}");
+            assert!(set_max_agents(&dir, 12).is_err(), "rewrote {corrupt}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 }

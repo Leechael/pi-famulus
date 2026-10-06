@@ -936,6 +936,29 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
 }
 
 #[test]
+fn p6_wrong_shape_capacity_config_refuses_reads_updates_and_admission() {
+    let home = test_home("p6-config-shapes");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut c = connect(&home, CONNECT_TIMEOUT);
+    hello_ext(&mut c, "session-config-shapes");
+    for (index, corrupt) in ["[]", "null", "42"].into_iter().enumerate() {
+        fs::write(home.join("config.json"), corrupt).unwrap();
+        let id = format!("bad{index}");
+        let request = format!(r#"{{"id":"{id}","type":"acquire_agent","child_id":"ch_bad{index}"}}"#);
+        let response = c.request(&request, &id);
+        assert!(compact(&response).contains("\"ok\":false"), "admitted with {corrupt}: {response}");
+        assert!(response.contains("JSON object"), "missing loud config error: {response}");
+        let get = Command::new(BIN).args(["--home", home.to_str().unwrap(), "config", "get", "max-agents"]).output().unwrap();
+        assert!(!get.status.success(), "config get accepted {corrupt}");
+        let set = Command::new(BIN).args(["--home", home.to_str().unwrap(), "config", "set", "max-agents", "12"]).output().unwrap();
+        assert!(!set.status.success(), "config set accepted {corrupt}");
+        assert_eq!(fs::read_to_string(home.join("config.json")).unwrap(), corrupt);
+    }
+}
+
+#[test]
 fn t13_repeated_start_exit_stress() {
     let d = Daemon::start("stress");
     let mut c = d.connect();
