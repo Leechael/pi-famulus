@@ -7,9 +7,11 @@
 import {
   formatFamulusWake,
   shellWakeTitle,
+  type FamulusWake,
   wakeDuration,
   type FormattedWake,
   type OverrunShell,
+  type SubagentOverrunChild,
   type WakeItem,
 } from "./wake";
 
@@ -312,16 +314,10 @@ const OVERRUN_ACTIVITY_CHARS = 300;
  * A child is past its soft budget and still running. The parent decides:
  * extend, steer, or interrupt; doing nothing leaves it running.
  */
-export function formatSubagentOverrun(info: SubagentOverrunInfo): FormattedWake {
-  const shellBit = info.shell ? `; it is waiting on a shell command that has run ${wakeDuration(info.shell.elapsedMs)}` : "";
-  const summary =
-    `${info.name} has run ${wakeDuration(info.elapsedMs)} in this turn, past its ` +
-    `${wakeDuration(info.budgetMs)} budget, and is still running${shellBit}.`;
+function formatOverrunChild(info: SubagentOverrunInfo): SubagentOverrunChild {
   const oneLine = info.lastActivity.text.replace(/\s+/g, " ").trim();
-  const text =
-    oneLine.length > OVERRUN_ACTIVITY_CHARS ? `…${oneLine.slice(-OVERRUN_ACTIVITY_CHARS)}` : oneLine;
-  return formatFamulusWake({
-    kind: "subagent-overrun",
+  const text = oneLine.length > OVERRUN_ACTIVITY_CHARS ? `…${oneLine.slice(-OVERRUN_ACTIVITY_CHARS)}` : oneLine;
+  return {
     runId: info.runId,
     childId: info.childId,
     name: info.name,
@@ -330,25 +326,28 @@ export function formatSubagentOverrun(info: SubagentOverrunInfo): FormattedWake 
     reminder: info.reminder,
     nextReminderMs: info.nextReminderMs,
     ...(info.hardCeilingMs !== undefined ? { hardCeilingMs: info.hardCeilingMs } : {}),
-    summary,
     lastActivity: { agoMs: info.lastActivity.agoMs, text: text || "(no output yet)" },
     ...(info.shell ? { shell: { ...info.shell, command: shellWakeTitle(info.shell.command) } } : {}),
-  });
+  };
+}
+
+function formatSubagentOverrunDetails(info: SubagentOverrunInfo): Extract<FamulusWake, { kind: "subagent-overrun" }> {
+  const child = formatOverrunChild(info);
+  const shellBit = child.shell ? `; it is waiting on a shell command that has run ${wakeDuration(child.shell.elapsedMs)}` : "";
+  const summary =
+    `${child.name} has run ${wakeDuration(child.elapsedMs)} in this turn, past its ` +
+    `${wakeDuration(child.budgetMs)} budget, and is still running${shellBit}.`;
+  return { kind: "subagent-overrun", ...child, summary };
+}
+
+export function formatSubagentOverrun(info: SubagentOverrunInfo): FormattedWake {
+  return formatFamulusWake(formatSubagentOverrunDetails(info));
 }
 
 export function formatSubagentOverrunBatch(infos: SubagentOverrunInfo[]): FormattedWake {
-  const first = formatSubagentOverrun(infos[0]);
-  if (infos.length === 1) return first;
-  const details = {
-    ...first.details,
-    additional: infos.slice(1).map((info) => ({
-      runId: info.runId,
-      childId: info.childId,
-      name: info.name,
-      elapsedMs: info.elapsedMs,
-      budgetMs: info.budgetMs,
-      reminder: info.reminder,
-    })),
-  };
-  return formatFamulusWake(details);
+  if (infos.length === 1) return formatSubagentOverrun(infos[0]);
+  return formatFamulusWake({
+    ...formatSubagentOverrunDetails(infos[0]),
+    additional: infos.slice(1).map(formatOverrunChild),
+  });
 }

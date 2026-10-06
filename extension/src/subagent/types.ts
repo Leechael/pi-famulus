@@ -89,6 +89,8 @@ export interface ChildHandle {
   lastEventAt(): number; // for the stall watchdog / status display
   /** Resolved `provider/id` once the child session has been constructed. */
   resolvedModel(): string | undefined;
+  /** Effective thinking level applied when the child session was constructed. */
+  effectiveThinkingLevel?(): string | undefined;
   /** Collect and reschedule a reminder if this child is overdue at the given time. */
   collectDueOverrun?(now: number): OverrunTick | undefined;
   /** Live child transcript. Empty when the session never started. */
@@ -107,6 +109,8 @@ export interface ChildSessionAdapter {
    * Used for fleet/ls persistence and so the child prompt can name its model.
    */
   readonly resolvedModel?: string;
+  /** Effective thinking level passed to createAgentSession, after model fallbacks. */
+  readonly effectiveThinkingLevel?: string;
   prompt(text: string): Promise<void>;
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;

@@ -29,6 +29,8 @@ export class FakeChildSession implements ChildSessionAdapter {
   streaming = false;
   /** When set, runner prepends "You are running as model …" on first prompt. */
   resolvedModel?: string;
+  /** Effective thinking level selected by the session runtime. */
+  effectiveThinkingLevel?: string;
   /** Non-fatal caveat the runner copies onto the child result. */
   warning?: string;
   /** When non-null, prompt() completes immediately with this text. */
