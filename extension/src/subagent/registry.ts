@@ -53,6 +53,7 @@ export interface RunRecord {
     endedAt?: number;
     /** User turns so far: 1 for the launch, +1 per accepted resume. */
     turn?: number;
+    tokenUsage?: { input: number; output: number };
   }[];
   status: "running" | "completed" | "partial" | "failed" | "interrupted";
   createdAt: number;
@@ -713,6 +714,7 @@ function snapshot(run: InternalRun): RunRecord {
       startedAt: c.startedAt,
       endedAt: c.endedAt,
       turn: c.turn,
+      tokenUsage: c.handle?.tokenUsage() ?? { input: 0, output: 0 },
     })),
   };
 }

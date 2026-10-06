@@ -51,6 +51,10 @@ pub struct AgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
     /// Set by the CLI (not on disk) when the record says running but its
     /// session is not connected: the child cannot be alive.
@@ -901,6 +905,9 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             }
             if let Some(n) = a.tool_calls {
                 kv("tool calls", n.to_string());
+            }
+            if a.tokens_input.is_some() || a.tokens_output.is_some() {
+                kv("tokens", format!("{} input / {} output", a.tokens_input.unwrap_or(0), a.tokens_output.unwrap_or(0)));
             }
             if shells.is_empty() {
                 kv("shells", "none");

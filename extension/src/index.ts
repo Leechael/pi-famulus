@@ -685,6 +685,8 @@ export default function (pi: ExtensionAPI): void {
           ...(c.model !== undefined ? { model: c.model } : {}),
           status: c.status,
           started_at: c.startedAt,
+          tokens_input: c.tokenUsage?.input ?? 0,
+          tokens_output: c.tokenUsage?.output ?? 0,
           ...(c.endedAt !== undefined ? { ended_at: c.endedAt } : {}),
           ...(c.result?.error ? { error: c.result.error } : {}),
           ...(c.result?.attempts !== undefined && c.result.attempts > 1
