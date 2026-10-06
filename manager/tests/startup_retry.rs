@@ -135,6 +135,134 @@ fn stalled_shutdown_probe_does_not_prevent_spawning_successor() {
     );
 }
 
+/// Regression: the retiring manager can remove its endpoint before it
+/// releases manager.lock. Initial hello EOF (not a shutdown refusal) must
+/// wait for that owner, not spawn a losing daemon and fail its 2s socket wait.
+#[test]
+fn initial_hello_eof_waits_for_endpoint_gap_before_spawning_successor() {
+    let home = Home::new("probe-endpoint-gap");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home.path.join("manager.lock"))
+        .unwrap();
+    let mut lock = fd_lock::RwLock::new(file);
+    let guard = lock.try_write().unwrap();
+    let listener = UnixListener::bind(home.sock()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut cli = CliGuard::spawn(&home, "endpoint-gap-session");
+
+    // Anchor the ownership window to this CLI's actual initial hello. Remove
+    // the listener before sending EOF so every subsequent connect sees the
+    // missing endpoint while the lifetime lock is still held.
+    let (initial, _) = accept_hello(&listener);
+    drop(listener);
+    fs::remove_file(home.sock()).unwrap();
+    drop(initial);
+    let exited_early = poll_true(S(3), || {
+        cli.0.as_mut().unwrap().try_wait().unwrap().is_some()
+    });
+    if exited_early {
+        let out = cli.0.take().unwrap().wait_with_output().unwrap();
+        panic!(
+            "CLI failed during held-lock endpoint gap: {}; manager.log: {}",
+            String::from_utf8_lossy(&out.stderr),
+            fs::read_to_string(home.path.join("manager.log")).unwrap_or_default()
+        );
+    }
+    assert!(!home.sock().exists());
+    assert!(home.pidfile_pid().is_none());
+    assert!(
+        daemon_pids_for(&home.path).is_empty(),
+        "spawned a competing daemon"
+    );
+    // spawn_daemon opens manager.log before launching: this also detects a
+    // transient loser that has already exited with AlreadyRunning.
+    assert!(
+        !home.path.join("manager.log").exists(),
+        "spawned while lifetime lock was held"
+    );
+    drop(guard);
+
+    assert!(
+        wait_child(cli.0.as_mut().unwrap(), S(8)).is_some(),
+        "CLI did not finish after lock release"
+    );
+    let out = cli.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "endpoint-gap retry failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "session endpoint-gap-session: stopped 0 task(s)\n"
+    );
+    assert!(out.stderr.is_empty());
+    let successor = home.pidfile_pid().expect("CLI created a real successor");
+    let mut check = home.connect();
+    assert_eq!(check.hello_cli()["pid"], successor);
+    assert_eq!(daemon_pids_for(&home.path), vec![successor]);
+    let log = fs::read_to_string(home.path.join("manager.log")).unwrap();
+    assert!(!log.contains("already running"), "premature spawn: {log}");
+}
+
+/// A framing violation is permanent, both on the initial hello and after
+/// a known shutdown refusal. It must not be retried as a transport failure.
+fn assert_oversized_hello_is_fatal(after_shutdown: bool) {
+    let home = Home::new(if after_shutdown { "probe-oversized" } else { "initial-oversized" });
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home.path.join("manager.lock"))
+        .unwrap();
+    let mut lock = fd_lock::RwLock::new(file);
+    let _guard = lock.try_write().unwrap();
+    let pid_file = serde_json::to_vec(&json!({
+        "pid": 0, "version": "fixture", "started_at": 0
+    })).unwrap();
+    fs::write(home.pidfile(), &pid_file).unwrap();
+    let listener = UnixListener::bind(home.sock()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut cli = CliGuard::spawn(&home, "oversized-session");
+
+    if after_shutdown {
+        refuse_shutdown(&listener);
+    }
+    let (mut probe, _) = accept_hello(&listener);
+    // The real CLI has sent hello. Only the invalid length is needed: frame
+    // validation must reject it before trying to read a payload.
+    probe.send_raw(&(MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
+    assert!(
+        wait_child(cli.0.as_mut().unwrap(), S(3)).is_some(),
+        "oversized hello frame was retried or stalled"
+    );
+    let out = cli.0.take().unwrap().wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "pi-famulus: cannot reach pi-famulus: protocol framing: frame length 4194305 exceeds 4 MiB limit\n"
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(fs::read(home.pidfile()).unwrap(), pid_file, "client changed the owner's pid file");
+    assert!(home.sock().exists(), "client deleted the owner's socket");
+    assert!(daemon_pids_for(&home.path).is_empty(), "spawned a competing daemon");
+    assert!(!home.path.join("manager.log").exists(), "unexpected spawn attempt");
+    assert!(probe.wait_closed(S(1)), "failed handshake connection was not closed");
+}
+
+#[test]
+fn initial_oversized_hello_frame_is_fatal_without_spawning() {
+    assert_oversized_hello_is_fatal(false);
+}
+
+#[test]
+fn shutdown_wait_oversized_probe_frame_is_fatal_without_spawning() {
+    assert_oversized_hello_is_fatal(true);
+}
+
 /// Invariant: a protocol error on a shutdown-wait probe is fatal, not a
 /// transport timeout to swallow. Neither ownership nor protocol files change.
 #[test]

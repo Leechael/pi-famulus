@@ -7,10 +7,11 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 
 | Suite | Kind | What it covers |
 |---|---|---|
-| `src/**` `#[cfg(test)]` | unit | ring buffer, record persistence, state mapping, daemon lock claim, UTF-8 chunk cutting, signal names, id format, manual clock (`test-clock` only) |
+| `src/**` `#[cfg(test)]` | unit | ring buffer, record persistence, state mapping, daemon lock claim, UTF-8 chunk cutting and eager-tee carry ownership, signal names, id format, manual clock (`test-clock` only) |
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | lifecycle table below (except C6), adversarial conditions; slow/stuck/concurrent shutdown startup (`d8c`/`d8d`/`d8e`, test-clock only) and post-spawn hello refusal (`d8f`) |
 | `tests/backpressure.rs` | black box, real-time measurements | C6: stuck watcher, 256 MiB output, unrelated-client latency <2s and RSS growth <96 MiB |
+| `tests/startup_retry.rs` | black box, actual OS locks and CLI | stalled shutdown probes; missing endpoint before lifetime-lock release; fatal protocol/framing errors without spawn or owner-file removal |
 | `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g14) |
 | `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI, CPU accounting and `stats` (p1–p4, e1–e5, c1–c11, g1, g15, g15b) |
 | `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
@@ -19,7 +20,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
 
 Daemon-facing black-box tests (`protocol`, `lifecycle_adversarial`,
-`backpressure`, `mutation_gaps`, `observability`, `upgrade`, `timing_canary`) start the
+`backpressure`, `startup_retry`, `mutation_gaps`, `observability`, `upgrade`, `timing_canary`) start the
 compiled binary with an isolated `--home` (`$TMPDIR/pi-famulus-test-<pid>-<test>`,
 kept short for the ~104-byte socket path limit) and speak the u32-BE +
 JSON protocol directly. They depend only on `serde_json` and `libc`,
@@ -42,8 +43,19 @@ Determinism rules:
   isolation, not a diagnosed product fix for the 2.958s Linux spike in
   publish run 37439173913; C6's workload and bounds are unchanged, with
   additional assertions that the producer succeeds and writes all 256 MiB.
+- Startup tests observe actual framed hellos before changing ownership.
+  The eager-tee UTF-8 unit regression waits for real pipe bytes to be appended
+  before its factory returns; it uses no process-global scheduling hook.
+  U10 releases the character continuation only after upgrade/reconnect.
 - Cleanup: each `Home` kills every recorded task process group and the
   daemon on drop, even when the test panics.
+
+The [2026-10-06 Actions audit](../docs/ci-failure-audit-2026-10-06.md)
+includes cancelled runs and earlier rerun attempts, plus explicit remaining
+uncertainty about the historical C6 stall. TS startup contracts live in
+`extension/tests/unit/contract-startup-retry.test.ts`; the actual flock/Rust
+process replay runs in CI as
+`extension/tests/integration/contract-startup-lock-gap.test.ts`.
 
 ```bash
 cd manager
@@ -55,8 +67,14 @@ cargo mutants -j 3 --timeout 150 -f src/lifecycle.rs -f src/task.rs -f src/regis
   -f src/daemon.rs -f src/sys.rs -f src/proto.rs          # mutation score (manual clock via .cargo/mutants.toml)
 ```
 
-Measured on an M-series Mac with a warm build (129 passing tests with the
-feature, 127 without; the difference is the two `clock` unit tests):
+Full-suite verification on macOS ARM64 at `b48cb28` (2026-10-06):
+218 passing tests with `test-clock`, 211 without, and two pre-existing
+ignored helpers in each mode.
+
+The following warm-build timings are historical, pre-follow-up measurements
+on an M-series Mac (129 passing tests with the feature, 127 without; at that
+snapshot the difference was the two `clock` unit tests). They are not current
+coverage totals:
 
 | | `cargo test` wall | per-test time, summed serially | `cargo mutants -f src/lifecycle.rs` (42 mutants, -j 3) |
 |---|---|---|---|

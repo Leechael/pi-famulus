@@ -292,7 +292,10 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(client.protocolLevel()).toBe(4);
     expect(await client.acquireAgent("ch_test", "test-suite")).toEqual({ granted: true });
     const legacyAcquire = fake.received.find((message) => message.type === "acquire_agent");
+    expect(legacyAcquire).toMatchObject({ child_id: "ch_test" });
     expect(legacyAcquire).not.toHaveProperty("work_kind");
+    await client.releaseAgent("ch_test");
+    expect(fake.received.find((message) => message.type === "release_agent")).toMatchObject({ child_id: "ch_test" });
 
     await client.close();
     fake.setProtocol(5);

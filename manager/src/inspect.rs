@@ -1312,22 +1312,25 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         outln!("binary:   {exe}");
     }
     outln!("uptime:   {}", fmt::human_duration(st.uptime_ms));
-    outln!("agent slots: {}/{} used", st.agent_capacity.used, st.agent_capacity.total);
-    for kind in crate::capacity::WORK_KINDS {
-        if let Some(capacity) = st.agent_capacity.by_kind.get(*kind) {
-            outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
-        }
-    }
-    let mut unknown_kinds: Vec<_> = st
-        .agent_capacity
-        .by_kind
-        .keys()
-        .filter(|kind| !crate::capacity::WORK_KINDS.contains(&kind.as_str()))
-        .collect();
-    unknown_kinds.sort();
-    for kind in unknown_kinds {
-        if let Some(capacity) = st.agent_capacity.by_kind.get(kind) {
-            outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
+    if st.protocol >= 4 {
+        if let Some(agent_capacity) = &st.agent_capacity {
+            outln!("agent slots: {}/{} used", agent_capacity.used, agent_capacity.total);
+            for kind in crate::capacity::WORK_KINDS {
+                if let Some(capacity) = agent_capacity.by_kind.get(*kind) {
+                    outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
+                }
+            }
+            let mut unknown_kinds: Vec<_> = agent_capacity
+                .by_kind
+                .keys()
+                .filter(|kind| !crate::capacity::WORK_KINDS.contains(&kind.as_str()))
+                .collect();
+            unknown_kinds.sort();
+            for kind in unknown_kinds {
+                if let Some(capacity) = agent_capacity.by_kind.get(kind) {
+                    outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
+                }
+            }
         }
     }
     outln!(

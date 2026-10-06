@@ -97,9 +97,9 @@ pub struct PendingAgent {
 
 #[derive(Clone)]
 pub struct AgentPermit {
-    work_kind: String,
+    pub(crate) work_kind: String,
     /// Only this request id owns cancellation authority for the held permit.
-    request_id: String,
+    pub(crate) request_id: String,
 }
 
 struct AgentGrant {
@@ -155,6 +155,8 @@ pub struct DaemonState {
     pub undelivered_agent_grants: HashMap<(String, String), String>,
     /// One-shot cancellation tombstones for cancel/acquire dispatch races.
     pub cancelled_acquires: HashSet<(String, String, String)>,
+    /// Cached global budget; per-kind settings remain part of CapacityConfig.
+    pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
 }
 
 /// Bound on remembered start keys.
@@ -195,6 +197,7 @@ impl DaemonState {
             pending_agents: std::collections::VecDeque::new(),
             undelivered_agent_grants: HashMap::new(),
             cancelled_acquires: HashSet::new(),
+            agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
         }
     }
 }
@@ -356,6 +359,33 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     }
     for (sid, key) in snap.start_keys.iter().cloned() {
         st.start_keys.push_back((sid, key));
+    }
+    if snap.agent_permit_details.is_empty() {
+        // Compatibility with pre-work-kind handover snapshots: retain these
+        // global permits, but they have no kind/cancellation owner to restore.
+        st.agent_permits
+            .extend(snap.agent_permits.iter().cloned().map(|key| {
+                (
+                    key,
+                    AgentPermit {
+                        work_kind: String::new(),
+                        request_id: String::new(),
+                    },
+                )
+            }));
+    } else {
+        st.agent_permits
+            .extend(snap.agent_permit_details.into_iter().map(
+                |(session_id, child_id, work_kind, request_id)| {
+                    (
+                        (session_id, child_id),
+                        AgentPermit {
+                            work_kind,
+                            request_id,
+                        },
+                    )
+                },
+            ));
     }
     let clock = st.clock.clone();
     clock.resume_at(snap.clock_now_ms);
@@ -890,7 +920,8 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
                     st.cancelled_acquires.retain(|(owner, _, _)| owner != sid);
                     if why == "closed" {
                         st.agent_permits.retain(|(owner, _), _| owner != sid);
-                        st.undelivered_agent_grants.retain(|(owner, _), _| owner != sid);
+                        st.undelivered_agent_grants
+                            .retain(|(owner, _), _| owner != sid);
                     }
                     crate::events::emit(
                         &home,
@@ -1335,15 +1366,13 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         RequestKind::CancelAcquireAgent {
             request_id,
             child_id,
-        } => {
-            match handle_cancel_acquire(&state, conn_id, &request_id, &child_id) {
-                Ok(wake) => {
-                    respond::<UnitOk>(&tx, &id, Ok(UnitOk {})).await;
-                    send_agent_grants(&state, wake);
-                }
-                Err(error) => respond::<UnitOk>(&tx, &id, Err(error)).await,
+        } => match handle_cancel_acquire(&state, conn_id, &request_id, &child_id) {
+            Ok(wake) => {
+                respond::<UnitOk>(&tx, &id, Ok(UnitOk {})).await;
+                send_agent_grants(&state, wake);
             }
-        }
+            Err(error) => respond::<UnitOk>(&tx, &id, Err(error)).await,
+        },
         RequestKind::CapacityChanged => {
             let result = handle_capacity_changed(&state, conn_id);
             match result {
@@ -2076,11 +2105,13 @@ async fn handle_acquire_agent(
                 (
                     sid.clone(),
                     st.sessions.get(sid).and_then(|s| s.protocol).unwrap_or(0),
+                    st.home.clone(),
+                    st.agent_budget.clone(),
                 )
             })
         })
     };
-    let Some((sid, client_protocol)) = session else {
+    let Some((sid, client_protocol, home, budget_cache)) = session else {
         respond::<AgentAdmissionOk>(
             tx,
             request_id,
@@ -2092,123 +2123,171 @@ async fn handle_acquire_agent(
         .await;
         return;
     };
+    // The #46 global budget cache remains authoritative for the machine-wide
+    // cap. Per-kind settings are loaded alongside it for protocol-5 scheduling.
+    let global_budget = budget_cache.lock().unwrap().get(&home);
+    let capacity = crate::capacity::load(&home);
     let (result, wake) = {
         let mut st = state.lock().unwrap();
-        let request_key = (sid.clone(), child_id.to_string(), request_id.to_string());
-        if st.cancelled_acquires.remove(&request_key) {
-            (None, Vec::new())
+        if st
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.session_id.as_deref())
+            != Some(sid.as_str())
+        {
+            (
+                Some(Err(ProtoError::new(
+                    E_SESSION_REQUIRED,
+                    "extension session required",
+                ))),
+                Vec::new(),
+            )
         } else {
-            // Reuse one parsed config for this acquire and its pending-queue scan.
-            let capacity = crate::capacity::load(&st.home);
-            let wake = match &capacity {
-                Ok(capacity) => wake_pending_with_capacity(&mut st, capacity),
-                Err(_) => Vec::new(),
-            };
-            let key = (sid.clone(), child_id.to_string());
-            let grant_still_undelivered = st
-                .undelivered_agent_grants
-                .get(&(sid.clone(), request_id.to_string()))
-                .is_some_and(|owner| owner == child_id);
-            if st.agent_permits.contains_key(&key)
-                && (grant_still_undelivered || re_served_grants.contains(request_id))
-            {
-                (None, wake)
-            } else if st.agent_permits.contains_key(&key) {
-                (Some(Ok(AgentAdmissionOk { granted: true, rejection: None })), wake)
-            } else if let Some(pending) = st
-                .pending_agents
-                .iter_mut()
-                .find(|p| p.session_id == sid && p.child_id == child_id)
-            {
-                if !pending.request_ids.iter().any(|id| id == request_id) {
-                    if pending.request_ids.len() >= PENDING_AGENT_REQUEST_IDS_MAX {
-                        (Some(Ok(AgentAdmissionOk {
-                            granted: false,
-                            rejection: Some("capacity_queue_full".into()),
-                        })), wake)
+            let request_key = (sid.clone(), child_id.to_string(), request_id.to_string());
+            if st.cancelled_acquires.remove(&request_key) {
+                (None, Vec::new())
+            } else {
+                let wake = match &capacity {
+                    Ok(capacity) => wake_pending_with_capacity(&mut st, capacity),
+                    Err(_) => Vec::new(),
+                };
+                let key = (sid.clone(), child_id.to_string());
+                let grant_still_undelivered = st
+                    .undelivered_agent_grants
+                    .get(&(sid.clone(), request_id.to_string()))
+                    .is_some_and(|owner| owner == child_id);
+                if st.agent_permits.contains_key(&key)
+                    && (grant_still_undelivered || re_served_grants.contains(request_id))
+                {
+                    // A queued grant is already being (re-)served under this id.
+                    (None, wake)
+                } else if st.agent_permits.contains_key(&key) {
+                    // Acquires are idempotent per (session, child). Reconnects and
+                    // same-id backpressure retries must never consume another slot.
+                    (
+                        Some(Ok(AgentAdmissionOk {
+                            granted: true,
+                            rejection: None,
+                        })),
+                        wake,
+                    )
+                } else if let Some(pending) = st
+                    .pending_agents
+                    .iter_mut()
+                    .find(|p| p.session_id == sid && p.child_id == child_id)
+                {
+                    if !pending.request_ids.iter().any(|id| id == request_id) {
+                        if pending.request_ids.len() >= PENDING_AGENT_REQUEST_IDS_MAX {
+                            (
+                                Some(Ok(AgentAdmissionOk {
+                                    granted: false,
+                                    rejection: Some("capacity_queue_full".into()),
+                                })),
+                                wake,
+                            )
+                        } else {
+                            pending.request_ids.push(request_id.to_string());
+                            (None, wake)
+                        }
                     } else {
-                        pending.request_ids.push(request_id.to_string());
                         (None, wake)
                     }
                 } else {
-                    (None, wake)
-                }
-            } else {
-                let budget = match &capacity {
-                    Ok(capacity) => capacity.max_agents().map_err(|error| {
-                        ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
-                    }),
-                    Err(error) => Err(ProtoError::new(
-                        E_INTERNAL,
-                        format!("invalid capacity config: {error}"),
-                    )),
-                };
-                match budget {
-                    Err(error) => (Some(Err(error)), wake),
-                    Ok(budget) if st.agent_permits.len() >= budget => (
-                        Some(Ok(AgentAdmissionOk {
-                            granted: false,
-                            rejection: Some("global_capacity".into()),
-                        })),
-                        wake,
-                    ),
-                    Ok(_) if client_protocol < 5 => {
-                        st.agent_permits.insert(
-                            key,
-                            AgentPermit {
-                                work_kind: String::new(),
-                                request_id: request_id.to_string(),
-                            },
-                        );
-                        (Some(Ok(AgentAdmissionOk { granted: true, rejection: None })), wake)
-                    }
-                    Ok(_) => {
-                        let kind = if work_kind.is_empty() { "other" } else { work_kind };
-                        let kind_budget = match &capacity {
-                            Ok(capacity) => capacity.max_kind(kind).map_err(|error| {
-                                ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
-                            }),
-                            Err(error) => Err(ProtoError::new(
-                                E_INTERNAL,
-                                format!("invalid capacity config: {error}"),
-                            )),
-                        };
-                        match kind_budget {
-                            Err(error) => (Some(Err(error)), wake),
-                            Ok(kind_budget)
-                                if admits_kind(&st.agent_permits, kind, kind_budget) =>
-                            {
-                                st.agent_permits.insert(
-                                    key,
-                                    AgentPermit {
-                                        work_kind: kind.to_string(),
-                                        request_id: request_id.to_string(),
-                                    },
-                                );
-                                (Some(Ok(AgentAdmissionOk { granted: true, rejection: None })), wake)
-                            }
-                            Ok(_) => {
-                                let session_pending = st
-                                    .pending_agents
-                                    .iter()
-                                    .filter(|p| p.session_id == sid)
-                                    .count();
-                                if session_pending >= PENDING_AGENTS_PER_SESSION_MAX
-                                    || st.pending_agents.len() >= PENDING_AGENTS_GLOBAL_MAX
+                    let budget = global_budget
+                        .as_ref()
+                        .map(|budget| *budget)
+                        .map_err(|error| {
+                            ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
+                        });
+                    match budget {
+                        Err(error) => (Some(Err(error)), wake),
+                        Ok(budget) if st.agent_permits.len() >= budget => (
+                            Some(Ok(AgentAdmissionOk {
+                                granted: false,
+                                rejection: Some("global_capacity".into()),
+                            })),
+                            wake,
+                        ),
+                        Ok(_) if client_protocol < 5 => {
+                            st.agent_permits.insert(
+                                key,
+                                AgentPermit {
+                                    work_kind: String::new(),
+                                    request_id: request_id.to_string(),
+                                },
+                            );
+                            (
+                                Some(Ok(AgentAdmissionOk {
+                                    granted: true,
+                                    rejection: None,
+                                })),
+                                wake,
+                            )
+                        }
+                        Ok(_) => {
+                            let kind = if work_kind.is_empty() {
+                                "other"
+                            } else {
+                                work_kind
+                            };
+                            let kind_budget = match &capacity {
+                                Ok(capacity) => capacity.max_kind(kind).map_err(|error| {
+                                    ProtoError::new(
+                                        E_INTERNAL,
+                                        format!("invalid capacity config: {error}"),
+                                    )
+                                }),
+                                Err(error) => Err(ProtoError::new(
+                                    E_INTERNAL,
+                                    format!("invalid capacity config: {error}"),
+                                )),
+                            };
+                            match kind_budget {
+                                Err(error) => (Some(Err(error)), wake),
+                                Ok(kind_budget)
+                                    if admits_kind(&st.agent_permits, kind, kind_budget) =>
                                 {
-                                    (Some(Ok(AgentAdmissionOk {
-                                        granted: false,
-                                        rejection: Some("capacity_queue_full".into()),
-                                    })), wake)
-                                } else {
-                                    st.pending_agents.push_back(PendingAgent {
-                                        session_id: sid,
-                                        child_id: child_id.into(),
-                                        work_kind: kind.into(),
-                                        request_ids: vec![request_id.into()],
-                                        tx: tx.clone(),
-                                    });
-                                    (None, wake)
+                                    st.agent_permits.insert(
+                                        key,
+                                        AgentPermit {
+                                            work_kind: kind.to_string(),
+                                            request_id: request_id.to_string(),
+                                        },
+                                    );
+                                    (
+                                        Some(Ok(AgentAdmissionOk {
+                                            granted: true,
+                                            rejection: None,
+                                        })),
+                                        wake,
+                                    )
+                                }
+                                Ok(_) => {
+                                    let session_pending = st
+                                        .pending_agents
+                                        .iter()
+                                        .filter(|p| p.session_id == sid)
+                                        .count();
+                                    if session_pending >= PENDING_AGENTS_PER_SESSION_MAX
+                                        || st.pending_agents.len() >= PENDING_AGENTS_GLOBAL_MAX
+                                    {
+                                        (
+                                            Some(Ok(AgentAdmissionOk {
+                                                granted: false,
+                                                rejection: Some("capacity_queue_full".into()),
+                                            })),
+                                            wake,
+                                        )
+                                    } else {
+                                        st.pending_agents.push_back(PendingAgent {
+                                            session_id: sid,
+                                            child_id: child_id.into(),
+                                            work_kind: kind.into(),
+                                            request_ids: vec![request_id.into()],
+                                            tx: tx.clone(),
+                                        });
+                                        (None, wake)
+                                    }
                                 }
                             }
                         }
@@ -2275,13 +2354,13 @@ fn handle_cancel_acquire(
     Ok(wake_pending(&mut st))
 }
 
-fn handle_capacity_changed(
-    state: &Shared,
-    conn_id: u64,
-) -> Result<Vec<AgentGrant>, ProtoError> {
+fn handle_capacity_changed(state: &Shared, conn_id: u64) -> Result<Vec<AgentGrant>, ProtoError> {
     let mut st = state.lock().unwrap();
     if !matches!(st.conns.get(&conn_id), Some(h) if h.kind == ClientKind::Cli) {
-        return Err(ProtoError::new(E_FORBIDDEN, "capacity_changed is a cli-only operation"));
+        return Err(ProtoError::new(
+            E_FORBIDDEN,
+            "capacity_changed is a cli-only operation",
+        ));
     }
     Ok(wake_pending(&mut st))
 }
@@ -2289,7 +2368,11 @@ fn handle_capacity_changed(
 fn clear_delivered_grant(state: &Shared, session_id: &str, request_id: &str, child_id: &str) {
     let mut st = state.lock().unwrap();
     let key = (session_id.to_string(), request_id.to_string());
-    if st.undelivered_agent_grants.get(&key).is_some_and(|child| child == child_id) {
+    if st
+        .undelivered_agent_grants
+        .get(&key)
+        .is_some_and(|child| child == child_id)
+    {
         st.undelivered_agent_grants.remove(&key);
     }
 }
@@ -2298,11 +2381,18 @@ fn send_agent_grants_locked(st: &mut DaemonState, wake: Vec<AgentGrant>) {
     for grant in wake {
         let frame = encode_ok(
             &grant.request_id,
-            &AgentAdmissionOk { granted: true, rejection: None },
+            &AgentAdmissionOk {
+                granted: true,
+                rejection: None,
+            },
         );
         if grant.tx.try_send(frame).is_ok() {
             let key = (grant.session_id, grant.request_id);
-            if st.undelivered_agent_grants.get(&key).is_some_and(|child| child == &grant.child_id) {
+            if st
+                .undelivered_agent_grants
+                .get(&key)
+                .is_some_and(|child| child == &grant.child_id)
+            {
                 st.undelivered_agent_grants.remove(&key);
             }
         }
@@ -2316,7 +2406,10 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
     for grant in wake {
         let frame = encode_ok(
             &grant.request_id,
-            &AgentAdmissionOk { granted: true, rejection: None },
+            &AgentAdmissionOk {
+                granted: true,
+                rejection: None,
+            },
         );
         if grant.tx.try_send(frame).is_ok() {
             delivered.push((grant.session_id, grant.request_id, grant.child_id));
@@ -2326,7 +2419,11 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
         let mut st = state.lock().unwrap();
         for (session_id, request_id, child_id) in delivered {
             let key = (session_id, request_id);
-            if st.undelivered_agent_grants.get(&key).is_some_and(|child| child == &child_id) {
+            if st
+                .undelivered_agent_grants
+                .get(&key)
+                .is_some_and(|child| child == &child_id)
+            {
                 st.undelivered_agent_grants.remove(&key);
             }
         }
@@ -2336,7 +2433,11 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
 fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) -> HashSet<String> {
     let pending = {
         let st = state.lock().unwrap();
-        let Some(sid) = st.conns.get(&conn_id).and_then(|conn| conn.session_id.as_ref()) else {
+        let Some(sid) = st
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.session_id.as_ref())
+        else {
             return HashSet::new();
         };
         st.undelivered_agent_grants
@@ -2352,7 +2453,10 @@ fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) ->
         if tx
             .try_send(encode_ok(
                 &request_id,
-                &AgentAdmissionOk { granted: true, rejection: None },
+                &AgentAdmissionOk {
+                    granted: true,
+                    rejection: None,
+                },
             ))
             .is_ok()
         {
@@ -2375,7 +2479,8 @@ fn handle_release_agent(
             .get(&conn_id)
             .and_then(|c| c.session_id.clone())
             .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
-        st.agent_permits.remove(&(sid.clone(), child_id.to_string()));
+        st.agent_permits
+            .remove(&(sid.clone(), child_id.to_string()));
         st.undelivered_agent_grants
             .retain(|(owner, _), child| owner != &sid || child != child_id);
         wake_pending(&mut st)
@@ -2385,6 +2490,15 @@ fn handle_release_agent(
 }
 
 fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> {
+    let (home, budget_cache) = {
+        let st = state.lock().unwrap();
+        (st.home.clone(), st.agent_budget.clone())
+    };
+    let total = budget_cache
+        .lock()
+        .unwrap()
+        .get(&home)
+        .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
     let st = state.lock().unwrap();
     // Status is read-only. Extensions need it so task_list can drop ghost
     // agents whose session is no longer connected. Shutdown stays cli-only.
@@ -2413,24 +2527,22 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         .filter(|e| e.record.status == TaskStatus::Running)
         .count();
     let terminal = st.registry.tasks.len() - running;
-    let capacity_config = crate::capacity::load(&st.home)
-        .map_err(|error| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}")))?;
-    let total_agent_capacity = capacity_config
-        .max_agents()
-        .map_err(|error| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}")))?;
+    let capacity_config = crate::capacity::load(&st.home).map_err(|error| {
+        ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
+    })?;
     Ok(StatusOk {
         version: crate::VERSION.to_string(),
         pid: std::process::id(),
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
         task_counts: TaskCounts { running, terminal },
-        agent_capacity: AgentCapacity {
+        agent_capacity: Some(AgentCapacity {
             used: st.agent_permits.len(),
-            total: total_agent_capacity,
+            total,
             by_kind: {
                 let mut kinds = HashMap::new();
                 for kind in crate::capacity::WORK_KINDS {
-                    let Ok(total) = capacity_config.max_kind(kind) else {
+                    let Ok(kind_total) = capacity_config.max_kind(kind) else {
                         // Per-kind values are advisory; a malformed kind should
                         // not make the entire status endpoint unavailable.
                         continue;
@@ -2443,22 +2555,25 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
                                 .values()
                                 .filter(|permit| permit.work_kind == *kind)
                                 .count(),
-                            total,
+                            total: kind_total,
                         },
                     );
                 }
-                for permit in st.agent_permits.values().filter(|permit| !permit.work_kind.is_empty()) {
+                for permit in st
+                    .agent_permits
+                    .values()
+                    .filter(|permit| !permit.work_kind.is_empty())
+                {
                     if !kinds.contains_key(&permit.work_kind) {
-                        let entry = kinds.entry(permit.work_kind.clone()).or_insert(AgentKindCapacity {
-                            used: 0,
-                            total: total_agent_capacity,
-                        });
+                        let entry = kinds
+                            .entry(permit.work_kind.clone())
+                            .or_insert(AgentKindCapacity { used: 0, total });
                         entry.used += 1;
                     }
                 }
                 kinds
             },
-        },
+        }),
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),
@@ -2521,6 +2636,23 @@ fn handle_shutdown(state: &Shared, conn_id: u64) -> Result<UnitOk, ProtoError> {
 /// Start (or restart) a task's tee pumps and output fanout from the
 /// descriptors in its entry. A pipe already at EOF (None) is skipped.
 pub fn start_task_io(state: &Shared, task_id: &str) {
+    start_task_io_with_tee(state, task_id, task::start_tee);
+}
+
+// Keep tee creation at a narrow seam so tests can force a real pump read
+// before the factory returns, without a global scheduling hook.
+fn start_task_io_with_tee(
+    state: &Shared,
+    task_id: &str,
+    start_tee: impl FnOnce(
+        Option<std::os::fd::OwnedFd>,
+        Option<std::os::fd::OwnedFd>,
+        Arc<Mutex<task::OutputState>>,
+        Option<std::fs::File>,
+        mpsc::Sender<task::OutputChunk>,
+        tokio::sync::watch::Receiver<bool>,
+    ) -> std::io::Result<task::Tee>,
+) {
     let mut st = state.lock().unwrap();
     let park = st.park_tx.subscribe();
     let Some(e) = st.registry.tasks.get_mut(task_id) else {
@@ -2531,14 +2663,8 @@ pub fn start_task_io(state: &Shared, task_id: &str) {
         .ok()
         .map(|(_, err)| err);
     let (tx, rx) = tokio::sync::mpsc::channel(task::CHUNK_CHANNEL_CAP);
-    match task::start_tee(stdout, stderr, e.output.clone(), mirror, tx, park.clone()) {
-        Ok(tee) => e.tee = Some(tee),
-        Err(err) => {
-            let home = st.home.clone();
-            lifecycle::log_line(&home, &format!("tee {task_id}: {err}"));
-            return;
-        }
-    }
+    // Snapshot before starting any pump: a new read must belong only to
+    // the chunk channel, never also to this file carry.
     // What reached the file but not the watchers: after a park, the
     // incomplete UTF-8 tail the fanout held back. It is completed by the
     // next bytes, so the restarted fanout begins with it.
@@ -2552,6 +2678,14 @@ pub fn start_task_io(state: &Shared, task_id: &str) {
     } else {
         Vec::new()
     };
+    match start_tee(stdout, stderr, e.output.clone(), mirror, tx, park.clone()) {
+        Ok(tee) => e.tee = Some(tee),
+        Err(err) => {
+            let home = st.home.clone();
+            lifecycle::log_line(&home, &format!("tee {task_id}: {err}"));
+            return;
+        }
+    }
     let tid = task_id.to_string();
     let state2 = state.clone();
     e.fanout = Some(tokio::spawn(run_output_fanout(
@@ -3171,7 +3305,11 @@ async fn graceful_shutdown(state: &Shared) {
 // Tests
 // ---------------------------------------------------------------------------
 
-fn admits_kind(permits: &HashMap<(String, String), AgentPermit>, kind: &str, budget: usize) -> bool {
+fn admits_kind(
+    permits: &HashMap<(String, String), AgentPermit>,
+    kind: &str,
+    budget: usize,
+) -> bool {
     permits
         .values()
         .filter(|permit| permit.work_kind == kind)
@@ -3265,6 +3403,149 @@ fn admit_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a tee that runs before its factory returns must not have
+    /// its bytes read again as carry. Also preserve the incomplete raw byte
+    /// across the same park/restart seam used by an in-place upgrade.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn utf8_watch_output_is_not_duplicated_when_tee_starts_eagerly() {
+        use std::os::fd::AsRawFd;
+        let home = std::env::temp_dir().join(format!(
+            "pi-famulus-fanout-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = registry::task_output_path(&home, "sess-utf8", "mon_utf8");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (file, _) = task::open_output_files(&path).unwrap();
+        let output = Arc::new(Mutex::new(task::OutputState::new(Some(file), 0)));
+        let record: TaskRecord = serde_json::from_value(serde_json::json!({
+            "task_id":"mon_utf8", "session_id":"sess-utf8", "kind":"monitor",
+            "command":"split UTF-8 pipe producer", "cwd":"/tmp", "pid":0,
+            "status":"running", "exit_code":null, "signal":null,
+            "started_at":0, "ended_at":null, "output_path":path, "output_size":0
+        }))
+        .unwrap();
+        let (read, write) = crate::sys::pipe_cloexec().unwrap();
+        let mut entry = TaskEntry::bare(record, output.clone());
+        entry.stdout_fd = Some(read);
+        entry.watchers.insert(1);
+        let mut registry = Registry::new(home.clone());
+        registry.tasks.insert("mon_utf8".into(), entry);
+        let state = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, false)));
+        let (tx, mut events) = mpsc::channel(8);
+        let writer = tokio::spawn(std::future::pending::<()>());
+        state.lock().unwrap().conns.insert(
+            1,
+            ConnHandle {
+                kind: ClientKind::Extension,
+                session_id: Some("sess-utf8".into()),
+                tx,
+                die: Arc::new(Notify::new()),
+                written: Arc::new(Mutex::new(HashMap::new())),
+                writer: writer.abort_handle(),
+            },
+        );
+        // Real initial bytes, not a fabricated OutputChunk. Wait only for the
+        // actual append (with a failure watchdog), never for a fixed sleep.
+        crate::sys::write_raw(write.as_raw_fd(), b"a\xe4").unwrap();
+        let eager_tee = |expected| {
+            move |stdout, stderr, output: Arc<Mutex<task::OutputState>>, mirror, tx, park| {
+                let tee = task::start_tee(stdout, stderr, output.clone(), mirror, tx, park)?;
+                let until = std::time::Instant::now() + Duration::from_secs(3);
+                while output.lock().unwrap().total_size < expected {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "real tee did not append {expected} bytes"
+                    );
+                    std::thread::yield_now();
+                }
+                Ok(tee)
+            }
+        };
+        start_task_io_with_tee(&state, "mon_utf8", eager_tee(2));
+        let first = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&first.bytes).unwrap();
+        assert_eq!(first["task_id"], "mon_utf8");
+        assert_eq!(first["chunk"], "a", "{first}");
+        assert_eq!(first["next_cursor"], 1);
+
+        let (tee, fanout) = {
+            let mut st = state.lock().unwrap();
+            st.park_tx.send_replace(true);
+            let e = st.registry.tasks.get_mut("mon_utf8").unwrap();
+            (e.tee.take().unwrap(), e.fanout.take().unwrap())
+        };
+        let stdout = tokio::time::timeout(Duration::from_secs(3), tee.stdout)
+            .await
+            .expect("stdout tee did not park")
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(3), tee.stderr)
+            .await
+            .expect("stderr tee did not park")
+            .unwrap()
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(3), fanout)
+            .await
+            .expect("fanout did not park")
+            .unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            let e = st.registry.tasks.get_mut("mon_utf8").unwrap();
+            assert_eq!(e.delivered_cursor, 1);
+            assert_eq!(e.output.lock().unwrap().total_size, 2);
+            e.stdout_fd = stdout;
+            st.park_tx.send_replace(false);
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "incomplete byte must not flush at park"
+        );
+        crate::sys::write_raw(write.as_raw_fd(), b"\xb8\xadb\n").unwrap();
+        start_task_io_with_tee(&state, "mon_utf8", eager_tee(6));
+        drop(write);
+        let last = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let last: serde_json::Value = serde_json::from_slice(&last.bytes).unwrap();
+        assert_eq!(last["task_id"], "mon_utf8");
+        assert_eq!(last["chunk"], "中b\n", "{last}");
+        assert_eq!(last["next_cursor"], 6);
+        let (tee, fanout) = {
+            let mut st = state.lock().unwrap();
+            let e = st.registry.tasks.get_mut("mon_utf8").unwrap();
+            (e.tee.take().unwrap(), e.fanout.take().unwrap())
+        };
+        assert!(tokio::time::timeout(Duration::from_secs(3), tee.stdout)
+            .await
+            .expect("stdout tee did not reach EOF")
+            .unwrap()
+            .is_none());
+        assert!(tokio::time::timeout(Duration::from_secs(3), tee.stderr)
+            .await
+            .expect("stderr tee did not reach EOF")
+            .unwrap()
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(3), fanout)
+            .await
+            .expect("fanout did not drain at EOF")
+            .unwrap();
+        assert!(events.try_recv().is_err(), "no repeated output at EOF");
+        {
+            let st = state.lock().unwrap();
+            let e = &st.registry.tasks["mon_utf8"];
+            assert_eq!(e.delivered_cursor, 6);
+            assert_eq!(e.record.output_size, 6);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"a\xe4\xb8\xadb\n");
+        writer.abort();
+        drop(state);
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn global_admission_grants_rejects_and_is_idempotent() {

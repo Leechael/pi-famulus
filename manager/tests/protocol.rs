@@ -863,22 +863,33 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
     }
     fs::write(home.join("config.json"), r#"{"maxAgents":2}"#).unwrap();
     let admitted = if winner_a {
-        b.request(r#"{"id":"b2","type":"acquire_agent","child_id":"ch_shared"}"#, "b2")
+        b.request(
+            r#"{"id":"p5-scale-up-b","type":"acquire_agent","child_id":"ch_shared"}"#,
+            "p5-scale-up-b",
+        )
     } else {
         a.request(r#"{"id":"a2","type":"acquire_agent","child_id":"ch_shared"}"#, "a2")
     };
     assert!(compact(&admitted).contains("\"granted\":true"), "scale up did not admit: {admitted}");
+    if winner_a {
+        a.request(r#"{"id":"release1","type":"release_agent","child_id":"ch_shared"}"#, "release1");
+        a.request(r#"{"id":"release2","type":"release_agent","child_id":"ch_shared"}"#, "release2");
+    } else {
+        b.request(r#"{"id":"release1","type":"release_agent","child_id":"ch_shared"}"#, "release1");
+        b.request(r#"{"id":"release2","type":"release_agent","child_id":"ch_shared"}"#, "release2");
+    }
+    let after_release = c.request(r#"{"id":"c1","type":"acquire_agent","child_id":"ch_c"}"#, "c1");
+    assert!(compact(&after_release).contains("\"granted\":true"), "winner release did not free a permit: {after_release}");
+    c.request(r#"{"id":"c2","type":"release_agent","child_id":"ch_c"}"#, "c2");
+
     fs::write(home.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
-    let denied = c.request(r#"{"id":"c1","type":"acquire_agent","child_id":"ch_c"}"#, "c1");
+    let denied = c.request(r#"{"id":"c3","type":"acquire_agent","child_id":"ch_c"}"#, "c3");
     assert!(compact(&denied).contains("\"rejection\":\"global_capacity\""), "scale down did not limit new admissions: {denied}");
-    let second = if winner_a { &mut b } else { &mut a };
-    second.request(r#"{"id":"release1","type":"release_agent","child_id":"ch_shared"}"#, "release1");
-    second.request(r#"{"id":"release2","type":"release_agent","child_id":"ch_shared"}"#, "release2");
-    if winner_a { drop(a); } else { drop(b); }
+    if winner_a { drop(b); } else { drop(a); }
     std::thread::sleep(Duration::from_millis(50));
-    let granted = c.request(r#"{"id":"c2","type":"acquire_agent","child_id":"ch_c"}"#, "c2");
+    let granted = c.request(r#"{"id":"c4","type":"acquire_agent","child_id":"ch_c"}"#, "c4");
     assert!(compact(&granted).contains("\"granted\":true"), "stale session permit was not reaped: {granted}");
-    c.request(r#"{"id":"c3","type":"release_agent","child_id":"ch_c"}"#, "c3");
+    c.request(r#"{"id":"c5","type":"release_agent","child_id":"ch_c"}"#, "c5");
 }
 
 #[test]
@@ -896,9 +907,9 @@ fn p6_wrong_shape_capacity_config_refuses_reads_updates_and_admission() {
         let response = c.request(&request, &id);
         assert!(compact(&response).contains("\"ok\":false"), "admitted with {corrupt}: {response}");
         assert!(response.contains("JSON object"), "missing loud config error: {response}");
-        let get = Command::new(BIN).args(["--home", home.to_str().unwrap(), "config", "get", "max-agents"]).output().unwrap();
+        let get = Command::new(BIN).arg("--home").arg(&home).args(["config", "get", "max-agents"]).output().unwrap();
         assert!(!get.status.success(), "config get accepted {corrupt}");
-        let set = Command::new(BIN).args(["--home", home.to_str().unwrap(), "config", "set", "max-agents", "12"]).output().unwrap();
+        let set = Command::new(BIN).arg("--home").arg(&home).args(["config", "set", "max-agents", "12"]).output().unwrap();
         assert!(!set.status.success(), "config set accepted {corrupt}");
         assert_eq!(fs::read_to_string(home.join("config.json")).unwrap(), corrupt);
     }

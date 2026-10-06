@@ -80,7 +80,22 @@ export default function (pi: ExtensionAPI): void {
   let ctx: ExtensionContext | null = null;
   let client: ManagerClient | null = null;
   const globalAgentLeases = new Map<string, string>();
+  const pendingAgentLeases = new Set<string>();
   const pendingAgentReregistrations = new Map<string, AbortController>();
+  let leaseReconciliation: Promise<void> | null = null;
+  const reconcileAgentLeases = (manager: ManagerClient): Promise<void> => {
+    if (leaseReconciliation) return leaseReconciliation;
+    leaseReconciliation = reregisterAgentLeases(
+      manager,
+      globalAgentLeases,
+      undefined,
+      pendingAgentLeases,
+      pendingAgentReregistrations,
+    ).finally(() => {
+      leaseReconciliation = null;
+    });
+    return leaseReconciliation;
+  };
   const capacityNotices = new Set<string>();
   const capacityNotice = (reason: "manager unavailable" | "daemon too old"): void => {
     if (capacityNotices.has(reason)) return;
@@ -440,6 +455,7 @@ export default function (pi: ExtensionAPI): void {
     for (const controller of pendingAgentReregistrations.values()) controller.abort();
     pendingAgentReregistrations.clear();
     globalAgentLeases.clear();
+    pendingAgentLeases.clear();
 
     client = new ManagerClient({
       home,
@@ -495,6 +511,10 @@ export default function (pi: ExtensionAPI): void {
       }
     });
     client.onReconnect(() => {
+      // A daemon restart may drop permits; a same-session rebind may retain
+      // them. Keep each kind for idempotent re-registration and mark all local
+      // leases pending until the daemon confirms them.
+      for (const childId of globalAgentLeases.keys()) pendingAgentLeases.add(childId);
       void monitorRegistry?.rewatchAll().then(() => syncWithManager());
       void (async () => {
         const manager = client;
@@ -504,7 +524,7 @@ export default function (pi: ExtensionAPI): void {
         }
         // The registry and its child ids survive socket reconnects in this
         // extension process; held ids include resumable interrupted children.
-        await reregisterAgentLeases(manager, globalAgentLeases, undefined, pendingAgentReregistrations);
+        await reconcileAgentLeases(manager);
       })().catch(() => {});
     });
 
@@ -587,6 +607,7 @@ export default function (pi: ExtensionAPI): void {
         reserveLocal: () => registry.reserveChildSlot(req.childId, ticket),
         manager: client,
         leases: globalAgentLeases,
+        pendingLeases: pendingAgentLeases,
         pendingReregistrations: pendingAgentReregistrations,
         ticket,
         notice: capacityNotice,
@@ -718,14 +739,18 @@ export default function (pi: ExtensionAPI): void {
     void c
       .connect()
       .then((ok) => {
-        if (!ok && startCtx.hasUI) {
+        if (ok) {
+          if (c.protocolLevel() >= 4) void reconcileAgentLeases(c).catch(() => {});
+          return;
+        }
+        if (startCtx.hasUI) {
           const detail = c.lastError();
           const reason = detail ? ` (${detail})` : "";
           const searched = managerPath ? `using ${managerPath}` : `looked in: ${describeManagerSearch(config, home)}`;
           startCtx.ui.notify(
             `pi-famulus unavailable${reason}; ${searched}. ` +
               "Bash runs locally without auto-backgrounding, task_*/monitor are disabled, " +
-              "and subagents cannot start. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",
+              "and subagents cannot run bash. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",
             "warning",
           );
         }
