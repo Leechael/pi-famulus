@@ -880,6 +880,27 @@ fn t12_restart_after_crash_orphans_the_task() {
 /// the daemon. Uses `wait` (not list polling) so Conn history substring
 /// matching cannot confuse ids like `r13-list-1` vs `r13-list-10`.
 #[test]
+fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
+    let home = test_home("p5-agent-capacity");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut a = connect(&home, CONNECT_TIMEOUT);
+    let mut b = connect(&home, CONNECT_TIMEOUT);
+    hello_ext(&mut a, "session-a");
+    hello_ext(&mut b, "session-b");
+    assert!(compact(&a.request(r#"{"id":"a1","type":"acquire_agent","child_id":"ch_a"}"#, "a1")).contains("\"granted\":true"));
+    let denied = b.request(r#"{"id":"b1","type":"acquire_agent","child_id":"ch_b"}"#, "b1");
+    assert!(compact(&denied).contains("\"rejection\":\"global_capacity\""), "{denied}");
+    b.request(r#"{"id":"b2","type":"release_agent","child_id":"ch_b"}"#, "b2");
+    drop(a);
+    std::thread::sleep(Duration::from_millis(50));
+    let granted = b.request(r#"{"id":"b3","type":"acquire_agent","child_id":"ch_b"}"#, "b3");
+    assert!(compact(&granted).contains("\"granted\":true"), "stale session permit was not reaped: {granted}");
+    b.request(r#"{"id":"b4","type":"release_agent","child_id":"ch_b"}"#, "b4");
+}
+
+#[test]
 fn t13_repeated_start_exit_stress() {
     let d = Daemon::start("stress");
     let mut c = d.connect();
