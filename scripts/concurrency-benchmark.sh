@@ -14,6 +14,15 @@ if ! command -v setsid >/dev/null 2>&1; then
 fi
 suite_command="${SUITE_COMMAND:-npm test}"
 sample_seconds="${SAMPLE_SECONDS:-1}"
+if [[ ! "$sample_seconds" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
+   ! LC_ALL=C awk -v interval="$sample_seconds" 'BEGIN { exit !(interval > 0) }'; then
+  echo "SAMPLE_SECONDS must be a positive number" >&2
+  exit 2
+fi
+if $json && ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required for --json output" >&2
+  exit 1
+fi
 device="${DISK_DEVICE:-}"
 if [[ -z "$device" ]]; then
   source_device=$(df -P . | awk 'NR==2 {print $1}')
@@ -25,6 +34,34 @@ fi
 device=${device#/dev/}
 work=$(mktemp -d)
 pids=() sampler= pg_poller=
+stop_pg_poller() {
+  [[ -z "$pg_poller" ]] && return
+  local p="$pg_poller"
+  touch "$work/stop-pg"
+  for _ in {1..10}; do
+    kill -0 -- -"$p" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 -- -"$p" 2>/dev/null; then
+    kill -TERM -- -"$p" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 -- -"$p" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  if kill -0 -- -"$p" 2>/dev/null; then
+    kill -KILL -- -"$p" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 -- -"$p" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  if kill -0 -- -"$p" 2>/dev/null; then
+    echo "warning: PostgreSQL poller process group $p still has members after SIGKILL" >&2
+  fi
+  wait "$p" 2>/dev/null || true
+  pg_poller=
+}
 cleanup() {
   trap - EXIT INT TERM
   local p alive=0
@@ -46,12 +83,12 @@ cleanup() {
     fi
   done
   [[ -z "$sampler" ]] || kill "$sampler" 2>/dev/null || true
-  [[ -z "$pg_poller" ]] || kill "$pg_poller" 2>/dev/null || true
+  stop_pg_poller
   rm -rf "$work"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-start_ns=$(date +%s%N)
+start_s=$(date +%s)
 for i in $(seq 1 "$n"); do
   status_file="$work/suite-$i.status"
   setsid bash -c 'set +e; bash -lc "$1"; rc=$?; printf "%s\n" "$rc" > "$2"; exit 0' _ "$suite_command" "$status_file" >"$work/suite-$i.log" 2>&1 &
@@ -65,16 +102,17 @@ else
   printf 'unavailable: iostat missing or disk device could not be identified\n' >"$work/iostat.err"
 fi
 if [[ -n "${PG_CONNINFO:-}" ]] && command -v psql >/dev/null; then
-  (
+  setsid bash -c '
+    work=$1 sample_seconds=$2 conninfo=$3 connect_timeout=$4
     while [[ ! -e "$work/stop-pg" ]]; do
-      if value=$(PGCONNECT_TIMEOUT="${PG_CONNECT_TIMEOUT:-2}" psql "$PG_CONNINFO" -Atqc 'select count(*) from pg_stat_activity' 2>>"$work/pg.err"); then
-        printf '%s\n' "$value" >>"$work/pg.samples"
+      if value=$(PGCONNECT_TIMEOUT="$connect_timeout" psql "$conninfo" -Atqc "select count(*) from pg_stat_activity" 2>>"$work/pg.err"); then
+        printf "%s\\n" "$value" >>"$work/pg.samples"
       else
-        printf 'unavailable\n' >>"$work/pg.samples"
+        printf "unavailable\\n" >>"$work/pg.samples"
       fi
       sleep "$sample_seconds"
     done
-  ) & pg_poller=$!
+  ' _ "$work" "$sample_seconds" "$PG_CONNINFO" "${PG_CONNECT_TIMEOUT:-2}" & pg_poller=$!
 else
   printf 'unavailable: psql or PG_CONNINFO unavailable\n' >"$work/pg.err"
 fi
@@ -89,13 +127,10 @@ for i in "${!pids[@]}"; do
   statuses+=("$code")
   [[ "$code" == 0 ]] || ((failures+=1))
 done
-end_ns=$(date +%s%N)
+end_s=$(date +%s)
 [[ -z "$sampler" ]] || { kill "$sampler" 2>/dev/null || true; wait "$sampler" 2>/dev/null || true; }
-if [[ -n "$pg_poller" ]]; then
-  touch "$work/stop-pg"
-  wait "$pg_poller" 2>/dev/null || true
-fi
-sampler= pg_poller=
+stop_pg_poller
+sampler=
 
 disk_util=unavailable write_iops=unavailable write_latency=unavailable
 disk_reason='no complete in-run iostat sample (suite may be shorter than SAMPLE_SECONDS)'
@@ -125,7 +160,7 @@ if [[ -s "$work/pg.samples" ]]; then
   pg_connections=$(awk '$1!="unavailable" { if ($1+0>max) max=$1+0; seen=1 } END { if(seen) print max; else print "unavailable" }' "$work/pg.samples")
 fi
 pg_errors=$(cat "$work/pg.err" 2>/dev/null || true)
-duration_ms=$(( (end_ns - start_ns) / 1000000 ))
+duration_ms=$(( (end_s - start_s) * 1000 ))
 if $json; then
   python3 - "$n" "$duration_ms" "$device" "$disk_util" "$write_iops" "$write_latency" "$pg_connections" "$pg_errors" "$disk_reason" "${statuses[@]}" <<'PY'
 import json, sys
