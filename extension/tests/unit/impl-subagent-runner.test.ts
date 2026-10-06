@@ -89,6 +89,50 @@ describe("InProcessRunner", () => {
     });
   });
 
+  for (const staleResult of ["grant", "reject"] as const) {
+    it(`does not let a stale ${staleResult} admission callback close the next generation's queue`, async () => {
+      const clock = new ManualClock(0);
+      const factory = new SessionFactory();
+      factory.autoComplete = "done";
+      type Release = (terminal?: boolean) => void;
+      const admissions: Array<{ grant: (release: Release) => void; reject: (error: Error) => void }> = [];
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        clock,
+        stallMs: 0,
+        acquire: () => new Promise<Release>((resolve, reject) => admissions.push({ grant: resolve, reject })),
+      });
+
+      const starting = runner.start(makeReq());
+      await tick();
+      admissions[0]!.grant(() => {});
+      const handle = await starting;
+      await handle.result;
+
+      await handle.resume("generation A");
+      await tick();
+      expect(admissions).toHaveLength(2);
+      clock.advanceBy(100);
+      await handle.interrupt();
+      await handle.result;
+
+      await handle.resume("generation B");
+      await tick();
+      expect(admissions).toHaveLength(3);
+      clock.advanceBy(300);
+      if (staleResult === "grant") admissions[1]!.grant(() => {});
+      else admissions[1]!.reject(new Error("late A rejection"));
+      await tick();
+
+      expect(handle.status()).toBe("pending");
+      expect(handle.wallUsage()).toMatchObject({ queueMs: 400, otherMs: 0, approximate: false });
+      clock.advanceBy(300);
+      admissions[2]!.grant(() => {});
+      await handle.result;
+      expect(handle.wallUsage()).toMatchObject({ queueMs: 700, otherMs: 0, approximate: false });
+    });
+  }
+
   it("tells the child its resolved model on the first prompt", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = "ok";

@@ -204,6 +204,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private generationToolMs = 0;
   private generationQueueMs = 0;
   private queueStartedAt: number | null = null;
+  private queueGeneration: number | null = null;
   private llmStartedAt: number | null = null;
   private toolStartedAt: number | null = null;
   /** contact_supervisor need_decision. Stall stays paused while true. */
@@ -513,6 +514,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       this.generationToolMs = 0;
       this.generationQueueMs = 0;
       this.queueStartedAt = this.acquire ? this.startedAt : null;
+      this.queueGeneration = this.queueStartedAt === null ? null : gen;
       this.llmStartedAt = null;
       this.toolStartedAt = null;
     }
@@ -531,13 +533,19 @@ class InProcessChildHandle implements DisposableChildHandle {
         // The ticket ties the slot request to THIS generation: a request
         // whose generation settled while queued (interrupt, then a new
         // resume) must not admit the child's next generation.
-        this.releaseSlot = await this.acquire(this.req, {
+        const release = await this.acquire(this.req, {
           current: () => !this.disposed && !this.isSettled(gen),
           signal: admissionAbort.signal,
         });
+        if (this.disposed || this.isSettled(gen)) {
+          // A queued interruption is resumable; only disposal is terminal.
+          release(this.disposed);
+          return;
+        }
+        this.releaseSlot = release;
       } catch (err) {
         // Admission denied (e.g. fail_fast cancellation while queued).
-        this.closeQueue(this.now());
+        this.closeQueue(this.now(), gen);
         this.settle(gen, {
           status: "interrupted",
           text: "",
@@ -552,7 +560,7 @@ class InProcessChildHandle implements DisposableChildHandle {
           if (this.admissionAbort === admissionAbort) this.admissionAbort = null;
         }
       }
-      this.closeQueue(this.now());
+      this.closeQueue(this.now(), gen);
     }
     if (this.disposed || this.isSettled(gen)) {
       this.release(this.terminalSettle);
@@ -678,7 +686,7 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private settle(gen: number, result: ChildResult): void {
     if (gen !== this.generation || this.settledFlag) return;
-    this.finishWallGeneration(this.now());
+    this.finishWallGeneration(this.now(), gen);
     this.settledFlag = true;
     if (this.admissionStartedAt !== null) {
       this.generationQueueMs = Math.max(0, this.now() - this.admissionStartedAt);
@@ -722,12 +730,13 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
   }
 
-  private closeQueue(at: number): void {
-    if (this.queueStartedAt === null) return;
+  private closeQueue(at: number, gen: number): void {
+    if (this.queueStartedAt === null || this.queueGeneration !== gen) return;
     const elapsed = Math.max(0, at - this.queueStartedAt);
     this.wall.queueMs += elapsed;
     this.generationQueueMs += elapsed;
     this.queueStartedAt = null;
+    this.queueGeneration = null;
   }
 
   private closeLlm(at: number): void {
@@ -768,8 +777,8 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
   }
 
-  private finishWallGeneration(at: number): void {
-    this.closeQueue(at);
+  private finishWallGeneration(at: number, gen: number): void {
+    this.closeQueue(at, gen);
     if (this.llmStartedAt !== null) {
       this.closeLlm(at);
       this.wall.approximate = true;
@@ -790,6 +799,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.generationToolMs = 0;
     this.generationQueueMs = 0;
     this.queueStartedAt = null;
+    this.queueGeneration = null;
     this.llmStartedAt = null;
     this.toolStartedAt = null;
   }
