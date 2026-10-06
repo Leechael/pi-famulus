@@ -8,6 +8,10 @@ if [[ "${1:-}" == "--json" ]]; then json=true; shift; fi
 if [[ $# -gt 1 ]]; then echo "usage: $0 [--json] [1|2|4|8]" >&2; exit 2; fi
 n="${1:-2}"
 case "$n" in 1|2|4|8) ;; *) echo "suite count must be one of 1, 2, 4, 8" >&2; exit 2;; esac
+if ! command -v setsid >/dev/null 2>&1; then
+  echo "setsid is required to isolate and clean up benchmark suite process groups" >&2
+  exit 1
+fi
 suite_command="${SUITE_COMMAND:-npm test}"
 sample_seconds="${SAMPLE_SECONDS:-1}"
 device="${DISK_DEVICE:-}"
@@ -22,25 +26,39 @@ device=${device#/dev/}
 work=$(mktemp -d)
 pids=() sampler= pg_poller=
 cleanup() {
-  for p in "${pids[@]}"; do kill -- -"$p" 2>/dev/null || true; done
+  trap - EXIT INT TERM
+  local p alive=0
+  for p in "${pids[@]}"; do
+    kill -TERM -- -"$p" 2>/dev/null || true
+    kill -0 -- -"$p" 2>/dev/null && alive=1 || true
+  done
+  if (( alive )); then sleep 2; fi
+  for p in "${pids[@]}"; do kill -KILL -- -"$p" 2>/dev/null || true; done
+  for _ in {1..20}; do
+    alive=0
+    for p in "${pids[@]}"; do kill -0 -- -"$p" 2>/dev/null && alive=1 || true; done
+    (( alive )) || break
+    sleep 0.1
+  done
+  for p in "${pids[@]}"; do
+    if kill -0 -- -"$p" 2>/dev/null; then
+      echo "warning: process group $p still has members after SIGKILL" >&2
+    fi
+  done
   [[ -z "$sampler" ]] || kill "$sampler" 2>/dev/null || true
   [[ -z "$pg_poller" ]] || kill "$pg_poller" 2>/dev/null || true
   rm -rf "$work"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 start_ns=$(date +%s%N)
 for i in $(seq 1 "$n"); do
   status_file="$work/suite-$i.status"
-  if command -v setsid >/dev/null; then
-    setsid bash -c 'set +e; bash -lc "$1"; rc=$?; printf "%s\\n" "$rc" > "$2"; exit 0' _ "$suite_command" "$status_file" >"$work/suite-$i.log" 2>&1 &
-  else
-    bash -c 'set +e; bash -lc "$1"; rc=$?; printf "%s\\n" "$rc" > "$2"; exit 0' _ "$suite_command" "$status_file" >"$work/suite-$i.log" 2>&1 &
-  fi
+  setsid bash -c 'set +e; bash -lc "$1"; rc=$?; printf "%s\n" "$rc" > "$2"; exit 0' _ "$suite_command" "$status_file" >"$work/suite-$i.log" 2>&1 &
   pids+=("$!")
 done
 
-# Keep sampling until every suite has ended. iostat emits repeated reports;
-# the parser below uses named header columns, not positional assumptions.
+# iostat's first report is cumulative since boot; later reports cover intervals.
 if command -v iostat >/dev/null && [[ -n "$device" ]]; then
   iostat -x "$device" "$sample_seconds" >"$work/iostat.txt" 2>"$work/iostat.err" & sampler=$!
 else
@@ -48,8 +66,8 @@ else
 fi
 if [[ -n "${PG_CONNINFO:-}" ]] && command -v psql >/dev/null; then
   (
-    while :; do
-      if value=$(psql "$PG_CONNINFO" -Atqc 'select count(*) from pg_stat_activity' 2>>"$work/pg.err"); then
+    while [[ ! -e "$work/stop-pg" ]]; do
+      if value=$(PGCONNECT_TIMEOUT="${PG_CONNECT_TIMEOUT:-2}" psql "$PG_CONNINFO" -Atqc 'select count(*) from pg_stat_activity' 2>>"$work/pg.err"); then
         printf '%s\n' "$value" >>"$work/pg.samples"
       else
         printf 'unavailable\n' >>"$work/pg.samples"
@@ -73,23 +91,32 @@ for i in "${!pids[@]}"; do
 done
 end_ns=$(date +%s%N)
 [[ -z "$sampler" ]] || { kill "$sampler" 2>/dev/null || true; wait "$sampler" 2>/dev/null || true; }
-[[ -z "$pg_poller" ]] || { kill "$pg_poller" 2>/dev/null || true; wait "$pg_poller" 2>/dev/null || true; }
+if [[ -n "$pg_poller" ]]; then
+  touch "$work/stop-pg"
+  wait "$pg_poller" 2>/dev/null || true
+fi
 sampler= pg_poller=
 
 disk_util=unavailable write_iops=unavailable write_latency=unavailable
+disk_reason='no complete in-run iostat sample (suite may be shorter than SAMPLE_SECONDS)'
+if [[ ! -s "$work/iostat.txt" && -s "$work/iostat.err" ]]; then
+  disk_reason=$(cat "$work/iostat.err")
+fi
 if [[ -s "$work/iostat.txt" ]]; then
-  read -r disk_util write_iops write_latency < <(awk -v target="$device" '
+  read -r disk_util write_iops write_latency disk_reason < <(awk -v target="$device" '
     /^Device[[:space:]]/ {
+      report++
+      delete col
       for (i=1; i<=NF; i++) col[$i]=i
       next
     }
-    $1==target {
+    report>=2 && $1==target {
       u=col["%util"]; w=col["w/s"]; a=col["w_await"]
       if (u && w && a) { util_sum += $u; iops_sum += $w; latency_sum += $a; count++ }
     }
     END {
-      if (count) printf "%.2f %.2f %.2f\n", util_sum/count, iops_sum/count, latency_sum/count
-      else print "unavailable unavailable unavailable"
+      if (count) printf "%.2f %.2f %.2f sampled\n", util_sum/count, iops_sum/count, latency_sum/count
+      else print "unavailable unavailable unavailable no-complete-in-run-sample"
     }
   ' "$work/iostat.txt") || true
 fi
@@ -97,19 +124,19 @@ pg_connections=unavailable
 if [[ -s "$work/pg.samples" ]]; then
   pg_connections=$(awk '$1!="unavailable" { if ($1+0>max) max=$1+0; seen=1 } END { if(seen) print max; else print "unavailable" }' "$work/pg.samples")
 fi
-pg_errors=$(<"$work/pg.err" 2>/dev/null || true)
+pg_errors=$(cat "$work/pg.err" 2>/dev/null || true)
 duration_ms=$(( (end_ns - start_ns) / 1000000 ))
 if $json; then
-  python3 - "$n" "$duration_ms" "$device" "$disk_util" "$write_iops" "$write_latency" "$pg_connections" "$pg_errors" "${statuses[@]}" <<'PY'
+  python3 - "$n" "$duration_ms" "$device" "$disk_util" "$write_iops" "$write_latency" "$pg_connections" "$pg_errors" "$disk_reason" "${statuses[@]}" <<'PY'
 import json, sys
-n, duration, device, util, iops, latency, pg, pg_errors, *codes = sys.argv[1:]
+n, duration, device, util, iops, latency, pg, pg_errors, disk_reason, *codes = sys.argv[1:]
 print(json.dumps({"suites": int(n), "duration_ms": int(duration), "disk_device": device or None,
  "disk_util_percent": util, "write_iops": iops, "write_latency_ms": latency,
- "postgres_connections": pg, "postgres_errors": pg_errors,
+ "postgres_connections": pg, "postgres_errors": pg_errors, "disk_sample_status": disk_reason,
  "suite_exit_codes": [int(c) if c.isdigit() else c for c in codes]}))
 PY
 else
-  printf 'Concurrency benchmark report\nSuites: %s\nDuration: %s ms\nDisk device: %s\nDisk util: %s%%\nWrite IOPS: %s\nWrite latency: %s ms\nPostgreSQL connections: %s\nPostgreSQL errors: %s\nSuite exit codes: %s\n' \
-    "$n" "$duration_ms" "${device:-unavailable}" "$disk_util" "$write_iops" "$write_latency" "$pg_connections" "${pg_errors:-none}" "${statuses[*]}"
+  printf 'Concurrency benchmark report\nSuites: %s\nDuration: %s ms\nDisk device: %s\nDisk util: %s%%\nWrite IOPS: %s\nWrite latency: %s ms\nPostgreSQL connections: %s\nPostgreSQL errors: %s\nDisk sample status: %s\nSuite exit codes: %s\n' \
+    "$n" "$duration_ms" "${device:-unavailable}" "$disk_util" "$write_iops" "$write_latency" "$pg_connections" "${pg_errors:-none}" "$disk_reason" "${statuses[*]}"
 fi
 (( failures == 0 ))
