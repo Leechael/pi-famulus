@@ -542,7 +542,7 @@ No removal turned a test red.
 - deferred: the extension's `list` (own session only) is not paged | impact: a single pi session with more than ~4 MiB of task records (thousands of tasks, or very long commands) gets `E_INTERNAL` from `task_list` and its reconnect reconcile | trigger: a session that long-lived, or `task_list` failing with the frame-limit error
 - deferred: one record larger than a frame (a command near 4 MiB) still fails a paged `list`, since a page always carries at least one record | impact: `ls`/`sessions`/`show` fail while that record is retained | trigger: a start request with a multi-MiB command
 - deferred: live CPU sampling of running tasks (see `src/stats.rs` header) | impact: running tasks show no CPU; tasks whose runner is SIGKILLed (`timeout_ms`, a stop past its grace) stay unmeasured | trigger: unmeasured tasks holding a large share of a group's wall time in `stats`, or a need for CPU while a task runs
-- deferred: per-project work-kind overrides (see `src/workkind.rs` header) | impact: opaque project script names land in `other` | trigger: `other` holding a large CPU/wall share a person can pin on a known script
+- deferred | per-project work-kind command overrides | impact | opaque project scripts land in `other`, obscuring their CPU/wall share | trigger | `other` repeatedly holds a material share that people can attribute to known scripts
 - resolved (manager-lifeline): re-adoption by pid liveness is gone. A crashed daemon's tasks die with it (lifeline), and the next startup only marks their records; it never signals a recorded pid (`d4b`).
 
 ## Lifeline and runner (manager-lifeline)
