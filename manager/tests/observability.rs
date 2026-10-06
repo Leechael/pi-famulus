@@ -746,6 +746,8 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
 
 /// Real-daemon smoke test: a busy process group becomes visible as cumulative
 /// and recent CPU in the plain-text `top` command.
+// Live process-group sampling reads /proc; it is Linux-only by design.
+#[cfg(target_os = "linux")]
 #[test]
 fn c13_top_reports_live_process_group_cpu() {
     let home = Home::new_real("c13");
