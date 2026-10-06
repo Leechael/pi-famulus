@@ -17,8 +17,9 @@ pub const PROTO_VERSION: u32 = 1;
 /// returned by `status`. 1 = original §3.3; 2 = observability contract
 /// (origin, mark_background, stop.reason, end_reason, events.jsonl); 3 =
 /// in-place upgrade (`upgrade`, status `generation`/`last_upgrade`, start
-/// keys, resend on reconnect); 4 = machine-wide agent admission.
-pub const PROTOCOL: u32 = 4;
+/// keys, resend on reconnect); 4 = machine-wide agent admission; 5 = per-kind
+/// agent budgets and queued acquire.
+pub const PROTOCOL: u32 = 5;
 /// The first protocol level whose manager understands `upgrade`.
 pub const PROTOCOL_UPGRADE: u32 = 3;
 /// §3.3: max frame 4 MiB.
@@ -310,7 +311,13 @@ pub enum RequestKind {
     ShutdownSession,
     Status,
     /// Request an idempotent machine-wide agent permit.
-    AcquireAgent { child_id: String },
+    AcquireAgent {
+        child_id: String,
+        #[serde(default)]
+        work_kind: String,
+    },
+    /// Cancel a queued acquire by its original request id.
+    CancelAcquireAgent { request_id: String },
     /// Return the child-owned agent permit.
     ReleaseAgent { child_id: String },
     Shutdown,
