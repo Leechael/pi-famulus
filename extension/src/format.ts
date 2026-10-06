@@ -335,3 +335,20 @@ export function formatSubagentOverrun(info: SubagentOverrunInfo): FormattedWake 
     ...(info.shell ? { shell: { ...info.shell, command: shellWakeTitle(info.shell.command) } } : {}),
   });
 }
+
+export function formatSubagentOverrunBatch(infos: SubagentOverrunInfo[]): FormattedWake {
+  const first = formatSubagentOverrun(infos[0]);
+  if (infos.length === 1) return first;
+  const details = {
+    ...first.details,
+    additional: infos.slice(1).map((info) => ({
+      runId: info.runId,
+      childId: info.childId,
+      name: info.name,
+      elapsedMs: info.elapsedMs,
+      budgetMs: info.budgetMs,
+      reminder: info.reminder,
+    })),
+  };
+  return formatFamulusWake(details);
+}
