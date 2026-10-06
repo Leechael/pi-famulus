@@ -192,6 +192,10 @@ class FailedChildHandle implements ChildHandle {
   conversation() {
     return [];
   }
+
+  tokenUsage() {
+    return { input: 0, output: 0 };
+  }
 }
 
 export class SubagentRegistry implements RunRegistry {

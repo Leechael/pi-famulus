@@ -37,6 +37,9 @@ export interface AgentChildRecord {
   result_tail?: string;
   /** Tool results seen in the transcript so far. */
   tool_calls?: number;
+  /** Provider-reported cumulative token counts (input includes cached prompt tokens). */
+  tokens_input?: number;
+  tokens_output?: number;
   /** Absolute path of the live `<child_id>.jsonl` transcript. */
   transcript?: string;
 }

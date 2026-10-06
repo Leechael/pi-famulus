@@ -166,6 +166,8 @@ export class FakeChildSession implements ChildSessionAdapter {
     return this.lastAssistantFailure;
   }
 
+  tokenUsage() { return { input: 0, output: 0 }; }
+
   getConversation() {
     const turns = this.prompts.map((text) => ({ role: "user", text }));
     if (this.lastText !== undefined) turns.push({ role: "assistant", text: this.lastText });

@@ -158,6 +158,7 @@ function wrapSession(
   session: PiAgentSession,
   extras: { warning?: string; resolvedModel?: string } = {},
 ): ChildSessionAdapter {
+  const tokenUsage = { input: 0, output: 0 };
   return {
     ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
     ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
@@ -180,10 +181,22 @@ function wrapSession(
       };
     },
     getConversation: () => turnsFromMessages(session.messages),
+    tokenUsage: () => ({ ...tokenUsage }),
     getActiveToolNames: () => session.getActiveToolNames(),
     getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
-    subscribe: (listener) => session.subscribe((event) => listener({ type: event.type })),
+    subscribe: (listener) => session.subscribe((event) => {
+      const message = (event as { message?: { usage?: { input?: number; output?: number } } }).message;
+      let usage: { input: number; output: number } | undefined;
+      if (event.type === "message_end" && message?.usage) {
+        const input = Number(message.usage.input) || 0;
+        const output = Number(message.usage.output) || 0;
+        tokenUsage.input += input;
+        tokenUsage.output += output;
+        usage = { input, output };
+      }
+      listener({ type: event.type, ...(usage ? { usage } : {}) });
+    }),
     dispose: () => session.dispose(),
   };
 }

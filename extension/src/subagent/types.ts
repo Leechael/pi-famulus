@@ -102,6 +102,8 @@ export interface ChildHandle {
   resolvedModel(): string | undefined;
   /** Live child transcript. Empty when the session never started. */
   conversation(): ConversationTurn[];
+  /** Cumulative provider-reported input/output tokens for this child. */
+  tokenUsage(): { input: number; output: number };
 }
 
 /**
@@ -125,11 +127,12 @@ export interface ChildSessionAdapter {
   /** Provider/model failure outcome of the last assistant turn, when any. */
   getLastAssistantFailure?(): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   getConversation(): ConversationTurn[];
+  tokenUsage(): { input: number; output: number };
   /** Introspection for child-session orchestration and contract tests. */
   getActiveToolNames?(): string[];
   getSystemPrompt?(): string;
   isStreaming(): boolean;
-  subscribe(listener: (event: { type: string }) => void): () => void;
+  subscribe(listener: (event: { type: string; usage?: { input: number; output: number } }) => void): () => void;
   dispose(): void;
 }
 
