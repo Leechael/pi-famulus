@@ -36,7 +36,14 @@ fn concurrent_capacity_config_sets_preserve_fields_and_valid_json() {
     let workers: Vec<_> = (1..=16).map(|n| {
         let home = home.clone();
         std::thread::spawn(move || {
-            Command::new(BIN).args(["--home", home.to_str().unwrap(), "config", "set", "max-agents", &n.to_string()]).output().unwrap()
+            let mut command = Command::new(BIN);
+            command
+                .arg("--home")
+                .arg(&home)
+                .args(["config", "set", "max-agents"])
+                .arg(n.to_string())
+                .output()
+                .unwrap()
         })
     }).collect();
     for worker in workers {
@@ -91,7 +98,7 @@ fn help_and_version_are_served_by_the_cli_framework() {
             "{name} should be under Acting on tasks: {help}"
         );
     }
-    for name in ["shutdown", "upgrade", "daemon"] {
+    for name in ["config", "shutdown", "upgrade", "daemon"] {
         assert!(
             section_has_command(daemon, name),
             "{name} should be under Daemon: {help}"

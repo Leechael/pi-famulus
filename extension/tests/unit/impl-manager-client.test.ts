@@ -268,8 +268,8 @@ describe("ManagerClient (integration, fake manager)", () => {
     await client.connect();
     expect(await client.acquireAgent("ch_test")).toEqual({ granted: true });
     await client.releaseAgent("ch_test");
-    expect(fake.received.map((message) => message.type)).toContain("acquire_agent");
-    expect(fake.received.map((message) => message.type)).toContain("release_agent");
+    expect(fake.received.find((message) => message.type === "acquire_agent")).toMatchObject({ child_id: "ch_test" });
+    expect(fake.received.find((message) => message.type === "release_agent")).toMatchObject({ child_id: "ch_test" });
   });
 
   it("preserves upgrade generation metadata from status", async () => {

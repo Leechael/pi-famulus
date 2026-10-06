@@ -182,7 +182,20 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     });
     const pid = (JSON.parse(readFileSync(paths.pidFile, "utf8")) as { pid: number }).pid;
     process.kill(pid, "SIGKILL");
-    await Promise.race([reconnected, delay(20000).then(() => { throw new Error("daemon reconnect did not re-register the child permit"); })]);
+    let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        reconnected,
+        new Promise<void>((_, reject) => {
+          reconnectTimeout = setTimeout(
+            () => reject(new Error("daemon reconnect did not re-register the child permit")),
+            20000,
+          );
+        }),
+      ]);
+    } finally {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    }
 
     const competitor = new ManagerClient({ home, sessionId: "competitor", managerPath: BIN });
     expect(await competitor.connect()).toBe(true);

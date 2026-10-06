@@ -127,6 +127,8 @@ fn u1_upgrade_keeps_every_task_running() {
     let before = status(&home);
     let mut c = home.connect();
     hello(&mut c, "sess-u1");
+    c.request_ok(json!({"type":"acquire_agent","child_id":"ch-u1"}));
+    assert_eq!(status(&home)["agent_capacity"]["used"], 1);
 
     // Streams numbered lines for ~3 s, then exits 7.
     let (stream, stream_pid) = start(&mut c, "shell",
@@ -163,6 +165,7 @@ fn u1_upgrade_keeps_every_task_running() {
     let after = status(&home);
     assert_eq!(after["pid"], before["pid"], "same pid");
     assert_eq!(after["generation"], 1);
+    assert_eq!(after["agent_capacity"]["used"], 1, "upgrade preserves active agent permits");
     assert_eq!(after["last_upgrade"]["ok"], true);
     assert_eq!(after["last_upgrade"]["trigger"], "cli");
     let human = home.cli(&["status"], s(10)).stdout;
@@ -177,6 +180,8 @@ fn u1_upgrade_keeps_every_task_running() {
     // with what was missed, and continues.
     let mut c2 = home.connect();
     hello(&mut c2, "sess-u1");
+    c2.request_ok(json!({"type":"release_agent","child_id":"ch-u1"}));
+    assert_eq!(status(&home)["agent_capacity"]["used"], 0);
     let w = c2.request_ok(json!({"type":"wait","task_id":stream,"budget_ms":15000}));
     assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(7)), "real exit code: {w}");
     let file = std::fs::read_to_string(home.path.join(format!("sessions/sess-u1/tasks/{stream}.output"))).unwrap();

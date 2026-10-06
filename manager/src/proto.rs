@@ -463,9 +463,9 @@ pub struct StatusOk {
     pub uptime_ms: u64,
     pub sessions: Vec<SessionInfo>,
     pub task_counts: TaskCounts,
-    /// Machine-wide active subagent permits / configured maximum.
-    #[serde(default)]
-    pub agent_capacity: AgentCapacity,
+    /// Machine-wide active subagent permits / configured maximum (protocol 4+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_capacity: Option<AgentCapacity>,
     /// The manager's protocol level ([`PROTOCOL`]).
     #[serde(default)]
     pub protocol: u32,
@@ -651,6 +651,15 @@ pub fn new_request_id() -> String {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[test]
+    fn pre_protocol_four_status_omits_capacity_when_reserialized() {
+        let old = br#"{"version":"0.1.0","pid":1,"uptime_ms":0,"sessions":[],"task_counts":{"running":0,"terminal":0},"protocol":3}"#;
+        let status: StatusOk = serde_json::from_slice(old).unwrap();
+        assert!(status.agent_capacity.is_none());
+        let encoded = serde_json::to_value(status).unwrap();
+        assert!(encoded.get("agent_capacity").is_none());
+    }
 
     #[tokio::test]
     async fn frame_roundtrip() {

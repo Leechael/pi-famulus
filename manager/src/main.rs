@@ -70,7 +70,7 @@ async fn async_main() {
         Sub::Config { action } => match action {
             cli::ConfigAction::Get { key } => {
                 if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }
-                else { match capacity::max_agents(&home) { Ok(n) => { println!("{n}"); 0 }, Err(e) => { eprintln!("pi-famulus: invalid config: {e}"); 1 } } }
+                else { match capacity::max_agents(&home) { Ok(n) => { out::line(&n.to_string()); 0 }, Err(e) => { eprintln!("pi-famulus: invalid config: {e}"); 1 } } }
             }
             cli::ConfigAction::Set { key, value } => {
                 if key != "max-agents" { eprintln!("unknown config key: {key}"); 1 }

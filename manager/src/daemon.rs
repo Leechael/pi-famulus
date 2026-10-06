@@ -120,6 +120,8 @@ pub struct DaemonState {
     pub start_keys: std::collections::VecDeque<(String, String)>,
     /// Agent permits keyed by session and child id.
     pub agent_permits: HashMap<(String, String), ()>,
+    /// Config budget cache: avoid reparsing config.json on every status/acquire.
+    pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
 }
 
 /// Bound on remembered start keys.
@@ -151,6 +153,7 @@ impl DaemonState {
             upgrade_ready: None,
             start_keys: std::collections::VecDeque::new(),
             agent_permits: HashMap::new(),
+            agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
         }
     }
 }
@@ -301,6 +304,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     for (sid, key) in snap.start_keys.iter().cloned() {
         st.start_keys.push_back((sid, key));
     }
+    st.agent_permits.extend(snap.agent_permits.iter().cloned().map(|key| (key, ())));
     let clock = st.clock.clone();
     clock.resume_at(snap.clock_now_ms);
     let state: Shared = Arc::new(Mutex::new(st));
@@ -1780,11 +1784,18 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
 }
 
 fn handle_acquire_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<AgentAdmissionOk, ProtoError> {
-    let mut st = state.lock().unwrap();
-    let sid = st.conns.get(&conn_id).and_then(|c| c.session_id.clone()).ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
-    let key = (sid, child_id.to_string());
-    let budget = crate::capacity::max_agents(&st.home)
+    let (sid, home, budget_cache) = {
+        let st = state.lock().unwrap();
+        let sid = st.conns.get(&conn_id).and_then(|c| c.session_id.clone()).ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+        (sid, st.home.clone(), st.agent_budget.clone())
+    };
+    let budget = budget_cache.lock().unwrap().get(&home)
         .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
+    let mut st = state.lock().unwrap();
+    if st.conns.get(&conn_id).and_then(|c| c.session_id.as_deref()) != Some(sid.as_str()) {
+        return Err(ProtoError::new(E_SESSION_REQUIRED, "extension session required"));
+    }
+    let key = (sid, child_id.to_string());
     Ok(admit_agent(&mut st.agent_permits, key, budget))
 }
 
@@ -1796,6 +1807,12 @@ fn handle_release_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<
 }
 
 fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> {
+    let (home, budget_cache) = {
+        let st = state.lock().unwrap();
+        (st.home.clone(), st.agent_budget.clone())
+    };
+    let total = budget_cache.lock().unwrap().get(&home)
+        .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
     let st = state.lock().unwrap();
     // Status is read-only. Extensions need it so task_list can drop ghost
     // agents whose session is no longer connected. Shutdown stays cli-only.
@@ -1826,11 +1843,10 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
         task_counts: TaskCounts { running, terminal },
-        agent_capacity: AgentCapacity {
+        agent_capacity: Some(AgentCapacity {
             used: st.agent_permits.len(),
-            total: crate::capacity::max_agents(&st.home)
-                .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?,
-        },
+            total,
+        }),
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),

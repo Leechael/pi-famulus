@@ -80,6 +80,20 @@ export default function (pi: ExtensionAPI): void {
   let ctx: ExtensionContext | null = null;
   let client: ManagerClient | null = null;
   const globalAgentLeases = new Set<string>();
+  const pendingAgentLeases = new Set<string>();
+  let leaseReconciliation: Promise<void> | null = null;
+  const reconcileAgentLeases = (manager: ManagerClient): Promise<void> => {
+    if (leaseReconciliation) return leaseReconciliation;
+    leaseReconciliation = reregisterAgentLeases(
+      manager,
+      globalAgentLeases,
+      undefined,
+      pendingAgentLeases,
+    ).finally(() => {
+      leaseReconciliation = null;
+    });
+    return leaseReconciliation;
+  };
   const capacityNotices = new Set<string>();
   const capacityNotice = (reason: "manager unavailable" | "daemon too old"): void => {
     if (capacityNotices.has(reason)) return;
@@ -492,6 +506,10 @@ export default function (pi: ExtensionAPI): void {
       }
     });
     client.onReconnect(() => {
+      // A closed socket drops daemon-side permits. Treat all local leases as
+      // pending until the reconnect has re-acquired them.
+      for (const childId of globalAgentLeases) pendingAgentLeases.add(childId);
+      globalAgentLeases.clear();
       void monitorRegistry?.rewatchAll().then(() => syncWithManager());
       void (async () => {
         const manager = client;
@@ -501,7 +519,7 @@ export default function (pi: ExtensionAPI): void {
         }
         // The registry and its child ids survive socket reconnects in this
         // extension process; held ids include resumable interrupted children.
-        await reregisterAgentLeases(manager, globalAgentLeases);
+        await reconcileAgentLeases(manager);
       })().catch(() => {});
     });
 
@@ -583,6 +601,7 @@ export default function (pi: ExtensionAPI): void {
         reserveLocal: () => registry.reserveChildSlot(req.childId, ticket),
         manager: client,
         leases: globalAgentLeases,
+        pendingLeases: pendingAgentLeases,
         ticket,
         notice: capacityNotice,
       }),
@@ -705,14 +724,18 @@ export default function (pi: ExtensionAPI): void {
     void c
       .connect()
       .then((ok) => {
-        if (!ok && startCtx.hasUI) {
+        if (ok) {
+          if (c.protocolLevel() >= 4) void reconcileAgentLeases(c).catch(() => {});
+          return;
+        }
+        if (startCtx.hasUI) {
           const detail = c.lastError();
           const reason = detail ? ` (${detail})` : "";
           const searched = managerPath ? `using ${managerPath}` : `looked in: ${describeManagerSearch(config, home)}`;
           startCtx.ui.notify(
             `pi-famulus unavailable${reason}; ${searched}. ` +
               "Bash runs locally without auto-backgrounding, task_*/monitor are disabled, " +
-              "and subagents cannot start. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",
+              "and subagents cannot run bash. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",
             "warning",
           );
         }
