@@ -1312,6 +1312,7 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         outln!("binary:   {exe}");
     }
     outln!("uptime:   {}", fmt::human_duration(st.uptime_ms));
+    outln!("agent slots: {}/{} used", st.agent_capacity.used, st.agent_capacity.total);
     outln!(
         "sessions: {} ({} connected)",
         st.sessions.len(),

@@ -783,6 +783,9 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
                 if s.conn_id == Some(conn_id) {
                     s.conn_id = None; // session now disconnected (§3.2)
                     s.last_seen = now_ms();
+                    if why == "closed" {
+                        st.agent_permits.retain(|(owner, _), _| owner != sid);
+                    }
                     crate::events::emit(
                         &home,
                         Some(sid),
@@ -1117,6 +1120,8 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             respond(&tx, &id, handle_shutdown_session(&state, conn_id)).await
         }
         RequestKind::Status => respond(&tx, &id, handle_status(&state, conn_id)).await,
+        RequestKind::AcquireAgent { child_id } => respond(&tx, &id, handle_acquire_agent(&state, conn_id, &child_id)).await,
+        RequestKind::ReleaseAgent { child_id } => respond(&tx, &id, handle_release_agent(&state, conn_id, &child_id)).await,
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
         #[cfg(feature = "test-clock")]
@@ -1781,6 +1786,21 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
             .map(|(t, _, _)| t)
             .collect(),
     })
+}
+
+fn handle_acquire_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<AgentAdmissionOk, ProtoError> {
+    let mut st = state.lock().unwrap();
+    let sid = st.conns.get(&conn_id).and_then(|c| c.session_id.clone()).ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+    let key = (sid, child_id.to_string());
+    let budget = crate::capacity::max_agents(&st.home);
+    Ok(admit_agent(&mut st.agent_permits, key, budget))
+}
+
+fn handle_release_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<UnitOk, ProtoError> {
+    let mut st = state.lock().unwrap();
+    let sid = st.conns.get(&conn_id).and_then(|c| c.session_id.clone()).ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+    st.agent_permits.remove(&(sid, child_id.to_string()));
+    Ok(UnitOk {})
 }
 
 fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> {
@@ -2493,6 +2513,15 @@ async fn graceful_shutdown(state: &Shared) {
 // Tests
 // ---------------------------------------------------------------------------
 
+fn admit_agent(permits: &mut HashMap<(String, String), ()>, key: (String, String), budget: usize) -> AgentAdmissionOk {
+    if permits.contains_key(&key) { return AgentAdmissionOk { granted: true, rejection: None }; }
+    if permits.len() >= budget {
+        return AgentAdmissionOk { granted: false, rejection: Some("global_capacity".into()) };
+    }
+    permits.insert(key, ());
+    AgentAdmissionOk { granted: true, rejection: None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2598,6 +2627,15 @@ mod tests {
         writer.abort();
         drop(state);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn global_admission_grants_rejects_and_is_idempotent() {
+        let mut permits = HashMap::new();
+        assert!(admit_agent(&mut permits, ("s1".into(), "ch1".into()), 1).granted);
+        let rejected = admit_agent(&mut permits, ("s2".into(), "ch2".into()), 1);
+        assert_eq!(rejected.rejection.as_deref(), Some("global_capacity"));
+        assert!(admit_agent(&mut permits, ("s1".into(), "ch1".into()), 1).granted);
     }
 
     #[test]

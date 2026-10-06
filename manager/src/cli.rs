@@ -54,7 +54,7 @@ impl Sub {
 #[derive(usage::Subcommands)]
 pub(crate) enum Sub {
     /// Read or update runtime daemon configuration.
-    #[usage(display_order = 5, help_heading = "Daemon")]
+    #[usage(display_order = 5, help_heading = "Inspection")]
     Config { #[usage(subcommand)] action: ConfigAction },
     /// Version, protocol, uptime, sessions, task and agent counts.
     ///
