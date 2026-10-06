@@ -613,6 +613,7 @@ export default function (pi: ExtensionAPI): void {
             ...(error ? { error } : {}),
             ...(c.result?.stalls ? { stalls: c.result.stalls } : {}),
             duration_ms: c.result?.durationMs ?? Math.max(0, clock.now() - c.startedAt),
+            ...(c.result?.queueMs !== undefined ? { queue_ms: c.result.queueMs } : {}),
           });
         }
         previousAgentStatus.set(c.childId, c.status);

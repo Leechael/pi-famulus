@@ -43,6 +43,8 @@ export interface ChildResult {
   /** Stall detections in the user turn that produced this result. */
   stalls?: number;
   durationMs: number;
+  /** Time spent waiting for an admission slot before execution. */
+  queueMs?: number;
 }
 
 /** One turn of a child session, for the /tasks conversation view. */
