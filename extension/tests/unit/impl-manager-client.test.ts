@@ -23,6 +23,7 @@ interface FakeManager {
   dropNext(type: string): void;
   startCount(): number;
   setTasks(tasks: Record<string, unknown>[]): void;
+  setProtocol(protocol: number | undefined): void;
   refuseFor(ms: number): Promise<void>;
   close(): Promise<void>;
 }
@@ -43,6 +44,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   const dropTypes = new Set<string>();
   const startsByKey = new Map<string, { task_id: string; pid: number }>();
   let tasks: Record<string, unknown>[] = [];
+  let protocol: number | undefined = 4;
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -82,7 +84,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
           rejectNextHelloForShutdown = false;
           return { v: 1, id: msg.id, ok: false, error: { code: "E_INTERNAL", message: "manager is shutting down" } };
         }
-        return { v: 1, id: msg.id, ok: true, version: "0.1.0", pid: 4321, started_at: 1 };
+        return { v: 1, id: msg.id, ok: true, version: "0.1.0", pid: 4321, started_at: 1, ...(protocol === undefined ? {} : { protocol }) };
       case "start": {
         const key = String(msg.key ?? "legacy");
         if (!startsByKey.has(key)) startsByKey.set(key, { task_id: "sh_a1b2c3d4", pid: 5678 });
@@ -153,6 +155,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     dropNext: (type) => { dropTypes.add(type); },
     startCount: () => startsByKey.size,
     setTasks: (value) => { tasks = value; },
+    setProtocol: (value) => { protocol = value; },
     refuseFor: async (ms) => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -206,6 +209,12 @@ describe("ManagerClient (integration, fake manager)", () => {
       extension_version: packageVersion,
       protocol: 4,
     });
+  });
+
+  it("records an old daemon's maximum protocol level from hello", async () => {
+    fake.setProtocol(3);
+    expect(await client.connect()).toBe(true);
+    expect(client.protocolLevel()).toBe(3);
   });
 
   it("waits out a shutting-down hello without deleting manager files", async () => {

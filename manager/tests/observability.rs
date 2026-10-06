@@ -224,7 +224,8 @@ fn p3_hello_protocol_and_status() {
     let _d = home.start_daemon();
     let t0 = now_ms();
     let mut a = home.connect();
-    hello_v2(&mut a, "sess-p3", "/tmp/p3");
+    let hello = hello_v2(&mut a, "sess-p3", "/tmp/p3");
+    assert_eq!(hello["protocol"], 4, "hello reports maximum supported protocol");
     let mut cli = home.connect();
     cli.hello_cli();
     let st = cli.request_ok(json!({"type":"status"}));

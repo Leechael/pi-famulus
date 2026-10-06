@@ -376,6 +376,9 @@ pub struct HelloOk {
     pub version: String,
     pub pid: u32,
     pub started_at: u64,
+    /// Maximum protocol level supported by this daemon.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
