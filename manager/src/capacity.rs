@@ -1,5 +1,6 @@
-//! Machine-wide agent-slot budget. CPU tokens and per-provider in-flight
-//! limits are deferred: add them when resource-aware scheduling lands.
+//! Machine-wide agent-slot budget.
+//! deferred | CPU tokens | impact | CPU-bound agents can saturate the host despite an agent-count cap | trigger | measured CPU-aware scheduling is needed
+//! deferred | per-provider in-flight limits | impact | concurrent agents can still burst requests to one provider | trigger | provider-aware dispatch or rate limiting is needed
 use serde_json::{Map, Value};
 use std::{fs, path::Path};
 
