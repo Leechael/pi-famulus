@@ -55,23 +55,48 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long connection writers get to flush before exec.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The executable path captured from the invoked install path before npm can
-/// retire its package directory. `current_exe` is unsuitable after that rename.
+/// The install executable path used for upgrades. Re-resolve it when npm
+/// retires its directory so a newly installed stable sibling becomes usable.
 pub fn exe_path() -> std::io::Result<PathBuf> {
-    static INSTALL_EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    if let Some(path) = INSTALL_EXE.get() {
-        return Ok(path.clone());
+    static INSTALL_EXE: std::sync::OnceLock<Mutex<Option<PathBuf>>> = std::sync::OnceLock::new();
+    let mut cached = INSTALL_EXE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if let Some(path) = cached.as_ref() {
+        // The stable sibling may have appeared since the daemon first started.
+        let path = non_retired_path(path.clone());
+        if path.is_file() {
+            *cached = Some(path.clone());
+            return Ok(path);
+        }
     }
-    let invoked = std::env::args_os().next().map(PathBuf::from);
-    // Canonicalization can race npm's directory retirement. In the worst case
-    // we cache a retired path, which is the pre-existing current_exe behavior.
-    let path = invoked
-        .and_then(|p| std::fs::canonicalize(&p).ok())
-        .or_else(|| std::env::current_exe().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot locate executable"))?;
+    let path = invoked_exe_path().or_else(current_exe_path).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "cannot locate executable")
+    })?;
     let path = non_retired_path(path);
-    let _ = INSTALL_EXE.set(path.clone());
+    *cached = Some(path.clone());
     Ok(path)
+}
+
+fn invoked_exe_path() -> Option<PathBuf> {
+    let invoked = PathBuf::from(std::env::args_os().next()?);
+    canonicalize_invoked_exe(&invoked)
+}
+
+fn canonicalize_invoked_exe(invoked: &Path) -> Option<PathBuf> {
+    (invoked.components().count() > 1)
+        .then(|| std::fs::canonicalize(invoked).ok())
+        .flatten()
+}
+
+fn current_exe_path() -> Option<PathBuf> {
+    std::env::current_exe().ok().map(strip_deleted_suffix)
+}
+
+fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let Some(original) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
+        return path;
+    };
+    PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()))
 }
 
 fn non_retired_path(path: PathBuf) -> PathBuf {
@@ -97,9 +122,12 @@ fn retired_component_stable_name(name: &str) -> Option<&str> {
     let rest = name.strip_prefix(".pi-famulus-")?;
     let (platform, nonce) = rest.rsplit_once('-')?;
     let valid_platform = !platform.is_empty()
-        && platform.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    let valid_nonce = nonce.len() >= 6
-        && nonce.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        && platform
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    // npm's retire-path hashes the original path, removes non-alphanumerics
+    // from its base64 form, then takes the first eight characters.
+    let valid_nonce = nonce.len() == 8 && nonce.bytes().all(|b| b.is_ascii_alphanumeric());
     (valid_platform && valid_nonce).then_some(&name[1..name.len() - nonce.len() - 1])
 }
 
@@ -640,15 +668,65 @@ pub fn rearm_timers(state: &Shared, id: &str) {
 
 #[cfg(test)]
 mod path_tests {
-    use super::non_retired_path;
+    use super::{
+        canonicalize_invoked_exe, non_retired_path, retired_component_stable_name,
+        strip_deleted_suffix,
+    };
     use std::path::PathBuf;
 
     #[test]
-    fn legitimate_hidden_package_names_are_not_remapped() {
-        for name in [".pi-famulus-linux-x64", ".pi-famulus-linux-x64-short"] {
-            let original = PathBuf::from("/tmp/node_modules").join(name).join("bin/pi-famulus");
-            assert_eq!(non_retired_path(original.clone()), original, "{name}");
+    fn npm_retirement_names_require_the_actual_nonce_shape() {
+        assert_eq!(
+            retired_component_stable_name(".pi-famulus-linux-x64-AWM9wakS"),
+            Some("pi-famulus-linux-x64")
+        );
+        for name in [
+            ".pi-famulus-linux-x64",
+            ".pi-famulus-linux-x64-custom1",
+            ".pi-famulus-linux-x64-1234567",
+            ".pi-famulus-linux-x64-1234567_",
+        ] {
+            assert_eq!(retired_component_stable_name(name), None, "{name}");
         }
+    }
+
+    #[test]
+    fn slashless_invoked_names_are_not_canonicalized_from_the_working_directory() {
+        assert_eq!(
+            canonicalize_invoked_exe(std::path::Path::new("pi-famulus")),
+            None
+        );
+        assert_eq!(PathBuf::from("./pi-famulus").components().count(), 2);
+    }
+
+    #[test]
+    fn current_executable_deleted_suffix_is_removed() {
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/tmp/pi-famulus (deleted)")),
+            PathBuf::from("/tmp/pi-famulus")
+        );
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/tmp/pi-famulus")),
+            PathBuf::from("/tmp/pi-famulus")
+        );
+    }
+
+    #[test]
+    fn legitimate_hidden_package_names_are_not_remapped() {
+        let modules = std::env::temp_dir().join(format!(
+            "pi-famulus-handover-path-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&modules);
+        let stable = modules.join("pi-famulus-linux-x64/bin/pi-famulus");
+        std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
+        std::fs::write(&stable, b"stable").unwrap();
+        let hidden = modules.join(".pi-famulus-linux-x64-custom1/bin/pi-famulus");
+        std::fs::create_dir_all(hidden.parent().unwrap()).unwrap();
+        std::fs::write(&hidden, b"hidden").unwrap();
+
+        assert_eq!(non_retired_path(hidden.clone()), hidden);
+        std::fs::remove_dir_all(modules).unwrap();
     }
 }
 

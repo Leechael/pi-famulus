@@ -412,7 +412,7 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
 /// until the file changes again.
 fn spawn_exe_watch(state: &Shared) {
     const POLL: Duration = Duration::from_secs(2);
-    let Ok(exe) = crate::handover::exe_path() else { return };
+    let Ok(mut exe) = crate::handover::exe_path() else { return };
     let ident = |p: &std::path::Path| {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
@@ -423,6 +423,11 @@ fn spawn_exe_watch(state: &Shared) {
         let mut seen = running;
         loop {
             tokio::time::sleep(POLL).await;
+            let Ok(resolved_exe) = crate::handover::exe_path() else {
+                seen = None;
+                continue;
+            };
+            exe = resolved_exe;
             let now = ident(&exe);
             if now.is_none() || now == running {
                 seen = now;
