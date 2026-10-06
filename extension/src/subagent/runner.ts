@@ -370,7 +370,6 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.settledFlag = false;
     this.retiredGen = null;
     this.status_ = "pending";
-    this.startedAt = this.runStartedAt;
     this.lastEvent = this.runStartedAt;
     this.resultPromise = new Promise((resolve) => {
       this.resolveResult = resolve;
@@ -463,8 +462,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.timerScope = new TimerScope(this.clock);
     this.settledFlag = false;
     this.status_ = "pending";
-    this.startedAt = this.clock.now();
-    this.lastEvent = this.startedAt;
+    this.lastEvent = this.clock.now();
     // A tool_execution_end from the previous generation may have been dropped
     // after settle. Don't carry that depth (or a pending decision) into this one.
     this.toolDepth = 0;
