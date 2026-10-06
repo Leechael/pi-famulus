@@ -887,17 +887,52 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
     wait_for_socket(&home, CONNECT_TIMEOUT);
     let mut a = connect(&home, CONNECT_TIMEOUT);
     let mut b = connect(&home, CONNECT_TIMEOUT);
+    let mut c = connect(&home, CONNECT_TIMEOUT);
     hello_ext(&mut a, "session-a");
     hello_ext(&mut b, "session-b");
-    assert!(compact(&a.request(r#"{"id":"a1","type":"acquire_agent","child_id":"ch_a"}"#, "a1")).contains("\"granted\":true"));
-    let denied = b.request(r#"{"id":"b1","type":"acquire_agent","child_id":"ch_b"}"#, "b1");
-    assert!(compact(&denied).contains("\"rejection\":\"global_capacity\""), "{denied}");
-    b.request(r#"{"id":"b2","type":"release_agent","child_id":"ch_b"}"#, "b2");
-    drop(a);
+    hello_ext(&mut c, "session-c");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let ba = barrier.clone();
+    let ta = std::thread::spawn(move || {
+        ba.wait();
+        let response = a.request(r#"{"id":"a1","type":"acquire_agent","child_id":"ch_shared"}"#, "a1");
+        (response, a)
+    });
+    let bb = barrier.clone();
+    let tb = std::thread::spawn(move || {
+        bb.wait();
+        let response = b.request(r#"{"id":"b1","type":"acquire_agent","child_id":"ch_shared"}"#, "b1");
+        (response, b)
+    });
+    barrier.wait();
+    let (ra, mut a) = ta.join().unwrap();
+    let (rb, mut b) = tb.join().unwrap();
+    assert_ne!(compact(&ra).contains("\"granted\":true"), compact(&rb).contains("\"granted\":true"), "one machine slot admits exactly one session");
+    let (winner_a, loser_b) = (compact(&ra).contains("\"granted\":true"), compact(&rb).contains("\"granted\":true"));
+    assert!(winner_a || loser_b);
+    if winner_a {
+        assert!(compact(&rb).contains("\"rejection\":\"global_capacity\""), "{rb}");
+    } else {
+        assert!(compact(&ra).contains("\"rejection\":\"global_capacity\""), "{ra}");
+    }
+    fs::write(home.join("config.json"), r#"{"maxAgents":2}"#).unwrap();
+    let admitted = if winner_a {
+        b.request(r#"{"id":"b2","type":"acquire_agent","child_id":"ch_shared"}"#, "b2")
+    } else {
+        a.request(r#"{"id":"a2","type":"acquire_agent","child_id":"ch_shared"}"#, "a2")
+    };
+    assert!(compact(&admitted).contains("\"granted\":true"), "scale up did not admit: {admitted}");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    let denied = c.request(r#"{"id":"c1","type":"acquire_agent","child_id":"ch_c"}"#, "c1");
+    assert!(compact(&denied).contains("\"rejection\":\"global_capacity\""), "scale down did not limit new admissions: {denied}");
+    let second = if winner_a { &mut b } else { &mut a };
+    second.request(r#"{"id":"release1","type":"release_agent","child_id":"ch_shared"}"#, "release1");
+    second.request(r#"{"id":"release2","type":"release_agent","child_id":"ch_shared"}"#, "release2");
+    if winner_a { drop(a); } else { drop(b); }
     std::thread::sleep(Duration::from_millis(50));
-    let granted = b.request(r#"{"id":"b3","type":"acquire_agent","child_id":"ch_b"}"#, "b3");
+    let granted = c.request(r#"{"id":"c2","type":"acquire_agent","child_id":"ch_c"}"#, "c2");
     assert!(compact(&granted).contains("\"granted\":true"), "stale session permit was not reaped: {granted}");
-    b.request(r#"{"id":"b4","type":"release_agent","child_id":"ch_b"}"#, "b4");
+    c.request(r#"{"id":"c3","type":"release_agent","child_id":"ch_c"}"#, "c3");
 }
 
 #[test]
