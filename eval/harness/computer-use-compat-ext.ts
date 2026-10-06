@@ -4,6 +4,35 @@ import { randomBytes } from "node:crypto";
 import { VERSION, type ContextEvent, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createStubUiTools, FIXTURE_VERSION, WAIT_FOR_SCHEMA_SHA256 } from "../ablation/fixtures/computer-use-0.5.1.ts";
 
+type HistoryMessage = ContextEvent["messages"][number];
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, i) => sameValue(value, b[i]));
+  }
+  const aRecord = a as Record<string, unknown>, bRecord = b as Record<string, unknown>;
+  const keys = Object.keys(aRecord);
+  return keys.length === Object.keys(bRecord).length && keys.every((key) => Object.hasOwn(bRecord, key) && sameValue(aRecord[key], bRecord[key]));
+}
+function sameHistoryContent(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a === "string" || typeof b === "string") return a === b;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((part, i) => sameHistoryContent(part, b[i]));
+  }
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  const left = a as Record<string, unknown>, right = b as Record<string, unknown>;
+  if (left.type !== right.type) return false;
+  if (left.type === "text") return left.text === right.text;
+  if (left.type === "toolCall") return left.id === right.id && left.name === right.name && sameValue(left.arguments, right.arguments);
+  return sameValue(left, right);
+}
+function sameHistoryMessage(a: HistoryMessage, b: HistoryMessage): boolean {
+  if (a.role !== b.role || !("content" in a) || !("content" in b) || !sameHistoryContent(a.content, b.content)) return false;
+  return a.role !== "toolResult" || (b.role === "toolResult" && a.toolCallId === b.toolCallId && a.toolName === b.toolName && a.isError === b.isError);
+}
+
 export default function computerUseCompatibility(pi: ExtensionAPI): void {
   // Fail closed: an accidental -e without explicit scenario setup installs no tools.
   if (process.env.PI_FAMULUS_COMPAT_FIXTURE !== FIXTURE_VERSION) return;
@@ -25,12 +54,14 @@ export default function computerUseCompatibility(pi: ExtensionAPI): void {
     return history.length ? { messages: [...history, ...event.messages] } : undefined;
   });
   pi.on("context_with_system", (event, ctx) => {
-    // The immutable synthetic prefix is measured once. Confirm and slice that
-    // exact prefix so only current messages are serialized on each request.
-    if (event.messages.length < history.length || history.some((message, i) => event.messages[i] !== message)) {
-      throw new Error("compat context history prefix changed; cannot produce an honest size audit");
+    // context_with_system includes native system messages and the SDK may clone
+    // conversation entries. Compare semantic content after removing system rows;
+    // equality checks allocate no serialized copies of the long fixture text.
+    const conversation = event.messages.filter((message) => message.role !== "system");
+    if (conversation.length < history.length || history.some((message, i) => !sameHistoryMessage(message, conversation[i]))) {
+      throw new Error("compat context history is not the leading conversation prefix; refusing an inaccurate audit");
     }
-    const liveMessages = event.messages.slice(history.length);
+    const liveMessages = conversation.slice(history.length);
     const liveJson = JSON.stringify(liveMessages);
     const liveJsonChars = liveJson.length;
     const contextCharsEstimate = cachedHistoryJsonChars + liveJsonChars;

@@ -23,10 +23,12 @@ export interface PiRpcOptions {
   model: string;
   /** Extra extensions loaded AFTER ours (faux harness, ablation harness). */
   extensions?: string[];
+  /** Isolated SDK fixtures can omit pi-famulus so no manager process is involved. */
+  includeExtensionUnderTest?: boolean;
   extraArgs?: string[];
 }
 
-export function piArgs(opts: Pick<PiRpcOptions, "model" | "extensions" | "extraArgs">, mode: "rpc" | "tui"): string[] {
+export function piArgs(opts: Pick<PiRpcOptions, "model" | "extensions" | "includeExtensionUnderTest" | "extraArgs">, mode: "rpc" | "tui"): string[] {
   const args = [
     // Isolation from the user's setup: no discovered extensions/skills/templates/
     // context files (settings.json `packages` included), no persisted session.
@@ -36,8 +38,7 @@ export function piArgs(opts: Pick<PiRpcOptions, "model" | "extensions" | "extraA
     "-nc",
     "--no-session",
     "--offline",
-    "-e",
-    EXTENSION_DIR,
+    ...(opts.includeExtensionUnderTest === false ? [] : ["-e", EXTENSION_DIR]),
     ...(opts.extensions ?? []).flatMap((e) => ["-e", e]),
     ...(opts.model ? ["--model", opts.model] : []),
     ...(opts.extraArgs ?? []),

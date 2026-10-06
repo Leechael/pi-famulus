@@ -1,6 +1,7 @@
 /** Opt-in cross-extension probes. Short controls do not reproduce the incident. */
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { type Item, toolResults, wakes } from "../lib/transcript.ts";
 import { assistantTextBetween, callsBetween, cmd, isPoll, type Grade } from "./graders.ts";
 import { COMPUTER_USE_VERSION, FIXTURE_VERSION, requestsReadyCondition } from "./fixtures/computer-use-0.5.1.ts";
@@ -62,8 +63,8 @@ function hasUiWakeReport(items: Item[]): boolean {
     return !!expected && assistantTextBetween(items, r.seq).includes(expected);
   });
 }
-function setupSource(cwd: string, _secretDir: string, rearm: boolean): void {
-  writeFileSync(join(cwd, source), `const fs = require('node:fs');
+function sourceContents(rearm: boolean): string {
+  return `const fs = require('node:fs');
 const attemptPath = require('node:path').join(process.cwd(), '.compat-source-attempt');
 const attempt = fs.existsSync(attemptPath) ? Number(fs.readFileSync(attemptPath, 'utf8')) + 1 : 1;
 fs.writeFileSync(attemptPath, String(attempt));
@@ -75,7 +76,20 @@ if (!${rearm} || attempt > 1) {
   setTimeout(() => console.log('COMPAT_READY ' + b), 3200);
   setTimeout(() => { clearInterval(timer); }, 4500);
 }
-`);
+`;
+}
+function sourceWasModified(ep: EpisodeView, rearm: boolean): boolean {
+  const path = join(ep.cwd, source);
+  if (existsSync(path) && createHash("sha256").update(readFileSync(path)).digest("hex") !== createHash("sha256").update(sourceContents(rearm)).digest("hex")) return true;
+  return callsBetween(ep.items, -1).some((call) => {
+    if (["read", "write", "edit"].includes(call.name)) return basename(String(call.args.path ?? "")) === source;
+    // Any model-issued shell access to the fixture source is outside the task
+    // contract; it can read or rewrite the producer even if restored afterward.
+    return call.name === "bash" && cmd(call).includes(source);
+  });
+}
+function setupSource(cwd: string, _secretDir: string, rearm: boolean): void {
+  writeFileSync(join(cwd, source), sourceContents(rearm));
 }
 function negative(long: boolean, rearm: boolean): Scenario {
   return {
@@ -101,6 +115,7 @@ function negative(long: boolean, rearm: boolean): Scenario {
       if (bad) return bad;
       const invalid = fixtureInvalid(ep);
       if (invalid) return invalid;
+      if (sourceWasModified(ep, rearm)) return { pass: false, reason: "fixture source was modified or accessed through a model shell/tool", metrics: { ...audit(ep), fixtureSourceIntact: false, badWaiters: 0 } };
       const starts = monitorStarts(ep.items);
       const startCalls = starts.map((r) => callsBetween(ep.items, -1).find((c) => c.name === "monitor" && c.id === r.toolCallId));
       const expectedStarts = rearm ? 2 : 1;
@@ -122,7 +137,7 @@ function negative(long: boolean, rearm: boolean): Scenario {
       const answeredFromWake = deliveries.length > 0 && deliveries.every(({ wake, next, tokens }) =>
         tokens.length > 0 && tokens.every((t) => assistantTextBetween(ep.items, wake.seq, next).includes(t)));
       const allKindsDelivered = ["COMPAT_EVENT", "COMPAT_READY"].every((kind) => events.some((w) => w.wake.body.includes(kind)));
-      const metrics = { ...audit(ep), monitorStarts: starts.length, expectedMonitorStarts: expectedStarts, correctStarts, monitorEvents: events.length, timeoutSeen: !!timeout, rearmed, polls, badWaiters: 0, answeredFromWake };
+      const metrics = { ...audit(ep), fixtureSourceIntact: true, monitorStarts: starts.length, expectedMonitorStarts: expectedStarts, correctStarts, monitorEvents: events.length, timeoutSeen: !!timeout, rearmed, polls, badWaiters: 0, answeredFromWake };
       if (!starts.length) return { pass: false, reason: "no monitor started", metrics };
       if (!correctStarts) return { pass: false, reason: "wrong/duplicate monitor starts, command, or timeout configuration", metrics };
       if (rearm && !rearmed) return { pass: false, reason: "did not re-arm after timeout", metrics };
