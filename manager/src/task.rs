@@ -21,6 +21,26 @@ use tokio::sync::mpsc;
 
 pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
 
+/// Best-effort live CPU for a process group, read from Linux /proc. Values
+/// are cumulative user/system milliseconds for all currently visible members.
+/// This deliberately does not pretend to include reaped descendants.
+pub fn live_group_cpu_ms(pgid: u32) -> Option<(u64, u64)> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 { return None; }
+    let mut user = 0u64;
+    let mut system = 0u64;
+    let members = crate::sys::group_members(pgid).ok()?;
+    if members.is_empty() { return None; }
+    for pid in members {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close = text.rfind(')')?;
+        let fields: Vec<&str> = text[close + 2..].split_whitespace().collect();
+        user = user.saturating_add(fields.get(11)?.parse::<u64>().ok()?);
+        system = system.saturating_add(fields.get(12)?.parse::<u64>().ok()?);
+    }
+    Some((user.saturating_mul(1000) / ticks as u64, system.saturating_mul(1000) / ticks as u64))
+}
+
 /// §3.4: in-memory ring buffer is 64KB; the disk file keeps the full stream.
 pub const RING_CAPACITY: usize = 64 * 1024;
 
