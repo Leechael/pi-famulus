@@ -50,6 +50,20 @@ fn spawn_daemon(home: &Path) -> Child {
         .expect("spawn pi-famulus daemon")
 }
 
+fn spawn_daemon_with_agent_budget_pause(home: &Path, marker: &Path) -> Child {
+    Command::new(BIN)
+        .arg("daemon")
+        .env("PI_FAMULUS_HOME", home)
+        .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD", "ch-old")
+        .env("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER", marker)
+        .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_MS", "700")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pi-famulus daemon with budget pause")
+}
+
 fn wait_for_socket(home: &Path, timeout: Duration) {
     // §3.1 step 3: clients poll for socket readiness with a 2s timeout.
     let deadline = Instant::now() + timeout;
@@ -890,6 +904,72 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
     let granted = c.request(r#"{"id":"c4","type":"acquire_agent","child_id":"ch_c"}"#, "c4");
     assert!(compact(&granted).contains("\"granted\":true"), "stale session permit was not reaped: {granted}");
     c.request(r#"{"id":"c5","type":"release_agent","child_id":"ch_c"}"#, "c5");
+}
+
+#[test]
+fn p7_stale_capacity_read_cannot_overtake_new_admission() {
+    let home = test_home("p7-agent-budget-order");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3}"#).unwrap();
+    let marker = home.join("old-budget-read");
+    let mut daemon = spawn_daemon_with_agent_budget_pause(&home, &marker);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut existing = connect(&home, CONNECT_TIMEOUT);
+    let mut old = connect(&home, CONNECT_TIMEOUT);
+    let mut fresh = connect(&home, CONNECT_TIMEOUT);
+    hello_ext(&mut existing, "budget-existing");
+    hello_ext(&mut old, "budget-old");
+    hello_ext(&mut fresh, "budget-fresh");
+    let held = existing.request(
+        r#"{"id":"held","type":"acquire_agent","child_id":"ch-held"}"#,
+        "held",
+    );
+    assert!(compact(&held).contains("\"granted\":true"), "{held}");
+
+    let old_request = std::thread::spawn(move || {
+        let response = old.request(
+            r#"{"id":"old","type":"acquire_agent","child_id":"ch-old"}"#,
+            "old",
+        );
+        (response, old)
+    });
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "acquire did not reach its old-budget read"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // `ch-old` has cached maxAgents=3 but is paused before its state admission.
+    // A newer request sees maxAgents=2 and must not be overtaken when the older
+    // request resumes with its stale budget.
+    fs::write(home.join("config.json"), r#"{"maxAgents":2}"#).unwrap();
+    let refreshed = existing.request(r#"{"id":"refresh","type":"status"}"#, "refresh");
+    assert!(
+        compact(&refreshed).contains("\"agent_capacity\":{\"used\":1,\"total\":2}"),
+        "{refreshed}"
+    );
+    let fresh_response = fresh.request(
+        r#"{"id":"fresh","type":"acquire_agent","child_id":"ch-fresh"}"#,
+        "fresh",
+    );
+    let (old_response, _old) = old_request.join().unwrap();
+    let fresh_granted = compact(&fresh_response).contains("\"granted\":true");
+    let old_granted = compact(&old_response).contains("\"granted\":true");
+    assert_ne!(
+        fresh_granted, old_granted,
+        "stale admission overtook the refreshed budget: {fresh_response}; {old_response}"
+    );
+
+    let status = existing.request(r#"{"id":"p7status","type":"status"}"#, "p7status");
+    assert!(
+        compact(&status).contains("\"agent_capacity\":{\"used\":2,\"total\":2}"),
+        "{status}"
+    );
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]

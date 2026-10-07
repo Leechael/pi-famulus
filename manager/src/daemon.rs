@@ -155,6 +155,9 @@ pub struct DaemonState {
     pub undelivered_agent_grants: HashMap<(String, String), String>,
     /// One-shot cancellation tombstones for cancel/acquire dispatch races.
     pub cancelled_acquires: HashSet<(String, String, String)>,
+    /// Serializes budget reads with admission commits without holding `state`
+    /// across config metadata/file I/O.
+    pub agent_admission: Arc<Mutex<()>>,
     /// Cached global budget; per-kind settings remain part of CapacityConfig.
     pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
 }
@@ -197,6 +200,7 @@ impl DaemonState {
             pending_agents: std::collections::VecDeque::new(),
             undelivered_agent_grants: HashMap::new(),
             cancelled_acquires: HashSet::new(),
+            agent_admission: Arc::new(Mutex::new(())),
             agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
         }
     }
@@ -409,10 +413,50 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     let s2 = state.clone();
     tokio::spawn(async move {
         clock.sleep("handover-grace", HANDOVER_GRACE).await;
-        s2.lock().unwrap().hold_idle = false;
+        let (home, admission_lock) = {
+            let st = s2.lock().unwrap();
+            (st.home.clone(), st.agent_admission.clone())
+        };
+        // Reconciliation can grant queued children after reclaiming leases.
+        // Read config outside `state`, and serialize its snapshot with direct
+        // admissions before committing those grants.
+        let _admission = admission_lock.lock().unwrap();
+        let capacity = crate::capacity::load(&home).ok();
+        let wake = {
+            let mut st = s2.lock().unwrap();
+            st.hold_idle = false;
+            reap_disconnected_agent_permits(&mut st);
+            capacity
+                .as_ref()
+                .map(|capacity| wake_pending_with_capacity(&mut st, capacity))
+                .unwrap_or_default()
+        };
+        drop(_admission);
+        send_agent_grants(&s2, wake);
         maybe_arm_idle_timer(&s2);
     });
     serve(state, listener, lock).await
+}
+
+/// Handover keeps permits while sessions have a chance to reconnect. Once
+/// that grace ends, sessions still disconnected cannot own live children.
+fn reap_disconnected_agent_permits(st: &mut DaemonState) {
+    let connected: HashSet<String> = st
+        .sessions
+        .iter()
+        .filter_map(|(sid, session)| session.conn_id.map(|_| sid.clone()))
+        .collect();
+    // A permit carries its work kind, so removing its owner also removes that
+    // kind's usage. Do not reap a lease whose session reconnected during grace.
+    st.agent_permits.retain(|(sid, _), _| connected.contains(sid));
+    st.pending_agents
+        .retain(|pending| connected.contains(&pending.session_id));
+    st.cancelled_acquires
+        .retain(|(sid, _, _)| connected.contains(sid));
+    let active_permits: HashSet<(String, String)> = st.agent_permits.keys().cloned().collect();
+    st.undelivered_agent_grants.retain(|(sid, _), child_id| {
+        connected.contains(sid) && active_permits.contains(&(sid.clone(), child_id.clone()))
+    });
 }
 
 /// The accept loop, shared by a fresh daemon and one restored after an
@@ -2107,11 +2151,12 @@ async fn handle_acquire_agent(
                     st.sessions.get(sid).and_then(|s| s.protocol).unwrap_or(0),
                     st.home.clone(),
                     st.agent_budget.clone(),
+                    st.agent_admission.clone(),
                 )
             })
         })
     };
-    let Some((sid, client_protocol, home, budget_cache)) = session else {
+    let Some((sid, client_protocol, home, budget_cache, admission_lock)) = session else {
         respond::<AgentAdmissionOk>(
             tx,
             request_id,
@@ -2124,8 +2169,13 @@ async fn handle_acquire_agent(
         return;
     };
     // The #46 global budget cache remains authoritative for the machine-wide
-    // cap. Per-kind settings are loaded alongside it for protocol-5 scheduling.
+    // cap. Serialize its refresh and this state commit so an older read cannot
+    // overtake a newer admission; config I/O remains outside `state`.
+    let admission = admission_lock.lock().unwrap();
     let global_budget = budget_cache.lock().unwrap().get(&home);
+    #[cfg(debug_assertions)]
+    pause_after_agent_budget_read(child_id);
+    // Per-kind settings are loaded alongside the global cap for v5 scheduling.
     let capacity = crate::capacity::load(&home);
     let (result, wake) = {
         let mut st = state.lock().unwrap();
@@ -2296,10 +2346,31 @@ async fn handle_acquire_agent(
             }
         }
     };
+    drop(admission);
     send_agent_grants(state, wake);
     if let Some(result) = result {
         respond(tx, request_id, result).await;
     }
+}
+
+#[cfg(debug_assertions)]
+fn pause_after_agent_budget_read(child_id: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PAUSED: AtomicBool = AtomicBool::new(false);
+    if std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD").as_deref() != Ok(child_id) {
+        return;
+    }
+    if PAUSED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(marker) = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER") {
+        let _ = std::fs::write(marker, b"read");
+    }
+    let ms = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(500);
+    tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(ms)));
 }
 
 fn handle_cancel_acquire(
