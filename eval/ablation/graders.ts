@@ -90,17 +90,18 @@ export function ackAndStop(items: Item[], wakeSeq: number): boolean {
 /** First tool call (at/after seq) that writes `file` via write/edit/bash redirection. */
 export function firstWriteOf(items: Item[], file: string, afterSeq = -1): CallAt | undefined {
   const base = file.replace(/^.*\//, "");
+  // Any directory prefix: models also write through the absolute cwd path.
   return callsBetween(items, afterSeq).find((c) => {
     if (c.name === "write" || c.name === "edit") return String(c.args.path ?? "").endsWith(base);
     if (c.name === "bash") {
       const b = base.replace(/\./g, "\\.");
       return (
-        new RegExp(`>>?\\s*['"]?(\\./)?${b}`).test(cmd(c)) ||
-        new RegExp(`tee\\s+(-a\\s+)?['"]?(\\./)?${b}`).test(cmd(c)) ||
+        new RegExp(`>>?\\s*['"]?(\\S*/)?${b}`).test(cmd(c)) ||
+        new RegExp(`tee\\s+(-a\\s+)?['"]?(\\S*/)?${b}`).test(cmd(c)) ||
         // mv/cp onto it: a command of its own (at the start or after a
         // separator, not quoted text), the file its last argument; a
         // redirect may follow.
-        new RegExp(`(^|[;&|(]\\s*)(mv|cp)\\s+(-\\S+\\s+)*\\S+\\s+['"]?(\\./)?${b}['"]?(?=\\s*($|[;&|]|\\d?>))`, "m").test(cmd(c))
+        new RegExp(`(^|[;&|(]\\s*)(mv|cp)\\s+(-\\S+\\s+)*\\S+\\s+['"]?(\\S*/)?${b}['"]?(?=\\s*($|[;&|]|\\d?>))`, "m").test(cmd(c))
       );
     }
     return false;
