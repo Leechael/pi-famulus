@@ -1223,9 +1223,13 @@ fn stale_files_recover_after_transient_lifetime_lock_contention() {
 /// replaces the owner's socket/pid files.
 #[test]
 fn real_lifetime_lock_owner_gets_bounded_refusal_without_second_server() {
-    let home = Home::new("real-lock-owner");
+    let home = Home::new("rlo");
     let mut owner = home.start_daemon();
     let owner_pid = owner.id();
+    // Keep the legitimate owner active while the contender exhausts retries,
+    // so the test always checks a live lock owner rather than idle shutdown.
+    let mut owner_client = home.connect();
+    assert_eq!(owner_client.hello_cli()["pid"], owner_pid);
     let blocked = home.path.join("blocked-lock-attempts");
     let started = Instant::now();
     let mut duplicate = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked, None)));
