@@ -38,7 +38,7 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
-Per-model results, and when they must be rerun: [BASELINES.md](BASELINES.md).
+Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun).
 
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
