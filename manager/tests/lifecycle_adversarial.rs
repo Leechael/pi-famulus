@@ -51,6 +51,28 @@ fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
     assert!(ok, "task {task_id} never printed {needle:?}");
 }
 
+/// Start a daemon that leaves a byte in `blocked` every time it cannot yet
+/// acquire manager.lock. The debug-only hook makes lock contention observable
+/// without relying on a scheduler sleep in the lifecycle regression below.
+fn spawn_lock_observer_daemon(home: &Home, blocked: &std::path::Path) -> std::process::Child {
+    std::process::Command::new(BIN)
+        .arg("--home")
+        .arg(&home.path)
+        .env("PI_FAMULUS_TEST_CLOCK", if home.manual { "manual" } else { "" })
+        .env("PI_FAMULUS_TEST_OWNER", test_owner())
+        .env("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED", blocked)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lock-observing daemon")
+}
+
+fn blocked_lock_attempts(path: &std::path::Path) -> usize {
+    std::fs::read(path).map(|attempts| attempts.len()).unwrap_or(0)
+}
+
 // ===========================================================================
 // Daemon: spawn race / singleton (D1, D2, D3)
 // ===========================================================================
@@ -1095,6 +1117,130 @@ fn d12_reused_pid_in_pidfile_does_not_block_startup() {
     let _ = impostor.kill();
     let _ = impostor.wait();
     assert!(out.status.success(), "manager blocked by reused pid: {}", out.stderr);
+}
+
+/// A transient exclusive manager.lock owner can overlap a successor's first
+/// claim after SIGKILL. The successor must keep retrying the actual lock,
+/// leaving the stale pid/socket untouched until it acquires ownership.
+#[test]
+fn stale_files_recover_after_transient_lifetime_lock_contention() {
+    let home = Home::new("stale-lock-contention");
+    let mut original = home.start_daemon();
+    let old_pid = original.id();
+    kill_pid(old_pid, libc::SIGKILL);
+    assert!(
+        wait_child(&mut original, S(5)).is_some(),
+        "killed daemon was not reaped"
+    );
+    assert_eq!(home.pidfile_pid(), Some(old_pid));
+    assert!(
+        home.sock().exists(),
+        "SIGKILL should leave the stale socket"
+    );
+
+    // This is the same exclusive flock as a paused lifecycle::lock_held
+    // probe, held in a different process from the successor daemon.
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.path.join("manager.lock"))
+        .unwrap();
+    let mut lifecycle_lock = fd_lock::RwLock::new(lock_file);
+    let guard = lifecycle_lock.try_write().unwrap();
+    let blocked = home.path.join("blocked-lock-attempts");
+    let mut successor = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked)));
+
+    assert!(
+        poll_true(S(3), || blocked_lock_attempts(&blocked) >= 1),
+        "successor did not observe the held manager.lock"
+    );
+    if let Some(status) = successor.0.as_mut().unwrap().try_wait().unwrap() {
+        let out = successor.0.take().unwrap().wait_with_output().unwrap();
+        panic!(
+            "successor exited before lock release ({status}; stdout: {:?})",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    assert_eq!(
+        home.pidfile_pid(),
+        Some(old_pid),
+        "contender cleaned up the stale pid"
+    );
+    assert!(
+        home.sock().exists(),
+        "contender unlinked the stale socket without ownership"
+    );
+    assert!(
+        UnixStream::connect(home.sock()).is_err(),
+        "stale socket unexpectedly serves"
+    );
+
+    drop(guard);
+    assert!(
+        poll_true(S(8), || {
+            home.pidfile_pid().is_some_and(|pid| pid != old_pid)
+                && UnixStream::connect(home.sock()).is_ok()
+        }),
+        "successor did not claim the released lifetime lock"
+    );
+    let new_pid = home.pidfile_pid().unwrap();
+    let mut client = home.connect();
+    assert_eq!(client.hello_cli()["pid"], new_pid);
+    assert_ne!(new_pid, old_pid);
+    assert!(successor.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    drop(client);
+
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(wait_child(successor.0.as_mut().unwrap(), S(10)).is_some());
+}
+
+/// A real daemon that owns manager.lock still wins after the bounded retry
+/// window: a contender exits with its informational pid and never binds or
+/// replaces the owner's socket/pid files.
+#[test]
+fn real_lifetime_lock_owner_gets_bounded_refusal_without_second_server() {
+    let home = Home::new("real-lock-owner");
+    let mut owner = home.start_daemon();
+    let owner_pid = owner.id();
+    let blocked = home.path.join("blocked-lock-attempts");
+    let started = Instant::now();
+    let mut duplicate = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked)));
+
+    assert!(
+        poll_true(S(3), || blocked_lock_attempts(&blocked) >= 2),
+        "contender did not retry while the real daemon owned manager.lock"
+    );
+    assert!(
+        duplicate.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "contender did not wait through a transient WouldBlock"
+    );
+    let status = wait_child(duplicate.0.as_mut().unwrap(), S(5))
+        .expect("contender did not refuse within the bounded claim window");
+    assert!(status.success(), "duplicate daemon exited with {status}");
+    assert!(
+        started.elapsed() < S(5),
+        "real-owner refusal was not bounded"
+    );
+    let out = duplicate.0.take().unwrap().wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("already running (pid {owner_pid})")),
+        "{stdout:?}"
+    );
+    assert_eq!(home.pidfile_pid(), Some(owner_pid));
+    assert_eq!(
+        daemon_pids_for(&home.path),
+        vec![owner_pid],
+        "a second daemon survived"
+    );
+    let mut client = home.connect();
+    assert_eq!(client.hello_cli()["pid"], owner_pid);
+    assert!(home.sock().exists(), "owner's socket was removed");
+
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(wait_child(&mut owner, S(10)).is_some());
 }
 
 // ===========================================================================
