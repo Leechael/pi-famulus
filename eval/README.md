@@ -15,7 +15,9 @@ Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np 
 - `pi` on `PATH` (tested with 1.0.0) — override with `PI_BIN`
 - `cargo`: `pi-famulus` is built from `../manager` into `eval/.cache/target` on first use (never inside `manager/`); override with `PI_FAMULUS_MANAGER_PATH`
 - `tmux` for the TUI test
-- `npm install` (or `npm ci`) in `eval/` is required for typechecking, unit tests, deterministic compatibility tests, and eval runners; fixture imports use pinned runtime dependencies.
+- Dependencies in `eval/` (and `extension/`) are required for typechecking, unit tests, deterministic compatibility tests, and eval runners; fixture imports use pinned runtime dependencies. Locally, install them with `npm run deps`, which runs [nub](https://github.com/nubjs/nub) (`nub install --frozen-lockfile --node-linker hoisted`) from the same `package-lock.json`. CI keeps `npm ci`.
+
+  Why nub: `@earendil-works/pi-coding-agent` alone is ~430 MB, and npm writes a full copy into every checkout. nub links files from one global store (copy-on-write clones on APFS), so each extra worktree costs a few MB instead of ~470 MB (measured 2026-10-08: a second `eval/` install took 6 MB of disk with nub, 472 MB with npm). The hoisted layout is required: the tsconfig `paths` entry and some tests reach the SDK's own nested `pi-ai`, which nub's default isolated layout does not expose.
 
 Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION` only for post-transition revisions compatible with this harness). For earlier revisions, use their matching harness and manager as described in [Where results go](#where-results-go).
 
@@ -127,8 +129,9 @@ For a cross-transition comparison, start in the current checkout's `eval/` with 
 
   # Build and run entirely from the baseline revision, including its own harness.
   cd "$baseline"
-  npm ci --prefix extension
-  npm ci --prefix eval
+  # Older revisions have no `deps` script: call nub directly.
+  (cd extension && nub install --frozen-lockfile --node-linker hoisted)
+  (cd eval && nub install --frozen-lockfile --node-linker hoisted)
   cargo build --release --manifest-path manager/Cargo.toml --target-dir eval/.cache/target
   cd eval
   node ablation/run.ts --tier full --models "$model" --transcripts --results "$results_dir/base/results.jsonl" --yes
@@ -136,8 +139,8 @@ For a cross-transition comparison, start in the current checkout's `eval/` with 
 
   # Candidate setup/run happens only if every baseline command succeeded.
   cd "$current_eval"
-  npm ci --prefix ../extension
-  npm ci
+  npm run deps --prefix ../extension
+  npm run deps
   node ablation/run.ts --tier full --models "$model" --transcripts --results "$results_dir/current/results.jsonl" --yes
   node ablation/report.ts --results "$results_dir/current/results.jsonl"
 )

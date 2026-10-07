@@ -24,6 +24,7 @@
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
+    "deps": "nub install --frozen-lockfile --node-linker hoisted",
     "prompts": "node scripts/build-prompts.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
