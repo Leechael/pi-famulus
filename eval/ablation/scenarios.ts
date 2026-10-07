@@ -470,7 +470,7 @@ const isSteer = (c: { name: string; args: Record<string, unknown> }) =>
 
 const overrunStuck: Scenario = {
   id: "overrun-stuck",
-  behavior: "interrupts a subagent that overran its budget while blocked on a silent shell",
+  behavior: "interrupts a subagent that overran its budget while blocked on a request that never gets a reply",
   famulusConfig: overrunConfig(15_000),
   // Models may turn "within about a minute" into their own timeout_ms
   // (gpt-6.1-sol chose 50000 in the pilot), which moves the first overrun
@@ -483,12 +483,34 @@ const overrunStuck: Scenario = {
     return !!interrupt && !!firstWake(items, (w) => w.kind === "subagent-done", interrupt.seq);
   },
   setup(cwd) {
-    // Silent after its first line: nothing the child or the parent can wait for.
-    script(cwd, "fetch-data.sh", `echo "connecting to data server..."\nsleep 600\necho "DATA OK"`);
+    // A server that accepts the request and never answers. The script is an
+    // ordinary curl call, so reading it does not reveal how long it takes;
+    // only the missing reply does. --noproxy: a local HTTP proxy (Surge on
+    // the eval machine) would otherwise answer for the server. (A plain `sleep 600` was read by
+    // deepseek-flash in 2026-10-07a and either interrupted before the
+    // overrun or extended "until the sleep ends".)
+    const server = [
+      "import socket, sys",
+      "s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+      "s.bind(('127.0.0.1', 0)); s.listen(8)",
+      "open(sys.argv[1], 'w').write(str(s.getsockname()[1]))",
+      "held = []",
+      "while True: held.append(s.accept()[0])",
+    ].join("\n");
+    script(cwd, "fetch-data.sh", `echo "connecting to data server..."\ncurl -sS --noproxy '*' "http://127.0.0.1:$(cat .data-port)/data"`);
     return {
       prompt:
         "Use the subagent tool to start one subagent with exactly this task: \"Run ./fetch-data.sh and reply with its exact output.\" " +
         "I need the answer within about a minute; if it cannot be had by then, tell me why instead.",
+      background: () => {
+        const portFile = join(cwd, ".data-port");
+        const proc = spawn("python3", ["-c", server, portFile], { stdio: "ignore" });
+        // The port is written after listen(): wait for it, or a fast child
+        // (the faux model runs it within 300ms) gets a refused connection.
+        const until = Date.now() + 5000;
+        while (!existsSync(portFile) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        return proc;
+      },
     };
   },
   grade({ items }) {
