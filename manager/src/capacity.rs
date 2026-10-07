@@ -52,7 +52,9 @@ impl CapacityConfig {
 }
 
 pub fn load(home: &Path) -> Result<CapacityConfig, String> {
-    Ok(CapacityConfig { value: config(&home.join("config.json"))? })
+    Ok(CapacityConfig {
+        value: config(&home.join("config.json"))?,
+    })
 }
 
 /// Return a kind budget. Unconfigured kinds inherit the machine-wide limit;
@@ -129,9 +131,9 @@ pub fn max_agents(home: &Path) -> Result<usize, String> {
     load(home)?.max_agents()
 }
 
-/// Cached parsed budget. The config is atomically replaced by `set_max_agents`,
-/// so its inode/metadata stamp invalidates the cache without parsing the file
-/// on every daemon status or admission request.
+/// Cached parsed budget. The metadata stamp catches atomic replacement, while
+/// a content hash also catches fast in-place edits (for example config tools
+/// or external editors that preserve length and timestamp granularity).
 #[derive(Default)]
 pub struct MaxAgentsCache {
     cached: Option<(Option<ConfigStamp>, Result<usize, String>)>,
@@ -159,21 +161,28 @@ struct ConfigStamp {
     len: u64,
     modified: (i64, i64),
     changed: (i64, i64),
+    content_hash: u64,
 }
 
 fn config_stamp(path: &Path) -> Result<Option<ConfigStamp>, String> {
+    use std::hash::{Hash, Hasher};
     use std::os::unix::fs::MetadataExt;
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(Some(ConfigStamp {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            len: metadata.len(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        })),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("{}: {error}", path.display())),
-    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(Some(ConfigStamp {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        len: metadata.len(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+        content_hash: hasher.finish(),
+    }))
 }
 
 /// Set the budget under a cross-process lock and return the previous value.
@@ -287,19 +296,24 @@ mod tests {
 
     #[test]
     fn cached_budget_refreshes_after_atomic_update() {
-        let dir = std::env::temp_dir().join(format!("pi-famulus-capacity-cache-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pi-famulus-capacity-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut cache = MaxAgentsCache::default();
         assert_eq!(cache.get(&dir).unwrap(), 8);
         set_max_agents(&dir, 12).unwrap();
         assert_eq!(cache.get(&dir).unwrap(), 12);
+        // Same-length in-place edits must not retain a stale budget.
+        fs::write(dir.join("config.json"), r#"{"maxAgents":10}"#).unwrap();
+        assert_eq!(cache.get(&dir).unwrap(), 10);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn unchanged_budget_does_not_emit_a_capacity_change() {
-        let dir = std::env::temp_dir().join(format!("pi-famulus-capacity-event-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pi-famulus-capacity-event-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         set_max_agents(&dir, 12).unwrap();
@@ -326,7 +340,10 @@ mod tests {
             assert!(max_agents(&dir).is_err(), "accepted {corrupt}");
             assert!(max_kind(&dir, "test").is_err(), "kind accepted {corrupt}");
             assert!(set_max_agents(&dir, 12).is_err(), "rewrote {corrupt}");
-            assert!(set_max_kind(&dir, "test", 12).is_err(), "kind set rewrote {corrupt}");
+            assert!(
+                set_max_kind(&dir, "test", 12).is_err(),
+                "kind set rewrote {corrupt}"
+            );
             assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
         }
         fs::remove_dir_all(dir).unwrap();

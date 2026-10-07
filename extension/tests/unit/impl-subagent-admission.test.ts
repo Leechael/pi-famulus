@@ -114,7 +114,7 @@ describe("machine agent admission", () => {
       childId: "ch-stale",
       reserveLocal: async () => ({ admit: () => { throw new Error("settled while queued"); }, release: releaseLocal }),
       manager: null,
-      leases: new Set(),
+      leases: new Map(),
       notice: () => {},
     })).rejects.toThrow("settled while queued");
     expect(releaseLocal).toHaveBeenCalledOnce();
@@ -123,7 +123,7 @@ describe("machine agent admission", () => {
   it("reacquires a locally admitted child before resuming it", async () => {
     const s = setup();
     s.manager.isAvailable = () => false;
-    const leases = new Set<string>();
+    const leases = new Map<string, string>();
     const pendingLeases = new Set<string>();
     const options = {
       childId: "ch-local-resume",
@@ -137,7 +137,7 @@ describe("machine agent admission", () => {
     firstTurn(false);
     s.manager.isAvailable = () => true;
     const resumedTurn = await admitAgentChild(options);
-    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-local-resume");
+    expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-local-resume", "other", undefined);
     expect(leases.has("ch-local-resume")).toBe(true);
     expect(pendingLeases.has("ch-local-resume")).toBe(false);
     resumedTurn();
@@ -146,7 +146,7 @@ describe("machine agent admission", () => {
   it("re-registers a locally admitted child after the initial manager connection", async () => {
     const s = setup();
     s.manager.isAvailable = () => false;
-    const leases = new Set<string>();
+    const leases = new Map<string, string>();
     const pendingLeases = new Set<string>();
     const release = await admitAgentChild({
       childId: "ch-local",
@@ -159,7 +159,7 @@ describe("machine agent admission", () => {
     expect(pendingLeases).toEqual(new Set(["ch-local"]));
     s.manager.isAvailable = () => true;
     await reregisterAgentLeases(s.manager, leases, async () => {}, pendingLeases);
-    expect(leases).toEqual(new Set(["ch-local"]));
+    expect(leases).toEqual(new Map([["ch-local", "other"]]));
     expect(pendingLeases.size).toBe(0);
     release();
     expect(s.manager.releaseAgent).toHaveBeenCalledWith("ch-local");
@@ -194,7 +194,7 @@ describe("machine agent admission", () => {
         signal?.addEventListener("abort", () => reject(new Error("subagent admission cancelled")), { once: true });
       }),
     );
-    const registering = reregisterAgentLeases(s.manager, leases, async () => {}, pending);
+    const registering = reregisterAgentLeases(s.manager, leases, async () => {}, undefined, pending);
     const controller = pending.get("ch-reregister");
     expect(controller).toBeDefined();
     leases.delete("ch-reregister");
@@ -214,7 +214,7 @@ describe("machine agent admission", () => {
         signal?.addEventListener("abort", () => reject(new Error("subagent admission cancelled")), { once: true });
       });
     });
-    const registering = reregisterAgentLeases(s.manager, leases, async () => {}, pending);
+    const registering = reregisterAgentLeases(s.manager, leases, async () => {}, undefined, pending);
     await Promise.resolve();
     expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-test", "test", expect.any(AbortSignal));
     expect(s.manager.acquireAgent).toHaveBeenCalledWith("ch-build", "build", expect.any(AbortSignal));
@@ -253,7 +253,7 @@ describe("machine agent admission", () => {
 
   it("bounds reconnect polling while retaining leases that still need a permit", async () => {
     const s = setup();
-    const leases = new Set(["ch-full"]);
+    const leases = new Map([["ch-full", "other"]]);
     vi.mocked(s.manager.acquireAgent).mockResolvedValue({ granted: false, rejection: "global_capacity" });
     const wait = vi.fn(async () => {});
     await reregisterAgentLeases(s.manager, leases, wait);
