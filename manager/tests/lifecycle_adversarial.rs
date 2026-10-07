@@ -368,16 +368,24 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
                 failures.push(String::from_utf8_lossy(&out.stderr).to_string());
             }
         }
-        let live = daemon_pids_for(&home.path);
+        let mut live = daemon_pids_for(&home.path);
         assert!(
             failures.is_empty(),
             "round {round}: clients failed: {failures:?}\n{}",
             d2_diagnostics(&home, old)
         );
-        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}\n{}", d2_diagnostics(&home, old));
-        // The survivor must own the well-known socket.
         let mut c = home.connect();
         let h = c.hello_cli();
+        // A losing spawn can still be finishing its bounded lifetime-lock
+        // retry after every CLI has connected to the winner. Wait for those
+        // non-serving contenders to exit before asserting the process count.
+        assert!(poll_true(S(15), || {
+            live = daemon_pids_for(&home.path);
+            live.len() == 1
+        }), "round {round}: daemon contenders did not settle\n{}", d2_diagnostics(&home, old));
+        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}\n{}", d2_diagnostics(&home, old));
+        // The survivor must own the well-known socket; the retained client
+        // also prevents idle shutdown while contenders finish their retries.
         assert_eq!(h["pid"].as_u64().map(|p| p as u32), Some(live[0]), "round {round}: socket owner\n{}", d2_diagnostics(&home, old));
         drop(c);
     }
