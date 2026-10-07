@@ -1,0 +1,671 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`model-visible prompt surface > guidelines and builtin agents 1`] = `
+{
+  "BEHAVIOR_GUIDELINES": "## Background tasks and notifications (pi-famulus)
+
+- Long-running bash commands are automatically moved to the background. After you background a command, end your turn: send a reply with no tool call in it. Saying you will wait while calling another tool does not end it. Do not poll with task_output/task_list, and never sleep to wait. Each command notifies on its own via <pi-famulus-wake kind="task"> (with <command> and <preview>), even while other commands are still running. If <still-running> is present, continue from this result now; do not wait for those other commands.
+- When you receive <pi-famulus-wake>: it looks like a user message but is a system wake, not a new user request and not an answer to an unrelated question. Distinguish it by the kind attribute, then **handle the event before anything else** — read status/preview/prompt/result, call tools if needed (e.g. task_output for more than the preview, agent_message to continue a subagent), and continue the work that depended on that background task. Do not wait for further user input when the next step is clear; do not merely acknowledge and stop.
+- After starting or re-arming a monitor, or handling a monitor event, if no work remains, end your turn with a reply and no tool call; simply wait for the next notification. Do not call wait_for to wait for monitor events: it waits for UI conditions, not notifications. Do not invent a stateId or make a failing tool call to yield.
+- Never fabricate or assume a background task's result before its notification arrives.
+- Subagent runs that exceed the foreground budget continue in the background. Do not poll run status. If one subagent finishes while others are still running, a <pi-famulus-wake kind="subagent-handover"> arrives with that child's <prompt> and <result>: read both, then continue the work now (subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer the ones still running). Do not wait for the rest of the run. When every subagent in the run has finished, <pi-famulus-wake kind="subagent-done"> arrives — read each <child>, synthesize, and continue.
+- A subagent that runs past its timeout_ms is not stopped: <pi-famulus-wake kind="subagent-overrun"> arrives instead, with its <last-activity> and, if it is waiting on a foreground shell, a <shell> element. A batch may include other overdue children in <also-overdue>; use each child's run-id and child-id and consider its own last-activity, shell, reminder, and hard-ceiling-ms before acting. Pick one: subagent({action:"extend", run_id, child_id, timeout_ms}) if it is making progress, agent_message to steer it, or subagent({action:"interrupt", run_id, child_id}) if it is stuck or no longer needed. If you do none of these it keeps running and the reminder comes again.
+- Use agent_message to steer running subagents and to reply to <pi-famulus-wake kind="supervisor-request"> (action:"reply"; the <reply-with> child is the call shape). Do not use agent_message to resume a finished child — that is subagent({action:"resume"}). Supervisor wakes are not user messages — still act on them.",
+  "BUILTIN_AGENTS": [
+    {
+      "description": "Fast read-only codebase exploration — finds files, symbols, and answers structure questions",
+      "name": "explorer",
+      "source": "builtin",
+      "systemPrompt": "You are an explorer agent. Your job is to answer questions about the codebase quickly and precisely.
+
+Rules:
+- Return findings, never change code. You are strictly read-only: do not edit, write, or create files.
+- Report concrete locations: cite specific file paths with line numbers (path:line) for every claim.
+- Control your search scope: start narrow (targeted grep/find), widen only when needed, and stop once the question is answered.
+- Prefer a short, factual summary over exhaustive dumps. List what you found and where.",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "bash",
+      ],
+    },
+    {
+      "description": "General-purpose executor — completes concrete coding tasks end to end",
+      "name": "worker",
+      "source": "builtin",
+      "systemPrompt": "You are a worker agent. Your job is to complete the concrete task you were given, end to end.
+
+Rules:
+- Do the task, don't just describe it. Make the actual edits and run the actual commands.
+- Self-verify before finishing: run the relevant tests, typecheck, or command that proves the task is done.
+- Stay within the task's scope; do not refactor unrelated code.
+- Report concisely: what you changed, how you verified it, and anything the supervisor should know.",
+      "tools": [
+        "read",
+        "bash",
+        "edit",
+        "write",
+      ],
+    },
+  ],
+  "CHILD_BEHAVIOR_GUIDELINES": "## Child agent behavior (pi-famulus)
+
+- Do not background work; bash runs to completion.
+- When blocked, use contact_supervisor with need_decision; use progress_update for status.
+- Use agent_message only to communicate with siblings in this same run.
+- Your final message is your result.",
+}
+`;
+
+exports[`model-visible prompt surface > tool declarations 1`] = `
+[
+  {
+    "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). Foreground commands that exceed the foreground budget are automatically moved to the background; you will be notified when they complete. Optionally provide a timeout in seconds (hard kill limit), or run_in_background to background immediately.",
+    "name": "bash",
+    "parameters": {
+      "properties": {
+        "command": {
+          "description": "The bash command to execute",
+          "type": "string",
+        },
+        "run_in_background": {
+          "description": "Start the command in the background and return immediately. You will be notified when it completes.",
+          "type": "boolean",
+        },
+        "timeout": {
+          "description": "Hard kill timeout in seconds (optional, no default timeout)",
+          "type": "number",
+        },
+      },
+      "required": [
+        "command",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": [
+      "You can inspect PI_* environment variables for current model and session details.",
+      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn (a reply with no tool call) and resume from the task wake when it arrives.",
+    ],
+    "promptSnippet": "Execute bash commands (ls, grep, find, etc.)",
+  },
+  {
+    "description": "List background work this session started: shell/monitor tasks and subagent children. Work from other pi sessions is never shown.",
+    "name": "task_list",
+    "parameters": {
+      "properties": {
+        "all": {
+          "description": "Also include finished work (default: running only). Always limited to this session.",
+          "type": "boolean",
+        },
+      },
+      "type": "object",
+    },
+    "promptGuidelines": undefined,
+    "promptSnippet": "List background shell/monitor tasks and subagents",
+  },
+  {
+    "description": "Read output of a background task. Without a cursor, returns the tail of the output plus the current file pointer; pass the returned next_cursor as cursor for incremental reads. Not a way to wait: a running task wakes you when it finishes, so reply with no tool call instead of calling this again.",
+    "name": "task_output",
+    "parameters": {
+      "properties": {
+        "cursor": {
+          "description": "Byte offset to read from (for incremental reads). Omit to read the tail of the output.",
+          "type": "number",
+        },
+        "max_bytes": {
+          "description": "Maximum bytes to return (default 65536)",
+          "type": "number",
+        },
+        "task_id": {
+          "description": "Task id, e.g. sh_a1b2c3d4",
+          "type": "string",
+        },
+      },
+      "required": [
+        "task_id",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": undefined,
+    "promptSnippet": "Read background task output",
+  },
+  {
+    "description": "Stop a running background task (SIGTERM to the process group, SIGKILL after a 2s grace).",
+    "name": "task_stop",
+    "parameters": {
+      "properties": {
+        "task_id": {
+          "description": "Task id to stop, e.g. sh_a1b2c3d4",
+          "type": "string",
+        },
+      },
+      "required": [
+        "task_id",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": undefined,
+    "promptSnippet": "Stop a background task",
+  },
+  {
+    "description": "Start a background monitor process whose stdout lines are injected back to you as <pi-famulus-wake kind="monitor"> messages (batched over 200ms, rate-limited). The command must be line-buffered: each event must be a single line. It must keep running and follow its source, e.g. \`tail -n +1 -F file | grep --line-buffered PATTERN\`; a command that reads once and exits (a plain grep or cat) only reports what is there now. Add \`-m1\` to grep to stop after the first match. Silence is not success: write the command so failures also produce lines (e.g. grep for both success and error patterns). Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind="monitor"> before other work. Do not poll. After starting or re-arming a monitor, or handling a monitor event, if no work remains, end your turn with a reply and no tool call; simply wait for the next notification. Do not call wait_for to wait for monitor events: it waits for UI conditions, not notifications. Do not invent a stateId or make a failing tool call to yield.",
+    "name": "monitor",
+    "parameters": {
+      "properties": {
+        "command": {
+          "description": "Command producing one event per line on stdout. Must be line-buffered (e.g. use \`stdbuf -oL\` / \`grep --line-buffered\` where needed).",
+          "type": "string",
+        },
+        "description": {
+          "description": "Short human-readable description of what is being watched",
+          "type": "string",
+        },
+        "persistent": {
+          "description": "Keep the monitor alive until the session ends (no timeout). Default false.",
+          "type": "boolean",
+        },
+        "timeout_ms": {
+          "description": "Stop the monitor after this many milliseconds (default 300000, min 1000, max 3600000)",
+          "type": "number",
+        },
+      },
+      "required": [
+        "command",
+        "description",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": [
+      "Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.",
+      "After starting or re-arming a monitor, or handling a monitor event, if no work remains, end your turn with a reply and no tool call; simply wait for the next notification. Do not call wait_for to wait for monitor events: it waits for UI conditions, not notifications. Do not invent a stateId or make a failing tool call to yield.",
+      "When woken by a <pi-famulus-wake kind="monitor">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
+    ],
+    "promptSnippet": "Watch a command's line stream and get injected events",
+  },
+  {
+    "description": "Run subagents in parallel (tasks) or sequentially (chain with {previous}/{outputs.<label>} interpolation). By default the call waits up to a foreground budget (default 45s); longer runs continue in the background. Each child that finishes while others are still running wakes you with <pi-famulus-wake kind="subagent-handover"> (its prompt and result). The whole run wakes you with <pi-famulus-wake kind="subagent-done">. Never poll or sleep to wait. A subagent still running past its timeout_ms is not stopped; it wakes you with <pi-famulus-wake kind="subagent-overrun"> so you can extend, steer, or interrupt it. Use action=list/get/status/interrupt/resume/steer/extend to manage existing runs.",
+    "name": "subagent",
+    "parameters": {
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "const": "list",
+              "type": "string",
+            },
+            {
+              "const": "get",
+              "type": "string",
+            },
+            {
+              "const": "status",
+              "type": "string",
+            },
+            {
+              "const": "interrupt",
+              "type": "string",
+            },
+            {
+              "const": "resume",
+              "type": "string",
+            },
+            {
+              "const": "steer",
+              "type": "string",
+            },
+            {
+              "const": "extend",
+              "type": "string",
+            },
+            {
+              "const": "models",
+              "type": "string",
+            },
+          ],
+          "description": "Manage an existing run (or list selectable models) instead of starting a new one",
+        },
+        "async": {
+          "description": "Return immediately with a run_id; completion arrives via notification",
+          "type": "boolean",
+        },
+        "chain": {
+          "description": "Steps to run sequentially (always awaited)",
+          "items": {
+            "properties": {
+              "agent": {
+                "description": "Agent definition name (default: worker)",
+                "type": "string",
+              },
+              "label": {
+                "description": "Label for referencing this step's output later",
+                "type": "string",
+              },
+              "prompt": {
+                "description": "Prompt for this step; {previous} and {outputs.<label>} interpolate earlier results",
+                "type": "string",
+              },
+              "work_kind": {
+                "anyOf": [
+                  {
+                    "const": "test-suite",
+                    "type": "string",
+                  },
+                  {
+                    "const": "test",
+                    "type": "string",
+                  },
+                  {
+                    "const": "build",
+                    "type": "string",
+                  },
+                  {
+                    "const": "lint/type",
+                    "type": "string",
+                  },
+                  {
+                    "const": "other",
+                    "type": "string",
+                  },
+                  {
+                    "const": "git",
+                    "type": "string",
+                  },
+                  {
+                    "const": "read/search",
+                    "type": "string",
+                  },
+                ],
+                "description": "Explicit planned workload class for machine-wide admission (default: other)",
+              },
+            },
+            "required": [
+              "prompt",
+            ],
+            "type": "object",
+          },
+          "minItems": 1,
+          "type": "array",
+        },
+        "child_id": {
+          "description": "Target child (id or name) for steer/interrupt/resume/extend",
+          "type": "string",
+        },
+        "concurrency": {
+          "description": "Max parallel subagents for tasks (default 4)",
+          "maximum": 8,
+          "minimum": 1,
+          "type": "number",
+        },
+        "fail_fast": {
+          "description": "Cancel not-yet-started subagents on first failure (already-started ones finish)",
+          "type": "boolean",
+        },
+        "message": {
+          "description": "Message content for steer/resume",
+          "type": "string",
+        },
+        "model": {
+          "description": "Model override for all subagents: fuzzy ("haiku"), qualified ("provider/id"), optionally with ":<thinking>" suffix (off, minimal, low, medium, high, xhigh, max; an unknown suffix is dropped with a warning when the base resolves; an unknown base still errors). Default: current model. Use action:"models" to list selectable values.",
+          "type": "string",
+        },
+        "run_id": {
+          "description": "Target run for action",
+          "type": "string",
+        },
+        "tasks": {
+          "description": "Subagents to run in parallel",
+          "items": {
+            "properties": {
+              "agent": {
+                "description": "Agent definition name (default: worker)",
+                "type": "string",
+              },
+              "name": {
+                "description": "Display name (default: agent name + ordinal)",
+                "type": "string",
+              },
+              "prompt": {
+                "description": "Task prompt for this subagent",
+                "type": "string",
+              },
+              "work_kind": {
+                "anyOf": [
+                  {
+                    "const": "test-suite",
+                    "type": "string",
+                  },
+                  {
+                    "const": "test",
+                    "type": "string",
+                  },
+                  {
+                    "const": "build",
+                    "type": "string",
+                  },
+                  {
+                    "const": "lint/type",
+                    "type": "string",
+                  },
+                  {
+                    "const": "other",
+                    "type": "string",
+                  },
+                  {
+                    "const": "git",
+                    "type": "string",
+                  },
+                  {
+                    "const": "read/search",
+                    "type": "string",
+                  },
+                ],
+                "description": "Explicit planned workload class for machine-wide admission (default: other)",
+              },
+            },
+            "required": [
+              "prompt",
+            ],
+            "type": "object",
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "type": "array",
+        },
+        "timeout_ms": {
+          "description": "Time budget per subagent turn in ms (default 1800000, max 3600000). Passing it does not stop the subagent: you get <pi-famulus-wake kind="subagent-overrun"> and choose extend, steer, or interrupt. With resume: the resumed turn's budget. With extend: the new budget from now.",
+          "maximum": 3600000,
+          "type": "number",
+        },
+      },
+      "type": "object",
+    },
+    "promptGuidelines": [
+      "When a <pi-famulus-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.",
+      "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
+      "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
+      "<pi-famulus-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
+    ],
+    "promptSnippet": "Fan out subagents in parallel or sequence them in a chain",
+  },
+  {
+    "description": "Message your subagents. "send" steers or queues a running child. Sending to a finished child errors (it does not resume) and points at subagent({ action: "resume", run_id, child_id, message }). "reply" answers a child's pending decision request; "broadcast" steers every running child of a run (to = run_id); "list" shows children, pending decision requests, and recent traffic.",
+    "name": "agent_message",
+    "parameters": {
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "const": "send",
+              "type": "string",
+            },
+            {
+              "const": "reply",
+              "type": "string",
+            },
+            {
+              "const": "broadcast",
+              "type": "string",
+            },
+            {
+              "const": "list",
+              "type": "string",
+            },
+          ],
+          "description": ""send" a message to a child, "reply" to a pending decision request, "broadcast" to all running children of a run, "list" pending requests and recent traffic.",
+        },
+        "delivery": {
+          "anyOf": [
+            {
+              "const": "steer",
+              "type": "string",
+            },
+            {
+              "const": "queue",
+              "type": "string",
+            },
+          ],
+          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).",
+        },
+        "message": {
+          "description": "Message text.",
+          "type": "string",
+        },
+        "to": {
+          "description": "Target child_id or name ("send"/"reply"). For "broadcast" from the parent session: run_id. Child sessions broadcast to their own run and must omit this.",
+          "type": "string",
+        },
+      },
+      "required": [
+        "action",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": undefined,
+    "promptSnippet": "Send/reply/broadcast messages to subagents",
+  },
+  {
+    "description": "Message sibling subagents in your run, or list pending requests. "send" delivers to a running sibling. Sending to a finished sibling errors and does not resume it; resume with subagent({ action: "resume", run_id, child_id, message }). "broadcast" steers every running sibling in your run; "list" shows pending decision requests and recent traffic. Cross-run messaging is rejected.",
+    "name": "agent_message",
+    "parameters": {
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "const": "send",
+              "type": "string",
+            },
+            {
+              "const": "reply",
+              "type": "string",
+            },
+            {
+              "const": "broadcast",
+              "type": "string",
+            },
+            {
+              "const": "list",
+              "type": "string",
+            },
+          ],
+          "description": ""send" a message to a child, "reply" to a pending decision request, "broadcast" to all running children of a run, "list" pending requests and recent traffic.",
+        },
+        "delivery": {
+          "anyOf": [
+            {
+              "const": "steer",
+              "type": "string",
+            },
+            {
+              "const": "queue",
+              "type": "string",
+            },
+          ],
+          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).",
+        },
+        "message": {
+          "description": "Message text.",
+          "type": "string",
+        },
+        "to": {
+          "description": "Target child_id or name ("send"/"reply"). For "broadcast" from the parent session: run_id. Child sessions broadcast to their own run and must omit this.",
+          "type": "string",
+        },
+      },
+      "required": [
+        "action",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": undefined,
+    "promptSnippet": "Message sibling subagents in your run",
+  },
+  {
+    "description": "Contact the supervisor (parent agent). Use reason "need_decision" when you are blocked and need the parent to decide — the call blocks until the parent replies (10 minute timeout, after which you must decide yourself). Use reason "progress_update" for a fire-and-forget status note.",
+    "name": "contact_supervisor",
+    "parameters": {
+      "properties": {
+        "message": {
+          "description": "Message for the supervisor.",
+          "type": "string",
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "const": "need_decision",
+              "type": "string",
+            },
+            {
+              "const": "progress_update",
+              "type": "string",
+            },
+          ],
+          "description": ""need_decision" blocks until the supervisor (parent agent) replies; "progress_update" is fire-and-forget.",
+        },
+      },
+      "required": [
+        "reason",
+        "message",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": undefined,
+    "promptSnippet": "Ask the parent agent for a decision or report progress",
+  },
+  {
+    "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). The command runs to completion (or the optional timeout in seconds, after which it is killed). There is no background execution inside subagents.",
+    "name": "bash",
+    "parameters": {
+      "properties": {
+        "command": {
+          "description": "The bash command to execute",
+          "type": "string",
+        },
+        "timeout": {
+          "description": "Hard kill timeout in seconds (optional, no default timeout)",
+          "type": "number",
+        },
+      },
+      "required": [
+        "command",
+      ],
+      "type": "object",
+    },
+    "promptGuidelines": undefined,
+    "promptSnippet": "Execute bash commands (ls, grep, find, etc.)",
+  },
+]
+`;
+
+exports[`model-visible prompt surface > tool result instructions 1`] = `
+{
+  "background": "Command "./build.sh" moved to background (task_id: sh_00000001). Output: /tmp/out/sh_00000001.output.
+You will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pi-famulus-wake kind="task"> when it arrives.",
+  "monitorStarted": "You will get a <pi-famulus-wake kind="monitor"> for each event, and a notice when it exits or times out. Do not poll it (task_list, task_output, or reading what it watches) or sleep. After starting or re-arming a monitor, or handling a monitor event, if no work remains, end your turn with a reply and no tool call; simply wait for the next notification. Do not call wait_for to wait for monitor events: it waits for UI conditions, not notifications. Do not invent a stateId or make a failing tool call to yield.",
+}
+`;
+
+exports[`model-visible prompt surface > wakes 1`] = `
+{
+  "changed": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="subagent-done" run-id="run_1" status="completed" duration-ms="9000" status-now="running" as-of="2026-10-07T12:00:00Z">
+  <summary>1/1 subagents completed in 9000ms</summary>
+  <changed-since-as-of>a (ch_1): completed → running. The run is active again; another subagent-done arrives when it finishes.</changed-since-as-of>
+  <child id="ch_1" name="a" status="running" status-as-of="completed">
+    <prompt>p</prompt>
+    <result>r</result>
+  </child>
+</pi-famulus-wake>",
+  "done": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="subagent-done" run-id="run_1" status="completed" duration-ms="9000">
+  <summary>1/1 subagents completed in 9000ms</summary>
+  <child id="ch_1" name="a" status="completed">
+    <prompt>p</prompt>
+    <result>r</result>
+  </child>
+</pi-famulus-wake>",
+  "handover": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="subagent-handover" run-id="run_1" child-id="ch_1" name="a" status="completed">
+  <still-running>
+    <item id="ch_2">b</item>
+  </still-running>
+  <summary>a completed; 1 still running</summary>
+  <prompt>p</prompt>
+  <result>r</result>
+</pi-famulus-wake>",
+  "leadIn": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.",
+  "monitor": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="monitor" id="mon_1" description="READY in service.log">
+  <event>READY token=X
+</event>
+</pi-famulus-wake>",
+  "overrun": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="subagent-overrun" run-id="run_1" child-id="ch_1" name="a" elapsed-ms="60000" budget-ms="60000" reminder="1">
+  <summary>a has run 1m in this turn, past its 1m budget, and is still running; it is waiting on a shell command that has run 55s.</summary>
+  <last-activity ago-ms="50000">assistant: tool bash</last-activity>
+  <shell task-id="sh_1" elapsed-ms="55000" output-bytes="10" output-idle-ms="50000" growing="no">
+    <command>./x.sh</command>
+    <output-file>/tmp/o</output-file>
+  </shell>
+  <options>It has not been stopped. Choose one: give it more time with subagent({ action: "extend", run_id: "run_1", child_id: "ch_1", timeout_ms: &lt;ms from now&gt; }); redirect it with agent_message({ action: "send", to: "ch_1", message: "&lt;instruction&gt;" }); or stop it with subagent({ action: "interrupt", run_id: "run_1", child_id: "ch_1" }). If you do none of these, it keeps running and the next reminder is scheduled in 10m; its result arrives as usual when it finishes.</options>
+</pi-famulus-wake>",
+  "overrunBatch": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="subagent-overrun" run-id="run_1" child-id="ch_1" name="a" elapsed-ms="60000" budget-ms="60000" reminder="1">
+  <summary>a has run 1m in this turn, past its 1m budget, and is still running; it is waiting on a shell command that has run 55s.</summary>
+  <last-activity ago-ms="50000">assistant: tool bash</last-activity>
+  <also-overdue>
+    <child run-id="run_1" child-id="ch_2" name="b" elapsed-ms="60000" budget-ms="60000" reminder="1" next-reminder-ms="600000">
+      <last-activity ago-ms="50000">assistant: tool bash</last-activity>
+      <shell task-id="sh_1" elapsed-ms="55000" output-bytes="10" output-idle-ms="50000" growing="no">
+        <command>./x.sh</command>
+        <output-file>/tmp/o</output-file>
+      </shell>
+    </child>
+  </also-overdue>
+  <shell task-id="sh_1" elapsed-ms="55000" output-bytes="10" output-idle-ms="50000" growing="no">
+    <command>./x.sh</command>
+    <output-file>/tmp/o</output-file>
+  </shell>
+  <options>It has not been stopped. Choose one: give it more time with subagent({ action: "extend", run_id: "run_1", child_id: "ch_1", timeout_ms: &lt;ms from now&gt; }); redirect it with agent_message({ action: "send", to: "ch_1", message: "&lt;instruction&gt;" }); or stop it with subagent({ action: "interrupt", run_id: "run_1", child_id: "ch_1" }). If you do none of these, it keeps running and the next reminder is scheduled in 10m; its result arrives as usual when it finishes.</options>
+</pi-famulus-wake>",
+  "overrunCeiling": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="subagent-overrun" run-id="run_1" child-id="ch_1" name="a" elapsed-ms="60000" budget-ms="60000" reminder="1" hard-ceiling-ms="30000">
+  <summary>a has run 1m in this turn, past its 1m budget, and is still running; it is waiting on a shell command that has run 55s.</summary>
+  <last-activity ago-ms="50000">assistant: tool bash</last-activity>
+  <shell task-id="sh_1" elapsed-ms="55000" output-bytes="10" output-idle-ms="50000" growing="no">
+    <command>./x.sh</command>
+    <output-file>/tmp/o</output-file>
+  </shell>
+  <options>It has not been stopped yet, but the configured hard ceiling stops it in 30s, and extend does not move that ceiling. Choose one: give it more time with subagent({ action: "extend", run_id: "run_1", child_id: "ch_1", timeout_ms: &lt;ms from now&gt; }); redirect it with agent_message({ action: "send", to: "ch_1", message: "&lt;instruction&gt;" }); or stop it with subagent({ action: "interrupt", run_id: "run_1", child_id: "ch_1" }). If you do none of these, it keeps running until the hard ceiling stops it. Its result, or the interruption, arrives as a wake.</options>
+</pi-famulus-wake>",
+  "request": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="supervisor-request" from="ch_1" name="a">
+  <message>JSON or YAML?</message>
+  <reply-with>agent_message { action: "reply", to: "ch_1", message: "&lt;your decision&gt;" }</reply-with>
+</pi-famulus-wake>",
+  "task": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="task">
+  <task id="sh_1" kind="shell" status="completed" duration-ms="15000" exit-code="0">
+    <summary>Background command "./build.sh" completed (exit code 0)</summary>
+    <command>./build.sh</command>
+    <output-file>/tmp/o</output-file>
+    <preview>BUILD OK</preview>
+  </task>
+</pi-famulus-wake>",
+  "update": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="supervisor-update" from="ch_1" name="a">
+  <message>halfway</message>
+</pi-famulus-wake>",
+}
+`;
