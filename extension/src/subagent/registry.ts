@@ -114,8 +114,6 @@ interface InternalChild {
   name: string;
   agent: string;
   workKind?: string;
-  queueMs?: number;
-  queueStartedAt?: number;
   /** Best-effort model id for fleet / ls (set when startChild runs). */
   model?: string;
   status: ChildStatus;
@@ -500,7 +498,7 @@ export class SubagentRegistry implements RunRegistry {
     child.result = undefined;
     child.endedAt = undefined;
     child.startedAt = this.now();
-    child.queueMs = undefined;
+    child.queueMs = 0;
     child.queueStartedAt = child.startedAt;
     child.turn += 1;
     try {

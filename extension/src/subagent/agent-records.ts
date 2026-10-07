@@ -47,7 +47,6 @@ export interface AgentChildRecord {
   /** Observed assistant-message, tool-execution, and admission-queue wall time. */
   llm_ms?: number;
   tool_ms?: number;
-  queue_ms?: number;
   /** Wall time that did not fit the observed phase boundaries. */
   wall_other_ms?: number;
   wall_approximate?: boolean;

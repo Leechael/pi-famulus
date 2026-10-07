@@ -191,8 +191,6 @@ class InProcessChildHandle implements DisposableChildHandle {
   private retiredGen: number | null = null;
   private releaseSlot: ((terminal?: boolean) => void) | null = null;
   private admissionAbort: AbortController | null = null;
-  private admissionStartedAt: number | null = null;
-  private generationQueueMs = 0;
   /** Whether the current generation's settled result is terminal for this child. */
   private terminalSettle = false;
   private disposed = false;
@@ -543,8 +541,6 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (this.acquire && !reuseSlot) {
       const admissionAbort = new AbortController();
       this.admissionAbort = admissionAbort;
-      const queuedAt = this.now();
-      this.admissionStartedAt = queuedAt;
       try {
         // The ticket ties the slot request to THIS generation: a request
         // whose generation settled while queued (interrupt, then a new
@@ -571,8 +567,8 @@ class InProcessChildHandle implements DisposableChildHandle {
         return;
       } finally {
         if (gen === this.generation) {
-          this.generationQueueMs = Math.max(0, this.now() - queuedAt);
-          if (this.admissionStartedAt === queuedAt) this.admissionStartedAt = null;
+          // closeQueue()/settle() accounts for this interval exactly once;
+          // the finally block only clears state owned by the current generation.
           if (this.admissionAbort === admissionAbort) this.admissionAbort = null;
         }
       }
@@ -713,14 +709,8 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.closeOther(at);
     this.finishWallGeneration(at, gen);
     this.settledFlag = true;
-    if (this.admissionStartedAt !== null) {
-      this.generationQueueMs = Math.max(0, this.now() - this.admissionStartedAt);
-    }
     this.admissionAbort?.abort();
     this.admissionAbort = null;
-    if (result.queueMs === undefined && this.generationQueueMs > 0) {
-      result.queueMs = this.generationQueueMs;
-    }
     this.clearTimers();
     // Generations run: 1 + resumes + stall retries. Forensics for the
     // incident class this exists for (a stalled child that needed retries).
