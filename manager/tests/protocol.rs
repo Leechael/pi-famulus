@@ -3,8 +3,8 @@
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state
 //! machine, CLI). Written against the *contract*, not the implementation:
 //! each test spawns the compiled binary and speaks the wire protocol
-//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. std only —
-//! no dev-dependencies, no serde; JSON is asserted via substring matching
+//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. `serde_json`
+//! parses response ids exactly; payload assertions use substring matching
 //! (whitespace-tolerant where it matters via `compact()`).
 //!
 //! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
@@ -139,6 +139,13 @@ struct Conn {
     history: Vec<String>,
 }
 
+fn has_response_id(frame: &str, id: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return false;
+    };
+    value.get("id").and_then(serde_json::Value::as_str) == Some(id)
+}
+
 impl Conn {
     fn send(&mut self, json: &str) {
         let body = json.as_bytes();
@@ -191,14 +198,14 @@ impl Conn {
             .unwrap_or_else(|| panic!("no response echoing id {id:?} within {RESPONSE_TIMEOUT:?}"))
     }
 
-    fn read_until(&mut self, needle: &str, timeout: Duration) -> Option<String> {
-        if let Some(f) = self.history.iter().find(|f| f.contains(needle)) {
+    fn read_until(&mut self, id: &str, timeout: Duration) -> Option<String> {
+        if let Some(f) = self.history.iter().find(|f| has_response_id(f, id)) {
             return Some(f.clone());
         }
         let deadline = Instant::now() + timeout;
         loop {
             let frame = self.read_frame(deadline)?;
-            if frame.contains(needle) {
+            if has_response_id(&frame, id) {
                 return Some(frame);
             }
         }
@@ -222,8 +229,20 @@ impl Conn {
     }
 }
 
+#[test]
+fn p0_conn_read_until_matches_json_id_exactly() {
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let mut conn = Conn {
+        stream,
+        buf: Vec::new(),
+        history: vec![r#"{"v":1,"id":"","version":"0.1.2+5ec12f60e7"}"#.to_owned()],
+    };
+
+    assert_eq!(conn.read_until("c1", Duration::ZERO), None);
+}
+
 // ---------------------------------------------------------------------------
-// JSON helpers (std-only, substring based)
+// JSON helpers (exact id parsing, substring assertions for payloads)
 // ---------------------------------------------------------------------------
 
 /// Whitespace-stripped copy for structural assertions (`"ok":true` matches
@@ -892,7 +911,7 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
 
 #[test]
 fn p7_stale_capacity_read_cannot_overtake_new_admission() {
-    let home = test_home("p7-agent-budget-order");
+    let home = test_home("p7");
     fs::write(home.join("config.json"), r#"{"maxAgents":3}"#).unwrap();
     let marker = home.join("old-budget-read");
     let mut daemon = spawn_daemon_with_agent_budget_pause(&home, &marker);
