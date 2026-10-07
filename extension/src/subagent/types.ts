@@ -55,10 +55,8 @@ export interface ChildResult {
   attempts?: number;
   /** Stall detections in the user turn that produced this result. */
   stalls?: number;
-  /** Time waiting for local and machine-wide admission in this turn. */
-  queueMs?: number;
   durationMs: number;
-  /** Time spent waiting for an admission slot before execution. */
+  /** Time waiting for local and machine-wide admission in this turn. */
   queueMs?: number;
 }
 
