@@ -175,6 +175,20 @@ describe("SubagentRegistry", () => {
     expect(record.status).toBe("interrupted");
   });
 
+  it("finalizeRun records elapsed queue time for never-submitted pending children", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+    expect(registry.activeChildren()[0]).toMatchObject({ status: "pending", queueMs: 75 });
+    let terminal: RunRecord | undefined;
+    registry.onTransition((record) => { terminal = record; });
+
+    registry.finalizeRun(run.runId, "cancelled (fail_fast)");
+
+    expect(terminal?.children[0]).toMatchObject({ status: "interrupted", queueMs: 75 });
+  });
+
   it("a queued child cancelled via shouldStart settles as interrupted", async () => {
     const { registry, factory } = makeStack({ maxConcurrentChildren: 1 });
     factory.autoComplete = null;

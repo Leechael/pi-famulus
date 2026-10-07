@@ -518,12 +518,17 @@ export class SubagentRegistry implements RunRegistry {
   finalizeRun(runId: string, error: string): void {
     const run = this.runs.get(runId);
     if (!run) return;
+    const now = this.now();
     let changed = false;
     for (const child of run.children) {
       if (child.status === "pending" && !child.handle) {
+        if (child.queueStartedAt !== undefined) {
+          child.queueMs = Math.max(0, now - child.queueStartedAt);
+          child.queueStartedAt = undefined;
+        }
         child.status = "interrupted";
         child.result = { status: "interrupted", text: "", error, durationMs: 0 };
-        child.endedAt = this.now();
+        child.endedAt = now;
         changed = true;
       }
     }
