@@ -246,6 +246,9 @@ async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
 /// Spawn `pi-famulus daemon` detached (own session, output to manager.log)
 /// so it outlives this short-lived CLI process (§3.1 step 3).
 fn spawn_daemon(home: &Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let exe = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)

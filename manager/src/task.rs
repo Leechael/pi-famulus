@@ -204,14 +204,23 @@ pub fn lifeline() -> io::Result<&'static Lifeline> {
 /// run inside the test harness, so they use the `pi-famulus` binary cargo
 /// builds next to it.
 pub fn runner_exe() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    if cfg!(test) {
+    #[cfg(test)]
+    {
+        let exe = std::env::current_exe()?;
         // target/<profile>/deps/pi_famulus-<hash> -> target/<profile>/pi-famulus
         if let Some(profile_dir) = exe.parent().and_then(|d| d.parent()) {
             return Ok(profile_dir.join("pi-famulus"));
         }
+        return Ok(exe);
     }
-    Ok(exe)
+    #[cfg(all(not(test), target_os = "linux"))]
+    {
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(all(not(test), not(target_os = "linux")))]
+    {
+        crate::handover::exe_path()
+    }
 }
 
 /// The runner process and the descriptors the daemon reads it through.

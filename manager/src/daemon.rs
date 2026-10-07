@@ -406,24 +406,34 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
     0
 }
 
-/// Poll this daemon's executable. When the file at its path is replaced
-/// (another inode, size or mtime) and stays unchanged for one more poll,
-/// upgrade in place. A binary that fails the handover check is not retried
-/// until the file changes again.
+/// Poll the resolved install path for this daemon's executable. A path change
+/// (for example, from an npm-retired package to its stable sibling) or a file
+/// replacement triggers an in-place upgrade when the candidate identity stays
+/// unchanged for two polls. A failed handover is not retried until the identity
+/// changes again.
 fn spawn_exe_watch(state: &Shared) {
     const POLL: Duration = Duration::from_secs(2);
-    let Ok(exe) = crate::handover::exe_path() else { return };
+    if crate::handover::exe_path().is_err() {
+        return;
+    }
     let ident = |p: &std::path::Path| {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
     };
     let state2 = state.clone();
     tokio::spawn(async move {
-        let mut running = ident(&exe);
+        #[cfg(target_os = "linux")]
+        let mut running = ident(std::path::Path::new("/proc/self/exe"));
+        #[cfg(not(target_os = "linux"))]
+        let mut running = std::env::current_exe().ok().as_deref().and_then(ident);
         let mut seen = running;
         loop {
             tokio::time::sleep(POLL).await;
-            let now = ident(&exe);
+            let Ok(resolved_exe) = crate::handover::exe_path() else {
+                seen = None;
+                continue;
+            };
+            let now = ident(&resolved_exe);
             if now.is_none() || now == running {
                 seen = now;
                 continue;

@@ -601,7 +601,9 @@ fn u14_upgrade_names_the_file_it_will_exec() {
     let _d = home.start_daemon_from(&bin, &[]);
     let out = upgrade(&home);
     assert!(out.status.success(), "{} {}", out.stdout, out.stderr);
-    let note = format!("upgrades to the file at its own path, {}", bin.display());
+    // exe_path canonicalizes the invoked path (resolving macOS /tmp symlink
+    // prefixes like /private/var), so the daemon names its canonical path.
+    let note = format!("upgrades to the file at its own path, {}", bin.canonicalize().unwrap().display());
     assert!(out.stderr.contains(&note), "{}", out.stderr);
     assert!(out.stderr.contains(BIN), "names this CLI: {}", out.stderr);
 
