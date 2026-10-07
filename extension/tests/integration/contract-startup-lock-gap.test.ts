@@ -160,7 +160,12 @@ print('released', flush=True)
       if (!ok) throw new Error(client.lastError());
       return loser;
     });
-    const proof = await bounded(Promise.race([loser, connectFailure]), "losing manager spawn");
+    const remainingConnectionBudget = Math.max(1, connectionDeadline - Date.now());
+    const proof = await bounded(
+      Promise.race([loser, connectFailure]),
+      "losing manager spawn",
+      remainingConnectionBudget,
+    );
     await bounded(holderExit, "flock release");
     expect(await bounded(connecting, "manager connection", Math.max(1, connectionDeadline - Date.now() + 50)), client.lastError()).toBe(true);
     await verify({ home, client, attempts, proof, loserOutput, loserHadReadableOutput });
