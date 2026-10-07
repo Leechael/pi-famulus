@@ -3,10 +3,10 @@
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state
 //! machine, CLI). Written against the *contract*, not the implementation:
 //! each test spawns the compiled binary and speaks the wire protocol
-//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. Response ids
-//! are matched as parsed JSON fields (never substrings); other contract
-//! assertions use whitespace-tolerant `compact()` JSON text. libc is used
-//! to probe the lifetime lock.
+//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. `serde_json`
+//! parses response ids exactly; payload assertions use substring matching
+//! (whitespace-tolerant where it matters via `compact()`). libc probes the
+//! daemon lifetime lock.
 //!
 //! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
 //! (pi-famulus-test-<pid>-<testname>) and kills its daemon on drop.
@@ -144,6 +144,13 @@ struct Conn {
     history: Vec<String>,
 }
 
+fn has_response_id(frame: &str, id: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return false;
+    };
+    value.get("id").and_then(serde_json::Value::as_str) == Some(id)
+}
+
 impl Conn {
     fn send(&mut self, json: &str) {
         let body = json.as_bytes();
@@ -197,19 +204,13 @@ impl Conn {
     }
 
     fn read_until(&mut self, id: &str, timeout: Duration) -> Option<String> {
-        let matches_id = |frame: &str| {
-            serde_json::from_str::<Value>(frame)
-                .ok()
-                .and_then(|value| value.get("id")?.as_str().map(str::to_owned))
-                .is_some_and(|frame_id| frame_id == id)
-        };
-        if let Some(frame) = self.history.iter().find(|frame| matches_id(frame)) {
+        if let Some(frame) = self.history.iter().find(|frame| has_response_id(frame, id)) {
             return Some(frame.clone());
         }
         let deadline = Instant::now() + timeout;
         loop {
             let frame = self.read_frame(deadline)?;
-            if matches_id(&frame) {
+            if has_response_id(&frame, id) {
                 return Some(frame);
             }
         }
@@ -233,8 +234,20 @@ impl Conn {
     }
 }
 
+#[test]
+fn p0_conn_read_until_matches_json_id_exactly() {
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let mut conn = Conn {
+        stream,
+        buf: Vec::new(),
+        history: vec![r#"{"v":1,"id":"","version":"0.1.2+5ec12f60e7"}"#.to_owned()],
+    };
+
+    assert_eq!(conn.read_until("c1", Duration::ZERO), None);
+}
+
 // ---------------------------------------------------------------------------
-// JSON helpers (std-only, substring based)
+// JSON helpers (exact id parsing, substring assertions for payloads)
 // ---------------------------------------------------------------------------
 
 /// Whitespace-stripped copy for structural assertions (`"ok":true` matches
@@ -947,7 +960,10 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
     }
     fs::write(home.join("config.json"), r#"{"maxAgents":2}"#).unwrap();
     let admitted = if winner_a {
-        b.request(r#"{"id":"b2","type":"acquire_agent","child_id":"ch_shared"}"#, "b2")
+        b.request(
+            r#"{"id":"p5-scale-up-b","type":"acquire_agent","child_id":"ch_shared"}"#,
+            "p5-scale-up-b",
+        )
     } else {
         a.request(r#"{"id":"a2","type":"acquire_agent","child_id":"ch_shared"}"#, "a2")
     };
@@ -975,26 +991,26 @@ fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
 
 #[test]
 fn p7_stale_capacity_read_cannot_overtake_new_admission() {
-    let home = test_home("p7-agent-budget-order");
-    fs::write(home.join("config.json"), r#"{"maxAgents":3}"#).unwrap();
+    let home = test_home("p7");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":3}"#).unwrap();
     let marker = home.join("old-budget-read");
     let mut daemon = spawn_daemon_with_agent_budget_pause(&home, &marker);
     wait_for_socket(&home, CONNECT_TIMEOUT);
     let mut existing = connect(&home, CONNECT_TIMEOUT);
     let mut old = connect(&home, CONNECT_TIMEOUT);
     let mut fresh = connect(&home, CONNECT_TIMEOUT);
-    hello_ext(&mut existing, "budget-existing");
-    hello_ext(&mut old, "budget-old");
-    hello_ext(&mut fresh, "budget-fresh");
+    hello_ext_protocol(&mut existing, "budget-existing", 5);
+    hello_ext_protocol(&mut old, "budget-old", 5);
+    hello_ext_protocol(&mut fresh, "budget-fresh", 5);
     let held = existing.request(
-        r#"{"id":"held","type":"acquire_agent","child_id":"ch-held"}"#,
+        r#"{"id":"held","type":"acquire_agent","child_id":"ch-held","work_kind":"test"}"#,
         "held",
     );
     assert!(compact(&held).contains("\"granted\":true"), "{held}");
 
     let old_request = std::thread::spawn(move || {
         let response = old.request(
-            r#"{"id":"old","type":"acquire_agent","child_id":"ch-old"}"#,
+            r#"{"id":"old","type":"acquire_agent","child_id":"ch-old","work_kind":"test"}"#,
             "old",
         );
         (response, old)
@@ -1011,14 +1027,15 @@ fn p7_stale_capacity_read_cannot_overtake_new_admission() {
     // `ch-old` has cached maxAgents=3 but is paused before its state admission.
     // A newer request sees maxAgents=2 and must not be overtaken when the older
     // request resumes with its stale budget.
-    fs::write(home.join("config.json"), r#"{"maxAgents":2}"#).unwrap();
+    fs::write(home.join("config.json"), r#"{"maxAgents":2,"maxTest":3}"#).unwrap();
     let refreshed = existing.request(r#"{"id":"refresh","type":"status"}"#, "refresh");
-    assert!(
-        compact(&refreshed).contains("\"agent_capacity\":{\"used\":1,\"total\":2}"),
-        "{refreshed}"
-    );
+    let refreshed: Value = serde_json::from_str(&refreshed).unwrap();
+    assert_eq!(refreshed["agent_capacity"]["used"], 1, "{refreshed}");
+    assert_eq!(refreshed["agent_capacity"]["total"], 2, "{refreshed}");
+    assert_eq!(refreshed["agent_capacity"]["by_kind"]["test"]["used"], 1, "{refreshed}");
+    assert_eq!(refreshed["agent_capacity"]["by_kind"]["test"]["total"], 3, "{refreshed}");
     let fresh_response = fresh.request(
-        r#"{"id":"fresh","type":"acquire_agent","child_id":"ch-fresh"}"#,
+        r#"{"id":"fresh","type":"acquire_agent","child_id":"ch-fresh","work_kind":"test"}"#,
         "fresh",
     );
     let (old_response, _old) = old_request.join().unwrap();
@@ -1030,10 +1047,11 @@ fn p7_stale_capacity_read_cannot_overtake_new_admission() {
     );
 
     let status = existing.request(r#"{"id":"p7status","type":"status"}"#, "p7status");
-    assert!(
-        compact(&status).contains("\"agent_capacity\":{\"used\":2,\"total\":2}"),
-        "{status}"
-    );
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(status["agent_capacity"]["used"], 2, "{status}");
+    assert_eq!(status["agent_capacity"]["total"], 2, "{status}");
+    assert_eq!(status["agent_capacity"]["by_kind"]["test"]["used"], 2, "{status}");
+    assert_eq!(status["agent_capacity"]["by_kind"]["test"]["total"], 3, "{status}");
     let _ = daemon.kill();
     let _ = daemon.wait();
     let _ = fs::remove_dir_all(&home);
