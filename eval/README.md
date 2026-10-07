@@ -155,7 +155,9 @@ Each revision's harness builds/selects its own manager and isolates each episode
 
 **Early stopping.** Baselines run first. A variant stops as soon as its 95% Wilson interval is entirely below or above `baseline − 20pp`. Variants of a (model, scenario) whose baseline is below 20% are skipped ("floor"): no drop of 20pp is possible there.
 
-### Scenarios (`ablation/scenarios.ts`)
+### Scenarios (`scenarios/*.md`, graders in `ablation/scenarios.ts`)
+
+Each scenario's prompt and what it tests live in `scenarios/<id>.md` (same format as `extension/prompts/`); the fixture and grader stay in code.
 
 | id | passes when the model… |
 |---|---|

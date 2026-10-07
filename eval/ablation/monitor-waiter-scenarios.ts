@@ -1,4 +1,5 @@
 /** Opt-in cross-extension probes. Short controls do not reproduce the incident. */
+import { scenarioText } from "./scenario-text.ts";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -92,9 +93,10 @@ function setupSource(cwd: string, _secretDir: string, rearm: boolean): void {
   writeFileSync(join(cwd, source), sourceContents(rearm));
 }
 function negative(long: boolean, rearm: boolean): Scenario {
+  const id = rearm ? "monitor-waiter-rearm" : long ? "monitor-waiter-synthetic-long" : "monitor-waiter-event";
   return {
-    id: rearm ? "monitor-waiter-rearm" : long ? "monitor-waiter-synthetic-long" : "monitor-waiter-event",
-    behavior: rearm ? "real timer timeout, re-arm, repeated monitor wakes without a UI waiter/no-op" : "ordinary/repeated monitor events without a UI waiter/no-op",
+    id,
+    behavior: scenarioText(`${id}.tests`),
     optIn: true, extensions: [COMPAT_EXT], famulusConfig: { foregroundBudgetMs: 2000 },
     timeoutMs: long ? 240_000 : 100_000, quietMs: 3000, estCalls: rearm ? 9 : 7,
     // Higher than chars/4 target to allow schema, current turns, and estimator error.
@@ -103,9 +105,7 @@ function negative(long: boolean, rearm: boolean): Scenario {
       setupSource(cwd, secretDir, rearm);
       return {
         ...setupFixture(secretDir, long, false),
-        prompt: `Use monitor to run node ${source} and watch this synthetic local export job. ` +
-          (rearm ? "Start with timeout_ms=1000. The first run stays silent and will time out. On its timeout, re-arm the same command exactly once with timeout_ms=12000. " : "Set timeout_ms=12000. ") +
-          "Report the exact token from each COMPAT_EVENT and COMPAT_READY line when its notification arrives. After COMPAT_READY the job is complete. There is no UI task or other work.",
+        prompt: scenarioText(`${id}.prompt`, { source }),
       };
     },
     done(items) { return waiterMisuses(items).length > 0 || hasWakeReports(items); },
@@ -148,12 +148,12 @@ function negative(long: boolean, rearm: boolean): Scenario {
   };
 }
 const uiControl: Scenario = {
-  id: "monitor-waiter-ui-control", behavior: "uses legitimate observed UI state + predicate, not a blanket waiter ban",
+  id: "monitor-waiter-ui-control", behavior: scenarioText("monitor-waiter-ui-control.tests"),
   optIn: true, extensions: [COMPAT_EXT], famulusConfig: {}, timeoutMs: 100_000, quietMs: 2000, estCalls: 4,
   setup(_cwd, secretDir) {
     return {
       ...setupFixture(secretDir, false, true),
-      prompt: "In the synthetic Export preview UI, observe its current state. An asynchronous export is preparing: wait until the status text is Export ready, then report the exact export token visible in the successor UI state. Do not perform UI actions.",
+      prompt: scenarioText("monitor-waiter-ui-control.prompt"),
     };
   },
   done(items) { return waiterMisuses(items).length > 0 || hasUiWakeReport(items); },
