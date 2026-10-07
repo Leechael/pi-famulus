@@ -120,6 +120,9 @@ pub struct DaemonState {
     pub start_keys: std::collections::VecDeque<(String, String)>,
     /// Agent permits keyed by session and child id.
     pub agent_permits: HashMap<(String, String), ()>,
+    /// Serializes budget reads with admission commits without holding `state`
+    /// across config metadata/file I/O.
+    pub agent_admission: Arc<Mutex<()>>,
     /// Config budget cache: avoid reparsing config.json on every status/acquire.
     pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
 }
@@ -153,6 +156,7 @@ impl DaemonState {
             upgrade_ready: None,
             start_keys: std::collections::VecDeque::new(),
             agent_permits: HashMap::new(),
+            agent_admission: Arc::new(Mutex::new(())),
             agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
         }
     }
@@ -327,10 +331,25 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     let s2 = state.clone();
     tokio::spawn(async move {
         clock.sleep("handover-grace", HANDOVER_GRACE).await;
-        s2.lock().unwrap().hold_idle = false;
+        {
+            let mut st = s2.lock().unwrap();
+            st.hold_idle = false;
+            reap_disconnected_agent_permits(&mut st);
+        }
         maybe_arm_idle_timer(&s2);
     });
     serve(state, listener, lock).await
+}
+
+/// Handover keeps permits while sessions have a chance to reconnect. Once
+/// that grace ends, sessions still disconnected cannot own live children.
+fn reap_disconnected_agent_permits(st: &mut DaemonState) {
+    let connected: HashSet<String> = st
+        .sessions
+        .iter()
+        .filter_map(|(sid, session)| session.conn_id.map(|_| sid.clone()))
+        .collect();
+    st.agent_permits.retain(|(sid, _), _| connected.contains(sid));
 }
 
 /// The accept loop, shared by a fresh daemon and one restored after an
@@ -1783,20 +1802,65 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
     })
 }
 
-fn handle_acquire_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<AgentAdmissionOk, ProtoError> {
-    let (sid, home, budget_cache) = {
+fn handle_acquire_agent(
+    state: &Shared,
+    conn_id: u64,
+    child_id: &str,
+) -> Result<AgentAdmissionOk, ProtoError> {
+    let (sid, home, budget_cache, admission_lock) = {
         let st = state.lock().unwrap();
-        let sid = st.conns.get(&conn_id).and_then(|c| c.session_id.clone()).ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
-        (sid, st.home.clone(), st.agent_budget.clone())
+        let sid = st
+            .conns
+            .get(&conn_id)
+            .and_then(|c| c.session_id.clone())
+            .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+        (
+            sid,
+            st.home.clone(),
+            st.agent_budget.clone(),
+            st.agent_admission.clone(),
+        )
     };
-    let budget = budget_cache.lock().unwrap().get(&home)
+    // Budget refresh may stat/read config.json, so keep it outside `state`;
+    // serialize refresh + state admission so an old-budget acquire cannot sit
+    // behind a newer one and then overtake it.
+    let _admission = admission_lock.lock().unwrap();
+    let budget = budget_cache
+        .lock()
+        .unwrap()
+        .get(&home)
         .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
+    #[cfg(debug_assertions)]
+    pause_after_agent_budget_read(child_id);
     let mut st = state.lock().unwrap();
     if st.conns.get(&conn_id).and_then(|c| c.session_id.as_deref()) != Some(sid.as_str()) {
-        return Err(ProtoError::new(E_SESSION_REQUIRED, "extension session required"));
+        return Err(ProtoError::new(
+            E_SESSION_REQUIRED,
+            "extension session required",
+        ));
     }
     let key = (sid, child_id.to_string());
     Ok(admit_agent(&mut st.agent_permits, key, budget))
+}
+
+#[cfg(debug_assertions)]
+fn pause_after_agent_budget_read(child_id: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PAUSED: AtomicBool = AtomicBool::new(false);
+    if std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD").as_deref() != Ok(child_id) {
+        return;
+    }
+    if PAUSED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(marker) = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER") {
+        let _ = std::fs::write(marker, b"read");
+    }
+    let ms = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(500);
+    tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(ms)));
 }
 
 fn handle_release_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<UnitOk, ProtoError> {

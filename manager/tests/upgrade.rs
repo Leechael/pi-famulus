@@ -180,6 +180,11 @@ fn u1_upgrade_keeps_every_task_running() {
     // with what was missed, and continues.
     let mut c2 = home.connect();
     hello(&mut c2, "sess-u1");
+    assert_eq!(
+        status(&home)["agent_capacity"]["used"],
+        1,
+        "reconnect retains the live child permit"
+    );
     c2.request_ok(json!({"type":"release_agent","child_id":"ch-u1"}));
     assert_eq!(status(&home)["agent_capacity"]["used"], 0);
     let w = c2.request_ok(json!({"type":"wait","task_id":stream,"budget_ms":15000}));
@@ -615,4 +620,45 @@ fn u14_upgrade_names_the_file_it_will_exec() {
     let own = (o.status, String::from_utf8_lossy(&o.stderr).into_owned());
     assert!(own.0.success(), "{}", own.1);
     assert!(!own.1.contains("upgrades to the file"), "{}", own.1);
+}
+
+#[test]
+fn u15_upgrade_reaps_permits_for_sessions_that_never_reconnect() {
+    let home = Home::new("u15");
+    std::fs::write(home.path.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    let bin = home.install_copy();
+    let _d = home.start_daemon_from(&bin, &[]);
+    let mut c = home.connect();
+    hello(&mut c, "sess-u15-never-reconnects");
+    c.request_ok(json!({"type":"acquire_agent","child_id":"ch-u15"}));
+    assert_eq!(status(&home)["agent_capacity"]["used"], 1);
+
+    let out = upgrade(&home);
+    assert!(
+        out.status.success(),
+        "upgrade failed: {} {}",
+        out.stdout,
+        out.stderr
+    );
+    assert_eq!(
+        status(&home)["agent_capacity"]["used"],
+        1,
+        "unreconnected permits remain held during handover grace"
+    );
+    drop(c); // Deliberately never reconnect the permit-owning session.
+
+    home.advance("handover-grace", 30_000);
+    assert_eq!(
+        status(&home)["agent_capacity"]["used"],
+        0,
+        "handover did not reap the abandoned session's permit"
+    );
+    let mut replacement = home.connect();
+    hello(&mut replacement, "sess-u15-replacement");
+    replacement.request_ok(json!({"type":"acquire_agent","child_id":"ch-u15-replacement"}));
+    assert_eq!(
+        status(&home)["agent_capacity"]["used"],
+        1,
+        "abandoned permit still blocks the machine slot"
+    );
 }
