@@ -1062,7 +1062,7 @@ fn p7_per_kind_budget_independence_and_queued_wakeup() {
 
 #[test]
 fn p7b_status_escapes_unknown_work_kind_control_characters() {
-    let home = test_home("p7b-workkind-terminal-injection");
+    let home = test_home("p7b-escape");
     fs::write(home.join("config.json"), r#"{"maxAgents":4}"#).unwrap();
     let _daemon = spawn_daemon(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
