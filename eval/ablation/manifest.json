@@ -66,6 +66,16 @@
       ]
     },
     {
+      "id": "guidelines.subagent-overrun",
+      "kind": "text",
+      "surface": "system section: BEHAVIOR_GUIDELINES",
+      "text": "A subagent that runs past its timeout_ms is not stopped: <pi-famulus-wake kind=\"subagent-overrun\"> arrives instead, with its <last-activity> and, if it is waiting on a foreground shell, a <shell> element. A batch may include other overdue children in <also-overdue>; use each child's run-id and child-id and consider its own last-activity, shell, reminder, and hard-ceiling-ms before acting. Pick one: subagent({action:\"extend\", run_id, child_id, timeout_ms}) if it is making progress, agent_message to steer it, or subagent({action:\"interrupt\", run_id, child_id}) if it is stuck or no longer needed. If you do none of these it keeps running and the reminder comes again.",
+      "affects": [
+        "overrun-stuck",
+        "overrun-progressing"
+      ]
+    },
+    {
       "id": "child.guidelines",
       "kind": "text",
       "surface": "child sessions only: CHILD_BEHAVIOR_GUIDELINES via contact_supervisor promptGuidelines (subagent/pi-runtime.ts)",
@@ -217,6 +227,26 @@
       ]
     },
     {
+      "id": "tooldesc.subagent-overrun",
+      "kind": "text",
+      "surface": "tool declaration: subagent.description",
+      "text": "A subagent still running past its timeout_ms is not stopped; it wakes you with <pi-famulus-wake kind=\"subagent-overrun\"> so you can extend, steer, or interrupt it. ",
+      "affects": [
+        "overrun-stuck",
+        "overrun-progressing"
+      ]
+    },
+    {
+      "id": "tooldesc.subagent-timeout-overrun",
+      "kind": "text",
+      "surface": "tool declaration: subagent.parameters.timeout_ms.description",
+      "text": "Passing it does not stop the subagent: you get <pi-famulus-wake kind=\"subagent-overrun\"> and choose extend, steer, or interrupt. With resume: the resumed turn's budget. With extend: the new budget from now.",
+      "affects": [
+        "overrun-stuck",
+        "overrun-progressing"
+      ]
+    },
+    {
       "id": "tooldesc.agent-message-no-resume",
       "kind": "text",
       "surface": "tool declaration: agent_message.description (parent, comms/tools.ts)",
@@ -293,7 +323,9 @@
         "handover-continue",
         "supervisor-reply",
         "resume-finished",
-        "bg-end-turn"
+        "bg-end-turn",
+        "overrun-stuck",
+        "overrun-progressing"
       ]
     },
     {
@@ -336,7 +368,8 @@
         "guidelines.no-fabrication",
         "guidelines.subagent-handover",
         "guidelines.agent-message",
-        "guidelines.monitor-end-turn"
+        "guidelines.monitor-end-turn",
+        "guidelines.subagent-overrun"
       ]
     },
     {
