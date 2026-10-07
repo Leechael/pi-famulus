@@ -21,6 +21,11 @@ fn hello(c: &mut Conn, session: &str) {
         "pi_pid":std::process::id(),"cwd":"/tmp","protocol":2}));
 }
 
+fn hello_v5(c: &mut Conn, session: &str) {
+    c.request_ok(json!({"type":"hello","client_kind":"extension","session_id":session,
+        "pi_pid":std::process::id(),"cwd":"/tmp","protocol":5}));
+}
+
 fn start(c: &mut Conn, kind: &str, command: &str, extra: Value) -> (String, u32) {
     let mut req = json!({"type":"start","kind":kind,"command":command,"cwd":"/tmp","env":{"PATH":PATH_ENV}});
     for (k, v) in extra.as_object().unwrap() {
@@ -625,15 +630,29 @@ fn u14_upgrade_names_the_file_it_will_exec() {
 }
 
 #[test]
-fn u15_upgrade_reaps_permits_for_sessions_that_never_reconnect() {
+fn u15_upgrade_reaps_disconnected_kind_and_wakes_queue_without_reaping_reconnected_owner() {
     let home = Home::new("u15");
-    std::fs::write(home.path.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    std::fs::write(
+        home.path.join("config.json"),
+        r#"{"maxAgents":3,"maxTest":1,"maxBuild":1}"#,
+    )
+    .unwrap();
     let bin = home.install_copy();
     let _d = home.start_daemon_from(&bin, &[]);
-    let mut c = home.connect();
-    hello(&mut c, "sess-u15-never-reconnects");
-    c.request_ok(json!({"type":"acquire_agent","child_id":"ch-u15"}));
-    assert_eq!(status(&home)["agent_capacity"]["used"], 1);
+    let mut abandoned = home.connect();
+    hello_v5(&mut abandoned, "sess-u15-never-reconnects");
+    abandoned.request_ok(json!({
+        "type":"acquire_agent","child_id":"ch-u15-abandoned","work_kind":"test"
+    }));
+    let mut retained = home.connect();
+    hello_v5(&mut retained, "sess-u15-reconnects");
+    retained.request_ok(json!({
+        "type":"acquire_agent","child_id":"ch-u15-retained","work_kind":"build"
+    }));
+    let before = status(&home);
+    assert_eq!(before["agent_capacity"]["used"], 2);
+    assert_eq!(before["agent_capacity"]["by_kind"]["test"]["used"], 1);
+    assert_eq!(before["agent_capacity"]["by_kind"]["build"]["used"], 1);
 
     let out = upgrade(&home);
     assert!(
@@ -642,25 +661,50 @@ fn u15_upgrade_reaps_permits_for_sessions_that_never_reconnect() {
         out.stdout,
         out.stderr
     );
+    assert!(abandoned.wait_closed(s(5)), "abandoned connection survived upgrade");
+    assert!(retained.wait_closed(s(5)), "retained connection survived upgrade");
+    drop(abandoned); // Deliberately never reconnect this permit-owning session.
+
+    let mut owner = home.connect();
+    hello_v5(&mut owner, "sess-u15-reconnects");
+    let mut waiter = home.connect();
+    hello_v5(&mut waiter, "sess-u15-kind-waiter");
+    waiter.send(&json!({
+        "v":1,"id":"u15-queued-test","type":"acquire_agent",
+        "child_id":"ch-u15-queued-test","work_kind":"test"
+    }));
+    assert!(
+        waiter.wait_id("u15-queued-test", Duration::from_millis(100)).is_none(),
+        "test-kind queue bypassed the abandoned owner's lease during grace"
+    );
     assert_eq!(
         status(&home)["agent_capacity"]["used"],
-        1,
-        "unreconnected permits remain held during handover grace"
+        2,
+        "leases remain held during handover grace"
     );
-    drop(c); // Deliberately never reconnect the permit-owning session.
 
     home.advance("handover-grace", 30_000);
+    let grant = waiter
+        .wait_id("u15-queued-test", s(3))
+        .expect("reaping abandoned test permit should wake the kind queue");
+    assert_eq!(grant["granted"], true, "{grant}");
+    let after = status(&home);
+    assert_eq!(after["agent_capacity"]["used"], 2, "{after}");
+    assert_eq!(after["agent_capacity"]["total"], 3, "{after}");
+    assert_eq!(after["agent_capacity"]["by_kind"]["test"]["used"], 1, "{after}");
+    assert_eq!(after["agent_capacity"]["by_kind"]["test"]["total"], 1, "{after}");
+    assert_eq!(after["agent_capacity"]["by_kind"]["build"]["used"], 1, "{after}");
+    assert_eq!(after["agent_capacity"]["by_kind"]["build"]["total"], 1, "{after}");
+
+    waiter.request_ok(json!({
+        "type":"release_agent","child_id":"ch-u15-queued-test"
+    }));
+    waiter.request_ok(json!({
+        "type":"acquire_agent","child_id":"ch-u15-replacement","work_kind":"test"
+    }));
     assert_eq!(
-        status(&home)["agent_capacity"]["used"],
-        0,
-        "handover did not reap the abandoned session's permit"
-    );
-    let mut replacement = home.connect();
-    hello(&mut replacement, "sess-u15-replacement");
-    replacement.request_ok(json!({"type":"acquire_agent","child_id":"ch-u15-replacement"}));
-    assert_eq!(
-        status(&home)["agent_capacity"]["used"],
+        status(&home)["agent_capacity"]["by_kind"]["test"]["used"],
         1,
-        "abandoned permit still blocks the machine slot"
+        "reaped test-kind key still blocks a replacement"
     );
 }

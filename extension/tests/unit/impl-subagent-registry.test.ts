@@ -225,6 +225,18 @@ describe("SubagentRegistry", () => {
     expect(record.status).toBe("interrupted");
   });
 
+  it("activeChildren includes a pending child's current queue delta", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    const childId = registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+
+    expect(registry.activeChildren().find((child) => child.childId === childId)).toMatchObject({
+      status: "pending",
+      queueMs: 75,
+    });
+  });
+
   it("finalizeRun records elapsed queue time for never-submitted pending children", () => {
     const { registry, clock } = makeStack();
     const run = registry.createRun("tasks");
@@ -237,6 +249,22 @@ describe("SubagentRegistry", () => {
     registry.finalizeRun(run.runId, "cancelled (fail_fast)");
 
     expect(terminal?.children[0]).toMatchObject({ status: "interrupted", queueMs: 75 });
+  });
+
+  it("finalizeRun freezes queue wall usage for never-submitted pending children", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+
+    registry.finalizeRun(run.runId, "cancelled (fail_fast)");
+
+    const queueAtFinalize = registry.get(run.runId)!.children[0]!.wallUsage!.queueMs;
+    clock.advanceBy(500);
+    const frozen = registry.get(run.runId)!.children[0]!;
+    expect(queueAtFinalize).toBe(75);
+    expect(frozen.queueMs).toBe(75);
+    expect(frozen.wallUsage).toMatchObject({ queueMs: queueAtFinalize, otherMs: 0 });
   });
 
   it("a queued child cancelled via shouldStart settles as interrupted", async () => {
