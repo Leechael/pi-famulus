@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import { realClock, type Clock } from "./clock";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient, TaskRecord } from "./manager-client";
+import { fill, PROMPTS } from "./prompts.generated";
 import {
   formatAgentCommand,
   isAgentStatusActive,
@@ -85,14 +86,12 @@ function formatTaskLine(task: TaskRecord, now: number): string {
   );
 }
 
-const END_TURN_HINT =
-  'The task is still running. Reply to the user now with no tool call; a <pi-famulus-wake> arrives when it finishes.';
-const LIST_END_TURN_HINT =
-  "Running work wakes you with a <pi-famulus-wake> when it finishes. Reply to the user now with no tool call instead of checking again.";
+const END_TURN_HINT = PROMPTS["tools.task_output.hint.still-running"];
+const LIST_END_TURN_HINT = PROMPTS["tools.task_list.hint.running"];
 
 const taskListParameters = Type.Object({
   all: Type.Optional(
-    Type.Boolean({ description: "Also include finished work (default: running only). Always limited to this session." }),
+    Type.Boolean({ description: PROMPTS["tools.task_list.param.all"] }),
   ),
 });
 
@@ -102,10 +101,8 @@ export function createTaskListTool(
   return {
     name: "task_list",
     label: "Task List",
-    description:
-      "List background work this session started: shell/monitor tasks and subagent children. " +
-      "Work from other pi sessions is never shown.",
-    promptSnippet: "List background shell/monitor tasks and subagents",
+    description: PROMPTS["tools.task_list.description"],
+    promptSnippet: PROMPTS["tools.task_list.snippet"],
     parameters: taskListParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const client = await requireClient(deps);
@@ -180,15 +177,12 @@ export function createTaskListTool(
 }
 
 const taskOutputParameters = Type.Object({
-  task_id: Type.String({ description: "Task id, e.g. sh_a1b2c3d4" }),
+  task_id: Type.String({ description: PROMPTS["tools.task_output.param.task_id"] }),
   cursor: Type.Optional(
-    Type.Number({
-      description:
-        "Byte offset to read from (for incremental reads). Omit to read the tail of the output.",
-    }),
+    Type.Number({ description: PROMPTS["tools.task_output.param.cursor"] }),
   ),
   max_bytes: Type.Optional(
-    Type.Number({ description: "Maximum bytes to return (default 65536)" }),
+    Type.Number({ description: PROMPTS["tools.task_output.param.max_bytes"] }),
   ),
 });
 
@@ -211,7 +205,7 @@ export function createTaskOutputTool(
   const lastRunningSize = new Map<string, number>();
   const guardPoll = (id: string, running: boolean, size: number) => {
     if (running && lastRunningSize.get(id) === size) {
-      throw new Error(`No new output from ${id} since your last read. ${END_TURN_HINT}`);
+      throw new Error(fill("tools.task_output.error.no-new-output", { taskId: id, hint: END_TURN_HINT }));
     }
     if (running) lastRunningSize.set(id, size);
     else lastRunningSize.delete(id);
@@ -219,11 +213,8 @@ export function createTaskOutputTool(
   return {
     name: "task_output",
     label: "Task Output",
-    description:
-      "Read output of a background task. Without a cursor, returns the tail of the output " +
-      "plus the current file pointer; pass the returned next_cursor as cursor for incremental reads. " +
-      "Not a way to wait: a running task wakes you when it finishes, so reply with no tool call instead of calling this again.",
-    promptSnippet: "Read background task output",
+    description: PROMPTS["tools.task_output.description"],
+    promptSnippet: PROMPTS["tools.task_output.snippet"],
     parameters: taskOutputParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const agentText = agentTextFor(deps, params.task_id);
@@ -280,7 +271,7 @@ export function createTaskOutputTool(
 }
 
 const taskStopParameters = Type.Object({
-  task_id: Type.String({ description: "Task id to stop, e.g. sh_a1b2c3d4" }),
+  task_id: Type.String({ description: PROMPTS["tools.task_stop.param.task_id"] }),
 });
 
 export function createTaskStopTool(
@@ -289,9 +280,8 @@ export function createTaskStopTool(
   return {
     name: "task_stop",
     label: "Task Stop",
-    description:
-      "Stop a running background task (SIGTERM to the process group, SIGKILL after a 2s grace).",
-    promptSnippet: "Stop a background task",
+    description: PROMPTS["tools.task_stop.description"],
+    promptSnippet: PROMPTS["tools.task_stop.snippet"],
     parameters: taskStopParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx: ExtensionContext) {
       const agent = deps.getRegistry?.()?.handle(params.task_id);

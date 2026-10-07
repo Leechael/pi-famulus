@@ -10,6 +10,7 @@ import {
   type MailboxOptions,
 } from "./mailbox";
 import type { Comms, CommsHost } from "./types";
+import { fill } from "../prompts.generated";
 import { formatFamulusWake, type FormattedWake } from "../wake";
 import type { Clock } from "../clock";
 
@@ -149,9 +150,12 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         // Lifecycle (resume) belongs to the subagent tool. Resuming here never
         // wired a completion wake, so the parent hung.
         throw new Error(
-          `Child ${toChildId} (${child.name}) has finished (${child.status}). ` +
-            `agent_message does not resume children. ` +
-            `Use subagent({ action: "resume", run_id: "${child.runId}", child_id: "${toChildId}", message: "..." }).`,
+          fill("tools.agent_message.error.finished-child", {
+            childId: toChildId,
+            name: child.name,
+            status: child.status,
+            runId: child.runId,
+          }),
         );
       } else {
         throw new Error(

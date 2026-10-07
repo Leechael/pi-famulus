@@ -1,6 +1,6 @@
 # Model baselines
 
-What each model scores on the smoke tier (baseline prompt only, 8 scenarios, k=10), and so which models the extension can be used with.
+When to rerun the baseline, and the per-model history up to 2026-09-30. From 2026-10-07 every run's result is a pass/fail matrix in [RESULTS.md](RESULTS.md); this file keeps the rerun rules below and the older sections for reference.
 
 ## When to rerun
 
@@ -19,11 +19,12 @@ node ablation/run.ts --tier smoke --k 10 --transcripts \
   --models <spec>,<spec>,... \
   --results results/<run>/results.jsonl --yes
 node ablation/report.ts --results results/<run>/results.jsonl
+node ablation/matrix.ts --results results/<run>/results.jsonl --title "<date>: <change>" --note "<tree, notes>" --write RESULTS.md
 ```
 
 Record which code ran as the tree hash of `extension/` (`git rev-parse --short HEAD:extension`): unlike a commit hash, it survives a rebase of the stack.
 
-Read the transcript of every FAIL and INVALID before writing the numbers down: graders have failed correct runs before (see PR #18). Record both the grader's count and the reviewed count, and say why they differ.
+Read the transcript of every FAIL and INVALID before writing the numbers down: graders have failed correct runs before (see PR #18). A wrong verdict means the grader or the scenario is wrong: fix it (with a test that goes red on the old behavior) and rerun the cell. Results record only what the grader decided, never a hand-corrected count.
 
 **Thinking level.** The spec's level is not always the level pi sends. Where a model's `thinkingLevelMap` maps a level to `null`, pi runs it at another level. Check it in any transcript (`"thinkingLevel":"…"` in the session state) and record both.
 

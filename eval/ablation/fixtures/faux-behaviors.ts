@@ -78,7 +78,55 @@ function supervisorBehavior(mode: "reply" | "send"): FauxScript {
   return { steps: [], fallback: decide };
 }
 
+/**
+ * overrun-stuck / overrun-progressing: the faux child runs the scenario's
+ * script in its foreground shell; the parent answers the subagent-overrun
+ * wake with `mode` once, then finishes from subagent-done.
+ */
+function overrunBehavior(mode: "interrupt" | "extend" | "steer" | "ignore"): FauxScript {
+  const decide: FauxStep = (ctx) => {
+    const first = textOf(ctx.messages.find((m) => m.role === "user"));
+    const last = ctx.messages.at(-1);
+    if (!first.startsWith("Use the subagent tool")) {
+      // Child session.
+      if (last?.role === "toolResult") return say(textOf(last).trim().split("\n").at(-1) ?? "");
+      return call("bash", { command: /fetch-data/.test(first) ? "./fetch-data.sh" : "./build.sh" });
+    }
+    // Parent session.
+    const input = lastInputText(ctx);
+    const acted = ctx.messages.some(
+      (m) => m.role === "assistant" && /"name":"(subagent|agent_message)"/.test(JSON.stringify(m.content)) && /"action":"(interrupt|extend|send)"/.test(JSON.stringify(m.content)),
+    );
+    if (!/run_[0-9a-f]{8}/.test(JSON.stringify(ctx.messages))) {
+      const task = /exactly this task: "([^"]+)"/.exec(first)?.[1] ?? first;
+      return call("subagent", { tasks: [{ prompt: task }] });
+    }
+    if (last?.role === "toolResult" && last.toolName === "write") return say("Done.");
+    const overrun = /kind="subagent-overrun"[^>]*?run-id="([^"]+)"[^>]*?child-id="([^"]+)"/.exec(input);
+    if (overrun && !acted) {
+      const [, runId, childId] = overrun;
+      if (mode === "interrupt") return call("subagent", { action: "interrupt", run_id: runId, child_id: childId });
+      if (mode === "extend") return call("subagent", { action: "extend", run_id: runId, child_id: childId, timeout_ms: 60000 });
+      if (mode === "steer") return call("agent_message", { action: "send", to: childId, message: "Stop waiting and report what you have." });
+      return say("It is still running; leaving it.");
+    }
+    if (/kind="subagent-done"/.test(input)) {
+      const line = /BUILD OK [A-Z0-9]+/.exec(input)?.[0];
+      return line ? call("write", { path: "build-result.txt", content: `${line}\n` }) : say("The data fetch hung, so I stopped it.");
+    }
+    return say("ok");
+  };
+  return { steps: [], fallback: decide };
+}
+
 const behaviors: Record<string, FauxScript> = {
+  "overrun-stuck/interrupt": overrunBehavior("interrupt"),
+  "overrun-stuck/extend": overrunBehavior("extend"),
+  "overrun-stuck/steer": overrunBehavior("steer"),
+  "overrun-stuck/ignore": overrunBehavior("ignore"),
+  "overrun-progressing/ignore": overrunBehavior("ignore"),
+  "overrun-progressing/extend": overrunBehavior("extend"),
+  "overrun-progressing/interrupt": overrunBehavior("interrupt"),
   "supervisor-reply/reply": supervisorBehavior("reply"),
   "supervisor-reply/send": supervisorBehavior("send"),
   "resume-finished/resume": resumeBehavior("resume"),

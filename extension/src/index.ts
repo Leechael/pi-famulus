@@ -5,7 +5,7 @@
  * M2: NotifyCenter + monitor tool.
  * M3: subagent tool (InProcessRunner + tasks/chain + budget-to-async) + fleet widget.
  */
-import { applyBehaviorGuidelines } from "./behavior-guidelines";
+import { registerBehaviorGuidelines } from "./behavior-guidelines";
 import { realClock } from "./clock";
 import { ExitNotifyGate } from "./exit-notify-gate";
 import { ExitWatchdog } from "./exit-watchdog";
@@ -70,6 +70,7 @@ function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
 }
 
 export default function (pi: ExtensionAPI): void {
+  registerBehaviorGuidelines(pi);
   const home = getFamulusHome();
   const config = loadConfig(home);
   const managerPath = resolveManagerPath(config, home);
@@ -432,10 +433,6 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, startCtx) => {
     ctx = startCtx;
-    const base = (
-      startCtx as { getSystemPromptOptions?: () => { sections?: Record<string, string> } }
-    ).getSystemPromptOptions?.();
-    if (base) applyBehaviorGuidelines(base);
     notifyCenter?.dispose();
     notifyCenter = new NotifyCenter({
       sendMessage: (msg, opts) => pi.sendMessage(msg, opts),
@@ -820,9 +817,5 @@ export default function (pi: ExtensionAPI): void {
       lookup: () => (subagentRegistry ? registryStatusLookup(subagentRegistry) : null),
     });
     return message ? { message } : undefined;
-  });
-
-  pi.on("before_agent_start", async (event) => {
-    applyBehaviorGuidelines(event.systemPromptOptions as { sections?: Record<string, string> });
   });
 }

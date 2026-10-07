@@ -30,6 +30,7 @@ import { backgroundRowText, formatBackgroundNotice, truncateTail } from "./forma
 import { toolComponent } from "./tui/tool-component";
 import type { WorkIndex } from "./work-index";
 import type { ManagerClient } from "./manager-client";
+import { fill, PROMPTS } from "./prompts.generated";
 import {
   appendStatus,
   bareSleepError,
@@ -48,15 +49,12 @@ const MAX_LINES = SHELL_MAX_LINES;
 const MAX_BYTES = SHELL_MAX_BYTES;
 
 const bashParameters = Type.Object({
-  command: Type.String({ description: "The bash command to execute" }),
+  command: Type.String({ description: PROMPTS["tools.bash.param.command"] }),
   timeout: Type.Optional(
-    Type.Number({ description: "Hard kill timeout in seconds (optional, no default timeout)" }),
+    Type.Number({ description: PROMPTS["tools.bash.param.timeout"] }),
   ),
   run_in_background: Type.Optional(
-    Type.Boolean({
-      description:
-        "Start the command in the background and return immediately. You will be notified when it completes.",
-    }),
+    Type.Boolean({ description: PROMPTS["tools.bash.param.run_in_background"] }),
   ),
 });
 
@@ -135,11 +133,8 @@ function isActiveStatus(status: string | undefined): boolean {
   return status === undefined || status === "running" || status === "pending";
 }
 
-const BARE_SLEEP_GUIDANCE =
-  "Do not sleep to wait for background work; completion is delivered via notification. Use the monitor tool to watch for a condition, or run_in_background for long commands.";
-
 function rejectBareSleep(command: string): string | null {
-  return bareSleepError(command, BARE_SLEEP_GUIDANCE);
+  return bareSleepError(command, "tools.bash.error.bare-sleep");
 }
 
 function resolveTimeoutMs(timeoutSeconds: number | undefined): number | null {
@@ -289,17 +284,9 @@ export function createBashOverride(
   return {
     name: "bash",
     label: "Bash",
-    description:
-      "Execute a bash command in the current working directory. Returns stdout and stderr. " +
-      `Output is truncated to last ${MAX_LINES} lines or ${MAX_BYTES / 1024}KB (whichever is hit first). ` +
-      "Foreground commands that exceed the foreground budget are automatically moved to the background; " +
-      "you will be notified when they complete. Optionally provide a timeout in seconds (hard kill limit), " +
-      "or run_in_background to background immediately.",
-    promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
-    promptGuidelines: [
-      "You can inspect PI_* environment variables for current model and session details.",
-      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn (a reply with no tool call) and resume from the task wake when it arrives.",
-    ],
+    description: fill("tools.bash.description", { maxLines: MAX_LINES, maxKb: MAX_BYTES / 1024 }),
+    promptSnippet: PROMPTS["tools.bash.snippet"],
+    promptGuidelines: [...PROMPTS["tools.bash.rules"]],
     parameters: bashParameters,
     outputSchema: bashOutputSchema,
     renderResult(result, { expanded }, theme, context) {

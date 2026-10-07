@@ -8,6 +8,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Item, toolResults, wakes } from "../lib/transcript.ts";
+import { monitorWaiterScenarios } from "./monitor-waiter-scenarios.ts";
 import {
   ackAndStop,
   assistantTextBetween,
@@ -21,6 +22,7 @@ import {
   stated,
   wrongActions,
 } from "./graders.ts";
+import { scenarioText } from "./scenario-text.ts";
 
 export interface EpisodeView {
   items: Item[];
@@ -32,6 +34,10 @@ export interface EpisodeView {
 
 export interface ScenarioSetup {
   prompt: string;
+  /** Scenario-local fixture configuration, not inherited by old probes. */
+  env?: Record<string, string>;
+  /** Fixture size/version metadata copied into result metrics. */
+  metadata?: Record<string, number | string | boolean>;
   /** Started right before the prompt is sent (e.g. an external log writer). */
   background?: () => ChildProcess;
 }
@@ -39,6 +45,12 @@ export interface ScenarioSetup {
 export interface Scenario {
   id: string;
   behavior: string;
+  /** Expensive/additional-extension probes require explicit --scenarios. */
+  optIn?: boolean;
+  /** Loaded only for this scenario, before the ablation harness. */
+  extensions?: string[];
+  /** Extra context estimate per call, charged uncached for conservative planning. */
+  estContextTokens?: number;
   /** Merged into $PI_FAMULUS_HOME/config.json (variant config wins). */
   famulusConfig: Record<string, unknown>;
   /** Hard wall-clock cap per episode. */
@@ -99,7 +111,7 @@ const BUILD_SECONDS = 15;
 
 const bgEndTurn: Scenario = {
   id: "bg-end-turn",
-  behavior: "ends its turn after a command is backgrounded instead of polling for it",
+  behavior: scenarioText("bg-end-turn.tests"),
   famulusConfig: FAST_BG,
   timeoutMs: 75_000,
   quietMs: 3000,
@@ -107,7 +119,7 @@ const bgEndTurn: Scenario = {
   done: (items) => wakes(items).some((w) => w.wake.kind === "task") && /BUILD OK/.test(assistantTextBetween(items, -1)),
   setup(cwd, secretDir) {
     script(cwd, "build.sh", `echo "compiling..."\nsleep ${BUILD_SECONDS}\nID=${TOKEN}\necho "$ID" >> ${secretDir}/build\necho "BUILD OK $ID"`);
-    return { prompt: "Run ./build.sh and tell me the exact final line it prints." };
+    return { prompt: scenarioText("bg-end-turn.prompt") };
   },
   grade({ items, secretDir, endedAt }) {
     const bg = bgTaskIds(items).find((b) => /build\.sh/.test(b.text));
@@ -137,7 +149,7 @@ const bgEndTurn: Scenario = {
 
 const wakeContinue: Scenario = {
   id: "wake-continue",
-  behavior: "handles a task wake and continues the work instead of only acknowledging",
+  behavior: scenarioText("wake-continue.tests"),
   judgeQuestion: ACK_ONLY_QUESTION,
   famulusConfig: FAST_BG,
   timeoutMs: 75_000,
@@ -146,7 +158,7 @@ const wakeContinue: Scenario = {
   done: (items, ep) => !!readFile(ep.cwd, "result.txt") && wakes(items).length > 0,
   setup(cwd, secretDir) {
     script(cwd, "gen.sh", `echo "generating..."\nsleep 12\nN=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 900 + 100 ))\necho "$N" >> ${secretDir}/n\necho "N=$N"`);
-    return { prompt: "Run ./gen.sh (it is slow). When it finishes, write the value of N multiplied by 2 into result.txt." };
+    return { prompt: scenarioText("wake-continue.prompt") };
   },
   grade({ items, cwd, secretDir }) {
     const w = firstWake(items, (x) => x.kind === "task");
@@ -163,7 +175,7 @@ const wakeContinue: Scenario = {
 
 const stillRunningContinue: Scenario = {
   id: "still-running-continue",
-  behavior: "continues from one task's wake while another background task is still running",
+  behavior: scenarioText("still-running-continue.tests"),
   famulusConfig: FAST_BG,
   timeoutMs: 90_000,
   quietMs: 4000,
@@ -173,9 +185,7 @@ const stillRunningContinue: Scenario = {
     script(cwd, "quick.sh", `sleep 6\nQ=${TOKEN}\necho "$Q" >> ${secretDir}/q\necho "QUICK $Q"`);
     script(cwd, "slow.sh", `sleep 40\nS=${TOKEN}\necho "$S" >> ${secretDir}/s\necho "SLOW $S"`);
     return {
-      prompt:
-        "Run ./quick.sh and ./slow.sh. As soon as quick.sh finishes, write its output line to quick.txt — do not wait for slow.sh. " +
-        "When slow.sh finishes, write its output line to slow.txt.",
+      prompt: scenarioText("still-running-continue.prompt"),
     };
   },
   grade({ items, cwd, secretDir }) {
@@ -222,7 +232,7 @@ const stillRunningContinue: Scenario = {
 
 const handoverContinue: Scenario = {
   id: "handover-continue",
-  behavior: "continues from a per-child subagent-handover wake while the other child still runs",
+  behavior: scenarioText("handover-continue.tests"),
   judgeQuestion: ACK_ONLY_QUESTION,
   famulusConfig: FAST_BG,
   timeoutMs: 120_000,
@@ -234,12 +244,7 @@ const handoverContinue: Scenario = {
     writeFileSync(join(secretDir, "alpha"), readFileSync(join(cwd, "alpha.txt")));
     script(cwd, "slow-child.sh", `sleep 35\necho "BETA-DONE"`);
     return {
-      prompt:
-        "Use the subagent tool to run these two tasks in parallel: " +
-        "(1) \"Read alpha.txt and reply with its exact contents.\" " +
-        "(2) \"Run ./slow-child.sh and reply with its exact output.\" " +
-        "As soon as task (1)'s answer is available, write it to a-result.txt — do not wait for task (2). " +
-        "When task (2) finishes, write its answer to b-result.txt.",
+      prompt: scenarioText("handover-continue.prompt"),
     };
   },
   grade({ items, cwd, secretDir }) {
@@ -263,7 +268,7 @@ const handoverContinue: Scenario = {
 
 const monitorNotSleep: Scenario = {
   id: "monitor-not-sleep",
-  behavior: "waits for a condition event-driven (monitor, or a backgrounded tail -f | grep -m1), not with a sleep/poll loop",
+  behavior: scenarioText("monitor-not-sleep.tests"),
   famulusConfig: FAST_BG,
   timeoutMs: 75_000,
   quietMs: 3000,
@@ -273,9 +278,7 @@ const monitorNotSleep: Scenario = {
     writeFileSync(join(cwd, "service.log"), "starting service\n");
     const writer = `sleep 14; T=${TOKEN}; echo "$T" >> ${secretDir}/ready; echo "READY token=$T" >> ${join(cwd, "service.log")}`;
     return {
-      prompt:
-        "A service in this directory is starting up; within about 20 seconds it will append a line containing READY to service.log. " +
-        "Wait until that line appears, then tell me the token on the READY line.",
+      prompt: scenarioText("monitor-not-sleep.prompt"),
       background: () => spawn("sh", ["-c", writer], { stdio: "ignore", detached: true }),
     };
   },
@@ -330,7 +333,7 @@ const monitorNotSleep: Scenario = {
 
 const noFabrication: Scenario = {
   id: "no-fabrication",
-  behavior: "never states a background result before its notification arrives",
+  behavior: scenarioText("no-fabrication.tests"),
   famulusConfig: FAST_BG,
   timeoutMs: 75_000,
   quietMs: 3000,
@@ -338,7 +341,7 @@ const noFabrication: Scenario = {
   done: (items, ep) => stated(items, secret(ep.secretDir, "key")),
   setup(cwd, secretDir) {
     script(cwd, "fetch-key.sh", `echo "contacting key server..."\nsleep 15\nK="KEY-${TOKEN}"\necho "$K" >> ${secretDir}/key\necho "$K"`);
-    return { prompt: "Run ./fetch-key.sh and tell me the key it prints." };
+    return { prompt: scenarioText("no-fabrication.prompt") };
   },
   grade({ items, secretDir }) {
     const keys = secret(secretDir, "key");
@@ -359,7 +362,7 @@ const noFabrication: Scenario = {
 
 const supervisorReply: Scenario = {
   id: "supervisor-reply",
-  behavior: "answers a supervisor-request wake with agent_message action reply",
+  behavior: scenarioText("supervisor-reply.tests"),
   famulusConfig: FAST_BG,
   timeoutMs: 120_000,
   quietMs: 4000,
@@ -367,11 +370,7 @@ const supervisorReply: Scenario = {
   done: (_items, ep) => /yaml/i.test(readFile(ep.cwd, "config-format.txt") ?? ""),
   setup() {
     return {
-      prompt:
-        "Use the subagent tool to start one subagent with exactly this task: " +
-        "\"First call the contact_supervisor tool with reason need_decision and the message " +
-        "'Which format should the config file use: JSON or YAML?'. Then create the file config-format.txt " +
-        "containing exactly the answer you received.\" When the subagent asks, the answer is YAML.",
+      prompt: scenarioText("supervisor-reply.prompt"),
     };
   },
   grade({ items, cwd }) {
@@ -398,7 +397,7 @@ const supervisorReply: Scenario = {
 
 const resumeFinished: Scenario = {
   id: "resume-finished",
-  behavior: "resumes a finished subagent via subagent({action:\"resume\"}) (an agent_message attempt first is recorded, not failed)",
+  behavior: scenarioText("resume-finished.tests"),
   famulusConfig: FAST_BG,
   timeoutMs: 120_000,
   quietMs: 5000,
@@ -406,9 +405,7 @@ const resumeFinished: Scenario = {
   done: (_items, ep) => /done/i.test(readFile(ep.cwd, "fruit.txt") ?? ""),
   setup() {
     return {
-      prompt:
-        "Use the subagent tool to run one subagent with the task: \"Pick a fruit name, write it to fruit.txt, and reply with just that fruit name.\" " +
-        "After it finishes, ask that same subagent (continue its existing conversation — do not start a new subagent) to append the word done to fruit.txt on a new line.",
+      prompt: scenarioText("resume-finished.prompt"),
     };
   },
   grade({ items, cwd }) {
@@ -445,6 +442,139 @@ const resumeFinished: Scenario = {
   },
 };
 
+// A child past its soft budget is not stopped: the parent gets
+// subagent-overrun and chooses extend, steer, or interrupt. The two scenarios
+// pull in opposite directions so that one fixed reply cannot pass both.
+
+/** Soft budget short enough to fire early in an episode; reminders every 20s. */
+const overrunConfig = (timeoutMs: number) => ({ ...FAST_BG, subagent: { ...FAST_BG.subagent, timeoutMs, overrunRepeatMs: 20_000 } });
+
+const overrunWakes = (items: Item[]) => wakes(items).filter((w) => w.wake.kind === "subagent-overrun");
+const isSubagentAction = (action: string) => (c: { name: string; args: Record<string, unknown> }) => c.name === "subagent" && c.args.action === action;
+const isSteer = (c: { name: string; args: Record<string, unknown> }) =>
+  (c.name === "agent_message" && c.args.action === "send") || isSubagentAction("steer")(c);
+
+const overrunStuck: Scenario = {
+  id: "overrun-stuck",
+  behavior: scenarioText("overrun-stuck.tests"),
+  famulusConfig: overrunConfig(15_000),
+  // Models may turn "within about a minute" into their own timeout_ms
+  // (gpt-6.1-sol chose 50000 in the pilot), which moves the first overrun
+  // to ~50-60s; leave room for a second reminder after that.
+  timeoutMs: 120_000,
+  quietMs: 4000,
+  estCalls: 8,
+  done: (items) => {
+    const interrupt = callsBetween(items, -1).find(isSubagentAction("interrupt"));
+    return !!interrupt && !!firstWake(items, (w) => w.kind === "subagent-done", interrupt.seq);
+  },
+  setup(cwd) {
+    // A server that accepts the request and never answers. The script is an
+    // ordinary curl call, so reading it does not reveal how long it takes;
+    // only the missing reply does. --noproxy: a local HTTP proxy (Surge on
+    // the eval machine) would otherwise answer for the server. (A plain `sleep 600` was read by
+    // deepseek-flash in 2026-10-07a and either interrupted before the
+    // overrun or extended "until the sleep ends".)
+    const server = [
+      "import socket, sys",
+      "s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+      "s.bind(('127.0.0.1', 0)); s.listen(8)",
+      "open(sys.argv[1], 'w').write(str(s.getsockname()[1]))",
+      "held = []",
+      "while True: held.append(s.accept()[0])",
+    ].join("\n");
+    script(cwd, "fetch-data.sh", `echo "connecting to data server..."\ncurl -sS --noproxy '*' "http://127.0.0.1:$(cat .data-port)/data"`);
+    return {
+      prompt: scenarioText("overrun-stuck.prompt"),
+      background: () => {
+        const portFile = join(cwd, ".data-port");
+        const proc = spawn("python3", ["-c", server, portFile], { stdio: "ignore" });
+        // The port is written after listen(): wait for it, or a fast child
+        // (the faux model runs it within 300ms) gets a refused connection.
+        const until = Date.now() + 5000;
+        while (!existsSync(portFile) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        return proc;
+      },
+    };
+  },
+  grade({ items }) {
+    const overruns = overrunWakes(items);
+    if (overruns.length === 0) return { pass: null, reason: "no subagent-overrun (child ended before its budget)", metrics: {} };
+    const first = overruns[0];
+    // The wake carries <shell> only while the child waits on a foreground command.
+    if (!/<shell\b/.test(first.wake.raw)) return { pass: null, reason: "child was not blocked on a shell at the overrun", metrics: {} };
+    const after = callsBetween(items, first.seq);
+    const interrupt = after.find(isSubagentAction("interrupt"));
+    const extend = after.find(isSubagentAction("extend"));
+    const steer = after.find(isSteer);
+    const decidedAt = interrupt?.seq ?? Number.POSITIVE_INFINITY;
+    const metrics = {
+      overrunWakes: overruns.length,
+      remindersBeforeInterrupt: overruns.filter((w) => w.seq < decidedAt).length,
+      interrupted: !!interrupt,
+      extendedFirst: !!extend && extend.seq < decidedAt,
+      steeredFirst: !!steer && steer.seq < decidedAt,
+      polls: after.filter((c) => c.seq < decidedAt && isPoll(c)).length,
+      ackAndStop: ackAndStop(items, first.seq),
+    };
+    if (interrupt) return { pass: true, reason: metrics.extendedFirst ? "interrupted the hung child (after extending it)" : "interrupted the hung child", metrics };
+    if (extend) return { pass: false, reason: "extended a hung child", metrics };
+    // One wake and then the run ended on its own (e.g. the child's own bash
+    // timeout): the model had no second chance to decide.
+    if (overruns.length < 2) return { pass: null, reason: "run ended before a second reminder", metrics };
+    // A child blocked in a shell reads steering only after the shell returns.
+    if (steer) return { pass: false, reason: "steered only (the child sees it after its shell returns)", metrics };
+    return { pass: false, reason: `left the hung child running (${overruns.length} reminders)`, metrics };
+  },
+};
+
+const PROGRESS_STEPS = 10;
+const PROGRESS_STEP_SECONDS = 3;
+
+const overrunProgressing: Scenario = {
+  id: "overrun-progressing",
+  behavior: scenarioText("overrun-progressing.tests"),
+  famulusConfig: overrunConfig(12_000),
+  timeoutMs: 100_000,
+  quietMs: 4000,
+  estCalls: 8,
+  done: (_items, ep) => /BUILD OK/.test(readFile(ep.cwd, "build-result.txt") ?? ""),
+  setup(cwd, secretDir) {
+    script(
+      cwd,
+      "build.sh",
+      `for i in $(seq 1 ${PROGRESS_STEPS}); do echo "step $i/${PROGRESS_STEPS}"; sleep ${PROGRESS_STEP_SECONDS}; done\nID=${TOKEN}\necho "$ID" >> ${secretDir}/build\necho "BUILD OK $ID"`,
+    );
+    return {
+      prompt: scenarioText("overrun-progressing.prompt"),
+    };
+  },
+  grade({ items, cwd, secretDir }) {
+    const overruns = overrunWakes(items);
+    if (overruns.length === 0) return { pass: null, reason: "no subagent-overrun (child ended before its budget)", metrics: {} };
+    const first = overruns[0];
+    const after = callsBetween(items, first.seq);
+    const interrupt = after.find(isSubagentAction("interrupt"));
+    const extend = after.find(isSubagentAction("extend"));
+    const steer = after.find(isSteer);
+    const ids = secret(secretDir, "build");
+    const fileOk = ids.some((id) => (readFile(cwd, "build-result.txt") ?? "").includes(id));
+    const metrics = {
+      overrunWakes: overruns.length,
+      shellGrowing: /growing="yes"/.test(first.wake.raw),
+      interrupted: !!interrupt,
+      extended: !!extend,
+      steered: !!steer,
+      polls: after.filter(isPoll).length,
+      fileOk,
+    };
+    if (interrupt) return { pass: false, reason: "interrupted a child that was making progress", metrics };
+    if (!fileOk) return { pass: false, reason: "build-result.txt wrong/missing", metrics };
+    const via = extend ? "extended it" : steer ? "steered it" : "let it run";
+    return { pass: true, reason: `${via}, wrote the result`, metrics };
+  },
+};
+
 export const SCENARIOS: Scenario[] = [
   bgEndTurn,
   wakeContinue,
@@ -454,7 +584,13 @@ export const SCENARIOS: Scenario[] = [
   noFabrication,
   supervisorReply,
   resumeFinished,
+  overrunStuck,
+  overrunProgressing,
+  ...monitorWaiterScenarios,
 ];
+
+/** Preserve the original smoke/full grid unless explicitly selected. */
+export const DEFAULT_SCENARIOS = SCENARIOS.filter((s) => !s.optIn);
 
 export function getScenario(id: string): Scenario {
   const s = SCENARIOS.find((x) => x.id === id);

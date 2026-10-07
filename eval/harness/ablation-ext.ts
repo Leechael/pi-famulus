@@ -45,9 +45,9 @@ export default function ablationHarness(pi: ExtensionAPI): void {
   log("init", new Map(variant.segments.map((s) => [s.id, 0])));
 
   if (segs.length > 0) {
-    // Edit the structured prompt in place (never return systemPrompt: that
-    // would force the prompt for this run only). Sections and guidelines are
-    // persisted by pi, so the removal also holds on wake-triggered turns.
+    // Edit user-turn initialization in place (never force a replacement prompt).
+    // Core may clear sections after wake/tool results. Famulus repairs visibility
+    // request-locally; our last-registered context hook strips those copies too.
     pi.on("before_agent_start", async (event) => {
       const hits = new Map<string, number>();
       const o = event.systemPromptOptions as {

@@ -463,7 +463,8 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 - Omit the `exit-code` attribute when `exitCode === null`; details always uses `number | null`. `signal` is a signal-name string (`"SIGTERM"` | `"SIGKILL"`), omitted if absent, not a number.
 - `reply-with` text is `agent_message { action: "reply", to: "<childId>", message: "<your decision>" }`, not included in `message`.
 - The subagent-done pill shows per-status counts, e.g. `3 completed · 1 failed`.
-- Behavior guidelines are a persistent section, not the entire systemPrompt returned by `before_agent_start`. Handle `<pi-famulus-wake>` before continuing; do not poll/sleep/fabricate results.
+- Parent behavior guidelines use a named `pi-famulus` section, not an entire forced system prompt. `before_agent_start` initializes user turns; `context_with_system` restores only that section in each model request if pi's base-prompt rebuild removed it. Wake turns skip `before_agent_start`, and tool-result continuations can remove run-local sections. The repair neither rewrites the persisted transcript nor replaces other system content/sections. Ordinary `session_start` contexts do not provide the command-only `getSystemPromptOptions` method.
+- Handle `<pi-famulus-wake>` before continuing. After starting/re-arming a monitor or handling its event, complete any remaining work, then end the turn with a reply and no tool call; wait for the next notification. Do not poll, sleep, fabricate a state, or call a UI extension's `wait_for` to yield. Legitimate UI-condition waits remain available. Instruction visibility is deterministic; model compliance is measured separately by opt-in compatibility evals.
 
 ### 4.6 subagent tool (M3)
 

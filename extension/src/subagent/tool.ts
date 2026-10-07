@@ -22,6 +22,7 @@ import { realClock, type Clock, type ClockTimer } from "../clock";
 import type { NotifyCenter } from "../notify";
 import { statusGlyph, toolComponent } from "../tui/tool-component";
 import type { WorkIndex } from "../work-index";
+import { fill, PROMPTS } from "../prompts.generated";
 import { runChain, runTasks, validateChainSteps } from "./pool";
 import type { RunRecord, SubagentRegistry } from "./registry";
 import { AGENT_WORK_KINDS, type AgentDefinition, type AgentWorkKind, type ChildHandle, type ChildResult, type ChildRunRequest } from "./types";
@@ -39,59 +40,47 @@ const MIN_TIMEOUT_MS = 1_000;
 // ---------------------------------------------------------------------------
 
 const workKindSchema = Type.Union(AGENT_WORK_KINDS.map((kind) => Type.Literal(kind)), {
-  description: "Explicit planned workload class for machine-wide admission (default: other)",
+  description: PROMPTS["tools.subagent.param.work_kind"],
 });
 
 const taskItem = Type.Object({
-  agent: Type.Optional(Type.String({ description: "Agent definition name (default: worker)" })),
-  prompt: Type.String({ description: "Task prompt for this subagent" }),
-  name: Type.Optional(Type.String({ description: "Display name (default: agent name + ordinal)" })),
+  agent: Type.Optional(Type.String({ description: PROMPTS["tools.subagent.param.tasks.agent"] })),
+  prompt: Type.String({ description: PROMPTS["tools.subagent.param.tasks.prompt"] }),
+  name: Type.Optional(Type.String({ description: PROMPTS["tools.subagent.param.tasks.name"] })),
   work_kind: Type.Optional(workKindSchema),
 });
 
 const chainItem = Type.Object({
-  agent: Type.Optional(Type.String({ description: "Agent definition name (default: worker)" })),
-  prompt: Type.String({
-    description: "Prompt for this step; {previous} and {outputs.<label>} interpolate earlier results",
-  }),
-  label: Type.Optional(Type.String({ description: "Label for referencing this step's output later" })),
+  agent: Type.Optional(Type.String({ description: PROMPTS["tools.subagent.param.chain.agent"] })),
+  prompt: Type.String({ description: PROMPTS["tools.subagent.param.chain.prompt"] }),
+  label: Type.Optional(Type.String({ description: PROMPTS["tools.subagent.param.chain.label"] })),
   work_kind: Type.Optional(workKindSchema),
 });
 
 const subagentParameters = Type.Object({
   tasks: Type.Optional(
-    Type.Array(taskItem, { minItems: 1, maxItems: 10, description: "Subagents to run in parallel" }),
+    Type.Array(taskItem, { minItems: 1, maxItems: 10, description: PROMPTS["tools.subagent.param.tasks"] }),
   ),
   chain: Type.Optional(
-    Type.Array(chainItem, { minItems: 1, description: "Steps to run sequentially (always awaited)" }),
+    Type.Array(chainItem, { minItems: 1, description: PROMPTS["tools.subagent.param.chain"] }),
   ),
   async: Type.Optional(
-    Type.Boolean({ description: "Return immediately with a run_id; completion arrives via notification" }),
+    Type.Boolean({ description: PROMPTS["tools.subagent.param.async"] }),
   ),
   concurrency: Type.Optional(
-    Type.Number({ minimum: 1, maximum: 8, description: "Max parallel subagents for tasks (default 4)" }),
+    Type.Number({ minimum: 1, maximum: 8, description: PROMPTS["tools.subagent.param.concurrency"] }),
   ),
   fail_fast: Type.Optional(
-    Type.Boolean({
-      description: "Cancel not-yet-started subagents on first failure (already-started ones finish)",
-    }),
+    Type.Boolean({ description: PROMPTS["tools.subagent.param.fail_fast"] }),
   ),
   model: Type.Optional(
     Type.String({
-      description:
-        'Model override for all subagents: fuzzy ("haiku"), qualified ("provider/id"), ' +
-        `optionally with ":<thinking>" suffix (${VALID_THINKING_LEVELS.join(", ")}; ` +
-        'an unknown suffix is dropped with a warning when the base resolves; ' +
-        'an unknown base still errors). Default: current model. ' +
-        'Use action:"models" to list selectable values.',
+      description: fill("tools.subagent.param.model", { thinkingLevels: VALID_THINKING_LEVELS.join(", ") }),
     }),
   ),
   timeout_ms: Type.Optional(
     Type.Number({
-      description:
-        `Time budget per subagent turn in ms (default 1800000, max ${MAX_TIMEOUT_MS}). ` +
-        'Passing it does not stop the subagent: you get <pi-famulus-wake kind="subagent-overrun"> ' +
-        "and choose extend, steer, or interrupt. With resume: the resumed turn's budget. With extend: the new budget from now.",
+      description: fill("tools.subagent.param.timeout_ms", { maxMs: MAX_TIMEOUT_MS }),
       maximum: MAX_TIMEOUT_MS,
     }),
   ),
@@ -107,14 +96,14 @@ const subagentParameters = Type.Object({
         Type.Literal("extend"),
         Type.Literal("models"),
       ],
-      { description: "Manage an existing run (or list selectable models) instead of starting a new one" },
+      { description: PROMPTS["tools.subagent.param.action"] },
     ),
   ),
-  run_id: Type.Optional(Type.String({ description: "Target run for action" })),
+  run_id: Type.Optional(Type.String({ description: PROMPTS["tools.subagent.param.run_id"] })),
   child_id: Type.Optional(
-    Type.String({ description: "Target child (id or name) for steer/interrupt/resume/extend" }),
+    Type.String({ description: PROMPTS["tools.subagent.param.child_id"] }),
   ),
-  message: Type.Optional(Type.String({ description: "Message content for steer/resume" })),
+  message: Type.Optional(Type.String({ description: PROMPTS["tools.subagent.param.message"] })),
 });
 
 type SubagentParams = {
@@ -459,13 +448,7 @@ export function createSubagentTool(
       content: [
         {
           type: "text",
-          text:
-            `Started ${items.length} subagent(s) in run ${run.runId}. ${reason}\n` +
-            `While others are still running, each finished subagent arrives as <pi-famulus-wake kind="subagent-handover"> ` +
-            `with that child's prompt and result. Read it and continue: subagent({action:"resume", run_id, child_id, message}) for that child, ` +
-            `or agent_message to steer the ones still running. Do not wait for the whole run. Do not poll. ` +
-            `<pi-famulus-wake kind="subagent-done"> arrives when every subagent in the run has finished. ` +
-            `Use subagent({action:"get", run_id:"${run.runId}"}) if you need the full record.`,
+          text: fill("tools.subagent.result.backgrounded", { count: items.length, runId: run.runId, reason }),
         },
       ],
       details: { run_id: run.runId, status: "backgrounded" },
@@ -631,15 +614,18 @@ export function createSubagentTool(
       const hard =
         hardDeadlineAt === null
           ? ""
-          : ` The configured hard ceiling (hardTimeoutMs) is not moved: it stops this subagent in ${formatDurationMs(Math.max(0, hardDeadlineAt - now))}.`;
+          : ` ${fill("tools.subagent.result.extended.hard-ceiling", { remaining: formatDurationMs(Math.max(0, hardDeadlineAt - now)) })}`;
       return {
         content: [
           {
             type: "text",
             text:
-              `Extended subagent ${child?.name ?? handle.childId} (${handle.childId}) in run ${record.runId}: ` +
-              `the next <pi-famulus-wake kind="subagent-overrun"> comes in ${formatDurationMs(deadlineAt - now)} if it is still running. ` +
-              `Its result arrives as a wake when it finishes; do not poll.${hard}`,
+              fill("tools.subagent.result.extended", {
+                name: child?.name ?? handle.childId,
+                childId: handle.childId,
+                runId: record.runId,
+                next: formatDurationMs(deadlineAt - now),
+              }) + hard,
           },
         ],
         details: { run_id: record.runId, child_id: handle.childId, deadline_at: deadlineAt, hard_deadline_at: hardDeadlineAt },
@@ -669,11 +655,12 @@ export function createSubagentTool(
       content: [
         {
           type: "text",
-          text:
-            `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
-            queuedText(queuedBehind) +
-            "You will be notified via <pi-famulus-wake kind=\"subagent-handover\"> if others are still running, " +
-            "otherwise via <pi-famulus-wake kind=\"subagent-done\"> when it completes. Do not poll.",
+          text: fill("tools.subagent.result.resumed", {
+            name: child.name,
+            childId: child.childId,
+            runId: record.runId,
+            queued: queuedText(queuedBehind),
+          }),
         },
       ],
       details: { run_id: record.runId, child_id: child.childId, queued_behind: queuedBehind },
@@ -683,22 +670,9 @@ export function createSubagentTool(
   return {
     name: "subagent",
     label: "Subagent",
-    description:
-      "Run subagents in parallel (tasks) or sequentially (chain with {previous}/{outputs.<label>} " +
-      "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
-      "continue in the background. Each child that finishes while others are still running wakes you with " +
-      "<pi-famulus-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pi-famulus-wake kind=\"subagent-done\">. " +
-      "Never poll or sleep to wait. " +
-      "A subagent still running past its timeout_ms is not stopped; it wakes you with " +
-      "<pi-famulus-wake kind=\"subagent-overrun\"> so you can extend, steer, or interrupt it. " +
-      "Use action=list/get/status/interrupt/resume/steer/extend to manage existing runs.",
-    promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
-    promptGuidelines: [
-      'When a <pi-famulus-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
-      "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
-      "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
-      "<pi-famulus-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
-    ],
+    description: PROMPTS["tools.subagent.description"],
+    promptSnippet: PROMPTS["tools.subagent.snippet"],
+    promptGuidelines: [...PROMPTS["tools.subagent.rules"]],
     parameters: subagentParameters,
     renderResult(result, { expanded }, theme, context) {
       const details = result.details as { run_id?: string; status?: string } | undefined;
@@ -803,10 +777,7 @@ function resolveSingleTerminalChild(record: RunRecord, childIdOrName: string | u
     if (child.status === "pending") {
       // Queued for an admission slot (a launch or an earlier resume): steer
       // would fail too, and a second resume adds nothing.
-      throw new Error(
-        `subagent ${child.name} (${child.childId}) is already queued and starts when a subagent slot frees; ` +
-          "its result arrives as a wake when it finishes. Do not resume it again.",
-      );
+      throw new Error(fill("tools.subagent.error.resume-queued", { name: child.name, childId: child.childId }));
     }
     if (!matches(child)) {
       throw new Error(`subagent ${child.name} (${child.childId}) is still ${child.status}; use steer instead`);

@@ -13,6 +13,7 @@ import { realClock, type Clock } from "../clock";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CommsWithOrigin } from "./comms";
 import { assertSiblingAllowed } from "./routing";
+import { PROMPTS } from "../prompts.generated";
 import type { ChildStatus, Comms, CommsHost, MailboxEntry } from "./types";
 
 export type AgentMessageSender =
@@ -25,11 +26,9 @@ export type AgentMessageSender =
 
 const contactSupervisorParameters = Type.Object({
   reason: Type.Union([Type.Literal("need_decision"), Type.Literal("progress_update")], {
-    description:
-      '"need_decision" blocks until the supervisor (parent agent) replies; ' +
-      '"progress_update" is fire-and-forget.',
+    description: PROMPTS["tools.child.contact_supervisor.param.reason"],
   }),
-  message: Type.String({ description: "Message for the supervisor." }),
+  message: Type.String({ description: PROMPTS["tools.child.contact_supervisor.param.message"] }),
 });
 
 export interface ContactSupervisorDetails {
@@ -45,13 +44,8 @@ export function createContactSupervisorTool(
   return {
     name: "contact_supervisor",
     label: "Contact Supervisor",
-    description:
-      "Contact the supervisor (parent agent). " +
-      'Use reason "need_decision" when you are blocked and need the parent to decide — ' +
-      "the call blocks until the parent replies (10 minute timeout, after which you must " +
-      "decide yourself). " +
-      'Use reason "progress_update" for a fire-and-forget status note.',
-    promptSnippet: "Ask the parent agent for a decision or report progress",
+    description: PROMPTS["tools.child.contact_supervisor.description"],
+    promptSnippet: PROMPTS["tools.child.contact_supervisor.snippet"],
     parameters: contactSupervisorParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       try {
@@ -79,24 +73,18 @@ const agentMessageParameters = Type.Object({
   action: Type.Union(
     [Type.Literal("send"), Type.Literal("reply"), Type.Literal("broadcast"), Type.Literal("list")],
     {
-      description:
-        '"send" a message to a child, "reply" to a pending decision request, ' +
-        '"broadcast" to all running children of a run, "list" pending requests and recent traffic.',
+      description: PROMPTS["tools.agent_message.param.action"],
     },
   ),
   to: Type.Optional(
     Type.String({
-      description:
-        'Target child_id or name ("send"/"reply"). For "broadcast" from the parent session: run_id. ' +
-        "Child sessions broadcast to their own run and must omit this.",
+      description: PROMPTS["tools.agent_message.param.to"],
     }),
   ),
-  message: Type.Optional(Type.String({ description: "Message text." })),
+  message: Type.Optional(Type.String({ description: PROMPTS["tools.agent_message.param.message"] })),
   delivery: Type.Optional(
     Type.Union([Type.Literal("steer"), Type.Literal("queue")], {
-      description:
-        '"steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after ' +
-        'its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).',
+      description: PROMPTS["tools.agent_message.param.delivery"],
     }),
   ),
 });
@@ -209,21 +197,8 @@ export function createAgentMessageTool(
   return {
     name: "agent_message",
     label: "Agent Message",
-    description: isChild
-      ? "Message sibling subagents in your run, or list pending requests. " +
-        '"send" delivers to a running sibling. Sending to a finished sibling errors and does not resume it; ' +
-        'resume with subagent({ action: "resume", run_id, child_id, message }). ' +
-        '"broadcast" steers every running sibling in your run; "list" shows pending ' +
-        "decision requests and recent traffic. Cross-run messaging is rejected."
-      : "Message your subagents. " +
-        '"send" steers or queues a running child. Sending to a finished child errors ' +
-        '(it does not resume) and points at subagent({ action: "resume", run_id, child_id, message }). ' +
-        '"reply" answers a child\'s pending decision request; "broadcast" steers every ' +
-        'running child of a run (to = run_id); "list" shows children, pending decision ' +
-        "requests, and recent traffic.",
-    promptSnippet: isChild
-      ? "Message sibling subagents in your run"
-      : "Send/reply/broadcast messages to subagents",
+    description: isChild ? PROMPTS["tools.child.agent_message.description"] : PROMPTS["tools.agent_message.description"],
+    promptSnippet: isChild ? PROMPTS["tools.child.agent_message.snippet"] : PROMPTS["tools.agent_message.snippet"],
     parameters: agentMessageParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const action = params.action;

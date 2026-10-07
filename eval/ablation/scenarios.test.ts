@@ -271,6 +271,17 @@ describe("grader gaps from review", () => {
     assert.equal(firstWriteOf([call(1, "b", "bash", { command: 'echo "next: cp alpha.txt a-result.txt"' })], "a-result.txt"), undefined);
   });
 
+  // 2026-10-07a: deepseek-flash wrote every result through the absolute cwd
+  // path; 4 handover-continue episodes were false FAILs.
+  it("firstWriteOf: a redirect, tee, or cp onto an absolute path writes; a longer file name does not", () => {
+    seq = 0;
+    const abs = "/private/tmp/eval-DJ880P/w/a-result.txt";
+    assert.ok(firstWriteOf([call(1, "a", "bash", { command: `printf 'ALPHA-X\\n' > ${abs} && cat -A ${abs}` })], "a-result.txt"));
+    assert.ok(firstWriteOf([call(1, "b", "bash", { command: `echo ALPHA-X | tee '${abs}'` })], "a-result.txt"));
+    assert.ok(firstWriteOf([call(1, "c", "bash", { command: `cp alpha.txt ${abs}` })], "a-result.txt"));
+    assert.equal(firstWriteOf([call(1, "d", "bash", { command: "echo x > /tmp/w/data-result.txt" })], "a-result.txt"), undefined);
+  });
+
   // cubic suggested counting it; batch 5 has one such episode (grok-4.6 #9):
   // it read the log alongside arming, before any instruction, then waited.
   it("monitor: a log read in the same turn as arming the monitor is not a poll", () => {

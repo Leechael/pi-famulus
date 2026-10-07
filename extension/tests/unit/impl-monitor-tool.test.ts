@@ -41,6 +41,9 @@ describe("monitor tool description", () => {
     const d = createMonitorTool(registry).description;
     expect(d).toMatch(/keep running/);
     expect(d).toMatch(/tail -n \+1 -F/);
+    expect(d).toMatch(/simply wait for the next notification/);
+    expect(d).toMatch(/Do not call wait_for to wait for monitor events/);
+    expect(createMonitorTool(registry).promptGuidelines).toContainEqual(expect.stringContaining("Do not call wait_for"));
   });
 });
 
@@ -82,6 +85,9 @@ describe("monitor start result", () => {
     const text = (res.content[0] as { text: string }).text;
     expect(text).toMatch(/when it exits or times out/);
     expect(text).toMatch(/task_list, task_output/);
+    expect(text).toMatch(/simply wait for the next notification/);
+    expect(text).toMatch(/Do not call wait_for to wait for monitor events/);
+    expect(text).toMatch(/re-arming a monitor/);
   });
 
   it("keeps the transcript row to the first line", () => {

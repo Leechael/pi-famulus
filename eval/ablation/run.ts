@@ -24,7 +24,7 @@ import { availableModels, type ModelInfo, parseModelSpec } from "../lib/models.t
 import { EVAL_DIR } from "../lib/paths.ts";
 import { runEpisode } from "./episode.ts";
 import { isAblatable, loadManifest, resolveVariant, type Variant, variantAffects } from "./manifest.ts";
-import { getScenario, type Scenario, SCENARIOS } from "./scenarios.ts";
+import { DEFAULT_SCENARIOS, getScenario, type Scenario } from "./scenarios.ts";
 import { setupBroken, stopDecision, type StopDecision } from "./stats.ts";
 
 export interface ResultRecord {
@@ -66,10 +66,10 @@ interface Cell {
 /** Per-call token assumptions for the estimate (system prompt ≈ 5k tokens, mostly cached after call 1). */
 const EST = { freshInput: 2500, cachedInput: 6000, output: 450 };
 
-function estimateCost(info: ModelInfo | undefined, calls: number): number {
+function estimateCost(info: ModelInfo | undefined, calls: number, extraContextTokens = 0): number {
   if (!info) return Number.NaN;
   const c = info.cost;
-  return (calls * (EST.freshInput * c.input + EST.cachedInput * (c.cacheRead || c.input) + EST.output * c.output)) / 1e6;
+  return (calls * (EST.freshInput * c.input + EST.cachedInput * (c.cacheRead || c.input) + EST.output * c.output) + extraContextTokens * c.input) / 1e6;
 }
 
 async function main(): Promise<void> {
@@ -101,7 +101,7 @@ async function main(): Promise<void> {
   const configured = (JSON.parse(readFileSync(join(EVAL_DIR, "models.json"), "utf8")) as { models: string[] }).models;
   let models = values.models ? values.models.split(",").map((s) => s.trim()) : configured;
   if (tier === "smoke" && !values.models) models = models.slice(0, 1);
-  const scenarios = values.scenarios ? values.scenarios.split(",").map((s) => getScenario(s.trim())) : SCENARIOS;
+  const scenarios = values.scenarios ? values.scenarios.split(",").map((s) => getScenario(s.trim())) : DEFAULT_SCENARIOS;
   const manifest = loadManifest();
   const variantIds = values.variants
     ? values.variants.split(",").map((s) => s.trim())
@@ -148,11 +148,15 @@ async function main(): Promise<void> {
   const plannedEpisodes = remaining.reduce((a, b) => a + b, 0);
   console.log(`tier=${tier} models=${models.join(",")} scenarios=${scenarios.length} variants=${variants.length} k=${k} pairs=${values.pairs}`);
   console.log(`cells=${cells.length} already-scored=${cells.reduce((a, c) => a + scored(c.key).length, 0)} max-new-episodes=${Math.min(plannedEpisodes, maxEpisodes)}`);
+  for (const s of scenarios.filter((s) => s.optIn)) {
+    console.log(`  OPT-IN ${s.id}: extra context estimate ~${s.estContextTokens ?? 0} tokens/call (synthetic, not incident replay; provider usage authoritative)`);
+  }
   let totalCost = 0;
   for (const model of models) {
     const eps = cells.map((c, i) => (c.model === model ? remaining[i] : 0));
     const calls = cells.reduce((acc, c, i) => acc + (c.model === model ? eps[i] * c.scenario.estCalls : 0), 0);
-    const cost = estimateCost(infoFor(model), calls);
+    const extraContextTokens = cells.reduce((acc, c, i) => acc + (c.model === model ? eps[i] * c.scenario.estCalls * (c.scenario.estContextTokens ?? 0) : 0), 0);
+    const cost = estimateCost(infoFor(model), calls, extraContextTokens);
     totalCost += cost;
     console.log(`  ${model}: ≤${eps.reduce((a, b) => a + b, 0)} episodes, ~${calls} model calls, ~$${cost.toFixed(2)} at list price`);
   }

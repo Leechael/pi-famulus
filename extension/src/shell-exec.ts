@@ -5,6 +5,7 @@
 import type { BashToolDetails } from "@earendil-works/pi-coding-agent";
 import { truncateTail } from "./format";
 import type { ManagerClient } from "./manager-client";
+import { fill } from "./prompts.generated";
 
 export const SHELL_MAX_LINES = 2000;
 export const SHELL_MAX_BYTES = 51200;
@@ -17,9 +18,12 @@ export const BARE_SLEEP_PATTERNS: RegExp[] = [
   /^\s*until\s+/,
 ];
 
-export function bareSleepError(command: string, guidance: string): string | null {
+export function bareSleepError(
+  command: string,
+  prompt: "tools.bash.error.bare-sleep" | "tools.child.bash.error.bare-sleep",
+): string | null {
   if (!BARE_SLEEP_PATTERNS.some((re) => re.test(command))) return null;
-  return `Refusing to run a bare sleep/idle-loop command: ${JSON.stringify(command)}. ${guidance}`;
+  return fill(prompt, { command: JSON.stringify(command) });
 }
 
 export function withAbort<T>(

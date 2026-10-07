@@ -15,7 +15,7 @@ Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np 
 - `pi` on `PATH` (tested with 1.0.0) — override with `PI_BIN`
 - `cargo`: `pi-famulus` is built from `../manager` into `eval/.cache/target` on first use (never inside `manager/`); override with `PI_FAMULUS_MANAGER_PATH`
 - `tmux` for the TUI test
-- `npm install` in `eval/` is only needed for `npm run typecheck`
+- `npm install` (or `npm ci`) in `eval/` is required for typechecking, unit tests, deterministic compatibility tests, and eval runners; fixture imports use pinned runtime dependencies.
 
 Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION` only for post-transition revisions compatible with this harness). For earlier revisions, use their matching harness and manager as described in [Where results go](#where-results-go).
 
@@ -24,7 +24,8 @@ Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION` 
 ```bash
 npm run test:e2e      # faux scenarios + ablation-harness self-test   (~15s)
 npm run test:tui      # PI_FAMULUS_E2E_TUI=1: tmux-driven interactive pi, asserts no line wider than the pane
-npm run test:unit     # sandbox socket paths, wake adapter, Wilson/early-stopping stats, report verdicts
+npm run test:unit     # sandbox socket paths, wake adapter, graders, stats, and report verdicts
+node --test ablation/monitor-waiter.test.ts  # deterministic compatibility fixture/graders; no model calls
 npm run test:graders  # real-model graders run on scripted good/bad behaviors (~2 min)
 npm run typecheck
 ```
@@ -37,7 +38,7 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
-Per-model results, and when they must be rerun: [BASELINES.md](BASELINES.md).
+Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun).
 
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
@@ -59,7 +60,7 @@ A run is a grid of **cells**, one per (model × variant × scenario), each repea
 | `--models a,b` | Which models (`pi --model` specs) | smoke: first entry of `models.json`; full: all of it |
 | `--variants a,b` | Which prompt texts to remove, one at a time. `baseline` removes nothing and always runs | smoke: `baseline` only; full: baseline + every ablatable segment in `manifest.json` + the groups |
 | `--k N` | Repeats per cell | smoke: 3; full: 10 |
-| `--scenarios a,b` | Which behaviors to probe (see [Scenarios](#scenarios-ablationscenariosts)) | all 8 |
+| `--scenarios a,b` | Which behaviors to probe (see [Scenarios](#scenarios-ablationscenariosts)) | the 10 default ones; compatibility probes are opt-in |
 
 So **smoke** answers "does this model behave with the full prompt?", and **full** answers "which pieces of the prompt does that depend on?". An explicit flag overrides the tier's preset: `--tier full --models x` runs every variant on model `x` only.
 
@@ -154,7 +155,9 @@ Each revision's harness builds/selects its own manager and isolates each episode
 
 **Early stopping.** Baselines run first. A variant stops as soon as its 95% Wilson interval is entirely below or above `baseline − 20pp`. Variants of a (model, scenario) whose baseline is below 20% are skipped ("floor"): no drop of 20pp is possible there.
 
-### Scenarios (`ablation/scenarios.ts`)
+### Scenarios (`scenarios/*.md`, graders in `ablation/scenarios.ts`)
+
+Each scenario's prompt and what it tests live in `scenarios/<id>.md` (same format as `extension/prompts/`); the fixture and grader stay in code.
 
 | id | passes when the model… |
 |---|---|
@@ -166,8 +169,42 @@ Each revision's harness builds/selects its own manager and isolates each episode
 | `no-fabrication` | never states the result before the wake (canary generated at run time) |
 | `supervisor-reply` | answers a `supervisor-request` with `agent_message` `reply` |
 | `resume-finished` | resumes a finished child via `subagent({action:"resume"})` (an `agent_message` attempt first is recorded, still a pass) |
+| `overrun-stuck` | interrupts a child that is past its `timeout_ms` and blocked on a silent shell (`subagent-overrun` wake, reminders every 20s); extending it, steering it only, or ignoring two reminders FAILs |
+| `overrun-progressing` | lets a child that is past its `timeout_ms` but printing progress finish (no action or `extend`), then writes its result; interrupting it FAILs |
 
 Each grade is PASS / FAIL / INVALID (setup precondition not met, e.g. the command finished before the budget). Invalid and errored episodes are excluded from rates.
+
+### Opt-in monitor / UI-waiter compatibility
+
+These scenarios load an additional **safe captured `@injaneity/pi-computer-use@0.5.1` tool fixture**, never the production extension. All UI execution is stubbed; monitor processes run only generated local fixtures. This is a functional fixture, not an OS security sandbox. Default smoke **and full** grids exclude them, unless named explicitly with `--scenarios`. Existing scenarios never load the compatible tools/history.
+
+| id | purpose |
+|---|---|
+| `monitor-waiter-event` | short ordinary/repeated monitor notifications; report tokens without a bogus UI wait (idle-turn behavior is prompted, not graded) |
+| `monitor-waiter-rearm` | exactly two starts of the same fixture command: real 1s initial monitor timeout, re-arm once with 12s timeout, then repeated event wakes; no bogus UI wait |
+| `monitor-waiter-ui-control` | positive: observe UI, use its state + meaningful predicate, report token revealed only by successful successor state |
+| `monitor-waiter-synthetic-long` | repeated monitor wakes after incident-shaped generated history with four bogus historic waiter examples; target ~173k estimated tokens, **not incident-exact replay** |
+
+**One new bad/no-op `wait_for` call fails**, even if schema validation/the executor errors or the eventual reply is normal. Graders check missing/invalid predicates and timeout schema bounds, fabricated/unobserved states/conditions, and monitor-source misuse. They do not treat the waiter name as global polling; genuine observed UI waits remain allowed, and the positive control fails if the model avoids the waiter entirely. Historic calls are not counted as newly issued calls. A proved compatibility misuse (`badWaiters > 0`) remains a scored FAIL if an ancillary provider/quiet-window error follows: its provenance is retained in `metrics.episodeError`, not the framework's top-level ERR flag. All other scenario/error policies are unchanged. Missing fixture/tool loading is INVALID, not a placebo pass.
+
+Ordinary/long probes require exactly one successful monitor start; duplicate monitor stacking fails. The re-arm probe associates the timeout with the initial task id and checks both command/timeout configurations and ordering.
+
+Metrics expose fixture/computer-use versions, history and request-context sizes, active/all tool counts and bounded active tool names, model/thinking spec and resolved provider/id/API, runtime pi/Node versions, separately labeled eval development SDK version, and captured source/loaded schema hashes. Serialized chars/4 is only an estimate; actual provider usage is authoritative. The long-case cost estimate charges 220k extra **uncached** tokens per model call; actual costs/tokenization may differ. See [fixture provenance, safety, and evidence limits](ablation/fixtures/README.md). Short probes cannot claim to reproduce the large-context incident. The deterministic compatibility tests were run in CI for commit `ed9d571`; changes in this review-fix commit await CI. No local eval tests or real-model eval/probes were run.
+
+Commands for a user-authorized later run (from `eval/`; replace the explicit model/thinking spec):
+
+```bash
+# Deterministic tests first; no model calls.
+node --test ablation/monitor-waiter.test.ts
+
+# Plan short negative + positive controls. Add --yes only when ready to run.
+node ablation/run.ts --models <provider/model:thinking> --scenarios monitor-waiter-event,monitor-waiter-rearm,monitor-waiter-ui-control --variants baseline,guidelines.monitor-end-turn --k 3 --concurrency 1 --transcripts --results results/monitor-waiter-v1/short.jsonl
+
+# Expensive synthetic-long is selected separately and explicitly; inspect cost first.
+node ablation/run.ts --models <provider/model:thinking> --scenarios monitor-waiter-synthetic-long --variants baseline,guidelines.monitor-end-turn --k 3 --concurrency 1 --transcripts --keep --results results/monitor-waiter-v1/long.jsonl
+```
+
+Use fresh result filenames after fixture/prompt changes; do not mix revisions or resume old cells. `--transcripts` records live events, not the request-local history prefix; `--keep` retains the generated history/context audit. `guidelines.monitor-end-turn` is the span in `extension/prompts/guidelines.md` (`# monitor-idle`) and removes **all copies** (system guidelines, tool description/rules, start result). The separate `result.monitor-started-instruction` removes only the first two start-notice sentences, avoiding overlap with the idle-instruction segment.
 
 ### Reading the report
 
@@ -186,11 +223,11 @@ Segment verdicts:
 
 The ablation harness is a separate pi extension loaded after ours; the extension itself is never edited.
 
-- `before_agent_start` edits `systemPromptOptions` in place (the `pi-famulus` section, `<rules>` guidelines). These persist, so wake-triggered turns are ablated too.
-- `context_with_system` strips segments from every request: tool declarations, tool results, and wakes (the shared `FAMULUS_WAKE_LEAD_IN`, `<reply-with>`). Non-destructive: the session keeps the original text.
+- `before_agent_start` edits `systemPromptOptions` in place (the `pi-famulus` section, `<rules>` guidelines) for user-turn initialization. These edits alone do not persist through every wake/tool-result boundary: the core may clear them.
+- Famulus's request-local `context_with_system` repair maintains its guideline visibility on ongoing/wake requests. The ablation `context_with_system` hook, registered last, then strips segments from **every request**: system guidelines, tool declarations, tool results, and wakes (the shared `FAMULUS_WAKE_LEAD_IN`, `<reply-with>`). Non-destructive: the session keeps the original text.
 - `tool_call` disables the bare-sleep guard (`mech.sleep-block`); `mech.autobg` is disabled via `config.json`.
 
-Segment texts must match the source exactly. Where possible they are read from the extension (`textFrom`, e.g. `wake.FAMULUS_WAKE_LEAD_IN`) instead of copied. `npm run test:e2e` fails on any drift, and verifies every removal happened and that no removed text is still visible.
+Segment texts are not copied here: a segment is the span marked `<!--seg:<id>-->…<!--/seg-->` in [`extension/prompts/`](../extension/prompts/INDEX.md), the same files the extension is built from. Only structural spans that are no prompt (the `<reply-with>` element) keep a `pattern` in the manifest. `npm run test:e2e` checks that every span reaches the model verbatim in a real pi session, that every removal happened, and that no removed text is still visible.
 
 **Not ablatable externally:** anything only child sessions see (`child.guidelines` = `CHILD_BEHAVIOR_GUIDELINES`, child tool descriptions). By design, children load no extensions, so no hook runs there. These segments are drift-guarded in child calls but never scheduled. Wake delivery itself (triggerTurn vs steer routing, coalescing) has no interception hook either.
 
