@@ -257,6 +257,41 @@ impl Drop for Burners {
     }
 }
 
+/// Failure-only snapshot: distinguish a rejected singleton claim from a slow
+/// startup or a missing/unlinked socket. This is diagnostics, not a race fix.
+fn d2_diagnostics(home: &Home, old: u32) -> String {
+    use std::os::unix::io::AsRawFd;
+    let files: Vec<_> = ["manager.sock", "manager.pid", "manager.pid.tmp", "manager.lock", "manager.spawn.lock"]
+        .iter()
+        .map(|name| format!("{name}: {:?}", std::fs::symlink_metadata(home.path.join(name))))
+        .collect();
+    let locks: Vec<_> = ["manager.lock", "manager.spawn.lock"]
+        .iter()
+        .map(|name| {
+            let result = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(home.path.join(name))
+                .map(|f| {
+                    // SAFETY: probe an fd we own; a successful lock is released
+                    // when f drops. Never unlink or create a lock file here.
+                    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                        "free".to_string()
+                    } else {
+                        format!("probe failed: {}", std::io::Error::last_os_error())
+                    }
+                });
+            format!("{name}: {result:?}")
+        })
+        .collect();
+    format!(
+        "old pid={old} running={}; files={files:#?}; locks={locks:#?}; raw pidfile={:?}\n{}",
+        pid_running(old),
+        std::fs::read_to_string(home.pidfile()),
+        d1_diagnostics(home)
+    )
+}
+
 /// D2: the same race, but starting from stale socket/pid files left by a
 /// SIGKILLed daemon. Regression guard: clients used to delete "zombie" files
 /// themselves, and a slow one could unlink the socket of the daemon a faster
@@ -298,12 +333,16 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
             }
         }
         let live = daemon_pids_for(&home.path);
-        assert!(failures.is_empty(), "round {round}: clients failed: {failures:?}");
-        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}");
+        assert!(
+            failures.is_empty(),
+            "round {round}: clients failed: {failures:?}\n{}",
+            d2_diagnostics(&home, old)
+        );
+        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}\n{}", d2_diagnostics(&home, old));
         // The survivor must own the well-known socket.
         let mut c = home.connect();
         let h = c.hello_cli();
-        assert_eq!(h["pid"].as_u64().map(|p| p as u32), Some(live[0]));
+        assert_eq!(h["pid"].as_u64().map(|p| p as u32), Some(live[0]), "round {round}: socket owner\n{}", d2_diagnostics(&home, old));
         drop(c);
     }
 }
