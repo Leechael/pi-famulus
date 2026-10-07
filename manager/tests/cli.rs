@@ -9,6 +9,15 @@ fn run(args: &[&str]) -> Output {
         .expect("run pi-famulus")
 }
 
+fn run_with_home(home: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .arg("--home")
+        .arg(home)
+        .args(args)
+        .output()
+        .expect("run pi-famulus")
+}
+
 /// Body of one help section, from the heading through the blank line before the next.
 fn help_section<'a>(help: &'a str, heading: &str) -> &'a str {
     let marker = format!("\n{heading}:\n");
@@ -25,6 +34,69 @@ fn section_has_command(section: &str, name: &str) -> bool {
         let rest = line.trim_start().strip_prefix(name);
         rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()))
     })
+}
+
+#[test]
+fn concurrent_capacity_config_sets_preserve_fields_and_valid_json() {
+    let home = std::env::temp_dir().join(format!("pi-famulus-config-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.json"), r#"{"managerPath":"/tmp/manager","goneSessionRetention":"2h","unrelated":{"keep":true}}"#).unwrap();
+    let workers: Vec<_> = (1..=16).map(|n| {
+        let home = home.clone();
+        std::thread::spawn(move || {
+            let mut command = Command::new(BIN);
+            command
+                .arg("--home")
+                .arg(&home)
+                .args(["config", "set", "max-agents"])
+                .arg(n.to_string())
+                .output()
+                .unwrap()
+        })
+    }).collect();
+    for worker in workers {
+        let output = worker.join().unwrap();
+        assert!(output.status.success(), "config set failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+    assert!((1..=16).contains(&config["maxAgents"].as_u64().unwrap()));
+    assert_eq!(config["managerPath"], "/tmp/manager");
+    assert_eq!(config["goneSessionRetention"], "2h");
+    assert_eq!(config["unrelated"]["keep"], true);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn work_kind_budgets_round_trip_for_every_supported_kind() {
+    let home = std::env::temp_dir().join(format!("pi-famulus-workkind-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.json"), r#"{"maxAgents":9,"unrelated":true}"#).unwrap();
+    for (key, expected) in [
+        ("max-test-suite", "maxTestSuite"),
+        ("max-test", "maxTest"),
+        ("max-build", "maxBuild"),
+        ("max-lint/type", "maxLintType"),
+        ("max-other", "maxOther"),
+        ("max-git", "maxGit"),
+        ("max-read/search", "maxReadSearch"),
+    ] {
+        let set = run_with_home(&home, &["config", "set", key, "3"]);
+        assert!(set.status.success(), "{key}: {}", String::from_utf8_lossy(&set.stderr));
+        let get = run_with_home(&home, &["config", "get", key]);
+        assert!(get.status.success(), "{key}: {}", String::from_utf8_lossy(&get.stderr));
+        assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "3");
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config[expected], 3);
+        assert_eq!(config["maxAgents"], 9);
+        assert_eq!(config["unrelated"], true);
+    }
+    let zero = run_with_home(&home, &["config", "set", "max-build", "0"]);
+    assert!(!zero.status.success());
+    let unknown = run_with_home(&home, &["config", "get", "max-does-not-exist"]);
+    assert!(!unknown.status.success());
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]
@@ -67,7 +139,7 @@ fn help_and_version_are_served_by_the_cli_framework() {
             "{name} should be under Acting on tasks: {help}"
         );
     }
-    for name in ["shutdown", "upgrade", "daemon"] {
+    for name in ["config", "shutdown", "upgrade", "daemon"] {
         assert!(
             section_has_command(daemon, name),
             "{name} should be under Daemon: {help}"

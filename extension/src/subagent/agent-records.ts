@@ -4,7 +4,8 @@
  *
  * Layout: <home>/sessions/<session_id>/agents/<child_id>.json
  */
-import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface AgentChildRecord {
@@ -15,6 +16,10 @@ export interface AgentChildRecord {
   session_id: string;
   name: string;
   agent: string;
+  /** Explicit planned work class; old records default to `other`. */
+  work_kind?: string;
+  /** Time spent waiting for admission, when measured. */
+  queue_ms?: number;
   /** Resolved model id when known (param override or agent definition). */
   model?: string;
   status: "pending" | "running" | "completed" | "failed" | "interrupted";
@@ -33,6 +38,18 @@ export interface AgentChildRecord {
   result_tail?: string;
   /** Tool results seen in the transcript so far. */
   tool_calls?: number;
+  /** Cumulative provider usage.input and usage.output as reported. */
+  tokens_input?: number;
+  tokens_output?: number;
+  /** Separate cumulative provider cache counters; not folded into tokens_input. */
+  tokens_cache_read?: number;
+  tokens_cache_write?: number;
+  /** Observed assistant-message, tool-execution, and admission-queue wall time. */
+  llm_ms?: number;
+  tool_ms?: number;
+  /** Wall time that did not fit the observed phase boundaries. */
+  wall_other_ms?: number;
+  wall_approximate?: boolean;
   /** Absolute path of the live `<child_id>.jsonl` transcript. */
   transcript?: string;
 }
@@ -82,11 +99,57 @@ export function agentRecordPath(home: string, sessionId: string, childId: string
   return join(agentRecordsDir(home, sessionId), `${childId}.json`);
 }
 
-/** Write one child record (mkdir + overwrite). */
+/** Write one child record atomically (mkdir + same-directory temp file + rename). */
 export function writeAgentChildRecord(home: string, record: AgentChildRecord): void {
   const dir = agentRecordsDir(home, record.session_id);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(agentRecordPath(home, record.session_id, record.child_id), JSON.stringify(record));
+  const path = agentRecordPath(home, record.session_id, record.child_id);
+  const tempPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(record), { flag: "wx" });
+    renameSync(tempPath, path);
+  } finally {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      // rename consumed the temporary file, or a failed write left none.
+    }
+  }
+}
+
+export type AgentChildTelemetry = Partial<Pick<AgentChildRecord,
+  "tokens_input" | "tokens_output" | "tokens_cache_read" | "tokens_cache_write" | "llm_ms" | "tool_ms" | "queue_ms" | "wall_other_ms" | "wall_approximate"
+>>;
+
+/** Refresh live telemetry without waiting for a child state transition. */
+export function updateAgentChildMetrics(
+  home: string,
+  sessionId: string,
+  childId: string,
+  metrics: AgentChildTelemetry,
+): void {
+  const path = agentRecordPath(home, sessionId, childId);
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as Partial<AgentChildRecord>;
+    if (record.v !== 1 || record.kind !== "agent" || record.session_id !== sessionId || record.child_id !== childId) return;
+    writeAgentChildRecord(home, { ...(record as AgentChildRecord), ...metrics });
+  } catch {
+    // A metrics refresh must never interfere with the in-process child.
+  }
+}
+
+export function updateAgentChildTokens(
+  home: string,
+  sessionId: string,
+  childId: string,
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number },
+): void {
+  updateAgentChildMetrics(home, sessionId, childId, {
+    tokens_input: tokens.input,
+    tokens_output: tokens.output,
+    tokens_cache_read: tokens.cacheRead,
+    tokens_cache_write: tokens.cacheWrite,
+  });
 }
 
 export function removeAgentChildRecord(home: string, sessionId: string, childId: string): void {

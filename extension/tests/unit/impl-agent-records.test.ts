@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,6 +6,8 @@ import {
   formatAgentCommand,
   isAgentStatusActive,
   loadAgentChildRecords,
+  updateAgentChildMetrics,
+  updateAgentChildTokens,
   writeAgentChildRecord,
   type AgentChildRecord,
 } from "../../src/subagent/agent-records";
@@ -43,6 +45,61 @@ describe("agent child records", () => {
     expect(formatAgentCommand(loaded[0])).toBe(
       "agent:fix-pr2153 (worker) openai-codex/gpt-5.6-sol",
     );
+  });
+
+  it("refreshes cumulative tokens on a running record without a status transition", () => {
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_usage001",
+      run_id: "run_usage001",
+      session_id: "sess-1",
+      name: "usage",
+      agent: "worker",
+      status: "running",
+      started_at: 1,
+    });
+    updateAgentChildTokens(home, "sess-1", "ch_usage001", { input: 320, output: 17, cacheRead: 240, cacheWrite: 9 });
+    updateAgentChildMetrics(home, "sess-1", "ch_usage001", {
+      llm_ms: 1_500,
+      tool_ms: 400,
+      queue_ms: 250,
+      wall_other_ms: 100,
+      wall_approximate: true,
+    });
+    expect(loadAgentChildRecords(home)[0]).toMatchObject({
+      status: "running",
+      tokens_input: 320,
+      tokens_output: 17,
+      tokens_cache_read: 240,
+      tokens_cache_write: 9,
+      llm_ms: 1_500,
+      tool_ms: 400,
+      queue_ms: 250,
+      wall_other_ms: 100,
+      wall_approximate: true,
+    });
+  });
+
+  it("atomically replaces live metrics without leaving temporary records", () => {
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_atomic001",
+      run_id: "run_atomic001",
+      session_id: "sess-1",
+      name: "atomic",
+      agent: "worker",
+      status: "running",
+      started_at: 1,
+    });
+    for (let output = 0; output < 100; output++) {
+      updateAgentChildMetrics(home, "sess-1", "ch_atomic001", { tokens_output: output });
+      expect(loadAgentChildRecords(home)[0]?.tokens_output).toBe(output);
+    }
+    expect(readdirSync(join(home, "sessions", "sess-1", "agents"))).toEqual(["ch_atomic001.json"]);
   });
 
   it("round-trips provider errors on failed agent records", () => {

@@ -19,7 +19,7 @@ function makeStack(opts: { maxConcurrentChildren?: number; spawnBudgetPerHour?: 
     acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
   });
   registry.setRunner(runner);
-  return { registry, factory, runner };
+  return { registry, factory, runner, clock };
 }
 
 function addReq(registry: SubagentRegistry, runId: string, name: string): ChildRunRequest {
@@ -122,6 +122,56 @@ describe("SubagentRegistry", () => {
     await Promise.all([h2.result, h3.result]);
   });
 
+  it("reports initial admission wait before the child handle is attached", async () => {
+    const { registry, factory, clock } = makeStack({ maxConcurrentChildren: 1 });
+    factory.autoComplete = null;
+    const run = registry.createRun("tasks");
+    const first = await registry.startChild(addReq(registry, run.runId, "first"));
+    const queued = registry.startChild(addReq(registry, run.runId, "queued"));
+    await tick();
+
+    clock.advanceBy(777);
+    const snapshot = registry.get(run.runId)!.children.find((child) => child.name === "queued")!;
+    expect(snapshot.status).toBe("pending");
+    expect(snapshot.wallUsage?.queueMs).toBe(777);
+
+    factory.sessions[0].complete("first done");
+    await first.result;
+    const second = await queued;
+    expect(registry.get(run.runId)!.children.find((child) => child.name === "queued")!.wallUsage?.queueMs).toBe(777);
+    factory.sessions[1].complete("second done");
+    await second.result;
+  });
+
+  it("reports post-admission session startup as approximate other wall time before handle attachment", async () => {
+    const { registry, factory, clock } = makeStack();
+    let allowCreate!: () => void;
+    let createStarted!: () => void;
+    const createGate = new Promise<void>((resolve) => { allowCreate = resolve; });
+    const startup = new Promise<void>((resolve) => { createStarted = resolve; });
+    registry.setRunner(new InProcessRunner({
+      createSession: async (req) => {
+        createStarted();
+        await createGate;
+        return factory.fn(req);
+      },
+      clock,
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
+    }));
+
+    const run = registry.createRun("tasks");
+    const starting = registry.startChild(addReq(registry, run.runId, "starting"));
+    await startup;
+    clock.advanceBy(777);
+    const snapshot = registry.get(run.runId)!.children[0]!;
+    expect(snapshot.status).toBe("running");
+    expect(snapshot.wallUsage).toMatchObject({ queueMs: 0, otherMs: 777, approximate: true });
+
+    allowCreate();
+    const handle = await starting;
+    await handle.result;
+  });
+
   it("enforces the session spawn budget per hour", async () => {
     const { registry, factory } = makeStack({ spawnBudgetPerHour: 2 });
     const run = registry.createRun("tasks");
@@ -173,6 +223,48 @@ describe("SubagentRegistry", () => {
     expect(record.children.every((c) => c.status === "interrupted")).toBe(true);
     expect(record.children[0].result?.error).toBe("cancelled (fail_fast)");
     expect(record.status).toBe("interrupted");
+  });
+
+  it("activeChildren includes a pending child's current queue delta", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    const childId = registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+
+    expect(registry.activeChildren().find((child) => child.childId === childId)).toMatchObject({
+      status: "pending",
+      queueMs: 75,
+    });
+  });
+
+  it("finalizeRun records elapsed queue time for never-submitted pending children", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+    expect(registry.activeChildren()[0]).toMatchObject({ status: "pending", queueMs: 75 });
+    let terminal: RunRecord | undefined;
+    registry.onTransition((record) => { terminal = record; });
+
+    registry.finalizeRun(run.runId, "cancelled (fail_fast)");
+
+    expect(terminal?.children[0]).toMatchObject({ status: "interrupted", queueMs: 75 });
+  });
+
+  it("finalizeRun freezes queue wall usage for never-submitted pending children", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+
+    registry.finalizeRun(run.runId, "cancelled (fail_fast)");
+
+    const queueAtFinalize = registry.get(run.runId)!.children[0]!.wallUsage!.queueMs;
+    clock.advanceBy(500);
+    const frozen = registry.get(run.runId)!.children[0]!;
+    expect(queueAtFinalize).toBe(75);
+    expect(frozen.queueMs).toBe(75);
+    expect(frozen.wallUsage).toMatchObject({ queueMs: queueAtFinalize, otherMs: 0 });
   });
 
   it("a queued child cancelled via shouldStart settles as interrupted", async () => {
@@ -254,6 +346,19 @@ describe("SubagentRegistry", () => {
     expect(registry.get(run.runId)!.children[0]).toMatchObject({ status: "running", turn: 1 });
   });
 
+  it("records elapsed admission wait when disposing a queued child", () => {
+    const { registry, clock } = makeStack();
+    const run = registry.createRun("tasks");
+    registry.addChild(run.runId, { name: "queued", agent: "worker" });
+    clock.advanceBy(75);
+    let terminal: RunRecord | undefined;
+    registry.onTransition((record) => { terminal = record; });
+
+    registry.disposeRun(run.runId);
+
+    expect(terminal?.children[0]).toMatchObject({ status: "interrupted", queueMs: 75 });
+  });
+
   it("disposeRun interrupts children, disposes sessions, and removes the run", async () => {
     const { registry, factory } = makeStack();
     factory.autoComplete = null;
@@ -302,6 +407,11 @@ describe("SubagentRegistry", () => {
     const h1 = await registry.startChild(addReq(registry, run.runId, "a"));
     await registry.startChild(addReq(registry, run.runId, "b"));
     expect(registry.activeChildren().map((c) => c.name)).toEqual(["a", "b"]);
+    expect(registry.activeChildren()[0]).toMatchObject({
+      childId: h1.childId,
+      workKind: "other",
+      queueMs: 0,
+    });
     factory.sessions[0].complete();
     await h1.result;
     await tick();

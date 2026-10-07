@@ -31,13 +31,11 @@
 //! Computed when read, never stored: a better rule applies to old records
 //! too, and nothing on the wire depends on it.
 //!
-//! deferred: per-project override rules (e.g. `.pi/famulus-kinds.json`
-//! mapping a project's own scripts like `pdm run ci-fast` to a kind) |
-//! impact: a project script whose name says nothing (`pdm run go`,
-//! `./run.sh`) lands in `other`, so `stats --by kind` under-reports that
-//! project's test or build cost; no record or behaviour is wrong |
-//! trigger: a real run where `other` holds a large share of CPU or wall
-//! time that a person can attribute to a known script.
+//! deferred | per-project work-kind command overrides |
+//! impact | opaque project scripts such as `pdm run go` or `./run.sh` land
+//! in `other`, obscuring their test/build CPU or wall share |
+//! trigger | `other` repeatedly holds a material share people can attribute
+//! to known project scripts.
 
 use std::path::Path;
 
@@ -635,7 +633,12 @@ const PATH_VALUE_FLAGS: &[&str] = &["--ignore", "--deselect", "--rootdir", "--ba
 /// `-t`/`--timeout` is not a filter (`mocha -t5000` is a whole suite).
 fn selects_tests(a: &str, runner: &str) -> bool {
     let key = a.split_once('=').map_or(a, |(k, _)| k);
-    if matches!(key, "-k" | "-m" | "--lf" | "--last-failed" | "--run") {
+    // Vitest/npm `--run` switches from watch mode to one-shot mode; it does
+    // not select a test subset.
+    if key == "--run" {
+        return false;
+    }
+    if matches!(key, "-k" | "-m" | "--lf" | "--last-failed") {
         return true;
     }
     let jestish = matches!(runner, "jest" | "vitest");
@@ -763,6 +766,8 @@ mod tests {
         assert_eq!(k("pytest -q -n 10"), TestSuite);
         assert_eq!(k("pdm run test -n 4"), TestSuite);
         assert_eq!(k("npm test"), TestSuite);
+        assert_eq!(k("npm test -- --run"), TestSuite, "--run selects one-shot mode, not a test subset");
+        assert_eq!(k("npm test -- --run tests/a.test.ts"), Test, "a path still selects a test subset");
         assert_eq!(k("npx vitest run"), TestSuite);
         assert_eq!(k("cargo test"), TestSuite);
         assert_eq!(k("cargo test -p pi-famulus --features test-clock"), TestSuite);

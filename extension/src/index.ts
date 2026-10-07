@@ -27,6 +27,7 @@ import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, 
 import type { TaskExitInfo } from "./format";
 import { ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
+import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
 import { NotifyCenter } from "./notify";
 import { onWakeMessageEnd, registryStatusLookup } from "./wake-delivery";
 import { createChildBashTool } from "./subagent/child-bash";
@@ -35,6 +36,7 @@ import {
   agentEndReason,
   headOf,
   tailOf,
+  updateAgentChildMetrics,
   writeAgentChildRecord,
   type AgentChildRecord,
 } from "./subagent/agent-records";
@@ -78,6 +80,29 @@ export default function (pi: ExtensionAPI): void {
 
   let ctx: ExtensionContext | null = null;
   let client: ManagerClient | null = null;
+  const globalAgentLeases = new Map<string, string>();
+  const pendingAgentLeases = new Set<string>();
+  const pendingAgentReregistrations = new Map<string, AbortController>();
+  let leaseReconciliation: Promise<void> | null = null;
+  const reconcileAgentLeases = (manager: ManagerClient): Promise<void> => {
+    if (leaseReconciliation) return leaseReconciliation;
+    leaseReconciliation = reregisterAgentLeases(
+      manager,
+      globalAgentLeases,
+      undefined,
+      pendingAgentLeases,
+      pendingAgentReregistrations,
+    ).finally(() => {
+      leaseReconciliation = null;
+    });
+    return leaseReconciliation;
+  };
+  const capacityNotices = new Set<string>();
+  const capacityNotice = (reason: "manager unavailable" | "daemon too old"): void => {
+    if (capacityNotices.has(reason)) return;
+    capacityNotices.add(reason);
+    console.warn(`pi-famulus: machine-wide agent capacity inactive (${reason}); using per-session limit only`);
+  };
   let notifyCenter: NotifyCenter | null = null;
   let monitorRegistry: MonitorRegistry | null = null;
   let subagentRegistry: SubagentRegistry | null = null;
@@ -428,6 +453,10 @@ export default function (pi: ExtensionAPI): void {
     fleetWidget = null;
     subagentRegistry?.disposeAll();
     subagentRegistry = null;
+    for (const controller of pendingAgentReregistrations.values()) controller.abort();
+    pendingAgentReregistrations.clear();
+    globalAgentLeases.clear();
+    pendingAgentLeases.clear();
 
     client = new ManagerClient({
       home,
@@ -483,7 +512,21 @@ export default function (pi: ExtensionAPI): void {
       }
     });
     client.onReconnect(() => {
+      // A daemon restart may drop permits; a same-session rebind may retain
+      // them. Keep each kind for idempotent re-registration and mark all local
+      // leases pending until the daemon confirms them.
+      for (const childId of globalAgentLeases.keys()) pendingAgentLeases.add(childId);
       void monitorRegistry?.rewatchAll().then(() => syncWithManager());
+      void (async () => {
+        const manager = client;
+        if (!manager || manager.protocolLevel() < 4) {
+          capacityNotice("daemon too old");
+          return;
+        }
+        // The registry and its child ids survive socket reconnects in this
+        // extension process; held ids include resumable interrupted children.
+        await reconcileAgentLeases(manager);
+      })().catch(() => {});
     });
 
     // M3: subagent registry + in-process runner + fleet widget. The runner's
@@ -559,9 +602,37 @@ export default function (pi: ExtensionAPI): void {
       stallRetryDelayMs: subagentConfig.stallRetryDelayMs,
       overrunRepeatMs: subagentConfig.overrunRepeatMs,
       hardTimeoutMs: subagentConfig.hardTimeoutMs,
-      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
+      acquire: (req, ticket) => admitAgentChild({
+        childId: req.childId,
+        workKind: req.workKind ?? "other",
+        reserveLocal: () => registry.reserveChildSlot(req.childId, ticket),
+        manager: client,
+        leases: globalAgentLeases,
+        pendingLeases: pendingAgentLeases,
+        pendingReregistrations: pendingAgentReregistrations,
+        ticket,
+        notice: capacityNotice,
+      }),
       onActivity: (childId) => {
         syncTranscript(childId);
+        const handle = registry.handle(childId);
+        const usage = handle?.tokenUsage();
+        const wall = handle?.wallUsage();
+        if (usage && wall) {
+          const metrics = {
+            tokens_input: usage.input,
+            tokens_output: usage.output,
+            tokens_cache_read: usage.cacheRead,
+            tokens_cache_write: usage.cacheWrite,
+            llm_ms: wall.llmMs,
+            tool_ms: wall.toolMs,
+            queue_ms: wall.queueMs,
+            wall_other_ms: wall.otherMs,
+            wall_approximate: wall.approximate,
+          };
+          updateAgentChildMetrics(home, sessionIdForAgents(), childId, metrics);
+          logEvent("agent.usage", { child_id: childId, ...metrics });
+        }
       },
       onStall: (childId, attempt) => {
         // One event per stall detection: an auto-resume follows unless the
@@ -600,6 +671,8 @@ export default function (pi: ExtensionAPI): void {
             run_id: run.runId,
             name: c.name,
             agent: c.agent,
+            work_kind: c.workKind ?? "other",
+            queue_ms: c.queueMs ?? 0,
             ...(c.model ? { model: c.model } : {}),
           });
         }
@@ -611,7 +684,9 @@ export default function (pi: ExtensionAPI): void {
             child_id: c.childId,
             status: c.status,
             ...(error ? { error } : {}),
+            work_kind: c.workKind ?? "other",
             ...(c.result?.stalls ? { stalls: c.result.stalls } : {}),
+            ...(c.queueMs !== undefined ? { queue_ms: c.queueMs } : {}),
             duration_ms: c.result?.durationMs ?? Math.max(0, clock.now() - c.startedAt),
           });
         }
@@ -624,9 +699,20 @@ export default function (pi: ExtensionAPI): void {
           session_id: sid,
           name: c.name,
           agent: c.agent,
+          work_kind: c.workKind ?? "other",
+          ...(c.queueMs !== undefined ? { queue_ms: c.queueMs } : {}),
           ...(c.model !== undefined ? { model: c.model } : {}),
           status: c.status,
           started_at: c.startedAt,
+          tokens_input: c.tokenUsage?.input ?? 0,
+          tokens_output: c.tokenUsage?.output ?? 0,
+          tokens_cache_read: c.tokenUsage?.cacheRead ?? 0,
+          tokens_cache_write: c.tokenUsage?.cacheWrite ?? 0,
+          llm_ms: c.wallUsage?.llmMs ?? 0,
+          tool_ms: c.wallUsage?.toolMs ?? 0,
+          queue_ms: c.wallUsage?.queueMs ?? 0,
+          wall_other_ms: c.wallUsage?.otherMs ?? 0,
+          wall_approximate: c.wallUsage?.approximate ?? false,
           ...(c.endedAt !== undefined ? { ended_at: c.endedAt } : {}),
           ...(c.result?.error ? { error: c.result.error } : {}),
           ...(c.result?.attempts !== undefined && c.result.attempts > 1
@@ -655,6 +741,8 @@ export default function (pi: ExtensionAPI): void {
           runId: run.runId,
           name: c.name,
           agent: c.agent,
+          workKind: c.workKind ?? "other",
+          ...(c.queueMs !== undefined ? { queueMs: c.queueMs } : {}),
           ...(c.model !== undefined ? { model: c.model } : {}),
           cwd: startCtx.cwd,
           ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
@@ -679,7 +767,11 @@ export default function (pi: ExtensionAPI): void {
     void c
       .connect()
       .then((ok) => {
-        if (!ok && startCtx.hasUI) {
+        if (ok) {
+          if (c.protocolLevel() >= 4) void reconcileAgentLeases(c).catch(() => {});
+          return;
+        }
+        if (startCtx.hasUI) {
           const detail = c.lastError();
           const reason = detail ? ` (${detail})` : "";
           const searched = managerPath ? `using ${managerPath}` : `looked in: ${describeManagerSearch(config, home)}`;

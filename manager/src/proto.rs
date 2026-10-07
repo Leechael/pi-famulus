@@ -17,8 +17,9 @@ pub const PROTO_VERSION: u32 = 1;
 /// returned by `status`. 1 = original §3.3; 2 = observability contract
 /// (origin, mark_background, stop.reason, end_reason, events.jsonl); 3 =
 /// in-place upgrade (`upgrade`, status `generation`/`last_upgrade`, start
-/// keys, resend on reconnect).
-pub const PROTOCOL: u32 = 3;
+/// keys, resend on reconnect); 4 = machine-wide agent admission; 5 = per-kind
+/// agent budgets and queued acquire.
+pub const PROTOCOL: u32 = 5;
 /// The first protocol level whose manager understands `upgrade`.
 pub const PROTOCOL_UPGRADE: u32 = 3;
 /// §3.3: max frame 4 MiB.
@@ -210,6 +211,22 @@ pub struct TaskRecord {
     /// Peak RSS of the single largest process in that set, in KiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rss_kb: Option<u64>,
+    /// Best-effort live process-group CPU snapshot, present only in daemon
+    /// responses for running tasks (never retained on disk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_user_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sys_ms: Option<u64>,
+    /// CPU used during the last sampling interval, in percent of one core.
+    /// Process-group values can exceed 100% when several cores are busy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_percent: Option<f64>,
+    /// Unix epoch milliseconds of the latest successful live CPU sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sampled_at: Option<u64>,
+    /// The most recent sampling attempt failed; cumulative CPU may be stale.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_cpu_stale: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +326,23 @@ pub enum RequestKind {
     },
     ShutdownSession,
     Status,
+    /// Request an idempotent machine-wide agent permit.
+    AcquireAgent {
+        child_id: String,
+        #[serde(default)]
+        work_kind: String,
+    },
+    /// Cancel a queued acquire or a grant race; only its owning request id may release a permit.
+    CancelAcquireAgent {
+        request_id: String,
+        child_id: String,
+    },
+    /// Re-evaluate queued acquisitions after a runtime budget update.
+    CapacityChanged,
+    /// Return the child-owned agent permit.
+    ReleaseAgent {
+        child_id: String,
+    },
     Shutdown,
     /// CLI only: replace this daemon in place with the binary now at its
     /// executable path (exec, same pid; see `handover.rs`). Answered before
@@ -321,7 +355,9 @@ pub enum RequestKind {
     ClockStatus,
     /// Test-only (`test-clock` feature): advance the manual clock.
     #[cfg(feature = "test-clock")]
-    ClockAdvance { ms: u64 },
+    ClockAdvance {
+        ms: u64,
+    },
     /// Test-only (`test-clock` feature): end the daemon on the spot the way
     /// a panic in its main future does (exit status 101, no shutdown path,
     /// no destructors). Sent without hello.
@@ -372,6 +408,9 @@ pub struct HelloOk {
     pub version: String,
     pub pid: u32,
     pub started_at: u64,
+    /// Maximum protocol level supported by this daemon.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +471,27 @@ pub struct SessionInfo {
     pub last_seen: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentCapacity {
+    pub used: usize,
+    pub total: usize,
+    /// Labelled permits by work kind. Protocol-4 permits have no kind label,
+    /// so they count toward `used` but are omitted from this map.
+    #[serde(default)]
+    pub by_kind: HashMap<String, AgentKindCapacity>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentKindCapacity { pub used: usize, pub total: usize }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAdmissionOk {
+    pub granted: bool,
+    /// Extensible reason code, e.g. `global_capacity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCounts {
     pub running: usize,
@@ -445,6 +505,9 @@ pub struct StatusOk {
     pub uptime_ms: u64,
     pub sessions: Vec<SessionInfo>,
     pub task_counts: TaskCounts,
+    /// Machine-wide active subagent permits / configured maximum (protocol 4+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_capacity: Option<AgentCapacity>,
     /// The manager's protocol level ([`PROTOCOL`]).
     #[serde(default)]
     pub protocol: u32,
@@ -631,6 +694,15 @@ mod tests {
     use super::*;
     use tokio::io::duplex;
 
+    #[test]
+    fn pre_protocol_four_status_omits_capacity_when_reserialized() {
+        let old = br#"{"version":"0.1.0","pid":1,"uptime_ms":0,"sessions":[],"task_counts":{"running":0,"terminal":0},"protocol":3}"#;
+        let status: StatusOk = serde_json::from_slice(old).unwrap();
+        assert!(status.agent_capacity.is_none());
+        let encoded = serde_json::to_value(status).unwrap();
+        assert!(encoded.get("agent_capacity").is_none());
+    }
+
     #[tokio::test]
     async fn frame_roundtrip() {
         let (mut a, mut b) = duplex(64 * 1024);
@@ -646,7 +718,9 @@ mod tests {
     async fn frame_over_limit_rejected() {
         let (mut a, mut b) = duplex(1024);
         // Reader rejects an announced length above 4 MiB.
-        a.write_all(&(MAX_FRAME_SIZE + 1).to_be_bytes()).await.unwrap();
+        a.write_all(&(MAX_FRAME_SIZE + 1).to_be_bytes())
+            .await
+            .unwrap();
         let err = read_frame(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // Writer refuses to send an oversized payload.
@@ -780,7 +854,10 @@ mod tests {
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&resp)).unwrap();
-        assert_eq!(v, serde_json::json!({"v": 1, "id": "x", "ok": true, "done": false}));
+        assert_eq!(
+            v,
+            serde_json::json!({"v": 1, "id": "x", "ok": true, "done": false})
+        );
     }
 
     #[test]
@@ -865,10 +942,16 @@ mod tests {
             serde_json::from_value::<TaskRecord>(v).unwrap().signal
         };
         assert_eq!(with(serde_json::json!(9)).as_deref(), Some("SIGKILL"));
-        assert_eq!(with(serde_json::json!("SIGTERM")).as_deref(), Some("SIGTERM"));
+        assert_eq!(
+            with(serde_json::json!("SIGTERM")).as_deref(),
+            Some("SIGTERM")
+        );
         assert_eq!(with(serde_json::Value::Null), None);
         // Missing field is fine too.
-        assert_eq!(serde_json::from_value::<TaskRecord>(base).unwrap().signal, None);
+        assert_eq!(
+            serde_json::from_value::<TaskRecord>(base).unwrap().signal,
+            None
+        );
         // And it serializes as the name.
         let ev = Event::new(EventKind::TaskExited {
             task_id: "sh_a".into(),
@@ -889,20 +972,31 @@ mod tests {
         let raw = r#"{"v":1,"id":"a","type":"start","kind":"shell","command":"x",
             "origin":{"via":"child-bash","child_id":"ch_1","run_id":"run_1"}}"#;
         let req: Request = serde_json::from_str(raw).unwrap();
-        let RequestKind::Start { origin, .. } = req.kind else { panic!() };
+        let RequestKind::Start { origin, .. } = req.kind else {
+            panic!()
+        };
         let o = origin.unwrap();
-        assert_eq!((o.via.as_str(), o.child_id.as_deref(), o.run_id.as_deref()), ("child-bash", Some("ch_1"), Some("run_1")));
+        assert_eq!(
+            (o.via.as_str(), o.child_id.as_deref(), o.run_id.as_deref()),
+            ("child-bash", Some("ch_1"), Some("run_1"))
+        );
         let req: Request =
-            serde_json::from_str(r#"{"id":"b","type":"mark_background","task_id":"sh_1"}"#).unwrap();
-        assert!(matches!(req.kind, RequestKind::MarkBackground { ref task_id } if task_id == "sh_1"));
+            serde_json::from_str(r#"{"id":"b","type":"mark_background","task_id":"sh_1"}"#)
+                .unwrap();
+        assert!(
+            matches!(req.kind, RequestKind::MarkBackground { ref task_id } if task_id == "sh_1")
+        );
         let req: Request =
-            serde_json::from_str(r#"{"id":"c","type":"stop","task_id":"sh_1","reason":"cli"}"#).unwrap();
+            serde_json::from_str(r#"{"id":"c","type":"stop","task_id":"sh_1","reason":"cli"}"#)
+                .unwrap();
         assert!(matches!(req.kind, RequestKind::Stop { reason: Some(ref r), .. } if r == "cli"));
         let req: Request = serde_json::from_str(
             r#"{"type":"hello","client_kind":"extension","session_id":"s","pi_pid":1,"extension_version":"0.3.0","protocol":2}"#,
         )
         .unwrap();
-        assert!(matches!(req.kind, RequestKind::Hello { protocol: Some(2), extension_version: Some(ref v), .. } if v == "0.3.0"));
+        assert!(
+            matches!(req.kind, RequestKind::Hello { protocol: Some(2), extension_version: Some(ref v), .. } if v == "0.3.0")
+        );
         // end_reason mapping
         assert_eq!(end_reason_for_stop(Some("cli")), "stopped:cli");
         assert_eq!(end_reason_for_stop(Some("tui")), "stopped:tui");

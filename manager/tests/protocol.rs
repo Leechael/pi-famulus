@@ -3,14 +3,15 @@
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state
 //! machine, CLI). Written against the *contract*, not the implementation:
 //! each test spawns the compiled binary and speaks the wire protocol
-//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. Mostly std —
-//! libc is used only to probe the lifetime lock; no dev-dependencies or serde.
-//! JSON is asserted via substring matching
-//! (whitespace-tolerant where it matters via `compact()`).
+//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. `serde_json`
+//! parses response ids exactly; payload assertions use substring matching
+//! (whitespace-tolerant where it matters via `compact()`). libc probes the
+//! daemon lifetime lock.
 //!
 //! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
 //! (pi-famulus-test-<pid>-<testname>) and kills its daemon on drop.
 
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -51,6 +52,36 @@ fn spawn_daemon(home: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn pi-famulus daemon")
+}
+
+fn spawn_daemon_with_agent_budget_pause(
+    home: &Path,
+    marker: &Path,
+    release_marker: &Path,
+) -> Child {
+    Command::new(BIN)
+        .arg("daemon")
+        .env("PI_FAMULUS_HOME", home)
+        .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD", "ch-old")
+        .env("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER", marker)
+        .env("PI_FAMULUS_TEST_AGENT_BUDGET_RELEASE_MARKER", release_marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pi-famulus daemon with budget pause")
+}
+
+fn spawn_daemon_with_writer_queue_marker(home: &Path, marker: &Path) -> Child {
+    Command::new(BIN)
+        .arg("daemon")
+        .env("PI_FAMULUS_HOME", home)
+        .env("PI_FAMULUS_TEST_WRITER_QUEUE_FULL_MARKER", marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pi-famulus daemon with writer queue marker")
 }
 
 fn wait_for_socket(home: &Path, timeout: Duration) {
@@ -129,6 +160,13 @@ struct Conn {
     history: Vec<String>,
 }
 
+fn has_response_id(frame: &str, id: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return false;
+    };
+    value.get("id").and_then(serde_json::Value::as_str) == Some(id)
+}
+
 impl Conn {
     fn send(&mut self, json: &str) {
         let body = json.as_bytes();
@@ -181,14 +219,14 @@ impl Conn {
             .unwrap_or_else(|| panic!("no response echoing id {id:?} within {RESPONSE_TIMEOUT:?}"))
     }
 
-    fn read_until(&mut self, needle: &str, timeout: Duration) -> Option<String> {
-        if let Some(f) = self.history.iter().find(|f| f.contains(needle)) {
-            return Some(f.clone());
+    fn read_until(&mut self, id: &str, timeout: Duration) -> Option<String> {
+        if let Some(frame) = self.history.iter().find(|frame| has_response_id(frame, id)) {
+            return Some(frame.clone());
         }
         let deadline = Instant::now() + timeout;
         loop {
             let frame = self.read_frame(deadline)?;
-            if frame.contains(needle) {
+            if has_response_id(&frame, id) {
                 return Some(frame);
             }
         }
@@ -212,8 +250,20 @@ impl Conn {
     }
 }
 
+#[test]
+fn p0_conn_read_until_matches_json_id_exactly() {
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    let mut conn = Conn {
+        stream,
+        buf: Vec::new(),
+        history: vec![r#"{"v":1,"id":"","version":"0.1.2+5ec12f60e7"}"#.to_owned()],
+    };
+
+    assert_eq!(conn.read_until("c1", Duration::ZERO), None);
+}
+
 // ---------------------------------------------------------------------------
-// JSON helpers (std-only, substring based)
+// JSON helpers (exact id parsing, substring assertions for payloads)
 // ---------------------------------------------------------------------------
 
 /// Whitespace-stripped copy for structural assertions (`"ok":true` matches
@@ -257,6 +307,15 @@ fn extract_num(json: &str, key: &str) -> Option<u64> {
 fn hello_ext(conn: &mut Conn, session_id: &str) -> String {
     conn.send(&format!(
         r#"{{"type":"hello","client_kind":"extension","session_id":"{session_id}","pi_pid":{}}}"#,
+        std::process::id()
+    ));
+    conn.read_frame(Instant::now() + Duration::from_secs(5))
+        .expect("hello response within 5s")
+}
+
+fn hello_ext_protocol(conn: &mut Conn, session_id: &str, protocol: u32) -> String {
+    conn.send(&format!(
+        r#"{{"type":"hello","client_kind":"extension","session_id":"{session_id}","pi_pid":{},"protocol":{protocol}}}"#,
         std::process::id()
     ));
     conn.read_frame(Instant::now() + Duration::from_secs(5))
@@ -879,6 +938,783 @@ fn t12_restart_after_crash_orphans_the_task() {
 /// Memory/lifecycle stress: N short-lived start→wait cycles must not panic
 /// the daemon. Uses `wait` (not list polling) so Conn history substring
 /// matching cannot confuse ids like `r13-list-1` vs `r13-list-10`.
+#[test]
+fn p5_machine_agent_admission_rejects_releases_and_reaps_disconnects() {
+    let home = test_home("p5-agent-capacity");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut a = connect(&home, CONNECT_TIMEOUT);
+    let mut b = connect(&home, CONNECT_TIMEOUT);
+    let mut c = connect(&home, CONNECT_TIMEOUT);
+    hello_ext(&mut a, "session-a");
+    hello_ext(&mut b, "session-b");
+    hello_ext(&mut c, "session-c");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let ba = barrier.clone();
+    let ta = std::thread::spawn(move || {
+        ba.wait();
+        let response = a.request(r#"{"id":"a1","type":"acquire_agent","child_id":"ch_shared"}"#, "a1");
+        (response, a)
+    });
+    let bb = barrier.clone();
+    let tb = std::thread::spawn(move || {
+        bb.wait();
+        let response = b.request(r#"{"id":"b1","type":"acquire_agent","child_id":"ch_shared"}"#, "b1");
+        (response, b)
+    });
+    barrier.wait();
+    let (ra, mut a) = ta.join().unwrap();
+    let (rb, mut b) = tb.join().unwrap();
+    assert_ne!(compact(&ra).contains("\"granted\":true"), compact(&rb).contains("\"granted\":true"), "one machine slot admits exactly one session");
+    let (winner_a, loser_b) = (compact(&ra).contains("\"granted\":true"), compact(&rb).contains("\"granted\":true"));
+    assert!(winner_a || loser_b);
+    if winner_a {
+        assert!(compact(&rb).contains("\"rejection\":\"global_capacity\""), "{rb}");
+    } else {
+        assert!(compact(&ra).contains("\"rejection\":\"global_capacity\""), "{ra}");
+    }
+    fs::write(home.join("config.json"), r#"{"maxAgents":2}"#).unwrap();
+    let admitted = if winner_a {
+        b.request(
+            r#"{"id":"p5-scale-up-b","type":"acquire_agent","child_id":"ch_shared"}"#,
+            "p5-scale-up-b",
+        )
+    } else {
+        a.request(r#"{"id":"a2","type":"acquire_agent","child_id":"ch_shared"}"#, "a2")
+    };
+    assert!(compact(&admitted).contains("\"granted\":true"), "scale up did not admit: {admitted}");
+    if winner_a {
+        a.request(r#"{"id":"release1","type":"release_agent","child_id":"ch_shared"}"#, "release1");
+        a.request(r#"{"id":"release2","type":"release_agent","child_id":"ch_shared"}"#, "release2");
+    } else {
+        b.request(r#"{"id":"release1","type":"release_agent","child_id":"ch_shared"}"#, "release1");
+        b.request(r#"{"id":"release2","type":"release_agent","child_id":"ch_shared"}"#, "release2");
+    }
+    let after_release = c.request(r#"{"id":"c1","type":"acquire_agent","child_id":"ch_c"}"#, "c1");
+    assert!(compact(&after_release).contains("\"granted\":true"), "winner release did not free a permit: {after_release}");
+    c.request(r#"{"id":"c2","type":"release_agent","child_id":"ch_c"}"#, "c2");
+
+    fs::write(home.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    let denied = c.request(r#"{"id":"c3","type":"acquire_agent","child_id":"ch_c"}"#, "c3");
+    assert!(compact(&denied).contains("\"rejection\":\"global_capacity\""), "scale down did not limit new admissions: {denied}");
+    if winner_a { drop(b); } else { drop(a); }
+    std::thread::sleep(Duration::from_millis(50));
+    let granted = c.request(r#"{"id":"c4","type":"acquire_agent","child_id":"ch_c"}"#, "c4");
+    assert!(compact(&granted).contains("\"granted\":true"), "stale session permit was not reaped: {granted}");
+    c.request(r#"{"id":"c5","type":"release_agent","child_id":"ch_c"}"#, "c5");
+}
+
+#[test]
+fn p7_stale_capacity_read_cannot_overtake_new_admission() {
+    let home = test_home("p7");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":3}"#).unwrap();
+    let marker = home.join("old-budget-read");
+    let release_marker = home.join("release-old-budget-read");
+    let mut daemon = spawn_daemon_with_agent_budget_pause(&home, &marker, &release_marker);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut existing = connect(&home, CONNECT_TIMEOUT);
+    let mut old = connect(&home, CONNECT_TIMEOUT);
+    let mut fresh = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut existing, "budget-existing", 5);
+    hello_ext_protocol(&mut old, "budget-old", 5);
+    hello_ext_protocol(&mut fresh, "budget-fresh", 5);
+    let held = existing.request(
+        r#"{"id":"held","type":"acquire_agent","child_id":"ch-held","work_kind":"test"}"#,
+        "held",
+    );
+    assert!(compact(&held).contains("\"granted\":true"), "{held}");
+
+    let old_request = std::thread::spawn(move || {
+        let response = old.request(
+            r#"{"id":"old","type":"acquire_agent","child_id":"ch-old","work_kind":"test"}"#,
+            "old",
+        );
+        (response, old)
+    });
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "acquire did not reach its old-budget read"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // `ch-old` has cached maxAgents=3 but is paused before its state admission.
+    // A newer request sees maxAgents=2 and must not be overtaken when the older
+    // request resumes with its stale budget.
+    fs::write(home.join("config.json"), r#"{"maxAgents":2,"maxTest":3}"#).unwrap();
+    let refreshed = existing.request(r#"{"id":"refresh","type":"status"}"#, "refresh");
+    let refreshed: Value = serde_json::from_str(&refreshed).unwrap();
+    assert_eq!(refreshed["agent_capacity"]["used"], 1, "{refreshed}");
+    assert_eq!(refreshed["agent_capacity"]["total"], 2, "{refreshed}");
+    assert_eq!(refreshed["agent_capacity"]["by_kind"]["test"]["used"], 1, "{refreshed}");
+    assert_eq!(refreshed["agent_capacity"]["by_kind"]["test"]["total"], 3, "{refreshed}");
+    fs::write(&release_marker, b"release").unwrap();
+    let fresh_response = fresh.request(
+        r#"{"id":"fresh","type":"acquire_agent","child_id":"ch-fresh","work_kind":"test"}"#,
+        "fresh",
+    );
+    let (old_response, _old) = old_request.join().unwrap();
+    let fresh_granted = compact(&fresh_response).contains("\"granted\":true");
+    let old_granted = compact(&old_response).contains("\"granted\":true");
+    assert_ne!(
+        fresh_granted, old_granted,
+        "stale admission overtook the refreshed budget: {fresh_response}; {old_response}"
+    );
+
+    let status = existing.request(r#"{"id":"p7status","type":"status"}"#, "p7status");
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(status["agent_capacity"]["used"], 2, "{status}");
+    assert_eq!(status["agent_capacity"]["total"], 2, "{status}");
+    assert_eq!(status["agent_capacity"]["by_kind"]["test"]["used"], 2, "{status}");
+    assert_eq!(status["agent_capacity"]["by_kind"]["test"]["total"], 3, "{status}");
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn p6_wrong_shape_capacity_config_refuses_reads_updates_and_admission() {
+    let home = test_home("p6-config-shapes");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut c = connect(&home, CONNECT_TIMEOUT);
+    hello_ext(&mut c, "session-config-shapes");
+    for (index, corrupt) in ["[]", "null", "42"].into_iter().enumerate() {
+        fs::write(home.join("config.json"), corrupt).unwrap();
+        let id = format!("bad{index}");
+        let request = format!(r#"{{"id":"{id}","type":"acquire_agent","child_id":"ch_bad{index}"}}"#);
+        let response = c.request(&request, &id);
+        assert!(compact(&response).contains("\"ok\":false"), "admitted with {corrupt}: {response}");
+        assert!(response.contains("JSON object"), "missing loud config error: {response}");
+        let get = Command::new(BIN).arg("--home").arg(&home).args(["config", "get", "max-agents"]).output().unwrap();
+        assert!(!get.status.success(), "config get accepted {corrupt}");
+        let set = Command::new(BIN).arg("--home").arg(&home).args(["config", "set", "max-agents", "12"]).output().unwrap();
+        assert!(!set.status.success(), "config set accepted {corrupt}");
+        assert_eq!(fs::read_to_string(home.join("config.json")).unwrap(), corrupt);
+    }
+}
+
+#[test]
+fn p7_per_kind_budget_independence_and_queued_wakeup() {
+    let home = test_home("p7-workkind-wakeup");
+    fs::write(
+        home.join("config.json"),
+        r#"{"maxAgents":4,"maxTest":1,"maxBuild":1,"maxTestSuite":1}"#,
+    )
+    .unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    let mut waiting = connect(&home, CONNECT_TIMEOUT);
+    let mut builder = connect(&home, CONNECT_TIMEOUT);
+    let mut suite = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p7-holder", 5);
+    hello_ext_protocol(&mut waiting, "session-p7-waiting", 5);
+    hello_ext_protocol(&mut builder, "session-p7-builder", 5);
+    hello_ext_protocol(&mut suite, "session-p7-suite", 5);
+
+    let granted = holder.request(
+        r#"{"id":"p7-test-a","type":"acquire_agent","child_id":"ch_test_a","work_kind":"test"}"#,
+        "p7-test-a",
+    );
+    assert!(compact(&granted).contains("\"granted\":true"), "{granted}");
+
+    waiting.send(
+        r#"{"id":"p7-test-b","type":"acquire_agent","child_id":"ch_test_b","work_kind":"test"}"#,
+    );
+    assert!(waiting.read_until("p7-test-b", Duration::from_millis(150)).is_none());
+
+    let build = builder.request(
+        r#"{"id":"p7-build","type":"acquire_agent","child_id":"ch_build","work_kind":"build"}"#,
+        "p7-build",
+    );
+    assert!(compact(&build).contains("\"granted\":true"), "different work kind blocked: {build}");
+    let suite_grant = suite.request(
+        r#"{"id":"p7-suite","type":"acquire_agent","child_id":"ch_suite","work_kind":"test-suite"}"#,
+        "p7-suite",
+    );
+    assert!(compact(&suite_grant).contains("\"granted\":true"), "test-suite has an independent budget: {suite_grant}");
+
+    holder.request(
+        r#"{"id":"p7-release-test","type":"release_agent","child_id":"ch_test_a"}"#,
+        "p7-release-test",
+    );
+    let awakened = waiting
+        .read_until("p7-test-b", Duration::from_secs(3))
+        .expect("FIFO waiter wakes when a same-kind permit is released");
+    assert!(compact(&awakened).contains("\"granted\":true"), "{awakened}");
+
+    let status = builder.request(r#"{"id":"p7-status","type":"status"}"#, "p7-status");
+    let flat = compact(&status);
+    assert!(flat.contains("\"test\":{\"used\":1,\"total\":1}"), "per-kind status missing: {status}");
+    assert!(flat.contains("\"build\":{\"used\":1,\"total\":1}"), "independent status missing: {status}");
+    let cli_status = Command::new(BIN)
+        .args(["--home", home.to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert!(cli_status.status.success());
+    let cli_status = String::from_utf8_lossy(&cli_status.stdout);
+    assert!(cli_status.contains("agent slots: 3/4 used"), "{cli_status}");
+    assert!(cli_status.contains("test: 1/1 used"), "{cli_status}");
+    assert!(cli_status.contains("build: 1/1 used"), "{cli_status}");
+
+    waiting.request(
+        r#"{"id":"p7-release-test-b","type":"release_agent","child_id":"ch_test_b"}"#,
+        "p7-release-test-b",
+    );
+    builder.request(
+        r#"{"id":"p7-release-build","type":"release_agent","child_id":"ch_build"}"#,
+        "p7-release-build",
+    );
+    suite.request(
+        r#"{"id":"p7-release-suite","type":"release_agent","child_id":"ch_suite"}"#,
+        "p7-release-suite",
+    );
+}
+
+#[test]
+fn p7b_status_escapes_unknown_work_kind_control_characters() {
+    let home = test_home("p7b-escape");
+    fs::write(home.join("config.json"), r#"{"maxAgents":4}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut client = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut client, "session-p7b", 5);
+
+    let kind = "vendor\u{1b}[31m\nforged: 9000/9000 used";
+    let request = format!(
+        r#"{{"id":"p7b-acquire","type":"acquire_agent","child_id":"ch_p7b","work_kind":{}}}"#,
+        serde_json::to_string(kind).unwrap(),
+    );
+    let response = client.request(&request, "p7b-acquire");
+    assert!(
+        compact(&response).contains("\"granted\":true"),
+        "{response}"
+    );
+
+    let status = Command::new(BIN)
+        .args(["--home", home.to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    let escaped: String = kind.chars().flat_map(char::escape_default).collect();
+    assert!(
+        stdout.contains(&format!("  {escaped}: 1/4 used")),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw terminal escape in status: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("\nforged:"),
+        "forged terminal line in status: {stdout:?}"
+    );
+}
+
+#[test]
+fn p8_shrinking_kind_budget_keeps_queued_fifo_and_existing_permits() {
+    let home = test_home("p8-workkind-shrink");
+    fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":2}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut first = connect(&home, CONNECT_TIMEOUT);
+    let mut second = connect(&home, CONNECT_TIMEOUT);
+    let mut queued_first = connect(&home, CONNECT_TIMEOUT);
+    let mut queued_second = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut first, "session-p8-first", 5);
+    hello_ext_protocol(&mut second, "session-p8-second", 5);
+    hello_ext_protocol(&mut queued_first, "session-p8-q1", 5);
+    hello_ext_protocol(&mut queued_second, "session-p8-q2", 5);
+    for (conn, id, child) in [(&mut first, "p8-a", "ch_a"), (&mut second, "p8-b", "ch_b")] {
+        let response = conn.request(
+            &format!(r#"{{"id":"{id}","type":"acquire_agent","child_id":"{child}","work_kind":"test"}}"#),
+            id,
+        );
+        assert!(compact(&response).contains("\"granted\":true"), "{response}");
+    }
+    queued_first.send(
+        r#"{"id":"p8-q1","type":"acquire_agent","child_id":"ch_q1","work_kind":"test"}"#,
+    );
+    assert!(queued_first.read_until("p8-q1", Duration::from_millis(100)).is_none());
+    queued_second.send(
+        r#"{"id":"p8-q2","type":"acquire_agent","child_id":"ch_q2","work_kind":"test"}"#,
+    );
+    assert!(queued_second.read_until("p8-q2", Duration::from_millis(100)).is_none());
+
+    let set = Command::new(BIN)
+        .args(["--home", home.to_str().unwrap(), "config", "set", "max-test", "1"])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{}", String::from_utf8_lossy(&set.stderr));
+    let capacity_events = fs::read_to_string(home.join("events.jsonl")).unwrap();
+    assert!(capacity_events.contains(r#""type":"capacity.changed""#), "capacity.changed event missing: {capacity_events}");
+    assert!(capacity_events.contains(r#""budget":"max-test""#), "capacity budget missing: {capacity_events}");
+    assert!(capacity_events.contains(r#""previous":2,"#), "previous budget missing: {capacity_events}");
+    assert!(capacity_events.contains(r#""total":1,"#), "new budget missing: {capacity_events}");
+    let status = first.request(r#"{"id":"p8-status","type":"status"}"#, "p8-status");
+    assert!(compact(&status).contains("\"test\":{\"used\":2,\"total\":1}"), "shrink revoked a granted permit: {status}");
+
+    first.request(
+        r#"{"id":"p8-release-a","type":"release_agent","child_id":"ch_a"}"#,
+        "p8-release-a",
+    );
+    assert!(queued_first.read_until("p8-q1", Duration::from_millis(150)).is_none());
+    assert!(queued_second.read_until("p8-q2", Duration::from_millis(100)).is_none());
+    second.request(
+        r#"{"id":"p8-release-b","type":"release_agent","child_id":"ch_b"}"#,
+        "p8-release-b",
+    );
+    let first_grant = queued_first
+        .read_until("p8-q1", Duration::from_secs(3))
+        .expect("oldest FIFO request granted first");
+    assert!(compact(&first_grant).contains("\"granted\":true"), "{first_grant}");
+    assert!(queued_second.read_until("p8-q2", Duration::from_millis(150)).is_none());
+    queued_first.request(
+        r#"{"id":"p8-release-q1","type":"release_agent","child_id":"ch_q1"}"#,
+        "p8-release-q1",
+    );
+    let second_grant = queued_second
+        .read_until("p8-q2", Duration::from_secs(3))
+        .expect("second FIFO request advances after first release");
+    assert!(compact(&second_grant).contains("\"granted\":true"), "{second_grant}");
+}
+
+#[test]
+fn p9_protocol_v4_uses_global_only_immediate_admission() {
+    let home = test_home("p9-v4-admission");
+    fs::write(home.join("config.json"), r#"{"maxAgents":2,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut first = connect(&home, CONNECT_TIMEOUT);
+    let mut second = connect(&home, CONNECT_TIMEOUT);
+    let mut third = connect(&home, CONNECT_TIMEOUT);
+    let hello = hello_ext_protocol(&mut first, "session-p9-first", 4);
+    assert!(compact(&hello).contains("\"protocol\":5"), "daemon advertises its max: {hello}");
+    hello_ext_protocol(&mut second, "session-p9-second", 4);
+    hello_ext_protocol(&mut third, "session-p9-third", 4);
+    for (conn, id, child) in [(&mut first, "p9-a", "ch_a"), (&mut second, "p9-b", "ch_b")] {
+        let response = conn.request(
+            &format!(r#"{{"id":"{id}","type":"acquire_agent","child_id":"{child}","work_kind":"test"}}"#),
+            id,
+        );
+        assert!(compact(&response).contains("\"granted\":true"), "v4 must ignore per-kind cap: {response}");
+    }
+    let denied = third.request(
+        r#"{"id":"p9-c","type":"acquire_agent","child_id":"ch_c","work_kind":"test"}"#,
+        "p9-c",
+    );
+    assert!(compact(&denied).contains("\"rejection\":\"global_capacity\""), "{denied}");
+}
+
+#[test]
+fn p17_status_survives_malformed_kind_budget() {
+    let home = test_home("p17-bad-kind");
+    fs::write(home.join("config.json"), r#"{"maxAgents":2,"maxTest":"2"}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut client = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut client, "session-p17-status", 5);
+
+    let response = client.request(r#"{"id":"p17-status","type":"status"}"#, "p17-status");
+    let value: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["agent_capacity"]["total"], 2, "{value}");
+    assert!(value["agent_capacity"]["by_kind"]["test"].is_null(), "{value}");
+    assert_eq!(value["agent_capacity"]["by_kind"]["build"]["total"], 2, "{value}");
+}
+
+#[test]
+fn p11_capacity_increase_notifies_daemon_and_wakes_kind_queue() {
+    let home = test_home("p11-budget-wake");
+    fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    let mut waiting = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p11-holder", 5);
+    hello_ext_protocol(&mut waiting, "session-p11-waiting", 5);
+    holder.request(
+        r#"{"id":"p11-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p11-hold",
+    );
+    waiting.send(
+        r#"{"id":"p11-wait","type":"acquire_agent","child_id":"ch_wait","work_kind":"test"}"#,
+    );
+    assert!(waiting.read_until("p11-wait", Duration::from_millis(100)).is_none());
+
+    let set = Command::new(BIN)
+        .args(["--home", home.to_str().unwrap(), "config", "set", "max-test", "2"])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{}", String::from_utf8_lossy(&set.stderr));
+    let wake = waiting
+        .read_until("p11-wait", Duration::from_secs(3))
+        .expect("config set notifies daemon and grants newly eligible waiter");
+    assert!(compact(&wake).contains("\"granted\":true"), "{wake}");
+    let status = holder.request(r#"{"id":"p11-status","type":"status"}"#, "p11-status");
+    assert!(compact(&status).contains("\"test\":{\"used\":2,\"total\":2}"), "{status}");
+
+    waiting.request(
+        r#"{"id":"p11-release-wait","type":"release_agent","child_id":"ch_wait"}"#,
+        "p11-release-wait",
+    );
+    holder.request(
+        r#"{"id":"p11-release-hold","type":"release_agent","child_id":"ch_hold"}"#,
+        "p11-release-hold",
+    );
+}
+
+#[test]
+fn p10_cancel_and_disconnect_remove_queued_acquires() {
+    let home = test_home("p10-cancel-queue");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    let mut cancelled = connect(&home, CONNECT_TIMEOUT);
+    let mut disconnected = connect(&home, CONNECT_TIMEOUT);
+    let mut contender = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p10-holder", 5);
+    hello_ext_protocol(&mut cancelled, "session-p10-cancel", 5);
+    hello_ext_protocol(&mut disconnected, "session-p10-drop", 5);
+    hello_ext_protocol(&mut contender, "session-p10-contender", 5);
+    holder.request(
+        r#"{"id":"p10-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p10-hold",
+    );
+    cancelled.send(
+        r#"{"id":"p10-cancelled-acquire","type":"acquire_agent","child_id":"ch_cancel","work_kind":"test"}"#,
+    );
+    disconnected.send(
+        r#"{"id":"p10-disconnected-acquire","type":"acquire_agent","child_id":"ch_drop","work_kind":"test"}"#,
+    );
+    assert!(cancelled.read_until("p10-cancelled-acquire", Duration::from_millis(100)).is_none());
+    assert!(disconnected.read_until("p10-disconnected-acquire", Duration::from_millis(100)).is_none());
+    let cancel_ack = cancelled.request(
+        r#"{"id":"p10-cancel","type":"cancel_acquire_agent","request_id":"p10-cancelled-acquire","child_id":"ch_cancel"}"#,
+        "p10-cancel",
+    );
+    assert!(compact(&cancel_ack).contains("\"ok\":true"), "{cancel_ack}");
+    drop(disconnected);
+    let disconnect_deadline = Instant::now() + RESPONSE_TIMEOUT;
+    let mut attempt = 0;
+    loop {
+        let id = format!("p10-disconnect-status-{attempt}");
+        let status = contender.request(&format!(r#"{{"id":"{id}","type":"status"}}"#), &id);
+        let value: Value = serde_json::from_str(&status).unwrap();
+        let observed = value["sessions"].as_array().is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                session["session_id"] == "session-p10-drop" && session["connected"] == false
+            })
+        });
+        if observed {
+            break;
+        }
+        assert!(Instant::now() < disconnect_deadline, "daemon did not observe disconnected session");
+        attempt += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    holder.request(
+        r#"{"id":"p10-release","type":"release_agent","child_id":"ch_hold"}"#,
+        "p10-release",
+    );
+    let result = contender.request(
+        r#"{"id":"p10-contender","type":"acquire_agent","child_id":"ch_contender","work_kind":"test"}"#,
+        "p10-contender",
+    );
+    assert!(compact(&result).contains("\"granted\":true"), "stale pending request held the kind slot: {result}");
+}
+
+#[test]
+fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
+    let home = test_home("p16-grant-retry");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
+    let marker = home.join("p16-writer-queue-full");
+    let child = spawn_daemon_with_writer_queue_marker(&home, &marker);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let _daemon = Daemon { child, home: home.clone() };
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    let mut waiter = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p16-holder", 5);
+    hello_ext_protocol(&mut waiter, "session-p16-waiter", 5);
+    holder.request(
+        r#"{"id":"p16-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p16-hold",
+    );
+    let acquire = r#"{"id":"p16-wait","type":"acquire_agent","child_id":"ch_wait","work_kind":"test"}"#;
+    waiter.send(acquire);
+    assert!(waiter.read_until("p16-wait", Duration::from_millis(100)).is_none());
+    for n in 0..2048 {
+        waiter.send(&format!(r#"{{"id":"p16-status-{n:04}","type":"status"}}"#));
+    }
+    let queue_deadline = Instant::now() + RESPONSE_TIMEOUT;
+    while !marker.exists() {
+        assert!(
+            Instant::now() < queue_deadline,
+            "writer response queue never reached capacity"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    holder.request(
+        r#"{"id":"p16-release","type":"release_agent","child_id":"ch_hold"}"#,
+        "p16-release",
+    );
+
+    // Drain the responses only after the release hit a known-full writer
+    // queue. The daemon retains the grant until a later same-id retry arrives
+    // after queue capacity is available again.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut status_frames = waiter
+        .history
+        .iter()
+        .filter(|frame| frame.contains("p16-status-"))
+        .count();
+    while status_frames < 2048 {
+        let frame = waiter.read_frame((Instant::now() + Duration::from_millis(100)).min(deadline));
+        let Some(frame) = frame else {
+            assert!(Instant::now() < deadline, "flooded status responses did not drain");
+            continue;
+        };
+        let value: Value = serde_json::from_str(&frame).unwrap();
+        assert_ne!(value["id"], "p16-wait", "grant arrived before a retry after backpressure");
+        if value["id"].as_str().is_some_and(|id| id.starts_with("p16-status-")) {
+            status_frames += 1;
+        }
+    }
+    waiter.send(acquire); // retry only once the full queue has drained
+    let grant = waiter
+        .read_until("p16-wait", RESPONSE_TIMEOUT)
+        .expect("queued acquire never received its retained grant");
+    let grant: Value = serde_json::from_str(&grant).unwrap();
+    assert_eq!(grant["granted"], true, "{grant}");
+    let quiet_deadline = Instant::now() + Duration::from_secs(2);
+    while waiter.read_frame(quiet_deadline).is_some() {}
+    let grant_responses = waiter
+        .history
+        .iter()
+        .filter(|frame| serde_json::from_str::<Value>(frame).ok().is_some_and(|value| value["id"] == "p16-wait"))
+        .count();
+    assert_eq!(grant_responses, 1, "same-id retry received duplicate grant frames");
+}
+
+#[test]
+fn p12_wake_scans_for_eligible_kind_and_keeps_same_kind_fifo() {
+    let home = test_home("p12-kind-scan");
+    fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":1,"maxBuild":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut test_holder = connect(&home, CONNECT_TIMEOUT);
+    let mut build_holder = connect(&home, CONNECT_TIMEOUT);
+    let mut test_waiter = connect(&home, CONNECT_TIMEOUT);
+    let mut build_waiter = connect(&home, CONNECT_TIMEOUT);
+    let mut build_fresh = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut test_holder, "session-p12-th", 5);
+    hello_ext_protocol(&mut build_holder, "session-p12-bh", 5);
+    hello_ext_protocol(&mut test_waiter, "session-p12-tw", 5);
+    hello_ext_protocol(&mut build_waiter, "session-p12-bw", 5);
+    hello_ext_protocol(&mut build_fresh, "session-p12-bf", 5);
+    test_holder.request(
+        r#"{"id":"p12-hold-test","type":"acquire_agent","child_id":"ch_th","work_kind":"test"}"#,
+        "p12-hold-test",
+    );
+    build_holder.request(
+        r#"{"id":"p12-hold-build","type":"acquire_agent","child_id":"ch_bh","work_kind":"build"}"#,
+        "p12-hold-build",
+    );
+    test_waiter.send(
+        r#"{"id":"p12-test-wait","type":"acquire_agent","child_id":"ch_tw","work_kind":"test"}"#,
+    );
+    assert!(test_waiter.read_until("p12-test-wait", Duration::from_millis(100)).is_none());
+    test_waiter.send(
+        r#"{"id":"p12-test-alias","type":"acquire_agent","child_id":"ch_tw","work_kind":"test"}"#,
+    );
+    assert!(test_waiter.read_until("p12-test-alias", Duration::from_millis(100)).is_none());
+    build_waiter.send(
+        r#"{"id":"p12-build-wait","type":"acquire_agent","child_id":"ch_bw","work_kind":"build"}"#,
+    );
+    assert!(build_waiter.read_until("p12-build-wait", Duration::from_millis(100)).is_none());
+    build_fresh.send(
+        r#"{"id":"p12-build-fresh","type":"acquire_agent","child_id":"ch_bf","work_kind":"build"}"#,
+    );
+    assert!(build_fresh.read_until("p12-build-fresh", Duration::from_millis(100)).is_none());
+
+    build_holder.request(
+        r#"{"id":"p12-release-build","type":"release_agent","child_id":"ch_bh"}"#,
+        "p12-release-build",
+    );
+    let build_grant = build_waiter.read_until("p12-build-wait", Duration::from_secs(3)).unwrap();
+    assert!(compact(&build_grant).contains("\"granted\":true"), "{build_grant}");
+    assert!(build_fresh.read_until("p12-build-fresh", Duration::from_millis(100)).is_none());
+    assert!(test_waiter.read_until("p12-test-wait", Duration::from_millis(100)).is_none());
+
+    build_waiter.request(
+        r#"{"id":"p12-release-build-wait","type":"release_agent","child_id":"ch_bw"}"#,
+        "p12-release-build-wait",
+    );
+    let fresh_grant = build_fresh.read_until("p12-build-fresh", Duration::from_secs(3)).unwrap();
+    assert!(compact(&fresh_grant).contains("\"granted\":true"), "{fresh_grant}");
+    test_holder.request(
+        r#"{"id":"p12-release-test","type":"release_agent","child_id":"ch_th"}"#,
+        "p12-release-test",
+    );
+    for id in ["p12-test-wait", "p12-test-alias"] {
+        let grant = test_waiter.read_until(id, Duration::from_secs(3)).unwrap();
+        assert!(compact(&grant).contains("\"granted\":true"), "{grant}");
+    }
+}
+
+#[test]
+fn p13_pending_queue_enforces_per_session_cap_and_child_deduplication() {
+    let home = test_home("p13-sess-cap");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1000,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    let mut waiter = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p13-holder", 5);
+    hello_ext_protocol(&mut waiter, "session-p13-waiter", 5);
+    holder.request(
+        r#"{"id":"p13-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p13-hold",
+    );
+    for n in 0..64 {
+        waiter.send(&format!(
+            r#"{{"id":"p13-q{n:02}","type":"acquire_agent","child_id":"ch_{n:02}","work_kind":"test"}}"#
+        ));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let overflow = waiter.request(
+        r#"{"id":"p13-overflow","type":"acquire_agent","child_id":"ch_overflow","work_kind":"test"}"#,
+        "p13-overflow",
+    );
+    assert!(compact(&overflow).contains("\"rejection\":\"capacity_queue_full\""), "{overflow}");
+
+    // A distinct request id for an already queued child aliases the same
+    // bounded waiter and receives its grant under both ids.
+    waiter.send(
+        r#"{"id":"p13-alias","type":"acquire_agent","child_id":"ch_00","work_kind":"test"}"#,
+    );
+    assert!(waiter.read_until("p13-alias", Duration::from_millis(100)).is_none());
+    let mut alias_ids = vec!["p13-q00".to_string(), "p13-alias".to_string()];
+    for n in 1..7 {
+        let id = format!("p13-alias-{n}");
+        waiter.send(&format!(
+            r#"{{"id":"{id}","type":"acquire_agent","child_id":"ch_00","work_kind":"test"}}"#
+        ));
+        alias_ids.push(id);
+    }
+    let alias_overflow = waiter.request(
+        r#"{"id":"p13-alias-overflow","type":"acquire_agent","child_id":"ch_00","work_kind":"test"}"#,
+        "p13-alias-overflow",
+    );
+    assert!(
+        compact(&alias_overflow).contains("\"rejection\":\"capacity_queue_full\""),
+        "{alias_overflow}"
+    );
+    holder.request(
+        r#"{"id":"p13-release","type":"release_agent","child_id":"ch_hold"}"#,
+        "p13-release",
+    );
+    for id in alias_ids {
+        let grant = waiter.read_until(&id, Duration::from_secs(3)).unwrap_or_else(|| {
+            panic!("missing grant for {id}; received frames: {:?}", waiter.history)
+        });
+        assert!(compact(&grant).contains("\"granted\":true"), "{grant}");
+    }
+}
+
+#[test]
+fn p14_pending_queue_enforces_daemon_global_cap() {
+    let home = test_home("p14-glob-cap");
+    fs::write(home.join("config.json"), r#"{"maxAgents":1000,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut holder = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut holder, "session-p14-holder", 5);
+    holder.request(
+        r#"{"id":"p14-hold","type":"acquire_agent","child_id":"ch_hold","work_kind":"test"}"#,
+        "p14-hold",
+    );
+    let mut sessions = Vec::new();
+    for session in 0..5 {
+        let mut conn = connect(&home, CONNECT_TIMEOUT);
+        hello_ext_protocol(&mut conn, &format!("session-p14-{session}"), 5);
+        sessions.push(conn);
+    }
+    for (session, conn) in sessions.iter_mut().take(4).enumerate() {
+        for n in 0..64 {
+            conn.send(&format!(
+                r#"{{"id":"p14-{session}-{n:02}","type":"acquire_agent","child_id":"ch_{session}_{n:02}","work_kind":"test"}}"#
+            ));
+        }
+        // This connection processes acquires in wire order; its response is
+        // a barrier proving all 64 children have reached the daemon queue.
+        conn.request(
+            &format!(r#"{{"id":"p14-barrier-{session}","type":"status"}}"#),
+            &format!("p14-barrier-{session}"),
+        );
+    }
+    let overflow = sessions[4].request(
+        r#"{"id":"p14-overflow","type":"acquire_agent","child_id":"ch_overflow","work_kind":"test"}"#,
+        "p14-overflow",
+    );
+    assert!(compact(&overflow).contains("\"rejection\":\"capacity_queue_full\""), "{overflow}");
+}
+
+#[test]
+fn p15_cancel_only_releases_its_owned_permit_and_same_id_retry_is_new() {
+    let home = test_home("p15-cancel-own");
+    fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut conn = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut conn, "session-p15", 5);
+    let first = conn.request(
+        r#"{"id":"p15-old","type":"acquire_agent","child_id":"ch_shared","work_kind":"test"}"#,
+        "p15-old",
+    );
+    assert!(compact(&first).contains("\"granted\":true"), "{first}");
+    conn.request(
+        r#"{"id":"p15-cancel-old","type":"cancel_acquire_agent","request_id":"p15-old","child_id":"ch_shared"}"#,
+        "p15-cancel-old",
+    );
+    let second = conn.request(
+        r#"{"id":"p15-new","type":"acquire_agent","child_id":"ch_shared","work_kind":"test"}"#,
+        "p15-new",
+    );
+    assert!(compact(&second).contains("\"granted\":true"), "{second}");
+    conn.request(
+        r#"{"id":"p15-stale-cancel","type":"cancel_acquire_agent","request_id":"p15-old","child_id":"ch_shared"}"#,
+        "p15-stale-cancel",
+    );
+    let status = conn.request(r#"{"id":"p15-status","type":"status"}"#, "p15-status");
+    assert!(compact(&status).contains("\"test\":{\"used\":1,\"total\":1}"), "stale cancel dropped the new permit: {status}");
+
+    conn.send(
+        r#"{"id":"p15-race-cancel","type":"cancel_acquire_agent","request_id":"p15-race","child_id":"ch_race"}"#,
+    );
+    conn.read_until("p15-race-cancel", Duration::from_secs(3)).unwrap();
+    conn.send(
+        r#"{"id":"p15-race","type":"acquire_agent","child_id":"ch_race","work_kind":"build"}"#,
+    );
+    assert!(conn.read_until("p15-race", Duration::from_millis(100)).is_none());
+    conn.send(
+        r#"{"id":"p15-race","type":"acquire_agent","child_id":"ch_race","work_kind":"build"}"#,
+    );
+    let retry = conn.read_until("p15-race", Duration::from_secs(3)).unwrap();
+    assert!(compact(&retry).contains("\"granted\":true"), "retry after consumed cancel tombstone: {retry}");
+}
+
 #[test]
 fn t13_repeated_start_exit_stress() {
     let d = Daemon::start("stress");

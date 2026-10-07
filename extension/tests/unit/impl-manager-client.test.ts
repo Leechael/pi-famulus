@@ -7,6 +7,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
 import {
   ManagerClient,
   releaseSpawnLockFile,
@@ -23,6 +24,9 @@ interface FakeManager {
   dropNext(type: string): void;
   startCount(): number;
   setTasks(tasks: Record<string, unknown>[]): void;
+  setProtocol(protocol: number | undefined): void;
+  holdNextAcquire(): void;
+  releaseHeldAcquire(): void;
   refuseFor(ms: number): Promise<void>;
   close(): Promise<void>;
 }
@@ -43,6 +47,9 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   const dropTypes = new Set<string>();
   const startsByKey = new Map<string, { task_id: string; pid: number }>();
   let tasks: Record<string, unknown>[] = [];
+  let protocol: number | undefined = 4;
+  let holdAcquire = false;
+  let heldAcquire: { message: Record<string, unknown>; socket: net.Socket } | null = null;
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -82,7 +89,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
           rejectNextHelloForShutdown = false;
           return { v: 1, id: msg.id, ok: false, error: { code: "E_INTERNAL", message: "manager is shutting down" } };
         }
-        return { v: 1, id: msg.id, ok: true, version: "0.1.0", pid: 4321, started_at: 1 };
+        return { v: 1, id: msg.id, ok: true, version: "0.1.0", pid: 4321, started_at: 1, ...(protocol === undefined ? {} : { protocol }) };
       case "start": {
         const key = String(msg.key ?? "legacy");
         if (!startsByKey.has(key)) startsByKey.set(key, { task_id: "sh_a1b2c3d4", pid: 5678 });
@@ -101,6 +108,16 @@ async function startFakeManager(home: string): Promise<FakeManager> {
           exit_code: 0,
           total_size: 13,
         };
+      case "acquire_agent":
+        if (holdAcquire) {
+          holdAcquire = false;
+          heldAcquire = { message: msg, socket };
+          return null;
+        }
+        return { v: 1, id: msg.id, ok: true, granted: true };
+      case "cancel_acquire_agent":
+        return { v: 1, id: msg.id, ok: true };
+      case "release_agent":
       case "stop":
       case "mark_background":
         return { v: 1, id: msg.id, ok: true };
@@ -150,6 +167,13 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     dropNext: (type) => { dropTypes.add(type); },
     startCount: () => startsByKey.size,
     setTasks: (value) => { tasks = value; },
+    setProtocol: (value) => { protocol = value; },
+    holdNextAcquire: () => { holdAcquire = true; },
+    releaseHeldAcquire: () => {
+      if (!heldAcquire) throw new Error("no held acquire request");
+      heldAcquire.socket.write(encodeFrame({ v: 1, id: heldAcquire.message.id, ok: true, granted: true }));
+      heldAcquire = null;
+    },
     refuseFor: async (ms) => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -201,8 +225,19 @@ describe("ManagerClient (integration, fake manager)", () => {
       session_id: "sess-1",
       pi_pid: process.pid,
       extension_version: packageVersion,
-      protocol: 3,
+      protocol: 5,
     });
+  });
+
+  it("negotiates the minimum of its v5 maximum and the daemon's reported maximum", async () => {
+    fake.setProtocol(3);
+    expect(await client.connect()).toBe(true);
+    expect(client.protocolLevel()).toBe(3);
+    await client.close();
+    fake.setProtocol(9);
+    client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null });
+    expect(await client.connect()).toBe(true);
+    expect(client.protocolLevel()).toBe(5);
   });
 
   it("waits out a shutting-down hello without deleting manager files", async () => {
@@ -250,6 +285,114 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(fake.received.find((message) => message.type === "stop")).toMatchObject({ reason: "tui" });
     await expect(client.list()).resolves.toEqual([]);
     await expect(client.shutdownSession()).resolves.toEqual(["sh_a1b2c3d4"]);
+  });
+
+  it("uses v4 acquire shape with an older daemon and includes work kind with v5", async () => {
+    await client.connect();
+    expect(client.protocolLevel()).toBe(4);
+    expect(await client.acquireAgent("ch_test", "test-suite")).toEqual({ granted: true });
+    const legacyAcquire = fake.received.find((message) => message.type === "acquire_agent");
+    expect(legacyAcquire).toMatchObject({ child_id: "ch_test" });
+    expect(legacyAcquire).not.toHaveProperty("work_kind");
+    await client.releaseAgent("ch_test");
+    expect(fake.received.find((message) => message.type === "release_agent")).toMatchObject({ child_id: "ch_test" });
+
+    await client.close();
+    fake.setProtocol(5);
+    client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null });
+    await client.connect();
+    expect(await client.acquireAgent("ch_test_v5", "test-suite")).toEqual({ granted: true });
+    expect(fake.received.find((message) => message.type === "acquire_agent" && message.child_id === "ch_test_v5"))
+      .toMatchObject({ work_kind: "test-suite" });
+    await client.releaseAgent("ch_test_v5");
+    expect(fake.received.map((message) => message.type)).toContain("release_agent");
+  });
+
+  it("retries a queued acquire at a bounded interval with the same request id", async () => {
+    fake.setProtocol(5);
+    const clock = new ManualClock();
+    client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null, clock });
+    await client.connect();
+    fake.holdNextAcquire();
+    const acquire = client.acquireAgent("ch_retry", "test", new AbortController().signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const first = fake.received.find((message) => message.type === "acquire_agent");
+    expect(first?.id).toBeTypeOf("string");
+    clock.advanceBy(3000);
+    for (let i = 0; i < 50 && fake.received.filter((message) => message.type === "acquire_agent").length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const retries = fake.received.filter((message) => message.type === "acquire_agent");
+    expect(retries).toHaveLength(2);
+    expect(retries[1]).toMatchObject({ id: first?.id, child_id: "ch_retry", work_kind: "test" });
+    await expect(acquire).resolves.toEqual({ granted: true });
+  });
+
+  it("keeps a protocol-4 acquire alive so a late grant can be released", async () => {
+    await client.connect();
+    expect(client.protocolLevel()).toBe(4);
+    fake.holdNextAcquire();
+    const controller = new AbortController();
+    const acquire = client.acquireAgent("ch_v4_abort", "test", controller.signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    controller.abort();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fake.received.some((message) => message.type === "cancel_acquire_agent")).toBe(false);
+    fake.releaseHeldAcquire();
+    await expect(acquire).resolves.toEqual({ granted: true });
+    await client.releaseAgent("ch_v4_abort");
+    expect(fake.received.find((message) => message.type === "release_agent"))
+      .toMatchObject({ child_id: "ch_v4_abort" });
+  });
+
+  it("cancels a pending acquire with its original request id when the child settles", async () => {
+    fake.setProtocol(5);
+    await client.connect();
+    expect(client.isAvailable()).toBe(true);
+    fake.holdNextAcquire();
+    const controller = new AbortController();
+    const acquire = client.acquireAgent("ch_cancel", "test", controller.signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const pending = fake.received.find((message) => message.type === "acquire_agent");
+    expect(pending).toMatchObject({ child_id: "ch_cancel", work_kind: "test" });
+    controller.abort();
+    await expect(acquire).rejects.toThrow("subagent admission cancelled");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fake.received.find((message) => message.type === "cancel_acquire_agent"))
+      .toMatchObject({ request_id: pending?.id, child_id: "ch_cancel" });
+  });
+
+  it("retries protocol-5 cancellation after aborting during reconnect", async () => {
+    fake.setProtocol(5);
+    await client.connect();
+    fake.holdNextAcquire();
+    const controller = new AbortController();
+    const acquire = client.acquireAgent("ch_disconnect_abort", "test", controller.signal);
+    for (let i = 0; i < 50 && !fake.received.some((message) => message.type === "acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const acquireRequest = fake.received.find((message) => message.type === "acquire_agent");
+    const acquireId = acquireRequest?.id;
+    expect(acquireId).toEqual(expect.any(String));
+    const restart = fake.refuseFor(500);
+    for (let i = 0; i < 50 && client.isAvailable(); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(client.isAvailable()).toBe(false);
+    controller.abort();
+    await expect(acquire).rejects.toThrow("subagent admission cancelled");
+    await restart;
+    for (let i = 0; i < 100 && !fake.received.some((message) => message.type === "cancel_acquire_agent"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(fake.received.find((message) => message.type === "cancel_acquire_agent"))
+      .toMatchObject({ request_id: acquireId, child_id: "ch_disconnect_abort" });
   });
 
   it("preserves upgrade generation metadata from status", async () => {

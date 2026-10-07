@@ -28,7 +28,8 @@ import {
   type ModelCandidate,
 } from "./model-spec";
 import { turnsFromMessages } from "./conversation";
-import type { ChildRunRequest, ChildSessionAdapter, CreateSessionFn } from "./types";
+import { createTokenUsageAccumulator, normalizedTokenUsage } from "./usage";
+import type { ChildRunRequest, ChildSessionAdapter, ChildSessionEvent, CreateSessionFn } from "./types";
 
 /** Structural subset of the pi module namespace we rely on. */
 type PiModule = typeof import("@earendil-works/pi-coding-agent");
@@ -36,6 +37,34 @@ type PiModule = typeof import("@earendil-works/pi-coding-agent");
 type PiAgentSession = Awaited<ReturnType<PiModule["createAgentSession"]>>["session"];
 
 type Model = NonNullable<ExtensionContext["model"]>;
+
+export function createPiUsageAdapter() {
+  const totals = createTokenUsageAccumulator();
+  return {
+    tokenUsage: () => totals.snapshot(),
+    adapt(event: {
+      type: string;
+      toolCallId?: string;
+      message?: {
+        role?: string;
+        usage?: { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown };
+      };
+    }): ChildSessionEvent {
+      const message = event.message;
+      let usage: ReturnType<typeof normalizedTokenUsage> | undefined;
+      if (event.type === "message_end" && message?.usage) {
+        usage = normalizedTokenUsage(message.usage);
+        totals.add(usage);
+      }
+      return {
+        type: event.type,
+        ...(typeof event.toolCallId === "string" ? { toolCallId: event.toolCallId } : {}),
+        ...(typeof message?.role === "string" ? { role: message.role } : {}),
+        ...(usage ? { usage } : {}),
+      };
+    },
+  };
+}
 
 export interface PiRuntimeDeps {
   /** Parent session model registry (ctx.modelRegistry). */
@@ -158,6 +187,7 @@ function wrapSession(
   session: PiAgentSession,
   extras: { warning?: string; resolvedModel?: string } = {},
 ): ChildSessionAdapter {
+  const usageAdapter = createPiUsageAdapter();
   return {
     ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
     ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
@@ -180,10 +210,13 @@ function wrapSession(
       };
     },
     getConversation: () => turnsFromMessages(session.messages),
+    tokenUsage: () => usageAdapter.tokenUsage(),
     getActiveToolNames: () => session.getActiveToolNames(),
     getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
-    subscribe: (listener) => session.subscribe((event) => listener({ type: event.type })),
+    subscribe: (listener) => session.subscribe((event) => {
+      listener(usageAdapter.adapt(event as Parameters<typeof usageAdapter.adapt>[0]));
+    }),
     dispose: () => session.dispose(),
   };
 }

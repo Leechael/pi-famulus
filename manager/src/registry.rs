@@ -303,7 +303,13 @@ pub fn persist_record(home: &Path, record: &TaskRecord) -> io::Result<()> {
     fs::create_dir_all(&dir)?;
     let final_path = task_json_path(home, &record.session_id, &record.task_id);
     let tmp_path = dir.join(format!("{}.json.tmp", record.task_id));
-    fs::write(&tmp_path, serde_json::to_vec(record).map_err(io::Error::other)?)?;
+    let mut persisted = record.clone();
+    persisted.live_cpu_user_ms = None;
+    persisted.live_cpu_sys_ms = None;
+    persisted.live_cpu_percent = None;
+    persisted.live_cpu_sampled_at = None;
+    persisted.live_cpu_stale = false;
+    fs::write(&tmp_path, serde_json::to_vec(&persisted).map_err(io::Error::other)?)?;
     fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
@@ -376,6 +382,11 @@ mod tests {
             cpu_user_ms: None,
             cpu_sys_ms: None,
             max_rss_kb: None,
+            live_cpu_user_ms: None,
+            live_cpu_sys_ms: None,
+            live_cpu_percent: None,
+            live_cpu_sampled_at: None,
+            live_cpu_stale: false,
         }
     }
 
@@ -397,7 +408,18 @@ mod tests {
     fn persist_and_load_roundtrip() {
         let home = temp_home("persist");
         let mut rec = sample_record(&home, "sess-a", "sh_deadbeef");
+        rec.live_cpu_user_ms = Some(250);
+        rec.live_cpu_sys_ms = Some(50);
+        rec.live_cpu_percent = Some(12.5);
+        rec.live_cpu_sampled_at = Some(1726000000500);
+        rec.live_cpu_stale = true;
         persist_record(&home, &rec).unwrap();
+        let persisted = load_all_records(&home);
+        assert_eq!(persisted[0].live_cpu_user_ms, None);
+        assert_eq!(persisted[0].live_cpu_sys_ms, None);
+        assert_eq!(persisted[0].live_cpu_percent, None);
+        assert_eq!(persisted[0].live_cpu_sampled_at, None);
+        assert!(!persisted[0].live_cpu_stale);
         // Atomic write leaves no tmp files behind.
         let dir = tasks_dir(&home, "sess-a");
         assert!(task_json_path(&home, "sess-a", "sh_deadbeef").exists());

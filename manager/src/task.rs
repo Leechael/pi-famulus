@@ -4,8 +4,7 @@
 //! Pipe creation uses `Stdio::piped()` (CLOEXEC, no raw fds). Session leadership
 //! and group signalling live in [`crate::sys`] — the only production `unsafe`.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +19,115 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
+
+/// Best-effort live CPU for requested process groups, read from one Linux
+/// `/proc` scan. Values are cumulative user/system milliseconds for currently
+/// visible members; reaped descendants are intentionally not inferred.
+pub fn live_group_cpu_ms_many(pgids: &[u32]) -> HashMap<u32, Option<(u64, u64)>> {
+    let mut readings: HashMap<u32, Option<(u64, u64)>> =
+        pgids.iter().copied().map(|pgid| (pgid, None)).collect();
+    let Some(ticks) = crate::sys::clock_ticks_per_second() else {
+        return readings;
+    };
+    let Ok(groups) = crate::sys::group_cpu_ticks_by_pgid(pgids) else {
+        return readings;
+    };
+    for (pgid, (user, system)) in groups {
+        readings.insert(
+            pgid,
+            Some((
+                user.saturating_mul(1000) / ticks,
+                system.saturating_mul(1000) / ticks,
+            )),
+        );
+    }
+    readings
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveCpuReading {
+    pub user_ms: u64,
+    pub system_ms: u64,
+    /// Recent CPU use as a percentage of one core; multi-process groups may
+    /// exceed 100%. Absent until two samples are available.
+    pub percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveCpuSample {
+    at: std::time::Instant,
+    user_ms: u64,
+    system_ms: u64,
+    raw_user_ms: u64,
+    raw_system_ms: u64,
+    rate_valid: bool,
+}
+
+/// Monotonic best-effort CPU snapshots and interval rates by task id.
+#[derive(Default)]
+pub struct LiveCpuTracker {
+    previous: HashMap<String, LiveCpuSample>,
+}
+
+impl LiveCpuTracker {
+    pub fn update(
+        &mut self,
+        task_id: &str,
+        at: std::time::Instant,
+        user_ms: u64,
+        system_ms: u64,
+    ) -> LiveCpuReading {
+        let previous = self.previous.get(task_id).copied();
+        let total_user_ms = previous.map_or(user_ms, |p| p.user_ms.max(user_ms));
+        let total_system_ms = previous.map_or(system_ms, |p| p.system_ms.max(system_ms));
+        let percent = previous.and_then(|p| {
+            if !p.rate_valid || user_ms < p.raw_user_ms || system_ms < p.raw_system_ms {
+                // A failed interval or a process leaving the visible group
+                // invalidates the old aggregate baseline. Rebase now; a later
+                // sample can still report CPU from surviving/new members.
+                return None;
+            }
+            let elapsed = at.checked_duration_since(p.at)?.as_millis();
+            if elapsed == 0 {
+                return None;
+            }
+            let user_delta = user_ms - p.raw_user_ms;
+            let system_delta = system_ms - p.raw_system_ms;
+            Some((user_delta.saturating_add(system_delta)) as f64 * 100.0 / elapsed as f64)
+        });
+        // Keep cumulative totals monotonic even though `/proc` only covers
+        // members still visible in the group, while separately retaining the
+        // raw aggregate as the interval baseline.
+        self.previous.insert(
+            task_id.to_string(),
+            LiveCpuSample {
+                at,
+                user_ms: total_user_ms,
+                system_ms: total_system_ms,
+                raw_user_ms: user_ms,
+                raw_system_ms: system_ms,
+                rate_valid: true,
+            },
+        );
+        LiveCpuReading {
+            user_ms: total_user_ms,
+            system_ms: total_system_ms,
+            percent,
+        }
+    }
+
+    /// Exclude the interval containing a failed sample without discarding the
+    /// last cumulative CPU totals.
+    pub fn mark_unavailable(&mut self, task_id: &str) {
+        if let Some(previous) = self.previous.get_mut(task_id) {
+            previous.rate_valid = false;
+        }
+    }
+
+    pub fn retain(&mut self, active: &HashSet<String>) {
+        self.previous.retain(|task_id, _| active.contains(task_id));
+    }
+}
 
 /// §3.4: in-memory ring buffer is 64KB; the disk file keeps the full stream.
 pub const RING_CAPACITY: usize = 64 * 1024;
@@ -521,6 +629,41 @@ mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
+
+    #[test]
+    fn live_cpu_tracker_keeps_totals_monotonic_and_rebases_after_process_exit() {
+        let mut tracker = LiveCpuTracker::default();
+        let at = std::time::Instant::now();
+        let first = tracker.update("sh_1", at, 100, 20);
+        assert_eq!((first.user_ms, first.system_ms, first.percent), (100, 20, None));
+
+        let second = tracker.update("sh_1", at + Duration::from_secs(5), 300, 40);
+        assert_eq!((second.user_ms, second.system_ms), (300, 40));
+        assert_eq!(second.percent, Some(4.4));
+
+        // A lower visible-process aggregate preserves the total but resets
+        // the interval baseline instead of hiding subsequent CPU forever.
+        let third = tracker.update("sh_1", at + Duration::from_secs(10), 50, 10);
+        assert_eq!((third.user_ms, third.system_ms, third.percent), (300, 40, None));
+        let fourth = tracker.update("sh_1", at + Duration::from_secs(15), 70, 20);
+        assert_eq!((fourth.user_ms, fourth.system_ms), (300, 40));
+        assert_eq!(fourth.percent, Some(0.6));
+        tracker.retain(&HashSet::new());
+        assert_eq!(tracker.update("sh_1", at + Duration::from_secs(20), 1, 2).percent, None);
+    }
+
+    #[test]
+    fn live_cpu_tracker_does_not_average_over_a_failed_interval() {
+        let mut tracker = LiveCpuTracker::default();
+        let at = std::time::Instant::now();
+        tracker.update("sh_1", at, 100, 20);
+        tracker.mark_unavailable("sh_1");
+        let recovered = tracker.update("sh_1", at + Duration::from_secs(10), 200, 40);
+        assert_eq!((recovered.user_ms, recovered.system_ms), (200, 40));
+        assert_eq!(recovered.percent, None);
+        let reading = tracker.update("sh_1", at + Duration::from_secs(15), 210, 45);
+        assert_eq!(reading.percent, Some(0.3));
+    }
 
     #[test]
     fn ring_buffer_caps_at_capacity() {

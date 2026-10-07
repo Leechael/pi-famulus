@@ -24,7 +24,7 @@ import { statusGlyph, toolComponent } from "../tui/tool-component";
 import type { WorkIndex } from "../work-index";
 import { runChain, runTasks, validateChainSteps } from "./pool";
 import type { RunRecord, SubagentRegistry } from "./registry";
-import type { AgentDefinition, ChildHandle, ChildResult, ChildRunRequest } from "./types";
+import { AGENT_WORK_KINDS, type AgentDefinition, type AgentWorkKind, type ChildHandle, type ChildResult, type ChildRunRequest } from "./types";
 
 
 /** Overall result text cap (§4.6: truncateTail 512 lines / 48KB). */
@@ -38,10 +38,15 @@ const MIN_TIMEOUT_MS = 1_000;
 // Schema (§4.6 field-name contract)
 // ---------------------------------------------------------------------------
 
+const workKindSchema = Type.Union(AGENT_WORK_KINDS.map((kind) => Type.Literal(kind)), {
+  description: "Explicit planned workload class for machine-wide admission (default: other)",
+});
+
 const taskItem = Type.Object({
   agent: Type.Optional(Type.String({ description: "Agent definition name (default: worker)" })),
   prompt: Type.String({ description: "Task prompt for this subagent" }),
   name: Type.Optional(Type.String({ description: "Display name (default: agent name + ordinal)" })),
+  work_kind: Type.Optional(workKindSchema),
 });
 
 const chainItem = Type.Object({
@@ -50,6 +55,7 @@ const chainItem = Type.Object({
     description: "Prompt for this step; {previous} and {outputs.<label>} interpolate earlier results",
   }),
   label: Type.Optional(Type.String({ description: "Label for referencing this step's output later" })),
+  work_kind: Type.Optional(workKindSchema),
 });
 
 const subagentParameters = Type.Object({
@@ -112,8 +118,8 @@ const subagentParameters = Type.Object({
 });
 
 type SubagentParams = {
-  tasks?: { agent?: string; prompt: string; name?: string }[];
-  chain?: { agent?: string; prompt: string; label?: string }[];
+  tasks?: { agent?: string; prompt: string; name?: string; work_kind?: AgentWorkKind }[];
+  chain?: { agent?: string; prompt: string; label?: string; work_kind?: AgentWorkKind }[];
   async?: boolean;
   concurrency?: number;
   fail_fast?: boolean;
@@ -373,12 +379,12 @@ export function createSubagentTool(
       const label = "name" in item ? item.name : undefined;
       const chainLabel = "label" in item ? item.label : undefined;
       const name = label ?? chainLabel ?? `${agent.name}-${i + 1}`;
-      return { agent, name, prompt: item.prompt };
+      return { agent, name, prompt: item.prompt, workKind: item.work_kind ?? "other" };
     });
 
     const run = registry.createRun(kind);
     const childIds = resolved.map((r) =>
-      registry.addChild(run.runId, { name: r.name, agent: r.agent.name }),
+      registry.addChild(run.runId, { name: r.name, agent: r.agent.name, workKind: r.workKind }),
     );
 
     const makeRequest = (ordinal: number, prompt: string): ChildRunRequest => ({
@@ -389,6 +395,7 @@ export function createSubagentTool(
       taskPrompt: prompt,
       agent: resolved[ordinal].agent,
       model: params.model,
+      workKind: resolved[ordinal].workKind,
       timeoutMs,
       depth: 1,
     });

@@ -51,6 +51,24 @@ pub struct AgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_cache_write: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_other_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wall_approximate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
     /// Set by the CLI (not on disk) when the record says running but its
     /// session is not connected: the child cannot be alive.
@@ -60,6 +78,21 @@ pub struct AgentRecord {
 
 pub fn agent_status_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "interrupted")
+}
+
+pub fn agent_output_tokens_per_second(tokens_output: Option<u64>, llm_ms: Option<u64>) -> Option<f64> {
+    match (tokens_output, llm_ms) {
+        (Some(tokens), Some(ms)) if ms > 0 => Some(tokens as f64 * 1000.0 / ms as f64),
+        _ => None,
+    }
+}
+
+fn token_count_label(value: Option<u64>) -> String {
+    value.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into())
+}
+
+fn sum_agent_field(agents: &[AgentRecord], field: impl Fn(&AgentRecord) -> Option<u64>) -> Option<u64> {
+    agents.iter().try_fold(0u64, |sum, agent| sum.checked_add(field(agent)?))
 }
 
 impl AgentRecord {
@@ -389,6 +422,15 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rss_kb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_user_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sys_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_cpu_sampled_at: Option<u64>,
+    pub live_cpu_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
@@ -437,6 +479,11 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         cpu_user_ms: t.cpu_user_ms,
         cpu_sys_ms: t.cpu_sys_ms,
         max_rss_kb: t.max_rss_kb,
+        live_cpu_user_ms: t.live_cpu_user_ms,
+        live_cpu_sys_ms: t.live_cpu_sys_ms,
+        live_cpu_percent: t.live_cpu_percent,
+        live_cpu_sampled_at: t.live_cpu_sampled_at,
+        live_cpu_stale: t.live_cpu_stale,
         pid: Some(t.pid),
         origin: t.origin.clone(),
         backgrounded_at: t.backgrounded_at,
@@ -469,6 +516,11 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         cpu_user_ms: None,
         cpu_sys_ms: None,
         max_rss_kb: None,
+        live_cpu_user_ms: None,
+        live_cpu_sys_ms: None,
+        live_cpu_percent: None,
+        live_cpu_sampled_at: None,
+        live_cpu_stale: false,
         pid: None,
         origin: None,
         backgrounded_at: None,
@@ -602,8 +654,8 @@ pub fn filter_rows(
     Ok(rows)
 }
 
-pub const LS_COLUMNS: [&str; 12] = [
-    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "EXIT", "REASON", "TITLE",
+pub const LS_COLUMNS: [&str; 14] = [
+    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "CPU", "CORES", "NOW", "SAMPLE", "EXIT", "REASON", "TITLE",
 ];
 /// Columns before TITLE.
 const LS_FIXED: usize = LS_COLUMNS.len() - 1;
@@ -614,7 +666,11 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
     let cells: Vec<[String; LS_FIXED]> = rows
         .iter()
         .map(|r| {
-            let cpu = cpu_ms(r.cpu_user_ms, r.cpu_sys_ms);
+            let cpu = if r.running {
+                cpu_ms(r.live_cpu_user_ms, r.live_cpu_sys_ms)
+            } else {
+                cpu_ms(r.cpu_user_ms, r.cpu_sys_ms)
+            };
             [
                 r.id.clone(),
                 r.kind.clone(),
@@ -625,6 +681,18 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
                 r.duration_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into()),
                 cpu_text(cpu),
                 cores_text(cpu, r.duration_ms.unwrap_or(0)),
+                if r.live_cpu_stale {
+                    "stale".into()
+                } else {
+                    r.live_cpu_percent.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into())
+                },
+                if r.running {
+                    r.live_cpu_sampled_at
+                        .map(|t| fmt::short_time(t, now))
+                        .unwrap_or_else(|| if r.live_cpu_stale { "never".into() } else { "-".into() })
+                } else {
+                    "-".into()
+                },
                 exit_col(r),
                 r.end_reason.clone().unwrap_or_else(|| "-".into()),
             ]
@@ -819,20 +887,43 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
                 kv("ended", fmt::datetime(e));
             }
             kv("duration", fmt::human_duration(r.duration_ms.unwrap_or(0)));
-            match cpu_ms(t.cpu_user_ms, t.cpu_sys_ms) {
-                Some(c) => kv(
-                    "cpu",
-                    format!(
-                        "{} (user {}, sys {}), {} cores avg, peak rss {}",
-                        cpu_text(Some(c)),
-                        cpu_text(t.cpu_user_ms),
-                        cpu_text(t.cpu_sys_ms),
-                        cores_text(Some(c), r.duration_ms.unwrap_or(0)),
-                        t.max_rss_kb.map(|k| format!("{} MiB", k / 1024)).unwrap_or_else(|| "?".into())
+            if r.running {
+                let last_sample = t.live_cpu_sampled_at.map(fmt::datetime).unwrap_or_else(|| "never".into());
+                let sample_state = if t.live_cpu_stale {
+                    "unavailable"
+                } else if t.live_cpu_sampled_at.is_some() {
+                    "available"
+                } else {
+                    "not sampled yet"
+                };
+                if let Some(c) = cpu_ms(t.live_cpu_user_ms, t.live_cpu_sys_ms) {
+                    let current = t.live_cpu_percent.map(|p| format!(", now {p:.0}%")).unwrap_or_default();
+                    kv(
+                        "cpu",
+                        format!(
+                            "{} (live user {}, sys {}; best-effort sample{current})",
+                            cpu_text(Some(c)),
+                            cpu_text(t.live_cpu_user_ms),
+                            cpu_text(t.live_cpu_sys_ms),
+                        ),
+                    );
+                }
+                kv("cpu sample", format!("{sample_state} (last successful sample {last_sample})"));
+            } else {
+                match cpu_ms(t.cpu_user_ms, t.cpu_sys_ms) {
+                    Some(c) => kv(
+                        "cpu",
+                        format!(
+                            "{} (user {}, sys {}), {} cores avg, peak rss {}",
+                            cpu_text(Some(c)),
+                            cpu_text(t.cpu_user_ms),
+                            cpu_text(t.cpu_sys_ms),
+                            cores_text(Some(c), r.duration_ms.unwrap_or(0)),
+                            t.max_rss_kb.map(|k| format!("{} MiB", k / 1024)).unwrap_or_else(|| "?".into())
+                        ),
                     ),
-                ),
-                None if r.running => {}
-                None => kv("cpu", "not measured (no runner report: SIGKILLed with its group, or an older record)"),
+                    None => kv("cpu", "not measured (no runner report: SIGKILLed with its group, or an older record)"),
+                }
             }
             if let Some(b) = t.backgrounded_at {
                 kv("backgrounded", format!("after {}", fmt::human_duration(b.saturating_sub(t.started_at))));
@@ -901,6 +992,30 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
             }
             if let Some(n) = a.tool_calls {
                 kv("tool calls", n.to_string());
+            }
+            if a.tokens_input.is_some() || a.tokens_output.is_some() || a.tokens_cache_read.is_some() || a.tokens_cache_write.is_some() {
+                let cache = if a.tokens_cache_read.is_some() || a.tokens_cache_write.is_some() {
+                    format!(" (cache read {} / write {})", token_count_label(a.tokens_cache_read), token_count_label(a.tokens_cache_write))
+                } else {
+                    String::new()
+                };
+                let rate = agent_output_tokens_per_second(a.tokens_output, a.llm_ms)
+                    .map(|v| format!(" ({v:.1} output tok/s of LLM time)"))
+                    .unwrap_or_default();
+                kv("tokens", format!("{} input / {} output{cache}{rate}", token_count_label(a.tokens_input), token_count_label(a.tokens_output)));
+            }
+            if a.llm_ms.is_some() || a.tool_ms.is_some() || a.queue_ms.is_some() || a.wall_other_ms.is_some() {
+                let approx = if a.wall_approximate { " (approximate; unclassified segments are not attributed)" } else { "" };
+                kv(
+                    "wall split",
+                    format!(
+                        "LLM {} / tool {} / queued {} / unclassified {}{approx}",
+                        fmt::human_duration(a.llm_ms.unwrap_or(0)),
+                        fmt::human_duration(a.tool_ms.unwrap_or(0)),
+                        fmt::human_duration(a.queue_ms.unwrap_or(0)),
+                        fmt::human_duration(a.wall_other_ms.unwrap_or(0)),
+                    ),
+                );
             }
             if shells.is_empty() {
                 kv("shells", "none");
@@ -1300,9 +1415,23 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let agents = load_agent_records(home, &connected);
     let a_running = agents.iter().filter(|a| !agent_status_terminal(&a.status)).count();
     let a_done = agents.len() - a_running;
+    let tokens_input = sum_agent_field(&agents, |a| a.tokens_input);
+    let tokens_output = sum_agent_field(&agents, |a| a.tokens_output);
+    let tokens_cache_read = sum_agent_field(&agents, |a| a.tokens_cache_read);
+    let tokens_cache_write = sum_agent_field(&agents, |a| a.tokens_cache_write);
+    let llm_ms = sum_agent_field(&agents, |a| a.llm_ms);
+    let tokens_per_second = agent_output_tokens_per_second(tokens_output, llm_ms);
     if json_out {
         let mut v = serde_json::to_value(&st).unwrap();
         v["agent_counts"] = json!({"running": a_running, "terminal": a_done});
+        v["agent_tokens"] = json!({
+            "input": tokens_input,
+            "output": tokens_output,
+            "tokens_cache_read": tokens_cache_read,
+            "tokens_cache_write": tokens_cache_write,
+            "llm_ms": llm_ms,
+            "output_tokens_per_second": tokens_per_second,
+        });
         outln!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(());
     }
@@ -1312,6 +1441,28 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         outln!("binary:   {exe}");
     }
     outln!("uptime:   {}", fmt::human_duration(st.uptime_ms));
+    if st.protocol >= 4 {
+        if let Some(agent_capacity) = &st.agent_capacity {
+            outln!("agent slots: {}/{} used", agent_capacity.used, agent_capacity.total);
+            for kind in crate::capacity::WORK_KINDS {
+                if let Some(capacity) = agent_capacity.by_kind.get(*kind) {
+                    outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
+                }
+            }
+            let mut unknown_kinds: Vec<_> = agent_capacity
+                .by_kind
+                .keys()
+                .filter(|kind| !crate::capacity::WORK_KINDS.contains(&kind.as_str()))
+                .collect();
+            unknown_kinds.sort();
+            for kind in unknown_kinds {
+                if let Some(capacity) = agent_capacity.by_kind.get(kind) {
+                    let escaped: String = kind.chars().flat_map(char::escape_default).collect();
+                    outln!("  {escaped}: {}/{} used", capacity.used, capacity.total);
+                }
+            }
+        }
+    }
     outln!(
         "sessions: {} ({} connected)",
         st.sessions.len(),
@@ -1325,6 +1476,17 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         st.task_counts.terminal,
         a_running,
         a_done
+    );
+    let rate = tokens_per_second
+        .zip(llm_ms)
+        .map(|(v, ms)| format!(" ({v:.1} output tok/s over {ms} ms of LLM time)"))
+        .unwrap_or_default();
+    outln!(
+        "agent tokens: {} input / {} output (cache read {} / write {}){rate}",
+        token_count_label(tokens_input),
+        token_count_label(tokens_output),
+        token_count_label(tokens_cache_read),
+        token_count_label(tokens_cache_write),
     );
     if let Some(line) = upgrade_line(&st, now_ms()) {
         outln!("{line}");
@@ -1388,6 +1550,35 @@ mod tests {
         assert_eq!(p["zzzzzzzzzzzz"], "zzzzzzzz");
         assert_eq!(p["0199aaaa-1111-7000"], "0199aaaa-1");
         assert_eq!(p["0199aaaa-2222-7000"], "0199aaaa-2");
+    }
+
+    #[test]
+    fn missing_agent_telemetry_makes_aggregate_unknown() {
+        let measured: AgentRecord = serde_json::from_value(json!({
+            "child_id": "ch_measured",
+            "session_id": "sess-1",
+            "status": "completed",
+            "tokens_input": 100,
+            "tokens_output": 20,
+            "llm_ms": 1_000
+        }))
+        .unwrap();
+        let legacy: AgentRecord = serde_json::from_value(json!({
+            "child_id": "ch_legacy",
+            "session_id": "sess-1",
+            "status": "completed"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            sum_agent_field(std::slice::from_ref(&measured), |a| a.tokens_output),
+            Some(20)
+        );
+        assert_eq!(
+            sum_agent_field(&[measured, legacy], |a| a.tokens_output),
+            None
+        );
+        assert_eq!(agent_output_tokens_per_second(None, Some(1_000)), None);
     }
 
     #[test]

@@ -13,7 +13,13 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 function makeStack(
-  opts: { budgetMs?: number; autoComplete?: string | null; hardTimeoutMs?: number; maxConcurrentChildren?: number } = {},
+  opts: {
+    budgetMs?: number;
+    autoComplete?: string | null;
+    hardTimeoutMs?: number;
+    maxConcurrentChildren?: number;
+    managerAdmissionDelayMs?: number;
+  } = {},
 ) {
   const clock = new ManualClock();
   const registry = new SubagentRegistry({ clock, maxConcurrentChildren: opts.maxConcurrentChildren });
@@ -27,7 +33,19 @@ function makeStack(
     overrunRepeatMs: 60_000,
     hardTimeoutMs: opts.hardTimeoutMs,
     onOverrun: (t) => overruns.push(t),
-    acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
+    acquire: async (req, ticket) => {
+      const reservation = await registry.reserveChildSlot(req.childId, ticket);
+      try {
+        if (req.name === "second" && opts.managerAdmissionDelayMs) {
+          await clock.sleep(opts.managerAdmissionDelayMs);
+        }
+        reservation.admit();
+        return reservation.release;
+      } catch (error) {
+        reservation.release();
+        throw error;
+      }
+    },
   });
   registry.setRunner(runner);
   const notify = vi.fn();
@@ -84,6 +102,65 @@ describe("subagent tool — validation", () => {
 });
 
 describe("subagent tool — tasks", () => {
+  it("passes explicit work kinds from each task to the child record", async () => {
+    const { exec, registry } = makeStack();
+    await exec({ tasks: [{ prompt: "run a suite", work_kind: "test-suite" }], async: true });
+    await flushMicrotasks();
+    expect(registry.list()[0].children[0].workKind).toBe("test-suite");
+  });
+
+  it("attributes local admission wait to queue_ms", async () => {
+    const { exec, registry, factory, clock } = makeStack({ autoComplete: null, maxConcurrentChildren: 1 });
+    await exec({
+      tasks: [
+        { prompt: "first", work_kind: "test" },
+        { prompt: "second", work_kind: "build" },
+      ],
+      async: true,
+    });
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
+    clock.advanceBy(250);
+    factory.sessions[0].complete("first done");
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(2);
+    const child = registry.list()[0].children[1];
+    expect(child.queueMs).toBe(250);
+    expect(child.workKind).toBe("build");
+  });
+
+  it("counts local plus daemon admission wait once in queue_ms", async () => {
+    const { exec, registry, factory, clock } = makeStack({
+      autoComplete: null,
+      maxConcurrentChildren: 1,
+      managerAdmissionDelayMs: 400,
+    });
+    await exec({
+      tasks: [
+        { prompt: "first", name: "first" },
+        { prompt: "second", name: "second" },
+      ],
+      async: true,
+    });
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
+
+    clock.advanceBy(250); // second child waits behind the local slot
+    factory.sessions[0].complete("first done");
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1); // now waiting on the manager permit
+    clock.advanceBy(400);
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(2);
+    let child = registry.list()[0].children[1];
+    expect(child.queueMs).toBe(650);
+
+    factory.sessions[1].complete("second done");
+    await flushMicrotasks();
+    child = registry.list()[0].children[1];
+    expect(child.result?.queueMs).toBe(650);
+  });
+
   it("runs tasks in parallel and returns ordinal-preserved sections", async () => {
     const { exec, factory, notify } = makeStack();
     const result = await exec({ tasks: [{ prompt: "a" }, { prompt: "b", name: "second" }] });

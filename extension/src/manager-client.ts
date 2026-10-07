@@ -19,8 +19,8 @@ import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
 const EXTENSION_VERSION = "0.1.2";
-// 3: speaks in-place upgrade (resends on reconnect, start keys).
-const PROTOCOL = 3;
+// 5: speaks per-kind agent admission and queued acquire.
+const PROTOCOL = 5;
 const HELLO_TIMEOUT_MS = 5000;
 const RECONNECT_HELLO_TIMEOUT_MS = 25_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -166,10 +166,13 @@ interface SpawnAttempt {
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (err: Error) => void;
-  timer: ClockTimer;
+  timer?: ClockTimer;
+  retryTimer?: ClockTimer;
   message: Record<string, unknown>;
   timeoutMs: number;
   retryable: boolean;
+  requestId?: string;
+  removeAbortListener?: () => void;
 }
 
 /** Reassembles `u32 BE length + JSON` frames from a byte stream. */
@@ -277,6 +280,7 @@ export class ManagerClient {
   private helloWaiter: { resolve: () => void; reject: (err: Error) => void } | null = null;
   private eventHandlers = new Set<EventHandler>();
   private reconnectHandlers = new Set<() => void>();
+  private protocolLevel_ = 0;
   private state: ClientState = "disconnected";
   private intentionalClose = false;
   private rebound = false;
@@ -302,6 +306,11 @@ export class ManagerClient {
 
   isAvailable(): boolean {
     return this.state === "connected";
+  }
+
+  /** Maximum protocol level reported by the connected manager; 0 means unknown/legacy. */
+  protocolLevel(): number {
+    return this.protocolLevel_;
   }
 
   /** Last connect/reconnect failure reason (empty when never failed / currently connected). */
@@ -414,6 +423,24 @@ export class ManagerClient {
   async list(all = false): Promise<TaskRecord[]> {
     const res = await this.request({ type: "list", all });
     return ((res.tasks as TaskRecord[] | undefined) ?? []) as TaskRecord[];
+  }
+
+  async acquireAgent(
+    childId: string,
+    workKind = "other",
+    signal?: AbortSignal,
+  ): Promise<{ granted: boolean; rejection?: string }> {
+    if (signal?.aborted) throw new Error("subagent admission cancelled");
+    const message: Record<string, unknown> = { type: "acquire_agent", child_id: childId };
+    if (this.protocolLevel_ >= 5) message.work_kind = workKind;
+    // Protocol 4 has no cancel frame. Keep its immediate acquire correlated so
+    // admission can release a grant that arrives after the generation aborts.
+    const res = await this.request(message, DEFAULT_REQUEST_TIMEOUT_MS, this.protocolLevel_ >= 5 ? signal : undefined, true);
+    return { granted: res.granted === true, ...(typeof res.rejection === "string" ? { rejection: res.rejection } : {}) };
+  }
+
+  async releaseAgent(childId: string): Promise<void> {
+    await this.request({ type: "release_agent", child_id: childId });
   }
 
   /** Daemon status, including optional in-place upgrade metadata. */
@@ -704,7 +731,7 @@ export class ManagerClient {
       this.helloWaiter = { resolve: () => done(), reject: (err) => done(err) };
       this.pending.set(id, {
         resolve: () => done(), reject: (err) => done(err), timer,
-        message: { type: "hello" }, timeoutMs, retryable: false,
+        message: { type: "hello" }, timeoutMs, retryable: false, requestId: id,
       });
       socket.write(
         encodeFrame({
@@ -776,33 +803,88 @@ export class ManagerClient {
     const entry = this.pending.get(id);
     if (!entry) return;
     this.pending.delete(id);
-    this.clock.clearTimeout(entry.timer);
+    if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+    if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
+    entry.removeAbortListener?.();
     if (msg.ok === true) {
+      if (entry.message.type === "hello") {
+        const serverMaximum = typeof msg.protocol === "number" ? msg.protocol : 0;
+        this.protocolLevel_ = Math.min(PROTOCOL, serverMaximum);
+      }
       entry.resolve(msg);
     } else {
       entry.reject(errorFromResponse(msg));
     }
   }
 
-  private request(msg: Record<string, unknown>, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<Record<string, unknown>> {
+  private request(
+    msg: Record<string, unknown>,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal?: AbortSignal,
+    waitForAdmission = false,
+  ): Promise<Record<string, unknown>> {
     const type = String(msg.type);
-    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start"].includes(type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent"].includes(type);
     const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error("subagent admission cancelled"));
+        return;
+      }
       const entry: PendingRequest = {
-        resolve, reject, message: msg, timeoutMs: effectiveTimeoutMs, retryable,
-        timer: this.clock.setTimeout(() => {
-          for (const [id, pending] of this.pending) {
-            if (pending === entry) this.pending.delete(id);
-          }
-          this.queuedRequests.delete(entry);
-          reject(new Error(`pi-famulus request timed out: ${type}`));
-        }, effectiveTimeoutMs),
+        resolve,
+        reject,
+        message: msg,
+        timeoutMs: effectiveTimeoutMs,
+        retryable,
       };
+      const removeEntry = () => {
+        if (entry.requestId) this.pending.delete(entry.requestId);
+        this.queuedRequests.delete(entry);
+        if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+        if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
+        entry.removeAbortListener?.();
+      };
+      const cancelRemoteAcquire = () => {
+        const requestId = entry.requestId;
+        if (type === "acquire_agent" && this.protocolLevel_ >= 5 && requestId) {
+          // Protocol-5 cancellation is retryable across reconnects, so a grant
+          // raced with a dropped socket cannot outlive the cancelled generation.
+          void this.request({
+            type: "cancel_acquire_agent",
+            request_id: requestId,
+            child_id: msg.child_id,
+          }).catch(() => {});
+        }
+      };
+      if (effectiveTimeoutMs > 0 && !(waitForAdmission && signal)) {
+        entry.timer = this.clock.setTimeout(() => {
+          cancelRemoteAcquire();
+          removeEntry();
+          reject(new Error(`pi-famulus request timed out: ${type}`));
+        }, effectiveTimeoutMs);
+      }
+      if (waitForAdmission && type === "acquire_agent") {
+        entry.retryTimer = this.clock.setInterval(() => {
+          const id = entry.requestId;
+          const socket = this.socket;
+          if (!id || this.pending.get(id) !== entry || !socket || this.state !== "connected") return;
+          socket.write(encodeFrame({ v: 1, id, ...entry.message }));
+        }, 3000);
+      }
+      if (signal) {
+        const onAbort = () => {
+          cancelRemoteAcquire();
+          removeEntry();
+          reject(new Error("subagent admission cancelled"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        entry.removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      }
       if (this.socket && this.state === "connected") this.sendPending(entry);
       else if (retryable && (this.reconnecting || this.connecting)) this.queuedRequests.add(entry);
       else {
-        this.clock.clearTimeout(entry.timer);
+        removeEntry();
         reject(new Error("pi-famulus not connected"));
       }
     });
@@ -811,7 +893,8 @@ export class ManagerClient {
   private sendPending(entry: PendingRequest): void {
     const socket = this.socket;
     if (!socket || this.state !== "connected") return;
-    const id = randomUUID();
+    const id = entry.requestId ?? randomUUID();
+    entry.requestId = id;
     this.pending.set(id, entry);
     socket.write(encodeFrame({ v: 1, id, ...entry.message }));
   }
@@ -829,7 +912,9 @@ export class ManagerClient {
     for (const [id, entry] of [...this.pending]) {
       if (entry.retryable && !this.intentionalClose && !this.rebound) continue;
       this.pending.delete(id);
-      this.clock.clearTimeout(entry.timer);
+      if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+      if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
+      entry.removeAbortListener?.();
       entry.reject(new Error("pi-famulus connection lost"));
     }
     if (this.helloWaiter) {
@@ -885,7 +970,9 @@ export class ManagerClient {
   private failAllPending(err: Error): void {
     const entries = new Set([...this.pending.values(), ...this.queuedRequests]);
     for (const entry of entries) {
-      this.clock.clearTimeout(entry.timer);
+      if (entry.timer !== undefined) this.clock.clearTimeout(entry.timer);
+      if (entry.retryTimer !== undefined) this.clock.clearInterval(entry.retryTimer);
+      entry.removeAbortListener?.();
       entry.reject(err);
     }
     this.pending.clear();

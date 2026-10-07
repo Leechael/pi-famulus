@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
+import { reregisterAgentLeases } from "../../src/subagent/admission";
 import { famulusPaths } from "../../src/config";
 
 const RUN = process.env.PI_FAMULUS_INTEG === "1";
@@ -76,6 +77,7 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
   });
 
   it("spawns the daemon on first connect (cold start, §3.1)", async () => {
+    writeFileSync(paths.config, JSON.stringify({ maxAgents: 1 }));
     client = new ManagerClient({ home, sessionId: "integ", managerPath: BIN });
     client.onEvent((e) => events.push(e));
     const ok = await client.connect();
@@ -197,6 +199,41 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     }
     expect(status).toBe("killed");
   });
+
+  it("re-registers a held child lease after the real daemon restarts", async () => {
+    const childId = "ch_reconnect01";
+    const leases = new Map([[childId, "test"]]);
+    expect((await client.acquireAgent(childId, "test")).granted).toBe(true);
+    let signal!: () => void;
+    const reconnected = new Promise<void>((resolve) => { signal = resolve; });
+    client.onReconnect(() => {
+      void reregisterAgentLeases(client, leases).then(signal);
+    });
+    const pid = (JSON.parse(readFileSync(paths.pidFile, "utf8")) as { pid: number }).pid;
+    process.kill(pid, "SIGKILL");
+    let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        reconnected,
+        new Promise<void>((_, reject) => {
+          reconnectTimeout = setTimeout(
+            () => reject(new Error("daemon reconnect did not re-register the child permit")),
+            20000,
+          );
+        }),
+      ]);
+    } finally {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    }
+
+    const competitor = new ManagerClient({ home, sessionId: "competitor", managerPath: BIN });
+    expect(await competitor.connect()).toBe(true);
+    const denied = await competitor.acquireAgent("ch_competitor");
+    expect(denied).toEqual({ granted: false, rejection: "global_capacity" });
+    await competitor.close();
+    await client.releaseAgent(childId);
+    leases.delete(childId);
+  }, 25000);
 
   it("idle reaper: manager exits ~5s after the last connection closes (§3.2)", async () => {
     await client.close();

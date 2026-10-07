@@ -27,11 +27,19 @@ pub(crate) struct Cli {
     pub(crate) cmd: Sub,
 }
 
+#[derive(usage::Subcommands)]
+pub(crate) enum ConfigAction {
+    /// Read a setting.
+    Get { key: String },
+    /// Persist and immediately apply a setting.
+    Set { key: String, value: String },
+}
+
 impl Sub {
     /// Listings and dumps a person reads; not a follow, not an action.
     pub(crate) fn pages(&self) -> bool {
         match self {
-            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } => true,
+            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } | Sub::Top { .. } => true,
             Sub::Agent { follow, .. } | Sub::Events { follow, .. } | Sub::Log { follow, .. } => {
                 !follow
             }
@@ -45,6 +53,9 @@ impl Sub {
 // into it, and the ungrouped section is always rendered first.
 #[derive(usage::Subcommands)]
 pub(crate) enum Sub {
+    /// Read or update runtime daemon configuration.
+    #[usage(display_order = 165, help_heading = "Daemon")]
+    Config { #[usage(subcommand)] action: ConfigAction },
     /// Version, protocol, uptime, sessions, task and agent counts.
     ///
     /// Never starts the daemon ("pi-famulus is not running", exit 1).
@@ -95,7 +106,16 @@ pub(crate) enum Sub {
         #[usage(long)]
         json: bool,
     },
-    /// Shell tasks' wall time and CPU, grouped by agent and/or work kind.
+    /// Cumulative and live task CPU (including monitors) by agent and work kind, with tokens.
+    ///
+    /// A plain-text snapshot; 100% NOW equals one CPU core.
+    #[usage(display_order = 43, help_heading = "Inspection")]
+    Top {
+        /// Machine-readable JSON on stdout.
+        #[usage(long)]
+        json: bool,
+    },
+    /// Retained tasks' wall time and CPU, grouped by agent and/or work kind.
     ///
     /// Covers every retained task record, finished work of gone sessions
     /// included. AGENT is the subagent that ran the task (`main <session>`

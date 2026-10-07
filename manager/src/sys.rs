@@ -7,6 +7,9 @@
 //!
 //! Invariants documented per function.
 
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -227,6 +230,64 @@ pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
         }
     }
     Ok(out)
+}
+
+/// One `/proc` walk for all requested process groups, returning cumulative
+/// user/system CPU ticks by process group. Unreadable or racing processes are
+/// skipped; a missing group entry means no member was readable.
+#[cfg(target_os = "linux")]
+pub fn group_cpu_ticks_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64)>> {
+    let wanted: HashSet<u32> = pgids.iter().copied().collect();
+    let mut totals = HashMap::new();
+    if wanted.is_empty() {
+        return Ok(totals);
+    }
+    for entry in std::fs::read_dir("/proc")?.flatten() {
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `comm` can contain spaces and parentheses. Fields after its last
+        // `)` begin with state (field 3): pgrp is index 2, utime/stime 11/12.
+        let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let (Some(pgrp), Some(user), Some(system)) =
+            (fields.get(2), fields.get(11), fields.get(12))
+        else {
+            continue;
+        };
+        let (Ok(pgrp), Ok(user), Ok(system)) = (
+            pgrp.parse::<u32>(),
+            user.parse::<u64>(),
+            system.parse::<u64>(),
+        ) else {
+            continue;
+        };
+        if wanted.contains(&pgrp) {
+            let total = totals.entry(pgrp).or_insert((0u64, 0u64));
+            total.0 = total.0.saturating_add(user);
+            total.1 = total.1.saturating_add(system);
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn group_cpu_ticks_by_pgid(_pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64)>> {
+    Ok(HashMap::new())
+}
+
+/// Linux clock ticks per second, kept behind the sys module's unsafe boundary.
+#[cfg(target_os = "linux")]
+pub fn clock_ticks_per_second() -> Option<u64> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (ticks > 0).then_some(ticks as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn clock_ticks_per_second() -> Option<u64> {
+    None
 }
 
 /// Is `sig` pending (blocked and delivered) for this process?

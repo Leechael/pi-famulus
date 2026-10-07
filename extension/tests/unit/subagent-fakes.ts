@@ -2,7 +2,7 @@
  * Shared fakes for subagent tests: an event-driven controllable
  * ChildSessionAdapter and a CreateSessionFn factory.
  */
-import type { ChildRunRequest, ChildSessionAdapter, CreateSessionFn } from "../../src/subagent/types";
+import type { ChildRunRequest, ChildSessionAdapter, ChildSessionEvent, ChildTokenUsage, CreateSessionFn } from "../../src/subagent/types";
 import type { AgentDefinition } from "../../src/subagent/types";
 
 export const WORKER_AGENT: AgentDefinition = {
@@ -45,11 +45,12 @@ export class FakeChildSession implements ChildSessionAdapter {
   /** When closed, abort() blocks until openAbortGate() (async abort unwind). */
   abortGateOpen = true;
 
-  private readonly listeners = new Set<(e: { type: string }) => void>();
+  private readonly listeners = new Set<(e: ChildSessionEvent) => void>();
   private idleWaiters: (() => void)[] = [];
   private abortGateWaiters: (() => void)[] = [];
   /** Signals of tools still executing; abort() aborts them (pi semantics). */
-  private readonly runningTools = new Set<AbortController>();
+  private readonly runningTools = new Map<AbortController, string>();
+  private toolIdCounter = 0;
 
   /**
    * Start a tool call, as pi does: tool_execution_start, and the tool gets an
@@ -57,15 +58,17 @@ export class FakeChildSession implements ChildSessionAdapter {
    * shell on that signal (`task.stop reason=tool`), so `signal.aborted` is the
    * observable for "the child's foreground shell was stopped".
    */
-  runTool(): { signal: AbortSignal; end: () => void } {
+  runTool(): { toolCallId: string; signal: AbortSignal; end: () => void } {
     const controller = new AbortController();
-    this.runningTools.add(controller);
-    this.emit({ type: "tool_execution_start" });
+    const toolCallId = `fake-tool-${++this.toolIdCounter}`;
+    this.runningTools.set(controller, toolCallId);
+    this.emit({ type: "tool_execution_start", toolCallId });
     return {
+      toolCallId,
       signal: controller.signal,
       end: () => {
         if (!this.runningTools.delete(controller)) return;
-        this.emit({ type: "tool_execution_end" });
+        this.emit({ type: "tool_execution_end", toolCallId });
       },
     };
   }
@@ -101,7 +104,11 @@ export class FakeChildSession implements ChildSessionAdapter {
     this.emit({ type: "message_update" });
   }
 
-  private emit(e: { type: string }): void {
+  emitEvent(e: ChildSessionEvent): void {
+    this.emit(e);
+  }
+
+  private emit(e: ChildSessionEvent): void {
     for (const l of [...this.listeners]) l(e);
   }
 
@@ -131,7 +138,7 @@ export class FakeChildSession implements ChildSessionAdapter {
 
   async abort(): Promise<void> {
     this.aborts++;
-    for (const tool of this.runningTools) tool.abort();
+    for (const tool of this.runningTools.keys()) tool.abort();
     this.runningTools.clear();
     if (this.hungAbort) {
       // The hung stream never unwinds: abort() never resolves.
@@ -166,6 +173,14 @@ export class FakeChildSession implements ChildSessionAdapter {
     return this.lastAssistantFailure;
   }
 
+  private tokenTotals: ChildTokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+  setTokenUsage(usage: ChildTokenUsage): void {
+    this.tokenTotals = { ...usage };
+  }
+
+  tokenUsage() { return { ...this.tokenTotals }; }
+
   getConversation() {
     const turns = this.prompts.map((text) => ({ role: "user", text }));
     if (this.lastText !== undefined) turns.push({ role: "assistant", text: this.lastText });
@@ -176,7 +191,7 @@ export class FakeChildSession implements ChildSessionAdapter {
     return this.streaming;
   }
 
-  subscribe(listener: (e: { type: string }) => void): () => void {
+  subscribe(listener: (e: ChildSessionEvent) => void): () => void {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);

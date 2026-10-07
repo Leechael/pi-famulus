@@ -166,6 +166,12 @@ pub struct Snapshot {
     /// the manual test clock continues from here).
     #[serde(default)]
     pub clock_now_ms: u64,
+    /// Machine-wide agent permits survive an in-place exec just like tasks.
+    #[serde(default)]
+    pub agent_permits: Vec<(String, String)>,
+    /// Preserve protocol-5 kind and cancel ownership across newer handovers.
+    #[serde(default)]
+    pub agent_permit_details: Vec<(String, String, String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -548,6 +554,19 @@ fn snapshot(
         tasks,
         start_keys: st.start_keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         clock_now_ms: st.clock.now_ms(),
+        agent_permits: st.agent_permits.keys().cloned().collect(),
+        agent_permit_details: st
+            .agent_permits
+            .iter()
+            .map(|((session_id, child_id), permit)| {
+                (
+                    session_id.clone(),
+                    child_id.clone(),
+                    permit.work_kind.clone(),
+                    permit.request_id.clone(),
+                )
+            })
+            .collect(),
     })
 }
 

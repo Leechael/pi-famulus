@@ -30,6 +30,8 @@ const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
 /// Poll interval for a process group that outlived its runner (fallback
 /// only: normally the runner guards its group and its exit says "empty").
 const GROUP_POLL: Duration = Duration::from_millis(500);
+/// Best-effort live process-group CPU refresh interval.
+const LIVE_CPU_POLL: Duration = Duration::from_secs(5);
 
 type OutTx = mpsc::Sender<OutFrame>;
 
@@ -43,10 +45,16 @@ pub struct OutFrame {
 
 impl OutFrame {
     fn plain(bytes: Arc<Vec<u8>>) -> OutFrame {
-        OutFrame { bytes, output: None }
+        OutFrame {
+            bytes,
+            output: None,
+        }
     }
     fn output(bytes: Arc<Vec<u8>>, task_id: &str, next_cursor: u64) -> OutFrame {
-        OutFrame { bytes, output: Some((task_id.to_string(), next_cursor)) }
+        OutFrame {
+            bytes,
+            output: Some((task_id.to_string(), next_cursor)),
+        }
     }
 }
 
@@ -78,6 +86,29 @@ pub struct SessionEntry {
     pub protocol: Option<u32>,
     pub connected_at: u64,
     pub last_seen: u64,
+}
+
+pub struct PendingAgent {
+    session_id: String,
+    child_id: String,
+    work_kind: String,
+    /// One waiter per (session, child); aliases let a resent request id share it.
+    request_ids: Vec<String>,
+    tx: OutTx,
+}
+
+#[derive(Clone)]
+pub struct AgentPermit {
+    pub(crate) work_kind: String,
+    /// Only this request id owns cancellation authority for the held permit.
+    pub(crate) request_id: String,
+}
+
+struct AgentGrant {
+    session_id: String,
+    child_id: String,
+    request_id: String,
+    tx: OutTx,
 }
 
 pub struct DaemonState {
@@ -118,10 +149,29 @@ pub struct DaemonState {
     /// Recent `start` request keys ("<session>\0<key>", task id), oldest
     /// first: a retried start returns the task it already started.
     pub start_keys: std::collections::VecDeque<(String, String)>,
+    /// Agent permits keyed by session and child id.
+    pub agent_permits: HashMap<(String, String), AgentPermit>,
+    /// FIFO requests waiting for a per-kind slot, one entry per child.
+    pub pending_agents: std::collections::VecDeque<PendingAgent>,
+    /// Queued grants that hit a full/closed output channel; retried on session activity.
+    pub undelivered_agent_grants: HashMap<(String, String), String>,
+    /// One-shot cancellation tombstones for cancel/acquire dispatch races.
+    pub cancelled_acquires: HashSet<(String, String, String)>,
+    /// Serializes budget reads with admission commits without holding `state`
+    /// across config metadata/file I/O.
+    pub agent_admission: Arc<Mutex<()>>,
+    /// Cached global budget; per-kind settings remain part of CapacityConfig.
+    pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
 }
 
 /// Bound on remembered start keys.
 const START_KEYS_MAX: usize = 512;
+/// Admission waiters are bounded per session and across the daemon.
+const PENDING_AGENTS_PER_SESSION_MAX: usize = 64;
+const PENDING_AGENTS_GLOBAL_MAX: usize = 256;
+/// A child can have a small number of in-flight request-id aliases, but never
+/// an unbounded number of responses attached to one queue entry.
+const PENDING_AGENT_REQUEST_IDS_MAX: usize = 8;
 
 impl DaemonState {
     fn new(home: PathBuf, registry: Registry, foreground: bool) -> DaemonState {
@@ -148,6 +198,12 @@ impl DaemonState {
             upgrade_pending: false,
             upgrade_ready: None,
             start_keys: std::collections::VecDeque::new(),
+            agent_permits: HashMap::new(),
+            pending_agents: std::collections::VecDeque::new(),
+            undelivered_agent_grants: HashMap::new(),
+            cancelled_acquires: HashSet::new(),
+            agent_admission: Arc::new(Mutex::new(())),
+            agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
         }
     }
 }
@@ -205,12 +261,19 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     let mut registry = Registry::new(home.clone());
     // Test hook: stand in for a scan over a large home (thousands of records).
     if cfg!(debug_assertions) {
-        if let Some(ms) = std::env::var("PI_FAMULUS_TEST_SLOW_SCAN_MS").ok().and_then(|v| v.parse().ok()) {
+        if let Some(ms) = std::env::var("PI_FAMULUS_TEST_SLOW_SCAN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             std::thread::sleep(Duration::from_millis(ms));
         }
     }
     let scan = lifecycle::scan_tasks(&home, &mut registry);
-    let state: Shared = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, foreground)));
+    let state: Shared = Arc::new(Mutex::new(DaemonState::new(
+        home.clone(),
+        registry,
+        foreground,
+    )));
 
     lifecycle::log_line(
         &home,
@@ -263,7 +326,12 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         }
     };
     let live = crate::handover::live_ids(&restored);
-    let crate::handover::Restored { snap, listener, lock, entries } = restored;
+    let crate::handover::Restored {
+        snap,
+        listener,
+        lock,
+        entries,
+    } = restored;
     let mut registry = Registry::new(home.clone());
     lifecycle::scan_tasks_except(&home, &mut registry, &live);
     for e in entries {
@@ -298,6 +366,33 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     for (sid, key) in snap.start_keys.iter().cloned() {
         st.start_keys.push_back((sid, key));
     }
+    if snap.agent_permit_details.is_empty() {
+        // Compatibility with pre-work-kind handover snapshots: retain these
+        // global permits, but they have no kind/cancellation owner to restore.
+        st.agent_permits
+            .extend(snap.agent_permits.iter().cloned().map(|key| {
+                (
+                    key,
+                    AgentPermit {
+                        work_kind: String::new(),
+                        request_id: String::new(),
+                    },
+                )
+            }));
+    } else {
+        st.agent_permits
+            .extend(snap.agent_permit_details.into_iter().map(
+                |(session_id, child_id, work_kind, request_id)| {
+                    (
+                        (session_id, child_id),
+                        AgentPermit {
+                            work_kind,
+                            request_id,
+                        },
+                    )
+                },
+            ));
+    }
     let clock = st.clock.clone();
     clock.resume_at(snap.clock_now_ms);
     let state: Shared = Arc::new(Mutex::new(st));
@@ -320,20 +415,65 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     let s2 = state.clone();
     tokio::spawn(async move {
         clock.sleep("handover-grace", HANDOVER_GRACE).await;
-        s2.lock().unwrap().hold_idle = false;
+        let (home, admission_lock) = {
+            let st = s2.lock().unwrap();
+            (st.home.clone(), st.agent_admission.clone())
+        };
+        // Reconciliation can grant queued children after reclaiming leases.
+        // Read config outside `state`, and serialize its snapshot with direct
+        // admissions before committing those grants.
+        let _admission = admission_lock.lock().unwrap();
+        let capacity = crate::capacity::load(&home).ok();
+        let wake = {
+            let mut st = s2.lock().unwrap();
+            st.hold_idle = false;
+            reap_disconnected_agent_permits(&mut st);
+            capacity
+                .as_ref()
+                .map(|capacity| wake_pending_with_capacity(&mut st, capacity))
+                .unwrap_or_default()
+        };
+        drop(_admission);
+        send_agent_grants(&s2, wake);
         maybe_arm_idle_timer(&s2);
     });
     serve(state, listener, lock).await
 }
 
+/// Handover keeps permits while sessions have a chance to reconnect. Once
+/// that grace ends, sessions still disconnected cannot own live children.
+fn reap_disconnected_agent_permits(st: &mut DaemonState) {
+    let connected: HashSet<String> = st
+        .sessions
+        .iter()
+        .filter_map(|(sid, session)| session.conn_id.map(|_| sid.clone()))
+        .collect();
+    // A permit carries its work kind, so removing its owner also removes that
+    // kind's usage. Do not reap a lease whose session reconnected during grace.
+    st.agent_permits.retain(|(sid, _), _| connected.contains(sid));
+    st.pending_agents
+        .retain(|pending| connected.contains(&pending.session_id));
+    st.cancelled_acquires
+        .retain(|(sid, _, _)| connected.contains(sid));
+    let active_permits: HashSet<(String, String)> = st.agent_permits.keys().cloned().collect();
+    st.undelivered_agent_grants.retain(|(sid, _), child_id| {
+        connected.contains(sid) && active_permits.contains(&(sid.clone(), child_id.clone()))
+    });
+}
+
 /// The accept loop, shared by a fresh daemon and one restored after an
 /// in-place upgrade. Also runs the upgrade itself when asked.
-async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
+async fn serve(
+    state: Shared,
+    listener: tokio::net::UnixListener,
+    daemon_lock: lifecycle::DaemonLockGuard,
+) -> i32 {
     use std::os::fd::AsRawFd;
     let home = state.lock().unwrap().home.clone();
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
+    let live_cpu_sampler = spawn_live_cpu_sampler(&state);
     // In-place upgrade when the binary on disk changes.
     spawn_exe_watch(&state);
     #[cfg(feature = "test-clock")]
@@ -347,7 +487,8 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
         let st = state.lock().unwrap();
         (st.shutdown_notify.clone(), st.upgrade_notify.clone())
     };
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
     // Keep accepting while shutting down: a new client then gets a prompt
@@ -402,8 +543,74 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
             } => break,
         }
     }
+    live_cpu_sampler.abort();
     drop(daemon_lock);
     0
+}
+
+fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut tracker = task::LiveCpuTracker::default();
+        loop {
+            tokio::time::sleep(LIVE_CPU_POLL).await;
+            let running: Vec<(String, u32)> = {
+                let st = state.lock().unwrap();
+                st.registry
+                    .tasks
+                    .values()
+                    .filter(|entry| entry.record.status == TaskStatus::Running)
+                    .map(|entry| (entry.record.task_id.clone(), entry.record.pid))
+                    .collect()
+            };
+            let active: HashSet<String> = running.iter().map(|(id, _)| id.clone()).collect();
+            tracker.retain(&active);
+            let at = std::time::Instant::now();
+            let sampled_at = now_ms();
+            let pgids: Vec<u32> = running.iter().map(|(_, pgid)| *pgid).collect();
+            let samples = task::live_group_cpu_ms_many(&pgids);
+            let readings: Vec<(String, Option<task::LiveCpuReading>)> = running
+                .into_iter()
+                .map(|(id, pgid)| {
+                    let reading = match samples.get(&pgid).copied().flatten() {
+                        Some((user, system)) => Some(tracker.update(&id, at, user, system)),
+                        None => {
+                            tracker.mark_unavailable(&id);
+                            None
+                        }
+                    };
+                    (id, reading)
+                })
+                .collect();
+            if readings.is_empty() {
+                continue;
+            }
+            let mut st = state.lock().unwrap();
+            for (id, reading) in readings {
+                let Some(entry) = st.registry.tasks.get_mut(&id) else { continue };
+                if entry.record.status != TaskStatus::Running {
+                    continue;
+                }
+                apply_live_cpu_sample(&mut entry.record, reading, sampled_at);
+            }
+        }
+    })
+}
+
+fn apply_live_cpu_sample(record: &mut TaskRecord, reading: Option<task::LiveCpuReading>, sampled_at: u64) {
+    match reading {
+        Some(reading) => {
+            record.live_cpu_user_ms = Some(record.live_cpu_user_ms.unwrap_or(0).max(reading.user_ms));
+            record.live_cpu_sys_ms = Some(record.live_cpu_sys_ms.unwrap_or(0).max(reading.system_ms));
+            record.live_cpu_percent = reading.percent;
+            record.live_cpu_sampled_at = Some(sampled_at);
+            record.live_cpu_stale = false;
+        }
+        None => {
+            record.live_cpu_percent = None;
+            record.live_cpu_stale = true;
+        }
+    }
 }
 
 /// Poll the resolved install path for this daemon's executable. A path change
@@ -418,7 +625,9 @@ fn spawn_exe_watch(state: &Shared) {
     }
     let ident = |p: &std::path::Path| {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
+        std::fs::metadata(p)
+            .ok()
+            .map(|m| (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
     };
     let state2 = state.clone();
     tokio::spawn(async move {
@@ -469,8 +678,8 @@ fn valid_session_id(s: &str) -> bool {
 }
 
 fn parse_request(bytes: &[u8]) -> Result<Request, (String, String)> {
-    let v: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| (String::new(), format!("invalid JSON: {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| (String::new(), format!("invalid JSON: {e}")))?;
     let id = v
         .get("id")
         .and_then(|x| x.as_str())
@@ -532,7 +741,13 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         (st.writers.clone(), st.inflight.clone())
     };
     let written: Written = Arc::new(Mutex::new(HashMap::new()));
-    let writer = tokio::spawn(writer_task(wr, rx, written.clone(), CountGuard::new(&writers))).abort_handle();
+    let writer = tokio::spawn(writer_task(
+        wr,
+        rx,
+        written.clone(),
+        CountGuard::new(&writers),
+    ))
+    .abort_handle();
 
     // ---- hello: must be the first message on the connection (§3.3) ----
     let first = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut rd)).await {
@@ -548,7 +763,10 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         }
         Err(_) => {
             let home = state.lock().unwrap().home.clone();
-            lifecycle::log_line(&home, &format!("connection closed: no hello within {HELLO_TIMEOUT:?}"));
+            lifecycle::log_line(
+                &home,
+                &format!("connection closed: no hello within {HELLO_TIMEOUT:?}"),
+            );
             return;
         }
     };
@@ -562,7 +780,10 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
     // Test-only manual-clock requests: answered before (instead of) hello,
     // so they never count as an active connection or cancel the idle timer.
     #[cfg(feature = "test-clock")]
-    if matches!(hello.kind, RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) {
+    if matches!(
+        hello.kind,
+        RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }
+    ) {
         respond(&tx, &hello.id, handle_clock(&state, &hello.kind)).await;
         return;
     }
@@ -572,7 +793,11 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
     }
     if matches!(hello.v, Some(v) if v != PROTO_VERSION) {
         let _ = tx
-            .send(encode_error(&hello.id, E_VERSION, "unsupported protocol version"))
+            .send(encode_error(
+                &hello.id,
+                E_VERSION,
+                "unsupported protocol version",
+            ))
             .await;
         return;
     }
@@ -596,7 +821,11 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         ),
         _ => {
             let _ = tx
-                .send(encode_error(&hello.id, E_BAD_REQUEST, "first message must be hello"))
+                .send(encode_error(
+                    &hello.id,
+                    E_BAD_REQUEST,
+                    "first message must be hello",
+                ))
                 .await;
             return;
         }
@@ -615,7 +844,17 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         }
     }
 
-    let conn_id = match register_conn(&state, &tx, &die, &written, &writer, client_kind, session_id, pi_pid, info) {
+    let conn_id = match register_conn(
+        &state,
+        &tx,
+        &die,
+        &written,
+        &writer,
+        client_kind,
+        session_id,
+        pi_pid,
+        info,
+    ) {
         Ok(id) => id,
         Err(e) => {
             let _ = tx.send(encode_error(&hello.id, &e.code, &e.message)).await;
@@ -630,6 +869,7 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
                 version: crate::VERSION.to_string(),
                 pid: std::process::id(),
                 started_at,
+                protocol: PROTOCOL,
             },
         ))
         .await;
@@ -659,7 +899,11 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         };
         if matches!(req.v, Some(v) if v != PROTO_VERSION) {
             let _ = tx
-                .send(encode_error(&req.id, E_VERSION, "unsupported protocol version"))
+                .send(encode_error(
+                    &req.id,
+                    E_VERSION,
+                    "unsupported protocol version",
+                ))
                 .await;
             continue;
         }
@@ -667,17 +911,28 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         let tx2 = tx.clone();
         let guard = CountGuard::new(&inflight);
         let mut park = state.lock().unwrap().park_tx.subscribe();
-        tokio::spawn(async move {
-            // An in-place upgrade cancels requests at their next await and
-            // leaves them unanswered: the client resends them after it
-            // reconnects to the new image.
+        if matches!(&req.kind, RequestKind::AcquireAgent { .. }) {
+            // Preserve wire arrival order for admission requests on one
+            // connection. Other RPCs can remain pipelined in independent tasks.
             tokio::select! {
                 biased;
                 _ = task::parked(&mut park) => {}
                 _ = dispatch(s2, conn_id, req, tx2) => {}
             }
             drop(guard);
-        });
+        } else {
+            tokio::spawn(async move {
+                // An in-place upgrade cancels requests at their next await and
+                // leaves them unanswered: the client resends them after it
+                // reconnects to the new image.
+                tokio::select! {
+                    biased;
+                    _ = task::parked(&mut park) => {}
+                    _ = dispatch(s2, conn_id, req, tx2) => {}
+                }
+                drop(guard);
+            });
+        }
     }
 
     // ---- disconnect (§3.2: socket close marks the session disconnected) ----
@@ -724,7 +979,9 @@ fn register_conn(
         let old = st.sessions.get(&sid).and_then(|s| s.conn_id);
         if let Some(old_id) = old {
             if let Some(old_h) = st.conns.get(&old_id) {
-                let _ = old_h.tx.try_send(encode_event(&EventKind::SessionRebound {}));
+                let _ = old_h
+                    .tx
+                    .try_send(encode_event(&EventKind::SessionRebound {}));
                 old_h.die.notify_one();
             }
             remove_conn(&mut st, old_id, "rebound");
@@ -780,6 +1037,13 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
                 if s.conn_id == Some(conn_id) {
                     s.conn_id = None; // session now disconnected (§3.2)
                     s.last_seen = now_ms();
+                    st.pending_agents.retain(|p| p.session_id != *sid);
+                    st.cancelled_acquires.retain(|(owner, _, _)| owner != sid);
+                    if why == "closed" {
+                        st.agent_permits.retain(|(owner, _), _| owner != sid);
+                        st.undelivered_agent_grants
+                            .retain(|(owner, _), _| owner != sid);
+                    }
                     crate::events::emit(
                         &home,
                         Some(sid),
@@ -793,6 +1057,8 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
         for t in st.registry.tasks.values_mut() {
             t.watchers.remove(&conn_id);
         }
+        let wake = wake_pending(st);
+        send_agent_grants_locked(st, wake);
     }
 }
 
@@ -807,7 +1073,10 @@ pub struct Carried {
 /// Close every client connection (an in-place upgrade). Returns the output
 /// subscriptions to carry over and the connections' writers; call
 /// [`carry_watches`] once the writers flushed or were aborted.
-pub fn close_all_connections(state: &Shared, why: &str) -> (Vec<Carried>, Vec<tokio::task::AbortHandle>) {
+pub fn close_all_connections(
+    state: &Shared,
+    why: &str,
+) -> (Vec<Carried>, Vec<tokio::task::AbortHandle>) {
     let mut st = state.lock().unwrap();
     let conns: HashMap<u64, (Option<String>, Written)> = st
         .conns
@@ -819,7 +1088,11 @@ pub fn close_all_connections(state: &Shared, why: &str) -> (Vec<Carried>, Vec<to
     for (tid, e) in st.registry.tasks.iter_mut() {
         for w in std::mem::take(&mut e.watchers) {
             if let Some((Some(sid), written)) = conns.get(&w) {
-                carried.push(Carried { task_id: tid.clone(), session_id: sid.clone(), written: written.clone() });
+                carried.push(Carried {
+                    task_id: tid.clone(),
+                    session_id: sid.clone(),
+                    written: written.clone(),
+                });
             }
         }
     }
@@ -839,9 +1112,21 @@ pub fn close_all_connections(state: &Shared, why: &str) -> (Vec<Carried>, Vec<to
 pub fn carry_watches(state: &Shared, carried: Vec<Carried>) {
     let mut st = state.lock().unwrap();
     for c in carried {
-        let Some(e) = st.registry.tasks.get_mut(&c.task_id) else { continue };
-        let cursor = c.written.lock().unwrap().get(&c.task_id).copied().unwrap_or(0);
-        match e.watch_sessions.iter_mut().find(|(s, _)| *s == c.session_id) {
+        let Some(e) = st.registry.tasks.get_mut(&c.task_id) else {
+            continue;
+        };
+        let cursor = c
+            .written
+            .lock()
+            .unwrap()
+            .get(&c.task_id)
+            .copied()
+            .unwrap_or(0);
+        match e
+            .watch_sessions
+            .iter_mut()
+            .find(|(s, _)| *s == c.session_id)
+        {
             Some((_, at)) => *at = (*at).min(cursor),
             None => e.watch_sessions.push((c.session_id, cursor)),
         }
@@ -863,10 +1148,14 @@ const REPLAY_MAX: u64 = 8 * 1024 * 1024;
 /// what the connection got).
 fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
     let mut st = state.lock().unwrap();
-    let Some(sid) = st.conns.get(&conn_id).and_then(|h| h.session_id.clone()) else { return };
+    let Some(sid) = st.conns.get(&conn_id).and_then(|h| h.session_id.clone()) else {
+        return;
+    };
     let st_conns_written = st.conns.get(&conn_id).map(|h| h.written.clone());
     for (tid, e) in st.registry.tasks.iter_mut() {
-        let Some(i) = e.watch_sessions.iter().position(|(s, _)| *s == sid) else { continue };
+        let Some(i) = e.watch_sessions.iter().position(|(s, _)| *s == sid) else {
+            continue;
+        };
         let (_, from) = e.watch_sessions.remove(i);
         e.watchers.insert(conn_id);
         if let Some(h) = st_conns_written.as_ref() {
@@ -876,7 +1165,9 @@ fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
         let mut cursor = from.max(to.saturating_sub(REPLAY_MAX));
         while cursor < to {
             let want = ((to - cursor) as usize).min(256 * 1024);
-            let Ok((bytes, _)) = task::read_file_range(std::path::Path::new(&e.record.output_path), cursor, want) else {
+            let Ok((bytes, _)) =
+                task::read_file_range(std::path::Path::new(&e.record.output_path), cursor, want)
+            else {
                 break;
             };
             if bytes.is_empty() {
@@ -884,7 +1175,13 @@ fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
             }
             // `to` is on a character boundary (the fanout never counts a
             // held-back tail), so only the 256 KiB cut needs care.
-            let n = task::utf8_chunk_len(&bytes, want, CHUNK_JSON_BUDGET, cursor + (bytes.len() as u64) < to).max(1);
+            let n = task::utf8_chunk_len(
+                &bytes,
+                want,
+                CHUNK_JSON_BUDGET,
+                cursor + (bytes.len() as u64) < to,
+            )
+            .max(1);
             let chunk = &bytes[..n.min(bytes.len())];
             cursor += chunk.len() as u64;
             let ev = encode_event_bytes(&EventKind::Output {
@@ -914,8 +1211,14 @@ fn spawn_session_gc(state: &Shared) {
             default
         }
     };
-    let retention = read(crate::gc::retention_ms(&home), crate::gc::DEFAULT_RETENTION_MS);
-    let task_retention = read(crate::gc::task_retention_ms(&home), crate::gc::DEFAULT_TASK_RETENTION_MS);
+    let retention = read(
+        crate::gc::retention_ms(&home),
+        crate::gc::DEFAULT_RETENTION_MS,
+    );
+    let task_retention = read(
+        crate::gc::task_retention_ms(&home),
+        crate::gc::DEFAULT_TASK_RETENTION_MS,
+    );
     run_session_gc(state, retention);
     run_task_gc(state, task_retention);
     let state2 = state.clone();
@@ -943,7 +1246,11 @@ fn run_task_gc(state: &Shared, retention_ms: u64) {
             .tasks
             .values()
             .filter(|e| !e.owns_live_group())
-            .filter(|e| e.record.ended_at.is_some_and(|t| now.saturating_sub(t) >= retention_ms))
+            .filter(|e| {
+                e.record
+                    .ended_at
+                    .is_some_and(|t| now.saturating_sub(t) >= retention_ms)
+            })
             .map(|e| e.record.clone())
             .collect();
         (st.home.clone(), candidates)
@@ -962,7 +1269,11 @@ fn run_task_gc(state: &Shared, retention_ms: u64) {
             let output = PathBuf::from(&r.output_path);
             remove_file_if_present(&crate::task::stderr_path_for(&output))
                 && remove_file_if_present(&output)
-                && remove_file_if_present(&registry::task_json_path(&home, &r.session_id, &r.task_id))
+                && remove_file_if_present(&registry::task_json_path(
+                    &home,
+                    &r.session_id,
+                    &r.task_id,
+                ))
         })
         .map(|r| r.task_id)
         .collect();
@@ -977,7 +1288,11 @@ fn run_task_gc(state: &Shared, retention_ms: u64) {
     }
     lifecycle::log_line(
         &home,
-        &format!("gc: removed {} finished task(s): {}", removed.len(), crate::gc::log_ids(&removed)),
+        &format!(
+            "gc: removed {} finished task(s): {}",
+            removed.len(),
+            crate::gc::log_ids(&removed)
+        ),
     );
 }
 
@@ -1010,11 +1325,17 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
         return;
     }
     let gone: HashSet<&String> = removed.iter().collect();
-    st.registry.tasks.retain(|_, e| !gone.contains(&e.record.session_id));
+    st.registry
+        .tasks
+        .retain(|_, e| !gone.contains(&e.record.session_id));
     st.sessions.retain(|sid, _| !gone.contains(sid));
     lifecycle::log_line(
         &home,
-        &format!("gc: removed {} gone session(s): {}", removed.len(), crate::gc::log_ids(&removed)),
+        &format!(
+            "gc: removed {} gone session(s): {}",
+            removed.len(),
+            crate::gc::log_ids(&removed)
+        ),
     );
     crate::events::emit(
         &home,
@@ -1028,7 +1349,12 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
 /// §3.2: arm the 5s idle timer when the last active connection went away.
 pub fn maybe_arm_idle_timer(state: &Shared) {
     let mut st = state.lock().unwrap();
-    if st.shutdown || st.upgrading || st.hold_idle || !st.conns.is_empty() || st.idle_timer.is_some() {
+    if st.shutdown
+        || st.upgrading
+        || st.hold_idle
+        || !st.conns.is_empty()
+        || st.idle_timer.is_some()
+    {
         return;
     }
     let state2 = state.clone();
@@ -1056,11 +1382,16 @@ pub fn maybe_arm_idle_timer(state: &Shared) {
 // ---------------------------------------------------------------------------
 
 async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
+    let re_served_grants = service_unconfirmed_agent_grants(&state, conn_id, &tx);
     let id = req.id;
     match req.kind {
         RequestKind::Hello { .. } => {
             let _ = tx
-                .send(encode_error(&id, E_BAD_REQUEST, "connection already said hello"))
+                .send(encode_error(
+                    &id,
+                    E_BAD_REQUEST,
+                    "connection already said hello",
+                ))
                 .await;
         }
         RequestKind::Start {
@@ -1088,22 +1419,46 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             respond(&tx, &id, handle_mark_background(&state, conn_id, &task_id)).await
         }
         RequestKind::Wait { task_id, budget_ms } => {
-            respond(&tx, &id, handle_wait(&state, conn_id, &task_id, budget_ms).await).await
+            respond(
+                &tx,
+                &id,
+                handle_wait(&state, conn_id, &task_id, budget_ms).await,
+            )
+            .await
         }
         RequestKind::Output {
             task_id,
             cursor,
             max_bytes,
-        } => respond(&tx, &id, handle_output(&state, conn_id, &task_id, cursor, max_bytes)).await,
+        } => {
+            respond(
+                &tx,
+                &id,
+                handle_output(&state, conn_id, &task_id, cursor, max_bytes),
+            )
+            .await
+        }
         RequestKind::Stop { task_id, reason } => {
-            respond(&tx, &id, handle_stop(&state, conn_id, &task_id, reason.as_deref())).await
+            respond(
+                &tx,
+                &id,
+                handle_stop(&state, conn_id, &task_id, reason.as_deref()),
+            )
+            .await
         }
         RequestKind::List {
             all,
             session_id,
             paged,
             after,
-        } => respond(&tx, &id, handle_list(&state, conn_id, all, session_id, paged, after)).await,
+        } => {
+            respond(
+                &tx,
+                &id,
+                handle_list(&state, conn_id, all, session_id, paged, after),
+            )
+            .await
+        }
         RequestKind::Watch { task_id } => {
             respond(&tx, &id, handle_watch(&state, conn_id, &task_id, true)).await
         }
@@ -1114,6 +1469,44 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             respond(&tx, &id, handle_shutdown_session(&state, conn_id)).await
         }
         RequestKind::Status => respond(&tx, &id, handle_status(&state, conn_id)).await,
+        RequestKind::AcquireAgent {
+            child_id,
+            work_kind,
+        } => {
+            handle_acquire_agent(
+                &state,
+                conn_id,
+                &child_id,
+                &work_kind,
+                &id,
+                &re_served_grants,
+                &tx,
+            )
+            .await;
+        }
+        RequestKind::CancelAcquireAgent {
+            request_id,
+            child_id,
+        } => match handle_cancel_acquire(&state, conn_id, &request_id, &child_id) {
+            Ok(wake) => {
+                respond::<UnitOk>(&tx, &id, Ok(UnitOk {})).await;
+                send_agent_grants(&state, wake);
+            }
+            Err(error) => respond::<UnitOk>(&tx, &id, Err(error)).await,
+        },
+        RequestKind::CapacityChanged => {
+            let result = handle_capacity_changed(&state, conn_id);
+            match result {
+                Ok(wake) => {
+                    respond::<UnitOk>(&tx, &id, Ok(UnitOk {})).await;
+                    send_agent_grants(&state, wake);
+                }
+                Err(error) => respond::<UnitOk>(&tx, &id, Err(error)).await,
+            }
+        }
+        RequestKind::ReleaseAgent { child_id } => {
+            respond(&tx, &id, handle_release_agent(&state, conn_id, &child_id)).await;
+        }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
         #[cfg(feature = "test-clock")]
@@ -1132,7 +1525,10 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
 /// runner's lifeline breaks and takes its group down. Polls in real time.
 #[cfg(feature = "test-clock")]
 fn spawn_test_owner_watch(home: &std::path::Path) {
-    let Some(owner) = std::env::var("PI_FAMULUS_TEST_OWNER").ok().and_then(|v| v.parse::<u32>().ok()) else {
+    let Some(owner) = std::env::var("PI_FAMULUS_TEST_OWNER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    else {
         return;
     };
     let home = home.to_path_buf();
@@ -1147,7 +1543,10 @@ fn spawn_test_owner_watch(home: &std::path::Path) {
 
 /// Test-only: inspect or advance the manual clock (`test-clock` feature).
 #[cfg(feature = "test-clock")]
-fn handle_clock(state: &Shared, req: &RequestKind) -> Result<crate::clock::ClockStatus, ProtoError> {
+fn handle_clock(
+    state: &Shared,
+    req: &RequestKind,
+) -> Result<crate::clock::ClockStatus, ProtoError> {
     let clock = state.lock().unwrap().clock.clone();
     let Some(m) = clock.manual() else {
         return Err(ProtoError::new(
@@ -1171,7 +1570,19 @@ async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoErro
     if frame.bytes.len() > MAX_FRAME_SIZE as usize {
         frame = encode_error(id, E_INTERNAL, "response exceeds the 4 MiB frame limit");
     }
+    #[cfg(debug_assertions)]
+    mark_test_writer_queue_full(tx, id);
     let _ = tx.send(frame).await;
+}
+
+#[cfg(debug_assertions)]
+fn mark_test_writer_queue_full(tx: &OutTx, id: &str) {
+    if !id.starts_with("p16-status-") || tx.capacity() != 0 {
+        return;
+    }
+    if let Some(marker) = std::env::var_os("PI_FAMULUS_TEST_WRITER_QUEUE_FULL_MARKER") {
+        let _ = std::fs::write(marker, b"full");
+    }
 }
 
 fn encode_ok<T: Serialize>(id: &str, body: &T) -> OutFrame {
@@ -1275,10 +1686,18 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     if let Some(k) = &key {
         let st = state.lock().unwrap();
         let want = format!("{session_id}\u{0}{k}");
-        let prior = st.start_keys.iter().rev().find(|(sk, _)| *sk == want).map(|(_, t)| t.clone());
+        let prior = st
+            .start_keys
+            .iter()
+            .rev()
+            .find(|(sk, _)| *sk == want)
+            .map(|(_, t)| t.clone());
         if let Some(tid) = prior {
             if let Some(e) = st.registry.tasks.get(&tid) {
-                return Ok(StartOk { task_id: tid, pid: e.record.pid });
+                return Ok(StartOk {
+                    task_id: tid,
+                    pid: e.record.pid,
+                });
             }
         }
     }
@@ -1328,6 +1747,11 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         cpu_user_ms: None,
         cpu_sys_ms: None,
         max_rss_kb: None,
+        live_cpu_user_ms: None,
+        live_cpu_sys_ms: None,
+        live_cpu_percent: None,
+        live_cpu_sampled_at: None,
+        live_cpu_stale: false,
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -1361,7 +1785,8 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         }
         st.registry.tasks.insert(task_id.clone(), entry);
         if let Some(k) = &key {
-            st.start_keys.push_back((format!("{session_id}\u{0}{k}"), task_id.clone()));
+            st.start_keys
+                .push_back((format!("{session_id}\u{0}{k}"), task_id.clone()));
             while st.start_keys.len() > START_KEYS_MAX {
                 st.start_keys.pop_front();
             }
@@ -1482,7 +1907,12 @@ fn handle_output(
     // A truncated sequence at the end of the data is held back while the task
     // can still write the rest. (One straddling the cap never looks truncated:
     // the lookahead always holds the whole character.)
-    let n = task::utf8_chunk_len(&bytes, cap, CHUNK_JSON_BUDGET, status == TaskStatus::Running);
+    let n = task::utf8_chunk_len(
+        &bytes,
+        cap,
+        CHUNK_JSON_BUDGET,
+        status == TaskStatus::Running,
+    );
     bytes.truncate(n);
     let next_cursor = cursor + bytes.len() as u64;
     Ok(OutputOk {
@@ -1504,7 +1934,10 @@ fn handle_stop(
         if !STOP_REASONS.contains(&r) {
             return Err(ProtoError::new(
                 E_BAD_REQUEST,
-                format!("unknown stop reason {r:?} (expected one of {})", STOP_REASONS.join(", ")),
+                format!(
+                    "unknown stop reason {r:?} (expected one of {})",
+                    STOP_REASONS.join(", ")
+                ),
             ));
         }
     }
@@ -1536,7 +1969,11 @@ fn handle_stop(
 
 /// Observability: record that the extension moved a task to the background.
 /// Idempotent (the first time is kept); a no-op on a finished task.
-fn handle_mark_background(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, ProtoError> {
+fn handle_mark_background(
+    state: &Shared,
+    conn_id: u64,
+    task_id: &str,
+) -> Result<UnitOk, ProtoError> {
     let (home, rec) = {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
@@ -1600,7 +2037,13 @@ pub fn rearm_kill_reaper(state: &Shared, task_id: &str, pid: u32, left: Duration
     arm_kill_reaper(state, task_id, pid, clock, left);
 }
 
-fn arm_kill_reaper(state: &Shared, task_id: &str, pid: u32, clock: crate::clock::Clock, grace: Duration) {
+fn arm_kill_reaper(
+    state: &Shared,
+    task_id: &str,
+    pid: u32,
+    clock: crate::clock::Clock,
+    grace: Duration,
+) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     tokio::spawn(async move {
@@ -1720,7 +2163,11 @@ fn handle_watch(
         e.watchers.insert(conn_id);
         let base = e.delivered_cursor;
         if let Some(h) = st.conns.get(&conn_id) {
-            h.written.lock().unwrap().entry(task_id.to_string()).or_insert(base);
+            h.written
+                .lock()
+                .unwrap()
+                .entry(task_id.to_string())
+                .or_insert(base);
         }
     } else {
         e.watchers.remove(&conn_id);
@@ -1780,7 +2227,454 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
     })
 }
 
+async fn handle_acquire_agent(
+    state: &Shared,
+    conn_id: u64,
+    child_id: &str,
+    work_kind: &str,
+    request_id: &str,
+    re_served_grants: &HashSet<String>,
+    tx: &OutTx,
+) {
+    let session = {
+        let st = state.lock().unwrap();
+        st.conns.get(&conn_id).and_then(|c| {
+            c.session_id.as_ref().map(|sid| {
+                (
+                    sid.clone(),
+                    st.sessions.get(sid).and_then(|s| s.protocol).unwrap_or(0),
+                    st.home.clone(),
+                    st.agent_budget.clone(),
+                    st.agent_admission.clone(),
+                )
+            })
+        })
+    };
+    let Some((sid, client_protocol, home, budget_cache, admission_lock)) = session else {
+        respond::<AgentAdmissionOk>(
+            tx,
+            request_id,
+            Err(ProtoError::new(
+                E_SESSION_REQUIRED,
+                "extension session required",
+            )),
+        )
+        .await;
+        return;
+    };
+    // The #46 global budget cache remains authoritative for the machine-wide
+    // cap. Serialize its refresh and this state commit so an older read cannot
+    // overtake a newer admission; config I/O remains outside `state`.
+    let admission = admission_lock.lock().unwrap();
+    let global_budget = budget_cache.lock().unwrap().get(&home);
+    #[cfg(debug_assertions)]
+    pause_after_agent_budget_read(child_id);
+    // Per-kind settings are loaded alongside the global cap for v5 scheduling.
+    let capacity = crate::capacity::load(&home);
+    let (result, wake) = {
+        let mut st = state.lock().unwrap();
+        if st
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.session_id.as_deref())
+            != Some(sid.as_str())
+        {
+            (
+                Some(Err(ProtoError::new(
+                    E_SESSION_REQUIRED,
+                    "extension session required",
+                ))),
+                Vec::new(),
+            )
+        } else {
+            let request_key = (sid.clone(), child_id.to_string(), request_id.to_string());
+            if st.cancelled_acquires.remove(&request_key) {
+                (None, Vec::new())
+            } else {
+                let wake = match &capacity {
+                    Ok(capacity) => wake_pending_with_capacity(&mut st, capacity),
+                    Err(_) => Vec::new(),
+                };
+                let key = (sid.clone(), child_id.to_string());
+                let grant_still_undelivered = st
+                    .undelivered_agent_grants
+                    .get(&(sid.clone(), request_id.to_string()))
+                    .is_some_and(|owner| owner == child_id);
+                if st.agent_permits.contains_key(&key)
+                    && (grant_still_undelivered || re_served_grants.contains(request_id))
+                {
+                    // A queued grant is already being (re-)served under this id.
+                    (None, wake)
+                } else if st.agent_permits.contains_key(&key) {
+                    // Acquires are idempotent per (session, child). Reconnects and
+                    // same-id backpressure retries must never consume another slot.
+                    (
+                        Some(Ok(AgentAdmissionOk {
+                            granted: true,
+                            rejection: None,
+                        })),
+                        wake,
+                    )
+                } else if let Some(pending) = st
+                    .pending_agents
+                    .iter_mut()
+                    .find(|p| p.session_id == sid && p.child_id == child_id)
+                {
+                    if !pending.request_ids.iter().any(|id| id == request_id) {
+                        if pending.request_ids.len() >= PENDING_AGENT_REQUEST_IDS_MAX {
+                            (
+                                Some(Ok(AgentAdmissionOk {
+                                    granted: false,
+                                    rejection: Some("capacity_queue_full".into()),
+                                })),
+                                wake,
+                            )
+                        } else {
+                            pending.request_ids.push(request_id.to_string());
+                            (None, wake)
+                        }
+                    } else {
+                        (None, wake)
+                    }
+                } else {
+                    let budget = global_budget
+                        .as_ref()
+                        .map(|budget| *budget)
+                        .map_err(|error| {
+                            ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
+                        });
+                    match budget {
+                        Err(error) => (Some(Err(error)), wake),
+                        Ok(budget) if st.agent_permits.len() >= budget => (
+                            Some(Ok(AgentAdmissionOk {
+                                granted: false,
+                                rejection: Some("global_capacity".into()),
+                            })),
+                            wake,
+                        ),
+                        Ok(_) if client_protocol < 5 => {
+                            st.agent_permits.insert(
+                                key,
+                                AgentPermit {
+                                    work_kind: String::new(),
+                                    request_id: request_id.to_string(),
+                                },
+                            );
+                            (
+                                Some(Ok(AgentAdmissionOk {
+                                    granted: true,
+                                    rejection: None,
+                                })),
+                                wake,
+                            )
+                        }
+                        Ok(_) => {
+                            let kind = if work_kind.is_empty() {
+                                "other"
+                            } else {
+                                work_kind
+                            };
+                            let kind_budget = match &capacity {
+                                Ok(capacity) => capacity.max_kind(kind).map_err(|error| {
+                                    ProtoError::new(
+                                        E_INTERNAL,
+                                        format!("invalid capacity config: {error}"),
+                                    )
+                                }),
+                                Err(error) => Err(ProtoError::new(
+                                    E_INTERNAL,
+                                    format!("invalid capacity config: {error}"),
+                                )),
+                            };
+                            match kind_budget {
+                                Err(error) => (Some(Err(error)), wake),
+                                Ok(kind_budget)
+                                    if admits_kind(&st.agent_permits, kind, kind_budget) =>
+                                {
+                                    st.agent_permits.insert(
+                                        key,
+                                        AgentPermit {
+                                            work_kind: kind.to_string(),
+                                            request_id: request_id.to_string(),
+                                        },
+                                    );
+                                    (
+                                        Some(Ok(AgentAdmissionOk {
+                                            granted: true,
+                                            rejection: None,
+                                        })),
+                                        wake,
+                                    )
+                                }
+                                Ok(_) => {
+                                    let session_pending = st
+                                        .pending_agents
+                                        .iter()
+                                        .filter(|p| p.session_id == sid)
+                                        .count();
+                                    if session_pending >= PENDING_AGENTS_PER_SESSION_MAX
+                                        || st.pending_agents.len() >= PENDING_AGENTS_GLOBAL_MAX
+                                    {
+                                        (
+                                            Some(Ok(AgentAdmissionOk {
+                                                granted: false,
+                                                rejection: Some("capacity_queue_full".into()),
+                                            })),
+                                            wake,
+                                        )
+                                    } else {
+                                        st.pending_agents.push_back(PendingAgent {
+                                            session_id: sid,
+                                            child_id: child_id.into(),
+                                            work_kind: kind.into(),
+                                            request_ids: vec![request_id.into()],
+                                            tx: tx.clone(),
+                                        });
+                                        (None, wake)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    drop(admission);
+    send_agent_grants(state, wake);
+    if let Some(result) = result {
+        respond(tx, request_id, result).await;
+    }
+}
+
+#[cfg(debug_assertions)]
+fn pause_after_agent_budget_read(child_id: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PAUSED: AtomicBool = AtomicBool::new(false);
+    if std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD").as_deref() != Ok(child_id) {
+        return;
+    }
+    if PAUSED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(marker) = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER") {
+        let _ = std::fs::write(marker, b"read");
+    }
+    let release_marker = std::env::var_os("PI_FAMULUS_TEST_AGENT_BUDGET_RELEASE_MARKER");
+    tokio::task::block_in_place(|| {
+        if let Some(marker) = release_marker {
+            let marker = std::path::PathBuf::from(marker);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            let ms = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(500);
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    });
+}
+
+fn handle_cancel_acquire(
+    state: &Shared,
+    conn_id: u64,
+    request_id: &str,
+    child_id: &str,
+) -> Result<Vec<AgentGrant>, ProtoError> {
+    let mut st = state.lock().unwrap();
+    let sid = st
+        .conns
+        .get(&conn_id)
+        .and_then(|c| c.session_id.clone())
+        .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+    let permit_key = (sid.clone(), child_id.to_string());
+    let pending_index = st.pending_agents.iter().position(|pending| {
+        pending.session_id == sid
+            && pending.child_id == child_id
+            && pending.request_ids.iter().any(|id| id == request_id)
+    });
+    if let Some(index) = pending_index {
+        let pending = st.pending_agents.get_mut(index).unwrap();
+        pending.request_ids.retain(|id| id != request_id);
+        if pending.request_ids.is_empty() {
+            st.pending_agents.remove(index);
+        }
+    } else if st
+        .agent_permits
+        .get(&permit_key)
+        .is_some_and(|permit| permit.request_id == request_id)
+    {
+        st.agent_permits.remove(&permit_key);
+        st.undelivered_agent_grants
+            .retain(|(owner, _), child| owner != &sid || child != child_id);
+    } else if !st.agent_permits.contains_key(&permit_key) {
+        // One-shot tombstone closes cancel-before-acquire dispatch races. Once
+        // consumed, a retry with this id is evaluated as a new acquire.
+        let tombstone = (sid.clone(), child_id.to_string(), request_id.to_string());
+        st.cancelled_acquires.insert(tombstone.clone());
+        while st.cancelled_acquires.len() > 512 {
+            let Some(oldest) = st
+                .cancelled_acquires
+                .iter()
+                .find(|entry| *entry != &tombstone)
+                .cloned()
+            else {
+                break;
+            };
+            st.cancelled_acquires.remove(&oldest);
+        }
+    }
+    Ok(wake_pending(&mut st))
+}
+
+fn handle_capacity_changed(state: &Shared, conn_id: u64) -> Result<Vec<AgentGrant>, ProtoError> {
+    let mut st = state.lock().unwrap();
+    if !matches!(st.conns.get(&conn_id), Some(h) if h.kind == ClientKind::Cli) {
+        return Err(ProtoError::new(
+            E_FORBIDDEN,
+            "capacity_changed is a cli-only operation",
+        ));
+    }
+    Ok(wake_pending(&mut st))
+}
+
+fn clear_delivered_grant(state: &Shared, session_id: &str, request_id: &str, child_id: &str) {
+    let mut st = state.lock().unwrap();
+    let key = (session_id.to_string(), request_id.to_string());
+    if st
+        .undelivered_agent_grants
+        .get(&key)
+        .is_some_and(|child| child == child_id)
+    {
+        st.undelivered_agent_grants.remove(&key);
+    }
+}
+
+fn send_agent_grants_locked(st: &mut DaemonState, wake: Vec<AgentGrant>) {
+    for grant in wake {
+        let frame = encode_ok(
+            &grant.request_id,
+            &AgentAdmissionOk {
+                granted: true,
+                rejection: None,
+            },
+        );
+        if grant.tx.try_send(frame).is_ok() {
+            let key = (grant.session_id, grant.request_id);
+            if st
+                .undelivered_agent_grants
+                .get(&key)
+                .is_some_and(|child| child == &grant.child_id)
+            {
+                st.undelivered_agent_grants.remove(&key);
+            }
+        }
+        // Full/closed retains the grant state. The next request from this
+        // session re-serves it through service_unconfirmed_agent_grants().
+    }
+}
+
+fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
+    let mut delivered = Vec::new();
+    for grant in wake {
+        let frame = encode_ok(
+            &grant.request_id,
+            &AgentAdmissionOk {
+                granted: true,
+                rejection: None,
+            },
+        );
+        if grant.tx.try_send(frame).is_ok() {
+            delivered.push((grant.session_id, grant.request_id, grant.child_id));
+        }
+    }
+    if !delivered.is_empty() {
+        let mut st = state.lock().unwrap();
+        for (session_id, request_id, child_id) in delivered {
+            let key = (session_id, request_id);
+            if st
+                .undelivered_agent_grants
+                .get(&key)
+                .is_some_and(|child| child == &child_id)
+            {
+                st.undelivered_agent_grants.remove(&key);
+            }
+        }
+    }
+}
+
+fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) -> HashSet<String> {
+    let pending = {
+        let st = state.lock().unwrap();
+        let Some(sid) = st
+            .conns
+            .get(&conn_id)
+            .and_then(|conn| conn.session_id.as_ref())
+        else {
+            return HashSet::new();
+        };
+        st.undelivered_agent_grants
+            .iter()
+            .filter(|((owner, _), _)| owner == sid)
+            .map(|((owner, request_id), child_id)| {
+                (owner.clone(), request_id.clone(), child_id.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut re_served = HashSet::new();
+    for (sid, request_id, child_id) in pending {
+        if tx
+            .try_send(encode_ok(
+                &request_id,
+                &AgentAdmissionOk {
+                    granted: true,
+                    rejection: None,
+                },
+            ))
+            .is_ok()
+        {
+            clear_delivered_grant(state, &sid, &request_id, &child_id);
+            re_served.insert(request_id);
+        }
+    }
+    re_served
+}
+
+fn handle_release_agent(
+    state: &Shared,
+    conn_id: u64,
+    child_id: &str,
+) -> Result<UnitOk, ProtoError> {
+    let wake = {
+        let mut st = state.lock().unwrap();
+        let sid = st
+            .conns
+            .get(&conn_id)
+            .and_then(|c| c.session_id.clone())
+            .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+        st.agent_permits
+            .remove(&(sid.clone(), child_id.to_string()));
+        st.undelivered_agent_grants
+            .retain(|(owner, _), child| owner != &sid || child != child_id);
+        wake_pending(&mut st)
+    };
+    send_agent_grants(state, wake);
+    Ok(UnitOk {})
+}
+
 fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> {
+    let (home, budget_cache) = {
+        let st = state.lock().unwrap();
+        (st.home.clone(), st.agent_budget.clone())
+    };
+    let total = budget_cache
+        .lock()
+        .unwrap()
+        .get(&home)
+        .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
     let st = state.lock().unwrap();
     // Status is read-only. Extensions need it so task_list can drop ghost
     // agents whose session is no longer connected. Shutdown stays cli-only.
@@ -1795,7 +2689,11 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
             extension_version: s.extension_version.clone(),
             protocol: s.protocol,
             connected_at: s.connected_at,
-            last_seen: if s.conn_id.is_some() { now_ms() } else { s.last_seen },
+            last_seen: if s.conn_id.is_some() {
+                now_ms()
+            } else {
+                s.last_seen
+            },
         })
         .collect();
     let running = st
@@ -1805,16 +2703,59 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         .filter(|e| e.record.status == TaskStatus::Running)
         .count();
     let terminal = st.registry.tasks.len() - running;
+    let capacity_config = crate::capacity::load(&st.home).map_err(|error| {
+        ProtoError::new(E_INTERNAL, format!("invalid capacity config: {error}"))
+    })?;
     Ok(StatusOk {
         version: crate::VERSION.to_string(),
         pid: std::process::id(),
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
         task_counts: TaskCounts { running, terminal },
+        agent_capacity: Some(AgentCapacity {
+            used: st.agent_permits.len(),
+            total,
+            by_kind: {
+                let mut kinds = HashMap::new();
+                for kind in crate::capacity::WORK_KINDS {
+                    let Ok(kind_total) = capacity_config.max_kind(kind) else {
+                        // Per-kind values are advisory; a malformed kind should
+                        // not make the entire status endpoint unavailable.
+                        continue;
+                    };
+                    kinds.insert(
+                        (*kind).to_string(),
+                        AgentKindCapacity {
+                            used: st
+                                .agent_permits
+                                .values()
+                                .filter(|permit| permit.work_kind == *kind)
+                                .count(),
+                            total: kind_total,
+                        },
+                    );
+                }
+                for permit in st
+                    .agent_permits
+                    .values()
+                    .filter(|permit| !permit.work_kind.is_empty())
+                {
+                    if !kinds.contains_key(&permit.work_kind) {
+                        let entry = kinds
+                            .entry(permit.work_kind.clone())
+                            .or_insert(AgentKindCapacity { used: 0, total });
+                        entry.used += 1;
+                    }
+                }
+                kinds
+            },
+        }),
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),
-        exe: crate::handover::exe_path().ok().map(|p| p.display().to_string()),
+        exe: crate::handover::exe_path()
+            .ok()
+            .map(|p| p.display().to_string()),
     })
 }
 
@@ -1822,7 +2763,10 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
     let st = state.lock().unwrap();
     if let Some(h) = st.conns.get(&conn_id) {
         if h.kind != ClientKind::Cli {
-            return Err(ProtoError::new(E_FORBIDDEN, "upgrade is a cli-only operation"));
+            return Err(ProtoError::new(
+                E_FORBIDDEN,
+                "upgrade is a cli-only operation",
+            ));
         }
     }
     if st.shutdown {
@@ -1831,7 +2775,10 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
     let generation = st.generation;
     drop(st);
     if !crate::handover::request(state, "cli") {
-        return Err(ProtoError::new(E_INTERNAL, "an upgrade is already in progress"));
+        return Err(ProtoError::new(
+            E_INTERNAL,
+            "an upgrade is already in progress",
+        ));
     }
     Ok(UpgradeOk {
         from_version: crate::VERSION.to_string(),
@@ -1844,7 +2791,10 @@ fn handle_shutdown(state: &Shared, conn_id: u64) -> Result<UnitOk, ProtoError> {
     // §3.3 marks shutdown as a cli message.
     if let Some(h) = st.conns.get(&conn_id) {
         if h.kind != ClientKind::Cli {
-            return Err(ProtoError::new(E_FORBIDDEN, "shutdown is a cli-only operation"));
+            return Err(ProtoError::new(
+                E_FORBIDDEN,
+                "shutdown is a cli-only operation",
+            ));
         }
     }
     // §3.3: same graceful shutdown as the zero-connection path (§3.2).
@@ -1871,14 +2821,19 @@ fn start_task_io_with_tee(
     state: &Shared,
     task_id: &str,
     start_tee: impl FnOnce(
-        Option<std::os::fd::OwnedFd>, Option<std::os::fd::OwnedFd>,
-        Arc<Mutex<task::OutputState>>, Option<std::fs::File>,
-        mpsc::Sender<task::OutputChunk>, tokio::sync::watch::Receiver<bool>,
+        Option<std::os::fd::OwnedFd>,
+        Option<std::os::fd::OwnedFd>,
+        Arc<Mutex<task::OutputState>>,
+        Option<std::fs::File>,
+        mpsc::Sender<task::OutputChunk>,
+        tokio::sync::watch::Receiver<bool>,
     ) -> std::io::Result<task::Tee>,
 ) {
     let mut st = state.lock().unwrap();
     let park = st.park_tx.subscribe();
-    let Some(e) = st.registry.tasks.get_mut(task_id) else { return };
+    let Some(e) = st.registry.tasks.get_mut(task_id) else {
+        return;
+    };
     let (stdout, stderr) = (e.stdout_fd.take(), e.stderr_fd.take());
     let mirror = task::open_output_files(std::path::Path::new(&e.record.output_path))
         .ok()
@@ -1909,7 +2864,9 @@ fn start_task_io_with_tee(
     }
     let tid = task_id.to_string();
     let state2 = state.clone();
-    e.fanout = Some(tokio::spawn(run_output_fanout(state2, tid, rx, delivered, carry, park)));
+    e.fanout = Some(tokio::spawn(run_output_fanout(
+        state2, tid, rx, delivered, carry, park,
+    )));
 }
 
 /// Push a task's output chunks to its watchers as `output` events.
@@ -1940,7 +2897,9 @@ async fn run_output_fanout(
                 carry = data.split_off(n);
                 (data, c.next_cursor - carry.len() as u64)
             }
-            None if !carry.is_empty() && !*park.borrow() => (std::mem::take(&mut carry), last_cursor),
+            None if !carry.is_empty() && !*park.borrow() => {
+                (std::mem::take(&mut carry), last_cursor)
+            }
             None => break,
         };
         let chunk = task::OutputChunk { bytes, next_cursor };
@@ -1992,7 +2951,11 @@ impl Outcome {
     }
 
     fn reported(r: &crate::runner::Reported) -> Self {
-        Outcome { code: r.code, signal: r.signal, usage: r.usage }
+        Outcome {
+            code: r.code,
+            signal: r.signal,
+            usage: r.usage,
+        }
     }
 }
 
@@ -2001,8 +2964,16 @@ fn normalize_killed_outcome(kill_requested: bool, outcome: Outcome) -> Outcome {
         return outcome;
     }
     match outcome.code {
-        Some(code) if code == 128 + task::SIGTERM => Outcome { code: None, signal: Some(task::SIGTERM), ..outcome },
-        Some(code) if code == 128 + task::SIGKILL => Outcome { code: None, signal: Some(task::SIGKILL), ..outcome },
+        Some(code) if code == 128 + task::SIGTERM => Outcome {
+            code: None,
+            signal: Some(task::SIGTERM),
+            ..outcome
+        },
+        Some(code) if code == 128 + task::SIGKILL => Outcome {
+            code: None,
+            signal: Some(task::SIGKILL),
+            ..outcome
+        },
         _ => outcome,
     }
 }
@@ -2083,7 +3054,9 @@ async fn run_exit_watch(state: Shared, tid: String) {
     let Some(mut runner) = runner else { return };
     let mut line = line;
     // Put everything back for whoever resumes the watch.
-    let put_back = |runner: task::RunnerProc, status_rx: Option<tokio::net::unix::pipe::Receiver>, line: Vec<u8>| {
+    let put_back = |runner: task::RunnerProc,
+                    status_rx: Option<tokio::net::unix::pipe::Receiver>,
+                    line: Vec<u8>| {
         if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(&tid) {
             e.child = Some(runner);
             e.status_rx = status_rx;
@@ -2091,7 +3064,9 @@ async fn run_exit_watch(state: Shared, tid: String) {
         }
     };
     if phase == registry::ExitPhase::AwaitReport {
-        let Some(mut status_rx) = status_rx else { return };
+        let Some(mut status_rx) = status_rx else {
+            return;
+        };
         let first = {
             let timeout_left = deadline.map(|d| d.saturating_sub(now_ms()));
             let timeout = async {
@@ -2139,7 +3114,11 @@ async fn run_exit_watch(state: Shared, tid: String) {
         match first {
             FirstSeen::Report(Some(r)) => {
                 let outcome = Outcome::reported(&r);
-                let leftover = if r.linger { Leftover::Guarded } else { Leftover::None };
+                let leftover = if r.linger {
+                    Leftover::Guarded
+                } else {
+                    Leftover::None
+                };
                 wait_tee_drained(&state, &tid, !r.linger).await;
                 finalize_exit(&state, &tid, outcome, leftover);
                 set_exit_phase(&state, &tid, registry::ExitPhase::AwaitRunnerExit);
@@ -2156,7 +3135,11 @@ async fn run_exit_watch(state: Shared, tid: String) {
                 // be in the pipe; the write end is closed now, so this ends.
                 match read_status_line(&mut status_rx, &mut line).await {
                     Some(r) => {
-                        let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
+                        let leftover = if r.linger {
+                            Leftover::Probe
+                        } else {
+                            Leftover::None
+                        };
                         wait_tee_drained(&state, &tid, !r.linger).await;
                         finalize_exit(&state, &tid, Outcome::reported(&r), leftover);
                     }
@@ -2215,7 +3198,9 @@ async fn wait_tee_drained(state: &Shared, tid: &str, alone: bool) {
     for _ in 0..rounds {
         let size = {
             let st = state.lock().unwrap();
-            let Some(e) = st.registry.tasks.get(tid) else { return };
+            let Some(e) = st.registry.tasks.get(tid) else {
+                return;
+            };
             match &e.tee {
                 Some(t) if !(t.stdout.is_finished() && t.stderr.is_finished()) => {
                     e.output.lock().unwrap().total_size
@@ -2252,7 +3237,11 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         if entry.record.status.is_terminal() {
             return; // already finalized (e.g. shutdown force-pass)
         }
-        let Outcome { code, signal, usage } = normalize_killed_outcome(entry.kill_requested, outcome);
+        let Outcome {
+            code,
+            signal,
+            usage,
+        } = normalize_killed_outcome(entry.kill_requested, outcome);
         let now = now_ms();
         entry.record.exit_code = code;
         if let Some(u) = usage {
@@ -2264,6 +3253,11 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         entry.record.ended_at = Some(now);
         entry.record.output_size = entry.output.lock().unwrap().total_size;
         entry.record.status = registry::terminal_status(entry.kill_requested, code, signal);
+        entry.record.live_cpu_user_ms = None;
+        entry.record.live_cpu_sys_ms = None;
+        entry.record.live_cpu_percent = None;
+        entry.record.live_cpu_sampled_at = None;
+        entry.record.live_cpu_stale = false;
         // Why it ended: our kill's reason; otherwise a natural exit.
         entry.record.end_reason = Some(
             entry
@@ -2272,7 +3266,10 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
                 .unwrap_or_else(|| end_reason::EXITED.to_string()),
         );
         if let Err(e) = registry::persist_record(&home, &entry.record) {
-            lifecycle::log_line(&home, &format!("persist {} failed: {e}", entry.record.task_id));
+            lifecycle::log_line(
+                &home,
+                &format!("persist {} failed: {e}", entry.record.task_id),
+            );
         }
         // The command is gone; descendants it backgrounded may not be.
         let pgid = entry.record.pid;
@@ -2428,6 +3425,11 @@ async fn graceful_shutdown(state: &Shared) {
         for e in st.registry.tasks.values_mut() {
             if e.record.status == TaskStatus::Running {
                 e.record.status = TaskStatus::Killed;
+                e.record.live_cpu_user_ms = None;
+                e.record.live_cpu_sys_ms = None;
+                e.record.live_cpu_percent = None;
+                e.record.live_cpu_sampled_at = None;
+                e.record.live_cpu_stale = false;
                 e.record.ended_at = Some(now);
                 e.record.output_size = e.output.lock().unwrap().total_size;
                 e.record.end_reason = Some(
@@ -2489,9 +3491,166 @@ async fn graceful_shutdown(state: &Shared) {
 // Tests
 // ---------------------------------------------------------------------------
 
+fn admits_kind(
+    permits: &HashMap<(String, String), AgentPermit>,
+    kind: &str,
+    budget: usize,
+) -> bool {
+    permits
+        .values()
+        .filter(|permit| permit.work_kind == kind)
+        .count()
+        < budget
+}
+
+/// Grant the earliest eligible waiter, skipping a kind-blocked head so another
+/// kind can use its independent budget. Removing an eligible index preserves
+/// FIFO order among waiters of every individual kind.
+fn wake_pending(st: &mut DaemonState) -> Vec<AgentGrant> {
+    let Ok(capacity) = crate::capacity::load(&st.home) else {
+        return Vec::new();
+    };
+    wake_pending_with_capacity(st, &capacity)
+}
+
+fn wake_pending_with_capacity(
+    st: &mut DaemonState,
+    capacity: &crate::capacity::CapacityConfig,
+) -> Vec<AgentGrant> {
+    let mut wake = Vec::new();
+    let Ok(global) = capacity.max_agents() else {
+        return wake;
+    };
+    while st.agent_permits.len() < global {
+        let eligible = st.pending_agents.iter().position(|pending| {
+            capacity
+                .max_kind(&pending.work_kind)
+                .is_ok_and(|budget| admits_kind(&st.agent_permits, &pending.work_kind, budget))
+        });
+        let Some(index) = eligible else {
+            break;
+        };
+        let pending = st.pending_agents.remove(index).unwrap();
+        let owner_request_id = pending.request_ids[0].clone();
+        st.agent_permits.insert(
+            (pending.session_id.clone(), pending.child_id.clone()),
+            AgentPermit {
+                work_kind: pending.work_kind,
+                request_id: owner_request_id,
+            },
+        );
+        for request_id in pending.request_ids {
+            st.undelivered_agent_grants.insert(
+                (pending.session_id.clone(), request_id.clone()),
+                pending.child_id.clone(),
+            );
+            wake.push(AgentGrant {
+                session_id: pending.session_id.clone(),
+                child_id: pending.child_id.clone(),
+                request_id,
+                tx: pending.tx.clone(),
+            });
+        }
+    }
+    wake
+}
+
+#[cfg(test)]
+fn admit_agent(
+    permits: &mut HashMap<(String, String), AgentPermit>,
+    key: (String, String),
+    budget: usize,
+) -> AgentAdmissionOk {
+    if permits.contains_key(&key) {
+        return AgentAdmissionOk {
+            granted: true,
+            rejection: None,
+        };
+    }
+    if permits.len() >= budget {
+        return AgentAdmissionOk {
+            granted: false,
+            rejection: Some("global_capacity".into()),
+        };
+    }
+    permits.insert(
+        key.clone(),
+        AgentPermit {
+            work_kind: "unknown".into(),
+            request_id: format!("request-{}", key.1),
+        },
+    );
+    AgentAdmissionOk {
+        granted: true,
+        rejection: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn running_record_for_cpu_test() -> TaskRecord {
+        serde_json::from_value(json!({
+            "task_id": "sh_cpu_test",
+            "session_id": "s1",
+            "kind": "shell",
+            "command": "sleep 10",
+            "cwd": "/tmp",
+            "pid": 1234,
+            "status": "running",
+            "started_at": 1,
+            "output_path": "/tmp/output",
+            "output_size": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn post_handover_live_sample_preserves_existing_cpu_high_water() {
+        let mut record = running_record_for_cpu_test();
+        record.live_cpu_user_ms = Some(5_000);
+        record.live_cpu_sys_ms = Some(700);
+        apply_live_cpu_sample(
+            &mut record,
+            Some(task::LiveCpuReading {
+                user_ms: 120,
+                system_ms: 30,
+                percent: None,
+            }),
+            2_000,
+        );
+        assert_eq!(
+            (record.live_cpu_user_ms, record.live_cpu_sys_ms),
+            (Some(5_000), Some(700))
+        );
+        assert_eq!(record.live_cpu_sampled_at, Some(2_000));
+        assert!(!record.live_cpu_stale);
+    }
+
+    #[test]
+    fn failed_live_cpu_sample_clears_rate_but_preserves_totals_and_last_timestamp() {
+        let mut record = running_record_for_cpu_test();
+        apply_live_cpu_sample(
+            &mut record,
+            Some(task::LiveCpuReading { user_ms: 120, system_ms: 30, percent: Some(24.0) }),
+            1_000,
+        );
+        assert_eq!(record.live_cpu_sampled_at, Some(1_000));
+        assert!(!record.live_cpu_stale);
+
+        apply_live_cpu_sample(&mut record, None, 6_000);
+        assert_eq!((record.live_cpu_user_ms, record.live_cpu_sys_ms), (Some(120), Some(30)));
+        assert_eq!(record.live_cpu_percent, None);
+        assert_eq!(record.live_cpu_sampled_at, Some(1_000));
+        assert!(record.live_cpu_stale);
+
+        let mut never_sampled = running_record_for_cpu_test();
+        apply_live_cpu_sample(&mut never_sampled, None, 6_000);
+        assert_eq!(never_sampled.live_cpu_sampled_at, None);
+        assert!(never_sampled.live_cpu_stale);
+    }
 
     /// Regression: a tee that runs before its factory returns must not have
     /// its bytes read again as carry. Also preserve the incomplete raw byte
@@ -2499,7 +3658,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn utf8_watch_output_is_not_duplicated_when_tee_starts_eagerly() {
         use std::os::fd::AsRawFd;
-        let home = std::env::temp_dir().join(format!("pi-famulus-fanout-{}-{}", std::process::id(), now_ms()));
+        let home = std::env::temp_dir().join(format!(
+            "pi-famulus-fanout-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
         let path = registry::task_output_path(&home, "sess-utf8", "mon_utf8");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let (file, _) = task::open_output_files(&path).unwrap();
@@ -2509,7 +3672,8 @@ mod tests {
             "command":"split UTF-8 pipe producer", "cwd":"/tmp", "pid":0,
             "status":"running", "exit_code":null, "signal":null,
             "started_at":0, "ended_at":null, "output_path":path, "output_size":0
-        })).unwrap();
+        }))
+        .unwrap();
         let (read, write) = crate::sys::pipe_cloexec().unwrap();
         let mut entry = TaskEntry::bare(record, output.clone());
         entry.stdout_fd = Some(read);
@@ -2519,25 +3683,39 @@ mod tests {
         let state = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, false)));
         let (tx, mut events) = mpsc::channel(8);
         let writer = tokio::spawn(std::future::pending::<()>());
-        state.lock().unwrap().conns.insert(1, ConnHandle {
-            kind: ClientKind::Extension, session_id: Some("sess-utf8".into()), tx,
-            die: Arc::new(Notify::new()), written: Arc::new(Mutex::new(HashMap::new())),
-            writer: writer.abort_handle(),
-        });
+        state.lock().unwrap().conns.insert(
+            1,
+            ConnHandle {
+                kind: ClientKind::Extension,
+                session_id: Some("sess-utf8".into()),
+                tx,
+                die: Arc::new(Notify::new()),
+                written: Arc::new(Mutex::new(HashMap::new())),
+                writer: writer.abort_handle(),
+            },
+        );
         // Real initial bytes, not a fabricated OutputChunk. Wait only for the
         // actual append (with a failure watchdog), never for a fixed sleep.
         crate::sys::write_raw(write.as_raw_fd(), b"a\xe4").unwrap();
-        let eager_tee = |expected| move |stdout, stderr, output: Arc<Mutex<task::OutputState>>, mirror, tx, park| {
-            let tee = task::start_tee(stdout, stderr, output.clone(), mirror, tx, park)?;
-            let until = std::time::Instant::now() + Duration::from_secs(3);
-            while output.lock().unwrap().total_size < expected {
-                assert!(std::time::Instant::now() < until, "real tee did not append {expected} bytes");
-                std::thread::yield_now();
+        let eager_tee = |expected| {
+            move |stdout, stderr, output: Arc<Mutex<task::OutputState>>, mirror, tx, park| {
+                let tee = task::start_tee(stdout, stderr, output.clone(), mirror, tx, park)?;
+                let until = std::time::Instant::now() + Duration::from_secs(3);
+                while output.lock().unwrap().total_size < expected {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "real tee did not append {expected} bytes"
+                    );
+                    std::thread::yield_now();
+                }
+                Ok(tee)
             }
-            Ok(tee)
         };
         start_task_io_with_tee(&state, "mon_utf8", eager_tee(2));
-        let first = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let first: serde_json::Value = serde_json::from_slice(&first.bytes).unwrap();
         assert_eq!(first["task_id"], "mon_utf8");
         assert_eq!(first["chunk"], "a", "{first}");
@@ -2550,11 +3728,18 @@ mod tests {
             (e.tee.take().unwrap(), e.fanout.take().unwrap())
         };
         let stdout = tokio::time::timeout(Duration::from_secs(3), tee.stdout)
-            .await.expect("stdout tee did not park").unwrap();
+            .await
+            .expect("stdout tee did not park")
+            .unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(3), tee.stderr)
-            .await.expect("stderr tee did not park").unwrap().is_none());
+            .await
+            .expect("stderr tee did not park")
+            .unwrap()
+            .is_none());
         tokio::time::timeout(Duration::from_secs(3), fanout)
-            .await.expect("fanout did not park").unwrap();
+            .await
+            .expect("fanout did not park")
+            .unwrap();
         {
             let mut st = state.lock().unwrap();
             let e = st.registry.tasks.get_mut("mon_utf8").unwrap();
@@ -2563,11 +3748,17 @@ mod tests {
             e.stdout_fd = stdout;
             st.park_tx.send_replace(false);
         }
-        assert!(events.try_recv().is_err(), "incomplete byte must not flush at park");
+        assert!(
+            events.try_recv().is_err(),
+            "incomplete byte must not flush at park"
+        );
         crate::sys::write_raw(write.as_raw_fd(), b"\xb8\xadb\n").unwrap();
         start_task_io_with_tee(&state, "mon_utf8", eager_tee(6));
         drop(write);
-        let last = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+        let last = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let last: serde_json::Value = serde_json::from_slice(&last.bytes).unwrap();
         assert_eq!(last["task_id"], "mon_utf8");
         assert_eq!(last["chunk"], "中b\n", "{last}");
@@ -2578,11 +3769,19 @@ mod tests {
             (e.tee.take().unwrap(), e.fanout.take().unwrap())
         };
         assert!(tokio::time::timeout(Duration::from_secs(3), tee.stdout)
-            .await.expect("stdout tee did not reach EOF").unwrap().is_none());
+            .await
+            .expect("stdout tee did not reach EOF")
+            .unwrap()
+            .is_none());
         assert!(tokio::time::timeout(Duration::from_secs(3), tee.stderr)
-            .await.expect("stderr tee did not reach EOF").unwrap().is_none());
+            .await
+            .expect("stderr tee did not reach EOF")
+            .unwrap()
+            .is_none());
         tokio::time::timeout(Duration::from_secs(3), fanout)
-            .await.expect("fanout did not drain at EOF").unwrap();
+            .await
+            .expect("fanout did not drain at EOF")
+            .unwrap();
         assert!(events.try_recv().is_err(), "no repeated output at EOF");
         {
             let st = state.lock().unwrap();
@@ -2594,6 +3793,15 @@ mod tests {
         writer.abort();
         drop(state);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn global_admission_grants_rejects_and_is_idempotent() {
+        let mut permits = HashMap::new();
+        assert!(admit_agent(&mut permits, ("s1".into(), "ch1".into()), 1).granted);
+        let rejected = admit_agent(&mut permits, ("s2".into(), "ch2".into()), 1);
+        assert_eq!(rejected.rejection.as_deref(), Some("global_capacity"));
+        assert!(admit_agent(&mut permits, ("s1".into(), "ch1".into()), 1).granted);
     }
 
     #[test]
@@ -2617,7 +3825,14 @@ mod tests {
 
     #[test]
     fn killed_shell_exit_code_143_is_reported_as_sigterm() {
-        let outcome = normalize_killed_outcome(true, Outcome { code: Some(143), signal: None, usage: None });
+        let outcome = normalize_killed_outcome(
+            true,
+            Outcome {
+                code: Some(143),
+                signal: None,
+                usage: None,
+            },
+        );
         assert_eq!(outcome.code, None);
         assert_eq!(outcome.signal, Some(task::SIGTERM));
     }

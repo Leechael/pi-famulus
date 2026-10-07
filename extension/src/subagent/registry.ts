@@ -26,6 +26,8 @@ import type {
   ChildRunRequest,
   ChildRunner,
   ChildStatus,
+  ChildTokenUsage,
+  ChildWallUsage,
   DisposableChildHandle,
 } from "./types";
 
@@ -40,6 +42,8 @@ export interface RunRecord {
     childId: string;
     name: string;
     agent: string;
+    workKind?: string;
+    queueMs?: number;
     model?: string;
     status: ChildStatus;
     /** User-authored prompt (after chain interpolation), without injected preamble. */
@@ -51,6 +55,8 @@ export interface RunRecord {
     endedAt?: number;
     /** User turns so far: 1 for the launch, +1 per accepted resume. */
     turn?: number;
+    tokenUsage?: ChildTokenUsage;
+    wallUsage?: ChildWallUsage;
   }[];
   status: "running" | "completed" | "partial" | "failed" | "interrupted";
   createdAt: number;
@@ -94,6 +100,8 @@ export interface ActiveChildInfo {
   runId: string;
   name: string;
   agent: string;
+  workKind?: string;
+  queueMs?: number;
   model?: string;
   status: ChildStatus;
   startedAt: number;
@@ -105,6 +113,7 @@ interface InternalChild {
   runId: string;
   name: string;
   agent: string;
+  workKind?: string;
   /** Best-effort model id for fleet / ls (set when startChild runs). */
   model?: string;
   status: ChildStatus;
@@ -116,6 +125,9 @@ interface InternalChild {
   turn: number;
   handle?: ChildHandle;
   shouldStart?: () => boolean;
+  /** Initial admission wait while runner.start() has not returned its handle. */
+  queueStartedAt?: number;
+  queueMs: number;
 }
 
 interface InternalRun {
@@ -185,6 +197,14 @@ class FailedChildHandle implements ChildHandle {
   conversation() {
     return [];
   }
+
+  tokenUsage() {
+    return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  }
+
+  wallUsage(): ChildWallUsage {
+    return { llmMs: 0, toolMs: 0, queueMs: 0, otherMs: 0, approximate: false };
+  }
 }
 
 export class SubagentRegistry implements RunRegistry {
@@ -229,16 +249,17 @@ export class SubagentRegistry implements RunRegistry {
     };
     this.runs.set(run.runId, run);
     this.emit(run);
-    return snapshot(run);
+    return snapshot(run, this.now());
   }
 
   get(runId: string): RunRecord | undefined {
     const run = this.runs.get(runId);
-    return run ? snapshot(run) : undefined;
+    return run ? snapshot(run, this.now()) : undefined;
   }
 
   list(): RunRecord[] {
-    return [...this.runs.values()].map(snapshot);
+    const now = this.now();
+    return [...this.runs.values()].map((run) => snapshot(run, now));
   }
 
   handle(childId: string): ChildHandle | undefined {
@@ -271,6 +292,10 @@ export class SubagentRegistry implements RunRegistry {
     // "running" record (ghost agents in ls).
     for (const child of run.children) {
       if (child.status === "pending" || child.status === "running") {
+        if (child.status === "pending" && child.queueStartedAt !== undefined) {
+          child.queueMs = Math.max(0, now - child.queueStartedAt);
+          child.queueStartedAt = undefined;
+        }
         child.status = "interrupted";
         child.endedAt = now;
         child.result = {
@@ -302,7 +327,7 @@ export class SubagentRegistry implements RunRegistry {
   // -------------------------------------------------------------------------
 
   /** Allocate a pending child inside a run. Returns the child id. */
-  addChild(runId: string, info: { name: string; agent: string }): string {
+  addChild(runId: string, info: { name: string; agent: string; workKind?: string }): string {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`unknown run ${runId}`);
     const child: InternalChild = {
@@ -310,9 +335,12 @@ export class SubagentRegistry implements RunRegistry {
       runId,
       name: info.name,
       agent: info.agent,
+      workKind: info.workKind ?? "other",
       status: "pending",
       startedAt: this.now(),
+      queueStartedAt: this.now(),
       turn: 1,
+      queueMs: 0,
     };
     run.children.push(child);
     this.children.set(child.childId, child);
@@ -329,6 +357,7 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(req.childId);
     if (!child) throw new Error(`unknown child ${req.childId} (addChild first)`);
     child.shouldStart = opts?.shouldStart;
+    child.workKind = req.workKind ?? child.workKind ?? "other";
     child.prompt = req.taskPrompt ?? req.prompt;
     child.preamble = req.agent.systemPrompt || undefined;
     child.model = req.model ?? req.agent.model;
@@ -343,7 +372,15 @@ export class SubagentRegistry implements RunRegistry {
       return this.failWithoutSession(child, (err as Error).message);
     }
 
-    const handle = await runner.start(req);
+    child.queueStartedAt = this.now();
+    let handle: ChildHandle;
+    try {
+      handle = await runner.start(req);
+    } catch (error) {
+      this.closeInitialQueue(child, this.now());
+      throw error;
+    }
+    this.closeInitialQueue(child, this.now());
     child.handle = handle;
     // Prefer the actually resolved provider/id over the request-time spec
     // (inherits parent model when neither param nor agent.model is set).
@@ -370,7 +407,10 @@ export class SubagentRegistry implements RunRegistry {
    * and wires result settlement for resumed generations. Returns the slot
    * releaser.
    */
-  async admitChild(childId: string, ticket?: { current: () => boolean }): Promise<() => void> {
+  async reserveChildSlot(
+    childId: string,
+    ticket?: { current: () => boolean },
+  ): Promise<{ admit: () => void; release: () => void }> {
     await this.acquireSlot();
     let released = false;
     const release = () => {
@@ -383,27 +423,47 @@ export class SubagentRegistry implements RunRegistry {
       release();
       throw new Error(`unknown child ${childId}`);
     }
-    if (child.shouldStart && !child.shouldStart()) {
+    const checkCurrent = () => {
+      if (child.shouldStart && !child.shouldStart()) throw new ChildCancelledError();
+      // A request settled while waiting (interrupt/dispose or a newer resume
+      // queued behind other children) must hand this local reservation on.
+      const stale = ticket ? !ticket.current() : (child.handle?.status() ?? "pending") !== "pending";
+      if (stale) throw new ChildCancelledError("settled while queued");
+    };
+    try {
+      checkCurrent();
+    } catch (error) {
+      this.closeInitialQueue(child, this.now());
       release();
-      throw new ChildCancelledError();
+      throw error;
     }
-    // The generation that queued this request settled while it waited
-    // (interrupt/dispose; maybe a newer resume is queued behind other
-    // children): hand the slot on, without touching the child's status.
-    // Without a ticket, fall back to the handle's status.
-    const stale = ticket ? !ticket.current() : (child.handle?.status() ?? "pending") !== "pending";
-    if (stale) {
-      release();
-      throw new ChildCancelledError("settled while queued");
+    let admitted = false;
+    return {
+      release,
+      admit: () => {
+        if (admitted) return;
+        checkCurrent();
+        this.closeInitialQueue(child, this.now());
+        admitted = true;
+        this.transitionChild(child, "running");
+        const handle = child.handle;
+        if (handle) {
+          // Resume generations: wire settlement only once global admission also succeeds.
+          handle.result.then((result) => this.settleChild(childId, result));
+        }
+      },
+    };
+  }
+
+  async admitChild(childId: string, ticket?: { current: () => boolean }): Promise<() => void> {
+    const reservation = await this.reserveChildSlot(childId, ticket);
+    try {
+      reservation.admit();
+      return reservation.release;
+    } catch (error) {
+      reservation.release();
+      throw error;
     }
-    this.transitionChild(child, "running");
-    const handle = child.handle;
-    if (handle) {
-      // Resume generations: the handle (and its fresh result promise) already
-      // exists, so wire settlement here. Generation 1 is wired by startChild.
-      handle.result.then((result) => this.settleChild(childId, result));
-    }
-    return release;
   }
 
   /**
@@ -428,6 +488,8 @@ export class SubagentRegistry implements RunRegistry {
       result: child.result,
       startedAt: child.startedAt,
       endedAt: child.endedAt,
+      queueMs: child.queueMs,
+      queueStartedAt: child.queueStartedAt,
     };
     const accepted = handle.resume(message, opts);
     // Mark the child queued before awaiting: with a free slot, admitChild's
@@ -436,6 +498,8 @@ export class SubagentRegistry implements RunRegistry {
     child.result = undefined;
     child.endedAt = undefined;
     child.startedAt = this.now();
+    child.queueMs = 0;
+    child.queueStartedAt = child.startedAt;
     child.turn += 1;
     try {
       await accepted;
@@ -448,6 +512,8 @@ export class SubagentRegistry implements RunRegistry {
         child.result = previous.result;
         child.startedAt = previous.startedAt;
         child.endedAt = previous.endedAt;
+        child.queueMs = previous.queueMs;
+        child.queueStartedAt = previous.queueStartedAt;
       }
       throw err;
     }
@@ -477,12 +543,17 @@ export class SubagentRegistry implements RunRegistry {
   finalizeRun(runId: string, error: string): void {
     const run = this.runs.get(runId);
     if (!run) return;
+    const now = this.now();
     let changed = false;
     for (const child of run.children) {
       if (child.status === "pending" && !child.handle) {
+        if (child.queueStartedAt !== undefined) {
+          child.queueMs = (child.queueMs ?? 0) + Math.max(0, now - child.queueStartedAt);
+          child.queueStartedAt = undefined;
+        }
         child.status = "interrupted";
         child.result = { status: "interrupted", text: "", error, durationMs: 0 };
-        child.endedAt = this.now();
+        child.endedAt = now;
         changed = true;
       }
     }
@@ -502,6 +573,11 @@ export class SubagentRegistry implements RunRegistry {
         runId: child.runId,
         name: child.name,
         agent: child.agent,
+        workKind: child.workKind,
+        queueMs:
+          child.status === "pending" && child.queueStartedAt !== undefined
+            ? (child.queueMs ?? 0) + Math.max(0, this.now() - child.queueStartedAt)
+            : child.queueMs,
         model: child.model,
         status: child.status,
         startedAt: child.startedAt,
@@ -535,9 +611,15 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(childId);
     if (!child) return;
     if (child.status !== "pending" && child.status !== "running") return; // already terminal
+    const settledAt = this.now();
+    if (child.status === "pending" && child.queueStartedAt !== undefined) {
+      child.queueMs = Math.max(0, settledAt - child.queueStartedAt);
+      child.queueStartedAt = undefined;
+    }
+    if (child.queueMs === undefined && result.queueMs !== undefined) child.queueMs = result.queueMs;
     child.status = result.status;
     child.result = result;
-    child.endedAt = this.now();
+    child.endedAt = settledAt;
     child.shouldStart = undefined;
     const run = this.runs.get(child.runId);
     if (run) {
@@ -550,8 +632,11 @@ export class SubagentRegistry implements RunRegistry {
     if (child.status === status) return;
     child.status = status;
     if (status === "running") {
+      const startedAt = this.now();
+      child.queueMs = Math.max(0, startedAt - (child.queueStartedAt ?? child.startedAt));
+      child.queueStartedAt = undefined;
       // (Re-)start: elapsed time and any previous generation's result reset.
-      child.startedAt = this.now();
+      child.startedAt = startedAt;
       child.result = undefined;
       child.endedAt = undefined;
     }
@@ -579,9 +664,15 @@ export class SubagentRegistry implements RunRegistry {
     else run.status = "partial";
   }
 
+  private closeInitialQueue(child: InternalChild, at: number): void {
+    if (child.queueStartedAt === undefined) return;
+    child.queueMs += Math.max(0, at - child.queueStartedAt);
+    child.queueStartedAt = undefined;
+  }
+
   private emit(run: InternalRun): void {
     if (this.transitionCbs.size === 0) return;
-    const record = snapshot(run);
+    const record = snapshot(run, this.now());
     for (const cb of this.transitionCbs) {
       try {
         cb(record);
@@ -630,7 +721,7 @@ export class SubagentRegistry implements RunRegistry {
   }
 }
 
-function snapshot(run: InternalRun): RunRecord {
+function snapshot(run: InternalRun, now: number): RunRecord {
   return {
     runId: run.runId,
     kind: run.kind,
@@ -640,6 +731,8 @@ function snapshot(run: InternalRun): RunRecord {
       childId: c.childId,
       name: c.name,
       agent: c.agent,
+      ...(c.workKind !== undefined ? { workKind: c.workKind } : {}),
+      ...(c.queueMs !== undefined ? { queueMs: c.queueMs } : {}),
       ...(c.model !== undefined ? { model: c.model } : {}),
       status: c.status,
       ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
@@ -648,6 +741,14 @@ function snapshot(run: InternalRun): RunRecord {
       startedAt: c.startedAt,
       endedAt: c.endedAt,
       turn: c.turn,
+      tokenUsage: c.handle?.tokenUsage() ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      wallUsage: c.handle?.wallUsage() ?? {
+        llmMs: 0,
+        toolMs: 0,
+        queueMs: c.queueMs + (c.queueStartedAt === undefined ? 0 : Math.max(0, now - c.queueStartedAt)),
+        otherMs: c.status === "running" ? Math.max(0, now - c.startedAt) : 0,
+        approximate: c.status === "running",
+      },
     })),
   };
 }

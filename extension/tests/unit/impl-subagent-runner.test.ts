@@ -49,6 +49,150 @@ describe("InProcessRunner", () => {
     expect(handle.status()).toBe("completed");
   });
 
+  it("attributes queued, assistant-message, and tool wall time with a fake clock", async () => {
+    const clock = new ManualClock(0);
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    let grant!: (release: (terminal?: boolean) => void) => void;
+    const admission = new Promise<(terminal?: boolean) => void>((resolve) => { grant = resolve; });
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      clock,
+      stallMs: 0,
+      acquire: async () => admission,
+    });
+    const starting = runner.start(makeReq());
+    await tick();
+    clock.advanceBy(500);
+    grant(() => {});
+    const handle = await starting;
+    const session = factory.sessions[0];
+
+    session.emitEvent({ type: "message_start", role: "assistant" });
+    clock.advanceBy(1_200);
+    session.emitEvent({ type: "message_end", role: "assistant" });
+    const tool = session.runTool();
+    clock.advanceBy(300);
+    tool.end();
+    session.emitEvent({ type: "message_start", role: "assistant" });
+    clock.advanceBy(500);
+    session.emitEvent({ type: "message_end", role: "assistant" });
+    session.complete("done");
+    await handle.result;
+
+    expect(handle.wallUsage()).toEqual({
+      llmMs: 1_700,
+      toolMs: 300,
+      queueMs: 500,
+      otherMs: 0,
+      approximate: false,
+    });
+  });
+
+  it("prunes unfinished tool-call identities when a generation settles", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 0 });
+    const handle = await runner.start(makeReq());
+    const session = factory.sessions[0]!;
+    const generations = handle as unknown as {
+      toolCallGenerations: Map<string, number>;
+      anonymousToolGenerations: number[];
+    };
+
+    session.runTool(); // aborted tools need not emit tool_execution_end
+    session.emitEvent({ type: "tool_execution_start" }); // adapter fallback
+    expect(generations.toolCallGenerations.size).toBe(1);
+    expect(generations.anonymousToolGenerations).toEqual([1]);
+    await handle.interrupt();
+    await handle.result;
+    expect(generations.toolCallGenerations.size).toBe(0);
+    expect(generations.anonymousToolGenerations).toEqual([]);
+
+    await handle.resume("continue");
+    await tick();
+    session.runTool();
+    session.emitEvent({ type: "tool_execution_start" });
+    expect(generations.toolCallGenerations.size).toBe(1);
+    expect(generations.anonymousToolGenerations).toEqual([2]);
+    await handle.interrupt();
+    await handle.result;
+    expect(generations.toolCallGenerations.size).toBe(0);
+    expect(generations.anonymousToolGenerations).toEqual([]);
+  });
+
+  it("does not let a late old-generation tool end close a resumed tool interval", async () => {
+    const clock = new ManualClock(0);
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const runner = new InProcessRunner({ createSession: factory.fn, clock, stallMs: 0 });
+    const handle = await runner.start(makeReq());
+    const session = factory.sessions[0];
+
+    const oldTool = session.runTool();
+    clock.advanceBy(100);
+    await handle.interrupt();
+    await handle.result;
+
+    await handle.resume("continue");
+    await tick();
+    const currentTool = session.runTool();
+    clock.advanceBy(50);
+    session.emitEvent({ type: "tool_execution_end", toolCallId: oldTool.toolCallId });
+    expect(handle.wallUsage().toolMs).toBe(150);
+
+    clock.advanceBy(50);
+    currentTool.end();
+    expect(handle.wallUsage().toolMs).toBe(200);
+    session.complete("done");
+    await handle.result;
+    expect(handle.wallUsage().toolMs).toBe(200);
+  });
+
+  for (const staleResult of ["grant", "reject"] as const) {
+    it(`does not let a stale ${staleResult} admission callback close the next generation's queue`, async () => {
+      const clock = new ManualClock(0);
+      const factory = new SessionFactory();
+      factory.autoComplete = "done";
+      type Release = (terminal?: boolean) => void;
+      const admissions: Array<{ grant: (release: Release) => void; reject: (error: Error) => void }> = [];
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        clock,
+        stallMs: 0,
+        acquire: () => new Promise<Release>((resolve, reject) => admissions.push({ grant: resolve, reject })),
+      });
+
+      const starting = runner.start(makeReq());
+      await tick();
+      admissions[0]!.grant(() => {});
+      const handle = await starting;
+      await handle.result;
+
+      await handle.resume("generation A");
+      await tick();
+      expect(admissions).toHaveLength(2);
+      clock.advanceBy(100);
+      await handle.interrupt();
+      await handle.result;
+
+      await handle.resume("generation B");
+      await tick();
+      expect(admissions).toHaveLength(3);
+      clock.advanceBy(300);
+      if (staleResult === "grant") admissions[1]!.grant(() => {});
+      else admissions[1]!.reject(new Error("late A rejection"));
+      await tick();
+
+      expect(handle.status()).toBe("pending");
+      expect(handle.wallUsage()).toMatchObject({ queueMs: 400, otherMs: 0, approximate: false });
+      clock.advanceBy(300);
+      admissions[2]!.grant(() => {});
+      await handle.result;
+      expect(handle.wallUsage()).toMatchObject({ queueMs: 700, otherMs: 0, approximate: false });
+    });
+  }
+
   it("tells the child its resolved model on the first prompt", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = "ok";
@@ -145,6 +289,23 @@ describe("InProcessRunner", () => {
     expect(factory.sessions[0].aborts).toBe(1);
   });
 
+  it("notifies transcript observers for terminal events that arrive after settle", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    let activities = 0;
+    const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 0, onActivity: () => activities++ });
+    const handle = await runner.start(makeReq());
+    const session = factory.sessions[0];
+    session.complete("done");
+    await handle.result;
+    const settledActivities = activities;
+
+    session.emitEvent({ type: "message_end", role: "assistant" });
+    session.emitEvent({ type: "tool_execution_end", toolCallId: "late-tool" });
+    session.emitEvent({ type: "agent_end" });
+    expect(activities).toBe(settledActivities + 3);
+  });
+
   it("resume re-prompts the same session and exposes a new result promise", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = "first";
@@ -205,6 +366,65 @@ describe("InProcessRunner", () => {
     expect(released).toBe(2);
   });
 
+  it("keeps the machine permit across an interrupted resumable turn", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => (terminal = true) => { releases.push(terminal); },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    expect(releases).toEqual([false]);
+    factory.sessions[0].autoComplete = "resumed";
+    await handle.resume("continue");
+    expect((await handle.result).status).toBe("completed");
+    expect(releases).toEqual([false, true]);
+  });
+
+  it("keeps the permit when admission resolves after a resumable interruption", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    let resolveAdmission!: (release: (terminal?: boolean) => void) => void;
+    let acquired = 0;
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => {
+        acquired++;
+        if (acquired === 1) return (terminal = true) => { releases.push(terminal); };
+        return new Promise((resolve) => { resolveAdmission = resolve; });
+      },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    await handle.resume("continue");
+    await tick();
+    expect(acquired).toBe(2);
+    await handle.interrupt();
+    resolveAdmission((terminal = true) => { releases.push(terminal); });
+    await tick();
+    expect(releases).toEqual([false, false, false]);
+    handle.dispose();
+    expect(releases).toEqual([false, false, false, true]);
+  });
+
+  it("releases an interrupted child's retained machine permit on disposal", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => (terminal = true) => { releases.push(terminal); },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    expect(releases).toEqual([false]);
+    handle.dispose();
+    expect(releases).toEqual([false, true]);
+  });
+
   it("cancels the child when admission rejects", async () => {
     const factory = new SessionFactory();
     const runner = new InProcessRunner({
@@ -258,13 +478,13 @@ describe("InProcessRunner", () => {
       factory.autoComplete = null;
       const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock, stallRetries: 0 });
       const handle = await runner.start(makeReq());
-      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string; toolCallId?: string }) => void }).emit.bind(
         factory.sessions[0],
       );
-      emit({ type: "tool_execution_start" });
+      emit({ type: "tool_execution_start", toolCallId: "stall-tool" });
       clock.advanceBy(2_000);
       expect(handle.status()).toBe("running");
-      emit({ type: "tool_execution_end" });
+      emit({ type: "tool_execution_end", toolCallId: "stall-tool" });
       clock.advanceBy(500);
       expect(handle.status()).toBe("failed");
     });
@@ -280,16 +500,16 @@ describe("InProcessRunner", () => {
         hardTimeoutMs: 100,
       });
       const handle = await runner.start(makeReq());
-      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string; toolCallId?: string }) => void }).emit.bind(
         factory.sessions[0],
       );
-      emit({ type: "tool_execution_start" });
+      emit({ type: "tool_execution_start", toolCallId: "stall-tool" });
       clock.advanceBy(100);
       expect(handle.status()).toBe("interrupted");
-      emit({ type: "tool_execution_end" });
+      emit({ type: "tool_execution_end", toolCallId: "stall-tool" });
       await handle.resume("again");
       await tick(); // the ceiling's abort drains, then the turn starts
-      emit({ type: "tool_execution_end" });
+      emit({ type: "tool_execution_end", toolCallId: "stall-tool" });
       clock.advanceBy(50);
       expect(handle.status()).toBe("failed");
       expect((await handle.result).error).toBe("stalled");
@@ -447,6 +667,75 @@ describe("InProcessRunner", () => {
       expect(result.status).toBe("completed");
       expect(acquired).toBe(1);
       expect(released).toBe(1);
+    });
+
+    it("does not let an abandoned acquire overwrite a resumed generation's queue wait", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      let acquisitions = 0;
+      let resolveOldAcquire!: (release: () => void) => void;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        clock,
+        acquire: async () => {
+          acquisitions++;
+          if (acquisitions === 2) {
+            return new Promise<() => void>((resolve) => { resolveOldAcquire = resolve; });
+          }
+          if (acquisitions === 3) await clock.sleep(100);
+          return () => {};
+        },
+      });
+      const handle = await runner.start(makeReq());
+      await handle.interrupt();
+
+      await handle.resume("queued old generation");
+      await tick();
+      expect(acquisitions).toBe(2);
+      clock.advanceBy(500);
+      await handle.interrupt();
+
+      await handle.resume("current generation");
+      const currentResult = handle.result;
+      await tick();
+      expect(acquisitions).toBe(3);
+      clock.advanceBy(100);
+      await tick();
+      clock.advanceBy(100);
+      resolveOldAcquire(() => {});
+      await tick();
+
+      factory.sessions[0].complete("done");
+      const result = await currentResult;
+      expect(result.status).toBe("completed");
+      expect(result.queueMs).toBe(100);
+    });
+
+    it("preserves the turn's admission wait across a stall retry", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        stallRetries: 1,
+        clock,
+        acquire: async () => {
+          await clock.sleep(250);
+          return () => {};
+        },
+      });
+      const starting = runner.start(makeReq());
+      await tick();
+      clock.advanceBy(250);
+      const handle = await starting;
+      clock.advanceBy(500); // first generation stalls
+      clock.advanceBy(100); // retry reuses the held slot
+      await tick();
+      factory.sessions[0].complete("recovered");
+      const result = await handle.result;
+      expect(result.status).toBe("completed");
+      expect(result.queueMs).toBe(250);
     });
 
     it("a completed stall retry re-arms the watchdog for the new generation", async () => {
@@ -723,13 +1012,17 @@ describe("InProcessRunner", () => {
       const first = await handle.result;
       expect(first.error).toBe("stalled");
 
+      const previousOtherMs = handle.wallUsage().otherMs;
       await handle.resume("try again"); // accepted; the drain runs in the background
       await tick();
       expect(handle.status()).toBe("pending");
       expect(factory.sessions[0].prompts).toHaveLength(1); // waits for the abort
+      clock.advanceBy(250);
+      expect(handle.wallUsage().otherMs).toBe(previousOtherMs + 250);
       factory.sessions[0].openAbortGate();
       await tick();
       expect(factory.sessions[0].prompts).toHaveLength(2);
+      expect(handle.wallUsage().otherMs).toBe(previousOtherMs + 250);
       factory.sessions[0].complete("recovered");
       const second = await handle.result;
       expect(second.status).toBe("completed");

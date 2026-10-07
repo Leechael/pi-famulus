@@ -2,6 +2,7 @@
 //! Single binary: `daemon` runs the manager; every other subcommand is a
 //! socket client (design doc §3.5).
 
+mod capacity;
 mod cli;
 mod out;
 
@@ -30,8 +31,6 @@ use cli::{Cli, Sub};
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
 
 fn main() {
-    // Capture the installed executable path before package managers can rename it.
-    let _ = handover::exe_path();
     // `__run` is every task's process-group leader (`runner`): plain
     // threads, no async runtime, and not a user-facing subcommand.
     let mut args = std::env::args().skip(1);
@@ -68,6 +67,74 @@ async fn async_main() {
             handover,
         } => daemon::run(home, foreground, handover).await,
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
+        Sub::Config { action } => match action {
+            cli::ConfigAction::Get { key } => {
+                let result = if key == "max-agents" {
+                    Some(capacity::max_agents(&home))
+                } else if let Some(kind) = key.strip_prefix("max-") {
+                    if capacity::is_work_kind(kind) {
+                        Some(capacity::max_kind(&home, kind))
+                    } else {
+                        eprintln!("unknown config key: {key}");
+                        None
+                    }
+                } else {
+                    eprintln!("unknown config key: {key}");
+                    None
+                };
+                match result {
+                    Some(Ok(n)) => {
+                        out::line(&n.to_string());
+                        0
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("pi-famulus: invalid config: {e}");
+                        1
+                    }
+                    None => 1,
+                }
+            }
+            cli::ConfigAction::Set { key, value } => {
+                let kind = (key != "max-agents")
+                    .then(|| key.strip_prefix("max-"))
+                    .flatten();
+                if key != "max-agents" && !kind.is_some_and(capacity::is_work_kind) {
+                    eprintln!("unknown config key: {key}");
+                    1
+                } else {
+                    match value.parse::<usize>() {
+                        Ok(n) => {
+                            let result = if let Some(kind) = kind {
+                                capacity::set_max_kind(&home, kind, n)
+                            } else {
+                                capacity::set_max_agents(&home, n)
+                            };
+                            match result {
+                                Ok(_previous) => {
+                                    if let Ok(mut conn) =
+                                        client::connect_existing(&home, &client::HelloMode::Cli)
+                                            .await
+                                    {
+                                        let _: Result<proto::UnitOk, String> = conn
+                                            .roundtrip(proto::RequestKind::CapacityChanged)
+                                            .await;
+                                    }
+                                    0
+                                }
+                                Err(e) => {
+                                    eprintln!("pi-famulus: {e}");
+                                    1
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("{key} must be a positive integer");
+                            1
+                        }
+                    }
+                }
+            }
+        },
         Sub::Sessions { json } => run_client(inspect::cmd_sessions(&home, json)).await,
         Sub::List {
             all,
@@ -102,6 +169,7 @@ async fn async_main() {
             };
             run_client(stats::cmd_stats(&home, opts)).await
         }
+        Sub::Top { json } => run_client(stats::cmd_top(&home, json)).await,
         Sub::Agent { id, full, follow } => {
             run_client(inspect::cmd_agent(&home, &id, full, follow)).await
         }

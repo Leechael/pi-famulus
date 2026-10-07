@@ -26,6 +26,17 @@ export interface AgentDefinition {
 
 export type ChildStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
 
+export const AGENT_WORK_KINDS = [
+  "test-suite",
+  "test",
+  "build",
+  "lint/type",
+  "other",
+  "git",
+  "read/search",
+] as const;
+export type AgentWorkKind = (typeof AGENT_WORK_KINDS)[number];
+
 export interface ChildResult {
   status: "completed" | "failed" | "interrupted";
   text: string; // getLastAssistantText() or "(no output)"
@@ -42,6 +53,8 @@ export interface ChildResult {
   attempts?: number;
   /** Stall detections in the user turn that produced this result. */
   stalls?: number;
+  /** Time waiting for local and machine-wide admission in this turn. */
+  queueMs?: number;
   durationMs: number;
 }
 
@@ -60,9 +73,34 @@ export interface ChildRunRequest {
   taskPrompt?: string;
   agent: AgentDefinition; // already resolved
   model?: string; // subagent() parameter-level override
+  /** Explicit planned workload class; natural-language prompts are not classified. */
+  workKind?: AgentWorkKind;
   /** Soft budget per turn: reaching it wakes the parent; it does not abort. */
   timeoutMs: number;
   depth: number; // main session = 0, child = 1
+}
+
+export interface ChildTokenUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface ChildWallUsage {
+  llmMs: number;
+  toolMs: number;
+  queueMs: number;
+  otherMs: number;
+  approximate: boolean;
+}
+
+export interface ChildSessionEvent {
+  type: string;
+  role?: string;
+  /** Pi's stable tool-call id, used to pair execution start/end events. */
+  toolCallId?: string;
+  usage?: ChildTokenUsage;
 }
 
 export interface ChildHandle {
@@ -87,6 +125,10 @@ export interface ChildHandle {
   resolvedModel(): string | undefined;
   /** Live child transcript. Empty when the session never started. */
   conversation(): ConversationTurn[];
+  /** Cumulative provider input/output and cache counts for this child. */
+  tokenUsage(): ChildTokenUsage;
+  /** Cumulative observed LLM, tool, admission-queue and approximate wall time. */
+  wallUsage(): ChildWallUsage;
 }
 
 /**
@@ -110,11 +152,12 @@ export interface ChildSessionAdapter {
   /** Provider/model failure outcome of the last assistant turn, when any. */
   getLastAssistantFailure?(): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   getConversation(): ConversationTurn[];
+  tokenUsage(): ChildTokenUsage;
   /** Introspection for child-session orchestration and contract tests. */
   getActiveToolNames?(): string[];
   getSystemPrompt?(): string;
   isStreaming(): boolean;
-  subscribe(listener: (event: { type: string }) => void): () => void;
+  subscribe(listener: (event: ChildSessionEvent) => void): () => void;
   dispose(): void;
 }
 
