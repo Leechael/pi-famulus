@@ -472,7 +472,10 @@ const overrunStuck: Scenario = {
   id: "overrun-stuck",
   behavior: "interrupts a subagent that overran its budget while blocked on a silent shell",
   famulusConfig: overrunConfig(15_000),
-  timeoutMs: 90_000,
+  // Models may turn "within about a minute" into their own timeout_ms
+  // (gpt-6.1-sol chose 50000 in the pilot), which moves the first overrun
+  // to ~50-60s; leave room for a second reminder after that.
+  timeoutMs: 120_000,
   quietMs: 4000,
   estCalls: 8,
   done: (items) => {
