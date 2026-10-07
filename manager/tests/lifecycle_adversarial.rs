@@ -1134,7 +1134,9 @@ fn d12_reused_pid_in_pidfile_does_not_block_startup() {
 /// leaving the stale pid/socket untouched until it acquires ownership.
 #[test]
 fn stale_files_recover_after_transient_lifetime_lock_contention() {
-    let home = Home::new("stale-lock-contention");
+    // Keep the macOS sockaddr path short: its sun_path limit is much smaller
+    // than Linux's and the runner's temporary directory already uses many bytes.
+    let home = Home::new("slc");
     let mut original = home.start_daemon();
     let old_pid = original.id();
     kill_pid(old_pid, libc::SIGKILL);
@@ -1160,7 +1162,7 @@ fn stale_files_recover_after_transient_lifetime_lock_contention() {
     let mut lifecycle_lock = fd_lock::RwLock::new(lock_file);
     let guard = lifecycle_lock.try_write().unwrap();
     let blocked = home.path.join("blocked-lock-attempts");
-    let barrier_path = home.path.join("claim-barrier.sock");
+    let barrier_path = home.path.join("b.sock");
     let listener = UnixListener::bind(&barrier_path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut successor = KillOnDrop(Some(spawn_lock_observer_daemon(
