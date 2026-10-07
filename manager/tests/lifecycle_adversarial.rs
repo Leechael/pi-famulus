@@ -72,7 +72,14 @@ fn spawn_lock_observer_daemon(
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(home.path.join("daemon.stderr"))
+                .map(std::process::Stdio::from)
+                .unwrap_or_else(|_| std::process::Stdio::null()),
+        );
     if let Some(barrier) = barrier {
         command.env("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER", barrier);
     }
@@ -381,7 +388,7 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
         // non-serving contenders to exit before asserting the process count.
         assert!(poll_true(S(15), || {
             live = daemon_pids_for(&home.path);
-            live.len() == 1
+            live.len() <= 1
         }), "round {round}: daemon contenders did not settle\n{}", d2_diagnostics(&home, old));
         assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}\n{}", d2_diagnostics(&home, old));
         // The survivor must own the well-known socket; the retained client

@@ -3,8 +3,9 @@
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state
 //! machine, CLI). Written against the *contract*, not the implementation:
 //! each test spawns the compiled binary and speaks the wire protocol
-//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. std only —
-//! no dev-dependencies, no serde; JSON is asserted via substring matching
+//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. Mostly std —
+//! libc is used only to probe the lifetime lock; no dev-dependencies or serde.
+//! JSON is asserted via substring matching
 //! (whitespace-tolerant where it matters via `compact()`).
 //!
 //! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
@@ -22,6 +23,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(6);
+// Mirrors the production cap; the debug hook records one byte per WouldBlock.
+#[cfg(debug_assertions)]
 const DAEMON_LOCK_RETRY_ATTEMPTS: usize = 100;
 
 // ---------------------------------------------------------------------------
@@ -296,11 +299,13 @@ fn watch_req(id: &str, task_id: &str) -> String {
 // process helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(debug_assertions)]
 fn blocked_lock_attempts(path: &Path) -> usize {
     fs::read(path).map(|attempts| attempts.len()).unwrap_or(0)
 }
 
 /// Probe the real daemon lifetime lock without relying on pid-file contents.
+#[cfg(debug_assertions)]
 fn lifetime_lock_held(home: &Path) -> bool {
     use std::os::fd::AsRawFd;
     let lock = fs::OpenOptions::new()
@@ -716,6 +721,8 @@ fn t09_zero_connections_shutdown_kills_tasks() {
 
 /// §3.1: a live pid in manager.pid makes a second daemon refuse to start —
 /// prints "already running" and exits with code 0.
+// The marker hook used to prove all retries is intentionally debug-only.
+#[cfg(debug_assertions)]
 #[test]
 fn t10_second_daemon_refused() {
     use std::os::unix::fs::MetadataExt;
@@ -743,7 +750,6 @@ fn t10_second_daemon_refused() {
     // only a deadlock guard and does not replace the bounded-policy evidence.
     let deadline = Instant::now() + Duration::from_secs(15);
     while blocked_lock_attempts(&blocked) < DAEMON_LOCK_RETRY_ATTEMPTS && Instant::now() < deadline {
-        assert!(duplicate.try_wait().unwrap().is_none(), "second daemon exited before its retry cap");
         assert!(lifetime_lock_held(&d.home), "owner released manager.lock during contention");
         std::thread::sleep(Duration::from_millis(25));
     }

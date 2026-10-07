@@ -213,8 +213,8 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
 async fn wait_for_manager_exit(home: &Path, mode: &HelloMode) -> Result<Option<Conn>, String> {
     while lifecycle::lock_held(home) {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // Use the same per-attempt budget as socket readiness; don't let
-        // one hello consume the whole 15s startup deadline.
+        // Keep the per-attempt hello probe at 2s; socket readiness may wait
+        // 30s, while connect() still bounds the overall startup flow at 60s.
         match tokio::time::timeout(Duration::from_secs(2), connect_existing(home, mode)).await {
             Ok(Ok(conn)) => return Ok(Some(conn)),
             Ok(Err(e)) if is_shutting_down(&e) || is_disconnect(&e) || e.starts_with("connect ") => {}
