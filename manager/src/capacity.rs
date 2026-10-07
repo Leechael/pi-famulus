@@ -99,13 +99,15 @@ pub fn set_max_kind(home: &Path, kind: &str, count: usize) -> Result<usize, Stri
     let tmp = home.join(format!("config.json.{}.tmp", std::process::id()));
     fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
     fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    crate::events::emit(
-        home,
-        None,
-        "capacity.changed",
-        None,
-        serde_json::json!({"budget":format!("max-{kind}"), "previous":previous, "total":count}),
-    );
+    if previous != count {
+        crate::events::emit(
+            home,
+            None,
+            "capacity.changed",
+            None,
+            serde_json::json!({"budget":format!("max-{kind}"), "previous":previous, "total":count}),
+        );
+    }
     Ok(previous)
 }
 
@@ -323,6 +325,14 @@ mod tests {
         set_max_agents(&dir, 13).unwrap();
         let events = fs::read_to_string(crate::events::daemon_events_path(&dir)).unwrap();
         assert_eq!(events.lines().count(), 2, "{events}");
+        set_max_kind(&dir, "test", DEFAULT_MAX_TEST).unwrap();
+        let events = fs::read_to_string(crate::events::daemon_events_path(&dir)).unwrap();
+        assert_eq!(events.lines().count(), 2, "same effective kind budget emitted: {events}");
+        set_max_kind(&dir, "test", 3).unwrap();
+        set_max_kind(&dir, "test", 3).unwrap();
+        let events = fs::read_to_string(crate::events::daemon_events_path(&dir)).unwrap();
+        assert_eq!(events.lines().count(), 3, "kind change or idempotent update emitted incorrectly: {events}");
+        assert!(events.contains(r#""budget":"max-test""#), "{events}");
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -54,18 +54,34 @@ fn spawn_daemon(home: &Path) -> Child {
         .expect("spawn pi-famulus daemon")
 }
 
-fn spawn_daemon_with_agent_budget_pause(home: &Path, marker: &Path) -> Child {
+fn spawn_daemon_with_agent_budget_pause(
+    home: &Path,
+    marker: &Path,
+    release_marker: &Path,
+) -> Child {
     Command::new(BIN)
         .arg("daemon")
         .env("PI_FAMULUS_HOME", home)
         .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD", "ch-old")
         .env("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER", marker)
-        .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_MS", "700")
+        .env("PI_FAMULUS_TEST_AGENT_BUDGET_RELEASE_MARKER", release_marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn pi-famulus daemon with budget pause")
+}
+
+fn spawn_daemon_with_writer_queue_marker(home: &Path, marker: &Path) -> Child {
+    Command::new(BIN)
+        .arg("daemon")
+        .env("PI_FAMULUS_HOME", home)
+        .env("PI_FAMULUS_TEST_WRITER_QUEUE_FULL_MARKER", marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pi-famulus daemon with writer queue marker")
 }
 
 fn wait_for_socket(home: &Path, timeout: Duration) {
@@ -994,7 +1010,8 @@ fn p7_stale_capacity_read_cannot_overtake_new_admission() {
     let home = test_home("p7");
     fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":3}"#).unwrap();
     let marker = home.join("old-budget-read");
-    let mut daemon = spawn_daemon_with_agent_budget_pause(&home, &marker);
+    let release_marker = home.join("release-old-budget-read");
+    let mut daemon = spawn_daemon_with_agent_budget_pause(&home, &marker, &release_marker);
     wait_for_socket(&home, CONNECT_TIMEOUT);
     let mut existing = connect(&home, CONNECT_TIMEOUT);
     let mut old = connect(&home, CONNECT_TIMEOUT);
@@ -1034,6 +1051,7 @@ fn p7_stale_capacity_read_cannot_overtake_new_admission() {
     assert_eq!(refreshed["agent_capacity"]["total"], 2, "{refreshed}");
     assert_eq!(refreshed["agent_capacity"]["by_kind"]["test"]["used"], 1, "{refreshed}");
     assert_eq!(refreshed["agent_capacity"]["by_kind"]["test"]["total"], 3, "{refreshed}");
+    fs::write(&release_marker, b"release").unwrap();
     let fresh_response = fresh.request(
         r#"{"id":"fresh","type":"acquire_agent","child_id":"ch-fresh","work_kind":"test"}"#,
         "fresh",
@@ -1421,8 +1439,10 @@ fn p10_cancel_and_disconnect_remove_queued_acquires() {
 fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
     let home = test_home("p16-grant-retry");
     fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
-    let _daemon = spawn_daemon(&home);
+    let marker = home.join("p16-writer-queue-full");
+    let child = spawn_daemon_with_writer_queue_marker(&home, &marker);
     wait_for_socket(&home, CONNECT_TIMEOUT);
+    let _daemon = Daemon { child, home: home.clone() };
     let mut holder = connect(&home, CONNECT_TIMEOUT);
     let mut waiter = connect(&home, CONNECT_TIMEOUT);
     hello_ext_protocol(&mut holder, "session-p16-holder", 5);
@@ -1434,49 +1454,49 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
     let acquire = r#"{"id":"p16-wait","type":"acquire_agent","child_id":"ch_wait","work_kind":"test"}"#;
     waiter.send(acquire);
     assert!(waiter.read_until("p16-wait", Duration::from_millis(100)).is_none());
-    for n in 0..5000 {
+    for n in 0..2048 {
         waiter.send(&format!(r#"{{"id":"p16-status-{n:04}","type":"status"}}"#));
     }
-    std::thread::sleep(Duration::from_millis(500));
+    let queue_deadline = Instant::now() + RESPONSE_TIMEOUT;
+    while !marker.exists() {
+        assert!(
+            Instant::now() < queue_deadline,
+            "writer response queue never reached capacity"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     holder.request(
         r#"{"id":"p16-release","type":"release_agent","child_id":"ch_hold"}"#,
         "p16-release",
     );
-    std::thread::sleep(Duration::from_millis(250));
-    waiter.send(acquire); // same request id, while all status replies are unread
-    assert!(waiter.read_until("p16-wait", Duration::from_millis(100)).is_none());
-    std::thread::sleep(Duration::from_secs(3));
 
+    // Drain the responses only after the release hit a known-full writer
+    // queue. The daemon retains the grant until a later same-id retry arrives
+    // after queue capacity is available again.
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut next_retry = Instant::now() + Duration::from_secs(3);
-    let mut same_id_retries = 1; // Count the explicit retry above.
     let mut status_frames = waiter
         .history
         .iter()
         .filter(|frame| frame.contains("p16-status-"))
         .count();
-    loop {
-        if Instant::now() >= next_retry {
-            waiter.send(acquire);
-            same_id_retries += 1;
-            next_retry += Duration::from_secs(3);
-        }
+    while status_frames < 2048 {
         let frame = waiter.read_frame((Instant::now() + Duration::from_millis(100)).min(deadline));
         let Some(frame) = frame else {
-            assert!(Instant::now() < deadline, "queued acquire never received its retained grant");
+            assert!(Instant::now() < deadline, "flooded status responses did not drain");
             continue;
         };
         let value: Value = serde_json::from_str(&frame).unwrap();
-        if value["id"] == "p16-wait" {
-            assert_eq!(value["granted"], true, "{value}");
-            assert!(same_id_retries >= 1, "no same-id retry was sent after backpressure");
-            assert!(status_frames > 0, "no flooded status responses drained before grant");
-            break;
-        }
+        assert_ne!(value["id"], "p16-wait", "grant arrived before a retry after backpressure");
         if value["id"].as_str().is_some_and(|id| id.starts_with("p16-status-")) {
             status_frames += 1;
         }
     }
+    waiter.send(acquire); // retry only once the full queue has drained
+    let grant = waiter
+        .read_until("p16-wait", RESPONSE_TIMEOUT)
+        .expect("queued acquire never received its retained grant");
+    let grant: Value = serde_json::from_str(&grant).unwrap();
+    assert_eq!(grant["granted"], true, "{grant}");
     let quiet_deadline = Instant::now() + Duration::from_secs(2);
     while waiter.read_frame(quiet_deadline).is_some() {}
     let grant_responses = waiter

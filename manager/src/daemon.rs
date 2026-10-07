@@ -1501,7 +1501,19 @@ async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoErro
     if frame.bytes.len() > MAX_FRAME_SIZE as usize {
         frame = encode_error(id, E_INTERNAL, "response exceeds the 4 MiB frame limit");
     }
+    #[cfg(debug_assertions)]
+    mark_test_writer_queue_full(tx, id);
     let _ = tx.send(frame).await;
+}
+
+#[cfg(debug_assertions)]
+fn mark_test_writer_queue_full(tx: &OutTx, id: &str) {
+    if !id.starts_with("p16-status-") || tx.capacity() != 0 {
+        return;
+    }
+    if let Some(marker) = std::env::var_os("PI_FAMULUS_TEST_WRITER_QUEUE_FULL_MARKER") {
+        let _ = std::fs::write(marker, b"full");
+    }
 }
 
 fn encode_ok<T: Serialize>(id: &str, body: &T) -> OutFrame {
@@ -2374,11 +2386,22 @@ fn pause_after_agent_budget_read(child_id: &str) {
     if let Ok(marker) = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER") {
         let _ = std::fs::write(marker, b"read");
     }
-    let ms = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(500);
-    tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(ms)));
+    let release_marker = std::env::var_os("PI_FAMULUS_TEST_AGENT_BUDGET_RELEASE_MARKER");
+    tokio::task::block_in_place(|| {
+        if let Some(marker) = release_marker {
+            let marker = std::path::PathBuf::from(marker);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            let ms = std::env::var("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(500);
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    });
 }
 
 fn handle_cancel_acquire(

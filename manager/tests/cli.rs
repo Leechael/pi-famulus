@@ -9,6 +9,15 @@ fn run(args: &[&str]) -> Output {
         .expect("run pi-famulus")
 }
 
+fn run_with_home(home: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(BIN)
+        .arg("--home")
+        .arg(home)
+        .args(args)
+        .output()
+        .expect("run pi-famulus")
+}
+
 /// Body of one help section, from the heading through the blank line before the next.
 fn help_section<'a>(help: &'a str, heading: &str) -> &'a str {
     let marker = format!("\n{heading}:\n");
@@ -73,9 +82,9 @@ fn work_kind_budgets_round_trip_for_every_supported_kind() {
         ("max-git", "maxGit"),
         ("max-read/search", "maxReadSearch"),
     ] {
-        let set = run(&["--home", home.to_str().unwrap(), "config", "set", key, "3"]);
+        let set = run_with_home(&home, &["config", "set", key, "3"]);
         assert!(set.status.success(), "{key}: {}", String::from_utf8_lossy(&set.stderr));
-        let get = run(&["--home", home.to_str().unwrap(), "config", "get", key]);
+        let get = run_with_home(&home, &["config", "get", key]);
         assert!(get.status.success(), "{key}: {}", String::from_utf8_lossy(&get.stderr));
         assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "3");
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
@@ -83,9 +92,9 @@ fn work_kind_budgets_round_trip_for_every_supported_kind() {
         assert_eq!(config["maxAgents"], 9);
         assert_eq!(config["unrelated"], true);
     }
-    let zero = run(&["--home", home.to_str().unwrap(), "config", "set", "max-build", "0"]);
+    let zero = run_with_home(&home, &["config", "set", "max-build", "0"]);
     assert!(!zero.status.success());
-    let unknown = run(&["--home", home.to_str().unwrap(), "config", "get", "max-does-not-exist"]);
+    let unknown = run_with_home(&home, &["config", "get", "max-does-not-exist"]);
     assert!(!unknown.status.success());
     let _ = std::fs::remove_dir_all(home);
 }
