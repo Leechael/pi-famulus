@@ -228,7 +228,7 @@ describe("scenario controls", () => {
     assert.equal(scenario.grade(ep(await transcript(ready, { reportBefore: true }))).pass, false, "guessing the token before successor evidence fails");
   });
   it("old default grid never loads compatibility extension", () => {
-    assert.equal(DEFAULT_SCENARIOS.length, 8);
+    assert.equal(DEFAULT_SCENARIOS.length, 10, "the 8 original probes and overrun-stuck/overrun-progressing");
     assert.ok(DEFAULT_SCENARIOS.every((s) => !s.extensions && !s.optIn));
     assert.equal(SCENARIOS.filter((s) => s.optIn).length, 4);
   });

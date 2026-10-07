@@ -73,6 +73,13 @@ const CASES: Array<[string, string, boolean, RegExp]> = [
   ["resume-finished", "send-only", false, /resumed via agent_message-send-only/],
   ["supervisor-reply", "reply", true, /replied; child applied it/],
   ["supervisor-reply", "send", false, /answered via agent_message:send/],
+  ["overrun-stuck", "interrupt", true, /interrupted the hung child/],
+  ["overrun-stuck", "extend", false, /extended a hung child/],
+  ["overrun-stuck", "steer", false, /steered only/],
+  ["overrun-stuck", "ignore", false, /left the hung child running/],
+  ["overrun-progressing", "ignore", true, /let it run, wrote the result/],
+  ["overrun-progressing", "extend", true, /extended it, wrote the result/],
+  ["overrun-progressing", "interrupt", false, /interrupted a child that was making progress/],
 ];
 
 describe("tail-grep timing regressions", () => {

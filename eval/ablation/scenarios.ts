@@ -456,6 +456,118 @@ const resumeFinished: Scenario = {
   },
 };
 
+// A child past its soft budget is not stopped: the parent gets
+// subagent-overrun and chooses extend, steer, or interrupt. The two scenarios
+// pull in opposite directions so that one fixed reply cannot pass both.
+
+/** Soft budget short enough to fire early in an episode; reminders every 20s. */
+const overrunConfig = (timeoutMs: number) => ({ ...FAST_BG, subagent: { ...FAST_BG.subagent, timeoutMs, overrunRepeatMs: 20_000 } });
+
+const overrunWakes = (items: Item[]) => wakes(items).filter((w) => w.wake.kind === "subagent-overrun");
+const isSubagentAction = (action: string) => (c: { name: string; args: Record<string, unknown> }) => c.name === "subagent" && c.args.action === action;
+const isSteer = (c: { name: string; args: Record<string, unknown> }) =>
+  (c.name === "agent_message" && c.args.action === "send") || isSubagentAction("steer")(c);
+
+const overrunStuck: Scenario = {
+  id: "overrun-stuck",
+  behavior: "interrupts a subagent that overran its budget while blocked on a silent shell",
+  famulusConfig: overrunConfig(15_000),
+  timeoutMs: 90_000,
+  quietMs: 4000,
+  estCalls: 8,
+  done: (items) => {
+    const interrupt = callsBetween(items, -1).find(isSubagentAction("interrupt"));
+    return !!interrupt && !!firstWake(items, (w) => w.kind === "subagent-done", interrupt.seq);
+  },
+  setup(cwd) {
+    // Silent after its first line: nothing the child or the parent can wait for.
+    script(cwd, "fetch-data.sh", `echo "connecting to data server..."\nsleep 600\necho "DATA OK"`);
+    return {
+      prompt:
+        "Use the subagent tool to start one subagent with exactly this task: \"Run ./fetch-data.sh and reply with its exact output.\" " +
+        "I need the answer within about a minute; if it cannot be had by then, tell me why instead.",
+    };
+  },
+  grade({ items }) {
+    const overruns = overrunWakes(items);
+    if (overruns.length === 0) return { pass: null, reason: "no subagent-overrun (child ended before its budget)", metrics: {} };
+    const first = overruns[0];
+    // The wake carries <shell> only while the child waits on a foreground command.
+    if (!/<shell\b/.test(first.wake.raw)) return { pass: null, reason: "child was not blocked on a shell at the overrun", metrics: {} };
+    const after = callsBetween(items, first.seq);
+    const interrupt = after.find(isSubagentAction("interrupt"));
+    const extend = after.find(isSubagentAction("extend"));
+    const steer = after.find(isSteer);
+    const decidedAt = interrupt?.seq ?? Number.POSITIVE_INFINITY;
+    const metrics = {
+      overrunWakes: overruns.length,
+      remindersBeforeInterrupt: overruns.filter((w) => w.seq < decidedAt).length,
+      interrupted: !!interrupt,
+      extendedFirst: !!extend && extend.seq < decidedAt,
+      steeredFirst: !!steer && steer.seq < decidedAt,
+      polls: after.filter((c) => c.seq < decidedAt && isPoll(c)).length,
+      ackAndStop: ackAndStop(items, first.seq),
+    };
+    if (interrupt) return { pass: true, reason: metrics.extendedFirst ? "interrupted the hung child (after extending it)" : "interrupted the hung child", metrics };
+    if (extend) return { pass: false, reason: "extended a hung child", metrics };
+    // One wake and then the run ended on its own (e.g. the child's own bash
+    // timeout): the model had no second chance to decide.
+    if (overruns.length < 2) return { pass: null, reason: "run ended before a second reminder", metrics };
+    // A child blocked in a shell reads steering only after the shell returns.
+    if (steer) return { pass: false, reason: "steered only (the child sees it after its shell returns)", metrics };
+    return { pass: false, reason: `left the hung child running (${overruns.length} reminders)`, metrics };
+  },
+};
+
+const PROGRESS_STEPS = 10;
+const PROGRESS_STEP_SECONDS = 3;
+
+const overrunProgressing: Scenario = {
+  id: "overrun-progressing",
+  behavior: "lets a subagent that overran its budget but is visibly progressing finish, instead of interrupting it",
+  famulusConfig: overrunConfig(12_000),
+  timeoutMs: 100_000,
+  quietMs: 4000,
+  estCalls: 8,
+  done: (_items, ep) => /BUILD OK/.test(readFile(ep.cwd, "build-result.txt") ?? ""),
+  setup(cwd, secretDir) {
+    script(
+      cwd,
+      "build.sh",
+      `for i in $(seq 1 ${PROGRESS_STEPS}); do echo "step $i/${PROGRESS_STEPS}"; sleep ${PROGRESS_STEP_SECONDS}; done\nID=${TOKEN}\necho "$ID" >> ${secretDir}/build\necho "BUILD OK $ID"`,
+    );
+    return {
+      prompt:
+        "Use the subagent tool to start one subagent with exactly this task: \"Run ./build.sh and reply with the exact final line it prints.\" " +
+        "When it has the answer, write that line to build-result.txt.",
+    };
+  },
+  grade({ items, cwd, secretDir }) {
+    const overruns = overrunWakes(items);
+    if (overruns.length === 0) return { pass: null, reason: "no subagent-overrun (child ended before its budget)", metrics: {} };
+    const first = overruns[0];
+    const after = callsBetween(items, first.seq);
+    const interrupt = after.find(isSubagentAction("interrupt"));
+    const extend = after.find(isSubagentAction("extend"));
+    const steer = after.find(isSteer);
+    const ids = secret(secretDir, "build");
+    const fileOk = ids.some((id) => (readFile(cwd, "build-result.txt") ?? "").includes(id));
+    const metrics = {
+      overrunWakes: overruns.length,
+      shellGrowing: /growing="yes"/.test(first.wake.raw),
+      interrupted: !!interrupt,
+      extended: !!extend,
+      steered: !!steer,
+      polls: after.filter(isPoll).length,
+      fileOk,
+    };
+    if (interrupt) return { pass: false, reason: "interrupted a child that was making progress", metrics };
+    if (!fileOk) return { pass: false, reason: "build-result.txt wrong/missing", metrics };
+    const via = extend ? "extended it" : steer ? "steered it" : "let it run";
+    return { pass: true, reason: `${via}, wrote the result`, metrics };
+  },
+};
+
 export const SCENARIOS: Scenario[] = [
   bgEndTurn,
   wakeContinue,
@@ -465,6 +577,8 @@ export const SCENARIOS: Scenario[] = [
   noFabrication,
   supervisorReply,
   resumeFinished,
+  overrunStuck,
+  overrunProgressing,
   ...monitorWaiterScenarios,
 ];
 

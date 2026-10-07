@@ -60,7 +60,7 @@ A run is a grid of **cells**, one per (model × variant × scenario), each repea
 | `--models a,b` | Which models (`pi --model` specs) | smoke: first entry of `models.json`; full: all of it |
 | `--variants a,b` | Which prompt texts to remove, one at a time. `baseline` removes nothing and always runs | smoke: `baseline` only; full: baseline + every ablatable segment in `manifest.json` + the groups |
 | `--k N` | Repeats per cell | smoke: 3; full: 10 |
-| `--scenarios a,b` | Which behaviors to probe (see [Scenarios](#scenarios-ablationscenariosts)) | original 8; compatibility probes are opt-in |
+| `--scenarios a,b` | Which behaviors to probe (see [Scenarios](#scenarios-ablationscenariosts)) | the 10 default ones; compatibility probes are opt-in |
 
 So **smoke** answers "does this model behave with the full prompt?", and **full** answers "which pieces of the prompt does that depend on?". An explicit flag overrides the tier's preset: `--tier full --models x` runs every variant on model `x` only.
 
@@ -167,6 +167,8 @@ Each revision's harness builds/selects its own manager and isolates each episode
 | `no-fabrication` | never states the result before the wake (canary generated at run time) |
 | `supervisor-reply` | answers a `supervisor-request` with `agent_message` `reply` |
 | `resume-finished` | resumes a finished child via `subagent({action:"resume"})` (an `agent_message` attempt first is recorded, still a pass) |
+| `overrun-stuck` | interrupts a child that is past its `timeout_ms` and blocked on a silent shell (`subagent-overrun` wake, reminders every 20s); extending it, steering it only, or ignoring two reminders FAILs |
+| `overrun-progressing` | lets a child that is past its `timeout_ms` but printing progress finish (no action or `extend`), then writes its result; interrupting it FAILs |
 
 Each grade is PASS / FAIL / INVALID (setup precondition not met, e.g. the command finished before the budget). Invalid and errored episodes are excluded from rates.
 
