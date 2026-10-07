@@ -90,13 +90,17 @@ fn blocked_lock_attempts(path: &std::path::Path) -> usize {
 /// Is manager.lock (the daemon's lifetime lock, §3.1) free right now?
 /// Takes and immediately releases it when free.
 fn lifetime_lock_free(home: &Home) -> bool {
+    lifetime_lock_free_path(&home.path)
+}
+
+fn lifetime_lock_free_path(path: &std::path::Path) -> bool {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(home.path.join("manager.lock"))
+        .open(path.join("manager.lock"))
         .unwrap();
     // SAFETY: flock on an fd we own; released when `f` is dropped.
     unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
@@ -386,7 +390,10 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
 fn d3_concurrent_daemon_processes_leave_one_survivor() {
     for round in 0..10 {
         let home = Home::new(&format!("d3r{round}"));
-        let mut kids: Vec<_> = (0..6).map(|_| home.spawn_daemon()).collect();
+        let blocked = home.path.join("blocked-lock-attempts");
+        let mut kids: Vec<_> = (0..6)
+            .map(|_| spawn_lock_observer_daemon(&home, &blocked, None))
+            .collect();
         // Identify and keep the lock owner connected before waiting for the
         // contenders, so the five-second idle shutdown cannot race the wait.
         let mut client = home.connect();
@@ -394,18 +401,22 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             .as_u64()
             .expect("owner hello did not identify the daemon") as u32;
 
-        // Losers retry the lifetime lock; assert the convergence deadline
-        // rather than continuing with a partial process snapshot on timeout.
+        // Five contenders must each finish the production lock-retry cap;
+        // the marker proves actual WouldBlock attempts, while 15s is only a
+        // safety deadline for scheduling (not a claim-time contract).
+        let expected_blocked_attempts = 5 * DAEMON_LOCK_RETRY_ATTEMPTS;
         let mut running = Vec::new();
         assert!(
-            poll_true(S(5), || {
+            poll_true(S(15), || {
                 running = kids
                     .iter_mut()
                     .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
                     .collect();
                 running.len() <= 1
+                    && blocked_lock_attempts(&blocked) == expected_blocked_attempts
             }),
-            "round {round}: daemons did not converge; still running {running:?}"
+            "round {round}: daemons did not converge after bounded lock retries; still running {running:?}, blocked attempts {}, expected {expected_blocked_attempts}",
+            blocked_lock_attempts(&blocked)
         );
         for k in kids.iter_mut() {
             let _ = k.kill();
@@ -415,6 +426,11 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             running,
             vec![owner],
             "round {round}: running daemons {running:?}, socket owner {owner}"
+        );
+        assert_eq!(
+            blocked_lock_attempts(&blocked),
+            expected_blocked_attempts,
+            "round {round}: every losing daemon must exhaust the bounded lock policy"
         );
         assert_eq!(home.pidfile_pid(), Some(owner));
         assert!(home.sock().exists(), "round {round}: owner socket disappeared");
@@ -1006,6 +1022,8 @@ fn d8e_concurrent_shutdown_waiters_share_the_successor() {
 fn d8f_cli_retries_shutdown_refusal_on_the_post_spawn_hello() {
     let home = Home::new("d8f");
     let path = home.path.clone();
+    let blocked = home.path.join("blocked-lock-attempts");
+    let blocked_for_peer = blocked.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let peer = std::thread::spawn(move || {
         let file = std::fs::OpenOptions::new().create(true).truncate(false)
@@ -1035,18 +1053,39 @@ fn d8f_cli_retries_shutdown_refusal_on_the_post_spawn_hello() {
             conn.send(&json!({"v":1,"id":hello["id"],"ok":false,
                 "error":{"code":"E_INTERNAL","message":message}}));
         }
-        // The unrelated first error took the ordinary spawn path. Keep
-        // ownership until that attempt has actually exited "already running".
-        assert!(poll_true(S(5), || std::fs::read_to_string(path.join("manager.log"))
-            .unwrap_or_default().contains("already running")), "first error was misclassified as shutdown");
+        // The unrelated first error took the ordinary spawn path. Keep the
+        // fake owner's lock until all bounded WouldBlock attempts are observed;
+        // scheduler time is not evidence that the retry policy completed.
+        assert!(
+            poll_true(S(15), || blocked_lock_attempts(&blocked_for_peer)
+                == DAEMON_LOCK_RETRY_ATTEMPTS),
+            "first error did not reach bounded spawn refusal; observed {} lock attempts",
+            blocked_lock_attempts(&blocked_for_peer)
+        );
+        assert_eq!(blocked_lock_attempts(&blocked_for_peer), DAEMON_LOCK_RETRY_ATTEMPTS);
+        assert!(!lifetime_lock_free_path(&path), "fake peer must still own manager.lock");
         drop(listener);
         std::fs::remove_file(sock).unwrap();
         drop(guard);
     });
     ready_rx.recv_timeout(S(5)).unwrap();
-    let out = home.cli(&["ls"], S(20));
+    let blocked_text = blocked.to_str().expect("test home path is UTF-8");
+    let clock = if home.manual { "manual" } else { "" };
+    let out = run_cli_env(
+        &home.path,
+        &["ls"],
+        S(20),
+        &[
+            ("PI_FAMULUS_TEST_CLOCK", clock),
+            ("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED", blocked_text),
+        ],
+    );
     peer.join().unwrap();
     assert!(out.status.success(), "post-spawn shutdown refusal failed: {}", out.stderr);
+    assert_eq!(blocked_lock_attempts(&blocked), DAEMON_LOCK_RETRY_ATTEMPTS);
+    assert!(std::fs::read_to_string(home.path.join("manager.log"))
+        .unwrap_or_default()
+        .contains("already running"), "contended spawn did not refuse before peer lock release");
     let new = home.pidfile_pid().expect("a real successor manager");
     let mut check = home.connect();
     assert_eq!(check.hello_cli()["pid"], new);
