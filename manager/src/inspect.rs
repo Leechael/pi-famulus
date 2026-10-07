@@ -1328,7 +1328,8 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
             unknown_kinds.sort();
             for kind in unknown_kinds {
                 if let Some(capacity) = agent_capacity.by_kind.get(kind) {
-                    outln!("  {kind}: {}/{} used", capacity.used, capacity.total);
+                    let escaped: String = kind.chars().flat_map(char::escape_default).collect();
+                    outln!("  {escaped}: {}/{} used", capacity.used, capacity.total);
                 }
             }
         }

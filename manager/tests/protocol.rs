@@ -994,6 +994,51 @@ fn p7_per_kind_budget_independence_and_queued_wakeup() {
 }
 
 #[test]
+fn p7b_status_escapes_unknown_work_kind_control_characters() {
+    let home = test_home("p7b-workkind-terminal-injection");
+    fs::write(home.join("config.json"), r#"{"maxAgents":4}"#).unwrap();
+    let _daemon = spawn_daemon(&home);
+    wait_for_socket(&home, CONNECT_TIMEOUT);
+    let mut client = connect(&home, CONNECT_TIMEOUT);
+    hello_ext_protocol(&mut client, "session-p7b", 5);
+
+    let kind = "vendor\u{1b}[31m\nforged: 9000/9000 used";
+    let request = format!(
+        r#"{{"id":"p7b-acquire","type":"acquire_agent","child_id":"ch_p7b","work_kind":{}}}"#,
+        serde_json::to_string(kind).unwrap(),
+    );
+    let response = client.request(&request, "p7b-acquire");
+    assert!(
+        compact(&response).contains("\"granted\":true"),
+        "{response}"
+    );
+
+    let status = Command::new(BIN)
+        .args(["--home", home.to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    let escaped: String = kind.chars().flat_map(char::escape_default).collect();
+    assert!(
+        stdout.contains(&format!("  {escaped}: 1/4 used")),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw terminal escape in status: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("\nforged:"),
+        "forged terminal line in status: {stdout:?}"
+    );
+}
+
+#[test]
 fn p8_shrinking_kind_budget_keeps_queued_fifo_and_existing_permits() {
     let home = test_home("p8-workkind-shrink");
     fs::write(home.join("config.json"), r#"{"maxAgents":4,"maxTest":2}"#).unwrap();
