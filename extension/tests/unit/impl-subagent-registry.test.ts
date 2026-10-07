@@ -143,6 +143,35 @@ describe("SubagentRegistry", () => {
     await second.result;
   });
 
+  it("reports post-admission session startup as approximate other wall time before handle attachment", async () => {
+    const { registry, factory, clock } = makeStack();
+    let allowCreate!: () => void;
+    let createStarted!: () => void;
+    const createGate = new Promise<void>((resolve) => { allowCreate = resolve; });
+    const startup = new Promise<void>((resolve) => { createStarted = resolve; });
+    registry.setRunner(new InProcessRunner({
+      createSession: async (req) => {
+        createStarted();
+        await createGate;
+        return factory.fn(req);
+      },
+      clock,
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
+    }));
+
+    const run = registry.createRun("tasks");
+    const starting = registry.startChild(addReq(registry, run.runId, "starting"));
+    await startup;
+    clock.advanceBy(777);
+    const snapshot = registry.get(run.runId)!.children[0]!;
+    expect(snapshot.status).toBe("running");
+    expect(snapshot.wallUsage).toMatchObject({ queueMs: 0, otherMs: 777, approximate: true });
+
+    allowCreate();
+    const handle = await starting;
+    await handle.result;
+  });
+
   it("enforces the session spawn budget per hour", async () => {
     const { registry, factory } = makeStack({ spawnBudgetPerHour: 2 });
     const run = registry.createRun("tasks");

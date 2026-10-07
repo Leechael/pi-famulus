@@ -89,6 +89,38 @@ describe("InProcessRunner", () => {
     });
   });
 
+  it("prunes unfinished tool-call identities when a generation settles", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 0 });
+    const handle = await runner.start(makeReq());
+    const session = factory.sessions[0]!;
+    const generations = handle as unknown as {
+      toolCallGenerations: Map<string, number>;
+      anonymousToolGenerations: number[];
+    };
+
+    session.runTool(); // aborted tools need not emit tool_execution_end
+    session.emitEvent({ type: "tool_execution_start" }); // adapter fallback
+    expect(generations.toolCallGenerations.size).toBe(1);
+    expect(generations.anonymousToolGenerations).toEqual([1]);
+    await handle.interrupt();
+    await handle.result;
+    expect(generations.toolCallGenerations.size).toBe(0);
+    expect(generations.anonymousToolGenerations).toEqual([]);
+
+    await handle.resume("continue");
+    await tick();
+    session.runTool();
+    session.emitEvent({ type: "tool_execution_start" });
+    expect(generations.toolCallGenerations.size).toBe(1);
+    expect(generations.anonymousToolGenerations).toEqual([2]);
+    await handle.interrupt();
+    await handle.result;
+    expect(generations.toolCallGenerations.size).toBe(0);
+    expect(generations.anonymousToolGenerations).toEqual([]);
+  });
+
   it("does not let a late old-generation tool end close a resumed tool interval", async () => {
     const clock = new ManualClock(0);
     const factory = new SessionFactory();

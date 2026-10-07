@@ -747,8 +747,8 @@ function snapshot(run: InternalRun, now: number): RunRecord {
         llmMs: 0,
         toolMs: 0,
         queueMs: c.queueMs + (c.queueStartedAt === undefined ? 0 : Math.max(0, now - c.queueStartedAt)),
-        otherMs: 0,
-        approximate: false,
+        otherMs: c.status === "running" ? Math.max(0, now - c.startedAt) : 0,
+        approximate: c.status === "running",
       },
     })),
   };

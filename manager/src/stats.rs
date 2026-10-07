@@ -148,9 +148,9 @@ pub struct TopAgent {
     pub tokens_cache_read: Option<u64>,
     pub tokens_cache_write: Option<u64>,
     pub llm_ms: Option<u64>,
-    pub tool_ms: u64,
-    pub queue_ms: u64,
-    pub wall_other_ms: u64,
+    pub tool_ms: Option<u64>,
+    pub queue_ms: Option<u64>,
+    pub wall_other_ms: Option<u64>,
     pub wall_approximate: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_per_second: Option<f64>,
@@ -403,9 +403,9 @@ pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
             token_count_label(a.tokens_cache_write),
             rate,
             duration_label(a.llm_ms),
-            fmt::human_duration(a.tool_ms),
-            fmt::human_duration(a.queue_ms),
-            fmt::human_duration(a.wall_other_ms),
+            duration_label(a.tool_ms),
+            duration_label(a.queue_ms),
+            duration_label(a.wall_other_ms),
             approximate,
         );
     }
@@ -449,9 +449,9 @@ fn top_agent(agent: String, child_id: Option<String>, group: Option<&Group>, rec
         tokens_cache_read,
         tokens_cache_write,
         llm_ms,
-        tool_ms: record.and_then(|a| a.tool_ms).unwrap_or(0),
-        queue_ms: record.and_then(|a| a.queue_ms).unwrap_or(0),
-        wall_other_ms: record.and_then(|a| a.wall_other_ms).unwrap_or(0),
+        tool_ms: record.and_then(|a| a.tool_ms),
+        queue_ms: record.and_then(|a| a.queue_ms),
+        wall_other_ms: record.and_then(|a| a.wall_other_ms),
         wall_approximate: record.is_some_and(|a| a.wall_approximate),
         output_tokens_per_second: inspect::agent_output_tokens_per_second(tokens_output, llm_ms),
     }

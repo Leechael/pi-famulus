@@ -743,6 +743,10 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
     assert_eq!((worker["tokens_cache_read"].as_u64(), worker["tokens_cache_write"].as_u64()), (Some(80), Some(4)));
     assert_eq!(worker["output_tokens_per_second"].as_f64(), Some(10.0));
     assert_eq!(worker["wall_approximate"], true);
+    let legacy = report["agents"].as_array().unwrap().iter().find(|a| a["child_id"] == "ch_0000e002").unwrap();
+    for field in ["tool_ms", "queue_ms", "wall_other_ms"] {
+        assert_eq!(legacy.get(field), Some(&Value::Null), "missing {field} should remain unavailable: {legacy}");
+    }
     assert!(report["agents"].as_array().unwrap().iter().any(|a| a["child_id"] == "ch_0000e002" && a["tasks"] == 0));
     let suite = report["work_kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "test-suite").unwrap();
     assert_eq!((suite["tasks"].as_u64(), suite["cpu_ms"].as_u64()), (Some(1), Some(1_500)));
@@ -750,6 +754,7 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
 
     let text = cli_ok(&home, &["top"]).stdout;
     assert!(text.contains("AGENTS") && text.contains("WORK KINDS") && text.contains("10.0 output tok/s") && text.contains("test-suite"), "{text}");
+    assert!(text.contains("wall LLM 1s / tool unavailable / queue unavailable / unclassified unavailable"), "{text}");
     assert!(!home.sock().exists(), "top must not start the daemon");
 }
 

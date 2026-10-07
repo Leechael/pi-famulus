@@ -511,6 +511,8 @@ class InProcessChildHandle implements DisposableChildHandle {
     reuseSlot = false,
     resumedGen?: number,
   ): Promise<void> {
+    // Stall retries replace a generation without settling the user turn.
+    if (reuseSlot) this.pruneToolCalls(this.generation);
     // A resumed turn allocated its generation when it was requested.
     const gen = resumedGen ?? ++this.generation;
     this.retiredGen = null;
@@ -701,6 +703,13 @@ class InProcessChildHandle implements DisposableChildHandle {
   private settle(gen: number, result: ChildResult): void {
     if (gen !== this.generation || this.settledFlag) return;
     const at = this.now();
+    this.pruneToolCalls(gen);
+    const queueMs = this.generationQueueMs + (
+      this.queueStartedAt !== null && this.queueGeneration === gen
+        ? Math.max(0, at - this.queueStartedAt)
+        : 0
+    );
+    if (result.queueMs === undefined && queueMs > 0) result.queueMs = queueMs;
     this.closeOther(at);
     this.finishWallGeneration(at, gen);
     this.settledFlag = true;
@@ -743,6 +752,15 @@ class InProcessChildHandle implements DisposableChildHandle {
       this.onActivity?.(this.req.childId);
     } catch {
       // persistence observers must not break the child lifecycle
+    }
+  }
+
+  private pruneToolCalls(gen: number): void {
+    for (const [toolCallId, generation] of this.toolCallGenerations) {
+      if (generation === gen) this.toolCallGenerations.delete(toolCallId);
+    }
+    for (let i = this.anonymousToolGenerations.length - 1; i >= 0; i--) {
+      if (this.anonymousToolGenerations[i] === gen) this.anonymousToolGenerations.splice(i, 1);
     }
   }
 
