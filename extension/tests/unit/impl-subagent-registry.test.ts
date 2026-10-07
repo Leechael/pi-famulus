@@ -46,6 +46,19 @@ describe("SubagentRegistry", () => {
     expect(run2.runId).not.toBe(run.runId);
   });
 
+  it("records the effective thinking level when an agent model falls back", async () => {
+    const { registry, factory } = makeStack();
+    factory.configure = (session) => {
+      session.resolvedModel = "openai/gpt-5.6-sol";
+      session.effectiveThinkingLevel = "low";
+    };
+    const run = registry.createRun("tasks");
+    const req = addReq(registry, run.runId, "fallback");
+    req.agent = { ...WORKER_AGENT, model: "openai:high" };
+    await registry.startChild(req);
+    expect(registry.get(run.runId)?.children[0].model).toBe("openai/gpt-5.6-sol:low");
+  });
+
   it("tracks pending -> running -> completed transitions with onTransition", async () => {
     const { registry, factory } = makeStack();
     factory.autoComplete = null; // keep the child running until we complete it

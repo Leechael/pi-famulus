@@ -382,10 +382,13 @@ export class SubagentRegistry implements RunRegistry {
     }
     this.closeInitialQueue(child, this.now());
     child.handle = handle;
-    // Prefer the actually resolved provider/id over the request-time spec
-    // (inherits parent model when neither param nor agent.model is set).
+    // Preserve the session's effective model and thinking setting, not a raw
+    // request suffix that may have fallen back to a different parent model.
     const resolved = handle.resolvedModel();
-    if (resolved) child.model = resolved;
+    if (resolved) {
+      const thinking = handle.effectiveThinkingLevel?.();
+      child.model = `${resolved}${thinking ? `:${thinking}` : ""}`;
+    }
     // Generation-1 result wiring (later generations are wired in admitChild,
     // where the handle is already visible).
     handle.result.then((result) => this.settleChild(child.childId, result));

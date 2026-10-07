@@ -102,7 +102,8 @@ function collapsedText(details: FamulusWake, theme: Theme): string {
       const shell = details.shell
         ? ` · shell ${formatDuration(details.shell.elapsedMs)}${details.shell.growing === null ? "" : details.shell.growing ? " (output growing)" : " (output idle)"}`
         : "";
-      return `${theme.fg("warning", "!")} ${theme.fg("muted", "overrun")} ${details.name} ${formatDuration(details.elapsedMs)} / ${formatDuration(details.budgetMs)} budget · still running${shell}`;
+      const additional = details.additional?.length ? ` · +${details.additional.length} more overdue` : "";
+      return `${theme.fg("warning", "!")} ${theme.fg("muted", "overrun")} ${details.name} ${formatDuration(details.elapsedMs)} / ${formatDuration(details.budgetMs)} budget · still running${additional}${shell}`;
     }
     case "supervisor-request":
       return [
@@ -167,6 +168,21 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
         // reminder that the hard ceiling will stop the child before.
         ...(details.hardCeilingMs === undefined || details.nextReminderMs < details.hardCeilingMs
           ? [`Next reminder in ${formatDuration(details.nextReminderMs)} unless you extend, steer, or interrupt it.`]
+          : []),
+        ...(details.additional?.length
+          ? [
+              `Also overdue (${details.additional.length}):`,
+              ...details.additional.map((child) => [
+                `${child.name} (${child.childId}) · run ${child.runId}`,
+                `Elapsed this turn: ${formatDuration(child.elapsedMs)} of ${formatDuration(child.budgetMs)}`,
+                `Last activity (${formatDuration(child.lastActivity.agoMs)} ago): ${child.lastActivity.text}`,
+                ...(child.shell ? [`Shell ${child.shell.taskId} · ${formatDuration(child.shell.elapsedMs)}\n$ ${child.shell.command}\nOutput: ${child.shell.outputPath}`] : []),
+                ...(child.hardCeilingMs !== undefined ? [`Hard ceiling stops it in ${formatDuration(child.hardCeilingMs)}.`] : []),
+                ...(child.hardCeilingMs === undefined || child.nextReminderMs < child.hardCeilingMs
+                  ? [`Next reminder in ${formatDuration(child.nextReminderMs)}.`]
+                  : []),
+              ].join("\n")),
+            ]
           : []),
       ].join("\n\n");
     }

@@ -95,7 +95,7 @@ const agentMessageParameters = Type.Object({
   delivery: Type.Optional(
     Type.Union([Type.Literal("steer"), Type.Literal("queue")], {
       description:
-        '"steer" (default) injects into a running child immediately; "queue" delivers after ' +
+        '"steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after ' +
         'its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).',
     }),
   ),

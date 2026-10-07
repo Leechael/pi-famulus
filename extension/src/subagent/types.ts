@@ -6,6 +6,8 @@
  * consumer stays testable with plain fakes.
  */
 
+import type { OverrunTick } from "./overrun";
+
 /**
  * Mirror of the M5 `AgentDefinition` (design doc Appendix B, src/agents/).
  * Structurally compatible with the M5 definition, so the real agent loader
@@ -53,9 +55,9 @@ export interface ChildResult {
   attempts?: number;
   /** Stall detections in the user turn that produced this result. */
   stalls?: number;
+  durationMs: number;
   /** Time waiting for local and machine-wide admission in this turn. */
   queueMs?: number;
-  durationMs: number;
 }
 
 /** One turn of a child session, for the /tasks conversation view. */
@@ -123,6 +125,10 @@ export interface ChildHandle {
   lastEventAt(): number; // for the stall watchdog / status display
   /** Resolved `provider/id` once the child session has been constructed. */
   resolvedModel(): string | undefined;
+  /** Effective thinking level applied when the child session was constructed. */
+  effectiveThinkingLevel?(): string | undefined;
+  /** Collect and reschedule a reminder if this child is overdue at the given time. */
+  collectDueOverrun?(now: number): OverrunTick | undefined;
   /** Live child transcript. Empty when the session never started. */
   conversation(): ConversationTurn[];
   /** Cumulative provider input/output and cache counts for this child. */
@@ -143,6 +149,8 @@ export interface ChildSessionAdapter {
    * Used for fleet/ls persistence and so the child prompt can name its model.
    */
   readonly resolvedModel?: string;
+  /** Effective thinking level passed to createAgentSession, after model fallbacks. */
+  readonly effectiveThinkingLevel?: string;
   prompt(text: string): Promise<void>;
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
@@ -157,6 +165,8 @@ export interface ChildSessionAdapter {
   getActiveToolNames?(): string[];
   getSystemPrompt?(): string;
   isStreaming(): boolean;
+  /** Current queued steering drain mode, when supported by the runtime. */
+  getSteeringMode?(): "all" | "one-at-a-time";
   subscribe(listener: (event: ChildSessionEvent) => void): () => void;
   dispose(): void;
 }

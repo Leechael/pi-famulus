@@ -148,10 +148,12 @@ class InProcessChildHandle implements DisposableChildHandle {
   private unsubscribe: (() => void) | null = null;
   private status_: ChildStatus = "pending";
   private lastEvent: number;
-  /** Generation start (reset per generation; durationMs is relative to runStartedAt). */
+  /** Session start, set once and preserved across user resumes. */
   private startedAt: number;
   /** User-turn start: reset on launch and user resume(), not on stall retries. */
   private runStartedAt: number;
+  /** Timestamp when this generation acquired admission; durationMs is measured from here. */
+  private admittedAt: number | null;
   /**
    * When the turn's deadlines start counting. Set after admission and session
    * creation (queue wait must not eat the budget), and NOT reset by stall
@@ -241,6 +243,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.onActivity = opts.onActivity;
     this.startedAt = this.clock.now();
     this.runStartedAt = this.startedAt;
+    this.admittedAt = null;
     this.turnBudgetStart = this.startedAt;
     this.lastEvent = this.startedAt;
     this.resultPromise = new Promise((resolve) => {
@@ -267,6 +270,10 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   resolvedModel(): string | undefined {
     return this.resolvedModel_ ?? this.session?.resolvedModel;
+  }
+
+  effectiveThinkingLevel(): string | undefined {
+    return this.session?.effectiveThinkingLevel;
   }
 
   /**
@@ -409,6 +416,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       opts.timeoutMs !== undefined && opts.timeoutMs > 0 ? opts.timeoutMs : this.req.timeoutMs;
     this.reminders = 0;
     this.runStartedAt = this.clock.now();
+    this.admittedAt = null;
     // The turn's generation exists from here: interrupt()/dispose() while it
     // is queued settle it, and its result promise is observable through
     // registry.getResult() before admission.
@@ -416,7 +424,6 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.settledFlag = false;
     this.retiredGen = null;
     this.status_ = "pending";
-    this.startedAt = this.runStartedAt;
     this.lastEvent = this.runStartedAt;
     this.resultPromise = new Promise((resolve) => {
       this.resolveResult = resolve;
@@ -578,6 +585,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       this.release(this.terminalSettle);
       return;
     }
+    if (!reuseSlot) this.admittedAt = this.now();
     this.status_ = "running";
 
     if (first) {
@@ -718,9 +726,14 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (result.attempts === undefined && this.generation > 1) {
       result.attempts = this.generation;
     }
-    // durationMs covers the whole user turn (launch/resume -> settle),
-    // including time lost to stalls and retry delays. dispose keeps its 0.
-    if (result.error !== "disposed") result.durationMs = this.now() - this.runStartedAt;
+    // durationMs covers admitted execution (including stalls and retry delays),
+    // but excludes time waiting for an admission slot. dispose keeps its 0.
+    if (result.error !== "disposed") {
+      result.durationMs = this.admittedAt === null ? 0 : Math.max(0, this.now() - this.admittedAt);
+    }
+    result.queueMs = this.admittedAt === null
+      ? Math.max(0, this.now() - this.runStartedAt)
+      : Math.max(0, this.admittedAt - this.runStartedAt);
     if (result.stalls === undefined && this.stallAttempts > 0) {
       result.stalls = this.stallAttempts;
     }
@@ -930,6 +943,25 @@ class InProcessChildHandle implements DisposableChildHandle {
       if (this.decisionPaused) return;
       this.fireOverrun(gen);
     }, delay) ?? null;
+  }
+
+  collectDueOverrun(now: number): OverrunTick | undefined {
+    if (this.settledFlag || this.disposed || this.status_ !== "running" || this.decisionPaused || this.softDeadlineAt === null) return undefined;
+    if (this.softDeadlineAt > now || this.nextReminderAt === null || this.nextReminderAt > now) return undefined;
+    if (this.softTimer !== null) this.timerScope?.clearTimeout(this.softTimer);
+    this.softTimer = null;
+    this.reminders++;
+    this.nextReminderAt = now + this.overrunRepeatMs;
+    this.armSoftDeadline(this.generation);
+    return {
+      childId: this.req.childId,
+      elapsedMs: now - this.turnBudgetStart,
+      budgetMs: this.softDeadlineAt - this.turnBudgetStart,
+      reminder: this.reminders,
+      nextReminderMs: this.overrunRepeatMs,
+      lastEventAt: this.lastEvent,
+      hardRemainingMs: this.hardTimeoutMs > 0 ? Math.max(0, this.turnBudgetStart + this.hardTimeoutMs - now) : null,
+    };
   }
 
   private fireOverrun(gen: number): void {

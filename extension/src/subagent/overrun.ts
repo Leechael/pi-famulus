@@ -5,7 +5,7 @@
  *
  * Zero pi dependency; the output-file stat is injected so tests can drive it.
  */
-import { formatSubagentOverrun, type SubagentOverrunInfo } from "../format";
+import { formatSubagentOverrunBatch, type SubagentOverrunInfo } from "../format";
 import type { FormattedWake, OverrunShell } from "../wake";
 import type { ConversationTurn } from "./types";
 
@@ -125,7 +125,7 @@ export interface OverrunNotifierDeps {
   now: () => number;
   registry: {
     list(): { runId: string; children: { childId: string; name: string }[] }[];
-    handle(childId: string): { conversation(): ConversationTurn[] } | undefined;
+    handle(childId: string): { conversation(): ConversationTurn[]; collectDueOverrun?(now: number): OverrunTick | undefined } | undefined;
   };
   shells: ChildShellTracker;
   stat: OverrunInfoDeps["stat"];
@@ -153,24 +153,39 @@ export function createOverrunNotifier(deps: OverrunNotifierDeps): (tick: Overrun
     stat: deps.stat,
   };
   return (tick) => {
-    const info = buildOverrunInfo(infoDeps, tick);
-    if (!info) return;
-    const shell = info.shell;
-    deps.logEvent("agent.overrun", {
-      child_id: info.childId,
-      run_id: info.runId,
-      reminder: info.reminder,
-      elapsed_ms: info.elapsedMs,
-      budget_ms: info.budgetMs,
-      ...(shell
-        ? {
-            shell_task_id: shell.taskId,
-            shell_elapsed_ms: shell.elapsedMs,
-            ...(shell.outputBytes !== null ? { output_bytes: shell.outputBytes } : {}),
-            ...(shell.growing !== null ? { growing: shell.growing } : {}),
-          }
-        : {}),
-    });
-    deps.notify(formatSubagentOverrun(info));
+    const infos: SubagentOverrunInfo[] = [];
+    const primary = buildOverrunInfo(infoDeps, tick);
+    if (!primary) return;
+    infos.push(primary);
+    const now = deps.now();
+    for (const run of deps.registry.list()) {
+      for (const child of run.children) {
+        if (child.childId === tick.childId) continue;
+        const due = deps.registry.handle(child.childId)?.collectDueOverrun?.(now);
+        if (due) {
+          const info = buildOverrunInfo(infoDeps, due);
+          if (info) infos.push(info);
+        }
+      }
+    }
+    for (const info of infos) {
+      const shell = info.shell;
+      deps.logEvent("agent.overrun", {
+        child_id: info.childId,
+        run_id: info.runId,
+        reminder: info.reminder,
+        elapsed_ms: info.elapsedMs,
+        budget_ms: info.budgetMs,
+        ...(shell
+          ? {
+              shell_task_id: shell.taskId,
+              shell_elapsed_ms: shell.elapsedMs,
+              ...(shell.outputBytes !== null ? { output_bytes: shell.outputBytes } : {}),
+              ...(shell.growing !== null ? { growing: shell.growing } : {}),
+            }
+          : {}),
+      });
+    }
+    deps.notify(formatSubagentOverrunBatch(infos));
   };
 }

@@ -60,6 +60,21 @@ export interface OverrunShell {
   growing: boolean | null;
 }
 
+/** Context retained for every secondary child in a batched overrun wake. */
+export interface SubagentOverrunChild {
+  runId: string;
+  childId: string;
+  name: string;
+  elapsedMs: number;
+  budgetMs: number;
+  reminder: number;
+  nextReminderMs: number;
+  /** Time left until the opt-in hard ceiling aborts this child. */
+  hardCeilingMs?: number;
+  lastActivity: { agoMs: number; text: string };
+  shell?: OverrunShell;
+}
+
 /**
  * When the wake's content was generated (design.md §4.5): stamped by the
  * NotifyCenter when it receives or builds the wake. A steered wake can wait
@@ -133,6 +148,7 @@ type FamulusWakeBody =
       summary: string;
       lastActivity: { agoMs: number; text: string };
       shell?: OverrunShell;
+      additional?: SubagentOverrunChild[];
     }
   | { kind: "supervisor-request"; from: string; name: string; message: string }
   | { kind: "supervisor-update"; from: string; name: string; message: string };
@@ -177,6 +193,7 @@ export function wakeIds(details: { kind?: string }): string[] {
   };
   if (d.kind === "task") return (d.tasks ?? []).map((task) => task.id);
   if (d.kind === "subagent-done") return (d.children ?? []).map((child) => child.childId);
+  if (d.kind === "subagent-overrun") return [d.childId, ...((d as { additional?: { childId: string }[] }).additional ?? []).map((child) => child.childId)].filter((id): id is string => Boolean(id));
   return [d.id ?? d.taskId ?? d.childId ?? d.from].filter((id): id is string => Boolean(id));
 }
 
@@ -387,17 +404,29 @@ function renderOverrun(details: Extract<FamulusWake, { kind: "subagent-overrun" 
   parts.push(
     `  <last-activity ago-ms="${Math.round(details.lastActivity.agoMs)}">${escapeXml(details.lastActivity.text)}</last-activity>`,
   );
-  const shell = details.shell;
-  if (shell) {
-    const shellAttrs = [`task-id="${escapeXmlAttr(shell.taskId)}"`, `elapsed-ms="${Math.round(shell.elapsedMs)}"`];
-    if (shell.outputBytes !== null) shellAttrs.push(`output-bytes="${shell.outputBytes}"`);
-    if (shell.outputIdleMs !== null) shellAttrs.push(`output-idle-ms="${Math.round(shell.outputIdleMs)}"`);
-    if (shell.growing !== null) shellAttrs.push(`growing="${shell.growing ? "yes" : "no"}"`);
-    parts.push(`  <shell ${shellAttrs.join(" ")}>`);
-    parts.push(`    <command>${escapeXml(shell.command)}</command>`);
-    parts.push(`    <output-file>${escapeXml(shell.outputPath)}</output-file>`);
-    parts.push("  </shell>");
+  if (details.additional?.length) {
+    parts.push("  <also-overdue>");
+    for (const child of details.additional) {
+      const childAttrs = [
+        `run-id="${escapeXmlAttr(child.runId)}"`,
+        `child-id="${escapeXmlAttr(child.childId)}"`,
+        `name="${escapeXmlAttr(child.name)}"`,
+        `elapsed-ms="${Math.round(child.elapsedMs)}"`,
+        `budget-ms="${Math.round(child.budgetMs)}"`,
+        `reminder="${child.reminder}"`,
+        `next-reminder-ms="${Math.round(child.nextReminderMs)}"`,
+      ];
+      if (child.hardCeilingMs !== undefined) childAttrs.push(`hard-ceiling-ms="${Math.round(child.hardCeilingMs)}"`);
+      parts.push(`    <child ${childAttrs.join(" ")}>`);
+      parts.push(
+        `      <last-activity ago-ms="${Math.round(child.lastActivity.agoMs)}">${escapeXml(child.lastActivity.text)}</last-activity>`,
+      );
+      if (child.shell) parts.push(...renderOverrunShell(child.shell, "      "));
+      parts.push("    </child>");
+    }
+    parts.push("  </also-overdue>");
   }
+  if (details.shell) parts.push(...renderOverrunShell(details.shell, "  "));
   parts.push(`  <options>${escapeXml(overrunOptions(details))}</options>`);
   parts.push("</pi-famulus-wake>");
   return parts.join("\n");
@@ -432,6 +461,19 @@ function overrunOptions(details: Extract<FamulusWake, { kind: "subagent-overrun"
     noAction +
     " Its result, or the interruption, arrives as a wake."
   );
+}
+
+function renderOverrunShell(shell: OverrunShell, indent: string): string[] {
+  const shellAttrs = [`task-id="${escapeXmlAttr(shell.taskId)}"`, `elapsed-ms="${Math.round(shell.elapsedMs)}"`];
+  if (shell.outputBytes !== null) shellAttrs.push(`output-bytes="${shell.outputBytes}"`);
+  if (shell.outputIdleMs !== null) shellAttrs.push(`output-idle-ms="${Math.round(shell.outputIdleMs)}"`);
+  if (shell.growing !== null) shellAttrs.push(`growing="${shell.growing ? "yes" : "no"}"`);
+  return [
+    `${indent}<shell ${shellAttrs.join(" ")}>`,
+    `${indent}  <command>${escapeXml(shell.command)}</command>`,
+    `${indent}  <output-file>${escapeXml(shell.outputPath)}</output-file>`,
+    `${indent}</shell>`,
+  ];
 }
 
 function renderRequest(details: Extract<FamulusWake, { kind: "supervisor-request" }>): string {

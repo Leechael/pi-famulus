@@ -185,12 +185,16 @@ function resolveModel(deps: PiRuntimeDeps, req: ChildRunRequest): ResolvedModel 
 /** Wrap a real AgentSession into the pi-free ChildSessionAdapter. */
 function wrapSession(
   session: PiAgentSession,
-  extras: { warning?: string; resolvedModel?: string } = {},
+  extras: { warning?: string; resolvedModel?: string; effectiveThinkingLevel?: string } = {},
 ): ChildSessionAdapter {
   const usageAdapter = createPiUsageAdapter();
+  // Children receive all queued steering messages in one drain/turn rather
+  // than the interactive one-at-a-time default, which can strand wake bursts.
+  session.setSteeringMode("all");
   return {
     ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
     ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
+    ...(extras.effectiveThinkingLevel !== undefined ? { effectiveThinkingLevel: extras.effectiveThinkingLevel } : {}),
     // pi ≥0.99 returns QueuedInputDisposition ("handled" | "queued") from
     // input methods; the adapter contract stays Promise<void>.
     prompt: async (text) => { await session.prompt(text); },
@@ -214,6 +218,7 @@ function wrapSession(
     getActiveToolNames: () => session.getActiveToolNames(),
     getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
+    getSteeringMode: () => session.steeringMode,
     subscribe: (listener) => session.subscribe((event) => {
       listener(usageAdapter.adapt(event as Parameters<typeof usageAdapter.adapt>[0]));
     }),
@@ -325,6 +330,7 @@ export function createPiSessionFn(deps: PiRuntimeDeps): CreateSessionFn {
     return wrapSession(session, {
       ...(resolved.warning !== undefined ? { warning: resolved.warning } : {}),
       ...(resolvedModel !== undefined ? { resolvedModel } : {}),
+      ...(typeof thinkingLevel === "string" ? { effectiveThinkingLevel: thinkingLevel } : {}),
     });
   };
 }
