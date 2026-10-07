@@ -3,8 +3,9 @@
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state
 //! machine, CLI). Written against the *contract*, not the implementation:
 //! each test spawns the compiled binary and speaks the wire protocol
-//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. std only —
-//! no dev-dependencies, no serde; JSON is asserted via substring matching
+//! (u32 BE length + UTF-8 JSON) by hand over the unix socket. Mostly std —
+//! libc is used only to probe the lifetime lock; no dev-dependencies or serde.
+//! JSON is asserted via substring matching
 //! (whitespace-tolerant where it matters via `compact()`).
 //!
 //! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
@@ -22,6 +23,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(6);
+// Mirrors the production cap; the debug hook records one byte per WouldBlock.
+#[cfg(debug_assertions)]
+const DAEMON_LOCK_RETRY_ATTEMPTS: usize = 100;
 
 // ---------------------------------------------------------------------------
 // test scaffolding
@@ -294,6 +298,31 @@ fn watch_req(id: &str, task_id: &str) -> String {
 // ---------------------------------------------------------------------------
 // process helpers
 // ---------------------------------------------------------------------------
+
+#[cfg(debug_assertions)]
+fn blocked_lock_attempts(path: &Path) -> usize {
+    fs::read(path).map(|attempts| attempts.len()).unwrap_or(0)
+}
+
+/// Probe the real daemon lifetime lock without relying on pid-file contents.
+#[cfg(debug_assertions)]
+fn lifetime_lock_held(home: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join("manager.lock"))
+        .expect("open daemon lifetime lock");
+    // SAFETY: a successful probe is released when `lock` drops.
+    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        false
+    } else {
+        assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+        true
+    }
+}
 
 fn wait_child_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
@@ -692,18 +721,59 @@ fn t09_zero_connections_shutdown_kills_tasks() {
 
 /// §3.1: a live pid in manager.pid makes a second daemon refuse to start —
 /// prints "already running" and exits with code 0.
+// The marker hook used to prove all retries is intentionally debug-only.
+#[cfg(debug_assertions)]
 #[test]
 fn t10_second_daemon_refused() {
+    use std::os::unix::fs::MetadataExt;
+
     let d = Daemon::start("singleton");
-    let (status, text) = run_cli(&d.home, &["daemon"], Duration::from_secs(5));
-    assert!(
-        status.success(),
-        "second daemon must exit 0 (§3.1), got {status:?}; output: {text}"
-    );
-    assert!(
-        text.to_lowercase().contains("already running"),
-        "second daemon should print an 'already running' message, got: {text:?}"
-    );
+    let mut owner_conn = d.connect();
+    let owner_hello = hello_ext(&mut owner_conn, "sess-singleton-owner");
+    let owner_pid = extract_num(&owner_hello, "pid").expect("owner pid");
+    let socket = sock_path(&d.home);
+    let owner_socket_inode = fs::metadata(&socket).unwrap().ino();
+    let blocked = d.home.join("blocked-lock-attempts");
+    assert!(lifetime_lock_held(&d.home), "owner must hold manager.lock before refusal probe");
+
+    let mut duplicate = Command::new(BIN)
+        .arg("daemon")
+        .env("PI_FAMULUS_HOME", &d.home)
+        .env("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED", &blocked)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn competing daemon");
+
+    // Retry count is the synchronization condition; this wall deadline is
+    // only a deadlock guard and does not replace the bounded-policy evidence.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while blocked_lock_attempts(&blocked) < DAEMON_LOCK_RETRY_ATTEMPTS && Instant::now() < deadline {
+        assert!(lifetime_lock_held(&d.home), "owner released manager.lock during contention");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(blocked_lock_attempts(&blocked), DAEMON_LOCK_RETRY_ATTEMPTS,
+        "contender must observe the retry cap while the real owner lock is held");
+    assert!(lifetime_lock_held(&d.home), "owner must hold manager.lock at refusal");
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let status = wait_child_timeout(&mut duplicate, remaining)
+        .expect("contending daemon did not exit after the bounded retry policy");
+    let out = duplicate.wait_with_output().expect("collect refusal output");
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(status.success(), "second daemon must exit 0 (§3.1), got {status:?}; output: {text}");
+    assert!(text.to_lowercase().contains("already running"),
+        "second daemon should print an 'already running' message, got: {text:?}");
+
+    // Strict refusal: no new pid, endpoint inode, or service replaces owner.
+    assert_eq!(extract_num(&fs::read_to_string(d.home.join("manager.pid")).unwrap(), "pid"), Some(owner_pid));
+    assert_eq!(fs::metadata(&socket).unwrap().ino(), owner_socket_inode);
+    assert!(lifetime_lock_held(&d.home), "refusal must leave owner's lock held");
+    let mut still_owner = d.connect();
+    still_owner.send(r#"{"type":"hello","client_kind":"cli"}"#);
+    let current = still_owner.read_frame(Instant::now() + Duration::from_secs(5))
+        .expect("owner still serves original socket");
+    assert_eq!(extract_num(&current, "pid"), Some(owner_pid), "no second daemon may serve");
 }
 
 /// §3.5 CLI smoke: status/sessions/list/doctor against a running daemon.

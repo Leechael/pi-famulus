@@ -7,6 +7,8 @@ use crate::registry::{self, Registry, TaskEntry};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+#[cfg(debug_assertions)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -102,8 +104,8 @@ pub enum Claim {
     /// daemon's whole lifetime; the OS releases the lock when it exits, even
     /// on SIGKILL.
     Acquired(DaemonLockGuard),
-    /// Another live daemon holds the lock. `pid` comes from manager.pid and
-    /// may be absent while that daemon is still starting.
+    /// The lock was unavailable on every attempt in the bounded claim window.
+    /// `pid` comes from manager.pid and is informational; it may be stale or absent.
     AlreadyRunning { pid: Option<u32> },
 }
 
@@ -142,23 +144,74 @@ fn open_daemon_lock(home: &Path) -> io::Result<fd_lock::RwLock<std::fs::File>> {
     Ok(fd_lock::RwLock::new(f))
 }
 
+#[cfg(debug_assertions)]
+fn note_daemon_lock_would_block(attempt: usize) -> io::Result<()> {
+    if let Some(path) = std::env::var_os("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED") {
+        let mut marker = OpenOptions::new().create(true).append(true).open(path)?;
+        marker.write_all(b"x")?;
+    }
+    if attempt == 0 {
+        if let Some(path) = std::env::var_os("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER") {
+            let mut barrier = std::os::unix::net::UnixStream::connect(path)?;
+            barrier.write_all(b"x")?;
+            let mut resume = [0_u8; 1];
+            barrier.read_exact(&mut resume)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn note_daemon_lock_would_block(_attempt: usize) -> io::Result<()> {
+    Ok(())
+}
+
+/// Try the leaked lock through a raw pointer so a failed attempt doesn't
+/// borrow it for `'static` and prevent the next bounded attempt.
+///
+/// # Safety
+/// `lock` must point to a `RwLock<File>` leaked for the process lifetime.
+unsafe fn try_write_daemon_lock(
+    lock: *mut fd_lock::RwLock<std::fs::File>,
+) -> io::Result<DaemonLockGuard> {
+    // SAFETY: the caller guarantees this object remains allocated for the
+    // guard's 'static lifetime; a WouldBlock result returns no guard.
+    let guard = (&mut *lock).try_write()?;
+    Ok(DaemonLockGuard { _guard: guard })
+}
+
+const DAEMON_LOCK_CLAIM_ATTEMPTS: usize = 100;
+const DAEMON_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// §3.1 singleton claim. Identity is the lifetime lock on manager.lock, not
 /// pid liveness: the pid in manager.pid can belong to an unrelated process
 /// after a crash or reboot. Only the lock holder touches socket/pid files, so
-/// whatever it finds is stale and is removed before binding.
+/// whatever it finds is stale and is removed before binding. Brief lock
+/// contention is retried regardless of the pid file; sustained contention
+/// gets a bounded refusal without touching either endpoint.
 pub fn claim_daemon(home: &Path) -> io::Result<Claim> {
-    let lock: &'static mut fd_lock::RwLock<std::fs::File> =
-        Box::leak(Box::new(open_daemon_lock(home)?));
-    match lock.try_write() {
-        Ok(guard) => {
-            cleanup_stale_files(home)?;
-            Ok(Claim::Acquired(DaemonLockGuard { _guard: guard }))
+    let lock = Box::into_raw(Box::new(open_daemon_lock(home)?));
+    for attempt in 0..DAEMON_LOCK_CLAIM_ATTEMPTS {
+        // SAFETY: `lock` came from Box::into_raw and is retained with the
+        // lifetime guard on success; on WouldBlock, no guard is returned.
+        match unsafe { try_write_daemon_lock(lock) } {
+            Ok(guard) => {
+                cleanup_stale_files(home)?;
+                return Ok(Claim::Acquired(guard));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                note_daemon_lock_would_block(attempt)?;
+                if attempt + 1 == DAEMON_LOCK_CLAIM_ATTEMPTS {
+                    return Ok(Claim::AlreadyRunning {
+                        pid: read_pid_file(home).map(|p| p.pid),
+                    });
+                }
+                std::thread::sleep(DAEMON_LOCK_RETRY_INTERVAL);
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Claim::AlreadyRunning {
-            pid: read_pid_file(home).map(|p| p.pid),
-        }),
-        Err(e) => Err(e),
     }
+    unreachable!("the bounded daemon-lock loop always returns")
 }
 
 /// True when some process holds manager.lock (a daemon is alive). Takes and

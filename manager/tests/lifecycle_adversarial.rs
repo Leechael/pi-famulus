@@ -13,7 +13,8 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
 /// Re-exec entry point for `HelperClient` (a killable stand-in for pi). It is
@@ -26,6 +27,8 @@ fn helper_hold_extension_conn() {
 
 const S: fn(u64) -> Duration = Duration::from_secs;
 const MS: fn(u64) -> Duration = Duration::from_millis;
+// Mirrors the production cap; the debug hook records one byte per WouldBlock.
+const DAEMON_LOCK_RETRY_ATTEMPTS: usize = 100;
 
 #[cfg(feature = "test-clock")]
 struct CliGuard(Option<std::process::Child>);
@@ -51,6 +54,42 @@ fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
     assert!(ok, "task {task_id} never printed {needle:?}");
 }
 
+/// Start a daemon that leaves a byte in `blocked` every time it cannot yet
+/// acquire manager.lock. The debug-only hook makes lock contention observable
+/// without relying on a scheduler sleep in the lifecycle regression below.
+fn spawn_lock_observer_daemon(
+    home: &Home,
+    blocked: &std::path::Path,
+    barrier: Option<&std::path::Path>,
+) -> std::process::Child {
+    let mut command = std::process::Command::new(BIN);
+    command
+        .arg("--home")
+        .arg(&home.path)
+        .env("PI_FAMULUS_TEST_CLOCK", if home.manual { "manual" } else { "" })
+        .env("PI_FAMULUS_TEST_OWNER", test_owner())
+        .env("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED", blocked)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(home.path.join("daemon.stderr"))
+                .map(std::process::Stdio::from)
+                .unwrap_or_else(|_| std::process::Stdio::null()),
+        );
+    if let Some(barrier) = barrier {
+        command.env("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER", barrier);
+    }
+    command.spawn().expect("spawn lock-observing daemon")
+}
+
+fn blocked_lock_attempts(path: &std::path::Path) -> usize {
+    std::fs::read(path).map(|attempts| attempts.len()).unwrap_or(0)
+}
+
 // ===========================================================================
 // Daemon: spawn race / singleton (D1, D2, D3)
 // ===========================================================================
@@ -58,13 +97,17 @@ fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
 /// Is manager.lock (the daemon's lifetime lock, §3.1) free right now?
 /// Takes and immediately releases it when free.
 fn lifetime_lock_free(home: &Home) -> bool {
+    lifetime_lock_free_path(&home.path)
+}
+
+fn lifetime_lock_free_path(path: &std::path::Path) -> bool {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(home.path.join("manager.lock"))
+        .open(path.join("manager.lock"))
         .unwrap();
     // SAFETY: flock on an fd we own; released when `f` is dropped.
     unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
@@ -332,16 +375,24 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
                 failures.push(String::from_utf8_lossy(&out.stderr).to_string());
             }
         }
-        let live = daemon_pids_for(&home.path);
+        let mut live = daemon_pids_for(&home.path);
         assert!(
             failures.is_empty(),
             "round {round}: clients failed: {failures:?}\n{}",
             d2_diagnostics(&home, old)
         );
-        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}\n{}", d2_diagnostics(&home, old));
-        // The survivor must own the well-known socket.
         let mut c = home.connect();
         let h = c.hello_cli();
+        // A losing spawn can still be finishing its bounded lifetime-lock
+        // retry after every CLI has connected to the winner. Wait for those
+        // non-serving contenders to exit before asserting the process count.
+        assert!(poll_true(S(15), || {
+            live = daemon_pids_for(&home.path);
+            live.len() <= 1
+        }), "round {round}: daemon contenders did not settle\n{}", d2_diagnostics(&home, old));
+        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}\n{}", d2_diagnostics(&home, old));
+        // The survivor must own the well-known socket; the retained client
+        // also prevents idle shutdown while contenders finish their retries.
         assert_eq!(h["pid"].as_u64().map(|p| p as u32), Some(live[0]), "round {round}: socket owner\n{}", d2_diagnostics(&home, old));
         drop(c);
     }
@@ -354,20 +405,34 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
 fn d3_concurrent_daemon_processes_leave_one_survivor() {
     for round in 0..10 {
         let home = Home::new(&format!("d3r{round}"));
-        let mut kids: Vec<_> = (0..6).map(|_| home.spawn_daemon()).collect();
-        // Losers exit quickly; wait until at most one process is left.
+        let blocked = home.path.join("blocked-lock-attempts");
+        let mut kids: Vec<_> = (0..6)
+            .map(|_| spawn_lock_observer_daemon(&home, &blocked, None))
+            .collect();
+        // Identify and keep the lock owner connected before waiting for the
+        // contenders, so the five-second idle shutdown cannot race the wait.
+        let mut client = home.connect();
+        let owner = client.hello_cli()["pid"]
+            .as_u64()
+            .expect("owner hello did not identify the daemon") as u32;
+
+        // Five contenders must each finish the production lock-retry cap;
+        // the marker proves actual WouldBlock attempts, while 15s is only a
+        // safety deadline for scheduling (not a claim-time contract).
+        let expected_blocked_attempts = 5 * DAEMON_LOCK_RETRY_ATTEMPTS;
         let mut running = Vec::new();
-        poll_true(S(5), || {
-            running = kids
-                .iter_mut()
-                .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
-                .collect();
-            running.len() <= 1
-        });
-        let owner = {
-            let mut c = home.connect();
-            c.hello_cli()["pid"].as_u64().unwrap() as u32
-        };
+        assert!(
+            poll_true(S(15), || {
+                running = kids
+                    .iter_mut()
+                    .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
+                    .collect();
+                running.len() <= 1
+                    && blocked_lock_attempts(&blocked) == expected_blocked_attempts
+            }),
+            "round {round}: daemons did not converge after bounded lock retries; still running {running:?}, blocked attempts {}, expected {expected_blocked_attempts}",
+            blocked_lock_attempts(&blocked)
+        );
         for k in kids.iter_mut() {
             let _ = k.kill();
             let _ = k.wait();
@@ -377,6 +442,13 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             vec![owner],
             "round {round}: running daemons {running:?}, socket owner {owner}"
         );
+        assert_eq!(
+            blocked_lock_attempts(&blocked),
+            expected_blocked_attempts,
+            "round {round}: every losing daemon must exhaust the bounded lock policy"
+        );
+        assert_eq!(home.pidfile_pid(), Some(owner));
+        assert!(home.sock().exists(), "round {round}: owner socket disappeared");
     }
 }
 
@@ -874,10 +946,13 @@ fn d8d_cli_bounds_wait_for_stuck_shutdown_without_spawning() {
             .is_some_and(|p| p.iter().any(|t| t["label"] == "shutdown-grace"))
     }), "shutdown grace was not armed");
 
-    // Do not advance the shutdown timer until the CLI has timed out.
-    let out = home.cli(&["ls"], S(20));
+    // Do not advance the shutdown timer until the CLI has timed out. The
+    // harness bound must exceed the CLI's whole-flow startup deadline (60s,
+    // see client::connect) so the CLI gives up on its own — killing it here
+    // would no longer prove boundedness.
+    let out = home.cli(&["ls"], S(90));
     assert!(!out.status.success(), "CLI unexpectedly passed a stuck shutdown");
-    assert!(out.stderr.contains("manager did not become ready within 15s"), "{}", out.stderr);
+    assert!(out.stderr.contains("manager did not become ready within 60s"), "{}", out.stderr);
     assert_eq!(home.pidfile_pid(), Some(old));
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
     assert!(!log.contains("already running"), "spawn attempted during stuck shutdown: {log}");
@@ -962,6 +1037,8 @@ fn d8e_concurrent_shutdown_waiters_share_the_successor() {
 fn d8f_cli_retries_shutdown_refusal_on_the_post_spawn_hello() {
     let home = Home::new("d8f");
     let path = home.path.clone();
+    let blocked = home.path.join("blocked-lock-attempts");
+    let blocked_for_peer = blocked.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let peer = std::thread::spawn(move || {
         let file = std::fs::OpenOptions::new().create(true).truncate(false)
@@ -991,18 +1068,39 @@ fn d8f_cli_retries_shutdown_refusal_on_the_post_spawn_hello() {
             conn.send(&json!({"v":1,"id":hello["id"],"ok":false,
                 "error":{"code":"E_INTERNAL","message":message}}));
         }
-        // The unrelated first error took the ordinary spawn path. Keep
-        // ownership until that attempt has actually exited "already running".
-        assert!(poll_true(S(5), || std::fs::read_to_string(path.join("manager.log"))
-            .unwrap_or_default().contains("already running")), "first error was misclassified as shutdown");
+        // The unrelated first error took the ordinary spawn path. Keep the
+        // fake owner's lock until all bounded WouldBlock attempts are observed;
+        // scheduler time is not evidence that the retry policy completed.
+        assert!(
+            poll_true(S(15), || blocked_lock_attempts(&blocked_for_peer)
+                == DAEMON_LOCK_RETRY_ATTEMPTS),
+            "first error did not reach bounded spawn refusal; observed {} lock attempts",
+            blocked_lock_attempts(&blocked_for_peer)
+        );
+        assert_eq!(blocked_lock_attempts(&blocked_for_peer), DAEMON_LOCK_RETRY_ATTEMPTS);
+        assert!(!lifetime_lock_free_path(&path), "fake peer must still own manager.lock");
         drop(listener);
         std::fs::remove_file(sock).unwrap();
         drop(guard);
     });
     ready_rx.recv_timeout(S(5)).unwrap();
-    let out = home.cli(&["ls"], S(20));
+    let blocked_text = blocked.to_str().expect("test home path is UTF-8");
+    let clock = if home.manual { "manual" } else { "" };
+    let out = run_cli_env(
+        &home.path,
+        &["ls"],
+        S(20),
+        &[
+            ("PI_FAMULUS_TEST_CLOCK", clock),
+            ("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED", blocked_text),
+        ],
+    );
     peer.join().unwrap();
     assert!(out.status.success(), "post-spawn shutdown refusal failed: {}", out.stderr);
+    assert_eq!(blocked_lock_attempts(&blocked), DAEMON_LOCK_RETRY_ATTEMPTS);
+    assert!(std::fs::read_to_string(home.path.join("manager.log"))
+        .unwrap_or_default()
+        .contains("already running"), "contended spawn did not refuse before peer lock release");
     let new = home.pidfile_pid().expect("a real successor manager");
     let mut check = home.connect();
     assert_eq!(check.hello_cli()["pid"], new);
@@ -1092,6 +1190,141 @@ fn d12_reused_pid_in_pidfile_does_not_block_startup() {
     let _ = impostor.kill();
     let _ = impostor.wait();
     assert!(out.status.success(), "manager blocked by reused pid: {}", out.stderr);
+}
+
+/// A transient exclusive manager.lock owner can overlap a successor's first
+/// claim after SIGKILL. The successor must keep retrying the actual lock,
+/// leaving the stale pid/socket untouched until it acquires ownership.
+#[test]
+fn stale_files_recover_after_transient_lifetime_lock_contention() {
+    // Keep the macOS sockaddr path short: its sun_path limit is much smaller
+    // than Linux's and the runner's temporary directory already uses many bytes.
+    let home = Home::new("slc");
+    let mut original = home.start_daemon();
+    let old_pid = original.id();
+    kill_pid(old_pid, libc::SIGKILL);
+    assert!(
+        wait_child(&mut original, S(5)).is_some(),
+        "killed daemon was not reaped"
+    );
+    assert_eq!(home.pidfile_pid(), Some(old_pid));
+    assert!(
+        home.sock().exists(),
+        "SIGKILL should leave the stale socket"
+    );
+
+    // This is the same exclusive flock as a paused lifecycle::lock_held
+    // probe, held in a different process from the successor daemon.
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.path.join("manager.lock"))
+        .unwrap();
+    let mut lifecycle_lock = fd_lock::RwLock::new(lock_file);
+    let guard = lifecycle_lock.try_write().unwrap();
+    let blocked = home.path.join("blocked-lock-attempts");
+    let barrier_path = home.path.join("b.sock");
+    let listener = UnixListener::bind(&barrier_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut successor = KillOnDrop(Some(spawn_lock_observer_daemon(
+        &home,
+        &blocked,
+        Some(&barrier_path),
+    )));
+
+    // The debug hook sends an ACK on its first WouldBlock and blocks reading
+    // this socket. The retry cannot proceed until after we release manager.lock
+    // and send the resume byte, regardless of how slowly this test is scheduled.
+    let (mut barrier, _) = poll_until(S(3), || listener.accept().ok())
+        .expect("successor did not observe the held manager.lock");
+    barrier.set_read_timeout(Some(S(3))).unwrap();
+    barrier.set_write_timeout(Some(S(3))).unwrap();
+    let mut observed = [0_u8; 1];
+    barrier.read_exact(&mut observed).unwrap();
+    assert_eq!(observed, [b'x']);
+    assert_eq!(blocked_lock_attempts(&blocked), 1);
+    assert_eq!(
+        home.pidfile_pid(),
+        Some(old_pid),
+        "contender cleaned up the stale pid"
+    );
+    assert!(
+        home.sock().exists(),
+        "contender unlinked the stale socket without ownership"
+    );
+    assert!(
+        UnixStream::connect(home.sock()).is_err(),
+        "stale socket unexpectedly serves"
+    );
+
+    drop(guard);
+    barrier.write_all(b"x").unwrap();
+    drop(barrier);
+    drop(listener);
+    assert!(
+        poll_true(S(8), || {
+            home.pidfile_pid().is_some_and(|pid| pid != old_pid)
+                && UnixStream::connect(home.sock()).is_ok()
+        }),
+        "successor did not claim the released lifetime lock"
+    );
+    let new_pid = home.pidfile_pid().unwrap();
+    let mut client = home.connect();
+    assert_eq!(client.hello_cli()["pid"], new_pid);
+    assert_ne!(new_pid, old_pid);
+    assert!(successor.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    drop(client);
+
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(wait_child(successor.0.as_mut().unwrap(), S(10)).is_some());
+}
+
+/// A real daemon that owns manager.lock still wins after the bounded retry
+/// window: a contender exits with its informational pid and never binds or
+/// replaces the owner's socket/pid files.
+#[test]
+fn real_lifetime_lock_owner_gets_bounded_refusal_without_second_server() {
+    let home = Home::new("rlo");
+    let mut owner = home.start_daemon();
+    let owner_pid = owner.id();
+    // Keep the legitimate owner active while the contender exhausts retries,
+    // so the test always checks a live lock owner rather than idle shutdown.
+    let mut owner_client = home.connect();
+    assert_eq!(owner_client.hello_cli()["pid"], owner_pid);
+    let blocked = home.path.join("blocked-lock-attempts");
+    let mut duplicate = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked, None)));
+
+    // The bounded policy is the retry cap, not a wall-clock promise that can
+    // be distorted by process scheduling on a busy CI runner. Keep an outer
+    // safety deadline only to catch a stuck contender.
+    let status = wait_child(duplicate.0.as_mut().unwrap(), S(15))
+        .expect("contender did not refuse before the safety deadline");
+    assert!(status.success(), "duplicate daemon exited with {status}");
+    assert_eq!(
+        blocked_lock_attempts(&blocked),
+        DAEMON_LOCK_RETRY_ATTEMPTS,
+        "real owner must keep the contender blocked through the retry cap"
+    );
+    let out = duplicate.0.take().unwrap().wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("already running (pid {owner_pid})")),
+        "{stdout:?}"
+    );
+    assert_eq!(home.pidfile_pid(), Some(owner_pid));
+    assert_eq!(
+        daemon_pids_for(&home.path),
+        vec![owner_pid],
+        "a second daemon survived"
+    );
+    let mut client = home.connect();
+    assert_eq!(client.hello_cli()["pid"], owner_pid);
+    assert!(home.sock().exists(), "owner's socket was removed");
+
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(wait_child(&mut owner, S(10)).is_some());
 }
 
 // ===========================================================================

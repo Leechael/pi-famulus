@@ -213,8 +213,8 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
 async fn wait_for_manager_exit(home: &Path, mode: &HelloMode) -> Result<Option<Conn>, String> {
     while lifecycle::lock_held(home) {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // Use the same per-attempt budget as socket readiness; don't let
-        // one hello consume the whole 15s startup deadline.
+        // Keep the per-attempt hello probe at 2s; socket readiness may wait
+        // 30s, while connect() still bounds the overall startup flow at 60s.
         match tokio::time::timeout(Duration::from_secs(2), connect_existing(home, mode)).await {
             Ok(Ok(conn)) => return Ok(Some(conn)),
             Ok(Err(e)) if is_shutting_down(&e) || is_disconnect(&e) || e.starts_with("connect ") => {}
@@ -228,6 +228,13 @@ async fn wait_for_manager_exit(home: &Path, mode: &HelloMode) -> Result<Option<C
 fn is_shutting_down(e: &str) -> bool {
     e.strip_prefix("E_INTERNAL: ") == Some(SHUTTING_DOWN)
 }
+
+/// How long a client waits for a freshly spawned daemon to publish its
+/// socket. Daemon startup on a loaded machine can take seconds (observed
+/// 5.2 s on a busy 3-core CI runner, see issue #51), far beyond the old
+/// 2 s bound; 30 s leaves wide margin while the 50 ms poll still returns
+/// as soon as the socket is connectable.
+const SPAWN_SOCKET_WAIT: Duration = Duration::from_secs(30);
 
 async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
@@ -275,11 +282,15 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
 /// manager can also remove its endpoint before releasing the lifetime lock.
 /// Wait for that lock before spawning a successor. Bound the whole flow, not
 /// just each wait, so a stuck or repeatedly shutting-down daemon cannot
-/// keep a CLI alive indefinitely.
+/// keep a CLI alive indefinitely. The bound must comfortably exceed
+/// SPAWN_SOCKET_WAIT: d2 on a loaded CI runner showed every client hitting
+/// this deadline while the daemon was still legitimately starting (24-way
+/// contention stretches each phase; a 15s cap fired before the 30s socket
+/// wait could ever complete).
 pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
-    tokio::time::timeout(Duration::from_secs(15), connect_with_retry(home, mode))
+    tokio::time::timeout(Duration::from_secs(60), connect_with_retry(home, mode))
         .await
-        .map_err(|_| "cannot reach pi-famulus: manager did not become ready within 15s".to_string())?
+        .map_err(|_| "cannot reach pi-famulus: manager did not become ready within 60s".to_string())?
 }
 
 async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
@@ -320,15 +331,15 @@ async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, Strin
         match lifecycle::try_acquire_spawn_lock(home) {
             Ok(Some(guard)) => {
                 spawn_daemon(home)?;
-                let ok = wait_for_socket(home, Duration::from_secs(2)).await;
+                let ok = wait_for_socket(home, SPAWN_SOCKET_WAIT).await;
                 drop(guard); // release the spawn lock (§3.1 step 3)
                 if !ok {
-                    return Err("cannot reach pi-famulus: spawned daemon did not create its socket within 2s".into());
+                    return Err("cannot reach pi-famulus: spawned daemon did not create its socket in time".into());
                 }
             }
             Ok(None) => {
                 // Someone else is spawning; just wait.
-                if !wait_for_socket(home, Duration::from_secs(2)).await {
+                if !wait_for_socket(home, SPAWN_SOCKET_WAIT).await {
                     return Err("cannot reach pi-famulus: another client is spawning the manager, but it did not come up".into());
                 }
             }
