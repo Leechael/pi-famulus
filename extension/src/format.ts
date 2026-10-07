@@ -14,6 +14,7 @@ import {
   type SubagentOverrunChild,
   type WakeItem,
 } from "./wake";
+import { fill } from "./prompts.generated";
 
 export { FAMULUS_WAKE_LEAD_IN } from "./wake";
 export type { FormattedWake, WakeItem } from "./wake";
@@ -151,10 +152,7 @@ export function formatBackgroundNotice(
   outputPath: string,
 ): string {
   // Model-facing. The transcript row is drawn by the bash tool's renderResult.
-  return [
-    `Command "${displayCommand(command)}" moved to background (task_id: ${taskId}). Output: ${outputPath}.`,
-    'You will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pi-famulus-wake kind="task"> when it arrives.',
-  ].join("\n");
+  return fill("tools.bash.result.backgrounded", { command: displayCommand(command), taskId, outputPath });
 }
 
 /** Transcript row for a backgrounded command (UI only; never sent to the model). */
@@ -333,10 +331,13 @@ function formatOverrunChild(info: SubagentOverrunInfo): SubagentOverrunChild {
 
 function formatSubagentOverrunDetails(info: SubagentOverrunInfo): Extract<FamulusWake, { kind: "subagent-overrun" }> {
   const child = formatOverrunChild(info);
-  const shellBit = child.shell ? `; it is waiting on a shell command that has run ${wakeDuration(child.shell.elapsedMs)}` : "";
-  const summary =
-    `${child.name} has run ${wakeDuration(child.elapsedMs)} in this turn, past its ` +
-    `${wakeDuration(child.budgetMs)} budget, and is still running${shellBit}.`;
+  const shell = child.shell ? fill("wakes.overrun.summary-shell", { elapsed: wakeDuration(child.shell.elapsedMs) }) : "";
+  const summary = fill("wakes.overrun.summary", {
+    name: child.name,
+    elapsed: wakeDuration(child.elapsedMs),
+    budget: wakeDuration(child.budgetMs),
+    shell,
+  });
   return { kind: "subagent-overrun", ...child, summary };
 }
 

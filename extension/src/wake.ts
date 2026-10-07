@@ -5,10 +5,13 @@
  * discriminator the renderer and the eval adapter both read.
  */
 
+// .ts suffix: eval/ loads this module with Node's own TypeScript support, which
+// needs explicit extensions (it imports wake.ts and behavior-guidelines.ts).
+import { fill, PROMPTS } from "./prompts.generated.ts";
+
 export const FAMULUS_WAKE_CUSTOM_TYPE = "pi-famulus-wake";
 
-export const FAMULUS_WAKE_LEAD_IN =
-  "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.";
+export const FAMULUS_WAKE_LEAD_IN = PROMPTS["wakes.lead-in"];
 
 export interface WakeItem {
   id: string;
@@ -334,7 +337,7 @@ function renderHandover(details: Extract<FamulusWake, { kind: "subagent-handover
     parts.push(
       `  <changed-since-as-of>${escapeXml(
         `${details.name} (${details.childId}): ${details.statusAsOf} → ${details.status}.` +
-          (active ? " Its result arrives as a new wake when it finishes." : ""),
+          (active ? ` ${PROMPTS["wakes.handover.changed-active"]}` : ""),
       )}</changed-since-as-of>`,
     );
   }
@@ -361,7 +364,7 @@ function renderDone(details: Extract<FamulusWake, { kind: "subagent-done" }>): s
     const active = details.children.some((c) => c.status === "pending" || c.status === "running");
     parts.push(
       `  <changed-since-as-of>${escapeXml(
-        `${list}.` + (active ? " The run is active again; another subagent-done arrives when it finishes." : ""),
+        `${list}.` + (active ? ` ${PROMPTS["wakes.done.changed-active"]}` : ""),
       )}</changed-since-as-of>`,
     );
   }
@@ -434,33 +437,17 @@ function renderOverrun(details: Extract<FamulusWake, { kind: "subagent-overrun" 
 
 /** The parent's three actions and what happens if it takes none. */
 function overrunOptions(details: Extract<FamulusWake, { kind: "subagent-overrun" }>): string {
-  const ids = `run_id: "${details.runId}", child_id: "${details.childId}"`;
-  const actions =
-    `give it more time with subagent({ action: "extend", ${ids}, timeout_ms: <ms from now> }); ` +
-    `redirect it with agent_message({ action: "send", to: "${details.childId}", message: "<instruction>" }); ` +
-    `or stop it with subagent({ action: "interrupt", ${ids} }). `;
+  const actions = fill("wakes.overrun.actions", { runId: details.runId, childId: details.childId });
+  const next = wakeDuration(details.nextReminderMs);
   const hard = details.hardCeilingMs;
-  if (hard === undefined) {
-    return (
-      "It has not been stopped. Choose one: " +
-      actions +
-      `If you do none of these, it keeps running and the next reminder is scheduled in ${wakeDuration(details.nextReminderMs)}; ` +
-      "its result arrives as usual when it finishes."
-    );
-  }
+  if (hard === undefined) return fill("wakes.overrun.options", { actions, next });
   // Opt-in hard ceiling: never promise "keeps running" past it.
   const ceiling = wakeDuration(hard);
   const noAction =
     details.nextReminderMs < hard
-      ? `If you do none of these, it keeps running and the next reminder is scheduled in ${wakeDuration(details.nextReminderMs)}, until the hard ceiling stops it in ${ceiling}.`
-      : "If you do none of these, it keeps running until the hard ceiling stops it.";
-  return (
-    `It has not been stopped yet, but the configured hard ceiling stops it in ${ceiling}, and extend does not move that ceiling. ` +
-    "Choose one: " +
-    actions +
-    noAction +
-    " Its result, or the interruption, arrives as a wake."
-  );
+      ? fill("wakes.overrun.ceiling-no-action-reminder", { next, ceiling })
+      : PROMPTS["wakes.overrun.ceiling-no-action"];
+  return fill("wakes.overrun.options-ceiling", { ceiling, actions, noAction });
 }
 
 function renderOverrunShell(shell: OverrunShell, indent: string): string[] {
@@ -477,7 +464,7 @@ function renderOverrunShell(shell: OverrunShell, indent: string): string[] {
 }
 
 function renderRequest(details: Extract<FamulusWake, { kind: "supervisor-request" }>): string {
-  const recipe = `agent_message { action: "reply", to: "${details.from}", message: "<your decision>" }`;
+  const recipe = fill("wakes.request.reply-with", { from: details.from });
   return [
     `<pi-famulus-wake kind="supervisor-request" from="${escapeXmlAttr(details.from)}" name="${escapeXmlAttr(details.name)}">`,
     `  <message>${escapeXml(details.message)}</message>`,

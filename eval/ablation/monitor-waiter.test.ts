@@ -241,10 +241,10 @@ describe("monitor manifest segments", () => {
     assert.equal(idle.textFrom, "guidelines.MONITOR_IDLE_INSTRUCTION");
     assert.equal(idle.text, MONITOR_IDLE_INSTRUCTION);
     for (const id of ["monitor-not-sleep", ...SCENARIOS.filter((s) => s.optIn).map((s) => s.id)]) assert.ok(idle.affects.includes(id));
-    const source = readFileSync(new URL("../../extension/src/monitor.ts", import.meta.url), "utf8");
-    const block = source.split("export const MONITOR_STARTED_INSTRUCTION =")[1].split(";")[0];
-    const literals = [...block.matchAll(/(["'])(.*?)\1/gs)].map((m) => m[2]).join("");
-    assert.ok(literals.includes(started.text!.slice(1)));
+    // The start result's text lives in extension/prompts/tools/monitor.md (markers stripped).
+    const source = readFileSync(new URL("../../extension/prompts/tools/monitor.md", import.meta.url), "utf8").replace(/<!--\/?seg[^>]*-->/g, "");
+    const block = source.split("# result: started")[1];
+    assert.ok(block.includes(started.text!.slice(1)));
     const notice = `${started.text} ${MONITOR_IDLE_INSTRUCTION}`;
     const withoutIdle = removeSegments(notice, compileTextSegments([idle]), new Map());
     const withoutStart = removeSegments(notice, compileTextSegments([started]), new Map());

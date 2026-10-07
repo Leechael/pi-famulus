@@ -26,6 +26,7 @@ import { taskOutputPath } from "../config";
 import { realClock, type Clock } from "../clock";
 import type { ManagerClient } from "../manager-client";
 import type { ChildShellTracker } from "./overrun";
+import { fill, PROMPTS } from "../prompts.generated";
 import {
   appendStatus,
   bareSleepError,
@@ -44,10 +45,8 @@ const MAX_BYTES = SHELL_MAX_BYTES;
 const WAIT_SLICE_MS = 60_000;
 
 const childBashParameters = Type.Object({
-  command: Type.String({ description: "The bash command to execute" }),
-  timeout: Type.Optional(
-    Type.Number({ description: "Hard kill timeout in seconds (optional, no default timeout)" }),
-  ),
+  command: Type.String({ description: PROMPTS["tools.child.bash.param.command"] }),
+  timeout: Type.Optional(Type.Number({ description: PROMPTS["tools.child.bash.param.timeout"] })),
 });
 
 type ChildBashParams = { command: string; timeout?: number };
@@ -71,11 +70,8 @@ export interface ChildBashDeps {
   shells?: Pick<ChildShellTracker, "start" | "end">;
 }
 
-const CHILD_SLEEP_GUIDANCE =
-  "Sleeping to wait for work is never useful: run the actual command directly, or report back to the supervisor if you are blocked.";
-
 function rejectBareSleep(command: string): string | null {
-  return bareSleepError(command, CHILD_SLEEP_GUIDANCE);
+  return bareSleepError(command, "tools.child.bash.error.bare-sleep");
 }
 
 function resolveTimeoutMs(timeoutSeconds: number | undefined): number | null {
@@ -101,12 +97,8 @@ export function createChildBashTool(
   return {
     name: "bash",
     label: "Bash",
-    description:
-      "Execute a bash command in the current working directory. Returns stdout and stderr. " +
-      `Output is truncated to last ${MAX_LINES} lines or ${MAX_BYTES / 1024}KB (whichever is hit first). ` +
-      "The command runs to completion (or the optional timeout in seconds, after which it is killed). " +
-      "There is no background execution inside subagents.",
-    promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
+    description: fill("tools.child.bash.description", { maxLines: MAX_LINES, maxKb: MAX_BYTES / 1024 }),
+    promptSnippet: PROMPTS["tools.child.bash.snippet"],
     parameters: childBashParameters,
     async execute(_toolCallId, params, signal, _onUpdate, ctx: ExtensionContext) {
       const input = params as ChildBashParams;
