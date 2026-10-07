@@ -13,7 +13,8 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
 /// Re-exec entry point for `HelperClient` (a killable stand-in for pi). It is
@@ -26,6 +27,8 @@ fn helper_hold_extension_conn() {
 
 const S: fn(u64) -> Duration = Duration::from_secs;
 const MS: fn(u64) -> Duration = Duration::from_millis;
+// Mirrors the production cap; the debug hook records one byte per WouldBlock.
+const DAEMON_LOCK_RETRY_ATTEMPTS: usize = 100;
 
 #[cfg(feature = "test-clock")]
 struct CliGuard(Option<std::process::Child>);
@@ -54,8 +57,13 @@ fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
 /// Start a daemon that leaves a byte in `blocked` every time it cannot yet
 /// acquire manager.lock. The debug-only hook makes lock contention observable
 /// without relying on a scheduler sleep in the lifecycle regression below.
-fn spawn_lock_observer_daemon(home: &Home, blocked: &std::path::Path) -> std::process::Child {
-    std::process::Command::new(BIN)
+fn spawn_lock_observer_daemon(
+    home: &Home,
+    blocked: &std::path::Path,
+    barrier: Option<&std::path::Path>,
+) -> std::process::Child {
+    let mut command = std::process::Command::new(BIN);
+    command
         .arg("--home")
         .arg(&home.path)
         .env("PI_FAMULUS_TEST_CLOCK", if home.manual { "manual" } else { "" })
@@ -64,9 +72,11 @@ fn spawn_lock_observer_daemon(home: &Home, blocked: &std::path::Path) -> std::pr
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn lock-observing daemon")
+        .stderr(std::process::Stdio::null());
+    if let Some(barrier) = barrier {
+        command.env("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER", barrier);
+    }
+    command.spawn().expect("spawn lock-observing daemon")
 }
 
 fn blocked_lock_attempts(path: &std::path::Path) -> usize {
@@ -1150,19 +1160,26 @@ fn stale_files_recover_after_transient_lifetime_lock_contention() {
     let mut lifecycle_lock = fd_lock::RwLock::new(lock_file);
     let guard = lifecycle_lock.try_write().unwrap();
     let blocked = home.path.join("blocked-lock-attempts");
-    let mut successor = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked)));
+    let barrier_path = home.path.join("claim-barrier.sock");
+    let listener = UnixListener::bind(&barrier_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut successor = KillOnDrop(Some(spawn_lock_observer_daemon(
+        &home,
+        &blocked,
+        Some(&barrier_path),
+    )));
 
-    assert!(
-        poll_true(S(3), || blocked_lock_attempts(&blocked) >= 1),
-        "successor did not observe the held manager.lock"
-    );
-    if let Some(status) = successor.0.as_mut().unwrap().try_wait().unwrap() {
-        let out = successor.0.take().unwrap().wait_with_output().unwrap();
-        panic!(
-            "successor exited before lock release ({status}; stdout: {:?})",
-            String::from_utf8_lossy(&out.stdout)
-        );
-    }
+    // The debug hook sends an ACK on its first WouldBlock and blocks reading
+    // this socket. The retry cannot proceed until after we release manager.lock
+    // and send the resume byte, regardless of how slowly this test is scheduled.
+    let (mut barrier, _) = poll_until(S(3), || listener.accept().ok())
+        .expect("successor did not observe the held manager.lock");
+    barrier.set_read_timeout(Some(S(3))).unwrap();
+    barrier.set_write_timeout(Some(S(3))).unwrap();
+    let mut observed = [0_u8; 1];
+    barrier.read_exact(&mut observed).unwrap();
+    assert_eq!(observed, [b'x']);
+    assert_eq!(blocked_lock_attempts(&blocked), 1);
     assert_eq!(
         home.pidfile_pid(),
         Some(old_pid),
@@ -1178,6 +1195,9 @@ fn stale_files_recover_after_transient_lifetime_lock_contention() {
     );
 
     drop(guard);
+    barrier.write_all(b"x").unwrap();
+    drop(barrier);
+    drop(listener);
     assert!(
         poll_true(S(8), || {
             home.pidfile_pid().is_some_and(|pid| pid != old_pid)
@@ -1206,22 +1226,19 @@ fn real_lifetime_lock_owner_gets_bounded_refusal_without_second_server() {
     let owner_pid = owner.id();
     let blocked = home.path.join("blocked-lock-attempts");
     let started = Instant::now();
-    let mut duplicate = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked)));
+    let mut duplicate = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked, None)));
 
-    assert!(
-        poll_true(S(3), || blocked_lock_attempts(&blocked) >= 2),
-        "contender did not retry while the real daemon owned manager.lock"
-    );
-    assert!(
-        duplicate.0.as_mut().unwrap().try_wait().unwrap().is_none(),
-        "contender did not wait through a transient WouldBlock"
-    );
     let status = wait_child(duplicate.0.as_mut().unwrap(), S(5))
         .expect("contender did not refuse within the bounded claim window");
     assert!(status.success(), "duplicate daemon exited with {status}");
     assert!(
         started.elapsed() < S(5),
         "real-owner refusal was not bounded"
+    );
+    assert_eq!(
+        blocked_lock_attempts(&blocked),
+        DAEMON_LOCK_RETRY_ATTEMPTS,
+        "real owner must keep the contender blocked through the retry cap"
     );
     let out = duplicate.0.take().unwrap().wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);

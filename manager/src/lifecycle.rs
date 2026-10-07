@@ -7,6 +7,8 @@ use crate::registry::{self, Registry, TaskEntry};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+#[cfg(debug_assertions)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -143,16 +145,24 @@ fn open_daemon_lock(home: &Path) -> io::Result<fd_lock::RwLock<std::fs::File>> {
 }
 
 #[cfg(debug_assertions)]
-fn note_daemon_lock_would_block() -> io::Result<()> {
-    let Some(path) = std::env::var_os("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED") else {
-        return Ok(());
-    };
-    let mut marker = OpenOptions::new().create(true).append(true).open(path)?;
-    marker.write_all(b"x")
+fn note_daemon_lock_would_block(attempt: usize) -> io::Result<()> {
+    if let Some(path) = std::env::var_os("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED") {
+        let mut marker = OpenOptions::new().create(true).append(true).open(path)?;
+        marker.write_all(b"x")?;
+    }
+    if attempt == 0 {
+        if let Some(path) = std::env::var_os("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER") {
+            let mut barrier = std::os::unix::net::UnixStream::connect(path)?;
+            barrier.write_all(b"x")?;
+            let mut resume = [0_u8; 1];
+            barrier.read_exact(&mut resume)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(debug_assertions))]
-fn note_daemon_lock_would_block() -> io::Result<()> {
+fn note_daemon_lock_would_block(_attempt: usize) -> io::Result<()> {
     Ok(())
 }
 
@@ -190,7 +200,7 @@ pub fn claim_daemon(home: &Path) -> io::Result<Claim> {
                 return Ok(Claim::Acquired(guard));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                note_daemon_lock_would_block()?;
+                note_daemon_lock_would_block(attempt)?;
                 if attempt + 1 == DAEMON_LOCK_CLAIM_ATTEMPTS {
                     return Ok(Claim::AlreadyRunning {
                         pid: read_pid_file(home).map(|p| p.pid),
