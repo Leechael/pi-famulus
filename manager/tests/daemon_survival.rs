@@ -80,6 +80,38 @@ fn retired_layout_startup_maps_bin_executable_to_stable_sibling() {
     drop(daemon);
 }
 
+/// A daemon launched from npm's retired layout should auto-upgrade to an
+/// already-installed stable sibling rather than snapshotting its identity.
+#[cfg(target_os = "linux")]
+#[test]
+fn retired_layout_startup_auto_upgrades_to_stable_sibling() {
+    let home = Home::new("retired-auto-upgrade");
+    let stable = install_layout(&home, "pi-famulus-linux-x64");
+    let retired = install_layout(&home, ".pi-famulus-linux-x64-AWM9wakS");
+    let daemon = home.start_daemon_from(&retired, &[]);
+    let pid = home.pidfile_pid().unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        let out = home.cli(&["status", "--json"], Duration::from_secs(10));
+        let status: serde_json::Value = serde_json::from_str(&out.stdout).unwrap_or_default();
+        if status["generation"] == 1 {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retired-layout daemon did not auto-upgrade: {} {}\nmanager.log:\n{}",
+            out.stdout,
+            out.stderr,
+            fs::read_to_string(home.path.join("manager.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(status["last_upgrade"]["trigger"], "binary-changed");
+    assert_eq!(fs::read_link(format!("/proc/{pid}/exe")).unwrap(), stable);
+    drop(daemon);
+}
+
 /// A daemon started before npm creates the stable sibling must recover its
 /// executable path after npm deletes the retired directory.
 #[cfg(target_os = "linux")]
