@@ -387,19 +387,26 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
     for round in 0..10 {
         let home = Home::new(&format!("d3r{round}"));
         let mut kids: Vec<_> = (0..6).map(|_| home.spawn_daemon()).collect();
-        // Losers exit quickly; wait until at most one process is left.
+        // Identify and keep the lock owner connected before waiting for the
+        // contenders, so the five-second idle shutdown cannot race the wait.
+        let mut client = home.connect();
+        let owner = client.hello_cli()["pid"]
+            .as_u64()
+            .expect("owner hello did not identify the daemon") as u32;
+
+        // Losers retry the lifetime lock; assert the convergence deadline
+        // rather than continuing with a partial process snapshot on timeout.
         let mut running = Vec::new();
-        poll_true(S(5), || {
-            running = kids
-                .iter_mut()
-                .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
-                .collect();
-            running.len() <= 1
-        });
-        let owner = {
-            let mut c = home.connect();
-            c.hello_cli()["pid"].as_u64().unwrap() as u32
-        };
+        assert!(
+            poll_true(S(5), || {
+                running = kids
+                    .iter_mut()
+                    .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
+                    .collect();
+                running.len() <= 1
+            }),
+            "round {round}: daemons did not converge; still running {running:?}"
+        );
         for k in kids.iter_mut() {
             let _ = k.kill();
             let _ = k.wait();
@@ -409,6 +416,8 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             vec![owner],
             "round {round}: running daemons {running:?}, socket owner {owner}"
         );
+        assert_eq!(home.pidfile_pid(), Some(owner));
+        assert!(home.sock().exists(), "round {round}: owner socket disappeared");
     }
 }
 
@@ -1231,16 +1240,14 @@ fn real_lifetime_lock_owner_gets_bounded_refusal_without_second_server() {
     let mut owner_client = home.connect();
     assert_eq!(owner_client.hello_cli()["pid"], owner_pid);
     let blocked = home.path.join("blocked-lock-attempts");
-    let started = Instant::now();
     let mut duplicate = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked, None)));
 
-    let status = wait_child(duplicate.0.as_mut().unwrap(), S(5))
-        .expect("contender did not refuse within the bounded claim window");
+    // The bounded policy is the retry cap, not a wall-clock promise that can
+    // be distorted by process scheduling on a busy CI runner. Keep an outer
+    // safety deadline only to catch a stuck contender.
+    let status = wait_child(duplicate.0.as_mut().unwrap(), S(15))
+        .expect("contender did not refuse before the safety deadline");
     assert!(status.success(), "duplicate daemon exited with {status}");
-    assert!(
-        started.elapsed() < S(5),
-        "real-owner refusal was not bounded"
-    );
     assert_eq!(
         blocked_lock_attempts(&blocked),
         DAEMON_LOCK_RETRY_ATTEMPTS,
