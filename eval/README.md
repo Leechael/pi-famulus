@@ -202,7 +202,7 @@ node ablation/run.ts --models <provider/model:thinking> --scenarios monitor-wait
 node ablation/run.ts --models <provider/model:thinking> --scenarios monitor-waiter-synthetic-long --variants baseline,guidelines.monitor-end-turn --k 3 --concurrency 1 --transcripts --keep --results results/monitor-waiter-v1/long.jsonl
 ```
 
-Use fresh result filenames after fixture/prompt changes; do not mix revisions or resume old cells. `--transcripts` records live events, not the request-local history prefix; `--keep` retains the generated history/context audit. `guidelines.monitor-end-turn` reads `guidelines.MONITOR_IDLE_INSTRUCTION` via `textFrom` and removes **all copies** (system guidelines, tool description/rules, start result). The separate `result.monitor-started-instruction` removes only the first two start-notice sentences, avoiding overlap with the idle-instruction segment.
+Use fresh result filenames after fixture/prompt changes; do not mix revisions or resume old cells. `--transcripts` records live events, not the request-local history prefix; `--keep` retains the generated history/context audit. `guidelines.monitor-end-turn` is the span in `extension/prompts/guidelines.md` (`# monitor-idle`) and removes **all copies** (system guidelines, tool description/rules, start result). The separate `result.monitor-started-instruction` removes only the first two start-notice sentences, avoiding overlap with the idle-instruction segment.
 
 ### Reading the report
 
@@ -225,7 +225,7 @@ The ablation harness is a separate pi extension loaded after ours; the extension
 - Famulus's request-local `context_with_system` repair maintains its guideline visibility on ongoing/wake requests. The ablation `context_with_system` hook, registered last, then strips segments from **every request**: system guidelines, tool declarations, tool results, and wakes (the shared `FAMULUS_WAKE_LEAD_IN`, `<reply-with>`). Non-destructive: the session keeps the original text.
 - `tool_call` disables the bare-sleep guard (`mech.sleep-block`); `mech.autobg` is disabled via `config.json`.
 
-Segment texts must match the source exactly. Where possible they are read from the extension (`textFrom`, e.g. `wake.FAMULUS_WAKE_LEAD_IN`) instead of copied. `npm run test:e2e` fails on any drift, and verifies every removal happened and that no removed text is still visible.
+Segment texts are not copied here: a segment is the span marked `<!--seg:<id>-->…<!--/seg-->` in [`extension/prompts/`](../extension/prompts/INDEX.md), the same files the extension is built from. Only structural spans that are no prompt (the `<reply-with>` element) keep a `pattern` in the manifest. `npm run test:e2e` checks that every span reaches the model verbatim in a real pi session, that every removal happened, and that no removed text is still visible.
 
 **Not ablatable externally:** anything only child sessions see (`child.guidelines` = `CHILD_BEHAVIOR_GUIDELINES`, child tool descriptions). By design, children load no extensions, so no hook runs there. These segments are drift-guarded in child calls but never scheduled. Wake delivery itself (triggerTurn vs steer routing, coalescing) has no interception hook either.
 

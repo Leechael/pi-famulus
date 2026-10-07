@@ -5,17 +5,24 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import * as guidelines from "../../extension/src/behavior-guidelines.ts";
-import * as wake from "../../extension/src/wake.ts";
+import { PROMPT_SEGMENTS } from "../../extension/src/prompts.generated.ts";
 
-/** Extension exports a segment may take its text from (`textFrom: "wake.FAMULUS_WAKE_LEAD_IN"`). */
-const TEXT_SOURCES: Record<string, Record<string, unknown>> = { wake, guidelines };
-
-function resolveTextFrom(ref: string): string {
-  const [mod, name] = ref.split(".");
-  const value = TEXT_SOURCES[mod]?.[name];
-  if (typeof value !== "string") throw new Error(`manifest textFrom "${ref}" does not name a string export`);
-  return value;
+/**
+ * A text/regex segment without its own text or pattern is the span marked
+ * <!--seg:id--> in extension/prompts/ (one source of truth, no copy here).
+ */
+function resolveFromPrompts(s: Segment): void {
+  if (s.text !== undefined || s.pattern !== undefined || (s.kind !== "text" && s.kind !== "regex")) return;
+  const span = PROMPT_SEGMENTS[s.id];
+  if (!span) throw new Error(`manifest segment ${s.id} has no text and no <!--seg:${s.id}--> span in extension/prompts/`);
+  s.prompt = span.prompt;
+  if (span.text !== undefined) {
+    s.kind = "text";
+    s.text = span.text;
+  } else {
+    s.kind = "regex";
+    s.pattern = span.pattern;
+  }
 }
 
 export interface Segment {
@@ -23,8 +30,8 @@ export interface Segment {
   kind: "text" | "regex" | "hook" | "config";
   surface: string;
   text?: string;
-  /** Read the text from an extension export instead of copying it. */
-  textFrom?: string;
+  /** Set on load: the extension prompt id that holds this span. */
+  prompt?: string;
   pattern?: string;
   famulusConfig?: Record<string, unknown>;
   /** "child": only child sessions see it. */
@@ -53,7 +60,7 @@ export const MANIFEST_PATH = join(import.meta.dirname, "manifest.json");
 
 export function loadManifest(path = MANIFEST_PATH): Manifest {
   const m = JSON.parse(readFileSync(path, "utf8")) as Manifest;
-  for (const s of m.segments) if (s.textFrom) s.text = resolveTextFrom(s.textFrom);
+  for (const s of m.segments) resolveFromPrompts(s);
   return m;
 }
 

@@ -238,7 +238,7 @@ describe("monitor manifest segments", () => {
     const manifest = loadManifest();
     const idle = resolveVariant(manifest, "guidelines.monitor-end-turn").segments[0];
     const started = resolveVariant(manifest, "result.monitor-started-instruction").segments[0];
-    assert.equal(idle.textFrom, "guidelines.MONITOR_IDLE_INSTRUCTION");
+    assert.equal(idle.prompt, "guidelines.monitor-idle");
     assert.equal(idle.text, MONITOR_IDLE_INSTRUCTION);
     for (const id of ["monitor-not-sleep", ...SCENARIOS.filter((s) => s.optIn).map((s) => s.id)]) assert.ok(idle.affects.includes(id));
     // The start result's text lives in extension/prompts/tools/monitor.md (markers stripped).

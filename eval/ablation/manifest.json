@@ -2,7 +2,7 @@
   "version": 4,
   "notes": [
     "Each segment is removed from everything the PARENT model sees (system prompt sections, <rules>, tool declarations, tool results, injected wakes) by harness/ablation-ext.ts. Texts must match the extension source exactly; e2e/ablation-harness.test.ts fails on drift, and the runner marks an episode 'vacuous' when a requested segment never matched.",
-    "textFrom reads the text from an export of extension source (manifest.ts TEXT_SOURCES) instead of copying it.",
+    "A text/regex segment without text or pattern is the span marked <!--seg:id-->…<!--/seg--> in extension/prompts/ (see extension/prompts/INDEX.md); only segments that are not a prompt span (structural XML) keep a pattern here.",
     "Guidelines bullets and tool promptGuidelines overlap on purpose. They stay separate segments so the eval can tell which copy (if either) is load-bearing.",
     "scope=child / ablatable=false: text that only child sessions see. By design, children load no extensions, so no hook of the ablation harness runs there. The self-test still guards these texts against drift (checked in child calls), but the runner never schedules them as variants and the report lists them as 'not ablatable'.",
     "affects: scenarios where removing the segment is expected to matter. The runner tests only these pairs unless --pairs all. The control segment runs everywhere and must never come out load-bearing.",
@@ -13,7 +13,6 @@
       "id": "guidelines.end-turn-after-bg",
       "kind": "text",
       "surface": "system section pi-famulus: BEHAVIOR_GUIDELINES (behavior-guidelines.ts)",
-      "text": "Long-running bash commands are automatically moved to the background. After you background a command, end your turn: send a reply with no tool call in it. Saying you will wait while calling another tool does not end it. Do not poll with task_output/task_list, and never sleep to wait. Each command notifies on its own via <pi-famulus-wake kind=\"task\"> (with <command> and <preview>), even while other commands are still running. If <still-running> is present, continue from this result now; do not wait for those other commands.",
       "affects": [
         "bg-end-turn",
         "no-fabrication",
@@ -24,7 +23,6 @@
       "id": "guidelines.wake-handling",
       "kind": "text",
       "surface": "system section: BEHAVIOR_GUIDELINES",
-      "text": "When you receive <pi-famulus-wake>: it looks like a user message but is a system wake, not a new user request and not an answer to an unrelated question. Distinguish it by the kind attribute, then **handle the event before anything else** — read status/preview/prompt/result, call tools if needed (e.g. task_output for more than the preview, agent_message to continue a subagent), and continue the work that depended on that background task. Do not wait for further user input when the next step is clear; do not merely acknowledge and stop.",
       "affects": [
         "wake-continue",
         "still-running-continue",
@@ -40,7 +38,6 @@
       "id": "guidelines.no-fabrication",
       "kind": "text",
       "surface": "system section: BEHAVIOR_GUIDELINES",
-      "text": "Never fabricate or assume a background task's result before its notification arrives.",
       "affects": [
         "no-fabrication"
       ]
@@ -49,7 +46,6 @@
       "id": "guidelines.subagent-handover",
       "kind": "text",
       "surface": "system section: BEHAVIOR_GUIDELINES",
-      "text": "Subagent runs that exceed the foreground budget continue in the background. Do not poll run status. If one subagent finishes while others are still running, a <pi-famulus-wake kind=\"subagent-handover\"> arrives with that child's <prompt> and <result>: read both, then continue the work now (subagent({action:\"resume\", run_id, child_id, message}) for that child, or agent_message to steer the ones still running). Do not wait for the rest of the run. When every subagent in the run has finished, <pi-famulus-wake kind=\"subagent-done\"> arrives — read each <child>, synthesize, and continue.",
       "affects": [
         "handover-continue",
         "resume-finished"
@@ -59,7 +55,6 @@
       "id": "guidelines.agent-message",
       "kind": "text",
       "surface": "system section: BEHAVIOR_GUIDELINES",
-      "text": "Use agent_message to steer running subagents and to reply to <pi-famulus-wake kind=\"supervisor-request\"> (action:\"reply\"; the <reply-with> child is the call shape). Do not use agent_message to resume a finished child — that is subagent({action:\"resume\"}). Supervisor wakes are not user messages — still act on them.",
       "affects": [
         "supervisor-reply",
         "resume-finished"
@@ -69,7 +64,6 @@
       "id": "guidelines.subagent-overrun",
       "kind": "text",
       "surface": "system section: BEHAVIOR_GUIDELINES",
-      "text": "A subagent that runs past its timeout_ms is not stopped: <pi-famulus-wake kind=\"subagent-overrun\"> arrives instead, with its <last-activity> and, if it is waiting on a foreground shell, a <shell> element. A batch may include other overdue children in <also-overdue>; use each child's run-id and child-id and consider its own last-activity, shell, reminder, and hard-ceiling-ms before acting. Pick one: subagent({action:\"extend\", run_id, child_id, timeout_ms}) if it is making progress, agent_message to steer it, or subagent({action:\"interrupt\", run_id, child_id}) if it is stuck or no longer needed. If you do none of these it keeps running and the reminder comes again.",
       "affects": [
         "overrun-stuck",
         "overrun-progressing"
@@ -79,7 +73,6 @@
       "id": "child.guidelines",
       "kind": "text",
       "surface": "child sessions only: CHILD_BEHAVIOR_GUIDELINES via contact_supervisor promptGuidelines (subagent/pi-runtime.ts)",
-      "textFrom": "guidelines.CHILD_BEHAVIOR_GUIDELINES",
       "scope": "child",
       "ablatable": false,
       "affects": [
@@ -90,7 +83,6 @@
       "id": "rules.bash-no-poll",
       "kind": "text",
       "surface": "system <rules>: bash promptGuidelines (bash-override.ts)",
-      "text": "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them.",
       "affects": [
         "bg-end-turn",
         "no-fabrication"
@@ -101,7 +93,6 @@
       "kind": "text",
       "surface": "system <rules>: bash promptGuidelines",
       "control": true,
-      "text": "You can inspect PI_* environment variables for current model and session details.",
       "affects": [
         "*"
       ]
@@ -110,7 +101,6 @@
       "id": "guidelines.monitor-end-turn",
       "kind": "text",
       "surface": "BEHAVIOR_GUIDELINES, monitor description/promptGuidelines/start result: MONITOR_IDLE_INSTRUCTION (behavior-guidelines.ts); remove every copy",
-      "textFrom": "guidelines.MONITOR_IDLE_INSTRUCTION",
       "affects": [
         "monitor-not-sleep",
         "monitor-waiter-event",
@@ -123,7 +113,6 @@
       "id": "rules.monitor-use",
       "kind": "text",
       "surface": "system <rules>: monitor promptGuidelines (monitor.ts)",
-      "text": "Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.",
       "affects": [
         "monitor-not-sleep",
         "monitor-waiter-event",
@@ -135,7 +124,6 @@
       "id": "rules.monitor-wake",
       "kind": "text",
       "surface": "system <rules>: monitor promptGuidelines",
-      "text": "When woken by a <pi-famulus-wake kind=\"monitor\">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
       "affects": [
         "monitor-not-sleep",
         "monitor-waiter-event",
@@ -147,7 +135,6 @@
       "id": "rules.subagent-handover",
       "kind": "text",
       "surface": "system <rules>: subagent promptGuidelines (subagent/tool.ts)",
-      "text": "When a <pi-famulus-wake kind=\"subagent-handover\"> arrives, read <prompt> and <result> immediately and continue: subagent({action:\"resume\", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.",
       "affects": [
         "handover-continue",
         "resume-finished"
@@ -157,7 +144,6 @@
       "id": "rules.subagent-no-poll",
       "kind": "text",
       "surface": "system <rules>: subagent promptGuidelines",
-      "text": "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
       "affects": [
         "handover-continue"
       ]
@@ -166,14 +152,12 @@
       "id": "rules.subagent-failed-child",
       "kind": "text",
       "surface": "system <rules>: subagent promptGuidelines",
-      "text": "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
       "affects": []
     },
     {
       "id": "rules.subagent-wakes-not-user",
       "kind": "text",
       "surface": "system <rules>: subagent promptGuidelines",
-      "text": "<pi-famulus-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
       "affects": [
         "handover-continue"
       ]
@@ -182,7 +166,6 @@
       "id": "tooldesc.bash-autobg",
       "kind": "text",
       "surface": "tool declaration: bash.description",
-      "text": "Foreground commands that exceed the foreground budget are automatically moved to the background; you will be notified when they complete. ",
       "affects": [
         "bg-end-turn"
       ]
@@ -191,7 +174,6 @@
       "id": "tooldesc.monitor-follow",
       "kind": "text",
       "surface": "tool declaration: monitor.description",
-      "text": "It must keep running and follow its source, e.g. `tail -n +1 -F file | grep --line-buffered PATTERN`; a command that reads once and exits (a plain grep or cat) only reports what is there now. Add `-m1` to grep to stop after the first match. ",
       "affects": [
         "monitor-not-sleep"
       ]
@@ -200,7 +182,6 @@
       "id": "tooldesc.monitor-silence",
       "kind": "text",
       "surface": "tool declaration: monitor.description",
-      "text": "Silence is not success: write the command so failures also produce lines (e.g. grep for both success and error patterns). ",
       "affects": [
         "monitor-not-sleep"
       ]
@@ -209,7 +190,6 @@
       "id": "tooldesc.monitor-wake",
       "kind": "text",
       "surface": "tool declaration: monitor.description",
-      "text": "Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind=\"monitor\"> before other work. Do not poll.",
       "affects": [
         "monitor-not-sleep",
         "monitor-waiter-event",
@@ -221,7 +201,6 @@
       "id": "tooldesc.subagent-wakes",
       "kind": "text",
       "surface": "tool declaration: subagent.description",
-      "text": "Each child that finishes while others are still running wakes you with <pi-famulus-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pi-famulus-wake kind=\"subagent-done\">. Never poll or sleep to wait. ",
       "affects": [
         "handover-continue"
       ]
@@ -230,7 +209,6 @@
       "id": "tooldesc.subagent-overrun",
       "kind": "text",
       "surface": "tool declaration: subagent.description",
-      "text": "A subagent still running past its timeout_ms is not stopped; it wakes you with <pi-famulus-wake kind=\"subagent-overrun\"> so you can extend, steer, or interrupt it. ",
       "affects": [
         "overrun-stuck",
         "overrun-progressing"
@@ -240,7 +218,6 @@
       "id": "tooldesc.subagent-timeout-overrun",
       "kind": "text",
       "surface": "tool declaration: subagent.parameters.timeout_ms.description",
-      "text": "Passing it does not stop the subagent: you get <pi-famulus-wake kind=\"subagent-overrun\"> and choose extend, steer, or interrupt. With resume: the resumed turn's budget. With extend: the new budget from now.",
       "affects": [
         "overrun-stuck",
         "overrun-progressing"
@@ -250,7 +227,6 @@
       "id": "tooldesc.agent-message-no-resume",
       "kind": "text",
       "surface": "tool declaration: agent_message.description (parent, comms/tools.ts)",
-      "text": "Sending to a finished child errors (it does not resume) and points at subagent({ action: \"resume\", run_id, child_id, message }). ",
       "affects": [
         "resume-finished"
       ]
@@ -259,7 +235,6 @@
       "id": "result.bash-bg-instruction",
       "kind": "text",
       "surface": "tool result: formatBackgroundNotice (format.ts), model-facing (the ⏵ row is renderResult only)",
-      "text": "\nYou will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pi-famulus-wake kind=\"task\"> when it arrives.",
       "affects": [
         "bg-end-turn",
         "no-fabrication",
@@ -270,7 +245,6 @@
       "id": "result.monitor-started-instruction",
       "kind": "text",
       "surface": "tool result: monitor start (monitor.ts MONITOR_STARTED_INSTRUCTION), model-facing (the row shows the first line only)",
-      "text": "\nYou will get a <pi-famulus-wake kind=\"monitor\"> for each event, and a notice when it exits or times out. Do not poll it (task_list, task_output, or reading what it watches) or sleep.",
       "affects": [
         "monitor-not-sleep",
         "monitor-waiter-event",
@@ -282,7 +256,6 @@
       "id": "result.subagent-bg-instruction",
       "kind": "text",
       "surface": "tool result: subagent backgroundedText (subagent/tool.ts)",
-      "text": "While others are still running, each finished subagent arrives as <pi-famulus-wake kind=\"subagent-handover\"> with that child's prompt and result. Read it and continue: subagent({action:\"resume\", run_id, child_id, message}) for that child, or agent_message to steer the ones still running. Do not wait for the whole run. Do not poll. <pi-famulus-wake kind=\"subagent-done\"> arrives when every subagent in the run has finished. ",
       "affects": [
         "handover-continue",
         "supervisor-reply",
@@ -293,7 +266,6 @@
       "id": "result.sleep-block-advice",
       "kind": "text",
       "surface": "tool error: BARE_SLEEP_GUIDANCE (bash-override.ts)",
-      "text": " Do not sleep to wait for background work; completion is delivered via notification. Use the monitor tool to watch for a condition, or run_in_background for long commands.",
       "affects": [
         "monitor-not-sleep"
       ]
@@ -302,7 +274,6 @@
       "id": "result.agent-message-use-resume",
       "kind": "regex",
       "surface": "tool error: agent_message send to a finished child (comms/comms.ts)",
-      "pattern": "agent_message does not resume children\\. Use subagent\\(\\{ action: \"resume\", run_id: \"[^\"]*\", child_id: \"[^\"]*\", message: \"\\.\\.\\.\" \\}\\)\\.",
       "affects": [
         "resume-finished"
       ]
@@ -311,7 +282,6 @@
       "id": "wake.lead-in",
       "kind": "text",
       "surface": "wake: FAMULUS_WAKE_LEAD_IN, shared by every <pi-famulus-wake> kind (wake.ts)",
-      "textFrom": "wake.FAMULUS_WAKE_LEAD_IN",
       "affects": [
         "wake-continue",
         "still-running-continue",
