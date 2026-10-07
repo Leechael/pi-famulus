@@ -40,15 +40,15 @@ jobs:
   # No Windows job: the manager is unix-only, and the extension reaches it
   # over a unix socket path (manager/TESTING.md, Deferrals).
   extension:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: extension
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || '' }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -65,6 +65,8 @@ jobs:
     name: e2e (${{ matrix.os }})
     strategy:
       fail-fast: false
+      # macos-latest and ubuntu-latest intentionally track current hosted images
+      # for real-world compatibility coverage; other Ubuntu jobs are pinned.
       matrix:
         os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
@@ -76,14 +78,14 @@ jobs:
       # real-manager integration uses its own home, not an eval sandbox.
       PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || '' }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: manager
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -111,7 +113,7 @@ jobs:
         working-directory: eval
       - run: npm run test:e2e
         working-directory: eval
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: e2e-sandboxes-${{ matrix.os }}

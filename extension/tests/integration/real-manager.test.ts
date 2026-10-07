@@ -257,9 +257,36 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
   it("cold restart keeps finished history (records survive a daemon restart)", async () => {
     // Daemon is down now; a fresh client respawns it and sees prior tasks.
     const client2 = new ManagerClient({ home, sessionId: "integ", managerPath: BIN });
+    const connectStarted = Date.now();
+    const connectStartedAt = new Date(connectStarted).toISOString();
+    let ok = false;
+    let connectError: string | undefined;
     try {
-      const ok = await client2.connect();
-      expect(ok, client2.lastError() ?? undefined).toBe(true);
+      ok = await client2.connect();
+    } catch (error) {
+      connectError = error instanceof Error ? error.stack ?? error.message : String(error);
+    }
+    const elapsedMs = Date.now() - connectStarted;
+    let pidFile = "<manager.pid missing>";
+    try {
+      if (existsSync(paths.pidFile)) pidFile = readFileSync(paths.pidFile, "utf8");
+    } catch (error) {
+      pidFile = `<manager.pid read failed: ${error instanceof Error ? error.message : String(error)}>`;
+    }
+    let managerLog = "<manager.log missing>";
+    try {
+      if (existsSync(paths.log)) managerLog = readFileSync(paths.log, "utf8");
+    } catch (error) {
+      managerLog = `<manager.log read failed: ${error instanceof Error ? error.message : String(error)}>`;
+    }
+    try {
+      expect(ok, [
+        `cold-restart connect failed; started=${connectStartedAt}; elapsed=${elapsedMs}ms; home=${home}`,
+        `socket=${existsSync(paths.socket)} pidFile=${pidFile}`,
+        `connectError=${connectError ?? "<none>"}`,
+        `lastError=${client2.lastError() || "<none>"}`,
+        `manager.log:\n${managerLog}`,
+      ].join("\n")).toBe(true);
       const tasks = await client2.list();
       expect(tasks.length).toBeGreaterThanOrEqual(4); // tasks from earlier its
     } finally {
