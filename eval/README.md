@@ -15,7 +15,8 @@ Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np 
 - `pi` on `PATH` (tested with 1.0.0) — override with `PI_BIN`
 - `cargo`: `pi-famulus` is built from `../manager` into `eval/.cache/target` on first use (never inside `manager/`); override with `PI_FAMULUS_MANAGER_PATH`
 - `tmux` for the TUI test
-- Dependencies in `eval/` (and `extension/`) are required for typechecking, unit tests, deterministic compatibility tests, and eval runners; fixture imports use pinned runtime dependencies. Locally, install them with `npm run deps`, which runs [nub](https://github.com/nubjs/nub) (`nub install --frozen-lockfile --node-linker hoisted`) from the same `package-lock.json`. CI keeps `npm ci`.
+- [nub](https://github.com/nubjs/nub) on `PATH` for local installs (`curl -fsSL https://nubjs.com/install.sh | bash`, or `npm install -g @nubjs/nub`). `npm run deps` invokes `nub` and does not install it.
+- Dependencies in `eval/` (and `extension/`) are required for typechecking, unit tests, deterministic compatibility tests, and eval runners; fixture imports use pinned runtime dependencies. Locally, after nub is on `PATH`, install them with `npm run deps` (`nub install --frozen-lockfile --node-linker hoisted`) from the same `package-lock.json`. CI keeps `npm ci`.
 
   Why nub: `@earendil-works/pi-coding-agent` alone is ~430 MB, and npm writes a full copy into every checkout. nub links files from one global store (copy-on-write clones on APFS), so each extra worktree costs a few MB instead of ~470 MB (measured 2026-10-08: a second `eval/` install took 6 MB of disk with nub, 472 MB with npm). The hoisted layout is required: the tsconfig `paths` entry and some tests reach the SDK's own nested `pi-ai`, which nub's default isolated layout does not expose.
 
