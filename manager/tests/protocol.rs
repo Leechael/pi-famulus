@@ -1436,7 +1436,7 @@ fn p10_cancel_and_disconnect_remove_queued_acquires() {
 }
 
 #[test]
-fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
+fn p16_queued_grant_survives_writer_backpressure_and_session_activity() {
     let home = test_home("p16-grant-retry");
     fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
     let marker = home.join("p16-writer-queue-full");
@@ -1470,9 +1470,10 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
         "p16-release",
     );
 
-    // Drain the responses only after the release hit a known-full writer
-    // queue. The daemon retains the grant until a later same-id retry arrives
-    // after queue capacity is available again.
+    // The marker observes transient fullness, not a barrier at release.
+    // A pipelined status request may re-serve the grant while we drain.
+    // Exact full-channel retention and same-id retry are covered by the
+    // deterministic dispatch tests, independent of socket-buffer scheduling.
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut status_frames = waiter
         .history
@@ -1486,25 +1487,31 @@ fn p16_queued_grant_survives_full_writer_queue_and_same_id_retry() {
             continue;
         };
         let value: Value = serde_json::from_str(&frame).unwrap();
-        assert_ne!(value["id"], "p16-wait", "grant arrived before a retry after backpressure");
+        if value["id"] == "p16-wait" {
+            assert_eq!(value["granted"], true, "{value}");
+        }
         if value["id"].as_str().is_some_and(|id| id.starts_with("p16-status-")) {
             status_frames += 1;
         }
     }
-    waiter.send(acquire); // retry only once the full queue has drained
-    let grant = waiter
-        .read_until("p16-wait", RESPONSE_TIMEOUT)
-        .expect("queued acquire never received its retained grant");
-    let grant: Value = serde_json::from_str(&grant).unwrap();
-    assert_eq!(grant["granted"], true, "{grant}");
+    // If no flooded request re-served it, this ordinary request must do so.
+    // request() retains interleaved grant frames in history.
+    let status = waiter.request(
+        r#"{"id":"p16-status-after-drain","type":"status"}"#,
+        "p16-status-after-drain",
+    );
+    let status: Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(status["agent_capacity"]["by_kind"]["test"]["used"], 1, "{status}");
     let quiet_deadline = Instant::now() + Duration::from_secs(2);
     while waiter.read_frame(quiet_deadline).is_some() {}
-    let grant_responses = waiter
+    let grants: Vec<Value> = waiter
         .history
         .iter()
-        .filter(|frame| serde_json::from_str::<Value>(frame).ok().is_some_and(|value| value["id"] == "p16-wait"))
-        .count();
-    assert_eq!(grant_responses, 1, "same-id retry received duplicate grant frames");
+        .map(|frame| serde_json::from_str::<Value>(frame).unwrap())
+        .filter(|value| value["id"] == "p16-wait")
+        .collect();
+    assert_eq!(grants.len(), 1, "grant was lost or delivered more than once: {grants:?}");
+    assert_eq!(grants[0]["granted"], true, "{:?}", grants[0]);
 }
 
 #[test]

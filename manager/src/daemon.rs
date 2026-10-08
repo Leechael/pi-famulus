@@ -3795,6 +3795,103 @@ mod tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+    /// Regression for p16: exercise real request dispatch with a bounded writer
+    /// channel whose capacity cannot change behind the test. Socket fullness is
+    /// transient, and any later session request may re-serve a retained grant.
+    async fn queued_grant_after_full_writer(retry_acquire: bool) {
+        let home = std::env::temp_dir().join(format!(
+            "pi-famulus-grant-{}-{}-{retry_acquire}", std::process::id(), now_ms()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new(
+            home.clone(), Registry::new(home.clone()), false,
+        )));
+        let (holder_tx, mut holder_rx) = mpsc::channel(2);
+        let (waiter_tx, mut waiter_rx) = mpsc::channel(2);
+        let writer = tokio::spawn(std::future::pending::<()>());
+        let mut connections = Vec::new();
+        for (session, tx) in [("p16-holder", &holder_tx), ("p16-waiter", &waiter_tx)] {
+            connections.push(register_conn(
+                &state, tx, &Arc::new(Notify::new()),
+                &Arc::new(Mutex::new(HashMap::new())), &writer.abort_handle(),
+                ClientKind::Extension, Some(session.into()), Some(std::process::id()),
+                HelloInfo { cwd: None, extension_version: None, protocol: Some(5) },
+            ).unwrap());
+        }
+        let request = |id: &str, kind: &str, child: &str| {
+            let mut input = json!({ "id": id, "type": kind });
+            if !child.is_empty() {
+                input["child_id"] = json!(child);
+            }
+            if kind == "acquire_agent" {
+                input["work_kind"] = json!("test");
+            }
+            parse_request(input.to_string().as_bytes()).unwrap()
+        };
+        dispatch(state.clone(), connections[0],
+            request("p16-hold", "acquire_agent", "ch_hold"), holder_tx.clone()).await;
+        let held: serde_json::Value = serde_json::from_slice(&holder_rx.try_recv().unwrap().bytes).unwrap();
+        assert_eq!(held["granted"], true);
+        dispatch(state.clone(), connections[1],
+            request("p16-wait", "acquire_agent", "ch_wait"), waiter_tx.clone()).await;
+        assert!(waiter_rx.try_recv().is_err(), "waiter must not bypass held capacity");
+
+        for id in ["p16-status-0", "p16-status-1"] {
+            dispatch(state.clone(), connections[1], request(id, "status", ""), waiter_tx.clone()).await;
+        }
+        assert_eq!(waiter_tx.capacity(), 0);
+        dispatch(state.clone(), connections[0],
+            request("p16-release", "release_agent", "ch_hold"), holder_tx.clone()).await;
+        let released: serde_json::Value = serde_json::from_slice(&holder_rx.try_recv().unwrap().bytes).unwrap();
+        assert_eq!(released["ok"], true);
+        assert_eq!(waiter_tx.capacity(), 0, "release must hit the full writer");
+        assert_eq!(state.lock().unwrap().undelivered_agent_grants
+            .get(&("p16-waiter".into(), "p16-wait".into())).map(String::as_str), Some("ch_wait"));
+        for id in ["p16-status-0", "p16-status-1"] {
+            let frame: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
+            assert_eq!(frame["id"], id, "full writer must not lose queued responses");
+        }
+        let next = if retry_acquire {
+            request("p16-wait", "acquire_agent", "ch_wait")
+        } else {
+            request("p16-after-drain", "status", "")
+        };
+        dispatch(state.clone(), connections[1], next, waiter_tx.clone()).await;
+        let grant: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
+        assert_eq!(grant["id"], "p16-wait");
+        assert_eq!(grant["granted"], true);
+        if !retry_acquire {
+            let status: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
+            assert_eq!(status["id"], "p16-after-drain");
+            assert_eq!(status["agent_capacity"]["by_kind"]["test"]["used"], 1);
+        }
+        assert!(waiter_rx.try_recv().is_err(), "one request must not duplicate its retained grant");
+        {
+            let st = state.lock().unwrap();
+            assert!(st.pending_agents.is_empty());
+            assert!(st.undelivered_agent_grants.is_empty());
+            assert_eq!(st.agent_permits.len(), 1, "retry must not allocate another permit");
+        }
+        writer.abort();
+        drop(state);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_grant_survives_full_writer_and_same_id_retry() {
+        tokio::time::timeout(Duration::from_secs(3), queued_grant_after_full_writer(true))
+            .await
+            .expect("same-id grant recovery stalled");
+    }
+
+    #[tokio::test]
+    async fn queued_grant_survives_full_writer_and_status_request() {
+        tokio::time::timeout(Duration::from_secs(3), queued_grant_after_full_writer(false))
+            .await
+            .expect("status-triggered grant recovery stalled");
+    }
+
     #[test]
     fn global_admission_grants_rejects_and_is_idempotent() {
         let mut permits = HashMap::new();
