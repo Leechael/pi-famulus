@@ -41,11 +41,11 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
-Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun).
+Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun). The [2026-10-08 campaign review](2026-10-08-REVIEW.md) records model/thinking preflight, grader fixes, scenario-version differences, and retained failure caveats.
 
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
-Always spell out the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Episodes isolate `PI_FAMULUS_HOME` but not pi's own config, so a spec without one runs at `defaultThinkingLevel` from `~/.pi/agent/settings.json`: results then depend on whose machine ran them. The spec, level included, is the model key in `results.jsonl`, so `x:low` and `x:high` are separate cells and can be compared in one report.
+Always spell out the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Episodes isolate `PI_FAMULUS_HOME` but not pi's own config, so a spec without one runs at `defaultThinkingLevel` from `~/.pi/agent/settings.json`: results then depend on whose machine ran them. The spec, level included, is the model key in `results.jsonl`, so `x:low` and `x:high` are separate cells and can be compared in one report. Check the RPC `get_state` thinking level as well: unsupported levels can be silently clamped (the installed catalog resolves `grok-4.5:xhigh` to `high`). Every episode records requested and resolved model/API/thinking metadata; a requested label alone is not proof of an independent thinking configuration.
 
 The eval never reads keys or `auth.json`. Each episode is the user's own `pi --model <spec>`, which resolves credentials (including OAuth refresh) the normal way. Models are validated against what pi can authenticate (RPC `get_available_models`) before anything runs. See what is available:
 
@@ -176,7 +176,9 @@ Each scenario's prompt and what it tests live in `scenarios/<id>.md` (same forma
 | `overrun-stuck` | interrupts a child that is past its `timeout_ms` and blocked on a silent shell (`subagent-overrun` wake, reminders every 20s); extending it, steering it only, or ignoring two reminders FAILs |
 | `overrun-progressing` | lets a child that is past its `timeout_ms` but printing progress finish (no action or `extend`), then writes its result; interrupting it FAILs |
 
-Each grade is PASS / FAIL / INVALID (setup precondition not met, e.g. the command finished before the budget). Invalid and errored episodes are excluded from rates.
+Each grade is PASS / FAIL / INVALID (setup precondition not met, e.g. the command finished before the budget). Invalid and errored episodes are excluded from rates. Unresolved parent-provider errors and unfinished parent responses at cutoff are classified from the pre-shutdown event prefix; shutdown-induced aborts do not taint grades, and recovered transient errors remain auditable. An independently proved PASS may retain a pending-response metric. Child-provider failures still require child artifacts to attribute.
+
+Continuation probes require a separate opportunity to act: a target wake and final completion delivered in the same raw model turn (or both task completions in one coalesced wake) are INVALID, not evidence that the model waited. Missing turn metadata is unknown, not assumed batching. The still-running task requires separate unredirected script calls and parent-owned result-file writes so shell redirects cannot bypass the behavior under test.
 
 ### Opt-in monitor / UI-waiter compatibility
 
@@ -193,7 +195,7 @@ These scenarios load an additional **safe captured `@injaneity/pi-computer-use@0
 
 Ordinary/long probes require exactly one successful monitor start; duplicate monitor stacking fails. The re-arm probe associates the timeout with the initial task id and checks both command/timeout configurations and ordering.
 
-Metrics expose fixture/computer-use versions, history and request-context sizes, active/all tool counts and bounded active tool names, model/thinking spec and resolved provider/id/API, runtime pi/Node versions, separately labeled eval development SDK version, and captured source/loaded schema hashes. Serialized chars/4 is only an estimate; actual provider usage is authoritative. The long-case cost estimate charges 220k extra **uncached** tokens per model call; actual costs/tokenization may differ. See [fixture provenance, safety, and evidence limits](ablation/fixtures/README.md). Short probes cannot claim to reproduce the large-context incident. The deterministic compatibility tests were run in CI for commit `ed9d571`; changes in this review-fix commit await CI. No local eval tests or real-model eval/probes were run.
+Metrics expose fixture/computer-use versions, history and request-context sizes, active/all tool counts and bounded active tool names, model/thinking spec and resolved provider/id/API, runtime pi/Node versions, separately labeled eval development SDK version, and captured source/loaded schema hashes. Serialized chars/4 is only an estimate; actual provider usage is authoritative. The long-case cost estimate charges 220k extra **uncached** tokens per model call; actual costs/tokenization may differ. See [fixture provenance, safety, and evidence limits](ablation/fixtures/README.md). Short probes cannot claim to reproduce the large-context incident. The deterministic compatibility tests were run in CI for commit `ed9d571` and locally as part of the 2026-10-08 unit suite. The 2026-10-08 real-model campaign uses only the ten default scenarios; no real-model compatibility probes were run. Local results do not establish CI status for the current changes.
 
 Commands for a user-authorized later run (from `eval/`; replace the explicit model/thinking spec):
 
