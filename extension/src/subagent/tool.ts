@@ -151,8 +151,7 @@ export interface SubagentToolDeps {
 /** M3 stopgap resolver until M5 wires the real agent loader (§4.8). */
 const BUILTIN_WORKER: AgentDefinition = {
   name: "worker",
-  description: "General-purpose subagent with the full default tool set",
-  tools: ["read", "bash", "edit", "write"],
+  description: "General-purpose subagent with user-configured tools",
   systemPrompt: "",
   source: "builtin",
 };

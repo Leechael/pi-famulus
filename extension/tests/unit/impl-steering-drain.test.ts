@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 
 // The SDK's own pi-ai, wherever the installer put it (nested by npm, hoisted
 // or isolated by nub): the stream must be the class the session checks.
@@ -15,7 +15,7 @@ if (!aiPackage) throw new Error("The pi SDK's pi-ai dependency is missing");
 const { AssistantMessageEventStream } = (await import(pathToFileURL(join(dirname(aiPackage), "dist/utils/event-stream.js")).href)) as {
   AssistantMessageEventStream: new () => { push(event: unknown): void };
 };
-import { childResourceLoaderOptions } from "../../src/subagent/pi-runtime";
+import { createChildResources } from "../../src/subagent/pi-runtime";
 
 const tempDirs: string[] = [];
 
@@ -27,13 +27,13 @@ describe("pi steering queue drain", () => {
   it("injects multiple queued child steers in one request after the session setter", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "pi-famulus-steering-drain-"));
     tempDirs.push(cwd);
-    const resourceLoader = new DefaultResourceLoader(childResourceLoaderOptions({ cwd, agentDir: cwd }));
-    await resourceLoader.reload();
+    const { resourceLoader, settingsManager } = await createChildResources({ cwd, agentDir: cwd, projectTrusted: false });
     const { session } = await createAgentSession({
       cwd,
       agentDir: cwd,
       noTools: "all",
       resourceLoader,
+      settingsManager,
       sessionManager: SessionManager.inMemory(cwd),
     });
 

@@ -6,6 +6,8 @@ import { InProcessRunner } from "../../src/subagent/runner";
 import { createSubagentTool } from "../../src/subagent/tool";
 import { FAMULUS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import type { OverrunTick } from "../../src/subagent/overrun";
+import type { AgentDefinition } from "../../src/subagent/types";
+import { parseAgentMarkdown } from "../../src/agents/definition";
 import { SessionFactory, tick } from "./subagent-fakes";
 
 async function flushMicrotasks(): Promise<void> {
@@ -19,6 +21,7 @@ function makeStack(
     hardTimeoutMs?: number;
     maxConcurrentChildren?: number;
     managerAdmissionDelayMs?: number;
+    resolveAgent?: (name: string | undefined) => AgentDefinition;
   } = {},
 ) {
   const clock = new ManualClock();
@@ -56,6 +59,7 @@ function makeStack(
     defaultTimeoutMs: 600_000,
     defaultConcurrency: 4,
     clock,
+    resolveAgent: opts.resolveAgent,
   });
   const ctx = { cwd: "/tmp" } as ExtensionToolContext;
   const exec = (params: Record<string, unknown>, signal?: AbortSignal) =>
@@ -102,6 +106,32 @@ describe("subagent tool — validation", () => {
 });
 
 describe("subagent tool — tasks", () => {
+  it("lets the fallback worker inherit user-configured tools", async () => {
+    const { exec, factory } = makeStack();
+    await exec({ tasks: [{ prompt: "use configured tools" }] });
+    expect(factory.requests).toHaveLength(1);
+    expect(factory.requests[0].agent).not.toHaveProperty("tools");
+  });
+
+  it.each([
+    { policy: "inherited", tools: undefined },
+    { policy: "empty allowlist", tools: [] },
+    { policy: "explicit allowlist", tools: ["read", "custom_tool"] },
+  ])(
+    "preserves the resolved agent tool policy $policy in child requests",
+    async ({ tools }) => {
+      const agent = parseAgentMarkdown(
+        `---\nname: configured\ndescription: Configured agent\n${tools === undefined ? "" : `tools: [${tools.join(", ")}]\n`}---\n`,
+        "user",
+      );
+      const { exec, factory } = makeStack({ resolveAgent: () => agent });
+      await exec({ tasks: [{ agent: "configured", prompt: "task" }] });
+      expect(factory.requests).toHaveLength(1);
+      expect(factory.requests[0].agent.tools).toEqual(tools);
+      if (tools === undefined) expect(factory.requests[0].agent).not.toHaveProperty("tools");
+    },
+  );
+
   it("passes explicit work kinds from each task to the child record", async () => {
     const { exec, registry } = makeStack();
     await exec({ tasks: [{ prompt: "run a suite", work_kind: "test-suite" }], async: true });

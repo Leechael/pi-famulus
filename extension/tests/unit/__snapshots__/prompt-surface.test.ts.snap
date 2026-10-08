@@ -42,12 +42,6 @@ Rules:
 - Self-verify before finishing: run the relevant tests, typecheck, or command that proves the task is done.
 - Stay within the task's scope; do not refactor unrelated code.
 - Report concisely: what you changed, how you verified it, and anything the supervisor should know.",
-      "tools": [
-        "read",
-        "bash",
-        "edit",
-        "write",
-      ],
     },
   ],
   "CHILD_BEHAVIOR_GUIDELINES": "## Child agent behavior (pi-famulus)

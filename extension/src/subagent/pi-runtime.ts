@@ -11,12 +11,12 @@
  * allowlist plus injected custom tools (child bash, M4 comms), and wraps it
  * into a ChildSessionAdapter.
  *
- * Child sessions receive an isolated DefaultResourceLoader with extensions
- * disabled; createAgentSession binds whatever the loader returns. Thus the
- * subagent tool is never present in a child session — the depth-1 cap holds
- * by construction.
+ * Child sessions discover user resources and built-in extensions normally.
+ * A session-local event bus identifies child loaders before the famulus
+ * extension initializes, preventing recursive parent-tool registration.
  */
 import type {
+  ExtensionAPI,
   ExtensionContext,
   ModelRegistry,
   ToolDefinition,
@@ -87,6 +87,10 @@ export interface PiRuntimeDeps {
   getScopedModels?: () => readonly { model: Model; thinkingLevel?: string }[];
   /** Working directory for child sessions. */
   getCwd: () => string;
+  /** Global resource directory; defaults to pi.getAgentDir(). */
+  getAgentDir?: () => string;
+  /** Preserve the parent's project trust decision. */
+  getProjectTrusted?: () => boolean;
   /**
    * Custom tools injected into every child session (e.g. the no-background
    * bash variant, M4 contact_supervisor). Called per child request.
@@ -188,6 +192,7 @@ function wrapSession(
   extras: { warning?: string; resolvedModel?: string; effectiveThinkingLevel?: string } = {},
 ): ChildSessionAdapter {
   const usageAdapter = createPiUsageAdapter();
+  let disposal: Promise<void> | undefined;
   // Children receive all queued steering messages in one drain/turn rather
   // than the interactive one-at-a-time default, which can strand wake bursts.
   session.setSteeringMode("all");
@@ -222,29 +227,53 @@ function wrapSession(
     subscribe: (listener) => session.subscribe((event) => {
       listener(usageAdapter.adapt(event as Parameters<typeof usageAdapter.adapt>[0]));
     }),
-    dispose: () => session.dispose(),
+    dispose: () => disposal ??= (async () => {
+      try {
+        await session.abort();
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      } finally {
+        session.dispose();
+      }
+    })(),
   };
 }
 
-/** Options passed to createAgentSession. Tested without loading pi. */
-export function childResourceLoaderOptions(input: { cwd: string; agentDir: string }): {
+const CHILD_ROLE_CHANNEL = "pi-famulus:child-role";
+
+/** The loader's bus answers synchronously, before any extension initialization. */
+export function isFamulusChildSession(pi: Pick<ExtensionAPI, "events">): boolean {
+  const probe = { child: false };
+  pi.events?.emit(CHILD_ROLE_CHANNEL, probe);
+  return probe.child;
+}
+
+/** Keep configuration scopes and paths intact; never persist child overrides. */
+export async function createChildResources(input: {
   cwd: string;
   agentDir: string;
-  noExtensions: true;
-  noSkills: true;
-  noPromptTemplates: true;
-  noThemes: true;
-  noContextFiles: true;
-} {
-  return {
+  projectTrusted: boolean;
+}) {
+  const pi = await importPi();
+  const settingsManager = pi.SettingsManager.create(input.cwd, input.agentDir, {
+    projectTrusted: input.projectTrusted,
+  });
+  const eventBus = pi.createEventBus();
+  eventBus.on(CHILD_ROLE_CHANNEL, (probe) => {
+    if (probe && typeof probe === "object" && "child" in probe) probe.child = true;
+  });
+  const resourceLoader = new pi.DefaultResourceLoader({
     cwd: input.cwd,
     agentDir: input.agentDir,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-  };
+    settingsManager,
+    eventBus,
+    extensionFactories: [
+      { name: "codemode", factory: pi.createCodemodeExtension(), builtin: true, replaceable: true },
+      { name: "tool-search", factory: pi.createToolSearchExtension(), builtin: true, replaceable: true },
+      { name: "mcp", factory: pi.createMcpExtension(), builtin: true, replaceable: true },
+    ],
+  });
+  await resourceLoader.reload();
+  return { resourceLoader, settingsManager };
 }
 
 export function childSessionCreateOptions(input: {
@@ -260,13 +289,18 @@ export function childSessionCreateOptions(input: {
   model: unknown;
   thinkingLevel: unknown;
   tools?: string[];
+  excludeTools?: string[];
   customTools?: unknown[];
   modelRuntime?: unknown;
   resourceLoader?: unknown;
 } {
-  const tools = input.tools && input.tools.length > 0 ? [...input.tools] : undefined;
-  const customTools = input.customTools?.map((customTool) => {
+  const tools = input.tools !== undefined ? [...input.tools] : undefined;
+  const customTools = input.customTools?.filter((customTool) => {
+    const name = (customTool as { name?: unknown }).name;
+    return name !== "bash" || tools === undefined || tools.includes("bash");
+  }).map((customTool) => {
     const tool = customTool as { name?: unknown; promptGuidelines?: string[] };
+    if (tool.name === "bash") return { ...tool, defaultActive: false };
     if (tool.name === "contact_supervisor") {
       return {
         ...tool,
@@ -285,7 +319,11 @@ export function childSessionCreateOptions(input: {
     cwd: input.cwd,
     model: input.model,
     thinkingLevel: input.thinkingLevel,
-    ...(tools ? { tools } : {}),
+    ...(tools !== undefined ? { tools } : {}),
+    // pi 1.0.4+ otherwise retains MCP tools behind non-MCP allowlists.
+    ...(tools !== undefined && !tools.some((name) => name.startsWith("mcp__"))
+      ? { excludeTools: ["mcp__*"] }
+      : {}),
     ...(customTools && customTools.length > 0 ? { customTools } : {}),
     ...(input.modelRuntime ? { modelRuntime: input.modelRuntime } : {}),
     ...(input.resourceLoader ? { resourceLoader: input.resourceLoader } : {}),
@@ -305,25 +343,30 @@ export function createPiSessionFn(deps: PiRuntimeDeps): CreateSessionFn {
       req.agent.thinking ??
       deps.getParentThinkingLevel();
     const cwd = deps.getCwd();
-    const resourceLoader = new pi.DefaultResourceLoader(
-      childResourceLoaderOptions({ cwd, agentDir: pi.getAgentDir() }),
-    );
-    await resourceLoader.reload();
+    const agentDir = deps.getAgentDir?.() ?? pi.getAgentDir();
+    const { resourceLoader, settingsManager } = await createChildResources({
+      cwd,
+      agentDir,
+      projectTrusted: deps.getProjectTrusted?.() ?? false,
+    });
     const customTools = deps.customTools?.(req) ?? [];
     const modelRuntime = deps.getModelRuntime?.();
     const options = childSessionCreateOptions({
       cwd,
       model: resolved.model,
       thinkingLevel,
-      tools: req.agent.tools.length > 0 ? [...req.agent.tools] : undefined,
+      tools: req.agent.tools,
       customTools: customTools.length > 0 ? customTools : undefined,
       modelRuntime,
       resourceLoader,
     });
     const { session } = await pi.createAgentSession({
       ...options,
+      agentDir,
+      settingsManager,
       sessionManager: pi.SessionManager.inMemory(cwd),
     } as never);
+    await session.bindExtensions({});
     const resolvedModel = resolved.model
       ? `${resolved.model.provider}/${resolved.model.id}`
       : undefined;
