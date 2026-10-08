@@ -33,7 +33,14 @@ export type Item =
       details: Record<string, unknown> | undefined;
       isError: boolean;
     }
-  | { kind: "wake"; seq: number; t: number; wake: Wake }
+  | {
+      kind: "wake";
+      seq: number;
+      t: number;
+      /** Enclosing raw turn_start seq; absent when delivery-turn evidence is unavailable. */
+      turnSeq?: number;
+      wake: Wake;
+    }
   | { kind: "custom"; seq: number; t: number; customType: string; text: string };
 
 export function contentText(content: unknown): string {
@@ -49,10 +56,15 @@ export function contentText(content: unknown): string {
 /** Build items from `message_end` events (authoritative final messages). */
 export function itemsFromEvents(events: RpcEvent[]): Item[] {
   const items: Item[] = [];
+  let turnSeq: number | undefined;
   for (const ev of events) {
+    if (ev.type === "turn_start") turnSeq = ev.seq;
+    if (ev.type === "turn_end" || ev.type === "agent_start" || ev.type === "agent_end" || ev.type === "agent_settled") turnSeq = undefined;
     if (ev.type !== "message_end") continue;
     const m = ev.message as Record<string, unknown>;
-    items.push(...itemFromMessage(m, ev.seq, ev.t));
+    items.push(...itemFromMessage(m, ev.seq, ev.t).map((item) =>
+      item.kind === "wake" && turnSeq !== undefined ? { ...item, turnSeq } : item,
+    ));
   }
   return items;
 }

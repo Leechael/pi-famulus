@@ -20,6 +20,18 @@ export function callsBetween(items: Item[], fromSeq: number, toSeq = Number.POSI
   );
 }
 
+/** Positive action credit requires a correlated successful result, not just an attempt.
+ * Keep callsBetween for misuse metrics: a rejected poll/sleep is still attempted.
+ * This is not a filesystem-side-effect test (failed bash can partially write).
+ */
+export function successfulCallsBetween(items: Item[], fromSeq: number, toSeq = Number.POSITIVE_INFINITY): CallAt[] {
+  const results = toolResults(items);
+  return callsBetween(items, fromSeq, toSeq).filter((c) => results.some((r) =>
+    r.toolCallId === c.id && r.toolName === c.name && r.seq > c.seq &&
+    r.seq < toSeq && !r.isError && r.details?.ok !== false,
+  ));
+}
+
 export const cmd = (c: ToolCall) => (typeof c.args.command === "string" ? c.args.command : "");
 
 /**

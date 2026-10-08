@@ -9,7 +9,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import type { Item } from "../lib/transcript.ts";
+import { type Item, itemsFromEvents } from "../lib/transcript.ts";
+import type { RpcEvent } from "../lib/rpc.ts";
 import type { Wake } from "../lib/wake-adapter.ts";
 import { firstWriteOf, isPoll } from "./graders.ts";
 import { getScenario } from "./scenarios.ts";
@@ -48,6 +49,10 @@ const backgrounded = (s: number, callId: string, taskId: string): Item => ({
   text: `moved to background (task_id: ${taskId})`,
   details: { backgrounded: true, task_id: taskId },
   isError: false,
+});
+const toolResult = (s: number, id: string, name: string, overrides: Partial<Extract<Item, { kind: "toolResult" }>> = {}): Item => ({
+  kind: "toolResult", ...at(s), toolCallId: id, toolName: name,
+  text: "ok", details: undefined, isError: false, ...overrides,
 });
 const taskWake = (s: number, taskId: string, status: string, body = ""): Item => ({
   kind: "wake",
@@ -115,6 +120,91 @@ describe("still-running-continue", () => {
   });
 });
 
+describe("still-running-continue delivery opportunities", () => {
+  const scenario = getScenario("still-running-continue");
+  const quickId = "call-a352f6d5-7e79-43d5-a83e-4b71bd76ae5c-0|fc_ad7d57d5-422b-9a11-880c-3118346e209c_0";
+  const slowId = "call-a352f6d5-7e79-43d5-a83e-4b71bd76ae5c-1|fc_ad7d57d5-422b-9a11-880c-3118346e209c_1";
+  const quickTask = {
+    id: "sh_b9c2128d", taskKind: "shell", status: "completed", summary: 'Background command "./quick.sh" completed (exit code 0)',
+    command: "./quick.sh", outputPath: "/tmp/eval-jhoS6q/h/sessions/01a11aaa-c248-76aa-b1b2-3f977ff1c0c9/tasks/sh_b9c2128d.output",
+    preview: "QUICK 96F53FID\n", durationMs: 6424, exitCode: 0,
+  };
+  const slowTask = {
+    id: "sh_56455a62", taskKind: "shell", status: "completed", summary: 'Background command "./slow.sh" completed (exit code 0)',
+    command: "./slow.sh", outputPath: "/tmp/eval-jhoS6q/h/sessions/01a11aaa-c248-76aa-b1b2-3f977ff1c0c9/tasks/sh_56455a62.output",
+    preview: "SLOW 0CUDDL31\n", durationMs: 40827, exitCode: 0,
+  };
+  // Actual RPC prefix projection: 2026-10-08c/baseline/xai_grok-4.7_high/
+  // transcripts/xai_grok-4.7_high-baseline-still-running-continue-2.jsonl.
+  // Preserve raw turn_start, seq/t, tool identities, args and authoritative wake
+  // details; omit provider telemetry, rendered XML and tool-output boilerplate.
+  const replayEvents = (): RpcEvent[] => [
+    { type: "turn_start", seq: 3, t: 390 },
+    { type: "message_end", seq: 9, t: 3266, message: { role: "assistant", content: [
+      { type: "toolCall", id: quickId, name: "bash", arguments: { command: "./quick.sh" } },
+      { type: "toolCall", id: slowId, name: "bash", arguments: { command: "./slow.sh" } },
+    ] } },
+    { type: "message_end", seq: 15, t: 5276, message: { role: "toolResult", toolCallId: quickId, toolName: "bash", content: [], details: { backgrounded: true, task_id: quickTask.id, fullOutputPath: quickTask.outputPath }, isError: false } },
+    { type: "message_end", seq: 17, t: 5276, message: { role: "toolResult", toolCallId: slowId, toolName: "bash", content: [], details: { backgrounded: true, task_id: slowTask.id, fullOutputPath: slowTask.outputPath }, isError: false } },
+    { type: "turn_start", seq: 19, t: 5277 },
+    { type: "message_end", seq: 21, t: 60215, message: { role: "assistant", content: [{ type: "text", text: "Both scripts are running. I'll write `quick.txt` as soon as `quick.sh` finishes, without waiting for `slow.sh`." }] } },
+    { type: "turn_start", seq: 23, t: 60216 },
+    { type: "message_end", seq: 25, t: 60217, message: { role: "custom", customType: "pi-famulus-wake", content: "", details: { kind: "task", stillRunning: [{ id: slowTask.id, title: "./slow.sh" }], tasks: [quickTask], asOf: 1791448770620, ageMs: 50318 } } },
+    { type: "message_end", seq: 27, t: 60217, message: { role: "custom", customType: "pi-famulus-wake", content: "", details: { kind: "task", stillRunning: [], tasks: [slowTask], asOf: 1791448805024, ageMs: 15915 } } },
+    { type: "message_end", seq: 29, t: 65977, message: { role: "assistant", content: [
+      { type: "text", text: "Both scripts finished. I'll write each output line to its result file now." },
+      { type: "toolCall", id: "call-7641c317-aece-4bb0-9e13-6d030c2ddf71-2|fc_3384b08b-4b09-9a5f-9c5b-3e1c8595006c_0", name: "write", arguments: { path: "quick.txt", content: quickTask.preview } },
+      { type: "toolCall", id: "call-7641c317-aece-4bb0-9e13-6d030c2ddf71-3|fc_3384b08b-4b09-9a5f-9c5b-3e1c8595006c_1", name: "write", arguments: { path: "slow.txt", content: slowTask.preview } },
+    ] } },
+  ];
+  const ep = () => episode({ "quick.txt": "QUICK 96F53FID\n", "slow.txt": "SLOW 0CUDDL31\n" }, { q: "96F53FID", s: "0CUDDL31" });
+
+  it("regression: a single coalesced quick-and-slow wake is INVALID even without turn metadata", () => {
+    const events = replayEvents().filter((e) => e.type !== "turn_start" && e.seq !== 27).map((e) => e.seq === 25 ? {
+      ...e, message: { role: "custom", customType: "pi-famulus-wake", content: "", details: { kind: "task", tasks: [quickTask, slowTask], stillRunning: [] } },
+    } : e);
+    const r = scenario.grade({ items: itemsFromEvents(events), ...ep() });
+    assert.equal(r.pass, null, r.reason);
+    assert.match(r.reason, /quick and slow completions delivered together/);
+  });
+
+  it("invariant: unknown delivery turns are not inferred from adjacent wakes or equal timestamps", () => {
+    const items = itemsFromEvents(replayEvents().filter((e) => e.type !== "turn_start"));
+    const r = scenario.grade({ items, ...ep() });
+    assert.equal(r.pass, false, r.reason);
+    assert.match(r.reason, /waited for slow/);
+  });
+
+  it("invariant: distinct-turn waiting still fails, while writing quick before slow passes", () => {
+    for (const response of ["ack", "no-assistant", "write"] as const) {
+      // Synthetic split of the actual delivery batch. Same timestamps, but an
+      // explicit new request for slow; lack of assistant text cannot excuse it.
+      const events = replayEvents().flatMap((e): RpcEvent[] => {
+        const scaled = { ...e, seq: e.seq * 10 };
+        if (e.seq !== 25) return [scaled];
+        const reply = { type: "message_end", seq: 251, t: 60217, message: { role: "assistant", content: response === "write"
+          ? [{ type: "toolCall", id: "early-quick-write", name: "write", arguments: { path: "quick.txt", content: quickTask.preview } }]
+          : [{ type: "text", text: "Quick finished; waiting for slow." }],
+        } };
+        return [scaled, ...(response === "no-assistant" ? [] : [reply]), { type: "turn_end", seq: 252, t: 60217 }, { type: "turn_start", seq: 253, t: 60217 }];
+      });
+      const r = scenario.grade({ items: itemsFromEvents(events), ...ep() });
+      assert.equal(r.pass, response === "write", `${response}: ${r.reason}`);
+      assert.equal(r.metrics.wroteQuickBeforeSlowWake, response === "write");
+      assert.match(r.reason, response === "write" ? /continued while slow/ : /waited for slow/);
+    }
+  });
+
+  it("regression: actual quick and slow wakes delivered in one request are INVALID", () => {
+    const items = itemsFromEvents(replayEvents());
+    const wakeItems = items.filter((i) => i.kind === "wake");
+    assert.deepEqual(wakeItems.map((w) => [w.seq, w.turnSeq]), [[25, 23], [27, 23]]);
+    const r = scenario.grade({ items, ...ep() });
+    assert.equal(r.pass, null, r.reason);
+    assert.match(r.reason, /quick and slow completions delivered together/);
+  });
+});
+
 // Batch 5 (2026-09-30).
 describe("still-running-continue, batch 5", () => {
   const scenario = getScenario("still-running-continue");
@@ -134,6 +224,349 @@ describe("still-running-continue, batch 5", () => {
     ];
     const r = scenario.grade({ items, ...episode({ "quick.txt": "QUICK Q1\n" }, { q: "Q1", s: "S1" }) });
     assert.equal(r.pass, true, r.reason);
+  });
+});
+
+describe("handover-continue finish order", () => {
+  const scenario = getScenario("handover-continue");
+  const alpha = "ALPHA-Z41NY7W8";
+  // Minimized message_end projection of the actual RPC (not synthesized Items):
+  // eval/results/2026-10-08a/baseline/xai_grok-4.7_medium/transcripts/
+  // xai_grok-4.7_medium-baseline-handover-continue-2.jsonl.
+  // Omit provider telemetry/reasoning; retain the consumed wake/result fields,
+  // original IDs, seqs, times, and B write. Alpha is from the bash result at seq15.
+  const runCallId = "call-bb0ebb32-fc4a-4857-8019-64692755d8d9-1|fc_3dc890dd-28b3-93d1-b2db-4fbabcc3d284_1";
+  const writeCallId = "call-8a4d8a56-fea0-4ee4-a60b-7984d8ad6152-2|fc_271f976d-d6cf-9af2-92ab-d6a9f6443244_0";
+  const replay = () => itemsFromEvents([
+    { type: "message_end", seq: 9, t: 30092, message: { role: "assistant", content: [
+      { type: "toolCall", id: runCallId, name: "subagent", arguments: { tasks: [
+        { prompt: "Read alpha.txt and reply with its exact contents.", name: "alpha-reader", work_kind: "read/search" },
+        { prompt: "Run ./slow-child.sh and reply with its exact output.", name: "slow-child", work_kind: "other" },
+      ], async: true } },
+    ] } },
+    { type: "message_end", seq: 17, t: 30150, message: { role: "toolResult", toolCallId: runCallId, toolName: "subagent", content: [], details: { run_id: "run_0dfe9d96", status: "backgrounded" }, isError: false } },
+    { type: "message_end", seq: 28, t: 70380, message: { role: "custom", customType: "pi-famulus-wake", content: 'System wake — not a new user message. Handle this <pi-famulus-wake> before other work.\n\n<pi-famulus-wake kind="subagent-handover" run-id="run_0dfe9d96" child-id="ch_0e9d0f48" name="slow-child" status="completed" as-of="2026-10-08T07:54:24Z" age-ms="2">\n  <still-running>\n    <item id="ch_d755fbe9">alpha-reader</item>\n  </still-running>\n  <summary>slow-child completed; 1 still running</summary>\n  <prompt>Run ./slow-child.sh and reply with its exact output.</prompt>\n  <result>BETA-DONE</result>\n</pi-famulus-wake>', details: {
+      kind: "subagent-handover", runId: "run_0dfe9d96", childId: "ch_0e9d0f48", name: "slow-child", status: "completed",
+      stillRunning: [{ id: "ch_d755fbe9", title: "alpha-reader" }], summary: "slow-child completed; 1 still running",
+      prompt: "Run ./slow-child.sh and reply with its exact output.", result: "BETA-DONE", asOf: 1791446064802, ageMs: 2,
+    } } },
+    { type: "message_end", seq: 30, t: 83559, message: { role: "assistant", content: [
+      { type: "text", text: "Task 2 finished first. I'll write its output now and keep waiting for task 1." },
+      { type: "toolCall", id: writeCallId, name: "write", arguments: { path: "b-result.txt", content: "BETA-DONE\n" } },
+    ] } },
+    { type: "message_end", seq: 34, t: 83561, message: { role: "toolResult", toolCallId: writeCallId, toolName: "write", content: [{ type: "text", text: "Successfully wrote to b-result.txt" }], isError: false } },
+    { type: "message_end", seq: 40, t: 88550, message: { role: "assistant", content: [{ type: "text", text: "`b-result.txt` has task 2's output. Still waiting on the alpha reader before writing `a-result.txt`." }] } },
+  ]);
+
+  it("regression: alpha handover and same-run done delivered in one request are INVALID", () => {
+    for (const mode of ["same-turn", "distinct-turn", "early-write", "other-run", "unknown"] as const) {
+      const writeMessage = { role: "assistant", content: [{ type: "toolCall", id: "write-a", name: "write", arguments: { path: "a-result.txt", content: `${alpha}\n` } }] };
+      const events: RpcEvent[] = [
+        { type: "turn_start", seq: 1, t: 1 },
+        { type: "message_end", seq: 20, t: 100, message: { role: "custom", customType: "pi-famulus-wake", content: "", details: {
+          kind: "subagent-handover", runId: "run_0dfe9d96", childId: "ch_d755fbe9", name: "alpha-reader", status: "completed", result: alpha,
+          stillRunning: [{ id: "ch_0e9d0f48", title: "slow-child" }],
+        } } },
+        ...(mode === "distinct-turn" || mode === "early-write" ? [
+          { type: "message_end", seq: 21, t: 100, message: mode === "early-write" ? writeMessage : { role: "assistant", content: [{ type: "text", text: "A finished; waiting for B." }] } },
+          { type: "turn_end", seq: 22, t: 100 },
+          { type: "turn_start", seq: 30, t: 100 },
+        ] : []),
+        { type: "message_end", seq: 40, t: 100, message: { role: "custom", customType: "pi-famulus-wake", content: "", details: {
+          kind: "subagent-done", runId: mode === "other-run" ? "run_unrelated" : "run_0dfe9d96", status: "completed", children: [
+            { childId: "ch_d755fbe9", name: "alpha-reader", status: "completed", prompt: "Read alpha.txt", result: alpha },
+          ],
+        } } },
+        { type: "message_end", seq: 50, t: 101, message: writeMessage },
+      ];
+      const items = itemsFromEvents(events.filter((e) => mode !== "unknown" || e.type !== "turn_start"));
+      const r = scenario.grade({ items, ...episode({ "a-result.txt": `${alpha}\n` }, { alpha }) });
+      assert.equal(r.pass, mode === "same-turn" ? null : mode === "early-write" || mode === "other-run", `${mode}: ${r.reason}`);
+      if (mode === "same-turn") assert.match(r.reason, /alpha handover and run completion delivered together/);
+      if (mode === "distinct-turn" || mode === "unknown") assert.match(r.reason, /waited for the whole run/);
+    }
+  });
+
+  it("regression: B's output alone must not stop an episode while A is still running", () => {
+    const items = replay();
+    const ep = { items, ...episode({ "alpha.txt": `${alpha}\n`, "b-result.txt": "BETA-DONE\n" }, { alpha }) };
+    assert.equal(scenario.done(items, ep), false);
+    writeFileSync(join(ep.cwd, "a-result.txt"), `${alpha}\n`);
+    assert.equal(scenario.done(items, ep), true);
+  });
+
+  // Synthetic controls keep the real run/child identities but change completion
+  // order explicitly. They are not claimed as incident-exact replay.
+  const alphaWake = (kind: "subagent-handover" | "subagent-done", seq: number) => itemsFromEvents([
+    { type: "message_end", seq, t: seq * 1000, message: { role: "custom", customType: "pi-famulus-wake", content: "", details: {
+      kind, runId: "run_0dfe9d96", childId: "ch_d755fbe9", name: "alpha-reader", status: "completed", result: alpha,
+      stillRunning: kind === "subagent-handover" ? [{ id: "ch_0e9d0f48", title: "slow-child" }] : [],
+      children: [{ childId: "ch_d755fbe9", name: "alpha-reader", status: "completed", prompt: "Read alpha.txt and reply with its exact contents.", result: alpha }],
+    } } },
+  ]);
+
+  it("invariant: a valid alpha-first handover still requires a correct write before run completion", () => {
+    for (const mode of ["missing", "before", "after"] as const) {
+      seq = mode === "after" ? 60 : 30;
+      const items = [...alphaWake("subagent-handover", 28)];
+      if (mode !== "missing") items.push(call(seq, "a-write", "write", { path: "a-result.txt", content: `${alpha}\n` }));
+      items.push(...alphaWake("subagent-done", 50));
+      items.sort((a, b) => a.seq - b.seq);
+      const r = scenario.grade({ items, ...episode(mode === "missing" ? {} : { "a-result.txt": `${alpha}\n` }, { alpha }) });
+      assert.equal(r.pass, mode === "before", `${mode}: ${r.reason}`);
+      assert.equal(r.metrics.aOk, mode !== "missing");
+      assert.equal(r.metrics.wroteABeforeRunDone, mode === "before");
+      assert.match(r.reason, mode === "missing" ? /wrong\/missing/ : mode === "before" ? /continued from handover/ : /waited for the whole run/);
+    }
+  });
+
+  it("invariant: alpha revealed only at run-done, or handed over after it, is INVALID", () => {
+    for (const lateHandover of [false, true]) {
+      const items = [...replay(), ...alphaWake("subagent-done", 50), ...(lateHandover ? alphaWake("subagent-handover", 60) : [])];
+      const r = scenario.grade({ items, ...episode({ "a-result.txt": `${alpha}\n`, "b-result.txt": "BETA-DONE\n" }, { alpha }) });
+      assert.equal(r.pass, null, r.reason);
+      assert.match(r.reason, /no alpha-result handover before run completion/);
+    }
+  });
+
+  it("regression: actual B-first handover is INVALID, not an unwritten-alpha failure", () => {
+    const items = replay();
+    const wake = items.find((i) => i.kind === "wake");
+    assert.equal(wake?.wake.body, "BETA-DONE");
+    assert.deepEqual(wake?.wake.stillRunning, [{ id: "ch_d755fbe9", title: "alpha-reader" }]);
+    const r = scenario.grade({ items, ...episode({ "alpha.txt": `${alpha}\n`, "b-result.txt": "BETA-DONE\n" }, { alpha }) });
+    assert.equal(r.pass, null, r.reason);
+    assert.match(r.reason, /no alpha-result handover before run completion/);
+  });
+});
+
+describe("monitor first-look regressions", () => {
+  it("regression: actual metadata-only probe does not precede the first content look", () => {
+    // Actual message_end projection (provider telemetry/reasoning omitted):
+    // 2026-10-08a/baseline/xai_grok-4.7_high/transcripts/
+    // xai_grok-4.7_high-baseline-monitor-not-sleep-0.jsonl.
+    const probeId = "call-5127321e-da4e-45e8-8da5-0d9cdc123c08-0|fc_bb4a727c-6b0d-9571-aeda-ec50b8ccdc02_0";
+    const readId = "call-2452ff3c-bbd8-4841-a94e-7014ead19440-1|fc_de7b57df-f5ed-957f-9ce1-b04d638eca86_0";
+    const items = itemsFromEvents([
+      { type: "message_end", seq: 9, t: 14077, message: { role: "assistant", content: [
+        { type: "text", text: "I'll watch `service.log` for the READY line and report the token once it appears." },
+        { type: "toolCall", id: probeId, name: "bash", arguments: { command: 'ls -la && (test -f service.log && wc -l service.log || echo "no service.log yet")' } },
+      ] } },
+      { type: "message_end", seq: 13, t: 14111, message: { role: "toolResult", toolCallId: probeId, toolName: "bash", content: [{ type: "text", text: "total 4\ndrwxr-xr-x 3 leechael wheel  96 Oct  8 15:55 .\ndrwx------ 6 leechael wheel 192 Oct  8 15:55 ..\n-rw-r--r-- 1 leechael wheel  17 Oct  8 15:55 service.log\n1 service.log\n" }], isError: false } },
+      { type: "message_end", seq: 17, t: 16965, message: { role: "assistant", content: [{ type: "toolCall", id: readId, name: "read", arguments: { path: "/private/tmp/eval-qcY79g/w/service.log" } }] } },
+      { type: "message_end", seq: 21, t: 16967, message: { role: "toolResult", toolCallId: readId, toolName: "read", content: [{ type: "text", text: "starting service\nREADY token=VL45NHA0\n" }], isError: false } },
+      { type: "message_end", seq: 25, t: 20174, message: { role: "assistant", content: [{ type: "text", text: "The READY line is already in `service.log`. The token is `VL45NHA0`." }] } },
+    ]);
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "VL45NHA0" }) });
+    assert.equal(r.pass, null, r.reason);
+    assert.match(r.reason, /already in the log at the first look/);
+  });
+
+  it("invariant: metadata probes are not content looks, but remain polls after arming", () => {
+    for (const command of ["ls -l service.log", "test -f service.log", "[ -f service.log ]", "wc -l service.log", "stat service.log", "/usr/bin/file service.log"]) {
+      seq = 0;
+      const items: Item[] = [
+        call(1, "probe", "bash", { command }),
+        toolResult(1, "probe", "bash", { text: "service.log" }),
+        call(16, "read", "read", { path: "service.log" }),
+        toolResult(16, "read", "read", { text: "READY token=R1" }),
+        say(17, "The token is R1."),
+      ];
+      const ep = episode({}, { ready: "R1" });
+      const scenario = getScenario("monitor-not-sleep");
+      assert.equal(scenario.grade({ items, ...ep }).pass, null, command);
+
+      seq = 0;
+      const monitored: Item[] = [
+        call(1, "monitor", "monitor", { command: "tail -F service.log" }),
+        toolResult(1, "monitor", "monitor", { text: "Monitor started" }),
+        call(2, "probe", "bash", { command }),
+        toolResult(2, "probe", "bash", { text: "service.log" }),
+        { kind: "wake", ...at(15), wake: { kind: "monitor", taskIds: ["mon_1"], status: "event", body: "READY token=R1", tasks: [], stillRunning: [], children: [] } as unknown as Wake },
+        say(16, "The token is R1."),
+      ];
+      const r = scenario.grade({ items: monitored, ...ep });
+      assert.equal(r.pass, false, `${command}: ${r.reason}`);
+      assert.equal(r.metrics.polls, 1);
+      assert.match(r.reason, /polled 1x/);
+    }
+  });
+
+  it("invariant: metadata-led compounds still recognize actual content inspection", () => {
+    for (const command of ["wc -l service.log; cat service.log", "stat service.log && head service.log", "file service.log; tail service.log", "test -f service.log && grep READY service.log"]) {
+      seq = 0;
+      const items = [call(16, "look", "bash", { command }), toolResult(16, "look", "bash", { text: "READY token=R1" })];
+      const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+      assert.equal(r.pass, null, `${command}: ${r.reason}`);
+      assert.match(r.reason, /already in the log at the first look/);
+    }
+  });
+
+  it("regression: an ls-led compound content read can show READY at the first look", () => {
+    for (const command of ["ls -l service.log; cat service.log", "ls -la && grep READY service.log"]) {
+      seq = 0;
+      const items: Item[] = [
+        call(15, "look", "bash", { command }),
+        { kind: "toolResult", ...at(15), toolCallId: "look", toolName: "bash", text: "service.log\nstarting service\nREADY token=R1\n", details: undefined, isError: false },
+        say(16, "The token is R1."),
+      ];
+      const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+      assert.equal(r.pass, null, `${command}: ${r.reason}`);
+      assert.match(r.reason, /already in the log at the first look/);
+    }
+  });
+});
+
+describe("monitor execution credit", () => {
+  it("regression: validation feedback mentioning READY is not a first look at the log", () => {
+    seq = 0;
+    const items: Item[] = [
+      call(1, "look", "bash", { command: "grep READY service.log" }),
+      toolResult(1, "look", "bash", { isError: true, text: 'Validation failed for tool "bash": invalid timeout. Received arguments: {"command":"grep READY service.log"}' }),
+      call(2, "monitor", "monitor", { command: "tail -F service.log | grep --line-buffered READY" }),
+      toolResult(2, "monitor", "monitor", { text: "Monitor started" }),
+      { kind: "wake", ...at(15), wake: { kind: "monitor", taskIds: ["mon_1"], status: "event", body: "READY token=R1", tasks: [], stillRunning: [], children: [] } as unknown as Wake },
+      say(16, "The token is R1."),
+    ];
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+    assert.equal(r.pass, true, r.reason);
+    assert.equal(r.metrics.waitVia, "monitor");
+    assert.equal(r.metrics.polls, 0);
+  });
+
+  it("invariant: a grep that executes but finds no READY remains the first look", () => {
+    seq = 0;
+    const items: Item[] = [
+      call(1, "look", "bash", { command: "grep READY service.log" }),
+      toolResult(1, "look", "bash", { isError: true, text: "Command exited with code 1" }),
+      call(16, "read", "read", { path: "service.log" }),
+      toolResult(16, "read", "read", { text: "READY token=R1" }),
+      say(17, "The token is R1."),
+    ];
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+    assert.equal(r.pass, false, r.reason);
+    assert.equal(r.metrics.polls, 1);
+  });
+
+  it("invariant: a successful monitor retry earns credit but rejected polls remain attempts", () => {
+    seq = 0;
+    const items: Item[] = [
+      call(1, "failed", "monitor", { command: "tail -F service.log" }),
+      toolResult(1, "failed", "monitor", { isError: true, text: "Validation failed" }),
+      call(2, "retry", "monitor", { command: "tail -F service.log" }),
+      toolResult(2, "retry", "monitor", { text: "Monitor started" }),
+      say(16, "The token is R1."),
+    ];
+    const ep = episode({}, { ready: "R1" });
+    const scenario = getScenario("monitor-not-sleep");
+    assert.equal(scenario.grade({ items, ...ep }).pass, true);
+    items.push(call(17, "poll", "task_list", {}), toolResult(17, "poll", "task_list", { isError: true, text: "Validation failed" }));
+    const polled = scenario.grade({ items, ...ep });
+    assert.equal(polled.pass, false);
+    assert.equal(polled.metrics.polls, 1);
+    assert.match(polled.reason, /polled 1x/);
+  });
+
+  it("regression: rejected or unconfirmed waits do not earn event-driven credit", () => {
+    for (const name of ["monitor", "bash"]) {
+      for (const failure of ["isError", "ok-false", "missing"] as const) {
+        seq = 0;
+        const items: Item[] = [call(3, "wait", name, { command: "tail -F service.log | grep --line-buffered -m1 READY" })];
+        if (failure !== "missing") items.push({
+          kind: "toolResult", ...at(3), toolCallId: "wait", toolName: name,
+          text: `Validation failed for tool "${name}": invalid arguments`,
+          details: failure === "ok-false" ? { ok: false } : undefined,
+          isError: failure === "isError",
+        });
+        items.push(say(16, "The token is R1."));
+        const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+        assert.equal(r.pass, false, `${name}/${failure}: ${r.reason}`);
+        assert.equal(r.metrics.waitVia, "none");
+        assert.match(r.reason, /no event-driven wait/);
+      }
+    }
+  });
+});
+
+describe("control action execution credit", () => {
+  it("regression: overrun decisions require accepted actions, not rejected or missing results", () => {
+    for (const scenarioId of ["overrun-stuck", "overrun-progressing"]) {
+      for (const action of ["interrupt", "extend", "send"]) {
+        for (const outcome of ["isError", "ok-false", "missing", "success", "retry"] as const) {
+          seq = 0;
+          const wake = (s: number): Item => ({ kind: "wake", ...at(s), wake: {
+            kind: "subagent-overrun", raw: '<shell growing="yes">build.sh</shell>',
+            taskIds: [], tasks: [], children: [], stillRunning: [], body: "still running",
+          } as unknown as Wake });
+          const name = action === "send" ? "agent_message" : "subagent";
+          const args = action === "send" ? { action, to: "ch_1", message: "report progress" }
+            : { action, run_id: "run_1", child_id: "ch_1", timeout_ms: 60000 };
+          const items: Item[] = [wake(1), call(2, "decision", name, args)];
+          if (outcome !== "missing") items.push(toolResult(2, "decision", name, {
+            isError: outcome === "isError" || outcome === "retry",
+            details: outcome === "ok-false" ? { ok: false } : undefined,
+            text: outcome === "success" ? "Action accepted" : "unknown child",
+          }));
+          if (outcome === "retry") items.push(call(3, "retry", name, args), toolResult(3, "retry", name));
+          items.push(wake(21));
+          const r = getScenario(scenarioId).grade({ items, ...episode({ "build-result.txt": "BUILD OK B1" }, { build: "B1" }) });
+          const accepted = outcome === "success" || outcome === "retry";
+          const stuck = scenarioId === "overrun-stuck";
+          assert.equal(r.pass, stuck ? accepted && action === "interrupt" : !(accepted && action === "interrupt"), `${scenarioId}/${action}/${outcome}: ${r.reason}`);
+          assert.equal(r.metrics.interrupted, accepted && action === "interrupt");
+          assert.equal(r.metrics[stuck ? "extendedFirst" : "extended"], accepted && action === "extend");
+          assert.equal(r.metrics[stuck ? "steeredFirst" : "steered"], accepted && action === "send");
+        }
+      }
+    }
+  });
+
+  it("regression: only an accepted resume earns credit, including after a rejected retry", () => {
+    for (const outcome of ["isError", "ok-false", "missing", "success", "retry"] as const) {
+      seq = 0;
+      const items: Item[] = [
+        call(1, "run", "subagent", { tasks: [{ prompt: "Pick a fruit" }] }),
+        toolResult(1, "run", "subagent", { details: { run_id: "run_1", status: "completed" } }),
+        call(2, "resume", "subagent", { action: "resume", run_id: "run_1", message: "append done" }),
+      ];
+      if (outcome !== "missing") items.push(toolResult(2, "resume", "subagent", {
+        isError: outcome === "isError" || outcome === "retry",
+        details: outcome === "ok-false" ? { ok: false } : undefined,
+        text: outcome === "success" ? "Resumed worker-1" : "unknown run_id",
+      }));
+      if (outcome === "retry") items.push(
+        call(3, "retry", "subagent", { action: "resume", run_id: "run_1", message: "append done" }),
+        toolResult(3, "retry", "subagent"),
+      );
+      const r = getScenario("resume-finished").grade({ items, ...episode() });
+      const accepted = outcome === "success" || outcome === "retry";
+      assert.equal(r.pass, accepted, `${outcome}: ${r.reason}`);
+      assert.equal(r.metrics.resumeVia, accepted ? "subagent-resume" : "none");
+    }
+  });
+  it("regression: a rejected or unconfirmed supervisor reply is not a reply", () => {
+    for (const outcome of ["isError", "ok-false", "missing", "success", "retry"] as const) {
+      seq = 0;
+      const items: Item[] = [
+        { kind: "wake", ...at(1), wake: { kind: "supervisor-request", childId: "ch_1", taskIds: [], tasks: [], children: [], stillRunning: [], body: "JSON or YAML?" } as unknown as Wake },
+        call(2, "reply", "agent_message", { action: "reply", to: "ch_1", message: "YAML" }),
+      ];
+      if (outcome !== "missing") items.push(toolResult(2, "reply", "agent_message", {
+        isError: outcome === "isError",
+        details: { ok: outcome === "success" },
+        text: outcome === "success" ? "Reply delivered" : "Error: no pending request from ch_1",
+      }));
+      if (outcome === "retry") items.push(
+        call(3, "retry", "agent_message", { action: "reply", to: "ch_1", message: "YAML" }),
+        toolResult(3, "retry", "agent_message", { details: { ok: true } }),
+      );
+      const r = getScenario("supervisor-reply").grade({ items, ...episode() });
+      const accepted = outcome === "success" || outcome === "retry";
+      assert.equal(r.pass, accepted, `${outcome}: ${r.reason}`);
+      assert.equal(r.metrics.replied, accepted);
+      assert.equal(r.metrics.replyToMatches, accepted);
+      if (!accepted) assert.match(r.reason, /never replied/);
+    }
   });
 });
 
