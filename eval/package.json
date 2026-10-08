@@ -7,6 +7,7 @@
     "node": ">=22.19"
   },
   "scripts": {
+    "deps": "nub install --frozen-lockfile --node-linker hoisted",
     "test:e2e": "node --test --test-concurrency=4 e2e/faux.test.ts e2e/ablation-harness.test.ts e2e/compat-context.test.ts",
     "test:graders": "node --test ablation/graders.test.ts",
     "test:tui": "PI_FAMULUS_E2E_TUI=1 node --test e2e/tui.test.ts",

@@ -6,9 +6,11 @@ Automated suites (run first, all must be green):
 
 ```bash
 cd manager && cargo test && cargo test --features test-clock
-cd extension && npm ci && npx tsc --noEmit && npx vitest run
+cd extension && npm ci && npx tsc --noEmit && npx vitest run   # CI
+cd extension && npm run deps && npx tsc --noEmit && npx vitest run   # local: nub (see eval/README.md)
 PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
-cd eval && npm run test:e2e && npm run test:unit      # faux-model end-to-end, no model cost
+cd eval && npm ci && npm run test:e2e && npm run test:unit      # CI
+cd eval && npm run deps && npm run test:e2e && npm run test:unit   # local: nub
 ```
 
 ## 0. Install into an isolated home

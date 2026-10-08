@@ -1,9 +1,20 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { findPackageJSON } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
-import { AssistantMessageEventStream } from "../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/utils/event-stream.js";
+
+// The SDK's own pi-ai, wherever the installer put it (nested by npm, hoisted
+// or isolated by nub): the stream must be the class the session checks.
+const sdkPackage = findPackageJSON("@earendil-works/pi-coding-agent", import.meta.url);
+if (!sdkPackage) throw new Error("The pi SDK is missing");
+const aiPackage = findPackageJSON("@earendil-works/pi-ai", pathToFileURL(join(dirname(sdkPackage), "dist/index.js")).href);
+if (!aiPackage) throw new Error("The pi SDK's pi-ai dependency is missing");
+const { AssistantMessageEventStream } = (await import(pathToFileURL(join(dirname(aiPackage), "dist/utils/event-stream.js")).href)) as {
+  AssistantMessageEventStream: new () => { push(event: unknown): void };
+};
 import { childResourceLoaderOptions } from "../../src/subagent/pi-runtime";
 
 const tempDirs: string[] = [];
@@ -56,7 +67,8 @@ describe("pi steering queue drain", () => {
           timestamp: Date.now(),
         },
       } as never);
-      return stream;
+      // The SDK's class at runtime; its type is not reachable without a direct pi-ai dependency.
+      return stream as never;
     };
 
     try {
