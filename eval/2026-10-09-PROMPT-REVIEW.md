@@ -1,6 +1,6 @@
 # 2026-10-09: candidate P control-mode clarification
 
-**Status: targeted validation passed; adoption/merge scope gate pending.** Candidate P is not adopted or merge-ready. Final review has verified the targeted evidence, but [BASELINES.md](BASELINES.md#when-to-rerun) requires all ten default scenarios across its listed models for globally visible tool descriptions. Q/R do not satisfy that gate. No new maintainer waiver has been granted; adoption requires that decision or the prescribed rerun. The user requested the full round; it is planned/in preparation, not yet running or passed. The historical release-specific waiver is not a standing exemption.
+**Status: targeted validation passed; adoption/merge scope gate pending.** Candidate P is not adopted or merge-ready. Final review has verified the targeted evidence, but [BASELINES.md](BASELINES.md#when-to-rerun) requires all ten default scenarios across its listed models for globally visible tool descriptions. Q/R do not satisfy that gate. No new maintainer waiver has been granted; adoption requires that decision or the prescribed rerun. The user-requested full round S was parent-halted and is **INTERRUPTED / INCOMPLETE**, not completed or passed. The historical release-specific waiver is not a standing exemption.
 
 ## Proposed product change
 
@@ -49,6 +49,61 @@ P only, Luna medium: **3/3 native silent + 3/3 unknown-stat PASS**. Both control
 
 Independent archive replay verified all six exact runtime final-line canaries, **zero interrupt attempts** (including rejected/unconfirmed attempts), actual P schema exposure and the missing-stat-only projection. Exposure required a genuine provider request before producer completion; same-run completion/stale wakes were excluded. Original base/diagnostic grades are preserved separately. Missing stats are a request-local counterfactual, not a production telemetry change.
 
+## S: interrupted full-baseline attempt, not control-fix confirmation
+
+S used frozen P only: **15 model/thinking configs × 10 default scenarios × k10 = 1500 scored target**,
+with unchanged **14 attempts/cell, 2100 total cap and three parent slots**. No Q/R or historical pooling.
+The parent globally halted S after recorded cross-provider failures; no normal `CAMPAIGN_DONE` occurred.
+
+**189 authoritative original grade rows: 169 PASS, 2 FAIL, 18 ERR, 0 INVALID; 171 scored.**
+The original controller ledger remains **186 entries**, unchanged. Three extra OpenAI `wake-continue`
+**#4 PASS** records completed grading, but runner-finalization/controller `EPISODE_DONE` and ledger append
+were interrupted by the parent halt. Separate reconciliation preserves hashes, transcripts, launches and
+original timestamps; it invents no completion notices, runner exit codes or ERR verdicts.
+
+Coverage: **14 fully scored cells, 1 cap-underfilled, 3 config-guard-stopped, 3 parent-halt partial,
+129 unstarted**. All remaining **eight default scenarios are unstarted**. P/F/E = PASS/FAIL/ERR;
+`—` = unstarted, not an inferred grade. Exact catalog IDs below do not establish a backend version.
+
+| Model/thinking configuration | `bg-end-turn` | `wake-continue` |
+|---|---|---|
+| `kimi-coding/kimi-for-coding:high` | 8P / 2F (polling) | 5P / 3E (config guard) |
+| `deepseek/deepseek-flash:high` | 10P | 5P / 3E (config guard) |
+| `kimi-coding/k3-256k:high` | 10P | 0P / 3E (config guard) |
+| `openai-codex/gpt-6.1-sol:medium` | 10P | 4P / 1E (parent halt) |
+| `openai-codex/gpt-6.1-sol:high` | 10P | 4P / 1E (parent halt) |
+| `openai-codex/gpt-6-luna:medium` | 10P | 4P / 1E (parent halt) |
+| `openai-codex/gpt-6-luna:high` | 10P | — |
+| `xai/grok-4.7:medium` | 9P / 5E (cap14) | — |
+| `xai/grok-4.7:high` | 10P / 1E | — |
+| `xai/grok-4.7:xhigh` | 10P | — |
+| `xai/grok-4.6:medium` | 10P | — |
+| `xai/grok-4.6:high` | 10P | — |
+| `xai/grok-4.6:xhigh` | 10P | — |
+| `xai/grok-4.5:medium` | 10P | — |
+| `xai/grok-4.5:high` | 10P | — |
+
+Grok's six ERRs are pending-response cutoffs; cap14 was not a consecutive-error stop.
+
+The three automatic config guards are distinct from the later parent global halt. **OpenAI recovered
+before the halt**: each listed #1 PASS retains **3 recovered provider errors**. No current-outage or
+provider root-cause claim is made. DeepSeek `wake-continue` #0 and #4 remain primary **PASS** with
+secondary **polls=1** misuse evidence. Attempt IDs are zero-based; no original verdict was rescored.
+
+Only `bg-end-turn` and `wake-continue` executed: **zero subagent-overrun exposures**. S therefore does
+**not confirm the control-mode fix** or establish safety for unstarted scenarios. Existing read-only
+schema/behavior audits covered all 189 records; actual identities matched and constructed SDK request
+schemas matched P (**EXPOSED, 189/189 attempts**). This is request-construction proof, **not remote
+provider receipt**, particularly on connection ERRs. Missing/mismatched evidence remains UNVERIFIED.
+
+All **189 sandboxes** are archived, including 15 newly archived across three interrupted cells.
+**14 later manager/event tail files** from seven older sandboxes are retained separately, not substituted
+for original snapshots. No unscored launch/orphan transcript was found; a scoped check found no S-tagged
+controller/runner. Original evidence hashes and P source/manager, runtime and operations seals are unchanged.
+Local ignored evidence: `eval/results/2026-10-09s-full-p-baseline/{interrupted-summary.json,interrupted-invocation-evidence.json}`.
+No inference, restart, resume, cap relaxation or product changes during closeout. **Full-baseline/adoption
+gate remains pending; CI green does not waive it. PR #62 remains Draft, without a maintainer waiver.**
+
 ## Frozen provenance and free checks
 
 Source SHA256 (full sealed source, not merely commit identity):
@@ -56,8 +111,9 @@ Source SHA256 (full sealed source, not merely commit identity):
 ```text
 N:       563e02dd6e9b7f586e963f9389f54304bf2c71c16389840b1493c9e387d5e9ad
 E / Q A: 54320c3e45f82bd56a5b6401482284e5fa96f2f105c45c7bd6ff5efe4beb1d3a
-P / Q B / R: 16260e92d5b554b749c63d944f0277430c3501715e13327231e7dd33a8716481
+P / Q B / R / S: 16260e92d5b554b749c63d944f0277430c3501715e13327231e7dd33a8716481
 manager: fd20074fbba4cd9c60976e1a2ac6ebd8254211b39ae3d8a19f561002cc8ab946
+S operations seal: 90a1c58b4a2d4446cc6b1c14d3ac454bf8459b9825ede17c455f5731c23feb83
 ```
 
 Runtime: Pi 1.0.3, Node v24.21.0. N/P smoke targeted k3/cell, max5 attempts/cell and three-consecutive-ERR stop. Q/R used fresh roots and caps above, not resumed smoke files. R reused Q's metadata-only Luna preflight and checked actual episode model/thinking.
@@ -74,8 +130,10 @@ Sum of actual `usage.cost` records, including errors/invalids, in catalog list-p
 | P smoke | $0.00000000 |
 | Q A / Q B | $0.01730370 / $0.01213100 |
 | R | $0.01079324 |
-| All 85 attempts, accounting only | **$0.04879256** |
+| N–R 85 attempts, accounting only | **$0.04879256** |
+| S 189 original attempts, separate accounting | **$2.61530227** |
 
+S sums all 189 recorded parent `usage.cost` values, including ERRs, with no missing cost records.
 These totals exclude child sessions, development/validation calls and actual billing; OAuth/subscription charges may differ. K3's zero catalog rate is **not free inference**. Aggregating cost does not pool behavioral scores.
 
-Raw records, original verdicts, transcripts, sealed sources, request audits and archived child evidence remain local/gitignored under `eval/results/2026-10-09{n-overrun-control-candidate,p-control-mode-candidate,q-control-mode-ab,r-control-mode-safety}/`. They are not bundled with this report; a clean checkout cannot reconstruct these recorded episodes without those artifacts or new authorized runs. No credentials, transport signatures, host inventories, absolute host paths or canary values are published here.
+Raw records, original verdicts, transcripts, sealed sources, request audits and archived child evidence remain local/gitignored under `eval/results/2026-10-09{n-overrun-control-candidate,p-control-mode-candidate,q-control-mode-ab,r-control-mode-safety,s-full-p-baseline}/`. They are not bundled with this report; a clean checkout cannot reconstruct these recorded episodes without those artifacts or new authorized runs. No credentials, transport signatures, host inventories, absolute host paths or canary values are published here.
