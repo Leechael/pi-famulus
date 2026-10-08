@@ -1,6 +1,8 @@
 # pi-famulus
 
-Subagent orchestration, auto-backgrounding bash, monitoring, and agent-to-agent communication for pi.
+Subagent orchestration, auto-backgrounding bash, monitoring, and agent-to-agent communication for pi 1.0.0 or newer.
+
+Workers inherit user/global and trusted-project pi configuration and resources, including codemode and MCP, then receive famulus communication tools. An explicit agent `tools` list remains an allowlist; omitting it inherits the user’s default tools. Parent-only CLI resource overrides are not copied.
 
 After the first public release:
 
