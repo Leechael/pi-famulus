@@ -26,7 +26,7 @@ give it more time with subagent({ action: "extend", run_id: "{{runId}}", child_i
 
 # overrun: options
 
-It has not been stopped. Choose one: {{actions}} If you do none of these, it keeps running and the next reminder is scheduled in {{next}}; its result arrives as usual when it finishes.
+It has not been stopped. Extend only when progress or a known, still-useful silent workload justifies more time within the user's timing constraints; a child shell timeout is not evidence of progress or, by itself, a reason to extend past the requested timeframe. Choose one: {{actions}} If you do none of these, it keeps running and the next reminder is scheduled in {{next}}; its result arrives as usual when it finishes.
 
 # overrun: options-ceiling
 
