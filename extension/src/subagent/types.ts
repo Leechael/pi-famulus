@@ -168,13 +168,14 @@ export interface ChildSessionAdapter {
   /** Current queued steering drain mode, when supported by the runtime. */
   getSteeringMode?(): "all" | "one-at-a-time";
   subscribe(listener: (event: ChildSessionEvent) => void): () => void;
-  dispose(): void;
+  /** Await extension cleanup before releasing the underlying session. */
+  dispose(): void | Promise<void>;
 }
 
 export type CreateSessionFn = (req: ChildRunRequest) => Promise<ChildSessionAdapter>;
 
 export interface ChildRunner {
-  start(req: ChildRunRequest): Promise<ChildHandle>;
+  start(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<ChildHandle>;
 }
 
 /**
@@ -183,5 +184,6 @@ export interface ChildRunner {
  * duck-types this to release sessions in disposeRun().
  */
 export interface DisposableChildHandle extends ChildHandle {
-  dispose(): void;
+  /** Settles immediately; an optional promise tracks asynchronous session cleanup. */
+  dispose(): void | Promise<void>;
 }

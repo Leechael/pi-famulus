@@ -448,7 +448,8 @@ export default function (pi: ExtensionAPI): void {
     });
     fleetWidget?.dispose();
     fleetWidget = null;
-    subagentRegistry?.disposeAll();
+    comms.dispose(); // Release decision waiters before awaiting child aborts.
+    await subagentRegistry?.disposeAll();
     subagentRegistry = null;
     for (const controller of pendingAgentReregistrations.values()) controller.abort();
     pendingAgentReregistrations.clear();
@@ -788,10 +789,10 @@ export default function (pi: ExtensionAPI): void {
     exitWatchdog.dispose();
     fleetWidget?.dispose();
     fleetWidget = null;
-    subagentRegistry?.disposeAll();
+    comms.dispose(); // Release decision waiters before awaiting child aborts.
+    await subagentRegistry?.disposeAll();
     subagentRegistry = null;
     agentLoader = null;
-    comms.dispose(); // resolve orphaned need_decision waiters
     monitorRegistry?.disposeAll();
     notifyCenter?.dispose();
     const current = client;
