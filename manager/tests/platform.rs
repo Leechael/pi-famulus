@@ -700,6 +700,10 @@ fn d3_concurrent_daemons_leave_one_survivor() {
         exited += 1;
     }
     assert_eq!(exited, 5);
+    assert!(
+        poll_true(S(10), || home.reachable() && home.pidfile_pid() == Some(survivor)),
+        "survivor did not keep listening after the losing daemons exited"
+    );
     let mut c = home.connect();
     assert_eq!(c.hello_cli()["pid"].as_u64(), Some(survivor as u64));
 }

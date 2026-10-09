@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Black-box shutdown-wait regressions: real CLI processes, framed sockets,
 //! OS lifetime locks, and real successor daemons. No manager internals linked.
 

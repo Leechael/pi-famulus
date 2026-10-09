@@ -196,16 +196,17 @@ fn identity_stamp(metadata: &fs::Metadata, content_hash: u64) -> ConfigStamp {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
+        // `file_index` / `volume_serial_number` need the unstable
+        // `windows_by_handle` feature. Content hash plus FILETIME is enough
+        // to notice a replacement or in-place edit.
         let write = metadata.last_write_time();
+        let created = metadata.creation_time();
         ConfigStamp {
-            dev: u64::from(metadata.volume_serial_number().unwrap_or(0)),
-            ino: metadata.file_index().unwrap_or(0),
+            dev: 0,
+            ino: 0,
             len: metadata.len(),
             modified: ((write >> 32) as i64, (write & 0xffff_ffff) as i64),
-            changed: {
-                let created = metadata.creation_time();
-                ((created >> 32) as i64, (created & 0xffff_ffff) as i64)
-            },
+            changed: ((created >> 32) as i64, (created & 0xffff_ffff) as i64),
             content_hash,
         }
     }
