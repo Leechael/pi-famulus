@@ -102,8 +102,9 @@ test('publication guards cannot be satisfied by comments or other jobs', () => {
 });
 
 function assertExtensionSourceInstall(ci) {
-  const job = ci.match(/^  extension:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
-  assert.ok(job.includes('      - run: npm ci\n      - run: npx tsc --noEmit\n'), 'extension source job must install full dependencies before typecheck');
+  const job = ci.match(/^  extension-compat:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
+  assert.ok(job.includes('      - run: npm ci\n      - run: npx tsc --noEmit\n'), 'extension source job (extension-compat) must install full dependencies before typecheck');
+  assert.match(ci, /^  extension:\n    needs: extension-compat$/m, 'historical extension check must aggregate compatibility results');
 }
 
 test('extension source install guard cannot be satisfied by other jobs', () => {
