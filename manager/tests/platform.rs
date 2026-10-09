@@ -487,14 +487,25 @@ fn t16_utf8_split_across_writes() {
     c.request_ok(json!({"type":"watch","task_id":id}));
     c.wait_terminal(&id, S(10)).unwrap();
     assert_eq!(output_of(&mut c, &id), "aé中😀b\n");
-    c.drain(MS(300));
-    let watched: String = c
-        .events
-        .iter()
-        .filter(|e| e["event"] == "output" && e["task_id"] == json!(id))
-        .map(|e| e["chunk"].as_str().unwrap_or("").to_string())
-        .collect();
-    assert_eq!(watched, "aé中😀b\n");
+    let expected = "aé中😀b\n";
+    let watched = poll_until(S(3), || {
+        c.drain(MS(50));
+        let watched: String = c
+            .events
+            .iter()
+            .filter(|e| e["event"] == "output" && e["task_id"] == json!(id))
+            .map(|e| e["chunk"].as_str().unwrap_or("").to_string())
+            .collect();
+        (watched == expected).then_some(watched)
+    })
+    .unwrap_or_else(|| {
+        c.events
+            .iter()
+            .filter(|e| e["event"] == "output" && e["task_id"] == json!(id))
+            .map(|e| e["chunk"].as_str().unwrap_or("").to_string())
+            .collect()
+    });
+    assert_eq!(watched, expected);
 }
 
 /// O1: 16 MiB of output arrive byte-exact on disk and on the wire, and the
