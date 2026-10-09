@@ -719,6 +719,9 @@ fn d3_concurrent_daemons_leave_one_survivor() {
     assert_eq!(exited, 5);
     assert_eq!(home.pidfile_pid(), Some(survivor));
     assert_eq!(hold.request_ok(json!({"type":"status"}))["pid"].as_u64(), Some(survivor as u64));
+    let mut c = home.connect();
+    let hello = c.request_ok(json!({"type":"hello","client_kind":"cli"}));
+    assert_eq!(hello["pid"].as_u64(), Some(survivor as u64), "{hello}");
 }
 
 /// D5/C9/T11: the only client crashes. Nothing happens during the 5 s idle
