@@ -100,9 +100,11 @@ jobs:
   # reports its individual versioned checks.
   extension:
     needs: extension-compat
+    if: always()
     runs-on: ubuntu-24.04
     steps:
-      - run: echo "Extension compatibility matrix passed"
+      - name: Require the compatibility matrix to pass
+        run: test "${{ needs.extension-compat.result }}" = success
 
   # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.

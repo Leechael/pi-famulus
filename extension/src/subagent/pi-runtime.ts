@@ -242,8 +242,11 @@ const CHILD_ROLE_CHANNEL = "pi-famulus:child-role";
 
 /** The loader's bus answers synchronously, before any extension initialization. */
 export function isFamulusChildSession(pi: Pick<ExtensionAPI, "events">): boolean {
+  if (!pi.events) {
+    throw new Error("pi-famulus requires the extension event bus to identify child sessions safely");
+  }
   const probe = { child: false };
-  pi.events?.emit(CHILD_ROLE_CHANNEL, probe);
+  pi.events.emit(CHILD_ROLE_CHANNEL, probe);
   return probe.child;
 }
 

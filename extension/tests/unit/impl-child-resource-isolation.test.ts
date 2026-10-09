@@ -6,7 +6,7 @@ import { Type } from "typebox";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { BEHAVIOR_GUIDELINES, CHILD_BEHAVIOR_GUIDELINES } from "../../src/behavior-guidelines";
 import { createChildBashTool } from "../../src/subagent/child-bash";
-import { createChildResources, childSessionCreateOptions, createPiSessionFn } from "../../src/subagent/pi-runtime";
+import { createChildResources, childSessionCreateOptions, createPiSessionFn, isFamulusChildSession } from "../../src/subagent/pi-runtime";
 
 const tempDirs: string[] = [];
 
@@ -88,6 +88,11 @@ async function childSession(resources: Awaited<ReturnType<typeof fakeResources>>
 }
 
 describe("child resource inheritance", () => {
+  it("fails closed when the extension event bus is missing", () => {
+    expect(() => isFamulusChildSession({} as never)).toThrow("requires the extension event bus");
+    expect(isFamulusChildSession({ events: { emit: (_channel: string, probe: { child: boolean }) => { probe.child = true; } } } as never)).toBe(true);
+  });
+
   it("inherits defaults and user resources while skipping parent famulus initialization", async () => {
     const resources = await fakeResources();
     const settingsBefore = await readFile(join(resources.agentDir, "settings.json"), "utf8");

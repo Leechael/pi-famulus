@@ -26,7 +26,7 @@ export interface AgentDefinition {
   name: string;
   /** Required, non-empty. */
   description: string;
-  /** Omitted: inherit user-configured tools. Explicit list: allowlist; []: no tools. */
+  /** Omitted: inherit user-configured tools. Explicit list: allowlist; []: disables user-configured tools, but injected Famulus tools remain. */
   tools?: string[];
   /** "provider:id" or bare id. */
   model?: string;
