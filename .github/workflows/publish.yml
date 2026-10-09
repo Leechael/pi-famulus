@@ -9,17 +9,18 @@ on:
         description: Version bump (auto-detected from npm, git tags, and package.json)
         required: true
         type: choice
+        default: patch
         options:
-          - beta
-          - nightly
           - patch
           - minor
           - major
+          - beta
+          - nightly
       dry_run:
         description: Validate tarballs without publishing (does not test OIDC)
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read

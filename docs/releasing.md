@@ -85,7 +85,7 @@ The repository's `npm` GitHub environment was created and its single `main` bran
 
 ## Subsequent tokenless releases
 
-`publish.yml` does not take a version or tag. Dispatch from **main** and choose a channel:
+`publish.yml` does not take a version or tag. Dispatch from **main** and choose a channel. The workflow UI defaults to `patch` with `dry_run` unchecked (a real publish); first-time setup and artifact review still require an explicit dry run.
 
 | Channel | Version | npm dist-tag |
 |---|---|---|
