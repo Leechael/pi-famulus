@@ -59,20 +59,22 @@ fn current_exe_path() -> Option<PathBuf> {
     std::env::current_exe().ok().map(strip_deleted_suffix)
 }
 
-/// Only strip the Linux procfs " (deleted)" marker, and only for absolute paths.
+/// Strip the Linux procfs " (deleted)" marker. Other Unix kernels may also
+/// append it; Windows paths are left unchanged.
 pub(crate) fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let Some(original) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
             return path;
         };
-        if original.starts_with(b"/") && !original.is_empty() {
-            return PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()));
+        #[cfg(target_os = "linux")]
+        if !original.starts_with(b"/") || original.is_empty() {
+            return path;
         }
-        return path;
+        return PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         path
     }
@@ -188,6 +190,7 @@ mod path_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn current_executable_deleted_suffix_is_removed() {
         assert_eq!(
@@ -197,6 +200,15 @@ mod path_tests {
         assert_eq!(
             strip_deleted_suffix(PathBuf::from("/tmp/pi-famulus")),
             PathBuf::from("/tmp/pi-famulus")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_leaves_deleted_suffix_untouched() {
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from(r"C:\tmp\pi-famulus (deleted)")),
+            PathBuf::from(r"C:\tmp\pi-famulus (deleted)")
         );
     }
 

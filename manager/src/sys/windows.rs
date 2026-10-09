@@ -531,6 +531,15 @@ pub fn max_rss_bytes() -> u64 {
     0
 }
 
+/// Live CPU sampling is Linux `/proc` only; Windows callers treat this as unavailable.
+pub fn clock_ticks_per_second() -> Option<u64> {
+    None
+}
+
+pub fn group_cpu_ticks_by_pgid(_pgids: &[u32]) -> io::Result<std::collections::HashMap<u32, (u64, u64)>> {
+    Ok(std::collections::HashMap::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

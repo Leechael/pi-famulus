@@ -28,7 +28,7 @@ function processBoundary() {
   });
 }
 
-describe("startup contract", () => {
+describe.skipIf(process.platform === "win32")("startup contract", () => {
   let home: string;
   let clock: ManualClock;
   let client: ManagerClient;

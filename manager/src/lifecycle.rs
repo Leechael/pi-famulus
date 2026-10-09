@@ -198,10 +198,17 @@ fn note_daemon_lock_would_block(attempt: usize) -> io::Result<()> {
     }
     if attempt == 0 {
         if let Some(path) = std::env::var_os("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER") {
-            let mut barrier = std::os::unix::net::UnixStream::connect(path)?;
-            barrier.write_all(b"x")?;
-            let mut resume = [0_u8; 1];
-            barrier.read_exact(&mut resume)?;
+            #[cfg(unix)]
+            {
+                let mut barrier = std::os::unix::net::UnixStream::connect(path)?;
+                barrier.write_all(b"x")?;
+                let mut resume = [0_u8; 1];
+                barrier.read_exact(&mut resume)?;
+            }
+            #[cfg(windows)]
+            {
+                let _ = path;
+            }
         }
     }
     Ok(())

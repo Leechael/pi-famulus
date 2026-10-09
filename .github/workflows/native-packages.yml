@@ -90,6 +90,7 @@ jobs:
         with:
           node-version: 24
       - name: Capture source commit for release build
+        shell: bash
         run: echo "PI_FAMULUS_GIT_SHA=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_ENV"
       - name: Release tooling tests on Windows
         if: runner.os == 'Windows'

@@ -2903,8 +2903,8 @@ fn start_task_io_with_tee(
     state: &Shared,
     task_id: &str,
     start_tee: impl FnOnce(
-        Option<std::os::fd::OwnedFd>,
-        Option<std::os::fd::OwnedFd>,
+        Option<task::TeeSource>,
+        Option<task::TeeSource>,
         Arc<Mutex<task::OutputState>>,
         Option<std::fs::File>,
         mpsc::Sender<task::OutputChunk>,
@@ -3759,6 +3759,7 @@ mod tests {
     /// Regression: a tee that runs before its factory returns must not have
     /// its bytes read again as carry. Also preserve the incomplete raw byte
     /// across the same park/restart seam used by an in-place upgrade.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn utf8_watch_output_is_not_duplicated_when_tee_starts_eagerly() {
         use std::os::fd::AsRawFd;

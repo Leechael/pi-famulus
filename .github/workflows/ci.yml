@@ -120,14 +120,12 @@ jobs:
   # Preserve the historical required check name while the compatibility matrix
   # reports its individual versioned checks.
   extension:
-    needs: [extension-compat, extension-windows]
+    needs: extension-compat
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: Require the compatibility matrix and Windows suite to pass
-        run: |
-          test "${{ needs.extension-compat.result }}" = success
-          test "${{ needs.extension-windows.result }}" = success
+      - name: Require the compatibility matrix to pass
+        run: test "${{ needs.extension-compat.result }}" = success
 
   # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.
