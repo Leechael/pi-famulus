@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -23,10 +23,10 @@ async function fakeResources() {
   await writeFile(join(agentDir, "skills", "global-canary", "SKILL.md"),
     "---\nname: global-canary\ndescription: Global inheritance canary\n---\nGLOBAL_CHILD_SKILL_CANARY");
   await mkdir(join(agentDir, "extensions"), { recursive: true });
-  await writeFile(join(agentDir, "extensions", "canary.ts"), `import { writeFile } from "node:fs/promises";
+  await writeFile(join(agentDir, "extensions", "canary.ts"), `import { appendFile } from "node:fs/promises";
 export default function (pi) {
   pi.on("session_shutdown", async () => {
-    await writeFile(${JSON.stringify(join(root, "shutdown.txt"))}, "done");
+    await appendFile(${JSON.stringify(join(root, "shutdown.txt"))}, "shutdown:first\\n");
   });
   pi.registerTool({
     name: "canary_tool", label: "Canary", description: "User extension",
@@ -42,6 +42,12 @@ export default function (pi) {
     name: "mcp__canary__echo", label: "Deferred MCP", description: "MCP exposure canary",
     exposure: "codemode", parameters: { type: "object", properties: {} },
     async execute() { return { content: [{ type: "text", text: "mcp" }] }; }
+  });
+}`);
+  await writeFile(join(agentDir, "extensions", "shutdown-canary.ts"), `import { appendFile } from "node:fs/promises";
+export default function (pi) {
+  pi.on("session_shutdown", async () => {
+    await appendFile(${JSON.stringify(join(root, "shutdown.txt"))}, "shutdown:second\\n");
   });
 }`);
   await writeFile(join(agentDir, "extensions", "famulus.ts"),
@@ -210,6 +216,8 @@ describe("child resource inheritance", () => {
         expect(child.getSystemPrompt?.()).toContain("PROJECT_CONTEXT_CANARY");
       }
     } finally { await Promise.all([first.dispose(), second.dispose()]); }
-    expect(await readFile(join(resources.root, "shutdown.txt"), "utf8")).toBe("done");
+    const shutdownMarkers = (await readFile(join(resources.root, "shutdown.txt"), "utf8")).trim().split("\n");
+    expect(shutdownMarkers.filter((marker) => marker === "shutdown:first")).toHaveLength(2);
+    expect(shutdownMarkers.filter((marker) => marker === "shutdown:second")).toHaveLength(2);
   });
 });

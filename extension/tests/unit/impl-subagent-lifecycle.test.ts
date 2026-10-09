@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
-import type { ChildRunRequest, DisposableChildHandle } from "../../src/subagent/types";
+import type { ChildHandle, ChildRunRequest, DisposableChildHandle } from "../../src/subagent/types";
 import { SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
 
 const MIN = 60_000;
@@ -135,6 +135,44 @@ describe("child lifecycle", () => {
     await tick();
     expect(second).toMatchObject({ status: "completed", text: "second", attempts: 2 });
     expect(registry.get(runId)!.children[0].status).toBe("completed");
+  });
+
+  it("awaits interruption of a late custom handle before disposing it", async () => {
+    const { registry, req } = makeStack();
+    let resolveStart!: (handle: ChildHandle) => void;
+    registry.setRunner({ start: () => new Promise((resolve) => { resolveStart = resolve; }) });
+    const starting = registry.startChild(req);
+    await tick();
+    let finishInterrupt!: () => void;
+    const interruptGate = new Promise<void>((resolve) => { finishInterrupt = resolve; });
+    let interruptStarted = false;
+    let disposedAfterInterrupt = false;
+    const lateHandle = {
+      interrupt: async () => { interruptStarted = true; await interruptGate; },
+      dispose: () => { disposedAfterInterrupt = interruptStarted && !disposedAfterInterrupt; },
+    } as ChildHandle & { dispose(): void };
+    const disposal = registry.disposeAll();
+    resolveStart(lateHandle);
+    await tick();
+    expect(interruptStarted).toBe(true);
+    expect(disposedAfterInterrupt).toBe(false);
+    finishInterrupt();
+    await disposal;
+    await starting;
+    expect(disposedAfterInterrupt).toBe(true);
+  });
+
+  it("disposal during rejected session creation does not report a cleanup failure", async () => {
+    let rejectCreation!: (error: Error) => void;
+    const gate = new Promise<void>((_resolve, reject) => { rejectCreation = reject; });
+    const { registry, req } = makeStack(gate);
+    const starting = registry.startChild(req);
+    await tick();
+    const disposal = registry.disposeAll();
+    rejectCreation(new Error("session startup failed"));
+    await expect(disposal).resolves.toBeUndefined();
+    const handle = await starting;
+    expect((await handle.result).status).toBe("interrupted");
   });
 
   it("disposal during session creation awaits late cleanup exactly once without prompting", async () => {

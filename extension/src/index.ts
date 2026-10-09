@@ -450,7 +450,7 @@ export default function (pi: ExtensionAPI): void {
     fleetWidget?.dispose();
     fleetWidget = null;
     comms.dispose(); // Release decision waiters before awaiting child aborts.
-    await subagentRegistry?.disposeAll();
+    await subagentRegistry?.disposeAll().catch(() => {});
     subagentRegistry = null;
     for (const controller of pendingAgentReregistrations.values()) controller.abort();
     pendingAgentReregistrations.clear();
@@ -790,7 +790,7 @@ export default function (pi: ExtensionAPI): void {
     fleetWidget?.dispose();
     fleetWidget = null;
     comms.dispose(); // Release decision waiters before awaiting child aborts.
-    await subagentRegistry?.disposeAll();
+    await subagentRegistry?.disposeAll().catch(() => {});
     subagentRegistry = null;
     agentLoader = null;
     monitorRegistry?.disposeAll();
@@ -798,10 +798,13 @@ export default function (pi: ExtensionAPI): void {
     const current = client;
     client = null;
     if (current) {
-      if (current.isAvailable()) {
-        await current.shutdownSession().catch(() => {});
+      try {
+        if (current.isAvailable()) await current.shutdownSession();
+      } catch {
+        // Child teardown is best-effort; still release the manager connection.
+      } finally {
+        await current.close().catch(() => {});
       }
-      await current.close();
     }
     ctx = null;
   });

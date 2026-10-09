@@ -39,7 +39,7 @@ jobs:
 
   # No Windows job: the manager is unix-only, and the extension reaches it
   # over a unix socket path (manager/TESTING.md, Deferrals).
-  extension:
+  extension-compat:
     name: extension (pi ${{ matrix.pi-version }})
     strategy:
       fail-fast: false
@@ -95,6 +95,14 @@ jobs:
           tests/unit/impl-model-spec.test.ts
           tests/unit/impl-eval-fixes.test.ts
           tests/integration/behavior-guidelines.test.ts
+
+  # Preserve the historical required check name while the compatibility matrix
+  # reports its individual versioned checks.
+  extension:
+    needs: extension-compat
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Extension compatibility matrix passed"
 
   # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.

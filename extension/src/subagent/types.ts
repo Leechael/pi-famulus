@@ -16,7 +16,7 @@ import type { OverrunTick } from "./overrun";
 export interface AgentDefinition {
   name: string; // ^[a-z][a-z0-9-]*$
   description: string; // required, non-empty
-  tools?: string[]; // omitted: inherit user config; explicit list: allowlist; []: no tools
+  tools?: string[]; // omitted: inherit user config; explicit list: allowlist; []: no user-configured tools (injected communication tools remain)
   model?: string; // "provider:id" | bare id
   // Mirror of src/agents/definition.ts — keep in sync with
   // src/thinking-levels.ts (VALID_THINKING_LEVELS), the single source.

@@ -322,10 +322,10 @@ export class SubagentRegistry implements RunRegistry {
       const handle = child.handle as DisposableChildHandle | undefined;
       if (!handle) {
         // Custom runners may not expose a handle until startup completes.
-        if (child.starting) disposals.push(child.starting.then((lateHandle) => {
-          void lateHandle.interrupt().catch(() => {});
-          return (lateHandle as DisposableChildHandle).dispose?.();
-        }));
+        if (child.starting) disposals.push(child.starting.then(async (lateHandle) => {
+          await lateHandle.interrupt().catch(() => {});
+          await (lateHandle as DisposableChildHandle).dispose?.();
+        }, () => {}));
         continue;
       }
       void handle.interrupt().catch(() => {});

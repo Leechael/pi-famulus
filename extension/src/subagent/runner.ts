@@ -495,7 +495,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     try {
       this.disposalPromise = session
         ? session.dispose() || undefined
-        : this.sessionCreation?.then((created) => created.dispose());
+        : this.sessionCreation?.then((created) => created.dispose(), () => {});
       return this.disposalPromise;
     } finally {
       // Never leave result waiters hanging, even when cleanup throws or awaits.
