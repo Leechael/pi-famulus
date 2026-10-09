@@ -1,10 +1,12 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createBashOverride } from "../../src/bash-override";
 
 function ctx(): ExtensionToolContext {
   return {
-    cwd: "/tmp",
+    cwd: tmpdir(),
     sessionManager: { getSessionId: () => "s", getSessionFile: () => null },
   } as unknown as ExtensionToolContext;
 }
@@ -13,7 +15,7 @@ function makeTool() {
   return createBashOverride({
     getClient: () => null, // force the local fallback path
     config: { foregroundBudgetMs: 20_000 } as never,
-    home: "/tmp/pi-famulus-test",
+    home: join(tmpdir(), "pi-famulus-test"),
     sessionId: () => "s",
     sessionEnv: () => ({}),
     trackTask: vi.fn(),

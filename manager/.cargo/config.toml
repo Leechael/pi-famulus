@@ -1,0 +1,6 @@
+# Statically link the MSVC CRT into the Windows x64 manager. The native
+# package job exports RUSTFLAGS only for Linux, and a set RUSTFLAGS replaces
+# cargo's target rustflags. Windows does not set RUSTFLAGS, so this is what
+# `cargo build --release --target x86_64-pc-windows-msvc` links with.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

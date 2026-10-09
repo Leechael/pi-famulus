@@ -54,7 +54,7 @@ pi instance C (session c) ──┘                                ├─ proces
 
 ### 3.1 Singleton and startup
 
-Conventional paths (Unix; Windows uses named pipe `\\.\pipe\pi-famulus`). **The base directory can be overridden with `PI_FAMULUS_HOME`** (essential for tests and multi-instance debugging; the CLI also supports the global flag `--home <dir>`, with priority: flag > env > default):
+Conventional paths (Unix; Windows uses the named pipe `\\.\pipe\pi-famulus-<fnv1a64>` instead of `manager.sock`, hashed over the UTF-8 of the absolute home with `\` separators, no trailing separator, lower-cased, so lexical case/separator variants of one home reach one daemon — symlink or junction aliases still hash differently). **The base directory can be overridden with `PI_FAMULUS_HOME`** (essential for tests and multi-instance debugging; the CLI also supports the global flag `--home <dir>`, with priority: flag > env > default):
 
 ```
 ~/.pi/agent/pi-famulus/
@@ -139,7 +139,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 **`start` idempotency**: `start` may carry an optional client-generated `key`; resending the same key within the same session returns the first task started, without starting another; keys survive in-place upgrades.
 
 **Supplemental rulings (2026-09-17)**:
-- `kind:"shell"` commands are interpreted by a shell: Unix uses `env.SHELL -c` (`/bin/sh -c` if env omits SHELL); Windows uses `cmd /c`
+- `kind:"shell"` commands are interpreted by a shell: Unix uses `env.SHELL -c` (`/bin/sh -c` if env omits SHELL); Windows uses pi's shell: `PI_FAMULUS_SHELL` from the manager's environment, else Git Bash (`%ProgramFiles%\Git\bin\bash.exe`, then `%ProgramFiles(x86)%`), else a `bash.exe` on PATH outside `System32` (not WSL), each run as `-c <command>`; with no bash found (or `PI_FAMULUS_SHELL` naming `cmd`), `cmd.exe /d /s /c "<command>"` with the command verbatim
 - Omitting `env` from `start` → the child inherits the manager's own environment (the extension always explicitly passes the complete env)
 - `stop` response = signal sent (SIGTERM→2s→SIGKILL flow started); the state change is determined by `task_exited`; killed tasks' `task_exited` carries `exit_code:null, signal:"SIGTERM"|"SIGKILL"`
 - CLI output is human-readable tables (not a contract); successful `shutdown` exits 0
@@ -641,7 +641,7 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 - Detached subagent runner (ChildRunner seam reserved)
 - Worktree isolation, workflow-script sandbox, watchdog, missions
 - Compatibility with pi-subagents / pi-intercom
-- Full Windows support (code paths reserved, unverified)
+- Windows support: named-pipe IPC, Job Objects (KILL_ON_JOB_CLOSE lifeline), pi's bash (`cmd.exe` only as a fallback); in-place `exec` upgrade remains Unix-only
 
 ## Appendix A: TS pure-function signature contract (shared basis for implementation and tests)
 

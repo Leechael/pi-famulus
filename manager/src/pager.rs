@@ -5,8 +5,12 @@
 //! arguments runs as given. An empty value is treated as unset and falls
 //! through to the next choice; `cat` means no pager, so does `--no-pager`.
 
-use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
+use std::process::Child;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 pub struct Pager {
     child: Child,
@@ -57,17 +61,44 @@ fn program_exists(cmd: &str) -> bool {
     if matches!(program, "exec" | "command" | "builtin" | "eval") {
         return true;
     }
-    if program.contains('/') {
+    if program.contains('/') || (cfg!(windows) && program.contains('\\')) {
         return std::path::Path::new(program).is_file();
     }
     std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(program);
+            if candidate.is_file() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                // PATHEXT: bare `sh` must match `sh.exe` / `sh.cmd` / …
+                let pathext = std::env::var_os("PATHEXT")
+                    .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+                for ext in std::env::split_paths(&pathext) {
+                    let mut with_ext = candidate.as_os_str().to_owned();
+                    with_ext.push(ext);
+                    if std::path::Path::new(&with_ext).is_file() {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
     })
 }
 
 /// Point stdout at a pager when stdout is a terminal. Returns None when no
 /// pager runs (not a terminal, disabled, or it failed to start).
 pub fn start() -> Option<Pager> {
+    #[cfg(windows)]
+    {
+        // Known gap this PR: no portable dup2 onto a pager pipe on Windows yet.
+        // Listings print unpaged; PI_FAMULUS_PAGER / PAGER are ignored here.
+        return None;
+    }
+    #[cfg(unix)]
+    {
     // SAFETY: isatty only inspects the descriptor.
     if unsafe { libc::isatty(1) } != 1 {
         return None;
@@ -91,6 +122,7 @@ pub fn start() -> Option<Pager> {
     // SAFETY: setting a signal disposition to SIG_IGN.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
     Some(Pager { child })
+    }
 }
 
 impl Pager {
@@ -98,6 +130,7 @@ impl Pager {
     pub fn finish(mut self) {
         use std::io::Write;
         let _ = std::io::stdout().flush();
+        #[cfg(unix)]
         if let Ok(null) = std::fs::File::open("/dev/null") {
             // SAFETY: replaces fd 1 (the pipe's last write end) with /dev/null.
             unsafe { libc::dup2(null.as_raw_fd(), 1) };
@@ -128,7 +161,10 @@ mod tests {
 
     #[test]
     fn program_exists_checks_the_pager_will_actually_run() {
+        #[cfg(unix)]
         assert!(program_exists("sh -c whatever"));
+        #[cfg(windows)]
+        assert!(program_exists("cmd /c echo"));
         assert!(!program_exists("pi-famulus-pager-does-not-exist-anywhere -R"));
         assert!(!program_exists(""));
     }

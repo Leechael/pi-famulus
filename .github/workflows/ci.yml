@@ -37,8 +37,8 @@ jobs:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
 
-  # No Windows job: the manager is unix-only, and the extension reaches it
-  # over a unix socket path (manager/TESTING.md, Deferrals).
+  # The manager's Windows suites run in the native-packages matrix (win32-*).
+  # Pi-version compatibility stays on Ubuntu; Windows gets the locked-suite unit tests.
   extension-compat:
     name: extension (pi ${{ matrix.pi-version }})
     strategy:
@@ -96,6 +96,27 @@ jobs:
           tests/unit/impl-eval-fixes.test.ts
           tests/integration/behavior-guidelines.test.ts
 
+  extension-windows:
+    name: extension (windows-latest)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      # First-party natives use local lock links before registry bootstrap.
+      # Do not omit all optionals: TypeScript and Rollup need native bindings.
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+
   # Preserve the historical required check name while the compatibility matrix
   # reports its individual versioned checks.
   extension:
@@ -115,12 +136,16 @@ jobs:
       # macos-latest and ubuntu-latest intentionally track current hosted images
       # for real-world compatibility coverage; other Ubuntu jobs are pinned.
       matrix:
-        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     env:
-      PI_FAMULUS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pi-famulus
-      PI_BIN: ${{ github.workspace }}/eval/node_modules/.bin/pi
-      # Keep every sandbox (/tmp/eval-*) so a failure can be uploaded.
+      PI_FAMULUS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pi-famulus${{ startsWith(matrix.os, 'windows') && '.exe' || '' }}
+      # pi's own entry point on Windows: node_modules/.bin/pi is a .cmd shim there.
+      PI_BIN: ${{ github.workspace }}/eval/node_modules/${{ startsWith(matrix.os, 'windows') && '@earendil-works/pi-coding-agent/dist/bundle/cli.js' || '.bin/pi' }}
+      # Keep every sandbox (eval-* under the temp dir) so a failure can be uploaded.
       PI_FAMULUS_EVAL_KEEP: "1"
       # real-manager integration uses its own home, not an eval sandbox.
       PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
@@ -154,20 +179,33 @@ jobs:
           PI_FAMULUS_INTEG: "1"
       - run: npm run typecheck
         working-directory: eval
+      # Eval-internal unit and grader tests drive /bin/sh fixtures; the
+      # product scenarios (integration + faux e2e) run on every OS.
       - run: npm run test:unit
         working-directory: eval
+        if: runner.os != 'Windows'
       - run: npm run test:graders
         working-directory: eval
+        if: runner.os != 'Windows'
       - run: npm run test:e2e
         working-directory: eval
+        if: runner.os != 'Windows'
+      # Windows: keep the sandboxes on the workspace drive; upload-artifact
+      # cannot collect files from another drive. Unix keeps /tmp.
+      - run: npm run test:e2e
+        working-directory: eval
+        if: runner.os == 'Windows'
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
       - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: e2e-sandboxes-${{ matrix.os }}
           path: |
             pi-famulus-test-artifacts/
-            /tmp/eval-*/h/manager.log
-            /tmp/eval-*/h/events.jsonl
-            /tmp/eval-*/h/config.json
-            /tmp/eval-*/faux-trace.jsonl
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/manager.log
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/events.jsonl
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/config.json
+            ${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/faux-trace.jsonl
           if-no-files-found: ignore

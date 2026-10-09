@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
@@ -246,7 +247,10 @@ fn doctor_resolves_the_new_home_and_environment_contract() {
     let flag_home = root.join("flag");
     let doctor = |home_env: Option<&str>, flag: bool| {
         let mut cmd = Command::new(BIN);
-        cmd.env("HOME", &root).env_remove("PI_FAMULUS_HOME");
+        // resolve_home uses USERPROFILE on Windows, HOME on Unix.
+        cmd.env("HOME", &root)
+            .env("USERPROFILE", &root)
+            .env_remove("PI_FAMULUS_HOME");
         if let Some(value) = home_env {
             cmd.env("PI_FAMULUS_HOME", value);
         }
@@ -255,7 +259,8 @@ fn doctor_resolves_the_new_home_and_environment_contract() {
         }
         cmd.arg("doctor").output().unwrap()
     };
-    let expected_default = root.join(".pi/agent/pi-famulus");
+    // Same join shape as lifecycle::resolve_home.
+    let expected_default = root.join(".pi").join("agent").join("pi-famulus");
     for (home_env, flag, expected) in [
         (None, false, &expected_default),
         (Some(""), false, &expected_default),
@@ -265,7 +270,12 @@ fn doctor_resolves_the_new_home_and_environment_contract() {
         let output = doctor(home_env, flag);
         assert_eq!(output.status.code(), Some(1));
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.starts_with(&format!("home:   {}\n", expected.display())), "{text}");
+        // Windows text-mode stdout turns \n into \r\n; compare via lines().
+        let home_line = text.lines().next().expect("doctor prints a home line");
+        let printed = home_line
+            .strip_prefix("home:   ")
+            .unwrap_or_else(|| panic!("unexpected home line: {home_line:?}\n{text}"));
+        assert_eq!(Path::new(printed), expected.as_path(), "{text}");
         assert!(text.contains("PI_FAMULUS_HOME"), "{text}");
         assert!(!expected.exists(), "doctor must not create or start a manager");
     }

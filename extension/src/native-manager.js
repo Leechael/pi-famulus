@@ -14,9 +14,11 @@ const resolutionErrorCodes = new Set([
 const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const resolveInstalled = createRequire(import.meta.url).resolve;
 
-/** The four native optional packages are selected by npm's os/cpu constraints. */
+/** The native optional packages are selected by npm's os/cpu constraints. */
 export function nativePackageName(platform, arch) {
-  if (!["linux", "darwin"].includes(platform) || !["x64", "arm64"].includes(arch)) return null;
+  if (!["linux", "darwin", "win32"].includes(platform) || !["x64", "arm64"].includes(arch)) return null;
+  // Windows ARM64 has no release producer yet; manual binary lookup still works.
+  if (platform === "win32" && arch === "arm64") return null;
   return `pi-famulus-${platform}-${arch}`;
 }
 

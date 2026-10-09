@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Black-box tests for the observability contract (manager + CLI side):
 //! protocol additions (origin, mark_background, stop.reason, end_reason,
 //! hello extension_version/protocol, status protocol), the manager's

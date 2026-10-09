@@ -4,6 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { npmSync } from './prepare-native.mjs';
 import { validateMetadata, validateTag, REPOSITORY } from './validate-release.mjs';
 import { distTagForVersion } from './next-release.mjs';
 
@@ -13,12 +14,12 @@ const REGISTRY = 'https://registry.npmjs.org';
 export function validateArtifacts(root, directory, options) {
   const packages = validateMetadata(root, options);
   const filenames = readdirSync(directory).filter(f => f.endsWith('.tgz')).sort();
-  assert.deepEqual(filenames, packages.map(p => `${p.name}-${p.metadata.version}.tgz`).sort(), 'artifact set must contain exactly all five release packages');
+  assert.deepEqual(filenames, packages.map(p => `${p.name}-${p.metadata.version}.tgz`).sort(), `artifact set must contain exactly all ${packages.length} release packages`);
   return [...packages.slice(1), packages[0]].map(p => {
     const artifact = join(directory, `${p.name}-${p.metadata.version}.tgz`);
     const unpack = path => execFileSync('tar', ['-xOzf', artifact, `package/${path}`], { maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     assert.deepEqual(JSON.parse(unpack('package.json')), p.metadata, `artifact metadata mismatch: ${p.name}`);
-    for (const path of p.os ? ['bin/pi-famulus'] : ['bin/pi-famulus.js', 'src/native-manager.js', 'src/config.ts', 'README.md']) assert.ok(unpack(path).length, `artifact missing ${path}: ${p.name}`);
+    for (const path of p.os ? [p.binary] : ['bin/pi-famulus.js', 'src/native-manager.js', 'src/config.ts', 'README.md']) assert.ok(unpack(path).length, `artifact missing ${path}: ${p.name}`);
     const integrity = `sha512-${createHash('sha512').update(readFileSync(artifact)).digest('base64')}`;
     return { ...p, artifact, integrity };
   });
@@ -50,7 +51,9 @@ export async function publishPackages(root, directory, { tag, dryRun = true, rep
   for (const p of pending) {
     const distTag = distTagForVersion(p.metadata.version);
     console.log(`${dryRun ? 'Dry run' : 'Publish'}: ${p.name}@${p.metadata.version} --tag ${distTag}`);
-    run('npm', ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])], { cwd: root, stdio: 'inherit' });
+    // Tests inject only the execution boundary, not a different npm launch path.
+    const args = ['publish', p.artifact, '--access', 'public', '--provenance', '--registry', REGISTRY, '--tag', distTag, ...(dryRun ? ['--dry-run'] : [])];
+    npmSync(args, { cwd: root, stdio: 'inherit' }, run);
   }
   if (dryRun) console.log('Dry run validates packaging only; it does NOT prove OIDC authentication or trusted-publisher bindings.');
 }

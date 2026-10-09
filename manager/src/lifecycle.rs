@@ -25,14 +25,53 @@ pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
             return PathBuf::from(env);
         }
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
     home.join(".pi").join("agent").join("pi-famulus")
 }
 
+/// Namespaced pipe identity (no `\\.\pipe\` prefix), shared with the
+/// extension's `famulusPaths`: FNV-1a over one absolute lexical spelling of
+/// the home. Relative homes (`.famulus`), `..`, and repeated separators are
+/// resolved against the cwd first, so two processes that pass the same
+/// relative home from different directories do not share a pipe. This is
+/// lexical (`path.win32.resolve`), not a junction or symlink canonicalization.
+/// Windows paths are case-insensitive and take either separator, so
+/// `C:/Users/Me/x/` and `c:\users\me\x` must name one pipe, or a second
+/// daemon starts for the same home and cannot take its lock.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_pipe_ident(home: &Path) -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let key = windows_pipe_key(home.to_string_lossy().as_ref(), cwd.to_string_lossy().as_ref());
+    let h = crate::sys::fnv1a64(key.as_bytes());
+    format!("pi-famulus-{h:x}")
+}
+
+/// Absolute lexical home used as the pipe hash input. `cwd` is the directory
+/// a relative `home` is resolved against. See [`crate::winpath`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_pipe_key(home: &str, cwd: &str) -> String {
+    crate::winpath::pipe_key(home, cwd)
+}
+
+
 pub fn socket_path(home: &Path) -> PathBuf {
-    home.join("manager.sock")
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\{}", windows_pipe_ident(home)))
+    }
+    #[cfg(not(windows))]
+    {
+        home.join("manager.sock")
+    }
 }
 
 pub fn pid_path(home: &Path) -> PathBuf {
@@ -89,7 +128,12 @@ pub fn write_pid_file(home: &Path, pid: u32) -> io::Result<()> {
 
 /// Remove socket + pid files (stale after a dead manager, or at shutdown).
 pub fn cleanup_stale_files(home: &Path) -> io::Result<()> {
-    for p in [socket_path(home), pid_path(home)] {
+    let mut paths = vec![pid_path(home)];
+    // Named pipes are not filesystem files.
+    if !cfg!(windows) {
+        paths.push(socket_path(home));
+    }
+    for p in paths {
         match fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -117,6 +161,7 @@ pub struct DaemonLockGuard {
 impl DaemonLockGuard {
     /// The lock file's descriptor. An in-place upgrade keeps it open across
     /// the exec, so the lock (it belongs to the open file) is never released.
+    #[cfg(unix)]
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         self._guard.as_raw_fd()
@@ -126,6 +171,7 @@ impl DaemonLockGuard {
 /// Take over the daemon lock from a descriptor inherited across an in-place
 /// upgrade. The lock is already ours; re-locking the same open file is a
 /// no-op that must succeed.
+#[cfg(unix)]
 pub fn adopt_daemon_lock(fd: std::os::fd::OwnedFd) -> io::Result<DaemonLockGuard> {
     let lock: &'static mut fd_lock::RwLock<std::fs::File> =
         Box::leak(Box::new(fd_lock::RwLock::new(std::fs::File::from(fd))));
@@ -152,10 +198,17 @@ fn note_daemon_lock_would_block(attempt: usize) -> io::Result<()> {
     }
     if attempt == 0 {
         if let Some(path) = std::env::var_os("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER") {
-            let mut barrier = std::os::unix::net::UnixStream::connect(path)?;
-            barrier.write_all(b"x")?;
-            let mut resume = [0_u8; 1];
-            barrier.read_exact(&mut resume)?;
+            #[cfg(unix)]
+            {
+                let mut barrier = std::os::unix::net::UnixStream::connect(path)?;
+                barrier.write_all(b"x")?;
+                let mut resume = [0_u8; 1];
+                barrier.read_exact(&mut resume)?;
+            }
+            #[cfg(windows)]
+            {
+                let _ = path;
+            }
         }
     }
     Ok(())
@@ -237,7 +290,11 @@ pub fn daemon_running(home: &Path) -> io::Result<bool> {
 pub fn clean_if_no_daemon(home: &Path) -> io::Result<Option<Vec<PathBuf>>> {
     clean_if_no_daemon_with(home, |home| {
         let mut removed = Vec::new();
-        for p in [socket_path(home), pid_path(home)] {
+        let mut paths = vec![pid_path(home)];
+        if !cfg!(windows) {
+            paths.push(socket_path(home));
+        }
+        for p in paths {
             if p.exists() {
                 fs::remove_file(&p)?;
                 removed.push(p);
@@ -392,6 +449,44 @@ mod tests {
         dir
     }
 
+    /// Same vectors as the extension's `famulusPaths(home, "win32")` test.
+    #[test]
+    fn windows_pipe_ident_vectors() {
+        for (home, hash) in [
+            (r"C:\Users\runneradmin\.pi\agent\pi-famulus", "70d9f71744070b1c"),
+            ("C:/Users/RunnerAdmin/.pi/agent/pi-famulus/", "70d9f71744070b1c"),
+            (r"C:\Users\张三\.pi\agent\pi-famulus", "3d482c281b363211"),
+            (r"D:\", "cb481618f4f646d5"),
+            (r"D:/famulus\\", "44a0c6fb5c0148ee"),
+        ] {
+            assert_eq!(windows_pipe_ident(Path::new(home)), format!("pi-famulus-{hash}"), "{home}");
+        }
+    }
+
+    /// Relative homes and lexical `..` / repeated separators name the same
+    /// pipe as their absolute form, and the same relative home from two
+    /// cwds does not.
+    #[test]
+    fn relative_homes_are_lexical_and_cwd_isolated() {
+        let a = windows_pipe_key(r".famulus", r"C:\work\a");
+        let b = windows_pipe_key(r".famulus", r"C:\work\b");
+        assert_eq!(a, r"c:\work\a\.famulus");
+        assert_ne!(a, b, "two cwds must not share a pipe");
+        assert_eq!(a, windows_pipe_key(r"C:\work\a\.famulus", r"D:\other"));
+        assert_eq!(
+            windows_pipe_key(r"C:\work\a\proj\..\..\..\famulus", r"C:\work\a"),
+            windows_pipe_key(r"C:\famulus", r"D:\unused")
+        );
+        assert_eq!(
+            windows_pipe_key(r"C:\work\\a\.\famulus\", r"C:\other"),
+            windows_pipe_key(r"C:\work\a\famulus", r"D:\unused")
+        );
+        assert_ne!(
+            format!("pi-famulus-{:x}", crate::sys::fnv1a64(a.as_bytes())),
+            format!("pi-famulus-{:x}", crate::sys::fnv1a64(b.as_bytes()))
+        );
+    }
+
     #[test]
     fn home_resolution_priority() {
         // flag wins over everything (§3.1).
@@ -401,9 +496,16 @@ mod tests {
         std::env::set_var("PI_FAMULUS_HOME", "/tmp/pi-famulus-env");
         assert_eq!(resolve_home(None), PathBuf::from("/tmp/pi-famulus-env"));
         std::env::remove_var("PI_FAMULUS_HOME");
-        // default: ~/.pi/agent/pi-famulus
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
-        assert_eq!(resolve_home(None), home.join(".pi/agent/pi-famulus"));
+        // default: ~/.pi/agent/pi-famulus (USERPROFILE on Windows)
+        let home = if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .unwrap()
+        } else {
+            std::env::var_os("HOME").map(PathBuf::from).unwrap()
+        };
+        assert_eq!(resolve_home(None), home.join(".pi").join("agent").join("pi-famulus"));
     }
 
     #[test]
@@ -411,6 +513,7 @@ mod tests {
         let home = temp_home("claim");
         // A live but unrelated pid in manager.pid (pid reuse) does not block.
         write_pid_file(&home, std::process::id()).unwrap();
+        #[cfg(unix)]
         fs::write(socket_path(&home), b"").unwrap();
         let first = match claim_daemon(&home).unwrap() {
             Claim::Acquired(g) => g,
@@ -418,6 +521,7 @@ mod tests {
         };
         // The lock holder removed the stale files.
         assert!(!pid_path(&home).exists());
+        #[cfg(unix)]
         assert!(!socket_path(&home).exists());
         assert!(daemon_running(&home).unwrap());
         // A second claim while the first is held is refused and leaves the

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Tests written to kill cargo-mutants survivors (see manager/TESTING.md,
 //! "Mutation score"). Each asserts a customer-visible behaviour that the
 //! surviving mutant broke without any existing test noticing.

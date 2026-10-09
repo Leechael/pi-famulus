@@ -2,7 +2,19 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, describeManagerSearch, getFamulusHome, famulusPaths, resolveManagerPath } from "../../src/config";
+import {
+  DEFAULT_CONFIG,
+  MANAGER_FILE_NAME,
+  describeManagerSearch,
+  getFamulusHome,
+  famulusPaths,
+  resolveManagerPath,
+  windowsHomeKey,
+  windowsPipeName,
+} from "../../src/config";
+
+// Windows has no execute bit: X_OK only checks existence there.
+const itPosix = it.skipIf(process.platform === "win32");
 
 describe("degraded-startup manager search description", () => {
   it("names every place looked and flags configured paths that do not exist", () => {
@@ -13,7 +25,7 @@ describe("degraded-startup manager search description", () => {
     );
     expect(text).toContain("config managerPath /nope/pi-famulus (missing, ignored)");
     expect(text).toContain("PI_FAMULUS_MANAGER_PATH /also/missing (missing, ignored)");
-    expect(text).toContain("/home/u/.pi/agent/pi-famulus/bin/pi-famulus");
+    expect(text).toContain(join("/home/u/.pi/agent/pi-famulus", "bin", MANAGER_FILE_NAME));
     expect(text).toContain("pi-famulus on PATH");
   });
 });
@@ -30,7 +42,7 @@ describe("Famulus home and binary lookup", () => {
     expect(getFamulusHome({})).toBe(expected);
     expect(getFamulusHome({ PI_FAMULUS_HOME: "   " })).toBe(expected);
     expect(getFamulusHome({ PI_FAMULUS_HOME: "/custom/famulus" })).toBe("/custom/famulus");
-    expect(famulusPaths(expected)).toMatchObject({
+    expect(famulusPaths(expected, "linux")).toMatchObject({
       socket: join(expected, "manager.sock"),
       pidFile: join(expected, "manager.pid"),
       spawnLock: join(expected, "manager.spawn.lock"),
@@ -38,12 +50,37 @@ describe("Famulus home and binary lookup", () => {
     });
   });
 
+  // Same vectors as `lifecycle::tests::windows_pipe_ident_vectors` in the
+  // manager: both sides must name the same pipe for one home, however it is
+  // spelled, including non-ASCII user names.
+  it.each([
+    ["C:\\Users\\runneradmin\\.pi\\agent\\pi-famulus", "70d9f71744070b1c"],
+    ["C:/Users/RunnerAdmin/.pi/agent/pi-famulus/", "70d9f71744070b1c"],
+    ["C:\\Users\\张三\\.pi\\agent\\pi-famulus", "3d482c281b363211"],
+    ["D:\\", "cb481618f4f646d5"],
+    ["D:/famulus\\\\", "44a0c6fb5c0148ee"],
+  ])("names the Windows pipe of %s like the manager does", (home, hash) => {
+    expect(famulusPaths(home, "win32").socket).toBe(`\\\\.\\pipe\\pi-famulus-${hash}`);
+  });
+
+  it("resolves relative homes lexically and isolates cwds", () => {
+    const a = windowsHomeKey(".famulus", "C:\\work\\a");
+    const b = windowsHomeKey(".famulus", "C:\\work\\b");
+    expect(a).toBe("c:\\work\\a\\.famulus");
+    expect(b).not.toBe(a);
+    expect(a).toBe(windowsHomeKey("C:\\work\\a\\.famulus", "D:\\other"));
+    expect(windowsHomeKey("C:\\work\\a\\proj\\..\\..\\..\\famulus", "C:\\work\\a")).toBe("c:\\famulus");
+    expect(windowsHomeKey("C:\\work\\\\a\\.\\famulus\\", "C:\\other")).toBe("c:\\work\\a\\famulus");
+    expect(windowsPipeName(".famulus", "C:\\work\\a")).not.toBe(windowsPipeName(".famulus", "C:\\work\\b"));
+    expect(windowsPipeName(".famulus", "C:\\work\\a")).toBe(windowsPipeName("C:\\work\\a\\.famulus", "D:\\other"));
+  });
+
   it("looks up pi-famulus in config, env, home/bin, then executable PATH order", () => {
     root = mkdtempSync(join(tmpdir(), "pi-famulus-search-"));
     const home = join(root, "home");
     const pathDir = join(root, "path");
-    const bundled = join(home, "bin", "pi-famulus");
-    const onPath = join(pathDir, "pi-famulus");
+    const bundled = join(home, "bin", MANAGER_FILE_NAME);
+    const onPath = join(pathDir, MANAGER_FILE_NAME);
     const envBinary = join(root, "env-binary");
     const configured = join(root, "configured-binary");
     mkdirSync(join(home, "bin"), { recursive: true });
@@ -58,16 +95,17 @@ describe("Famulus home and binary lookup", () => {
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { ...env, PI_FAMULUS_MANAGER_PATH: "/missing" })).toBe(bundled);
     rmSync(bundled);
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { PATH: pathDir })).toBe(onPath);
+    if (process.platform === "win32") return;
     chmodSync(onPath, 0o644);
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { PATH: pathDir })).toBeNull();
   });
 
-  it("skips a stale non-executable home/bin candidate in favor of executable PATH", () => {
+  itPosix("skips a stale non-executable home/bin candidate in favor of executable PATH", () => {
     root = mkdtempSync(join(tmpdir(), "pi-famulus-search-"));
     const home = join(root, "home");
     const pathDir = join(root, "path");
-    const bundled = join(home, "bin", "pi-famulus");
-    const onPath = join(pathDir, "pi-famulus");
+    const bundled = join(home, "bin", MANAGER_FILE_NAME);
+    const onPath = join(pathDir, MANAGER_FILE_NAME);
     mkdirSync(join(home, "bin"), { recursive: true });
     mkdirSync(pathDir);
     writeFileSync(bundled, "");
@@ -83,10 +121,10 @@ describe("Famulus home and binary lookup", () => {
     expect(resolveManagerPath(DEFAULT_CONFIG, home, { PATH: pathDir })).toBeNull();
   });
 
-  it.each(["config", "env"])("skips a non-executable %s candidate", (source) => {
+  itPosix.each(["config", "env"])("skips a non-executable %s candidate", (source) => {
     root = mkdtempSync(join(tmpdir(), "pi-famulus-search-"));
     const candidate = join(root, "stale-binary");
-    const onPath = join(root, "pi-famulus");
+    const onPath = join(root, MANAGER_FILE_NAME);
     writeFileSync(candidate, "");
     chmodSync(candidate, 0o644);
     writeFileSync(onPath, "");
@@ -104,12 +142,12 @@ describe("Famulus home and binary lookup", () => {
     const pathDir = join(root, "path");
     const fallbackDir = join(root, "fallback");
     const candidate = source === "home/bin"
-      ? join(home, "bin", "pi-famulus")
-      : source === "PATH" ? join(pathDir, "pi-famulus") : join(root, "candidate");
+      ? join(home, "bin", MANAGER_FILE_NAME)
+      : source === "PATH" ? join(pathDir, MANAGER_FILE_NAME) : join(root, "candidate");
     mkdirSync(candidate, { recursive: true });
     chmodSync(candidate, 0o755);
     mkdirSync(fallbackDir);
-    const fallback = join(fallbackDir, "pi-famulus");
+    const fallback = join(fallbackDir, MANAGER_FILE_NAME);
     writeFileSync(fallback, "");
     chmodSync(fallback, 0o755);
     const config = { ...DEFAULT_CONFIG, managerPath: source === "config" ? candidate : null };

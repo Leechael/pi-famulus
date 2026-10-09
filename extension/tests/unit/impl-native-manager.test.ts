@@ -12,11 +12,12 @@ describe("npm native manager selection", () => {
     ["linux", "arm64", "pi-famulus-linux-arm64"],
     ["darwin", "x64", "pi-famulus-darwin-x64"],
     ["darwin", "arm64", "pi-famulus-darwin-arm64"],
+    ["win32", "x64", "pi-famulus-win32-x64"],
   ])("selects %s/%s", (platform, arch, name) => {
     expect(nativePackageName(platform, arch)).toBe(name);
   });
 
-  it.each([["win32", "x64"], ["linux", "ia32"], ["freebsd", "arm64"]])(
+  it.each([["linux", "ia32"], ["freebsd", "arm64"], ["win32", "arm64"]])(
     "does not invent an unsupported %s/%s package", (platform, arch) => {
       expect(nativePackageName(platform, arch)).toBeNull();
       expect(resolveNativeManagerPath({ platform, arch })).toBeNull();
@@ -50,7 +51,8 @@ describe("installed native manager", () => {
     expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBe(binary);
   });
 
-  it("rejects a non-executable native file rather than shadowing a working manual binary", () => {
+  // Windows has no execute bit to clear.
+  it.skipIf(process.platform === "win32")("rejects a non-executable native file rather than shadowing a working manual binary", () => {
     const { binary, resolve } = installed();
     chmodSync(binary, 0o644);
     expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();

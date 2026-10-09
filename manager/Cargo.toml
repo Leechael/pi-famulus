@@ -13,7 +13,33 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 interprocess = { version = "2", features = ["tokio"] }
 fd-lock = "4"
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
+
+# Portable black-box suite and resource benchmark. Each binary is also its
+# own task program (`taskkit`), so they bring their own `main`.
+[[test]]
+name = "platform"
+harness = false
+
+[[test]]
+name = "resource_bench"
+harness = false
 
 [features]
 # Test-only: the daemon's own timers (idle grace, SIGKILL escalation,

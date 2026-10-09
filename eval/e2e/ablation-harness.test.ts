@@ -9,6 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { compileTextSegments, loadManifest } from "../ablation/manifest.ts";
@@ -104,7 +105,7 @@ describe("ablation harness", { concurrency: true }, () => {
   });
 
   it("everything ablated: nothing left, every removal audited, wakes still delivered", async () => {
-    const dir = mkdtempSync("/tmp/pi-famulus-eval-audit-");
+    const dir = mkdtempSync(join(tmpdir(), "pi-famulus-eval-audit-"));
     tempDirs.push(dir);
     const logPath = join(dir, "ablation.jsonl");
     const ep = await exercise({ PI_FAMULUS_ABLATE: ablateAll, PI_FAMULUS_ABLATION_LOG: logPath });

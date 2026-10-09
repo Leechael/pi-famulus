@@ -6,7 +6,7 @@
  */
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, win32 } from "node:path";
 import { nativePackageName, resolveNativeManagerPath } from "./native-manager.js";
 
 export interface FamulusConfig {
@@ -141,11 +141,43 @@ export function getFamulusHome(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".pi", "agent", "pi-famulus");
 }
 
+/** FNV-1a 64-bit over UTF-8 bytes — must match manager `sys::fnv1a64`. */
+export function fnv1a64(input: string): string {
+  let h = 0xcbf29ce484222325n;
+  for (const byte of Buffer.from(input, "utf8")) {
+    h ^= BigInt(byte);
+    h = (h * 0x0100000001b3n) & 0xffffffffffffffffn;
+  }
+  return h.toString(16);
+}
+
+/**
+ * Named-pipe identity of a home — must match manager `lifecycle::windows_pipe_ident`.
+ * The home is made absolute lexically (`path.win32.resolve` against `cwd`):
+ * `.` / `..` and repeated separators collapse, symlinks and junctions are
+ * not expanded. One spelling per directory (backslashes, no trailing
+ * separator except a drive root, lower case). The same relative home from
+ * two working directories must not share a pipe.
+ */
+export function windowsHomeKey(home: string, cwd: string = process.cwd()): string {
+  let s = win32.resolve(cwd, home);
+  while (s.length > 3 && s.endsWith("\\")) s = s.slice(0, -1);
+  return s.toLowerCase();
+}
+
+export function windowsPipeName(home: string, cwd: string = process.cwd()): string {
+  return `\\\\.\\pipe\\pi-famulus-${fnv1a64(windowsHomeKey(home, cwd))}`;
+}
+
 /** Well-known paths inside the pi-famulus home directory (design doc §3.1). */
-export function famulusPaths(home: string) {
+export function famulusPaths(home: string, platform: NodeJS.Platform = process.platform) {
+  const socket =
+    platform === "win32"
+      ? windowsPipeName(home)
+      : join(home, "manager.sock");
   return {
     home,
-    socket: join(home, "manager.sock"),
+    socket,
     pidFile: join(home, "manager.pid"),
     spawnLock: join(home, "manager.spawn.lock"),
     log: join(home, "manager.log"),
@@ -225,6 +257,9 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
   return config;
 }
 
+/** File name of the manager in <home>/bin and on PATH: Windows only starts `.exe` images. */
+export const MANAGER_FILE_NAME = process.platform === "win32" ? "pi-famulus.exe" : "pi-famulus";
+
 /** Return why a candidate is unusable, or null for an executable regular file. */
 function managerCandidateProblem(path: string): string | null {
   try {
@@ -260,14 +295,15 @@ export function describeManagerSearch(
   tried.push(nativeName
     ? `npm ${nativeName}${native ? ` ${native}` : " (missing or unusable, ignored)"}`
     : `npm native manager (unsupported ${process.platform}/${process.arch})`);
-  tried.push(describeCandidate(join(home, "bin", "pi-famulus")));
+  tried.push(describeCandidate(join(home, "bin", MANAGER_FILE_NAME)));
   tried.push("pi-famulus on PATH");
   return tried.join("; ");
 }
 
 /**
  * Resolve an executable regular pi-famulus binary, or null if none is usable.
- * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > npm native package > <home>/bin/pi-famulus > PATH.
+ * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > npm native package > <home>/bin/pi-famulus > PATH
+ * (`pi-famulus.exe` on Windows).
  */
 export function resolveManagerPath(
   config: FamulusConfig,
@@ -279,11 +315,11 @@ export function resolveManagerPath(
   if (envPath && managerCandidateProblem(envPath) === null) return envPath;
   const native = resolveNativeManagerPath();
   if (native) return native;
-  const bundled = join(home, "bin", "pi-famulus");
+  const bundled = join(home, "bin", MANAGER_FILE_NAME);
   if (managerCandidateProblem(bundled) === null) return bundled;
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const candidate = join(dir, "pi-famulus");
+    const candidate = join(dir, MANAGER_FILE_NAME);
     if (managerCandidateProblem(candidate) === null) return candidate;
   }
   return null;

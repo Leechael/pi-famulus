@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
@@ -88,7 +89,7 @@ describe("tasks view", () => {
 
   it("uses the manager task output path for a live monitor before exit", () => {
     expect(resolveTaskOutputPath(item("mon_1", "running"), "/home/pi-famulus", "sess-a"))
-      .toBe("/home/pi-famulus/sessions/sess-a/tasks/mon_1.output");
+      .toBe(join("/home/pi-famulus", "sessions", "sess-a", "tasks", "mon_1.output"));
   });
 
   it("puts task identity, outcome, duration, cwd, command, and info in the detail panes", () => {

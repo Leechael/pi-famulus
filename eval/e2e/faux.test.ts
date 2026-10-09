@@ -249,7 +249,8 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.ok(await waitPidGone(runnerPid), `runner pid ${runnerPid} still alive 10s after the manager crash\n${explain(ep)}`);
   });
 
-  it("(e3) an in-place manager upgrade is invisible to a running command and monitor", async () => {
+  // Windows has no in-place upgrade (the manager refuses it; manager/tests/platform.rs u1).
+  it("(e3) an in-place manager upgrade is invisible to a running command and monitor", { skip: process.platform === "win32" }, async () => {
     let upgradeOut = "";
     let before: { pid?: number } = {};
     const ep = await runFaux({

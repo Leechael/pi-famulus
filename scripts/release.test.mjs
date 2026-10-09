@@ -6,12 +6,15 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './validate-release.mjs';
-import { prepareNative } from './prepare-native.mjs';
+import { npmSync, prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
 import { bumpRelease } from './bump-release.mjs';
 
 const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
+// Git's Windows checkout may use CRLF. Workflow syntax assertions should
+// inspect the same logical text on every host, not the checkout line endings.
+const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 function fixture(t, fixtureVersion = version) {
   const root = mkdtempSync(join(tmpdir(), 'famulus-release-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -24,18 +27,20 @@ function fixture(t, fixtureVersion = version) {
   put('extension/bin/pi-famulus.js', '#!/usr/bin/env node\nconsole.log("pi-famulus");');
   put('extension/README.md', 'Test package');
   put('manager/Cargo.toml', `[package]\nname = "pi-famulus"\nversion = "${fixtureVersion}"\n`);
-  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version: fixtureVersion, main: './bin/pi-famulus', exports: { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, files: ['bin/pi-famulus'], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
+  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version: fixtureVersion, main: `./${p.binary}`, exports: { './package.json': './package.json', './bin/pi-famulus': `./${p.binary}` }, files: [p.binary], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
   return { root, put };
 }
 function packAll(t, fixtureVersion = version) {
   const f = fixture(t, fixtureVersion);
   for (const p of PLATFORMS) {
-    const binary = join(f.root, 'manager', 'target', p.target, 'release', 'pi-famulus');
-    f.put(binary.slice(f.root.length + 1), `#!/bin/sh\necho pi-famulus ${fixtureVersion}+fixture\n`);
-    chmodSync(binary, 0o755);
-    prepareNative(f.root, p.id, join(f.root, 'dist'));
+    // Artifact validation needs bytes, not runnable cross-platform binaries.
+    // Stage directly instead of executing a shell script disguised as .exe.
+    f.put(`${p.directory}/${p.binary}`, `native fixture ${p.id} ${fixtureVersion}\n`);
+    chmodSync(join(f.root, p.directory, p.binary), 0o755);
+    mkdirSync(join(f.root, 'dist'), { recursive: true });
+    npmSync(['pack', '--json', '--pack-destination', join(f.root, 'dist')], { cwd: join(f.root, p.directory), stdio: 'pipe' });
   }
-  execFileSync('npm', ['pack', '--json', '--pack-destination', join(f.root, 'dist')], { cwd: join(f.root, 'extension'), stdio: 'pipe' });
+  npmSync(['pack', '--json', '--pack-destination', join(f.root, 'dist')], { cwd: join(f.root, 'extension'), stdio: 'pipe' });
   return f;
 }
 const response = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body });
@@ -93,7 +98,7 @@ test('bump-release writes every versioned manifest including prerelease', t => {
 });
 
 test('publication guards cannot be satisfied by comments or other jobs', () => {
-  const publish = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+  const publish = workflow('publish');
   assertPublishingAuthority(publish);
   assert.throws(() => assertPublishingAuthority(publish.replace('  queue: max', '  # queue: max')), /release queue/);
   assert.throws(() => assertPublishingAuthority(publish.replace("    if: github.ref == 'refs/heads/main'", "    # if: github.ref == 'refs/heads/main'")), /validate job/);
@@ -108,7 +113,7 @@ function assertExtensionSourceInstall(ci) {
 }
 
 test('extension source install guard cannot be satisfied by other jobs', () => {
-  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const ci = workflow('ci');
   assertExtensionSourceInstall(ci);
   const missingSourceInstall = ci.replace('      - run: npm ci\n      - run: npx tsc --noEmit\n', '      - run: npx tsc --noEmit\n');
   assert.ok(missingSourceInstall.includes('- run: npm ci\n'), 'other jobs still install dependencies');
@@ -143,11 +148,11 @@ test('native files whitelist cannot ship an entire bin directory', t => {
 test('actual checkout and CLI accept the renamed GitHub repository and reject the old identity', () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const cli = fileURLToPath(new URL('./validate-release.mjs', import.meta.url));
-  assert.equal(validateMetadata(root, { repository: 'Leechael/pi-famulus' }).length, 5);
+  assert.equal(validateMetadata(root, { repository: 'Leechael/pi-famulus' }).length, PLATFORMS.length + 1);
   const output = execFileSync(process.execPath, [cli], {
     cwd: root, encoding: 'utf8', env: { ...process.env, GITHUB_REPOSITORY: 'Leechael/pi-famulus' }, stdio: 'pipe',
   });
-  assert.match(output, /Validated all five packages/);
+  assert.match(output, /Validated all \d+ packages/);
   assert.throws(() => validateMetadata(root, { repository: 'Leechael/pi-better-subagents' }), /canonical GitHub repository/);
   assert.throws(() => execFileSync(process.execPath, [cli], {
     cwd: root, encoding: 'utf8', env: { ...process.env, GITHUB_REPOSITORY: 'Leechael/pi-better-subagents' }, stdio: 'pipe',
@@ -166,10 +171,10 @@ test('release checkout paths with spaces and percent signs run the actual CLI re
   assert.match(output, /actual checkout and CLI accept the renamed GitHub repository/);
 });
 
-test('all five packed packages include the approved MIT license', t => {
+test('all packed packages include the approved MIT license', t => {
   const source = fileURLToPath(new URL('../', import.meta.url));
   const license = readFileSync(join(source, 'LICENSE'), 'utf8');
-  assert.match(license, /^MIT License\n/);
+  assert.match(license, /^MIT License\r?\n/);
   const { root, put } = fixture(t);
   const destination = join(root, 'licensed-packs');
   mkdirSync(destination);
@@ -180,18 +185,18 @@ test('all five packed packages include the approved MIT license', t => {
     put(`${p.directory}/package.json`, p.metadata);
     put(`${p.directory}/LICENSE`, packageLicense);
     if (p.os) {
-      put(`${p.directory}/bin/pi-famulus`, '#!/bin/sh\necho license-pack-fixture\n');
-      chmodSync(join(root, p.directory, 'bin/pi-famulus'), 0o755);
+      put(`${p.directory}/${p.binary}`, '#!/bin/sh\necho license-pack-fixture\n');
+      chmodSync(join(root, p.directory, p.binary), 0o755);
     }
-    const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8', stdio: 'pipe' }));
+    const [pack] = JSON.parse(npmSync(['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8', stdio: 'pipe' }));
     const packedLicense = execFileSync('tar', ['-xOzf', join(destination, pack.filename), 'package/LICENSE'], { encoding: 'utf8', stdio: 'pipe' });
     assert.equal(packedLicense, license, `license included despite files whitelist: ${p.name}`);
   }
 });
 
-test('release versions, literal repository and all four metadata contracts', t => {
+test('release versions, literal repository and metadata contracts', t => {
   const { root, put } = fixture(t);
-  assert.equal(validateMetadata(root, { tag: 'v0.1.0', repository }).length, 5);
+  assert.equal(validateMetadata(root, { tag: 'v0.1.0', repository }).length, PLATFORMS.length + 1);
   for (const bad of ['v01.1.0', '0.1.0', 'v1.2.3;echo pwn', 'v1.2.3\n', 'v1.2.3-beta', 'v1.2.3-nightly', 'v1.2.3-rc.1']) assert.throws(() => validateTag(bad));
   assert.equal(validateTag('v1.2.3-beta.0'), '1.2.3-beta.0');
   assert.equal(validateTag('v1.2.3-nightly.20261006'), '1.2.3-nightly.20261006');
@@ -235,7 +240,9 @@ test('tag must be the checked-out commit and an ancestor of main (real git)', t 
   assert.throws(() => validateGitTag(root, 'v0.2.0'), /origin\/main.*missing|fetch.*origin\/main/);
 });
 
-test('prepare fails for missing/nonexecutable/wrong-version binary; real npm tarball contains binary', t => {
+// These two tests exercise Unix executable bits/inodes with real sh fixtures.
+// Windows prepareNative is exercised with the real PE binary in native CI.
+test('prepare fails for missing/nonexecutable/wrong-version binary; real npm tarball contains binary', { skip: process.platform === 'win32' }, t => {
   const { root, put } = fixture(t);
   const p = PLATFORMS[0];
   const path = `manager/target/${p.target}/release/pi-famulus`;
@@ -249,7 +256,7 @@ test('prepare fails for missing/nonexecutable/wrong-version binary; real npm tar
   assert.match(execFileSync('tar', ['-tzf', artifact], { encoding: 'utf8' }), /package\/bin\/pi-famulus/);
 });
 
-test('re-preparing a native package atomically replaces its executable inode', t => {
+test('re-preparing a native package atomically replaces its executable inode', { skip: process.platform === 'win32' }, t => {
   const { root, put } = fixture(t);
   const p = PLATFORMS[0];
   const source = `manager/target/${p.target}/release/pi-famulus`;
@@ -268,13 +275,15 @@ test('dry run uses all real packed candidates, natives first/root last, and neve
   const { root } = packAll(t);
   const calls = [];
   await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', repository, dryRun: true, fetchImpl: () => { throw Error('network forbidden'); }, run: (...args) => calls.push(args) });
-  assert.equal(calls.length, 5);
-  assert.match(calls.at(-1)[1][1], /pi-famulus-0.1.0.tgz$/);
-  for (const [, args] of calls) {
+  assert.equal(calls.length, PLATFORMS.length + 1);
+  const lastArgs = calls.at(-1)[1];
+  assert.match(lastArgs[lastArgs.indexOf('publish') + 1], /pi-famulus-0.1.0.tgz$/);
+  for (const [, args, options] of calls) {
     assert.ok(args.includes('--dry-run'));
     assert.ok(args.includes('--provenance'));
     assert.ok(args.includes('--access'));
     assert.equal(args[args.indexOf('--tag') + 1], 'latest');
+    assert.equal(options.shell, false);
   }
 });
 
@@ -300,8 +309,9 @@ test('partial retry skips only byte-identical integrity; mismatch/network errors
   const integrity = createHash('sha512').update(readFileSync(join(root, 'dist', 'pi-famulus-linux-x64-0.1.0.tgz'))).digest('base64');
   const fetchImpl = async url => url.endsWith('/0.1.0') ? (url.includes('linux-x64') ? response(200, { dist: { integrity: `sha512-${integrity}` } }) : response(404, {})) : response(200, {});
   await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl, run: (...args) => calls.push(args) });
-  assert.equal(calls.length, 4);
-  assert.match(calls.at(-1)[1][1], /pi-famulus-0.1.0.tgz$/);
+  assert.equal(calls.length, PLATFORMS.length);
+  const lastArgs = calls.at(-1)[1];
+  assert.match(lastArgs[lastArgs.indexOf('publish') + 1], /pi-famulus-0.1.0.tgz$/);
   await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl: async () => response(200, { dist: { integrity: 'sha512-other' } }), run: () => assert.fail('publish') }), /integrity/);
   await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl: async () => response(503, {}), run: () => assert.fail('publish') }), /503/);
 });
@@ -317,7 +327,7 @@ test('tampered metadata and omitted native binary in real tarballs fail closed',
   const { root, put } = packAll(t);
   const directory = 'npm/linux-x64';
   const pkg = JSON.parse(readFileSync(join(root, directory, 'package.json')));
-  const repack = () => execFileSync('npm', ['pack', '--json', '--pack-destination', join(root, 'dist')], { cwd: join(root, directory), stdio: 'pipe' });
+  const repack = () => npmSync(['pack', '--json', '--pack-destination', join(root, 'dist')], { cwd: join(root, directory), stdio: 'pipe' });
   const opts = { tag: 'v0.1.0', dryRun: true, run: () => assert.fail('publish') };
   put(`${directory}/package.json`, { ...pkg, main: './tampered' });
   repack();
@@ -328,7 +338,7 @@ test('tampered metadata and omitted native binary in real tarballs fail closed',
   await assert.rejects(publishPackages(root, join(root, 'dist'), opts), /package\/bin\/pi-famulus/);
 });
 
-test('real npm publish dry-run validates all five packed artifacts without publication', async t => {
+test('real npm publish dry-run validates all packed artifacts without publication', async t => {
   // npm rejects dry-run republication of versions that already exist on the
   // registry, so the real-registry smoke test must pack a version below the
   // first real release that can never be published.
@@ -342,12 +352,45 @@ test('real npm publish dry-run validates all five packed artifacts without publi
   } });
 });
 
-test('workflow literal security, release graph and four host/target contracts', () => {
-  const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8');
+test('e2e redirects temp only on Windows so failure artifact paths match', () => {
+  const ci = workflow('ci');
+  const steps = ci.split(/(?=^      - )/m).filter(step => /^      - run: npm run test:e2e$/m.test(step));
+  assert.equal(steps.length, 2, 'separate Windows and Unix e2e steps');
+  const unix = steps.find(step => step.includes("if: runner.os != 'Windows'"));
+  const windows = steps.find(step => step.includes("if: runner.os == 'Windows'"));
+  assert.ok(unix && windows);
+  assert.doesNotMatch(unix, /TEMP:|TMP:/, 'Unix must retain its ordinary temp directory');
+  assert.match(windows, /TEMP: \$\{\{ runner.temp \}\}/);
+  assert.match(windows, /TMP: \$\{\{ runner.temp \}\}/);
+});
+
+test('Windows dependency guard rejects VC and Universal CRT imports', () => {
   const native = workflow('native-packages');
-  for (const p of PLATFORMS) { assert.ok(native.includes(`platform: ${p.id}`)); assert.ok(native.includes(`target: ${p.target}`)); }
-  for (const runner of ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15']) assert.ok(native.includes(`runner: ${runner}\n`));
+  const pattern = native.match(/if \(\$imports -match '([^']+)'\)/)?.[1];
+  assert.ok(pattern, 'release workflow must inspect DLL dependencies');
+  const forbidden = new RegExp(pattern.replace('(?i)', ''), 'i');
+  for (const dll of ['VCRUNTIME140.dll', 'vcruntime140_1.dll', 'MSVCP140.dll', 'MSVCR120.dll', 'CONCRT140.dll', 'ucrtbase.dll', 'api-ms-win-crt-runtime-l1-1-0.dll', 'api-ms-win-crt-stdio-l1-1-0.dll']) {
+    assert.match(`    ${dll}`, forbidden, dll);
+  }
+  for (const dll of ['KERNEL32.dll', 'ntdll.dll', 'WS2_32.dll', 'api-ms-win-core-synch-l1-2-0.dll']) {
+    assert.doesNotMatch(`    ${dll}`, forbidden, dll);
+  }
+});
+
+test('workflow literal security, release graph and host/target contracts', () => {
+  const native = workflow('native-packages');
+  for (const p of PLATFORMS) {
+    assert.ok(native.includes(`platform: ${p.id}`), p.id);
+    assert.ok(native.includes(`target: ${p.target}`), p.target);
+  }
+  for (const runner of ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15', 'windows-latest']) {
+    assert.ok(native.includes(`runner: ${runner}\n`), runner);
+  }
   assert.ok(native.includes('cargo test --locked\n'));
+  const windowsCrt = readFileSync(new URL('../manager/.cargo/config.toml', import.meta.url), 'utf8');
+  assert.match(windowsCrt, /\[target\.x86_64-pc-windows-msvc\]\s*rustflags = \["-C", "target-feature=\+crt-static"\]/);
+  assert.ok(native.includes('$imports = & $dumpbin /dependents "manager/target/$env:TARGET/release/pi-famulus.exe"'));
+  assert.ok(native.includes("throw 'Release binary must statically link the VC runtime'"));
   assert.ok(native.includes('cargo test --locked --features test-clock'));
   assert.ok(native.includes('resolveManagerPath(DEFAULT_CONFIG'));
   assert.ok(native.includes("packages['node_modules/@earendil-works/pi-coding-agent'].version"));
@@ -357,7 +400,7 @@ test('workflow literal security, release graph and four host/target contracts', 
   assert.ok(!ci.includes('npm ci --omit=optional'), 'source installs must retain TypeScript/Rollup native optional bindings');
   assertExtensionSourceInstall(ci);
   assert.ok(ci.includes('npm run test:graders'));
-  assert.ok(ci.includes('/tmp/eval-*'));
+  assert.ok(ci.includes("${{ runner.os == 'Windows' && runner.temp || '/tmp' }}/eval-*/h/manager.log"));
   const publish = workflow('publish');
   assert.ok(publish.includes('needs: [validate, tests]'));
   assert.ok(publish.includes('uses: ./.github/workflows/ci.yml'));

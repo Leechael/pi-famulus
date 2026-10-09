@@ -8,6 +8,7 @@ extension/dist/
 
 # Generated npm release artifacts (metadata is tracked; native executables are not)
 npm/*/bin/pi-famulus
+npm/*/bin/pi-famulus.exe
 /dist/
 
 # OS / editor

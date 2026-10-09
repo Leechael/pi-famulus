@@ -13,9 +13,7 @@ use crate::lifecycle;
 use crate::outln;
 use crate::proto::*;
 use crate::task;
-use interprocess::local_socket::tokio::prelude::*; // trait for Stream::connect
 use interprocess::local_socket::tokio::Stream;
-use interprocess::local_socket::{GenericFilePath, ToFsName};
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -172,11 +170,7 @@ async fn reconnect(home: &Path) -> Result<Conn, String> {
 /// Connect to a running daemon and say hello; never spawns one.
 pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
     let sock = lifecycle::socket_path(home);
-    let name = sock
-        .as_os_str()
-        .to_fs_name::<GenericFilePath>()
-        .map_err(|e| format!("bad socket path: {e}"))?;
-    let stream = Stream::connect(name)
+    let stream = crate::ipc::connect(home)
         .await
         .map_err(|e| format!("connect {}: {e}", sock.display()))?;
     let (rd, wr) = tokio::io::split(stream);
@@ -239,11 +233,8 @@ const SPAWN_SOCKET_WAIT: Duration = Duration::from_secs(30);
 async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        let sock = lifecycle::socket_path(home);
-        if let Ok(name) = sock.as_os_str().to_fs_name::<GenericFilePath>() {
-            if Stream::connect(name).await.is_ok() {
-                return true;
-            }
+        if crate::ipc::connect(home).await.is_ok() {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -270,8 +261,13 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
-    crate::sys::apply_new_session_std(&mut cmd);
-    cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
+    #[cfg(windows)]
+    crate::sys::spawn_detached_std(&mut cmd).map_err(|e| format!("spawn daemon: {e}"))?;
+    #[cfg(unix)]
+    {
+        crate::sys::apply_new_session_std(&mut cmd);
+        cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
+    }
     Ok(())
 }
 
@@ -841,6 +837,7 @@ impl Report {
 }
 
 /// Longest unix socket path the platform accepts (sun_path minus NUL).
+#[cfg(unix)]
 const MAX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
 /// Sessions dir size that deserves a warning (events.jsonl has no rotation).
 const SESSIONS_WARN_BYTES: u64 = 100 * 1024 * 1024;
@@ -871,12 +868,16 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     }
     r.ok("home", "exists");
 
+    #[cfg(unix)]
     let sock_len = lifecycle::socket_path(home).as_os_str().len();
+    #[cfg(unix)]
     if sock_len > MAX_SOCKET_PATH {
         r.fail("socket path", format!("{sock_len} bytes, longer than the {MAX_SOCKET_PATH}-byte unix socket limit; use a shorter home"));
     } else {
         r.ok("socket path", format!("{sock_len} bytes"));
     }
+    #[cfg(windows)]
+    r.ok("named pipe", lifecycle::windows_pipe_ident(home));
 
     // config.json (optional) and the manager path it or the env configures.
     let cfg_path = home.join("config.json");
@@ -1008,7 +1009,9 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::{cut_utf8, humanize_log_line, resolve_task_id, same_file_by_path};
+    use super::{cut_utf8, humanize_log_line, resolve_task_id};
+    #[cfg(unix)]
+    use super::same_file_by_path;
 
     #[test]
     fn exact_and_typo_prefix() {
@@ -1039,6 +1042,7 @@ mod resolve_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn same_file_by_path_follows_symlinks() {
         let dir = std::env::temp_dir().join(format!("pi-famulus-same-file-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

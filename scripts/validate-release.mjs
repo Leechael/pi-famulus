@@ -5,12 +5,19 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 export const REPOSITORY = 'Leechael/pi-famulus';
+// win32-arm64 is not required: CI does not build it, and publish.yml only
+// downloads artifacts from its own run. Add it back with a producer.
 export const PLATFORMS = [
   ['linux', 'x64', 'x86_64-unknown-linux-musl'],
   ['linux', 'arm64', 'aarch64-unknown-linux-musl'],
   ['darwin', 'x64', 'x86_64-apple-darwin'],
   ['darwin', 'arm64', 'aarch64-apple-darwin'],
-].map(([os, arch, target]) => ({ os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}` }));
+  ['win32', 'x64', 'x86_64-pc-windows-msvc'],
+].map(([os, arch, target]) => ({
+  os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}`,
+  // CreateProcess needs an explicit extension for lpApplicationName; this package ships `.exe`.
+  binary: os === 'win32' ? 'bin/pi-famulus.exe' : 'bin/pi-famulus',
+}));
 
 function isUtcCalendarDay(yyyymmdd) {
   const y = Number(yyyymmdd.slice(0, 4));
@@ -43,11 +50,12 @@ export function validateMetadata(root, { tag, repository = REPOSITORY } = {}) {
     assert.equal(m.repository?.directory, p.directory, `repository directory: ${p.name}`);
     for (const hook of ['preinstall', 'install', 'postinstall']) assert.ok(!m.scripts?.[hook], `install hook forbidden: ${p.name}`);
     if (p.os) {
-      assert.equal(m.main, './bin/pi-famulus', `native main: ${p.name}`);
-      assert.deepEqual(m.exports, { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, `native exports: ${p.name}`);
+      // `./bin/pi-famulus` is the OS-agnostic subpath resolvers ask for.
+      assert.equal(m.main, `./${p.binary}`, `native main: ${p.name}`);
+      assert.deepEqual(m.exports, { './package.json': './package.json', './bin/pi-famulus': `./${p.binary}` }, `native exports: ${p.name}`);
       assert.deepEqual(m.os, [p.os], `native os: ${p.name}`);
       assert.deepEqual(m.cpu, [p.arch], `native cpu: ${p.name}`);
-      assert.ok(Array.isArray(m.files) && m.files.includes('bin/pi-famulus') && m.files.every(f => ['bin/pi-famulus', 'README.md'].includes(f)), `native files must whitelist binary and optional README: ${p.name}`);
+      assert.ok(Array.isArray(m.files) && m.files.includes(p.binary) && m.files.every(f => [p.binary, 'README.md'].includes(f)), `native files must whitelist binary and optional README: ${p.name}`);
       for (const key of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) assert.equal(Object.keys(m[key] ?? {}).length, 0, `native dependencies forbidden: ${p.name}`);
     }
   }
@@ -80,7 +88,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const args = process.argv.slice(2);
     assert.ok(args.length === 0 || (args.length === 2 && args[0] === '--tag'), 'usage: validate-release.mjs [--tag vX.Y.Z]');
     const tag = args[1];
-    validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
-    console.log(`Validated all five packages${tag ? ` for ${tag}` : ''}`);
+    const packages = validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
+    if (tag !== undefined) validateGitTag(process.cwd(), tag);
+    console.log(`Validated all ${packages.length} packages${tag ? ` for ${tag}` : ''}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

@@ -169,7 +169,6 @@ struct ConfigStamp {
 
 fn config_stamp(path: &Path) -> Result<Option<ConfigStamp>, String> {
     use std::hash::{Hash, Hasher};
-    use std::os::unix::fs::MetadataExt;
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -178,14 +177,39 @@ fn config_stamp(path: &Path) -> Result<Option<ConfigStamp>, String> {
     let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
-    Ok(Some(ConfigStamp {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        len: metadata.len(),
-        modified: (metadata.mtime(), metadata.mtime_nsec()),
-        changed: (metadata.ctime(), metadata.ctime_nsec()),
-        content_hash: hasher.finish(),
-    }))
+    Ok(Some(identity_stamp(&metadata, hasher.finish())))
+}
+
+fn identity_stamp(metadata: &fs::Metadata, content_hash: u64) -> ConfigStamp {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ConfigStamp {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            content_hash,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // `file_index` / `volume_serial_number` need the unstable
+        // `windows_by_handle` feature. Content hash plus FILETIME is enough
+        // to notice a replacement or in-place edit.
+        let write = metadata.last_write_time();
+        let created = metadata.creation_time();
+        ConfigStamp {
+            dev: 0,
+            ino: 0,
+            len: metadata.len(),
+            modified: ((write >> 32) as i64, (write & 0xffff_ffff) as i64),
+            changed: ((created >> 32) as i64, (created & 0xffff_ffff) as i64),
+            content_hash,
+        }
+    }
 }
 
 /// Set the budget under a cross-process lock and return the previous value.
@@ -237,11 +261,12 @@ fn max_agents_from(value: &Value) -> Result<usize, String> {
         .ok_or_else(|| "config.json maxAgents must be a positive integer".to_string())
 }
 
-struct ConfigLock(std::fs::File);
+struct ConfigLock {
+    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+}
 
 impl ConfigLock {
     fn acquire(home: &Path) -> Result<Self, String> {
-        use std::os::fd::AsRawFd;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -249,26 +274,11 @@ impl ConfigLock {
             .write(true)
             .open(home.join("config.json.lock"))
             .map_err(|e| e.to_string())?;
-        loop {
-            // SAFETY: flock operates on the live file descriptor; the File owns it until Drop.
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result == 0 {
-                return Ok(Self(file));
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error.to_string());
-            }
-        }
-    }
-}
-
-impl Drop for ConfigLock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        // SAFETY: the owned lock file descriptor remains valid through Drop.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        let lock: &'static mut fd_lock::RwLock<std::fs::File> =
+            Box::leak(Box::new(fd_lock::RwLock::new(file)));
+        match lock.write() {
+            Ok(guard) => Ok(Self { _guard: guard }),
+            Err(error) => Err(error.to_string()),
         }
     }
 }

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Real-time canaries for the daemon's two lifecycle constants.
 //!
 //! Under `--features test-clock` the other suites step these timers on the

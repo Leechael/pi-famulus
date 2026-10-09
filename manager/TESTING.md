@@ -17,6 +17,8 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/cli.rs` | black box | CLI help/version, completion scripts, strict parser errors (no daemon / no `--home`) |
+| `tests/platform.rs` | black box, every OS | the lifecycle cells that hold on every platform, stated with `taskkit` instead of `sh` (the only daemon suite on Windows); see [Windows](#windows) |
+| `tests/resource_bench.rs` | benchmark, opt-in | daemon memory, handles/fds and CPU under idle, spawn, 20 running tasks, churn, leftovers and 128 MiB of output, against budgets; see [Windows](#windows) |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
 
 Daemon-facing black-box tests (`protocol`, `lifecycle_adversarial`,
@@ -286,6 +288,103 @@ added while fixing and were also run against the pre-fix code: all red.
 | `t13` hang (stale leftover-group flag, manual clock) | Seen once in a test-clock stress run: the daemon never exited after `shutdown`. `finalize_exit` marks a finished task `group_lingering` when `kill(-pgid, 0)` still succeeds. On macOS, just after the leader is reaped, that probe can answer EPERM for about a millisecond even though the group is already empty (diagnostic: EPERM at exit, `ps` shows no member, gone 1 ms later). Only the 500 ms `group-poll` clears the flag. Under the manual clock that poll never runs unless a test steps it, so shutdown saw a "leftover" group, sent SIGTERM to it, and waited forever on `shutdown-grace` (`clock_status`: `group-poll` 500, `shutdown-grace` 2000 at t=0). Plain mode lost only 2s. Any group that empties between two polls leaves the same stale flag. | Shutdown re-probes leftover groups before it signals them (`TaskEntry::refresh_lingering`), and a group that still looks alive gets a second probe 20 ms later. An emptied group gets no SIGTERM and no grace. The probe runs again before the SIGKILL pass, so a pgid that emptied during the grace is not signalled. A live leftover still gets TERM, grace and KILL (`t6c`, `g11`). | `t13b` (the leader leaves `sleep 0.3` behind; once it exits, shutdown with no clock step): red before (test-clock: `shutdown waited on an emptied group`; plain: `killed 1 leftover process group(s)`), green after. `t13` under load (6 copies + 3 full-suite loaders): 2 hangs in 360 runs before, 0 in 180 after; 200 × 3 copies with 3 loaders: 600/600. |
 | `t5b` | `signal` was an integer on the wire and on disk; §3.3 and the extension type say `"SIGTERM"`/`"SIGKILL"`. | `signal` is a name (`proto::signal_name`) in `task_exited`, `TaskRecord` and the CLI `EXIT` column (widened to 7). Legacy numeric records still load (converted). The extension only tests truthiness / displays it; verified with `tsc`, its unit tests, and its real-binary integration tests. | `t5b`, `t2`, unit `signal_names_on_wire_and_legacy_numbers_load` |
 
+## Windows
+
+Nobody on the team runs Windows, so CI is the only Windows test bed. The
+manager `tests/platform.rs` suite runs on `windows-latest` in both clock
+modes (real time and `--features test-clock`); the resource benchmark uses
+the real clock only; extension and e2e jobs run once. Coverage next to
+Linux and macOS:
+
+| Where | What |
+|---|---|
+| `native-packages / native (win32-x64)` | unit tests (incl. `sys::windows` shell resolution, gate parsing, pipe-name vectors), `tests/platform.rs`, `tests/cli.rs`; then the resource benchmark on a release build; then `npm install` of the packed root + win32 packages and a `pi-famulus.exe` smoke run |
+| `extension (windows-latest)` | extension unit tests (paths, the native `.exe` launcher, the pi-shell local fallback, sparse-file tail) |
+| `e2e (windows-latest)` | `tests/integration/real-manager.test.ts` against the real `pi-famulus.exe` (cold start over the named pipe, events, watch, idle reaper, restart) and the faux-pi e2e suite |
+
+```bash
+cd manager
+cargo test --test platform                                  # portable suite, real time
+cargo test --features test-clock --test platform            # portable suite, manual clock
+PI_FAMULUS_BENCH=1 cargo test --release --test resource_bench
+cargo check --tests --target x86_64-pc-windows-msvc         # type-check the Windows code from Linux/macOS
+```
+
+### Cells on Windows
+
+`tests/platform.rs` keeps the cell ids of the table above. Cells stated with
+POSIX-only mechanisms have a Windows counterpart or none:
+
+| Cell | Windows behaviour | Test |
+|---|---|---|
+| T4, T5 | No soft stop: `stop` terminates the task's Job Object at once (exit code 143 / `SIGTERM` on the wire); there is no grace to observe | `t4` |
+| T6, T6b | The job holds the whole tree, whoever dies first | `t6` |
+| T6c–T6e | The runner keeps its job alive while any non-`conhost` member remains; shutdown, `stop` and a natural exit act on the job | `t6c`, `t6d`, `t6e` |
+| T7 | Kill-on-job-close: the daemon's job handles close when it dies, and every tree goes with them | `t7` |
+| T10 | Nothing to forward: the command starts inside its job (the runner waits for the gate before it spawns) | `t4`, `x1` |
+| T14 (inherited handles) | The status pipe is handed to the runner as a non-inheritable duplicate; the CLI's stdio is never inherited by the daemon it spawns | `cli2`, `t6c` |
+| D14, D16 | No signals; the daemon is spawned in a new process group, out of the caller's job when breakaway is allowed | `cli2` |
+| Upgrade | `upgrade` is refused; the daemon keeps its pid and tasks | `u1` |
+| Task shell | pi's shell: `PI_FAMULUS_SHELL`, Git Bash, a non-WSL `bash.exe` on PATH, else `cmd.exe /d /s /c` with the command verbatim | `q1`, `q2`, `q3`, unit `task_shell_follows_pi` |
+| Pipe identity | One pipe per home whatever the spelling (`/` vs `\`, case, trailing separator, non-ASCII); manager and extension hash the same bytes | `h1`, unit `windows_pipe_ident_vectors`, extension `windowsPipeName` vectors |
+
+C6, C7, C10, T15, T16 and the observability contract are platform-free code
+paths (framing, chunking, records). They stay in the Unix suites; `f1`,
+`o1`, `o5` and `t16` re-run the framing and UTF-8 paths on Windows.
+
+### Bugs found on Windows (all fixed)
+
+| Bug | Fix | Guard |
+|---|---|---|
+| The extension hashed the home as UTF-16 code units, the manager as UTF-8 bytes, and neither normalized the path: a non-ASCII user name, or another spelling of the same home, gave a pipe nobody listened on. | Both sides hash the UTF-8 bytes of the absolute, `\`-separated, lowercased home with trailing separators trimmed. | `h1`, pipe-name vectors on both sides |
+| The extension waited for the socket with `existsSync`, which is always false for `\\.\pipe\…`: every cold start failed. | On Windows it probes by connecting. | `real-manager` cold start |
+| The win32 npm package shipped `bin/pi-famulus` without `.exe`; CreateProcess and libuv only try `.com`/`.exe`, so it could not be spawned. | Ship `bin/pi-famulus.exe` behind the same export. | Windows smoke install, `release.test.mjs` |
+| The job was assigned after the runner had spawned the command, so a fast child could escape it; the status pipe handle was inheritable and leaked into every task. | The runner blocks on a stdin gate until the daemon has assigned the job and duplicated the status pipe into it (non-inheritable, source closed). | `t6`, `x1` |
+| Commands from pi's bash tool ran under `cmd /C`. | Resolve the task shell the way pi does (see the table above). | `q2`, `q3` |
+| The runner read the daemon's job map (empty in the runner) to decide whether its job still had members, so leftovers were killed when the command exited. | Query the runner's own job, ignoring `conhost.exe`. | `t6c`, `t6d`, `t6e` |
+| Job handles were never closed. | Drop the job once the runner and its tree are gone. | `churn200.handle_growth`, `leftovers20.handle_growth` |
+| A task's `.output` file stayed open after the task ended (every platform). | Close it once both pipes are drained. | `churn200.handle_growth` |
+| The daemon inherited the auto-spawning CLI's stdio: a reader of the CLI's output (`pi-famulus ls \| findstr`, the test harness) saw EOF only when the daemon idled out. | Clear the inherit flag on the CLI's standard handles before the spawn. | `cli2`, `cli1`, `d1`, `d10`, `h1` |
+| The extension's local fallback ran `$SHELL` or `/bin/bash` instead of pi's shell. | Use pi's `getShellConfig()`. | `impl-bash-killed` "runs the command in pi's POSIX shell" |
+
+Two Windows-only test-harness bugs also showed up as flakes (`d6`, `x1`).
+Windows gives a freed pid to a new process within seconds. `Home::drop`
+ran `taskkill /T` on every recorded task pid, finished ones included, and
+killed live processes of tests running alongside; it now relies on killing
+the daemon, whose kill-on-close jobs take every tree. Liveness probes by
+bare pid could find a newcomer alive in place of a stopped task; the
+harness now `track`s each pid a test is told about and probes it through a
+handle held for that test (`test_scope`).
+
+### Resource benchmark
+
+`tests/resource_bench.rs` drives one real daemon (release build, real
+clock) and samples it from outside: resident memory, open handles (Windows)
+or fds (Unix), CPU time. CI runs it on every native platform, prints a table
+to the job summary and uploads `bench-<platform>.json`. Budgets are
+ceilings that catch a kind of regression (a busy loop, a per-task leak,
+unbounded buffering), not a few percent:
+
+| Metric | Budget |
+|---|---|
+| `idle.rss` | ≤ 48 MiB |
+| `idle.cpu_3s` (connected client, no tasks) | ≤ 60 ms |
+| `spawn_to_exit.p50` / `.p95` (40 sequential tasks) | ≤ 500 / 1500 ms |
+| `running20.daemon_rss` | ≤ 64 MiB |
+| `running20.daemon_handles_per_task` | ≤ 16 |
+| `running20.runner_rss_avg` | ≤ 16 MiB |
+| `running20.daemon_cpu_3s`, `running20.runners_cpu_3s` | ≤ 150 ms each |
+| `churn200.handle_growth`, `leftovers20.handle_growth` (after tokio's 10 s blocking-thread keep-alive) | ≤ 24 |
+| `churn.rss_after` | ≤ 64 MiB |
+| `output128m.rss_growth_peak` | ≤ 48 MiB |
+
+`idle.handles`, `churn200.handle_growth_warm`, `output128m.throughput` and
+`daemon.cpu_total` are reported without a budget. On Windows each pipe read
+of a running task occupies a tokio blocking thread, and threads hold
+handles, so right after a burst of tasks the count reflects the idle
+thread pool (74 handles after the churn on `windows-latest`); the leak
+budgets apply once those threads have exited.
+
 ## Observability contract (manager + CLI side)
 
 `tests/observability.rs` covers the contract black-box. Extension-owned
@@ -536,7 +635,9 @@ No removal turned a test red.
 ## Deferrals
 
 - deferred: HELLO_TIMEOUT (10s) close of a silent connection is not asserted, only that it does not keep the daemon alive | impact: a silent peer holds one fd for 10s; not customer-visible | trigger: if connection limits are added
-- deferred: Windows. The manager is unix-only (process groups, `setsid`, signals, unix pipes; no Windows `cfg` anywhere), and the extension is not Windows-ready either: tried on `windows-latest` (ci-platforms), 18 of 378 extension unit tests failed. 15 because `famulusPaths()` gives `<home>/manager.sock`, a unix socket path Node cannot listen on or connect to on Windows (`listen EACCES`; it needs `\\.\pipe\...`, design §3.1); 2 because tests assume `/` separators; 1 because the 1 GiB sparse-file tail test times out on NTFS | impact: no Windows support at all, neither manager nor extension | trigger: first Windows build: a named-pipe path in `famulusPaths()`, a Windows manager, then add `windows-latest` to the CI matrix
+- deferred: graceful stop on Windows. `stop` terminates the job at once; a console task gets no Ctrl-Break first. | impact: Windows tasks cannot clean up on `stop` | trigger: a task that needs cleanup on Windows
+- deferred: named-pipe access control. The listener takes `interprocess`'s defaults for its security descriptor and instance flags; no test pins who may connect, or what happens when another process already owns the name. | impact: unknown on multi-user Windows hosts | trigger: multi-user Windows hosts
+- deferred: Windows in-place upgrade (`exec` handover). Job Objects provide the lifeline; upgrades require a restart. | impact: `pi-famulus upgrade` returns an error on Windows | trigger: a non-exec restart protocol, if wanted
 - deferred: the extension's own connect path (TypeScript) is not changed to wait out a shutting-down manager the way the Rust client now does; the exact protocol to implement is design §3.1 step 6 | impact: an extension connecting in the ≤ 2s shutdown window gets `manager is shutting down` at once instead of a successor | trigger: extension side of this branch's merge (handed to the extension engineer)
 - resolved (ci-github-actions): `task_exited.output_size` and the terminal record now cover every byte. The exit watch waits for the pumps to drain before finalizing (restored after the rebase lost it, `t15`), and the output fanout no longer moves a finished record's `output_size` back to its own lagging cursor.
 - deferred: the extension's `list` (own session only) is not paged | impact: a single pi session with more than ~4 MiB of task records (thousands of tasks, or very long commands) gets `E_INTERNAL` from `task_list` and its reconnect reconcile | trigger: a session that long-lived, or `task_list` failing with the frame-limit error

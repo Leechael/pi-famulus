@@ -13,6 +13,15 @@ export const FAUX_EXT = join(EVAL_DIR, "harness", "faux-ext.ts");
 export const ABLATION_EXT = join(EVAL_DIR, "harness", "ablation-ext.ts");
 export const PI_BIN = process.env.PI_BIN ?? "pi";
 
+/**
+ * Program and leading arguments that run pi. A `.js` PI_BIN (pi's
+ * `dist/bundle/cli.js`) runs under this Node: on Windows `node_modules/.bin/pi`
+ * is a `.cmd` shim, which `spawn` cannot start without a shell.
+ */
+export function piCommand(args: string[]): [string, string[]] {
+  return /\.[cm]?js$/.test(PI_BIN) ? [process.execPath, [PI_BIN, ...args]] : [PI_BIN, args];
+}
+
 const CACHE_TARGET = join(EVAL_DIR, ".cache", "target");
 const BUILT_MANAGER = join(CACHE_TARGET, "release", "pi-famulus");
 

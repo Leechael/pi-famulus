@@ -443,13 +443,21 @@ pub fn signal_group(pid: u32, sig: i32) -> io::Result<()> {
 ///
 /// # Safety boundary
 /// `localtime_r` writes only into the `tm` we own.
-pub fn localtime(secs: i64) -> libc::tm {
+pub fn localtime(secs: i64) -> super::LocalTime {
     let t = secs as libc::time_t;
     // SAFETY: both pointers are valid for the duration of the call.
-    unsafe {
+    let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&t, &mut tm);
         tm
+    };
+    super::LocalTime {
+        year: tm.tm_year + 1900,
+        month: (tm.tm_mon + 1) as u32,
+        day: tm.tm_mday as u32,
+        hour: tm.tm_hour as u32,
+        min: tm.tm_min as u32,
+        sec: tm.tm_sec as u32,
     }
 }
 

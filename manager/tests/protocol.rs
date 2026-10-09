@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Black-box integration tests for `pi-famulus`.
 //!
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state

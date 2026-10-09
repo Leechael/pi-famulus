@@ -631,7 +631,8 @@ export class ManagerClient {
     const deadline = this.now() + timeoutMs;
     for (;;) {
       this.checkStartupOpen();
-      if (existsSync(socketPath)) {
+      // A named pipe is not a file: existsSync does not see it, connecting does.
+      if (process.platform === "win32" || existsSync(socketPath)) {
         const ok = await this.openSocket(socketPath, Math.min(SOCKET_READY_POLL_MS, Math.max(0, deadline - this.now())))
           .then((probe) => { probe.destroy(); return true; }, () => false);
         if (ok) return;

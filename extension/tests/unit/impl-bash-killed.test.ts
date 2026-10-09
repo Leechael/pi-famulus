@@ -5,6 +5,8 @@
  * reported "Command timed out"; the manager path treated a signal kill
  * (exit_code null) as exit 0.
  */
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createBashOverride } from "../../src/bash-override";
@@ -54,20 +56,29 @@ describe("bash on the manager path, command killed", () => {
 
 // cubic review on #19: the local fallback (manager unavailable) had the same
 // gap: a command killed by a signal came back as a success.
-describe("bash on the local fallback, command killed", () => {
-  it("reports a signal kill as killed", async () => {
-    const tool = createBashOverride({
+describe("bash on the local fallback", () => {
+  function localTool() {
+    return createBashOverride({
       getClient: () => null,
       config: DEFAULT_CONFIG,
-      home: "/tmp/pi-famulus-test",
+      home: join(tmpdir(), "pi-famulus-test"),
       sessionId: () => "s",
       sessionEnv: () => ({}),
       trackTask: vi.fn(),
       markNotifyOnExit: vi.fn(),
     });
-    const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionToolContext;
-    await expect(tool.execute("tc", { command: "echo partial; kill -9 $$" }, undefined, undefined, ctx)).rejects.toThrow(
+  }
+  const ctx = { cwd: tmpdir(), sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionToolContext;
+
+  // Windows has no signal kills to report.
+  it.skipIf(process.platform === "win32")("reports a signal kill as killed", async () => {
+    await expect(localTool().execute("tc", { command: "echo partial; kill -9 $$" }, undefined, undefined, ctx)).rejects.toThrow(
       /partial[\s\S]*killed \(SIGKILL\)/,
     );
+  });
+
+  it("runs the command in pi's POSIX shell", async () => {
+    const res = await localTool().execute("tc", { command: "x=21; echo \"answer=$((x * 2))\"" }, undefined, undefined, ctx);
+    expect((res.content[0] as { text: string }).text.trim()).toBe("answer=42");
   });
 });

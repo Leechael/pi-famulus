@@ -13,16 +13,16 @@ The TypeScript extension requires a Rust manager. Users should install one npm p
 | Option | Advantages | Costs |
 |---|---|---|
 | GitHub Release assets + postinstall download | One npm package; small root archive | Another network/auth/redirect/integrity path; install hooks; GitHub availability required |
-| Native optional npm packages | npm selects the platform and verifies registry integrity; no install hooks | Five packages, trusted-publisher bindings, and synchronized versions |
+| Native optional npm packages | npm selects the platform and verifies registry integrity; no install hooks | Six packages, trusted-publisher bindings, and synchronized versions |
 
 ## Decision
 
-Publish `pi-famulus` plus `pi-famulus-{linux,darwin}-{x64,arm64}`. The root declares exact-version optional dependencies; native packages declare `os` and `cpu`. Linux binaries use native-architecture static musl builds; macOS builds target macOS 13+. Other systems/architectures are unsupported.
+Publish `pi-famulus` plus `pi-famulus-{linux,darwin}-{x64,arm64}` and `pi-famulus-win32-x64`. The root declares exact-version optional dependencies; native packages declare `os` and `cpu`. Linux binaries use native-architecture static musl builds; macOS builds target macOS 13+; Windows x64 statically links the MSVC CRT. Other systems/architectures have no automatic native package. Windows ARM64 stays outside the release set until CI produces its artifact.
 
 ```
 release tag on main
   -> validate versions/repository -> full CI
-  -> four native cargo builds -> four native npm tarballs
+  -> five native cargo builds -> five native npm tarballs
   -> root npm tarball -> per-host installed-package smoke tests
   -> artifact validation -> publish natives -> publish root
 
@@ -40,8 +40,8 @@ Entity: release set (see [domain vocabulary](../../npm/CONTEXT.md)).
 
 | State | Trigger | Source | Next state | Invariant |
 |---|---|---|---|---|
-| Draft | Stable tag/version/repository validation passes | Maintainer + validate job | Validated source | All five versions and actual GitHub identity agree; tag is on main ancestry |
-| Validated source | Build, pack, tests, installed-package checks pass | Four native builders + full CI | Verified artifacts | Correct targets; Linux static; five actual tarballs contain required files |
+| Draft | Stable tag/version/repository validation passes | Maintainer + validate job | Validated source | All six versions and actual GitHub identity agree; tag is on main ancestry |
+| Validated source | Build, pack, tests, installed-package checks pass | Five native builders + full CI | Verified artifacts | Correct targets; Linux static and Windows static CRT; six actual tarballs contain required files |
 | Validated source | Any build/test/package check fails | CI | Blocked | No publication is attempted |
 | Verified artifacts | Dry-run publish requested | Manual workflow | Verified artifacts | No registry mutation or claim of OIDC authentication |
 | Verified artifacts | Registry preflight fails | Publish job | Blocked | No mutation occurs before all candidate preflights pass |
@@ -59,8 +59,8 @@ Missing/invalid/omitted native dependencies permit explicit/manual discovery for
 
 ## Consequences
 
-The registry is the only binary transport. Version synchronization and five independent npm trust bindings are required. npm optional dependencies can be intentionally omitted; this is visible, not treated as a successful manager installation.
+The registry is the only binary transport. Version synchronization and six independent npm trust bindings are required. npm optional dependencies can be intentionally omitted; this is visible, not treated as a successful manager installation.
 
 Publication uses GitHub OIDC, public provenance, and no npm token secret. The workflow is explicitly dispatched from main; npm trust must bind to the `npm` GitHub environment, whose external deployment policy permits only that branch. Tag ancestry validates build input, not workflow authority. Release serialization retains up to 100 pending runs with `queue: max`; arrivals exceeding that bound must be redispatched. Repository URLs must match the actual repository even while its external name still differs from the renamed product. npm's first authenticated publication and package-side trust settings cannot be bootstrapped by unauthenticated OIDC; they remain explicit setup steps in [the release guide](../releasing.md).
 
-No Windows build or automatic migration of old state is in scope. Roll back by installing a previously published complete root version with its exact native dependencies; never rewrite an existing version's bytes. A retry may skip a version only when the candidate tarball integrity equals the registry's existing integrity; if rebuilding differs, release a new synchronized version instead.
+No automatic migration of old state is in scope. Windows is supported for the manager binary and named-pipe IPC (in-place upgrade remains Unix-only). Roll back by installing a previously published complete root version with its exact native dependencies; never rewrite an existing version's bytes. A retry may skip a version only when the candidate tarball integrity equals the registry's existing integrity; if rebuilding differs, release a new synchronized version instead.

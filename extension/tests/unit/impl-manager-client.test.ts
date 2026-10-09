@@ -14,6 +14,7 @@ import {
   tryAcquireSpawnLockFile,
   type ManagerEvent,
 } from "../../src/manager-client";
+import { famulusPaths } from "../../src/config";
 
 interface FakeManager {
   server: net.Server;
@@ -40,7 +41,7 @@ function encodeFrame(message: Record<string, unknown>): Buffer {
 
 /** Start a fake manager that answers hello/start/wait/output/stop/list/watch. */
 async function startFakeManager(home: string): Promise<FakeManager> {
-  const socketPath = join(home, "manager.sock");
+  const socketPath = famulusPaths(home).socket;
   const received: Record<string, unknown>[] = [];
   const sockets = new Set<net.Socket>();
   let rejectNextHelloForShutdown = false;
@@ -246,7 +247,8 @@ describe("ManagerClient (integration, fake manager)", () => {
 
     expect(await client.connect()).toBe(true);
     expect(fake.received.filter((message) => message.type === "hello")).toHaveLength(2);
-    expect(existsSync(fake.socketPath)).toBe(true);
+    // A Windows named pipe is not a file.
+    if (process.platform !== "win32") expect(existsSync(fake.socketPath)).toBe(true);
     expect(existsSync(join(home, "manager.pid"))).toBe(true);
   });
 

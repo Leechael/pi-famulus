@@ -1,6 +1,6 @@
 # npm releases
 
-The main extension and four native manager packages form one versioned release. The packaging design is recorded in [the ADR](decisions/npm-native-packages.md).
+The main extension and native manager packages form one versioned release. The packaging design is recorded in [the ADR](decisions/npm-native-packages.md).
 
 ## Supported outputs
 
@@ -10,18 +10,19 @@ The main extension and four native manager packages form one versioned release. 
 | `pi-famulus-linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
 | `pi-famulus-darwin-x64` | `x86_64-apple-darwin` | `macos-15-intel` |
 | `pi-famulus-darwin-arm64` | `aarch64-apple-darwin` | `macos-15` |
+| `pi-famulus-win32-x64` | `x86_64-pc-windows-msvc` | `windows-latest` |
 | `pi-famulus` | TypeScript extension + JS CLI/resolver | `ubuntu-24.04` |
 
-Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Node/pi's runtime requirements still apply. There is no Windows or other-architecture release.
+Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Windows x64 builds use the MSVC toolchain with the CRT linked statically (`manager/.cargo/config.toml`, `target.x86_64-pc-windows-msvc` `+crt-static`). The package job sets `RUSTFLAGS` only on Linux, so that cargo config is what the Windows release binary is linked with. Before packing, CI inspects the actual PE dependencies with `dumpbin` and rejects VC runtime DLL imports; the hosted runner's installed redistributables must not hide a dependency. Node/pi's runtime requirements still apply. In-place upgrade (`exec` handover) remains Unix-only; on Windows, replace the binary and restart the manager.
 
-CI builds the four targets on native-architecture hosts, runs the ordinary and manual-clock Rust suites, and verifies actual root/native npm tarball installation on each host. Installation smoke tests explicitly select the pi version pinned in the extension lockfile rather than an unbounded latest peer. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
+CI builds the Unix targets on native-architecture hosts and `win32-x64` on `windows-latest`, runs the ordinary and (Unix) manual-clock Rust suites, and verifies actual root/native npm tarball installation on Unix hosts and Windows x64. Windows ARM64 is not part of the required release set until a CI producer exists. Installation smoke tests explicitly select the pi version pinned in the extension lockfile rather than an unbounded latest peer. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
 
 ## Exact release metadata
 
 Keep these at the same stable `X.Y.Z`:
 
-- `extension/package.json` version and its four exact optional dependency versions.
-- All four `npm/*/package.json` versions.
+- `extension/package.json` version and its exact optional dependency versions.
+- All `npm/*/package.json` versions.
 - `manager/Cargo.toml` version and the own-package Cargo lock record.
 - The extension lockfile's root metadata and first-party native-package version records.
 
@@ -59,18 +60,20 @@ The publish job requires the **`npm` GitHub environment**. In repository Setting
 
 ## Required one-time npm setup
 
-Repository configuration does not create npm packages or their trusted-publisher bindings. All five packages must first exist in npm and be controlled by the intended maintainer. This repository cannot assert that those remote settings are configured just because the workflow passes a dry run.
+Repository configuration does not create npm packages or their trusted-publisher bindings. All packages in the release set must first exist in npm and be controlled by the intended maintainer. This repository cannot assert that those remote settings are configured just because the workflow passes a dry run.
 
-1. Confirm the public license/ownership and all five npm names before the first public release.
+1. Confirm the public license/ownership and all release-set npm names before the first public release.
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
 3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and **checking** `dry_run` (the UI default is now unchecked and would publish for real). The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
-4. Download all five `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the four native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
+4. Download all `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
 5. Configure the table above under each package's npm Access / Trusted publishing settings. With current npm, the equivalent authenticated commands are:
 
 ```sh
 for package in \
   pi-famulus-linux-x64 pi-famulus-linux-arm64 \
-  pi-famulus-darwin-x64 pi-famulus-darwin-arm64 pi-famulus
+  pi-famulus-darwin-x64 pi-famulus-darwin-arm64 \
+  pi-famulus-win32-x64 \
+  pi-famulus
 do
   npm trust github "$package" --file publish.yml \
     --repository Leechael/pi-famulus --environment npm --allow-publish --yes \
@@ -109,7 +112,7 @@ gh workflow run publish.yml --ref main -f channel=patch -f dry_run=false
 
 A dry run proves package validity, **not** OIDC authentication or npm-side trust. For real publication, safe diagnostics assert OIDC request credentials are present without logging them. Successful OIDC/provenance must be verified from the publishing logs and npm metadata. Re-running an identical bootstrap version may skip every publish call; that is **not** an OIDC authentication test. Verify on a subsequent new version.
 
-Native packages publish before the root. The script preflights all five registry names/versions before its first mutation. Existing versions are skipped only if their SHA-512 tarball integrity equals the candidate; a mismatch or registry error stops publication. Releases are serialized with GitHub's `queue: max`: one active run and up to 100 pending runs. Active publication is not auto-cancelled. GitHub cancels additional arrivals beyond that queue limit; operators must inspect and explicitly redispatch those requests. npm versions cannot be overwritten. If a partial retry rebuilds different artifacts, fail closed and publish a new synchronized version rather than bypassing the integrity check.
+Native packages publish before the root. The script preflights all registry names/versions before its first mutation. Existing versions are skipped only if their SHA-512 tarball integrity equals the candidate; a mismatch or registry error stops publication. Releases are serialized with GitHub's `queue: max`: one active run and up to 100 pending runs. Active publication is not auto-cancelled. GitHub cancels additional arrivals beyond that queue limit; operators must inspect and explicitly redispatch those requests. npm versions cannot be overwritten. If a partial retry rebuilds different artifacts, fail closed and publish a new synchronized version rather than bypassing the integrity check.
 
 After a real npm publish, the same job creates the GitHub tag at the validated commit and a generated GitHub Release (`scripts/github-release.mjs`). Tag existence is resolved through the commits API so annotated tags peel to their commit SHA (`git/ref/tags` returns the tag-object SHA). A missing tag is HTTP 404 **or** the commits-API 422 `No commit found for SHA:`; other 4xx/5xx responses fail closed and never retarget an existing tag. Retries reuse this run's tag and SHA. A later dispatch computes a new version from npm, so a failed GitHub tag step must be recovered by re-running that same job (after this helper is on the job's SHA) or by creating that exact tag/release manually — not by dispatching a new channel bump.
 

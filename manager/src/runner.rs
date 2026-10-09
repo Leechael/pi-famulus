@@ -49,8 +49,11 @@
 //! moment the child unblocks it. SIGKILL takes the runner down with the
 //! group; the daemon then falls back to the runner's own wait status.
 
-use crate::sys::{self, RUNNER_LIFELINE_FD, RUNNER_STATUS_FD};
+use crate::sys;
+#[cfg(unix)]
+use crate::sys::{RUNNER_LIFELINE_FD, RUNNER_STATUS_FD};
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
@@ -67,6 +70,18 @@ const GUARD_POLL_SLOW: Duration = Duration::from_secs(1);
 const GUARD_STABLE_FOR: Duration = Duration::from_secs(1);
 
 pub fn main(command: &OsStr) -> i32 {
+    #[cfg(unix)]
+    {
+        unix_main(command)
+    }
+    #[cfg(windows)]
+    {
+        windows_main(command)
+    }
+}
+
+#[cfg(unix)]
+fn unix_main(command: &OsStr) -> i32 {
     // Neither descriptor may reach the command.
     let _ = sys::set_cloexec(RUNNER_LIFELINE_FD);
     let _ = sys::set_cloexec(RUNNER_STATUS_FD);
@@ -127,10 +142,106 @@ pub fn main(command: &OsStr) -> i32 {
     0
 }
 
+/// What the daemon writes to a Windows runner's stdin once the runner is in
+/// its task's job: `<status handle>\n<posix|cmd>\n<shell program>\n`, then
+/// EOF. Until then the runner starts nothing, so every process of the task
+/// is born inside the job (a child started before the assignment would
+/// escape both stop and the kill-on-close lifeline).
+#[cfg(windows)]
+struct Gate {
+    status: usize,
+    shell: sys::TaskShell,
+}
+
+#[cfg(windows)]
+fn parse_gate(text: &str) -> Option<Gate> {
+    let mut lines = text.lines();
+    let status = lines.next()?.trim().parse().ok()?;
+    let kind = match lines.next()?.trim() {
+        "posix" => sys::ShellKind::Posix,
+        "cmd" => sys::ShellKind::Cmd,
+        _ => return None,
+    };
+    let program = lines.next().filter(|p| !p.is_empty())?.into();
+    Some(Gate { status, shell: sys::TaskShell { program, kind } })
+}
+
+/// Windows: the task's Job Object stands in for the process group and its
+/// kill-on-close for the lifeline; the status pipe arrives through the gate.
+#[cfg(windows)]
+fn windows_main(command: &OsStr) -> i32 {
+    use std::io::{Read, Write};
+    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let mut text = String::new();
+    let _ = std::io::stdin().lock().read_to_string(&mut text);
+    let Some(gate) = parse_gate(&text) else {
+        eprintln!("pi-famulus: __run is started by the manager");
+        return 127;
+    };
+    // SAFETY: the daemon duplicated this handle into us for our sole use.
+    let mut status_file = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(gate.status as RawHandle) });
+    let mut report = |what: &str, alone: bool| {
+        let line = format!("{what} {}\n", if alone { "alone" } else { "linger" });
+        let _ = status_file.write_all(line.as_bytes());
+        let _ = status_file.flush();
+    };
+
+    let me = sys::getpid();
+    let mut cmd = std::process::Command::new(&gate.shell.program);
+    match gate.shell.kind {
+        sys::ShellKind::Posix => {
+            cmd.arg("-c").arg(command);
+        }
+        sys::ShellKind::Cmd => {
+            let mut line = std::ffi::OsString::from("/d /s /c \"");
+            line.push(command);
+            line.push("\"");
+            cmd.raw_arg(line);
+        }
+    }
+    cmd.stdin(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pi-famulus: cannot run {}: {e}", gate.shell.program.display());
+            report("exit 127", alone(me));
+            return 127;
+        }
+    };
+    let st = match child.wait() {
+        Ok(s) => s,
+        Err(_) => {
+            report("exit 0", alone(me));
+            return 0;
+        }
+    };
+    // A waited child that exited 137 or 143 (for example `exit /b 143`)
+    // exited; it was not signaled. Manager-initiated job termination kills
+    // the runner with the job, so the daemon reports that from the runner's
+    // own wait status (`Outcome::of`) and never sees this line.
+    let what = child_exit_word(st.code());
+    let alone_now = alone(me);
+    report(&what, alone_now);
+    if !alone_now {
+        let mut stable = Duration::ZERO;
+        while !alone(me) {
+            let poll = if stable >= GUARD_STABLE_FOR { GUARD_POLL_SLOW } else { GUARD_POLL };
+            std::thread::sleep(poll);
+            stable += poll;
+        }
+    }
+    0
+}
+
+#[cfg(unix)]
 fn report(what: &str, alone: bool) {
     report_usage(what, alone, None);
 }
 
+#[cfg(unix)]
 fn report_usage(what: &str, alone: bool, usage: Option<Usage>) {
     let _ = sys::write_raw(RUNNER_STATUS_FD, status_line(what, alone, usage).as_bytes());
 }
@@ -152,12 +263,17 @@ fn status_line(what: &str, alone: bool, usage: Option<Usage>) -> String {
 /// guarding (and the daemon keeps probing the group) rather than let a
 /// leftover escape both watchers.
 fn alone(me: u32) -> bool {
-    match sys::group_members(me) {
+    #[cfg(unix)]
+    let members = sys::group_members(me);
+    #[cfg(windows)]
+    let members = sys::own_job_members();
+    match members {
         Ok(pids) => pids.iter().all(|p| *p == me),
         Err(_) => false,
     }
 }
 
+#[cfg(unix)]
 fn watch_lifeline(me: u32) {
     let mut buf = [0u8; 64];
     loop {
@@ -221,6 +337,15 @@ pub struct Reported {
     /// values is missing or malformed. Never makes the line itself invalid:
     /// the exit status is what the daemon cannot do without.
     pub usage: Option<Usage>,
+}
+
+/// Status word for a waited child. Exit codes 137 and 143 stay exit codes.
+#[cfg(any(windows, test))]
+fn child_exit_word(code: Option<i32>) -> String {
+    match code {
+        Some(c) => format!("exit {c}"),
+        None => "exit 0".to_string(),
+    }
 }
 
 pub fn parse_status(line: &str) -> Option<Reported> {
@@ -299,5 +424,30 @@ mod tests {
         let line = status_line("signal 9", false, Some(Usage { cpu_user_us: 1, cpu_sys_us: 2, max_rss_kb: 3 }));
         let head: Vec<&str> = line.split_whitespace().take(3).collect();
         assert_eq!(head, ["signal", "9", "linger"]);
+    }
+
+    #[test]
+    fn waited_child_exit_137_and_143_stay_exit_codes() {
+        for code in [0, 3, 137, 143] {
+            assert_eq!(child_exit_word(Some(code)), format!("exit {code}"));
+        }
+        assert_eq!(child_exit_word(None), "exit 0");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn gate_lines() {
+        let g = parse_gate("1234\nposix\nC:\\Program Files\\Git\\bin\\bash.exe\n").unwrap();
+        assert_eq!(g.status, 1234);
+        assert_eq!(g.shell.kind, sys::ShellKind::Posix);
+        assert_eq!(g.shell.program, std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        assert_eq!(parse_gate("8\ncmd\ncmd.exe").unwrap().shell.kind, sys::ShellKind::Cmd);
+        for bad in ["", "x\nposix\nbash\n", "8\nzsh\nbash\n", "8\nposix\n\n", "8\nposix\n"] {
+            assert!(parse_gate(bad).is_none(), "{bad:?}");
+        }
     }
 }

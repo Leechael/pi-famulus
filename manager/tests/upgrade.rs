@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! In-place upgrade (design doc §3.2, `handover.rs`): the daemon execs the
 //! binary now at its path, with the same pid, and every task keeps running.
 //!

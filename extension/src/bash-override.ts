@@ -18,11 +18,12 @@ import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
-import type {
-  AgentToolResult,
-  BashToolDetails,
-  ExtensionContext,
-  ToolDefinition,
+import {
+  getShellConfig,
+  type AgentToolResult,
+  type BashToolDetails,
+  type ExtensionContext,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { taskOutputPath, type FamulusConfig } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
@@ -166,15 +167,29 @@ async function executeLocal(
 ): Promise<AgentToolResult<FamulusBashDetails | undefined>> {
   const timeoutMs = resolveTimeoutMs(params.timeout);
   const startedAtMs = clock.now();
-  const shell = process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : "/bin/bash";
+  // pi's own choice (Git Bash on Windows, /bin/bash on Unix): commands are
+  // written for pi's bash tool, not for whatever $SHELL is.
+  let shell: ReturnType<typeof getShellConfig>;
+  try {
+    shell = getShellConfig();
+  } catch (err) {
+    throw new Error(`Failed to start shell: ${(err as Error).message}`);
+  }
+  const viaStdin = shell.commandTransport === "stdin";
 
   const output = await new Promise<{ text: string; exitCode: number | null; signal: string | null; timedOut: boolean; aborted: boolean }>(
     (resolve, reject) => {
-      const child = spawn(shell, ["-c", params.command], {
+      const child = spawn(shell.shell, viaStdin ? shell.args : [...shell.args, params.command], {
         cwd: ctx.cwd,
         env: process.env,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [viaStdin ? "pipe" : "ignore", "pipe", "pipe"],
+        windowsHide: true,
       });
+      if (viaStdin) {
+        // Swallow EPIPE if the shell exits before consuming stdin (pi's runner does the same).
+        child.stdin?.on("error", () => {});
+        child.stdin?.end(params.command);
+      }
       const chunks: Buffer[] = [];
       let settled = false;
       let timedOut = false;
