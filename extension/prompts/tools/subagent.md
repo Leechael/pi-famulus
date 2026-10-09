@@ -17,7 +17,7 @@ Fan out subagents in parallel or sequence them in a chain
 
 # param: tasks
 
-Subagents to run in parallel
+Start new subagents in parallel. Use only when action is omitted. For any action call, omit tasks entirely; do not supply placeholder tasks.
 
 # param: tasks.agent
 
@@ -37,7 +37,7 @@ Explicit planned workload class for machine-wide admission (default: other)
 
 # param: chain
 
-Steps to run sequentially (always awaited)
+Start a new sequential chain (always awaited). Use only when action is omitted. For any action call, omit chain entirely.
 
 # param: chain.agent
 
@@ -73,7 +73,7 @@ Time budget per subagent turn in ms (default 1800000, max {{maxMs}}). <!--seg:to
 
 # param: action
 
-Manage an existing run (or list selectable models) instead of starting a new one
+Manage an existing run (or list selectable models) instead of starting a new one. When action is set, omit tasks and chain entirely; these launch-only fields are not required placeholders for control calls.
 
 # param: run_id
 

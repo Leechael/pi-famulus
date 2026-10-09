@@ -41,7 +41,7 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
-Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun). The [2026-10-08 campaign review](2026-10-08-REVIEW.md) records model/thinking preflight, grader fixes, scenario-version differences, and retained failure caveats. The separate [targeted prompt experiments](2026-10-08-PROMPT-REVIEW.md) record333 later episodes: C1 showed no benefit; C2's Luna improvement did not clear the K3 execution-risk gate. Both product prompts were retained unchanged.
+Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun). The [2026-10-08 campaign review](2026-10-08-REVIEW.md) records model/thinking preflight, grader fixes, scenario-version differences, and retained failure caveats. The separate [targeted prompt experiments](2026-10-08-PROMPT-REVIEW.md) record333 later episodes: C1 showed no benefit; C2's Luna improvement did not clear the K3 execution-risk gate. Both product prompts were retained unchanged. The [2026-10-09 candidate P review](2026-10-09-PROMPT-REVIEW.md) records targeted control-mode/silent-work validation; adoption and the all-default-scenario merge gate remain pending.
 
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
