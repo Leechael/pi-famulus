@@ -40,6 +40,7 @@ jobs:
         if: inputs.version != ''
         env:
           RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
         run: node scripts/bump-release.mjs "$RELEASE_VERSION"
       - run: node scripts/validate-release.mjs
       - run: node --test scripts/*.test.mjs
@@ -99,6 +100,7 @@ jobs:
         if: inputs.version != ''
         env:
           RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
         run: node scripts/bump-release.mjs "$RELEASE_VERSION"
       - uses: dtolnay/rust-toolchain@stable
         with:
