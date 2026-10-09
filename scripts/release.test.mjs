@@ -387,6 +387,11 @@ test('workflow literal security, release graph and host/target contracts', () =>
     assert.ok(native.includes(`runner: ${runner}\n`), runner);
   }
   assert.ok(native.includes('cargo test --locked\n'));
+  assert.equal(
+    (native.match(/shell: bash\n        run: node scripts\/bump-release\.mjs "\$RELEASE_VERSION"/g) ?? []).length,
+    2,
+    'bump-release must use bash so Windows pwsh does not pass a literal $RELEASE_VERSION',
+  );
   const windowsCrt = readFileSync(new URL('../manager/.cargo/config.toml', import.meta.url), 'utf8');
   assert.match(windowsCrt, /\[target\.x86_64-pc-windows-msvc\]\s*rustflags = \["-C", "target-feature=\+crt-static"\]/);
   assert.ok(native.includes('$imports = & $dumpbin /dependents "manager/target/$env:TARGET/release/pi-famulus.exe"'));
