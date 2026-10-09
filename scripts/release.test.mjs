@@ -97,6 +97,24 @@ test('bump-release writes every versioned manifest including prerelease', t => {
   validateMetadata(root, { tag: 'v0.1.3-beta.0', repository });
 });
 
+test('bump-release updates a CRLF Cargo.lock from a Windows checkout', t => {
+  const { root, put } = fixture(t);
+  put('manager/Cargo.lock', '[[package]]\r\nname = "pi-famulus"\r\nversion = "0.1.0"\r\n');
+  put('extension/package-lock.json', {
+    name: 'pi-famulus',
+    version: '0.1.0',
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'pi-famulus', version: '0.1.0', optionalDependencies: Object.fromEntries(PLATFORMS.map(p => [p.name, '0.1.0'])) },
+      ...Object.fromEntries(PLATFORMS.map(p => [`../npm/${p.id}`, { name: p.name, version: '0.1.0' }])),
+    },
+  });
+  bumpRelease(root, '0.1.5');
+  const lock = readFileSync(join(root, 'manager/Cargo.lock'), 'utf8');
+  assert.match(lock, /name = "pi-famulus"\r\nversion = "0\.1\.5"/);
+  assert.match(lock, /\r\n/);
+});
+
 test('publication guards cannot be satisfied by comments or other jobs', () => {
   const publish = workflow('publish');
   assertPublishingAuthority(publish);

@@ -35,11 +35,13 @@ export function bumpRelease(root, version) {
 
   const lockPath = join(root, 'manager/Cargo.lock');
   const lock = readFileSync(lockPath, 'utf8');
+  // Git's Windows checkout may store CRLF; keep whatever newline the file uses.
+  const ownPackageVersion = text => text.match(/\[\[package\]\]\r?\nname = "pi-famulus"\r?\nversion = "([^"]+)"/)?.[1];
   const bumpedLock = lock.replace(
-    /(\[\[package\]\]\nname = "pi-famulus"\nversion = ")[^"]+(")/,
+    /(\[\[package\]\]\r?\nname = "pi-famulus"\r?\nversion = ")[^"]+(")/,
     `$1${version}$2`,
   );
-  assert.ok(bumpedLock !== lock || lock.includes(`name = "pi-famulus"\nversion = "${version}"`), 'Cargo.lock pi-famulus version not updated');
+  assert.equal(ownPackageVersion(bumpedLock), version, 'Cargo.lock pi-famulus version not updated');
   writeFileSync(lockPath, bumpedLock);
 
   const clientPath = join(root, 'extension/src/manager-client.ts');
