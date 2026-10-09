@@ -127,6 +127,15 @@ test('existing tag at the expected peeled commit sha is idempotent', async () =>
   assert.equal(sleeps.length, 0);
 });
 
+test('existing tag matches the expected sha case-insensitively', async () => {
+  const github = mockGithub({
+    commits: [{ status: 200, body: { sha: SHA } }],
+    releases: [{ status: 200, body: { id: 1, tag_name: TAG } }],
+  });
+  const { commands } = await runEnsure(github, { sha: SHA.toUpperCase() });
+  assert.equal(commands.length, 0);
+});
+
 test('existing tag at a different sha fails closed and never moves the tag', async () => {
   const github = mockGithub({
     commits: [{ status: 200, body: { sha: OTHER_SHA } }],
@@ -138,7 +147,6 @@ test('existing tag at a different sha fails closed and never moves the tag', asy
 test('generic 422 and 5xx commit lookups fail closed without creating a tag', async () => {
   for (const commits of [
     [{ status: 422, body: { message: 'Validation Failed', status: '422' } }],
-    [{ status: 500, body: { message: 'Internal Server Error' } }],
     [{ status: 401, body: { message: 'Bad credentials' } }],
   ]) {
     const github = mockGithub({ commits, releases: [] });
@@ -154,6 +162,50 @@ test('generic 422 and 5xx commit lookups fail closed without creating a tag', as
     }), /failed with HTTP|Unexpected tag lookup/);
     assert.equal(commands.length, 0);
   }
+});
+
+test('persistent 5xx commit lookups retry then fail closed without creating a tag', async () => {
+  let lookups = 0;
+  const commands = [];
+  await assert.rejects(ensureGitHubTagAndRelease({
+    tag: TAG, sha: SHA, repository: REPO, token: 'test-token',
+    fetchImpl: async () => {
+      lookups += 1;
+      return response(500, { message: 'Internal Server Error' });
+    },
+    run: (...args) => {
+      commands.push(args);
+      return '';
+    },
+    sleep: async () => {},
+  }), /failed with HTTP 500/);
+  assert.equal(lookups, 3);
+  assert.equal(commands.length, 0);
+});
+
+test('transient fetch throw is retried and then succeeds', async () => {
+  let commits = 0;
+  const commands = [];
+  await ensureGitHubTagAndRelease({
+    tag: TAG, sha: SHA, repository: REPO, token: 'test-token',
+    fetchImpl: async url => {
+      const u = String(url);
+      if (u.includes('/commits/')) {
+        commits += 1;
+        if (commits === 1) throw Object.assign(new Error('ECONNRESET'), { cause: { code: 'ECONNRESET' } });
+        return response(200, { sha: SHA });
+      }
+      if (u.includes('/releases/tags/')) return response(200, { id: 1, tag_name: TAG });
+      throw new Error(`unexpected url ${u}`);
+    },
+    run: (...args) => {
+      commands.push(args);
+      return '';
+    },
+    sleep: async () => {},
+  });
+  assert.equal(commits, 2);
+  assert.equal(commands.length, 0);
 });
 
 test('POST that loses a create race still succeeds if the next lookup matches', async () => {

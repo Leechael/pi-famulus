@@ -63,7 +63,7 @@ Repository configuration does not create npm packages or their trusted-publisher
 
 1. Confirm the public license/ownership and all five npm names before the first public release.
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
-3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and leaving **dry_run=true**. The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
+3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and **checking** `dry_run` (the UI default is now unchecked and would publish for real). The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
 4. Download all five `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the four native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
 5. Configure the table above under each package's npm Access / Trusted publishing settings. With current npm, the equivalent authenticated commands are:
 

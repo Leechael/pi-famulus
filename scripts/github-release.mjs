@@ -7,6 +7,9 @@ import { validateTag } from './validate-release.mjs';
 const API_VERSION = '2022-11-28';
 const ATTEMPTS = 5;
 const RETRY_MS = 2000;
+const READ_ATTEMPTS = 3;
+const READ_TIMEOUT_MS = 10_000;
+const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
 export function classifyCommitLookup(status, body) {
   const code = Number(status);
@@ -30,17 +33,32 @@ function apiUrl(base) {
   return (base || 'https://api.github.com').replace(/\/$/, '');
 }
 
-async function githubGet(fetchImpl, { base, token, endpoint }) {
-  const response = await fetchImpl(`${base}/${endpoint}`, {
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': API_VERSION,
-      Authorization: `Bearer ${token}`,
-    },
-  });
-  let body = null;
-  try { body = await response.json(); } catch { body = null; }
-  return { status: response.status, body };
+async function githubGet(fetchImpl, { base, token, endpoint, sleep }) {
+  let lastError;
+  for (let attempt = 1; attempt <= READ_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetchImpl(`${base}/${endpoint}`, {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': API_VERSION,
+          Authorization: `Bearer ${token}`,
+        },
+        signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+      });
+      let body = null;
+      try { body = await response.json(); } catch { body = null; }
+      if (TRANSIENT_STATUS.has(response.status) && attempt < READ_ATTEMPTS) {
+        await sleep(RETRY_MS);
+        continue;
+      }
+      return { status: response.status, body };
+    } catch (error) {
+      lastError = error;
+      if (attempt === READ_ATTEMPTS) throw error;
+      await sleep(RETRY_MS);
+    }
+  }
+  throw lastError;
 }
 
 function lookupError(endpoint, status, body) {
@@ -61,6 +79,7 @@ export async function ensureGitHubTagAndRelease({
 } = {}) {
   validateTag(tag);
   assert.match(sha ?? '', /^[0-9a-f]{40}$/i, 'release sha must be a 40-character commit');
+  sha = sha.toLowerCase();
   assert.match(repository ?? '', /^[^/]+\/[^/]+$/, 'repository must be owner/name');
   assert.ok(token, 'GH_TOKEN is required');
   const base = apiUrl(rawApiUrl);
@@ -69,10 +88,10 @@ export async function ensureGitHubTagAndRelease({
 
   let tagReady = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const { status, body } = await githubGet(fetchImpl, { base, token, endpoint: commitEndpoint });
+    const { status, body } = await githubGet(fetchImpl, { base, token, endpoint: commitEndpoint, sleep });
     const kind = classifyCommitLookup(status, body);
     if (kind === 'exists') {
-      const tagSha = typeof body?.sha === 'string' && body.sha ? body.sha : '';
+      const tagSha = typeof body?.sha === 'string' && body.sha ? body.sha.toLowerCase() : '';
       if (!tagSha) throw new Error(`GitHub commit lookup for ${tag} returned no sha`);
       if (tagSha !== sha) throw new Error(`Tag ${tag} already exists at ${tagSha}, expected ${sha}`);
       console.log(`Tag ${tag} already points to ${sha}`);
@@ -95,7 +114,7 @@ export async function ensureGitHubTagAndRelease({
 
   let releaseReady = false;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const { status, body } = await githubGet(fetchImpl, { base, token, endpoint: releaseEndpoint });
+    const { status, body } = await githubGet(fetchImpl, { base, token, endpoint: releaseEndpoint, sleep });
     const kind = classifyReleaseLookup(status, body);
     if (kind === 'exists') {
       console.log(`GitHub Release ${tag} already exists`);
