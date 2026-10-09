@@ -59,8 +59,8 @@ export function parsePrompts(dir = PROMPTS_DIR): { prompts: PromptEntry[]; segme
   const prompts: PromptEntry[] = [];
   const segments: SegmentEntry[] = [];
   for (const path of walk(dir).sort()) {
-    const file = relative(dir, path);
-    const stem = file.replace(/\.md$/, "").replace(/[\\/]/g, ".");
+    const file = relative(dir, path).replace(/\\/g, "/");
+    const stem = file.replace(/\.md$/, "").replace(/\//g, ".");
     const lines = readFileSync(path, "utf8").split(/\r?\n/);
     const sections: Array<{ name: string; list: boolean; body: string[] }> = [];
     for (const line of lines) {

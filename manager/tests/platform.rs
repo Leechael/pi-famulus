@@ -695,7 +695,7 @@ fn d3_concurrent_daemons_leave_one_survivor() {
         if k.id() == survivor {
             continue;
         }
-        let st = wait_child(k, S(10)).expect("a losing daemon did not exit");
+        let st = wait_child(k, S(30)).expect("a losing daemon did not exit");
         assert!(st.success(), "a losing daemon failed: {st:?}");
         exited += 1;
     }

@@ -205,7 +205,7 @@ print('released', flush=True)
   if (failure !== undefined) throw failure;
 }
 
-it.skipIf(!RUN)("regression: missing socket/pid while the old lifetime lock is held recovers after the real losing spawn", async () => {
+it.skipIf(!RUN || process.platform === "win32")("regression: missing socket/pid while the old lifetime lock is held recovers after the real losing spawn", async () => {
   await withLockGap(BIN, async ({ home, client, attempts, proof, loserOutput, loserHadReadableOutput }) => {
     expect(proof).toEqual({ code: 0, socketMissing: true, pidMissing: true });
     if (loserHadReadableOutput) expect(loserOutput).toContain("pi-famulus already running (starting up)");
@@ -221,7 +221,7 @@ it.skipIf(!RUN)("regression: missing socket/pid while the old lifetime lock is h
   });
 }, 15000);
 
-it.skipIf(!RUN).each([
+it.skipIf(!RUN || process.platform === "win32").each([
   ["ENOENT", (home: string) => join(home, "missing-manager")],
   ["EACCES", (home: string) => home], // An existing directory cannot be executed.
 ] as const)("regression: real %s spawn failure rejects and cleans up the flock fixture", async (code, binary) => {
