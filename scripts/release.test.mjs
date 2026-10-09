@@ -364,17 +364,19 @@ test('workflow literal security, release graph and four host/target contracts', 
   assert.ok(publish.includes('cancel-in-progress: false'));
   assertPublishingAuthority(publish);
   assert.ok(!/^  release:/m.test(publish), 'tag-triggered workflows cannot use the main-only publishing environment');
-  assert.ok(publish.includes('default: true'));
+  const channelInput = publish.match(/^      channel:\n([\s\S]*?)(?=^      dry_run:)/m)?.[1] ?? '';
+  const dryRunInput = publish.match(/^      dry_run:\n([\s\S]*?)(?=^permissions:)/m)?.[1] ?? '';
+  assert.match(channelInput, /^        default: patch$/m, 'channel must default to patch');
+  assert.match(dryRunInput, /^        default: false$/m, 'dry_run must default off');
+  assert.ok(!publish.includes('default: true'), 'dry_run must not default on');
   assert.ok(publish.includes('type: choice'));
   for (const channel of ['beta', 'nightly', 'patch', 'minor', 'major']) {
     assert.match(publish, new RegExp(`^          - ${channel}$`, 'm'), channel);
   }
   assert.ok(publish.includes('scripts/next-release.mjs'));
   assert.ok(publish.includes('scripts/bump-release.mjs'));
-  assert.ok(publish.includes('--retry 3 --retry-delay 2'), 'GitHub API reads must retry transient failures');
-  assert.ok(publish.includes('if [[ "$status" == 404 ]]'), 'only a 404 may mean a missing GitHub resource');
-  assert.ok(publish.includes('release_args+=(--prerelease)'), 'beta and nightly GitHub Releases must be prereleases');
-  assert.ok(publish.includes('checking again before retrying'), 'tag and release creation retries must reuse this run\'s release tag');
+  assert.ok(publish.includes('node scripts/github-release.mjs'), 'GitHub tag/release creation must run the tested helper');
+  assert.ok(!publish.includes('api_get()'), 'inline GitHub tag lookup bash must not return; helper owns 422-as-missing');
   assert.ok(!publish.includes('Existing release tag'));
   assert.equal((publish.match(/id-token: write/g) ?? []).length, 1);
   assert.equal((publish.match(/^    environment: npm$/gm) ?? []).length, 1);

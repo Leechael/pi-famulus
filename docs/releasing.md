@@ -63,7 +63,7 @@ Repository configuration does not create npm packages or their trusted-publisher
 
 1. Confirm the public license/ownership and all five npm names before the first public release.
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
-3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and leaving **dry_run=true**. The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
+3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and **checking** `dry_run` (the UI default is now unchecked and would publish for real). The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
 4. Download all five `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the four native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
 5. Configure the table above under each package's npm Access / Trusted publishing settings. With current npm, the equivalent authenticated commands are:
 
@@ -85,7 +85,7 @@ The repository's `npm` GitHub environment was created and its single `main` bran
 
 ## Subsequent tokenless releases
 
-`publish.yml` does not take a version or tag. Dispatch from **main** and choose a channel:
+`publish.yml` does not take a version or tag. Dispatch from **main** and choose a channel. The workflow UI defaults to `patch` with `dry_run` unchecked (a real publish); first-time setup and artifact review still require an explicit dry run.
 
 | Channel | Version | npm dist-tag |
 |---|---|---|
@@ -110,6 +110,8 @@ gh workflow run publish.yml --ref main -f channel=patch -f dry_run=false
 A dry run proves package validity, **not** OIDC authentication or npm-side trust. For real publication, safe diagnostics assert OIDC request credentials are present without logging them. Successful OIDC/provenance must be verified from the publishing logs and npm metadata. Re-running an identical bootstrap version may skip every publish call; that is **not** an OIDC authentication test. Verify on a subsequent new version.
 
 Native packages publish before the root. The script preflights all five registry names/versions before its first mutation. Existing versions are skipped only if their SHA-512 tarball integrity equals the candidate; a mismatch or registry error stops publication. Releases are serialized with GitHub's `queue: max`: one active run and up to 100 pending runs. Active publication is not auto-cancelled. GitHub cancels additional arrivals beyond that queue limit; operators must inspect and explicitly redispatch those requests. npm versions cannot be overwritten. If a partial retry rebuilds different artifacts, fail closed and publish a new synchronized version rather than bypassing the integrity check.
+
+After a real npm publish, the same job creates the GitHub tag at the validated commit and a generated GitHub Release (`scripts/github-release.mjs`). Tag existence is resolved through the commits API so annotated tags peel to their commit SHA (`git/ref/tags` returns the tag-object SHA). A missing tag is HTTP 404 **or** the commits-API 422 `No commit found for SHA:`; other 4xx/5xx responses fail closed and never retarget an existing tag. Retries reuse this run's tag and SHA. A later dispatch computes a new version from npm, so a failed GitHub tag step must be recovered by re-running that same job (after this helper is on the job's SHA) or by creating that exact tag/release manually — not by dispatching a new channel bump.
 
 Verify a completed release with `npm view <package>@X.Y.Z version dist.integrity`, the provenance link, and clean installs on the four supported platforms. Roll back by installing a previously complete root version; its exact optional dependencies select the corresponding native build.
 
