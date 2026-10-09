@@ -41,7 +41,7 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
-Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun). The [2026-10-08 campaign review](2026-10-08-REVIEW.md) records model/thinking preflight, grader fixes, scenario-version differences, and retained failure caveats.
+Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun). The [2026-10-08 campaign review](2026-10-08-REVIEW.md) records model/thinking preflight, grader fixes, scenario-version differences, and retained failure caveats. The separate [targeted prompt experiments](2026-10-08-PROMPT-REVIEW.md) record333 later episodes: C1 showed no benefit; C2's Luna improvement did not clear the K3 execution-risk gate. Both product prompts were retained unchanged.
 
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
@@ -176,7 +176,7 @@ Each scenario's prompt and what it tests live in `scenarios/<id>.md` (same forma
 | `overrun-stuck` | interrupts a child that is past its `timeout_ms` and blocked on a silent shell (`subagent-overrun` wake, reminders every 20s); extending it, steering it only, or ignoring two reminders FAILs |
 | `overrun-progressing` | lets a child that is past its `timeout_ms` but printing progress finish (no action or `extend`), then writes its result; interrupting it FAILs |
 
-Each grade is PASS / FAIL / INVALID (setup precondition not met, e.g. the command finished before the budget). Invalid and errored episodes are excluded from rates. Unresolved parent-provider errors and unfinished parent responses at cutoff are classified from the pre-shutdown event prefix; shutdown-induced aborts do not taint grades, and recovered transient errors remain auditable. An independently proved PASS may retain a pending-response metric. Child-provider failures still require child artifacts to attribute.
+Each grade is PASS / FAIL / INVALID (setup precondition not met, e.g. the command finished before the budget). Invalid and errored episodes are excluded from rates. Unresolved parent-provider errors and unfinished parent responses at cutoff are classified from the pre-shutdown event prefix; shutdown-induced aborts do not taint grades, and recovered transient errors remain auditable. An independently proved PASS may retain a pending-response metric. An excluded ERR can also contain observed behavioral defects before cutoff, such as repeated rejected control calls; inspect those alongside the scored outcomes rather than describing every ERR as a pure provider outage. Child-provider failures still require child artifacts to attribute.
 
 Continuation probes require a separate opportunity to act: a target wake and final completion delivered in the same raw model turn (or both task completions in one coalesced wake) are INVALID, not evidence that the model waited. Missing turn metadata is unknown, not assumed batching. The still-running task requires separate unredirected script calls and parent-owned result-file writes so shell redirects cannot bypass the behavior under test.
 
