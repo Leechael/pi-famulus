@@ -4,9 +4,11 @@
 
 ## Proposed product change
 
+Prior labels used below come from the separate [2026-10-08 prompt review](2026-10-08-PROMPT-REVIEW.md): **C2** was that round's unadopted overrun-extension-rationale candidate; **K** was its silent-work safety-diagnostics round. In this 2026-10-09 sequence, **O** was a planned follow-up that was never started.
+
 - Retain C2's no-hard-ceiling rationale: extend for progress or a known useful silent workload within the user's timing constraints; a child shell timeout alone does not justify extension.
 - Clarify `subagent` parameter descriptions: `tasks`/`chain` launch new work only when `action` is omitted; control calls omit both fields, not placeholder tasks.
-- Only `extension/prompts/{wakes.md,tools/subagent.md}`, their generated projection and prompt-surface snapshot change. No schema shape, runtime, manager, default fixture/grader, dependency or hard-ceiling change. The proposed four files match sealed P byte-for-byte.
+- Only `extension/prompts/{wakes.md,tools/subagent.md}`, their generated projection and prompt-surface snapshot change. No schema shape, runtime, manager, default fixture/grader, dependency or hard-ceiling change. The four sealed product files match candidate P except for the post-review disambiguation of the no-ceiling overrun sentence (`or, by itself` → `and is not, by itself`).
 - N's verbose wake repair paragraph was rejected and removed. O was never started; it provides no efficacy evidence. The historical nonadoption decision in [PR #61](https://github.com/Leechael/pi-famulus/pull/61) is unchanged; this base does not contain that PR's report.
 
 ## Separate rounds, original verdicts

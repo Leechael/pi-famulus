@@ -607,7 +607,7 @@ exports[`model-visible prompt surface > wakes 1`] = `
     <command>./x.sh</command>
     <output-file>/tmp/o</output-file>
   </shell>
-  <options>It has not been stopped. Extend only when progress or a known, still-useful silent workload justifies more time within the user's timing constraints; a child shell timeout is not evidence of progress or, by itself, a reason to extend past the requested timeframe. Choose one: give it more time with subagent({ action: "extend", run_id: "run_1", child_id: "ch_1", timeout_ms: &lt;ms from now&gt; }); redirect it with agent_message({ action: "send", to: "ch_1", message: "&lt;instruction&gt;" }); or stop it with subagent({ action: "interrupt", run_id: "run_1", child_id: "ch_1" }). If you do none of these, it keeps running and the next reminder is scheduled in 10m; its result arrives as usual when it finishes.</options>
+  <options>It has not been stopped. Extend only when progress or a known, still-useful silent workload justifies more time within the user's timing constraints; a child shell timeout is not evidence of progress and is not, by itself, a reason to extend past the requested timeframe. Choose one: give it more time with subagent({ action: "extend", run_id: "run_1", child_id: "ch_1", timeout_ms: &lt;ms from now&gt; }); redirect it with agent_message({ action: "send", to: "ch_1", message: "&lt;instruction&gt;" }); or stop it with subagent({ action: "interrupt", run_id: "run_1", child_id: "ch_1" }). If you do none of these, it keeps running and the next reminder is scheduled in 10m; its result arrives as usual when it finishes.</options>
 </pi-famulus-wake>",
   "overrunBatch": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
 
@@ -627,7 +627,7 @@ exports[`model-visible prompt surface > wakes 1`] = `
     <command>./x.sh</command>
     <output-file>/tmp/o</output-file>
   </shell>
-  <options>It has not been stopped. Extend only when progress or a known, still-useful silent workload justifies more time within the user's timing constraints; a child shell timeout is not evidence of progress or, by itself, a reason to extend past the requested timeframe. Choose one: give it more time with subagent({ action: "extend", run_id: "run_1", child_id: "ch_1", timeout_ms: &lt;ms from now&gt; }); redirect it with agent_message({ action: "send", to: "ch_1", message: "&lt;instruction&gt;" }); or stop it with subagent({ action: "interrupt", run_id: "run_1", child_id: "ch_1" }). If you do none of these, it keeps running and the next reminder is scheduled in 10m; its result arrives as usual when it finishes.</options>
+  <options>It has not been stopped. Extend only when progress or a known, still-useful silent workload justifies more time within the user's timing constraints; a child shell timeout is not evidence of progress and is not, by itself, a reason to extend past the requested timeframe. Choose one: give it more time with subagent({ action: "extend", run_id: "run_1", child_id: "ch_1", timeout_ms: &lt;ms from now&gt; }); redirect it with agent_message({ action: "send", to: "ch_1", message: "&lt;instruction&gt;" }); or stop it with subagent({ action: "interrupt", run_id: "run_1", child_id: "ch_1" }). If you do none of these, it keeps running and the next reminder is scheduled in 10m; its result arrives as usual when it finishes.</options>
 </pi-famulus-wake>",
   "overrunCeiling": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
 
