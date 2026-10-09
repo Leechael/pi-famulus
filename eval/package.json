@@ -11,7 +11,7 @@
     "test:e2e": "node --test --test-concurrency=4 e2e/faux.test.ts e2e/ablation-harness.test.ts e2e/compat-context.test.ts",
     "test:graders": "node --test ablation/graders.test.ts",
     "test:tui": "PI_FAMULUS_E2E_TUI=1 node --test e2e/tui.test.ts",
-    "test:unit": "node --test lib/sandbox.test.ts lib/wake-adapter.test.ts ablation/stats.test.ts ablation/report.test.ts ablation/scenarios.test.ts ablation/monitor-waiter.test.ts ablation/matrix.test.ts",
+    "test:unit": "node --test lib/sandbox.test.ts lib/wake-adapter.test.ts lib/transcript.test.ts ablation/stats.test.ts ablation/report.test.ts ablation/scenarios.test.ts ablation/episode-error-policy.test.ts ablation/monitor-waiter.test.ts ablation/matrix.test.ts",
     "eval:smoke": "node ablation/run.ts --tier smoke",
     "eval:full": "node ablation/run.ts --tier full",
     "eval:report": "node ablation/report.ts",

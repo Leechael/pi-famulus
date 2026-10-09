@@ -20,6 +20,7 @@ import {
   type Grade,
   isPoll,
   stated,
+  successfulCallsBetween,
   wrongActions,
 } from "./graders.ts";
 import { scenarioText } from "./scenario-text.ts";
@@ -204,6 +205,13 @@ const stillRunningContinue: Scenario = {
       items,
       (w) => w.kind === "task" && w.tasks.some((t) => t.status === "completed" && slows.some((b) => b.taskId === t.id)),
     );
+    // Sequential notifications can be injected into one model request. In
+    // that case there was no opportunity to act on quick before learning slow
+    // had finished. Missing turn metadata is unknown, not evidence of batching.
+    if (quickWake && slowWake && (quickWake.seq === slowWake.seq ||
+      (quickWake.turnSeq !== undefined && quickWake.turnSeq === slowWake.turnSeq))) {
+      return { pass: null, reason: "quick and slow completions delivered together (no continuation opportunity)", metrics: {} };
+    }
     // The write under test is the model's own call after quick.sh's wake. If
     // the only write is the quick command itself (`./quick.sh > t && mv t
     // quick.txt`), the model never acted on a wake: nothing to grade.
@@ -238,7 +246,8 @@ const handoverContinue: Scenario = {
   timeoutMs: 120_000,
   quietMs: 4000,
   estCalls: 8,
-  done: (items, ep) => !!readFile(ep.cwd, "b-result.txt") || (wakes(items).some((w) => w.wake.kind === "subagent-done") && !!readFile(ep.cwd, "a-result.txt")),
+  done: (items, ep) => !!readFile(ep.cwd, "a-result.txt") &&
+    (!!readFile(ep.cwd, "b-result.txt") || wakes(items).some((w) => w.wake.kind === "subagent-done")),
   setup(cwd, secretDir) {
     writeFileSync(join(cwd, "alpha.txt"), `ALPHA-${Math.random().toString(36).slice(2, 10).toUpperCase()}\n`);
     writeFileSync(join(secretDir, "alpha"), readFileSync(join(cwd, "alpha.txt")));
@@ -249,10 +258,17 @@ const handoverContinue: Scenario = {
   },
   grade({ items, cwd, secretDir }) {
     const alpha = secret(secretDir, "alpha")[0];
-    const handover = firstWake(items, (w) => w.kind === "subagent-handover");
-    const done = firstWake(items, (w) => w.kind === "subagent-done");
+    // B can finish first when the alpha reader is slow. Its handover does not
+    // exercise the requested continuation from A while the rest of its run lasts.
+    const handover = firstWake(items, (w) => w.kind === "subagent-handover" && !!alpha && w.body.includes(alpha));
+    const done = firstWake(items, (w) => w.kind === "subagent-done" && (!handover || w.runId === handover.wake.runId));
     const subagentResult = toolResults(items).find((r) => r.toolName === "subagent" && (r.details as { status?: string })?.status === "backgrounded");
-    if (!handover) return { pass: null, reason: "no handover (run not backgrounded or children finished together)", metrics: { backgrounded: !!subagentResult } };
+    if (!handover || (done && handover.seq >= done.seq)) {
+      return { pass: null, reason: "no alpha-result handover before run completion", metrics: { backgrounded: !!subagentResult } };
+    }
+    if (done && handover.turnSeq !== undefined && handover.turnSeq === done.turnSeq) {
+      return { pass: null, reason: "alpha handover and run completion delivered together (no continuation opportunity)", metrics: { backgrounded: !!subagentResult } };
+    }
     const write = firstWriteOf(items, "a-result.txt");
     const aOk = (readFile(cwd, "a-result.txt") ?? "").includes(alpha);
     const beforeDone = !!write && (done === undefined || write.seq < done.seq);
@@ -284,24 +300,35 @@ const monitorNotSleep: Scenario = {
   },
   grade({ items, secretDir }) {
     const calls = callsBetween(items, -1);
+    const succeeded = successfulCallsBetween(items, -1);
     const bash = calls.filter((c) => c.name === "bash").map(cmd);
-    const usedMonitor = calls.some((c) => c.name === "monitor");
+    const usedMonitor = succeeded.some((c) => c.name === "monitor");
     // Event-driven waits: a follow + match that blocks until the line appears
     // (tail -f/-F | grep -m1 / grep -q / --line-buffered, inotifywait, fswatch).
-    const eventDriven = bash.filter((c) => /tail\s+(-n\s*\+?\d+\s+)?-[fF]\b|--follow|inotifywait|fswatch/.test(c) && !/\bsleep\b/.test(c)).length;
+    const eventDriven = succeeded.filter((c) => c.name === "bash").map(cmd)
+      .filter((c) => /tail\s+(-n\s*\+?\d+\s+)?-[fF]\b|--follow|inotifywait|fswatch/.test(c) && !/\bsleep\b/.test(c)).length;
     const sleepLoops = bash.filter((c) => /\bsleep\b|\bwhile\b|\buntil\b|\bfor\b.*\bdo\b/.test(c)).length;
     // Polling = checking again while the wait is armed, before the READY event
     // arrives. Looking at the log before arming it is not polling, and reading
     // it after the event is how a model may pick up the token.
     const tokens = secret(secretDir, "ready");
     const follows = (c: (typeof calls)[number]) => /tail\s+(-n\s*\+?\d+\s+)?-[fF]\b|--follow|inotifywait|fswatch/.test(cmd(c));
-    const armed = calls.find((c) => c.name === "monitor" || (c.name === "bash" && follows(c)));
+    const armed = succeeded.find((c) => c.name === "monitor" || (c.name === "bash" && follows(c)));
     // A slow first model call can land after READY: the first look at the
     // log already shows it, and no waiting was ever needed (gpt-6-sol, batch 5).
     const readsLog = (c: (typeof calls)[number]) =>
       (c.name === "bash" && /service\.log/.test(cmd(c)) && !follows(c)) || (c.name === "read" && /service\.log/.test(String(c.args.path)));
-    // The first call that shows the log's content (`ls` does not).
-    const firstLook = calls.find((c) => readsLog(c) && !/^\s*ls\b/.test(cmd(c)));
+    // Metadata/existence probes cannot reveal the READY line. This is a
+    // heuristic over simple shell segments, not a general shell parser; retain
+    // content reads in compounds such as `ls ...; cat service.log`.
+    // A failed grep can genuinely inspect the log (exit 1 = no match), but
+    // schema/guard rejection text may merely echo READY from the arguments.
+    const inspected = calls.filter((c) => succeeded.some((s) => s.id === c.id) ||
+      toolResults(items).some((r) => r.toolCallId === c.id && r.toolName === "bash" && c.name === "bash" &&
+        r.seq > c.seq && r.isError && /Command exited with code \d+/.test(r.text)));
+    const firstLook = inspected.find((c) => readsLog(c) && (c.name !== "bash" ||
+      cmd(c).split(/[;&|\n]+/).some((part) => /service\.log/.test(part) &&
+        !/^\s*[({]*\s*(?:\S*\/)?(?:ls|test|wc|stat|file|echo|printf|\[)(?=\s|$)/.test(part))));
     const firstLookResult = firstLook ? toolResults(items).find((r) => r.toolCallId === firstLook.id) : undefined;
     // A quiet probe (`grep -q READY service.log`) shows READY by succeeding.
     const quietProbe = !!firstLook && /\bgrep\b[^|;&]*\s(-\w*q\w*|--quiet|--silent)\b[^|;&]*READY/.test(cmd(firstLook));
@@ -377,7 +404,7 @@ const supervisorReply: Scenario = {
     const req = firstWake(items, (w) => w.kind === "supervisor-request");
     if (!req) return { pass: null, reason: "child never sent a supervisor-request", metrics: {} };
     const after = callsBetween(items, req.seq);
-    const reply = after.find((c) => c.name === "agent_message" && c.args.action === "reply");
+    const reply = successfulCallsBetween(items, req.seq).find((c) => c.name === "agent_message" && c.args.action === "reply");
     const wrong = after.filter(
       (c) => (c.name === "agent_message" && c.args.action !== "reply" && c.args.action !== "list") || (c.name === "subagent" && c.args.action === "steer"),
     );
@@ -409,11 +436,11 @@ const resumeFinished: Scenario = {
     };
   },
   grade({ items, cwd }) {
-    const runs = callsBetween(items, -1).filter((c) => c.name === "subagent" && (c.args.tasks || c.args.chain));
+    const succeeded = successfulCallsBetween(items, -1);
+    const runs = succeeded.filter((c) => c.name === "subagent" && (c.args.tasks || c.args.chain));
     if (runs.length === 0) return { pass: null, reason: "no subagent run started", metrics: {} };
     const later = callsBetween(items, runs[0].seq);
-    const resumeIdx = later.findIndex((c) => c.name === "subagent" && c.args.action === "resume");
-    const resume = resumeIdx >= 0 ? later[resumeIdx] : undefined;
+    const resume = succeeded.find((c) => c.seq > runs[0].seq && c.name === "subagent" && c.args.action === "resume");
     // agent_message send to a finished child now errors and points at subagent resume.
     const sendAttempts = later.filter((c) => c.name === "agent_message" && c.args.action === "send");
     const sendBeforeResume = sendAttempts.filter((c) => !resume || c.seq <= resume.seq).length;
@@ -504,9 +531,10 @@ const overrunStuck: Scenario = {
     // The wake carries <shell> only while the child waits on a foreground command.
     if (!/<shell\b/.test(first.wake.raw)) return { pass: null, reason: "child was not blocked on a shell at the overrun", metrics: {} };
     const after = callsBetween(items, first.seq);
-    const interrupt = after.find(isSubagentAction("interrupt"));
-    const extend = after.find(isSubagentAction("extend"));
-    const steer = after.find(isSteer);
+    const succeeded = successfulCallsBetween(items, first.seq);
+    const interrupt = succeeded.find(isSubagentAction("interrupt"));
+    const extend = succeeded.find(isSubagentAction("extend"));
+    const steer = succeeded.find(isSteer);
     const decidedAt = interrupt?.seq ?? Number.POSITIVE_INFINITY;
     const metrics = {
       overrunWakes: overruns.length,
@@ -554,9 +582,10 @@ const overrunProgressing: Scenario = {
     if (overruns.length === 0) return { pass: null, reason: "no subagent-overrun (child ended before its budget)", metrics: {} };
     const first = overruns[0];
     const after = callsBetween(items, first.seq);
-    const interrupt = after.find(isSubagentAction("interrupt"));
-    const extend = after.find(isSubagentAction("extend"));
-    const steer = after.find(isSteer);
+    const succeeded = successfulCallsBetween(items, first.seq);
+    const interrupt = succeeded.find(isSubagentAction("interrupt"));
+    const extend = succeeded.find(isSubagentAction("extend"));
+    const steer = succeeded.find(isSteer);
     const ids = secret(secretDir, "build");
     const fileOk = ids.some((id) => (readFile(cwd, "build-result.txt") ?? "").includes(id));
     const metrics = {

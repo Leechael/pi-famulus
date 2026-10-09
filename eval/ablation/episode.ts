@@ -2,11 +2,11 @@
 import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { ABLATION_EXT } from "../lib/paths.ts";
-import { PiRpc } from "../lib/rpc.ts";
+import { PiRpc, type RpcEvent } from "../lib/rpc.ts";
 import { createSandbox, hasRunningWork, waitManagerReady } from "../lib/sandbox.ts";
 import { assistants, itemsFromEvents } from "../lib/transcript.ts";
 import type { Grade } from "./graders.ts";
-import { errorAfterCompatibilityGrade } from "./episode-error-policy.ts";
+import { errorAfterCompatibilityGrade, errorBeforeShutdown } from "./episode-error-policy.ts";
 import { judge } from "./judge.ts";
 import { type Variant, variantFamulusConfig } from "./manifest.ts";
 import type { Scenario } from "./scenarios.ts";
@@ -76,6 +76,7 @@ export async function runEpisode(opts: {
   const bg = [] as Array<{ kill(sig?: NodeJS.Signals): boolean }>;
   let error: string | undefined;
   let endedAt: number | undefined;
+  let beforeShutdown: RpcEvent[] = [];
   try {
     await pi.ready(60_000);
     await waitManagerReady(sb, 15_000);
@@ -105,16 +106,27 @@ export async function runEpisode(opts: {
     error = (err as Error).message;
   } finally {
     endedAt = pi.now();
+    // Shutdown can finish an in-flight response with an abort. Capture the
+    // observed prefix by event boundary (timestamps can share a millisecond).
+    beforeShutdown = pi.events.slice();
     await pi.stop();
     for (const p of bg) p.kill("SIGKILL");
   }
-  const items = itemsFromEvents(pi.events);
-  const providerError = assistants(items).find((a) => a.stopReason === "error" || a.stopReason === "aborted");
-  if (!error && providerError && assistants(items).length === 1) error = `provider: ${providerError.errorMessage ?? providerError.stopReason}`;
+  const items = itemsFromEvents(beforeShutdown);
   const grade = scenario.grade({ items, cwd: sb.cwd, secretDir, endedAt });
   Object.assign(grade.metrics, setup.metadata ?? {});
-  if (scenario.optIn) grade.metrics.requestedModelSpec = opts.model;
-  error = errorAfterCompatibilityGrade(scenario, grade, error);
+  // ready() already records get_state: audit actual resolution without another
+  // request (notably thinking levels which pi may silently clamp).
+  const state = beforeShutdown.find((e) => e.type === "response" && e.command === "get_state" && e.success === true)?.data as
+    { model?: { provider?: string; id?: string; api?: string }; thinkingLevel?: string } | undefined;
+  Object.assign(grade.metrics, {
+    requestedModelSpec: opts.model,
+    modelProvider: state?.model?.provider ?? "unknown",
+    modelId: state?.model?.id ?? "unknown",
+    modelApi: state?.model?.api ?? "unknown",
+    thinkingLevel: state?.thinkingLevel ?? "unknown",
+  });
+  error = errorAfterCompatibilityGrade(scenario, grade, errorBeforeShutdown(beforeShutdown, grade, error));
   if (opts.judgeModel && scenario.judgeQuestion) {
     const excerpt = items
       .map((i) =>
@@ -132,7 +144,8 @@ export async function runEpisode(opts: {
     const verdict = await judge(opts.judgeModel, scenario.judgeQuestion, excerpt);
     grade.metrics.judge = verdict === null ? "unparsed" : verdict;
   }
-  const usage = assistants(items).reduce(
+  // Keep shutdown usage in the cost audit, but never use its messages to grade.
+  const usage = assistants(itemsFromEvents(pi.events)).reduce(
     (acc, a) => ({
       input: acc.input + (a.usage?.input ?? 0),
       output: acc.output + (a.usage?.output ?? 0),
