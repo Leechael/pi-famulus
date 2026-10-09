@@ -16,7 +16,7 @@ import type { OverrunTick } from "./overrun";
 export interface AgentDefinition {
   name: string; // ^[a-z][a-z0-9-]*$
   description: string; // required, non-empty
-  tools: string[]; // default ["read","bash","edit","write"]
+  tools?: string[]; // omitted: inherit user config; explicit list: allowlist; []: no user-configured tools (injected communication tools remain)
   model?: string; // "provider:id" | bare id
   // Mirror of src/agents/definition.ts — keep in sync with
   // src/thinking-levels.ts (VALID_THINKING_LEVELS), the single source.
@@ -168,13 +168,14 @@ export interface ChildSessionAdapter {
   /** Current queued steering drain mode, when supported by the runtime. */
   getSteeringMode?(): "all" | "one-at-a-time";
   subscribe(listener: (event: ChildSessionEvent) => void): () => void;
-  dispose(): void;
+  /** Await extension cleanup before releasing the underlying session. */
+  dispose(): void | Promise<void>;
 }
 
 export type CreateSessionFn = (req: ChildRunRequest) => Promise<ChildSessionAdapter>;
 
 export interface ChildRunner {
-  start(req: ChildRunRequest): Promise<ChildHandle>;
+  start(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<ChildHandle>;
 }
 
 /**
@@ -183,5 +184,6 @@ export interface ChildRunner {
  * duck-types this to release sessions in disposeRun().
  */
 export interface DisposableChildHandle extends ChildHandle {
-  dispose(): void;
+  /** Settles immediately; an optional promise tracks asynchronous session cleanup. */
+  dispose(): void | Promise<void>;
 }

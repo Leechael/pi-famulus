@@ -10,7 +10,6 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BUILTIN_AGENTS } from "../../src/agents/builtins";
 import {
-  DEFAULT_AGENT_TOOLS,
   parseAgentMarkdown,
   resolveAgent,
 } from "../../src/agents/definition";
@@ -56,9 +55,10 @@ describe("parseAgentMarkdown", () => {
     });
   });
 
-  it("applies defaults: tools default, model/thinking absent, empty body → empty prompt", () => {
+  it("omits tools to inherit user configuration, with model/thinking absent and an empty prompt", () => {
     const def = parseAgentMarkdown(MINIMAL_MD, "project");
-    expect(def.tools).toEqual([...DEFAULT_AGENT_TOOLS]);
+    expect(def.tools).toBeUndefined();
+    expect(def).not.toHaveProperty("tools");
     expect(def.model).toBeUndefined();
     expect(def.thinking).toBeUndefined();
     expect(def.systemPrompt).toBe("");
@@ -147,14 +147,15 @@ describe("parseAgentMarkdown", () => {
 });
 
 describe("builtins", () => {
-  it("ships at least explorer and worker with the contracted tool sets", () => {
+  it("keeps explorer restricted while worker inherits user-configured tools", () => {
     const names = BUILTIN_AGENTS.map((d) => d.name);
     expect(names).toContain("explorer");
     expect(names).toContain("worker");
     const explorer = BUILTIN_AGENTS.find((d) => d.name === "explorer")!;
     const worker = BUILTIN_AGENTS.find((d) => d.name === "worker")!;
     expect(explorer.tools).toEqual(["read", "grep", "find", "ls", "bash"]);
-    expect(worker.tools).toEqual(["read", "bash", "edit", "write"]);
+    expect(worker.tools).toBeUndefined();
+    expect(worker).not.toHaveProperty("tools");
     expect(explorer.source).toBe("builtin");
     expect(explorer.path).toBeUndefined();
   });
@@ -209,6 +210,17 @@ describe("loadAgentDefinitions", () => {
     expect(explorer.tools).toEqual(["read"]);
     expect(explorer.source).toBe("user");
     expect(explorer.path).toBe(join(userDir, "explorer.md"));
+  });
+
+  it("preserves inherited tools and explicit empty allowlists through loading", () => {
+    write(userDir, "inherited.md", agentMd("inherited", "uses user config"));
+    write(projectDir, "restricted.md", agentMd("restricted", "no tools", "tools: []"));
+    const report = loadAgentDefinitions({ userDir, projectDir });
+    expect(report.errors).toEqual([]);
+    const inherited = report.definitions.find((d) => d.name === "inherited")!;
+    const restricted = report.definitions.find((d) => d.name === "restricted")!;
+    expect(inherited).not.toHaveProperty("tools");
+    expect(restricted.tools).toEqual([]);
   });
 
   it("project definition overrides a user definition of the same name", () => {

@@ -18,7 +18,6 @@ export const BUILTIN_AGENTS: AgentDefinition[] = [
   {
     name: "worker",
     description: PROMPTS["agents.worker.description"],
-    tools: ["read", "bash", "edit", "write"],
     systemPrompt: PROMPTS["agents.worker.system-prompt"],
     source: "builtin",
   },

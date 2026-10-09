@@ -11,25 +11,28 @@ import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
-import type { ChildRunRequest } from "../../src/subagent/types";
+import type { ChildHandle, ChildRunRequest, DisposableChildHandle } from "../../src/subagent/types";
 import { SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
 
 const MIN = 60_000;
 
-function makeStack() {
+function makeStack(creationGate?: Promise<void>, exposeHandle = true) {
   const clock = new ManualClock();
   const registry = new SubagentRegistry({ clock });
   const factory = new SessionFactory();
   factory.autoComplete = null;
   const runner = new InProcessRunner({
-    createSession: factory.fn,
+    createSession: async (req) => {
+      if (creationGate) await creationGate;
+      return factory.fn(req);
+    },
     clock,
     stallMs: 5 * MIN,
     stallRetries: 1,
     stallRetryDelayMs: 5_000,
     acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
   });
-  registry.setRunner(runner);
+  registry.setRunner(exposeHandle ? runner : { start: (req) => runner.start(req) });
   const transitions: string[] = [];
   registry.onTransition((run) => {
     const line = run.children.map((c) => c.status).join(",");
@@ -133,6 +136,199 @@ describe("child lifecycle", () => {
     expect(second).toMatchObject({ status: "completed", text: "second", attempts: 2 });
     expect(registry.get(runId)!.children[0].status).toBe("completed");
   });
+
+  it("awaits interruption of a late custom handle before disposing it", async () => {
+    const { registry, req } = makeStack();
+    let resolveStart!: (handle: ChildHandle) => void;
+    registry.setRunner({ start: () => new Promise((resolve) => { resolveStart = resolve; }) });
+    const starting = registry.startChild(req);
+    await tick();
+    let finishInterrupt!: () => void;
+    const interruptGate = new Promise<void>((resolve) => { finishInterrupt = resolve; });
+    let interruptStarted = false;
+    let disposedAfterInterrupt = false;
+    const lateHandle = {
+      interrupt: async () => { interruptStarted = true; await interruptGate; },
+      dispose: () => { disposedAfterInterrupt = interruptStarted && !disposedAfterInterrupt; },
+    } as ChildHandle & { dispose(): void };
+    const disposal = registry.disposeAll();
+    resolveStart(lateHandle);
+    await tick();
+    expect(interruptStarted).toBe(true);
+    expect(disposedAfterInterrupt).toBe(false);
+    finishInterrupt();
+    await disposal;
+    await starting;
+    expect(disposedAfterInterrupt).toBe(true);
+  });
+
+  it("disposal during rejected session creation does not report a cleanup failure", async () => {
+    let rejectCreation!: (error: Error) => void;
+    const gate = new Promise<void>((_resolve, reject) => { rejectCreation = reject; });
+    const { registry, req } = makeStack(gate);
+    const starting = registry.startChild(req);
+    await tick();
+    const disposal = registry.disposeAll();
+    rejectCreation(new Error("session startup failed"));
+    await expect(disposal).resolves.toBeUndefined();
+    const handle = await starting;
+    expect((await handle.result).status).toBe("interrupted");
+  });
+
+  it("disposal during session creation awaits late cleanup exactly once without prompting", async () => {
+    let finishCreation!: () => void;
+    const gate = new Promise<void>((resolve) => { finishCreation = resolve; });
+    const { registry, factory, req } = makeStack(gate);
+    let finishCleanup!: () => void;
+    const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
+    let disposalCalls = 0;
+    factory.configure = (session) => {
+      session.dispose = () => { disposalCalls++; return cleanup; };
+    };
+    const starting = registry.startChild(req);
+    await tick();
+    expect(factory.sessions).toHaveLength(0);
+    let disposed = false;
+    const disposal = registry.disposeAll().then(() => { disposed = true; });
+    expect(registry.list()).toEqual([]);
+    await tick();
+    expect(disposed).toBe(false);
+    finishCreation();
+    await tick();
+    expect(factory.sessions).toHaveLength(1);
+    expect(disposalCalls).toBe(1);
+    expect(factory.sessions[0].prompts).toEqual([]);
+    expect(disposed).toBe(false);
+    finishCleanup();
+    await disposal;
+    const handle = await starting;
+    expect((await handle.result).status).toBe("interrupted");
+    expect(disposalCalls).toBe(1);
+  });
+
+  it("awaits late handles from custom runners that ignore the startup callback", async () => {
+    let finishCreation!: () => void;
+    const gate = new Promise<void>((resolve) => { finishCreation = resolve; });
+    const { registry, factory, req } = makeStack(gate, false);
+    let finishCleanup!: () => void;
+    const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
+    let disposalCalls = 0;
+    factory.configure = (session) => {
+      session.dispose = () => { disposalCalls++; return cleanup; };
+    };
+    const starting = registry.startChild(req);
+    await tick();
+    let disposed = false;
+    const disposal = registry.disposeAll().then(() => { disposed = true; });
+    expect(registry.list()).toEqual([]);
+    await tick();
+    expect(disposed).toBe(false);
+    finishCreation();
+    await tick();
+    expect(disposalCalls).toBe(1);
+    expect(disposed).toBe(false);
+    finishCleanup();
+    await disposal;
+    expect((await (await starting).result).status).toBe("interrupted");
+    expect(disposalCalls).toBe(1);
+  });
+
+  it("runner disposal settles immediately but awaits asynchronous session cleanup", async () => {
+    const { clock, registry, factory, req } = makeStack();
+    let finishCleanup!: () => void;
+    const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
+    factory.configure = (session) => { session.dispose = () => cleanup; };
+    const handle = await registry.startChild(req) as DisposableChildHandle;
+    let disposed = false;
+    const disposal = Promise.resolve(handle.dispose()).then(() => { disposed = true; });
+    expect((await handle.result).status).toBe("interrupted");
+    expect(clock.pendingTimers).toBe(0);
+    await tick();
+    expect(disposed).toBe(false);
+    finishCleanup();
+    await disposal;
+    expect(disposed).toBe(true);
+  });
+
+  it.each(["disposeRun", "disposeAll"] as const)(
+    "%s removes runs immediately but waits for every child cleanup",
+    async (method) => {
+      const { clock, registry, factory, req, runId } = makeStack();
+      const finishCleanup: Array<() => void> = [];
+      factory.configure = (session) => {
+        const cleanup = new Promise<void>((resolve) => { finishCleanup.push(resolve); });
+        session.dispose = () => cleanup;
+      };
+      const first = await registry.startChild(req);
+      const otherRun = method === "disposeAll" ? registry.createRun("tasks") : registry.get(runId)!;
+      const childId = registry.addChild(otherRun.runId, { name: "second", agent: "worker" });
+      const second = await registry.startChild({ ...req, childId, runId: otherRun.runId });
+      let disposed = false;
+      const disposal = Promise.resolve(
+        method === "disposeAll" ? registry.disposeAll() : registry.disposeRun(runId),
+      ).then(() => { disposed = true; });
+      expect(registry.list()).toEqual([]);
+      expect(clock.pendingTimers).toBe(0);
+      expect((await first.result).status).toBe("interrupted");
+      expect((await second.result).status).toBe("interrupted");
+      await tick();
+      expect(disposed).toBe(false);
+      finishCleanup[0]();
+      await tick();
+      expect(disposed).toBe(false);
+      finishCleanup[1]();
+      await disposal;
+      expect(disposed).toBe(true);
+    },
+  );
+
+  it.each(["sync", "async"])("runner propagates %s cleanup failures after settling", async (mode) => {
+    const { clock, registry, factory, req } = makeStack();
+    const failure = new Error("cleanup failed");
+    factory.configure = (session) => {
+      session.dispose = () => {
+        if (mode === "sync") throw failure;
+        return Promise.reject(failure);
+      };
+    };
+    const handle = await registry.startChild(req) as DisposableChildHandle;
+    if (mode === "sync") expect(() => handle.dispose()).toThrow(failure);
+    else await expect(handle.dispose()).rejects.toBe(failure);
+    expect((await handle.result).status).toBe("interrupted");
+    expect(clock.pendingTimers).toBe(0);
+  });
+
+  it.each(["disposeRun", "disposeAll"] as const)(
+    "%s propagates cleanup rejection only after all sessions finish",
+    async (method) => {
+      const { registry, factory, req, runId } = makeStack();
+      const failure = new Error("extension shutdown failed");
+      let finishCleanup!: () => void;
+      factory.configure = (session, request) => {
+        session.dispose = request.childId === req.childId
+          ? () => Promise.reject(failure)
+          : () => new Promise<void>((resolve) => { finishCleanup = resolve; });
+      };
+      await registry.startChild(req);
+      const otherRun = method === "disposeAll" ? registry.createRun("tasks") : registry.get(runId)!;
+      const childId = registry.addChild(otherRun.runId, { name: "second", agent: "worker" });
+      await registry.startChild({ ...req, childId, runId: otherRun.runId });
+      let settled = false;
+      const outcome = (method === "disposeAll" ? registry.disposeAll() : registry.disposeRun(runId))
+        .then(() => { throw new Error("expected cleanup failure"); }, (error) => {
+          settled = true;
+          return error;
+        });
+      await tick();
+      expect(settled).toBe(false);
+      expect(registry.list()).toEqual([]);
+      finishCleanup();
+      const error = await outcome;
+      expect(error).toBeInstanceOf(AggregateError);
+      if (method === "disposeRun") expect(error.errors).toEqual([failure]);
+      else expect(error.errors[0].errors).toEqual([failure]);
+    },
+  );
 
   it("disposeRun settles the child interrupted and clears the generation timers", async () => {
     const { clock, registry, factory, req, status, runId } = makeStack();

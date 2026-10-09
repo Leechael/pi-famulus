@@ -109,6 +109,10 @@ thinking: high
 You are a reviewer… (body = system prompt segment)
 ```
 
+Omit `tools` to inherit the user’s pi `defaultTools`; the built-in worker does this. An explicit list restricts the child to those tools, plus famulus communication tools; `tools: []` permits only communication. Children load user/global and trusted-project settings, extensions, skills, prompts, and context files, including configured codemode and MCP. Famulus skips parent-tool initialization in children and supplies a foreground-only bash replacement when bash is enabled. Parent-only CLI resource overrides are not copied.
+
+Requires pi 1.0.0 or newer. CI checks 1.0.0, 1.0.4, and the latest published version.
+
 ## Configuration `~/.pi/agent/pi-famulus/config.json`
 
 ```json

@@ -26,8 +26,8 @@ export interface AgentDefinition {
   name: string;
   /** Required, non-empty. */
   description: string;
-  /** Tool allowlist. Defaults to ["read","bash","edit","write"]. */
-  tools: string[];
+  /** Omitted: inherit user-configured tools. Explicit list: allowlist; []: disables user-configured tools, but injected Famulus tools remain. */
+  tools?: string[];
   /** "provider:id" or bare id. */
   model?: string;
   /** Thinking level (pi core parity; src/thinking-levels.ts). */
@@ -38,8 +38,6 @@ export interface AgentDefinition {
   /** Filesystem path; builtins have none. */
   path?: string;
 }
-
-export const DEFAULT_AGENT_TOOLS: readonly string[] = ["read", "bash", "edit", "write"];
 
 const NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
 
@@ -168,7 +166,7 @@ export function parseAgentMarkdown(
   const description = parseScalar(fields.description, "description", fail);
   if (description === "") fail("field 'description' must be non-empty");
 
-  let tools = [...DEFAULT_AGENT_TOOLS];
+  let tools: string[] | undefined;
   if (fields.tools !== undefined) {
     tools = parseStringArray(fields.tools, "tools", fail);
   }
@@ -195,7 +193,7 @@ export function parseAgentMarkdown(
   return {
     name,
     description,
-    tools,
+    ...(tools !== undefined ? { tools } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(thinking !== undefined ? { thinking } : {}),
     systemPrompt: body.trim(),

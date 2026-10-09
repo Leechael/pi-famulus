@@ -31,6 +31,12 @@ import type {
   DisposableChildHandle,
 } from "./types";
 
+async function awaitDisposals(disposals: Array<void | Promise<void>>): Promise<void> {
+  const results = await Promise.allSettled(disposals);
+  const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (errors.length > 0) throw new AggregateError(errors, "Child session cleanup failed");
+}
+
 // ---------------------------------------------------------------------------
 // Appendix B public record shape
 // ---------------------------------------------------------------------------
@@ -70,7 +76,7 @@ export interface RunRegistry {
   findChild(runId: string, childIdOrName: string): ChildHandle | undefined;
   lineage(runIdA: string, runIdB: string): boolean; // v1: same runId
   onTransition(cb: (run: RunRecord) => void): void; // fleet widget / notifications
-  disposeRun(runId: string): void;
+  disposeRun(runId: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +130,7 @@ interface InternalChild {
   endedAt?: number;
   turn: number;
   handle?: ChildHandle;
+  starting?: Promise<ChildHandle>;
   shouldStart?: () => boolean;
   /** Initial admission wait while runner.start() has not returned its handle. */
   queueStartedAt?: number;
@@ -283,7 +290,7 @@ export class SubagentRegistry implements RunRegistry {
     this.transitionCbs.add(cb);
   }
 
-  disposeRun(runId: string): void {
+  async disposeRun(runId: string): Promise<void> {
     const run = this.runs.get(runId);
     if (!run) return;
     const now = this.now();
@@ -309,17 +316,26 @@ export class SubagentRegistry implements RunRegistry {
     this.recomputeRunStatus(run);
     this.emit(run);
     this.runs.delete(runId);
+    const disposals: Array<void | Promise<void>> = [];
     for (const child of run.children) {
       this.children.delete(child.childId);
       const handle = child.handle as DisposableChildHandle | undefined;
-      if (!handle) continue;
+      if (!handle) {
+        // Custom runners may not expose a handle until startup completes.
+        if (child.starting) disposals.push(child.starting.then(async (lateHandle) => {
+          await lateHandle.interrupt().catch(() => {});
+          await (lateHandle as DisposableChildHandle).dispose?.();
+        }, () => {}));
+        continue;
+      }
       void handle.interrupt().catch(() => {});
       try {
-        handle.dispose?.();
-      } catch {
-        // ignore
+        disposals.push(handle.dispose?.());
+      } catch (error) {
+        disposals.push(Promise.reject(error));
       }
     }
+    await awaitDisposals(disposals);
   }
 
   // -------------------------------------------------------------------------
@@ -375,11 +391,16 @@ export class SubagentRegistry implements RunRegistry {
     child.queueStartedAt = this.now();
     let handle: ChildHandle;
     try {
-      handle = await runner.start(req);
+      child.starting = runner.start(req, (startingHandle) => { child.handle = startingHandle; });
+      handle = await child.starting;
     } catch (error) {
       this.closeInitialQueue(child, this.now());
       throw error;
+    } finally {
+      child.starting = undefined;
     }
+    // Teardown already owns this handle and its asynchronous cleanup.
+    if (!this.children.has(child.childId)) return handle;
     this.closeInitialQueue(child, this.now());
     child.handle = handle;
     // Preserve the session's effective model and thinking setting, not a raw
@@ -592,10 +613,8 @@ export class SubagentRegistry implements RunRegistry {
   }
 
   /** Dispose every run (session shutdown). */
-  disposeAll(): void {
-    for (const runId of [...this.runs.keys()]) {
-      this.disposeRun(runId);
-    }
+  async disposeAll(): Promise<void> {
+    await awaitDisposals([...this.runs.keys()].map((runId) => this.disposeRun(runId)));
   }
 
   // -------------------------------------------------------------------------

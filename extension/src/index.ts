@@ -43,7 +43,7 @@ import {
 import { TranscriptWriter } from "./subagent/transcript";
 import { FleetWidget } from "./subagent/fleet-widget";
 import { WorkIndex, type WorkItem } from "./work-index";
-import { createPiSessionFn, modelCandidates } from "./subagent/pi-runtime";
+import { createPiSessionFn, isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
 import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
@@ -70,6 +70,7 @@ function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
 }
 
 export default function (pi: ExtensionAPI): void {
+  if (isFamulusChildSession(pi)) return;
   registerBehaviorGuidelines(pi);
   const home = getFamulusHome();
   const config = loadConfig(home);
@@ -448,7 +449,8 @@ export default function (pi: ExtensionAPI): void {
     });
     fleetWidget?.dispose();
     fleetWidget = null;
-    subagentRegistry?.disposeAll();
+    comms.dispose(); // Release decision waiters before awaiting child aborts.
+    await subagentRegistry?.disposeAll().catch(() => {});
     subagentRegistry = null;
     for (const controller of pendingAgentReregistrations.values()) controller.abort();
     pendingAgentReregistrations.clear();
@@ -559,6 +561,7 @@ export default function (pi: ExtensionAPI): void {
       getParentThinkingLevel: () => ctx?.thinkingLevel,
       getScopedModels: () => ctx?.scopedModels ?? [],
       getCwd: () => ctx?.cwd ?? process.cwd(),
+      getProjectTrusted: () => ctx?.isProjectTrusted() ?? false,
       customTools: (req) => {
         const tools: Array<ToolDefinition<any, any, any>> = [
           // M4: every child can reach the supervisor and its siblings.
@@ -567,21 +570,19 @@ export default function (pi: ExtensionAPI): void {
         ];
         // The no-background bash variant replaces the built-in bash inside
         // child sessions (custom tools override builtins by name).
-        if (req.agent.tools.includes("bash")) {
-          tools.push(
-            createChildBashTool({
-              getClient: () => client,
-              home,
-              sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
-              sessionEnv: () => (ctx ? sessionEnv(ctx) : {}),
-              trackTask,
-              childId: req.childId,
-              runId: req.runId,
-              clock,
-              shells: childShells,
-            }),
-          );
-        }
+        tools.push(
+          createChildBashTool({
+            getClient: () => client,
+            home,
+            sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
+            sessionEnv: () => (ctx ? sessionEnv(ctx) : {}),
+            trackTask,
+            childId: req.childId,
+            runId: req.runId,
+            clock,
+            shells: childShells,
+          }),
+        );
         return tools;
       },
     });
@@ -788,19 +789,22 @@ export default function (pi: ExtensionAPI): void {
     exitWatchdog.dispose();
     fleetWidget?.dispose();
     fleetWidget = null;
-    subagentRegistry?.disposeAll();
+    comms.dispose(); // Release decision waiters before awaiting child aborts.
+    await subagentRegistry?.disposeAll().catch(() => {});
     subagentRegistry = null;
     agentLoader = null;
-    comms.dispose(); // resolve orphaned need_decision waiters
     monitorRegistry?.disposeAll();
     notifyCenter?.dispose();
     const current = client;
     client = null;
     if (current) {
-      if (current.isAvailable()) {
-        await current.shutdownSession().catch(() => {});
+      try {
+        if (current.isAvailable()) await current.shutdownSession();
+      } catch {
+        // Child teardown is best-effort; still release the manager connection.
+      } finally {
+        await current.close().catch(() => {});
       }
-      await current.close();
     }
     ctx = null;
   });

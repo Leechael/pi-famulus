@@ -41,6 +41,7 @@
 import { realClock, TimerScope, type Clock, type ClockTimer } from "../clock";
 import type { OverrunTick } from "./overrun";
 import type {
+  ChildHandle,
   ChildResult,
   ChildRunRequest,
   ChildRunner,
@@ -122,8 +123,9 @@ export class InProcessRunner implements ChildRunner {
     this.opts = opts;
   }
 
-  async start(req: ChildRunRequest): Promise<DisposableChildHandle> {
+  async start(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<DisposableChildHandle> {
     const handle = new InProcessChildHandle(req, this.opts);
+    onHandle?.(handle);
     await handle.launch();
     return handle;
   }
@@ -144,6 +146,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly onActivity?: (childId: string) => void;
 
   private session: ChildSessionAdapter | null = null;
+  private sessionCreation: Promise<ChildSessionAdapter> | null = null;
   private resolvedModel_: string | undefined;
   private unsubscribe: (() => void) | null = null;
   private status_: ChildStatus = "pending";
@@ -196,6 +199,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** Whether the current generation's settled result is terminal for this child. */
   private terminalSettle = false;
   private disposed = false;
+  private disposalPromise: Promise<void> | undefined;
   /** Nested current-generation tool calls. Stall stays paused while > 0. */
   private toolDepth = 0;
   /** Start generation by Pi toolCallId so late end events cannot close a new interval. */
@@ -474,7 +478,8 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
   }
 
-  dispose(): void {
+  dispose(): void | Promise<void> {
+    if (this.disposed) return this.disposalPromise;
     this.disposed = true;
     this.clearTimers();
     if (this.unsubscribe) {
@@ -487,18 +492,18 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
     const session = this.session;
     this.session = null;
-    if (session) {
-      try {
-        session.dispose();
-      } catch {
-        // ignore
-      }
+    try {
+      this.disposalPromise = session
+        ? session.dispose() || undefined
+        : this.sessionCreation?.then((created) => created.dispose(), () => {});
+      return this.disposalPromise;
+    } finally {
+      // Never leave result waiters hanging, even when cleanup throws or awaits.
+      this.settle(this.generation, { status: "interrupted", text: "", error: "disposed", durationMs: 0 });
+      // settle() can be a no-op if the child was already interrupted; disposal
+      // is terminal and must still return its retained machine permit.
+      this.release(true);
     }
-    // Never leave result waiters hanging.
-    this.settle(this.generation, { status: "interrupted", text: "", error: "disposed", durationMs: 0 });
-    // settle() can be a no-op if the child was already interrupted; disposal
-    // is terminal and must still return its retained machine permit.
-    this.release(true);
   }
 
   // -------------------------------------------------------------------------
@@ -516,6 +521,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     reuseSlot = false,
     resumedGen?: number,
   ): Promise<void> {
+    if (this.disposed) return;
     // Stall retries replace a generation without settling the user turn.
     if (reuseSlot) this.pruneToolCalls(this.generation);
     // A resumed turn allocated its generation when it was requested.
@@ -590,8 +596,12 @@ class InProcessChildHandle implements DisposableChildHandle {
 
     if (first) {
       try {
-        this.session = await this.createSession(this.req);
-        this.resolvedModel_ = this.session.resolvedModel;
+        this.sessionCreation = this.createSession(this.req);
+        const created = await this.sessionCreation;
+        // dispose() owns cleanup of an adapter that resolves after teardown.
+        if (this.disposed) return;
+        this.session = created;
+        this.resolvedModel_ = created.resolvedModel;
       } catch (err) {
         this.settle(gen, {
           status: "failed",
@@ -600,6 +610,8 @@ class InProcessChildHandle implements DisposableChildHandle {
           durationMs: this.now() - this.startedAt,
         });
         return;
+      } finally {
+        this.sessionCreation = null;
       }
       if (this.disposed || this.isSettled(gen)) {
         this.release();

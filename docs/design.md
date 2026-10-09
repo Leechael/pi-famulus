@@ -472,7 +472,7 @@ Modules: `src/subagent/` (types.ts / runner.ts / registry.ts / pool.ts / tool.ts
 
 **Strict pi-runtime isolation rule**: `createAgentSession` may be **dynamically imported** only in `pi-runtime.ts` (`await import("@earendil-works/pi-coding-agent")`); all other modules have zero runtime pi dependencies (`import type` is allowed). The runner creates child sessions through an injected `CreateSessionFn` factory, faked in tests. If dynamic import fails, the subagent tool returns explicit error text without affecting other tools.
 
-**Child-session construction** (pi SDK verified): `createAgentSession({ cwd, model?, thinkingLevel?, tools: allowlist, customTools: [contact_supervisor, etc.], sessionManager: SessionManager.inMemory() })`; model resolution uses `ctx.modelRegistry.find(provider, id)` / `getAvailable()`; default model = parent session's current model (`ctx.model`). Child-session objects remain in the registry until session_shutdown, so "resume" = another `prompt()` on the same object (v1 does not reconstruct across processes).
+**Child-session construction** (pi SDK verified): `createAgentSession({ cwd, model?, thinkingLevel?, tools?: explicit allowlist, customTools: [contact_supervisor, etc.], sessionManager: SessionManager.inMemory() })`; model resolution uses `ctx.modelRegistry.find(provider, id)` / `getAvailable()`; default model = parent session's current model (`ctx.model`). Child-session objects remain in the registry until session_shutdown, so "resume" = another `prompt()` on the same object (v1 does not reconstruct across processes).
 
 **Tool schema** (typebox, field-name contract):
 
@@ -499,7 +499,7 @@ subagent({
 - One child failure does not bring down the group: mark that result entry `status:"failed", error`; fail_fast=true cancels unstarted entries
 - Result text: each child's `session.getLastAssistantText()`; empty → "(no output)"
 - Depth: extension records its own depth (main=0); child-session tools **exclude subagent** (hard depth-1 cap, no deeper nesting in v1)
-- **Child session isolation**: `createPiSessionFn` explicitly passes `DefaultResourceLoader({ cwd, agentDir, noExtensions:true, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true })`; no user/project extensions, skills, prompt templates, themes, or context files load. In particular, never load the parent extension, whose session_start / before_agent_start would inject parent wake guidelines into the child prompt. Children still receive `CHILD_BEHAVIOR_GUIDELINES` separately; no configuration switch.
+- **Child configuration and isolation** (pi ≥1.0.0): each child uses a file-backed SettingsManager and ordinary resource discovery, preserving global/project paths and the parent’s project trust decision. Named built-in factories provide codemode, tool-search, and MCP while respecting user enable/disable settings; `bindExtensions()` runs startup/resource-discovery hooks. A session-local event-bus probe makes famulus return before parent initialization. SDK custom tools add communication and replace enabled bash without background support; children receive `CHILD_BEHAVIOR_GUIDELINES`. Omitted agent tools inherit `defaultTools`; explicit lists, including `[]`, restrict access plus communication. Explicit non-MCP allowlists exclude MCP tools across supported SDK versions. Disposal awaits child shutdown hooks and MCP cleanup, including sessions still being created. Parent-only CLI resource overrides are not copied. CI checks pi 1.0.0, 1.0.4, and latest.
 - **Unified clock and generation timer ownership**: the extension creates one `Clock` and injects it into time-dependent services. `ManualClock` deterministically runs timers by deadline, then insertion order for ties; already-due timers created during `advance()` also run, clearing a timer inside a callback prevents later execution, and intervals crossed by a large advance fire once per due point. Each child generation owns a `TimerScope`; settle, interrupt, resume, or dispose clears all timeouts in that scope, preventing expired generations from affecting later state. No Effect-TS required; the rejected pilot's rationale and measurements are in `docs/decisions/effect-child-runner-pilot.md`.
 - Child bash: `child-bash.ts` forbids backgrounding—schema has no `run_in_background`; execute uses manager start + wait (full timeout_ms), SIGKILLs on expiry and returns a timeout error (never backgrounds); bare-sleep interception matches main bash
 - Limits: global concurrency 8 (across runs); stall watchdog—no child events for `stallMs` (default 5min) → abort and automatically continue on the **same session** (continuation prompt, transcript preserved), up to `stallRetries` (default 1), only then mark `failed (stalled)`; session spawn budget 32 children/hour, error on excess
@@ -592,7 +592,7 @@ Markdown files, frontmatter (hand-parsed YAML subset, no dependency):
 ---
 name: explorer
 description: Fast codebase exploration — finds files, symbols, answers structure questions
-tools: [read, bash, grep, find, ls]     # or `read, bash, grep, find, ls`; default = [read, bash, edit, write]
+tools: [read, bash, grep, find, ls]     # optional allowlist; omit to inherit user defaultTools
 model: anthropic:claude-haiku-4-5       # optional; "provider:id" or bare id
 thinking: high                          # optional: off|minimal|low|medium|high|xhigh|max (src/thinking-levels.ts)
 ---
@@ -601,7 +601,7 @@ You are an explorer agent. ... (body = appended system prompt segment)
 ```
 
 - Three override tiers (later wins): builtin → `~/.pi/agent/agents/**/*.md` → `<cwd>/.pi/agents/**/*.md`; same-name definitions override, `description` required, `name` must match `^[a-z][a-z0-9-]*$`
-- At least two builtins: `explorer` (read-only tools), `worker` (all tools)
+- At least two builtins: `explorer` (explicit read-only tool allowlist), `worker` (inherits user default tools)
 - Loading: session_start + lazy reload before each subagent call (mtime cache; skip files that fail parsing and report them in status)
 - Unknown name: `subagent({agent:"xxx"})` errors, listing available agent names
 
@@ -716,7 +716,7 @@ export function isValidThinkingLevel(level: string): level is ThinkingLevel;
 export interface AgentDefinition {
   name: string;                 // ^[a-z][a-z0-9-]*$
   description: string;          // required, nonempty
-  tools: string[];              // default ["read","bash","edit","write"]
+  tools?: string[];             // omitted: inherit defaultTools; []: communication only
   model?: string;               // "provider:id" | bare id
   thinking?: ThinkingLevel;      // off|minimal|low|medium|high|xhigh|max (src/thinking-levels.ts)
   systemPrompt: string;         // frontmatter body, trimmed
