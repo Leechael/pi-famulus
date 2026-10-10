@@ -560,3 +560,18 @@ test('workflow literal security, release graph and host/target contracts', () =>
   const runBodies = workflowRunBodies(publish);
   assert.ok(!/\$\{\{[^}]+\}\}/.test(runBodies));
 });
+
+test('release version is written back to main only after a real, successful publish', () => {
+  const publish = workflow('publish');
+  const record = publish.match(/^  record-version:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
+  assert.ok(record, 'record-version job must exist');
+  assert.match(record, /^    needs: \[validate, publish\]$/m, 'must wait for the publish job (which creates the tag and release)');
+  assert.match(record, /^    if: needs\.validate\.outputs\.dry_run == 'false'$/m, 'dry runs must not write to main');
+  assert.match(record, /^          ref: main$/m, 'edit the latest main, not the tagged commit');
+  assert.match(record, /node scripts\/writeback-release\.mjs "\$RELEASE_VERSION"/);
+  assert.match(record, /origin HEAD:main/);
+  assert.match(record, /chore\(release\): v\$RELEASE_VERSION/);
+  assert.ok(!/id-token/.test(record) && !/environment:/.test(record), 'the write-back job needs neither npm OIDC nor the npm environment');
+  assert.match(record, /^      contents: write$/m);
+  assert.ok(!/NPM|npm publish/.test(record), 'no publish credentials in the write-back job');
+});
