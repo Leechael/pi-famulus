@@ -105,7 +105,7 @@ pi-famulus events -f
 
 ## F7. Manager lifecycle and degraded mode
 
-Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the one-time breaking name transition. For that transition, finish or stop work, close the previous installation's sessions, wait for its daemon to exit, reinstall, and migrate configuration only; see [README.md](../README.md#install). Do not move its runtime state/history tree, whose records contain absolute output/transcript paths.
+Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the one-time breaking name transition. For that transition, finish or stop work, close the previous installation's sessions, wait for its daemon to exit, reinstall, and migrate configuration only; see [development.md](development.md#one-time-name-transition). Do not move its runtime state/history tree, whose records contain absolute output/transcript paths.
 
 | # | Do | Expect |
 |---|---|---|

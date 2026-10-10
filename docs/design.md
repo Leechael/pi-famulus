@@ -641,7 +641,7 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 - Detached subagent runner (ChildRunner seam reserved)
 - Worktree isolation, workflow-script sandbox, watchdog, missions
 - Compatibility with pi-subagents / pi-intercom
-- Windows support: named-pipe IPC, Job Objects (KILL_ON_JOB_CLOSE lifeline), pi's bash (`cmd.exe` only as a fallback); in-place `exec` upgrade remains Unix-only
+- In-place `exec` upgrade on Windows (Unix-only; Windows replaces the binary and restarts). Windows itself is supported: named-pipe IPC and a Job Object lifeline (`KILL_ON_JOB_CLOSE`, manager/src/sys/windows.rs:6)
 
 ## Appendix A: TS pure-function signature contract (shared basis for implementation and tests)
 

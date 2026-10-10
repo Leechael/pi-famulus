@@ -1,182 +1,144 @@
 # pi-famulus
 
-A pi extension for subagent orchestration, auto-backgrounding bash, monitoring tasks, and agent-to-agent communication. Process management lives in a standalone Rust daemon, `pi-famulus` (machine-wide singleton, session-isolated, exits with the last pi).
+Let pi delegate, and keep working.
 
-## Architecture
+pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the coding agent. Subagents run inside pi. Shell commands and monitors run under a daemon (`pi-famulus`), which cleans them up if it crashes and reports their results back when they finish: no polling. It is for people who run pi on real projects and want to hand off parallel or slow work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
 
-```
-pi extension (extension/, TypeScript)        pi-famulus (manager/, Rust)
-├─ bash override: foreground budget →        ├─ spawn/wait/stop/output engine
-│  auto-background                           ├─ session_id namespacing
-├─ subagent: parallel tasks / serial chain   ├─ output duality (ring + full log)
-├─ monitor: command output → event stream    └─ lifecycle: 0 connections, 5s →
-├─ agent_message / contact_supervisor           kill tasks and exit
-└─ NotifyCenter: single injection point
-   for all async events
-```
+## Why
 
-Design doc (wire protocol, state machines, interface contracts): [docs/design.md](docs/design.md).
+Three things go wrong when an agent has to wait. This [field report on building pi tooling](https://dev.to/zangetsu101/the-coding-agent-i-could-shape-around-my-workflow-3c38) runs into all three.
+
+- **A foreground watch blocks the chat.** Monitoring CI or a dev server holds the turn, and new messages queue behind it. Here `bash` moves a command to the background after 20 seconds and the turn goes on.
+- **A backgrounded command finishes silently.** The agent has no way to wake and react. Here the result is injected into the conversation when the command exits, and `monitor` does the same for output lines.
+- **A subagent says "done" while its work still runs.** Here a subagent's `bash` runs in the foreground until the command exits or times out, and a subagent cannot start subagents or monitors. So when it reports done, nothing it started through pi-famulus is still running, unless a command detached itself (`setsid`) or left a process running with `&`. Such leftovers keep running until they exit or the daemon stops them.
+
+pi's core leaves these to extensions on purpose ([design, section 1](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md#1-background-and-goals)). pi-famulus adds them with a separate daemon (`pi-famulus`, written in Rust) that starts every shell command and monitor, including the ones subagents run, and is their parent. Subagents themselves run inside pi. Bare `sleep` is rejected, so the model waits for the result instead of polling. Whether a model uses a tool depends on how the tool is described, so the wording is tested against real models in [eval/RESULTS.md](https://github.com/Leechael/pi-famulus/blob/main/eval/RESULTS.md).
 
 ## Install
-
-After the first public npm release:
 
 ```bash
 pi install npm:pi-famulus
 ```
 
-npm installs the matching exact-version native manager automatically: Linux and macOS x64/arm64, and Windows x64. Windows ARM64 is not in the release set until CI produces it. No Rust compiler, postinstall download, or separate manager install is required. Linux builds are static musl binaries; macOS builds target macOS 13+; Windows x64 builds use MSVC with a statically linked CRT (Node/pi runtime requirements also apply). In-place upgrade is Unix-only. Keep optional dependencies enabled. The npm package also exposes `pi-famulus` on its npm bin path (`npx pi-famulus --help`).
+Requires pi 1.0.0 or newer. Native daemon builds ship for Linux x64 and arm64, macOS x64 and arm64 (macOS 13+), and Windows x64. There is no Windows arm64 build. The daemon comes with the npm package as an exact-version optional dependency, so keep optional dependencies enabled. No Rust compiler or extra download is needed.
 
-Discovery order: executable config `managerPath` → executable `PI_FAMULUS_MANAGER_PATH` → exact-version native npm package → executable home/bin → executable PATH. Installation does not move runtime state or copy into the shared home. Package installation/usage details: [extension/README.md](extension/README.md). CI, five-package publishing, and the one-time npm Trusted Publisher setup: [docs/releasing.md](docs/releasing.md).
+Do not install pi-famulus together with `pi-subagents`. Both register a tool named `subagent`, and in pi 1.0.0 the extension loaded first keeps that name, so the other one's `subagent` tool is never exposed. Choose one. `pi-background-tasks` registers the `/tasks` command, as pi-famulus does. In pi 1.0.0 two commands with one name are listed as `/tasks:1` and `/tasks:2`. Its tools (`bg_run` and others) have different names, but the two packages overlap in purpose, so choose one of them too. Details: [development](https://github.com/Leechael/pi-famulus/blob/main/docs/development.md#conflicts-with-other-packages).
 
-### Source build / local trial
+## Try this first
 
-Before the first npm release, or to use a separately built manager:
+You do not write tool calls. After installing, ask pi in plain language.
 
-```bash
-# 1. Build and install the manager at ~/.pi/agent/pi-famulus/bin/
-cd manager && cargo build --release
-mkdir -p ~/.pi/agent/pi-famulus/bin
-# Atomic replace (new inode). In-place `cp` onto an existing binary breaks
-# macOS code-signing and the next run dies with SIGKILL / "killed".
-install -m 755 target/release/pi-famulus ~/.pi/agent/pi-famulus/bin/pi-famulus
-#    Subsequent same-name upgrades: the same `install` line is enough.
-#    A running daemon upgrades itself in place within seconds (same pid,
-#    running work kept); `pi-famulus upgrade` does it now and reports the result.
-
-# 2. Load the extension with this manager (local trial recommended first)
-PI_FAMULUS_MANAGER_PATH="$HOME/.pi/agent/pi-famulus/bin/pi-famulus" \
-  pi -e /path/to/pi-famulus/extension
-# For keeps: `pi install <source>`
-```
-
-An installed native npm manager takes precedence over home/bin and PATH. To test a separately built manager, explicitly set `PI_FAMULUS_MANAGER_PATH` as above or set `managerPath` in `~/.pi/agent/pi-famulus/config.json` to its absolute executable path. An executable `managerPath` takes precedence over the environment override; update or clear it when using the latter.
-
-**One-time name transition:** this rename is a breaking installation change, not a hot upgrade of a previous installation. Wait for work to finish or stop it, close the sessions using that installation, and wait for its daemon to exit. Reinstall via npm (once published) or the source-build paths above, migrate **configuration only** to `~/.pi/agent/pi-famulus/config.json` (update explicit paths and environment overrides), then reopen sessions. Do not move the runtime state/history tree: records contain absolute output and transcript paths that a directory move does not rewrite. Keep previous history separately if needed. Subsequent compatible upgrades under the same name and home support the in-place upgrades described above; when changing installation method/binary location, restart the sessions rather than assuming an in-place upgrade across different paths.
-
-**Conflict**: the legacy `pi-subagents` package also registers a `subagent` tool. Either `pi remove pi-subagents`, or test with `pi -ne -e ./extension` (note `-ne` suppresses your other extensions too).
-
-**Degraded startup:** if `pi-famulus` is missing or cannot start, the extension warns in the TUI. Bash runs locally (so auto-backgrounding and manager-backed output/history are unavailable); `task_*` and `monitor` report that they are disabled. In-process subagents remain usable. Fix the manager installation or point to a binary with `PI_FAMULUS_MANAGER_PATH` / `managerPath` in config.json. If the extension is loaded outside pi and pi's bundled `pi-tui` cannot be resolved, a one-time console warning explains that interactive `/tasks` views use reduced text fallback; load the extension through pi for the full interactive UI.
-
-## Tools
-
-### bash (overrides the built-in)
-Adds a `run_in_background` parameter. Foreground commands that exceed `foregroundBudgetMs` (default 20s) move to the background automatically; completion arrives as a `<pi-famulus-wake kind="task">`. Bare `sleep` commands are rejected (use monitor or the background flag instead).
-
-### subagent
-```
-subagent({ tasks: [{agent?, prompt, name?}], ... })   // parallel, ≤10, concurrency 1..8
-subagent({ chain: [{agent?, prompt, label?}], ... })  // serial, {previous}/{outputs.<label>} interpolation
-subagent({ action: "list|get|status|interrupt|resume|steer|extend|models", run_id?, child_id?, message?, timeout_ms? })
-```
-- Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<pi-famulus-wake kind="subagent-done">`. **Never poll.**
-- `model` accepts fuzzy specs (`"haiku"`, `"openai/gpt-5.2"`, `"luna:high"`); the candidate set respects pi's whitelist (`enabledModels` / `--models`). Use `action:"models"` to list selectable values before choosing.
-- Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a no-background bash variant. The stall watchdog is 5 minutes of inactivity, paused while a tool is executing or a `need_decision` is pending. Each child turn has a 30-minute soft budget (`timeout_ms`): past it the child keeps running, its shell is not stopped, and the parent gets `<pi-famulus-wake kind="subagent-overrun">` (repeated every 10 minutes) to `extend`, steer, or `interrupt` it. `resume` takes `timeout_ms` for the new turn. An aborting ceiling, `hardTimeoutMs`, is opt-in. A decision request waits 10 minutes.
-- `resume` returns at once. When all `maxConcurrentChildren` slots are busy the child is queued (shown `pending`, the result says how many are ahead) and starts when a slot frees; its result arrives as a wake as usual.
-- Every wake carries `as-of` (when it was generated). Steered and turn-triggering wakes get `age-ms` (how old they are) when they enter the model's context. `subagent-handover` and `subagent-done` re-check child statuses then: a child resumed since the snapshot shows its current status with `status-as-of`. Re-checking `subagent-overrun` is deferred.
-
-### monitor
-```
-monitor({ command, description, timeout_ms?, persistent? })
-```
-Each output line becomes an event (200ms batching, 500 chars/line and 3000 chars/batch caps, 10 events per 2s rate limit). Exit, timeout, and rate-limit saturation all produce notifications.
-
-After starting/re-arming a monitor or handling its event, finish any remaining work, then end the turn with a reply and no tool call. Simply wait for the next notification—do not poll, sleep, or call `wait_for` to yield. A UI extension's `wait_for` is for observed UI conditions, not monitor notifications.
-
-Parent background-task guidelines are re-applied to every model request when pi rebuilds its base prompt, including wake-triggered tool continuations. This repairs instruction visibility; it does not guarantee that every model follows them. The opt-in [monitor/UI compatibility evals](eval/README.md) measure that behavior without operating a real UI.
-
-### task_list / task_output / task_stop
-Manage shell/monitor tasks held by the manager.
-
-### agent_message (parent↔child comms)
-```
-agent_message({ action: "send|reply|broadcast|list", to?, message?, delivery?: "steer"|"queue" })
-```
-Children additionally get `contact_supervisor({ reason: "need_decision"|"progress_update", message })` — `need_decision` blocks the child until the parent replies (10-minute timeout, `decisionTimeoutMs`). `agent_message` send to a finished child **errors** and tells you to resume with `subagent({ action: "resume", run_id, child_id, message })`. It does not resume the child.
-
-## Agent definitions
-
-Markdown with frontmatter, three tiers (later wins): built-in (`explorer`/`worker`) → `~/.pi/agent/agents/**/*.md` → `<project>/.pi/agents/**/*.md`:
+**1. Plan with your strongest model, implement with a cheap one.** Select your strongest model in the pi session. Then save this as `~/.pi/agent/agents/worker.md`:
 
 ```markdown
 ---
-name: reviewer
-description: Code review specialist
-tools: [read, bash, grep]
-model: anthropic:claude-haiku-4-5   # fuzzy ok; falls back to parent model if unresolvable
-thinking: high
+name: worker
+description: Implements one concrete task end to end
+model: haiku
 ---
-You are a reviewer… (body = system prompt segment)
+Do the task you were given. Make the edits and run the tests that prove it works.
+Stay within the task's scope. Report what you changed and how you verified it.
 ```
 
-Omit `tools` to inherit the user’s pi `defaultTools`; the built-in worker does this. An explicit list restricts the child to those tools, plus famulus communication tools; `tools: []` permits only communication. Children load user/global and trusted-project settings, extensions, skills, prompts, and context files, including configured codemode and MCP. Famulus skips parent-tool initialization in children and supplies a foreground-only bash replacement when bash is enabled. Parent-only CLI resource overrides are not copied.
+Now ask:
 
-Requires pi 1.0.0 or newer. CI checks 1.0.0, 1.0.4, and the latest published version.
-
-## Configuration `~/.pi/agent/pi-famulus/config.json`
-
-```json
-{
-  "foregroundBudgetMs": 20000,
-  "managerPath": null,
-  "logLevel": "info",
-  "subagent": { "budgetMs": 45000, "timeoutMs": 1800000, "overrunRepeatMs": 600000,
-                "hardTimeoutMs": 0, "stallMs": 300000,
-                "stallRetries": 1, "stallRetryDelayMs": 5000,
-                "decisionTimeoutMs": 600000,
-                "concurrency": 4, "maxConcurrentChildren": 8, "spawnBudgetPerHour": 32 }
-}
+```text
+Plan the move from callbacks to async/await in src/api/. When the plan is settled,
+have subagents implement it one module at a time, then review what they return.
 ```
 
-Timeouts are staggered so they do not fire together:
+The session model writes the plan. `subagent` runs `worker` by default, and `worker` now uses the model matching `haiku`. The prompt names no model. Notes:
 
-| Key | Default | Meaning |
-|---|---|---|
-| `stallMs` | 300000 (5 min) | No session events. Paused during `tool_execution_start`…`end` and while a `need_decision` is pending. Streaming providers emit `message_update` on `thinking_delta` / `text_delta` (pi agent-loop), which resets this. Not every provider streams partial thinking, so 2 min can kill a slow reasoning turn; 5 min is the default. |
-| `stallRetries` | 1 | Auto-resumes after a stall: the aborted generation is retried on the same session with a continuation prompt (transcript preserved). `0` restores the pre-fix behavior (settle `failed (stalled)` at once). |
-| `stallRetryDelayMs` | 5000 | Pause between the stall abort and the retry prompt. Gives a flaked provider stream time to recover before the retry. |
-| `decisionTimeoutMs` | 600000 (10 min) | Parent did not reply to `need_decision`. |
-| `timeoutMs` | 1800000 (30 min) | Soft budget per child turn (launch or `resume`). Reaching it does not stop the child: the parent gets a `subagent-overrun` wake with the child's last activity and, if it is waiting on a foreground shell, that shell, and decides (`extend`, steer, `interrupt`). Stall retries do not restart it. |
-| `overrunRepeatMs` | 600000 (10 min) | Repeat of the `subagent-overrun` wake while the child stays past its budget. `extend` re-arms the deadline at now + `timeout_ms` (default: the child's spawn budget); steering once the deadline has passed postpones the next reminder; reminders are held while the child waits on a `need_decision` reply. |
-| `hardTimeoutMs` | 0 (off) | Opt-in ceiling per child turn that aborts the child (and its running shell) and settles it `interrupted (timeout)`. `extend` does not move it. |
+- `model` is matched against the model ids and names pi lets you use (your `enabledModels` setting or `--models`). It must match exactly one model. If it matches none or several, the child falls back to the parent model and says so in a warning. (A `model` passed on a single `subagent` call is stricter: no match or several matches is an error, and the model is told the candidates.)
+- Ask pi "which models can subagents use?" to see the choices (it calls `subagent({action: "models"})`).
+- Add a thinking level with a suffix, for example `model: haiku:high`.
+- A `worker.md` in `<project>/.pi/agents/` overrides the one in your home directory. Without any `worker.md`, children use the parent's model.
 
-## Manager CLI
+**2. Run something slow.**
 
-Operations manual (every subcommand, fuzzy ids, output formats): **[docs/cli.md](docs/cli.md)**. Everything the TUI shows can also be answered from the CLI:
-
-| Question | Command |
-|---|---|
-| Is the daemon healthy? | `pi-famulus doctor` (non-zero exit on any failure), `pi-famulus status` |
-| What is each pi session doing, and where? | `pi-famulus sessions` (connected sessions: PID, CWD, running/tasks/agents) |
-| What is running / just finished? | `pi-famulus ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits drops its finished rows from `ls` at once, and drops out of `sessions` too once nothing of it is still running; either way its running work stays listed until it ends, and its records stay reachable by id for `goneSessionRetention` (default 24h) |
-| Why did this end? What did it print? | `pi-famulus show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
-| What did this subagent do? | `pi-famulus agent <ch_id> [-f] [--full]` (live transcript) |
-| Which subagent spent how much CPU on which kind of task? | `pi-famulus stats [--by agent\|kind\|agent,kind] [--since 2h]` (tasks, wall, CPU, average cores, unmeasured, killed); `ls` shows CPU and CORES per finished task |
-| Why didn't a notification arrive? | `pi-famulus events [-f] [--id X]` (task lifecycle + wake emit/deliver/inject/dedupe/drop; `wake.inject lag_ms` = how long a wake waited before the model saw it) |
-| Follow output | `pi-famulus tail <id>`, `pi-famulus log -f <id> [--stderr]` |
-
-Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pi-famulus/` (`PI_FAMULUS_HOME` / `--home`).
-
-## TUI (interactive mode)
-
-| Surface | Behavior |
-|---------|----------|
-| Fleet line (below editor) | One row of live work only: `● 2 shells · 1 monitor · alpha 12s   /tasks`. Running subagents by name; anything that exited, failed or was killed drops out, and the row disappears when nothing runs |
-| `/tasks` (alias `/bashes`) | Live list of shells, monitors and subagents (grouped by run). Type to filter; ↑↓ / PgUp / PgDn / Home / End move; Tab switches active+recent vs all; Enter opens details; `ctrl+x` stops (inline confirm); Esc closes |
-| Finished items | Stay listed for 10 minutes (cap 50). Commands that finished inside the foreground budget are not background work and are not listed |
-| Shell / monitor details | `1` output · `2` stderr · `3` info (status, exit, end reason, times, paths). Tab cycles, `f` toggles follow, arrows / PgUp / PgDn / wheel scroll, Esc back |
-| Subagent details | Conversation (agent preamble hidden), result, info |
-| `/reply <child> <text>` | Answer a subagent's decision request without going through the model |
-| Transcript rows | A backgrounded bash call is one row that updates when the command finishes |
-| Notification pills | One line per wake (✓ done, ✗ failed, › monitor event, ? decision request). Ctrl+O expands labelled fields; the XML envelope is model-facing only |
-
-Print mode (`pi -p`) skips widgets; notifications still inject as before.
-
-```bash
-cd manager && cargo test                        # Rust: unit + adversarial + protocol + observability
-cd manager && cargo test --features test-clock  # same suites on a manual clock (fast)
-cd extension && npx tsc --noEmit && npx vitest run
-PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts  # TS ↔ real daemon
+```text
+Run the full test suite and tell me what fails.
 ```
 
-Manual acceptance checklist: [docs/testing-guide.md](docs/testing-guide.md).
+`bash` waits 20 seconds. If the command is still running, it moves to the background and the turn continues. The output arrives in the conversation when the command exits.
+
+**3. Watch a log or a server.**
+
+```text
+Start the dev server and tell me if an error shows up in its output.
+```
+
+`monitor` turns each output line into an event and wakes pi when one arrives.
+
+## What you get
+
+### Delegate to subagents
+
+- `subagent` runs up to 10 tasks per call in parallel (`tasks`, 4 at a time by default) or one after another (`chain`, where `{previous}` carries the last result forward).
+- If a run takes longer than 45 seconds, it continues in the background. Each finished subagent reports back on its own.
+- `subagent({action: "steer" | "resume" | "extend" | "interrupt"})` redirects a running child, continues a finished one with a new message, gives it more time, or stops it.
+- Built-in agents are `explorer` (read, grep, find, ls, bash) and `worker` (inherits your tools). Add your own as markdown files in `~/.pi/agent/agents/` or `<project>/.pi/agents/`.
+- Subagents load your pi settings, extensions, skills and context files, including MCP servers. They run inside the pi process and cannot start subagents of their own.
+- A subagent can send its parent a question with `contact_supervisor` and wait for the answer. You can answer yourself with `/reply <child> <text>`. `agent_message` sends messages between parent and children.
+- At most 8 subagents run at once across all your pi sessions on the machine, and the rest queue. Change the limit with `pi-famulus config set max-agents N`. Work labelled `test-suite` or `test` is limited to 2 at a time. Details: [capacity](https://github.com/Leechael/pi-famulus/blob/main/docs/global-capacity.md).
+
+### Run long shell commands
+
+- `bash` moves a command to the background after 20 seconds (`foregroundBudgetMs`), or at once with `run_in_background`.
+- When a background command exits, the result is injected into the conversation. Nothing polls.
+- `task_list`, `task_output` and `task_stop` inspect and stop background commands. `/tasks` shows them live.
+- A fleet line under the editor lists the shells, monitors and subagents that are running.
+
+### Watch output
+
+- `monitor` runs a command and turns each output line into an event (batched every 200 ms, lines cut at 500 characters, at most 10 events per 2 seconds; batches over the limit are dropped). The command exiting and a timeout also produce events. If at least half the batches are dropped over a full 30-second window containing at least 10 batches, the monitor is stopped and you are told.
+
+### When things go wrong
+
+- A subagent still running when its 30-minute turn budget ends is not killed. The parent is told and chooses to extend, steer or interrupt it.
+- A subagent with no activity for 5 minutes is resumed once on the same session with its transcript kept. The timer pauses while a tool is running or a `contact_supervisor` question awaits an answer. If it stalls again, it is marked failed.
+- The daemon is the parent of every shell and monitor task. If the daemon crashes or is killed with `kill -9`, each task's process group is stopped. A command that moves a child into a new session (`setsid`) escapes this.
+- Running work does not survive the last pi session closing. Five seconds after the last session disconnects, the daemon stops what is left and exits. Records and transcripts stay for 24 hours.
+- With the daemon binary installed in `~/.pi/agent/pi-famulus/bin`, replacing it on Linux or macOS makes the running daemon re-execute itself with the same pid. Running commands keep going and clients reconnect (a 30 to 46 ms gap was measured).
+- The `pi-famulus` command inspects what happened: `doctor` (health), `ls` (what is running), `show <id>` (why it ended and what it printed), `agent <id>` (a subagent's transcript), `stats` (CPU per agent), `events` (why a notification did or did not arrive). See the [CLI manual](https://github.com/Leechael/pi-famulus/blob/main/docs/cli.md).
+
+## How it differs from other packages
+
+pi-famulus, `pi-subagents` and `pi-background-tasks` are alternatives. Pick one. These notes come from each package's npm tarball and README, read on 2026-10-10. Check them for current behavior.
+
+- [`pi-subagents`](https://github.com/nicobailon/pi-subagents): choose it if you want ready-made roles (`scout`, `reviewer`, `oracle` and others), saved workflows, `/council`, or background children that run in a detached process. It cannot be installed alongside pi-famulus (same `subagent` tool). In pi-famulus, subagents run inside pi and stop when the last session closes.
+- [`pi-background-tasks`](https://github.com/ismailsaleekh/pi-background-tasks): choose it if you want named background shell jobs with output files, a read-only delegated agent, or its multi-model Fusion workflows. It shares the `/tasks` command with pi-famulus and covers the same ground.
+- Trade-off: subagents run inside pi, so you cannot attach to a child or take over its session like a tmux pane. You can steer, resume or interrupt it through the parent, answer its questions with `/reply`, and read what it did with `pi-famulus agent <id> -f`, `show <id>` and `top`.
+- Choose pi-famulus if you want one daemon that starts and cleans up every shell and monitor process across your pi sessions, a shared cap on concurrent subagents, and a command-line tool for inspecting past runs.
+
+## FAQ
+
+**How do I run a subagent on a cheaper model in pi?**
+Put `model: haiku` (or another model id you have access to) in the frontmatter of `~/.pi/agent/agents/worker.md`. The `worker` agent is what `subagent` runs when no agent is named. See "Try this first" above. A single call can also pass `model`, but there a model that matches none or several is an error instead of a fallback.
+
+**Why does my pi bash command hang on long builds?**
+With pi-famulus, `bash` stops waiting after 20 seconds and moves the command to the background. The model gets the result when the command exits. Change the limit with `foregroundBudgetMs` in `~/.pi/agent/pi-famulus/config.json` ([configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)).
+
+**What happens to background tasks when pi exits?**
+They stop. The daemon exits 5 seconds after the last pi session disconnects and ends the tasks left running (SIGTERM, then SIGKILL after 2 seconds). Records, output and subagent transcripts stay on disk for 24 hours, and you can read them with `pi-famulus show <id>`.
+
+**Does pi-famulus work on Windows?**
+Yes on x64. There is no arm64 build. Replacing the daemon binary in place is Unix-only; on Windows, replace it and restart.
+
+**Can a subagent start its own subagents?**
+No. Depth is limited to one level.
+
+**How do I see or stop running work?**
+Type `/tasks` in pi. Press `ctrl+x` on an item to stop it. From a terminal, `pi-famulus ls` lists what is running.
+
+## Documentation
+
+- [Tool reference](https://github.com/Leechael/pi-famulus/blob/main/docs/tools.md): parameters, agent files, terminal UI
+- [Configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md): `config.json`, timeouts, binary lookup, degraded mode
+- [CLI manual](https://github.com/Leechael/pi-famulus/blob/main/docs/cli.md)
+- [Architecture](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md)
+- [Machine-wide capacity](https://github.com/Leechael/pi-famulus/blob/main/docs/global-capacity.md)
+- [Development](https://github.com/Leechael/pi-famulus/blob/main/docs/development.md): building from source, tests
+- [Releasing](https://github.com/Leechael/pi-famulus/blob/main/docs/releasing.md)
+
+MIT licensed.

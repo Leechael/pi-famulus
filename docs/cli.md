@@ -6,9 +6,24 @@ The pi extension talks to the daemon over a socket. These subcommands are the hu
 
 From the CLI alone you can answer: what is each session doing and where (cwd), what is running or just finished, why did it end, what did this subagent do, why didn't a notification arrive, and is the system healthy.
 
+## Which command answers which question
+
+| Question | Command |
+|---|---|
+| Is the daemon healthy? | `pi-famulus doctor` (non-zero exit on any failure), `pi-famulus status` |
+| What is each pi session doing, and where? | `pi-famulus sessions` (connected sessions: PID, CWD, running/tasks/agents) |
+| What is running / just finished? | `pi-famulus ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits drops its finished rows from `ls` at once, and drops out of `sessions` too once nothing of it is still running; either way its running work stays listed until it ends, and its agent records, transcripts and events stay reachable for `goneSessionRetention` (default 24h); a finished task's own record can expire sooner under `finishedTaskRetention` |
+| Why did this end? What did it print? | `pi-famulus show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
+| What did this subagent do? | `pi-famulus agent <ch_id> [-f] [--full]` (live transcript) |
+| Which subagent spent how much CPU on which kind of task? | `pi-famulus stats [--by agent\|kind\|agent,kind] [--since 2h]` (tasks, wall, CPU, average cores, unmeasured, killed); `ls` shows CPU and CORES per finished task |
+| Why didn't a notification arrive? | `pi-famulus events [-f] [--id X]` (task lifecycle + wake emit/deliver/inject/dedupe/drop; `wake.inject lag_ms` = how long a wake waited before the model saw it) |
+| Follow output | `pi-famulus tail <id>`, `pi-famulus log -f <id> [--stderr]` |
+
+Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pi-famulus/` (`PI_FAMULUS_HOME` / `--home`).
+
 ## Install
 
-After the first npm release, install `pi-famulus` with optional dependencies enabled (`pi install npm:pi-famulus`). The main package automatically selects the matching Linux/macOS x64/arm64 native package and exposes the CLI on its npm bin path; `npx pi-famulus --help` is a quick check. No compiler or separate binary download is needed. See [the npm package guide](../extension/README.md).
+Install `pi-famulus` with optional dependencies enabled (`pi install npm:pi-famulus`). The main package automatically selects the matching Linux/macOS x64/arm64 or Windows x64 native package and exposes the CLI on its npm bin path; `npx pi-famulus --help` is a quick check. No compiler or separate binary download is needed. See the [README](../README.md#install).
 
 ### Source build / separate manager
 
