@@ -167,6 +167,10 @@ test('CLI --tag validates metadata without requiring the git tag to exist yet', 
     () => execFileSync(process.execPath, [cli, '--tag', 'v0.1.0', '--require-git-tag'], { cwd: root, encoding: 'utf8', env, stdio: 'pipe' }),
     /not a git repository|Needed a single revision|refs\/tags\/v0\.1\.0/,
   );
+  assert.throws(
+    () => execFileSync(process.execPath, [cli, '--tag', 'v0.1.0', 'v0.1.0'], { cwd: root, encoding: 'utf8', env, stdio: 'pipe' }),
+    /usage: validate-release\.mjs/,
+  );
 });
 
 test('native files whitelist cannot ship an entire bin directory', t => {
