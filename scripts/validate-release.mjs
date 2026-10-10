@@ -7,17 +7,22 @@ import { execFileSync } from 'node:child_process';
 export const REPOSITORY = 'Leechael/pi-famulus';
 // win32-arm64 is not required: CI does not build it, and publish.yml only
 // downloads artifacts from its own run. Add it back with a producer.
+// npm package names use `win` for Windows. Unscoped `*-win32-*` names have
+// tripped npm's spam detector and blocked first publish.
 export const PLATFORMS = [
   ['linux', 'x64', 'x86_64-unknown-linux-musl'],
   ['linux', 'arm64', 'aarch64-unknown-linux-musl'],
   ['darwin', 'x64', 'x86_64-apple-darwin'],
   ['darwin', 'arm64', 'aarch64-apple-darwin'],
   ['win32', 'x64', 'x86_64-pc-windows-msvc'],
-].map(([os, arch, target]) => ({
-  os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}`,
-  // CreateProcess needs an explicit extension for lpApplicationName; this package ships `.exe`.
-  binary: os === 'win32' ? 'bin/pi-famulus.exe' : 'bin/pi-famulus',
-}));
+].map(([os, arch, target]) => {
+  const packageOs = os === 'win32' ? 'win' : os;
+  return {
+    os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${packageOs}-${arch}`, directory: `npm/${os}-${arch}`,
+    // CreateProcess needs an explicit extension for lpApplicationName; this package ships `.exe`.
+    binary: os === 'win32' ? 'bin/pi-famulus.exe' : 'bin/pi-famulus',
+  };
+});
 
 function isUtcCalendarDay(yyyymmdd) {
   const y = Number(yyyymmdd.slice(0, 4));

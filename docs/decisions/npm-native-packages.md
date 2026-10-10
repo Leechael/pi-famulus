@@ -17,7 +17,7 @@ The TypeScript extension requires a Rust manager. Users should install one npm p
 
 ## Decision
 
-Publish `pi-famulus` plus `pi-famulus-{linux,darwin}-{x64,arm64}` and `pi-famulus-win32-x64`. The root declares exact-version optional dependencies; native packages declare `os` and `cpu`. Linux binaries use native-architecture static musl builds; macOS builds target macOS 13+; Windows x64 statically links the MSVC CRT. Other systems/architectures have no automatic native package. Windows ARM64 stays outside the release set until CI produces its artifact.
+Publish `pi-famulus` plus `pi-famulus-{linux,darwin}-{x64,arm64}` and `pi-famulus-win-x64`. The Windows npm package uses `win` (not `win32`) because unscoped `*-win32-*` names were rejected by npm's spam detector on first publish; package `os` remains `win32`. The root declares exact-version optional dependencies; native packages declare `os` and `cpu`. Linux binaries use native-architecture static musl builds; macOS builds target macOS 13+; Windows x64 statically links the MSVC CRT. Other systems/architectures have no automatic native package. Windows ARM64 stays outside the release set until CI produces its artifact.
 
 ```
 release tag on main

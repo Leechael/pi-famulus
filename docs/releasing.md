@@ -10,7 +10,7 @@ The main extension and native manager packages form one versioned release. The p
 | `pi-famulus-linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
 | `pi-famulus-darwin-x64` | `x86_64-apple-darwin` | `macos-15-intel` |
 | `pi-famulus-darwin-arm64` | `aarch64-apple-darwin` | `macos-15` |
-| `pi-famulus-win32-x64` | `x86_64-pc-windows-msvc` | `windows-latest` |
+| `pi-famulus-win-x64` | `x86_64-pc-windows-msvc` | `windows-latest` |
 | `pi-famulus` | TypeScript extension + JS CLI/resolver | `ubuntu-24.04` |
 
 Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Windows x64 builds use the MSVC toolchain with the CRT linked statically (`manager/.cargo/config.toml`, `target.x86_64-pc-windows-msvc` `+crt-static`). The package job sets `RUSTFLAGS` only on Linux, so that cargo config is what the Windows release binary is linked with. Before packing, CI inspects the actual PE dependencies with `dumpbin` and rejects VC runtime DLL imports; the hosted runner's installed redistributables must not hide a dependency. Node/pi's runtime requirements still apply. In-place upgrade (`exec` handover) remains Unix-only; on Windows, replace the binary and restart the manager.
@@ -72,7 +72,7 @@ Repository configuration does not create npm packages or their trusted-publisher
 for package in \
   pi-famulus-linux-x64 pi-famulus-linux-arm64 \
   pi-famulus-darwin-x64 pi-famulus-darwin-arm64 \
-  pi-famulus-win32-x64 \
+  pi-famulus-win-x64 \
   pi-famulus
 do
   npm trust github "$package" --file publish.yml \

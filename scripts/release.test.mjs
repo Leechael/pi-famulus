@@ -230,6 +230,13 @@ test('all packed packages include the approved MIT license', t => {
   }
 });
 
+test('Windows npm package uses win, not win32, to avoid registry spam filters', () => {
+  const windows = PLATFORMS.find(p => p.os === 'win32' && p.arch === 'x64');
+  assert.equal(windows?.name, 'pi-famulus-win-x64');
+  assert.equal(windows?.directory, 'npm/win32-x64');
+  assert.deepEqual(windows && { os: windows.os, cpu: windows.arch }, { os: 'win32', cpu: 'x64' });
+});
+
 test('release versions, literal repository and metadata contracts', t => {
   const { root, put } = fixture(t);
   assert.equal(validateMetadata(root, { tag: 'v0.1.0', repository }).length, PLATFORMS.length + 1);

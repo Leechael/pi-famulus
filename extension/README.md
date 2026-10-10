@@ -20,7 +20,7 @@ Supported native packages:
 | Linux | arm64 | `pi-famulus-linux-arm64` |
 | macOS | Intel x64 | `pi-famulus-darwin-x64` |
 | macOS | Apple Silicon arm64 | `pi-famulus-darwin-arm64` |
-| Windows | x64 | `pi-famulus-win32-x64` |
+| Windows | x64 | `pi-famulus-win-x64` |
 
 Linux binaries are statically linked with musl. macOS binaries target macOS 13 or newer; Windows x64 binaries use MSVC with the CRT linked statically. Windows ARM64 is not published until CI produces that tarball. Your Node/pi runtime's requirements also apply. In-place manager upgrade remains Unix-only.
 

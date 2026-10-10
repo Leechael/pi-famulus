@@ -19,7 +19,10 @@ export function nativePackageName(platform, arch) {
   if (!["linux", "darwin", "win32"].includes(platform) || !["x64", "arm64"].includes(arch)) return null;
   // Windows ARM64 has no release producer yet; manual binary lookup still works.
   if (platform === "win32" && arch === "arm64") return null;
-  return `pi-famulus-${platform}-${arch}`;
+  // npm package names use `win` (not `win32`) after unscoped `*-win32-*` names
+  // were blocked by registry spam detection on first publish.
+  const packageOs = platform === "win32" ? "win" : platform;
+  return `pi-famulus-${packageOs}-${arch}`;
 }
 
 /** Resolve the exact-version optional package without loading native executable bytes. */
