@@ -1,7 +1,21 @@
 {
   "name": "pi-famulus",
   "version": "0.1.2",
-  "description": "Subagents, monitoring, and auto-backgrounding bash for pi",
+  "description": "Subagents and long-running bash for pi, run by a daemon that owns every process. Work reports back when it's done: no polling, no orphaned processes.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "subagent",
+    "subagents",
+    "background-tasks",
+    "bash",
+    "daemon",
+    "multi-agent"
+  ],
+  "author": "Leechael Yim",
+  "homepage": "https://github.com/Leechael/pi-famulus",
   "type": "module",
   "license": "MIT",
   "repository": {
