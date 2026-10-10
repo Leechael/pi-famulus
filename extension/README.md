@@ -22,7 +22,7 @@ pi install npm:pi-famulus
 
 Requires pi 1.0.0 or newer. Native daemon builds ship for Linux x64 and arm64, macOS x64 and arm64 (macOS 13+), and Windows x64. There is no Windows arm64 build. The daemon comes with the npm package as an exact-version optional dependency, so keep optional dependencies enabled. No Rust compiler or extra download is needed.
 
-If another package that registers a `subagent` tool is installed, such as `pi-subagents`, remove one of them. `pi-background-tasks` also registers `/tasks`. More in [development](https://github.com/Leechael/pi-famulus/blob/main/docs/development.md#conflicts-with-other-packages).
+Do not install pi-famulus together with `pi-subagents`. Both register a tool named `subagent`, and in pi 1.0.0 the extension loaded first keeps that name, so the other one's `subagent` tool is never exposed. Choose one. `pi-background-tasks` registers the `/tasks` command, as pi-famulus does. In pi 1.0.0 two commands with one name are listed as `/tasks:1` and `/tasks:2`. Its tools (`bg_run` and others) have different names, but the two packages overlap in purpose, so choose one of them too. Details: [development](https://github.com/Leechael/pi-famulus/blob/main/docs/development.md#conflicts-with-other-packages).
 
 ## Try this first
 
@@ -104,11 +104,11 @@ Start the dev server and tell me if an error shows up in its output.
 
 ## How it differs from other packages
 
-These notes come from each package's own README, read on 2026-10-10. Check them for current behavior.
+pi-famulus, `pi-subagents` and `pi-background-tasks` are alternatives. Pick one. These notes come from each package's npm tarball and README, read on 2026-10-10. Check them for current behavior.
 
-- [`pi-subagents`](https://github.com/nicobailon/pi-subagents): use it if you want ready-made roles (`scout`, `reviewer`, `oracle` and others), saved workflows, `/council`, or background children that run in a detached process. In pi-famulus, subagents run inside pi and stop when the last session closes.
-- [`pi-background-tasks`](https://github.com/ismailsaleekh/pi-background-tasks): use it if you want named background shell jobs with output files, a read-only delegated agent, or its multi-model Fusion workflows.
-- Use pi-famulus if you want one daemon that owns every shell and monitor process across your pi sessions, a shared cap on concurrent subagents, and a command-line tool for inspecting past runs.
+- [`pi-subagents`](https://github.com/nicobailon/pi-subagents): choose it if you want ready-made roles (`scout`, `reviewer`, `oracle` and others), saved workflows, `/council`, or background children that run in a detached process. It cannot be installed alongside pi-famulus (same `subagent` tool). In pi-famulus, subagents run inside pi and stop when the last session closes.
+- [`pi-background-tasks`](https://github.com/ismailsaleekh/pi-background-tasks): choose it if you want named background shell jobs with output files, a read-only delegated agent, or its multi-model Fusion workflows. It shares the `/tasks` command with pi-famulus and covers the same ground.
+- Choose pi-famulus if you want one daemon that owns every shell and monitor process across your pi sessions, a shared cap on concurrent subagents, and a command-line tool for inspecting past runs.
 
 ## FAQ
 

@@ -48,4 +48,15 @@ The rename to `pi-famulus` is a breaking installation change, not a hot upgrade 
 
 ## Conflicts with other packages
 
-The older `pi-subagents` package also registers a `subagent` tool. Either `pi remove pi-subagents`, or test with `pi -ne -e ./extension` (`-ne` also suppresses your other extensions).
+Checked against the npm tarballs of `pi-subagents` and `pi-background-tasks` (2026-10-10) and pi 1.0.0's extension loader.
+
+| Package | Overlap with pi-famulus | Source |
+|---|---|---|
+| `pi-subagents` | Tool `subagent`. Child sessions of both also get a `contact_supervisor` tool. | pi-subagents `src/extension/index.js:596`, `src/intercom/native-supervisor-channel.js:183`; pi-famulus `extension/src/index.ts:405` |
+| `pi-background-tasks` | Command `/tasks`. | pi-background-tasks `dist/src/extension.js:591`; pi-famulus `extension/src/tui/tasks-command.ts:63` |
+
+No other tool, command, shortcut or message-renderer name overlaps. pi-famulus registers tools `bash`, `task_list`, `task_output`, `task_stop`, `monitor`, `subagent`, `agent_message`, commands `/tasks`, `/bashes`, `/reply`, one message renderer for its wake messages, and no shortcuts. `pi-subagents` registers many `/subagents*` commands, `/run`, `/prompt-workflow`, `/subagent-cost`, a configurable detach shortcut and several renderers. `pi-background-tasks` registers `/bg`, `/jobs`, `/logs`, `/kill`, `/fusion` and others, and the shortcuts `shift+down`, `ctrl+alt+b` and `ctrl+alt+c`.
+
+What pi does (read from `@earendil-works/pi-coding-agent` 1.0.0, `dist/core/extensions/runner.js`): for tools, the first registration of a name wins, in extension load order. Duplicate commands are all kept and get invocation names `/name:1`, `/name:2`. Duplicate shortcuts: the later extension wins and pi reports a diagnostic. Other pi versions may differ.
+
+Treat these packages as alternatives and install one. To try pi-famulus beside them anyway, use `pi remove pi-subagents`, or `pi -ne -e ./extension` (`-ne` also suppresses your other extensions).
