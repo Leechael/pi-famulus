@@ -6,11 +6,13 @@ pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the cod
 
 ## Why
 
-pi's core leaves out subagents, background bash and monitoring on purpose and expects extensions to provide them ([design, section 1](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md#1-background-and-goals)). Without them:
+Three things go wrong when an agent has to wait. Tameem Bin Haider [hit all three](https://dev.to/zangetsu101/the-coding-agent-i-could-shape-around-my-workflow-3c38) while building his own tooling for pi.
 
-- A long command holds the turn until it exits.
-- Waiting for a result means a sleep loop or repeated checks. pi-famulus rejects bare `sleep` and tells the model to use the background flag or `monitor` instead.
-- A background process that nothing cleans up can outlive the session that started it.
+- **A foreground watch blocks the chat.** Monitoring CI or a dev server holds the turn, and new messages queue behind it. Here `bash` moves a command to the background after 20 seconds and the turn goes on.
+- **A backgrounded command finishes silently.** The agent has no way to wake and react. Here the result is injected into the conversation when the command exits, and `monitor` does the same for output lines.
+- **A subagent says "done" while its work still runs.** Subagents cannot background `bash`, start subagents or use `monitor`, so when one reports done, nothing it started through pi-famulus is still running. A child's `bash` waits for its full timeout and is killed on expiry. A command that detaches itself (`setsid`) is outside this guarantee.
+
+pi's core leaves out subagents, background bash and monitoring on purpose and expects extensions to provide them ([design, section 1](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md#1-background-and-goals)). pi-famulus also rejects bare `sleep` and tells the model to use the background flag or `monitor` instead. Whether a model uses a tool depends on how it is described, so the wording is tested against real models in [eval/RESULTS.md](https://github.com/Leechael/pi-famulus/blob/main/eval/RESULTS.md).
 
 pi-famulus moves processes into a separate daemon (`pi-famulus`, written in Rust). The daemon starts every shell command and monitor, including the ones subagents run, and is their parent. Subagents themselves run inside pi. The extension injects a message into the conversation when one finishes.
 
@@ -108,6 +110,7 @@ pi-famulus, `pi-subagents` and `pi-background-tasks` are alternatives. Pick one.
 
 - [`pi-subagents`](https://github.com/nicobailon/pi-subagents): choose it if you want ready-made roles (`scout`, `reviewer`, `oracle` and others), saved workflows, `/council`, or background children that run in a detached process. It cannot be installed alongside pi-famulus (same `subagent` tool). In pi-famulus, subagents run inside pi and stop when the last session closes.
 - [`pi-background-tasks`](https://github.com/ismailsaleekh/pi-background-tasks): choose it if you want named background shell jobs with output files, a read-only delegated agent, or its multi-model Fusion workflows. It shares the `/tasks` command with pi-famulus and covers the same ground.
+- Trade-off: subagents run inside pi, so you cannot attach to a child or take over its session like a tmux pane. You can steer, resume or interrupt it through the parent, answer its questions with `/reply`, and read what it did with `pi-famulus agent <id> -f`, `show <id>` and `top`.
 - Choose pi-famulus if you want one daemon that starts and cleans up every shell and monitor process across your pi sessions, a shared cap on concurrent subagents, and a command-line tool for inspecting past runs.
 
 ## FAQ
