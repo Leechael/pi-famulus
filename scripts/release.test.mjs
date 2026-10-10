@@ -586,6 +586,8 @@ test('release version is written back to main only after a real, successful publ
   assert.match(record, /^    if: needs\.validate\.outputs\.dry_run == 'false'$/m, 'dry runs must not write to main');
   assert.match(record, /^          ref: main$/m, 'edit the latest main, not the tagged commit');
   assert.match(record, /node scripts\/writeback-release\.mjs "\$RELEASE_VERSION"/);
+  assert.match(record, /^          set -euo pipefail$/m, 'GitHub default bash is `bash -e {0}`: without pipefail a failure is masked');
+  assert.ok(!/writeback-release\.mjs[^\n]*\|/.test(record), 'do not pipe the script: the pipe would hide its exit code');
   assert.match(record, /origin HEAD:main/);
   assert.match(record, /chore\(release\): v\$RELEASE_VERSION/);
   assert.ok(!/id-token/.test(record) && !/environment:/.test(record), 'the write-back job needs neither npm OIDC nor the npm environment');

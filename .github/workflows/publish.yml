@@ -172,13 +172,19 @@ jobs:
         with:
           node-version: 24
       - name: Commit the release version to main
+        # No `shell:` is set, so GitHub runs `bash -e {0}` (no pipefail).
+        # The script's exit code must reach the step, so it is not piped
+        # and pipefail is set explicitly.
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           for attempt in 1 2; do
-            node scripts/writeback-release.mjs "$RELEASE_VERSION" | tee "$RUNNER_TEMP/writeback.log"
+            # A failing script aborts the step here (set -e). Only a
+            # successful "skip:" run leaves a clean tree.
+            node scripts/writeback-release.mjs "$RELEASE_VERSION"
             if git diff --quiet; then
-              echo "Nothing to commit."
+              echo "Nothing to commit: main already records v$RELEASE_VERSION or newer."
               exit 0
             fi
             node scripts/validate-release.mjs --tag "v$RELEASE_VERSION"
