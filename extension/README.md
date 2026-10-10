@@ -2,7 +2,7 @@
 
 Let pi delegate, and keep working.
 
-pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the coding agent. Subagents run inside pi. Shell commands and monitors run under a daemon that cleans up their process groups, and results report back when done: no polling. It is for people who run pi on real projects and want to hand off parallel or slow work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
+pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the coding agent. Subagents run inside pi. Shell commands and monitors run under a daemon that stops everything they started if it exits or crashes, and results report back when done: no polling. It is for people who run pi on real projects and want to hand off parallel or slow work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
 
 ## Why
 
@@ -10,7 +10,7 @@ Three things go wrong when an agent has to wait. This [field report on building 
 
 - **A foreground watch blocks the chat.** Monitoring CI or a dev server holds the turn, and new messages queue behind it. Here `bash` moves a command to the background after 20 seconds and the turn goes on.
 - **A backgrounded command finishes silently.** The agent has no way to wake and react. Here the result is injected into the conversation when the command exits, and `monitor` does the same for output lines.
-- **A subagent says "done" while its work still runs.** Here a subagent's `bash` runs in the foreground until the command exits or times out, and a subagent cannot start subagents or monitors. So when it reports done, nothing it started through pi-famulus is still running, unless a command detached itself with `setsid`.
+- **A subagent says "done" while its work still runs.** Here a subagent's `bash` runs in the foreground until the command exits or times out, and a subagent cannot start subagents or monitors. So when it reports done, nothing it started through pi-famulus is still running, unless a command detached itself (`setsid`) or left a process running with `&`. Such leftovers keep running until they exit or the daemon stops them.
 
 pi's core leaves these to extensions on purpose ([design, section 1](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md#1-background-and-goals)). pi-famulus adds them with a separate daemon (`pi-famulus`, written in Rust) that starts every shell command and monitor, including the ones subagents run, and is their parent. Subagents themselves run inside pi. Bare `sleep` is rejected, so the model waits for the result instead of polling. Whether a model uses a tool depends on how the tool is described, so the wording is tested against real models in [eval/RESULTS.md](https://github.com/Leechael/pi-famulus/blob/main/eval/RESULTS.md).
 
@@ -49,7 +49,7 @@ have subagents implement it one module at a time, then review what they return.
 
 The session model writes the plan. `subagent` runs `worker` by default, and `worker` now uses the model matching `haiku`. The prompt names no model. Notes:
 
-- `model` is matched against the model ids and names pi lets you use (your `enabledModels` setting or `--models`). It must match exactly one model. If it matches none or several, the child falls back to the parent model and says so in a warning.
+- `model` is matched against the model ids and names pi lets you use (your `enabledModels` setting or `--models`). It must match exactly one model. If it matches none or several, the child falls back to the parent model and says so in a warning. (A `model` passed on a single `subagent` call is stricter: no match or several matches is an error, and the model is told the candidates.)
 - Ask pi "which models can subagents use?" to see the choices (it calls `subagent({action: "models"})`).
 - Add a thinking level with a suffix, for example `model: haiku:high`.
 - A `worker.md` in `<project>/.pi/agents/` overrides the one in your home directory. Without any `worker.md`, children use the parent's model.
@@ -91,7 +91,7 @@ Start the dev server and tell me if an error shows up in its output.
 
 ### Watch output
 
-- `monitor` runs a command and turns each output line into an event (batched every 200 ms, lines cut at 500 characters, at most 10 events per 2 seconds; batches over the limit are dropped). The command exiting and a timeout also produce events. If more than half the batches are dropped over a full 30 seconds, the monitor is stopped and you are told.
+- `monitor` runs a command and turns each output line into an event (batched every 200 ms, lines cut at 500 characters, at most 10 events per 2 seconds; batches over the limit are dropped). The command exiting and a timeout also produce events. If at least half the batches are dropped over a full 30-second window containing at least 10 batches, the monitor is stopped and you are told.
 
 ### When things go wrong
 
@@ -114,7 +114,7 @@ pi-famulus, `pi-subagents` and `pi-background-tasks` are alternatives. Pick one.
 ## FAQ
 
 **How do I run a subagent on a cheaper model in pi?**
-Put `model: haiku` (or another model id you have access to) in the frontmatter of `~/.pi/agent/agents/worker.md`. The `worker` agent is what `subagent` runs when no agent is named. See "Try this first" above. A single call can also pass `model`.
+Put `model: haiku` (or another model id you have access to) in the frontmatter of `~/.pi/agent/agents/worker.md`. The `worker` agent is what `subagent` runs when no agent is named. See "Try this first" above. A single call can also pass `model`, but there a model that matches none or several is an error instead of a fallback.
 
 **Why does my pi bash command hang on long builds?**
 With pi-famulus, `bash` stops waiting after 20 seconds and moves the command to the background. The model gets the result when the command exits. Change the limit with `foregroundBudgetMs` in `~/.pi/agent/pi-famulus/config.json` ([configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)).

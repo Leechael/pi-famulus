@@ -62,7 +62,7 @@ The publish job requires the **`npm` GitHub environment**. In repository Setting
 
 Repository configuration does not create npm packages or their trusted-publisher bindings. All packages in the release set must first exist in npm and be controlled by the intended maintainer. This repository cannot assert that those remote settings are configured just because the workflow passes a dry run.
 
-1. Confirm the public license/ownership and all release-set npm names before the first public release.
+1. Confirm the public license/ownership and all release-set npm names before adding a new package to the release set (0.1.6 is already published).
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
 3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and **checking** `dry_run` (the UI default is now unchecked and would publish for real). The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
 4. Download all `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
