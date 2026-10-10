@@ -2,7 +2,7 @@
 
 What pi-famulus registers in pi, with parameters and limits. For the architecture behind it see [design.md](design.md); for the daemon CLI see [cli.md](cli.md).
 
-A **wake** is the message pi-famulus injects into the model's context when background work finishes or needs attention. It appears to the model as `<pi-famulus-wake kind="...">`. Kinds: `task`, `subagent-done`, `subagent-handover`, `subagent-overrun`. The wake is how the model learns a result without polling.
+A **wake** is the message pi-famulus injects into the model's context when background work finishes or needs attention. It appears to the model as `<pi-famulus-wake kind="...">`. Kinds: `task`, `monitor`, `subagent-done`, `subagent-handover`, `subagent-overrun`, `supervisor-request`, `supervisor-update`. The wake is how the model learns a result without polling.
 
 ## Tools
 
@@ -25,11 +25,11 @@ subagent({ action: "list|get|status|interrupt|resume|steer|extend|models", run_i
 ```
 monitor({ command, description, timeout_ms?, persistent? })
 ```
-Each output line becomes an event (200ms batching, 500 chars/line and 3000 chars/batch caps, 10 events per 2s rate limit). Exit, timeout, and rate-limit saturation all produce notifications.
+Each output line becomes an event (200ms batching, 500 chars/line and 3000 chars/batch caps, 10 events per 2s; batches over the limit are dropped). Exit and timeout produce notifications. Sustained saturation (at least 10 batches in a 30s window, half or more dropped) stops the monitor and notifies.
 
 After starting/re-arming a monitor or handling its event, finish any remaining work, then end the turn with a reply and no tool call. Simply wait for the next notification—do not poll, sleep, or call `wait_for` to yield. A UI extension's `wait_for` is for observed UI conditions, not monitor notifications.
 
-Parent background-task guidelines are re-applied to every model request when pi rebuilds its base prompt, including wake-triggered tool continuations. This repairs instruction visibility; it does not guarantee that every model follows them. The opt-in [monitor/UI compatibility evals](eval/README.md) measure that behavior without operating a real UI.
+Parent background-task guidelines are re-applied to every model request when pi rebuilds its base prompt, including wake-triggered tool continuations. This repairs instruction visibility; it does not guarantee that every model follows them. The opt-in [monitor/UI compatibility evals](../eval/README.md) measure that behavior without operating a real UI.
 
 ### task_list / task_output / task_stop
 Manage shell/monitor tasks held by the manager.

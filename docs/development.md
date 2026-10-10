@@ -2,15 +2,15 @@
 
 ## Source build and local trial
 
-Use this to run a separately built manager, or to work on the project.
+Use this to run a separately built manager, or to work on the project. These commands are for Linux and macOS (`install` is POSIX); on Windows the binary is `manager/target/release/pi-famulus.exe` and the steps are not documented here.
 
 ```bash
 # 1. Build and install the manager at ~/.pi/agent/pi-famulus/bin/
-cd manager && cargo build --release
+(cd manager && cargo build --release)
 mkdir -p ~/.pi/agent/pi-famulus/bin
 # Atomic replace (new inode). In-place `cp` onto an existing binary breaks
 # macOS code-signing and the next run dies with SIGKILL / "killed".
-install -m 755 target/release/pi-famulus ~/.pi/agent/pi-famulus/bin/pi-famulus
+install -m 755 manager/target/release/pi-famulus ~/.pi/agent/pi-famulus/bin/pi-famulus
 #    Subsequent same-name upgrades: the same `install` line is enough.
 #    A running daemon upgrades itself in place within seconds (same pid,
 #    running work kept); `pi-famulus upgrade` does it now and reports the result.
@@ -26,13 +26,11 @@ An installed native npm manager takes precedence over home/bin and PATH. To test
 ## Tests
 
 ```bash
-cd manager && cargo test                        # Rust: unit + adversarial + protocol + observability
-cd manager && cargo test --features test-clock  # same suites on a manual clock (fast)
-cd extension && npx tsc --noEmit && npx vitest run
-PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts  # TS ↔ real daemon
+(cd manager && cargo test)                        # Rust: unit + adversarial + protocol + observability
+(cd manager && cargo test --features test-clock)  # same suites on a manual clock (fast)
+(cd extension && npx tsc --noEmit && npx vitest run)
+(cd extension && PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts)  # TS ↔ real daemon
 ```
-
-Manual acceptance checklist: [docs/testing-guide.md](docs/testing-guide.md).
 
 Manual acceptance checklist: [testing-guide.md](testing-guide.md). Model-facing prompt evals: [eval/README.md](../eval/README.md).
 

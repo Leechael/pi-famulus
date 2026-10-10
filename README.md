@@ -91,12 +91,12 @@ Start the dev server and tell me if an error shows up in its output.
 
 ### Watch output
 
-- `monitor` runs a command and turns each output line into an event (batched every 200 ms, lines cut at 500 characters, at most 10 events per 2 seconds). The command exiting, a timeout, and hitting the rate limit also produce events.
+- `monitor` runs a command and turns each output line into an event (batched every 200 ms, lines cut at 500 characters, at most 10 events per 2 seconds; batches over the limit are dropped). The command exiting and a timeout also produce events. If more than half the batches are dropped over a full 30 seconds, the monitor is stopped and you are told.
 
 ### When things go wrong
 
 - A subagent still running when its 30-minute turn budget ends is not killed. The parent is told and chooses to extend, steer or interrupt it.
-- A subagent with no activity for 5 minutes is resumed once on the same session with its transcript kept. If it stalls again, it is marked failed.
+- A subagent with no activity for 5 minutes is resumed once on the same session with its transcript kept. The timer pauses while a tool is running or a `contact_supervisor` question awaits an answer. If it stalls again, it is marked failed.
 - The daemon is the parent of every shell and monitor task. If the daemon crashes or is killed with `kill -9`, each task's process group is stopped. A command that moves a child into a new session (`setsid`) escapes this.
 - Running work does not survive the last pi session closing. Five seconds after the last session disconnects, the daemon stops what is left and exits. Records and transcripts stay for 24 hours.
 - With the daemon binary installed in `~/.pi/agent/pi-famulus/bin`, replacing it on Linux or macOS makes the running daemon re-execute itself with the same pid. Running commands keep going and clients reconnect (a 30 to 46 ms gap was measured).
