@@ -145,3 +145,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/github-release.mjs
+
+  # Record a successful stable publish in source. The publish job already
+  # created the tag and GitHub Release, so a failure here never affects the
+  # published artifacts; re-run this job to retry. It edits only version
+  # fields on the latest main (no rebase of the tagged commit), and the
+  # script is a no-op if main already carries this or a newer version.
+  # Pushes made with GITHUB_TOKEN do not start workflows: the release commit
+  # touches only version fields that the release pipeline just tested.
+  record-version:
+    needs: [validate, publish]
+    if: needs.validate.outputs.dry_run == 'false'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          # The default GITHUB_TOKEN is used only for the push below.
+          persist-credentials: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Commit the release version to main
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for attempt in 1 2; do
+            node scripts/writeback-release.mjs "$RELEASE_VERSION" | tee "$RUNNER_TEMP/writeback.log"
+            if git diff --quiet; then
+              echo "Nothing to commit."
+              exit 0
+            fi
+            node scripts/validate-release.mjs --tag "v$RELEASE_VERSION"
+            git commit -a -m "chore(release): v$RELEASE_VERSION"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            if [[ $attempt == 2 ]]; then
+              echo "::error::main moved twice while recording v$RELEASE_VERSION; re-run this job."
+              exit 1
+            fi
+            # main moved: drop our commit and redo the version edit on the new tip.
+            git fetch origin main
+            git reset --hard origin/main
+          done
