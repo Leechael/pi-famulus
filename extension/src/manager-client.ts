@@ -18,7 +18,7 @@ import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
-const EXTENSION_VERSION = "0.1.2";
+const EXTENSION_VERSION = "0.1.6";
 // 5: speaks per-kind agent admission and queued acquire.
 const PROTOCOL = 5;
 const HELLO_TIMEOUT_MS = 5000;
