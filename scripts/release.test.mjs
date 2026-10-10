@@ -155,6 +155,24 @@ test('explicit empty release tags are rejected by metadata and the actual CLI', 
   assert.throws(() => execFileSync(process.execPath, [fileURLToPath(new URL('./validate-release.mjs', import.meta.url)), '--tag', ''], { cwd: root, stdio: 'pipe' }), /release tag must/);
 });
 
+// Publish computes a new tag, publishes npm, then creates the GitHub tag.
+// Pre-publish --tag must therefore validate package metadata only.
+test('CLI --tag validates metadata without requiring the git tag to exist yet', t => {
+  const { root } = fixture(t);
+  const cli = fileURLToPath(new URL('./validate-release.mjs', import.meta.url));
+  const env = { ...process.env, GITHUB_REPOSITORY: repository };
+  const output = execFileSync(process.execPath, [cli, '--tag', 'v0.1.0'], { cwd: root, encoding: 'utf8', env, stdio: 'pipe' });
+  assert.match(output, /Validated all \d+ packages for v0\.1\.0/);
+  assert.throws(
+    () => execFileSync(process.execPath, [cli, '--tag', 'v0.1.0', '--require-git-tag'], { cwd: root, encoding: 'utf8', env, stdio: 'pipe' }),
+    /not a git repository|Needed a single revision|refs\/tags\/v0\.1\.0/,
+  );
+  assert.throws(
+    () => execFileSync(process.execPath, [cli, '--tag', 'v0.1.0', 'v0.1.0'], { cwd: root, encoding: 'utf8', env, stdio: 'pipe' }),
+    /usage: validate-release\.mjs/,
+  );
+});
+
 test('native files whitelist cannot ship an entire bin directory', t => {
   const { root, put } = fixture(t);
   const path = 'npm/linux-x64/package.json';
@@ -246,10 +264,16 @@ test('release versions, literal repository and metadata contracts', t => {
 test('tag must be the checked-out commit and an ancestor of main (real git)', t => {
   const { root, put } = fixture(t);
   const git = (...args) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
+  const cli = fileURLToPath(new URL('./validate-release.mjs', import.meta.url));
+  const env = { ...process.env, GITHUB_REPOSITORY: repository };
   git('init', '-b', 'main'); git('config', 'user.email', 'test@example.com'); git('config', 'user.name', 'Test');
   git('add', '.'); git('commit', '-m', 'fixture'); git('tag', 'v0.1.0');
   git('update-ref', 'refs/remotes/origin/main', 'HEAD');
   validateGitTag(root, 'v0.1.0');
+  assert.match(
+    execFileSync(process.execPath, [cli, '--tag', 'v0.1.0', '--require-git-tag'], { cwd: root, encoding: 'utf8', env, stdio: 'pipe' }),
+    /Validated all \d+ packages for v0\.1\.0/,
+  );
   put('unrelated', 'next'); git('add', '.'); git('commit', '-m', 'next');
   assert.throws(() => validateGitTag(root, 'v0.1.0'), /checked-out/);
   git('tag', 'v0.2.0');
@@ -441,7 +465,17 @@ test('workflow literal security, release graph and host/target contracts', () =>
   }
   assert.ok(publish.includes('scripts/next-release.mjs'));
   assert.ok(publish.includes('scripts/bump-release.mjs'));
+  assert.match(
+    publish,
+    /node scripts\/bump-release\.mjs "\$RELEASE_VERSION"\n\s*node scripts\/validate-release\.mjs --tag "\$RELEASE_TAG"\n/,
+    'pre-publish validation must use --tag without requiring the git tag that is created after npm publish',
+  );
+  assert.ok(!publish.includes('--require-git-tag'), 'pre-publish validation must not require a git tag that does not exist yet');
   assert.ok(publish.includes('node scripts/github-release.mjs'), 'GitHub tag/release creation must run the tested helper');
+  assert.ok(
+    publish.indexOf('node scripts/validate-release.mjs --tag "$RELEASE_TAG"') < publish.indexOf('node scripts/github-release.mjs'),
+    'metadata revalidation must precede GitHub tag creation',
+  );
   assert.ok(!publish.includes('api_get()'), 'inline GitHub tag lookup bash must not return; helper owns 422-as-missing');
   assert.ok(!publish.includes('Existing release tag'));
   assert.equal((publish.match(/id-token: write/g) ?? []).length, 1);

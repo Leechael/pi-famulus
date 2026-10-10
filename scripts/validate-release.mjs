@@ -86,10 +86,20 @@ export function validateGitTag(root, tag) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const args = process.argv.slice(2);
-    assert.ok(args.length === 0 || (args.length === 2 && args[0] === '--tag'), 'usage: validate-release.mjs [--tag vX.Y.Z]');
-    const tag = args[1];
+    // --tag validates package metadata against the computed release tag. The
+    // git tag itself is created after npm publish, so require it only when
+    // callers pass --require-git-tag.
+    const tagIdx = args.indexOf('--tag');
+    const requireIdx = args.indexOf('--require-git-tag');
+    const requireGit = requireIdx >= 0;
+    const skip = new Set([tagIdx, requireIdx].filter(i => i >= 0));
+    if (tagIdx >= 0) skip.add(tagIdx + 1);
+    const rest = args.filter((_, i) => !skip.has(i));
+    assert.ok(rest.length === 0 && (tagIdx < 0 || typeof args[tagIdx + 1] === 'string'), 'usage: validate-release.mjs [--tag vX.Y.Z] [--require-git-tag]');
+    assert.ok(!requireGit || tagIdx >= 0, '--require-git-tag needs --tag');
+    const tag = tagIdx >= 0 ? args[tagIdx + 1] : undefined;
     const packages = validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
-    if (tag !== undefined) validateGitTag(process.cwd(), tag);
+    if (requireGit) validateGitTag(process.cwd(), tag);
     console.log(`Validated all ${packages.length} packages${tag ? ` for ${tag}` : ''}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }
