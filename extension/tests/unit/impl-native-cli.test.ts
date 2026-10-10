@@ -5,9 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import pkg from "../../package.json";
+import { nativePackageName } from "../../src/native-manager.js";
 
 const WINDOWS = process.platform === "win32";
 const itPosix = it.skipIf(WINDOWS);
+// Windows ARM64 (and other unsupported hosts) have no published native package yet.
+const HAS_NATIVE_PACKAGE = nativePackageName(process.platform, process.arch) !== null;
+const itNative = it.skipIf(!HAS_NATIVE_PACKAGE);
 
 let root = "";
 afterEach(() => {
@@ -59,7 +63,8 @@ function consumer(native = true, exit = 0, nativeText?: string) {
   copyFileSync(new URL("../../src/native-manager.js", import.meta.url), join(main, "src", "native-manager.js"));
   copyFileSync(new URL("../../bin/pi-famulus.js", import.meta.url), join(main, "bin", "pi-famulus.js"));
   if (native) {
-    const name = `pi-famulus-${process.platform}-${process.arch}`;
+    const name = nativePackageName(process.platform, process.arch);
+    if (!name) throw new Error(`no native package for ${process.platform}/${process.arch}`);
     const dir = join(root, "node_modules", name);
     mkdirSync(join(dir, "bin"), { recursive: true });
     const file = WINDOWS ? "./bin/pi-famulus.exe" : "./bin/pi-famulus";
@@ -77,14 +82,14 @@ function consumer(native = true, exit = 0, nativeText?: string) {
   return join(main, "bin", "pi-famulus.js");
 }
 
-it("npm CLI forwards argument boundaries to the installed native executable", () => {
+itNative("npm CLI forwards argument boundaries to the installed native executable", () => {
   const result = spawnSync(process.execPath, [consumer(), "output", "--", "one arg", ";echo injected"], { encoding: "utf8" });
   expect(result.status).toBe(0);
   expect(result.stdout).toBe("output\n--\none arg\n;echo injected\n");
   expect(result.stderr).toBe("");
 });
 
-it("npm CLI preserves native failure exit codes", () => {
+itNative("npm CLI preserves native failure exit codes", () => {
   const result = spawnSync(process.execPath, [consumer(true, 42), "status"], { encoding: "utf8" });
   expect(result.status).toBe(42);
   expect(result.stdout).toBe("status\n");
