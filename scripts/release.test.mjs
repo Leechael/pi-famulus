@@ -238,9 +238,14 @@ test('Windows npm package uses win, not win32, to avoid registry spam filters', 
   const native = workflow('native-packages');
   assert.match(native, /native_tgz=\$\(node scripts\/prepare-native\.mjs "\$PLATFORM" "\$RUNNER_TEMP\/packages"\)/);
   assert.match(native, /NATIVE_TGZ=\$native_tgz/);
-  assert.match(native, /"\$NATIVE_TGZ"/);
+  assert.match(
+    native,
+    /npm install --ignore-scripts --no-audit --no-fund \\\n\s+"@earendil-works\/pi-coding-agent@\$pi_version" \\\n\s+"\$RUNNER_TEMP\/packages\/pi-famulus-\$version\.tgz" \\\n\s+"\$NATIVE_TGZ"/,
+    'smoke install must consume the prepare-native tarball path',
+  );
+  assert.match(native, /path: \$\{\{ env\.NATIVE_TGZ \}\}/, 'artifact upload must use the prepare-native path');
   assert.ok(!native.includes('pi-famulus-$PLATFORM-$version.tgz'), 'smoke install must not assume package name equals platform id');
-  assert.ok(!native.includes('pi-famulus-${{ matrix.platform }}-*.tgz'), 'artifact upload must use the prepare-native path');
+  assert.ok(!native.includes('pi-famulus-${{ matrix.platform }}-*.tgz'), 'artifact upload must not glob by platform id');
 });
 
 test('release versions, literal repository and metadata contracts', t => {
