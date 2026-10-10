@@ -2,7 +2,7 @@
 
 Let pi delegate, and keep working.
 
-pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the coding agent. Subagents run inside pi. Shell commands and monitors run under a daemon that stops everything they started if it exits or crashes, and results report back when done: no polling. It is for people who run pi on real projects and want to hand off parallel or slow work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
+pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the coding agent. Subagents run inside pi. Shell commands and monitors run under a daemon (`pi-famulus`), which cleans them up if it crashes and reports their results back when they finish: no polling. It is for people who run pi on real projects and want to hand off parallel or slow work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
 
 ## Why
 
