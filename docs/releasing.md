@@ -33,7 +33,7 @@ node scripts/validate-release.mjs
 node --test scripts/*.test.mjs
 ```
 
-`validate-release.mjs` checks versions, native names/targets, exports/files, no install hooks, and repository identity. `prepare-native.mjs <os-arch> <artifact-directory>` requires the compiled release under `manager/target/<target>/release/pi-famulus`, verifies its version, atomically installs it into the ignored native package bin directory, and packs a real tarball. Generated binaries and `dist/` are not committed.
+`validate-release.mjs` checks versions, native names/targets, exports/files, no install hooks, and repository identity. `--tag vX.Y.Z` compares that metadata to a computed release tag; add `--require-git-tag` only when the git tag must already exist (publish creates the tag after npm). `prepare-native.mjs <os-arch> <artifact-directory>` requires the compiled release under `manager/target/<target>/release/pi-famulus`, verifies its version, atomically installs it into the ignored native package bin directory, and packs a real tarball. Generated binaries and `dist/` are not committed.
 
 ## Trusted Publishers: repository configuration
 
