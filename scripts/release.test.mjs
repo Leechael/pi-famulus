@@ -9,6 +9,7 @@ import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './vali
 import { npmSync, prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
 import { bumpRelease } from './bump-release.mjs';
+import { writebackDecision, writebackRelease } from './writeback-release.mjs';
 
 const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
@@ -95,6 +96,63 @@ test('bump-release writes every versioned manifest including prerelease', t => {
   assert.deepEqual(lock.packages[''].optionalDependencies, Object.fromEntries(PLATFORMS.map(p => [p.name, '0.1.3-beta.0'])));
   for (const p of PLATFORMS) assert.equal(lock.packages[`../npm/${p.id}`].version, '0.1.3-beta.0');
   validateMetadata(root, { tag: 'v0.1.3-beta.0', repository });
+});
+
+function lockedFixture(t, v) {
+  const f = fixture(t, v);
+  f.put('manager/Cargo.lock', `[[package]]\nname = "pi-famulus"\nversion = "${v}"\n`);
+  f.put('extension/package-lock.json', {
+    name: 'pi-famulus',
+    version: v,
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'pi-famulus', version: v, optionalDependencies: Object.fromEntries(PLATFORMS.map(p => [p.name, v])) },
+      ...Object.fromEntries(PLATFORMS.map(p => [`../npm/${p.id}`, { name: p.name, version: v }])),
+    },
+  });
+  return f;
+}
+// Every file that carries the release version. If bump-release learns a new
+// one, add it here; the writeback must leave none on the old value.
+function versionCarriers(root) {
+  const json = path => JSON.parse(readFileSync(join(root, path), 'utf8'));
+  const text = path => readFileSync(join(root, path), 'utf8');
+  const lock = json('extension/package-lock.json');
+  const distinct = values => [...new Set(Object.values(values))].join();
+  return {
+    'extension/package.json': json('extension/package.json').version,
+    'extension optionalDependencies': distinct(json('extension/package.json').optionalDependencies),
+    ...Object.fromEntries(PLATFORMS.map(p => [`${p.directory}/package.json`, json(`${p.directory}/package.json`).version])),
+    'manager/Cargo.toml': text('manager/Cargo.toml').match(/^version = "([^"]+)"/m)[1],
+    'manager/Cargo.lock': text('manager/Cargo.lock').match(/name = "pi-famulus"\r?\nversion = "([^"]+)"/)[1],
+    'extension/src/manager-client.ts': text('extension/src/manager-client.ts').match(/EXTENSION_VERSION = "([^"]+)"/)[1],
+    'package-lock root': lock.version,
+    'package-lock packages[""]': lock.packages[''].version,
+    'package-lock optionalDependencies': distinct(lock.packages[''].optionalDependencies),
+    ...Object.fromEntries(PLATFORMS.map(p => [`package-lock ../npm/${p.id}`, lock.packages[`../npm/${p.id}`].version])),
+  };
+}
+
+test('writeback-release moves every versioned file from the old version to the release', t => {
+  const { root } = lockedFixture(t, '0.1.2');
+  assert.ok(Object.values(versionCarriers(root)).every(v => v === '0.1.2'), 'fixture must start fully on the old version');
+  assert.equal(writebackRelease(root, '0.1.6').write, true);
+  assert.deepEqual(Object.entries(versionCarriers(root)).filter(([, v]) => v !== '0.1.6'), [], 'files left on a stale version');
+  validateMetadata(root, { tag: 'v0.1.6', repository });
+});
+
+test('writeback-release is idempotent and never moves main backwards or records prereleases', t => {
+  const { root } = lockedFixture(t, '0.1.6');
+  const snapshot = () => JSON.stringify(versionCarriers(root)) + readFileSync(join(root, 'extension/package.json'), 'utf8');
+  const before = snapshot();
+  for (const release of ['0.1.6', '0.1.5', '0.1.7-beta.0', '0.1.7-nightly.20261010']) {
+    assert.equal(writebackRelease(root, release).write, false, release);
+    assert.equal(snapshot(), before, `${release} must not touch the tree`);
+  }
+  assert.equal(writebackDecision('0.1.9', '0.2.0').write, true);
+  assert.equal(writebackDecision('0.9.0', '0.10.0').write, true, 'numeric, not lexical, comparison');
+  assert.equal(writebackDecision('1.0.0', '0.99.99').write, false);
+  assert.throws(() => writebackRelease(root, '0.1.7; rm -rf /'), /release tag/);
 });
 
 test('bump-release updates a CRLF Cargo.lock from a Windows checkout', t => {
