@@ -9,7 +9,7 @@ import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './vali
 import { npmSync, prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
 import { bumpRelease } from './bump-release.mjs';
-import { writebackDecision, writebackRelease } from './writeback-release.mjs';
+import { compareSemver, writebackDecision, writebackRelease } from './writeback-release.mjs';
 
 const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
@@ -153,6 +153,23 @@ test('writeback-release is idempotent and never moves main backwards or records 
   assert.equal(writebackDecision('0.9.0', '0.10.0').write, true, 'numeric, not lexical, comparison');
   assert.equal(writebackDecision('1.0.0', '0.99.99').write, false);
   assert.throws(() => writebackRelease(root, '0.1.7; rm -rf /'), /release tag/);
+});
+
+test('writeback compares by SemVer precedence, so a prerelease on main is not overwritten by an older stable', () => {
+  assert.equal(writebackDecision('0.2.0-beta.1', '0.1.9').write, false, 'older stable must not replace a newer prerelease');
+  assert.equal(writebackDecision('0.2.0-beta.1', '0.2.0').write, true, 'stable outranks its own prerelease');
+  assert.equal(writebackDecision('0.2.0-beta.1', '0.3.0').write, true);
+  assert.equal(writebackDecision('0.2.0', '0.2.0').write, false);
+  assert.equal(writebackDecision('0.2.0', '0.2.0-beta.1').write, false);
+  const ascending = ['0.2.0-alpha', '0.2.0-alpha.1', '0.2.0-alpha.beta', '0.2.0-beta', '0.2.0-beta.2', '0.2.0-beta.10', '0.2.0-rc.1', '0.2.0'];
+  for (let i = 0; i < ascending.length - 1; i++) {
+    assert.equal(compareSemver(ascending[i], ascending[i + 1]), -1, `${ascending[i]} < ${ascending[i + 1]}`);
+    assert.equal(compareSemver(ascending[i + 1], ascending[i]), 1);
+  }
+  assert.equal(compareSemver('0.2.0-beta.2', '0.2.0-beta.10'), -1, 'numeric identifiers compare numerically');
+  assert.equal(compareSemver('0.2.0-1', '0.2.0-a'), -1, 'numeric identifiers sort below alphanumeric');
+  assert.equal(compareSemver('1.0.0+a', '1.0.0+b'), 0, 'build metadata is ignored');
+  assert.throws(() => compareSemver('1.0', '1.0.0'), /not a SemVer/);
 });
 
 test('bump-release updates a CRLF Cargo.lock from a Windows checkout', t => {
