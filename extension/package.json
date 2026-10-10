@@ -1,7 +1,7 @@
 {
   "name": "pi-famulus",
   "version": "0.1.2",
-  "description": "Subagents and long-running bash for pi, run by a daemon that owns every process. Work reports back when it's done: no polling, no orphaned processes.",
+  "description": "Subagents and long-running bash for pi. Shell commands and monitors run under a daemon that cleans up their process groups, and results report back when done: no polling.",
   "keywords": [
     "pi-package",
     "pi",

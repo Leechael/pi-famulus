@@ -2,7 +2,7 @@
 
 Let pi delegate, and keep working.
 
-pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the coding agent. A daemon owns every process, so work reports back when it's done: no polling, no orphaned processes. It is for people who run pi on real projects and want to hand off parallel or slow work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
+pi-famulus adds subagents and long-running bash to [pi](https://pi.dev), the coding agent. Subagents run inside pi. Shell commands and monitors run under a daemon that cleans up their process groups, and results report back when done: no polling. It is for people who run pi on real projects and want to hand off parallel or slow work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
 
 ## Why
 
@@ -10,9 +10,9 @@ pi's core leaves out subagents, background bash and monitoring on purpose and ex
 
 - A long command holds the turn until it exits.
 - Waiting for a result means a sleep loop or repeated checks. pi-famulus rejects bare `sleep` and tells the model to use the background flag or `monitor` instead.
-- A process that nothing owns can outlive the session that started it.
+- A background process that nothing cleans up can outlive the session that started it.
 
-pi-famulus moves processes into a separate daemon (`pi-famulus`, written in Rust). The daemon starts every shell command and monitor. The extension injects a message into the conversation when one finishes.
+pi-famulus moves processes into a separate daemon (`pi-famulus`, written in Rust). The daemon starts every shell command and monitor, including the ones subagents run, and is their parent. Subagents themselves run inside pi. The extension injects a message into the conversation when one finishes.
 
 ## Install
 
@@ -97,7 +97,7 @@ Start the dev server and tell me if an error shows up in its output.
 
 - A subagent still running when its 30-minute turn budget ends is not killed. The parent is told and chooses to extend, steer or interrupt it.
 - A subagent with no activity for 5 minutes is resumed once on the same session with its transcript kept. If it stalls again, it is marked failed.
-- The daemon is the parent of every task. If the daemon crashes or is killed with `kill -9`, each task's process group is stopped. A command that moves a child into a new session (`setsid`) escapes this.
+- The daemon is the parent of every shell and monitor task. If the daemon crashes or is killed with `kill -9`, each task's process group is stopped. A command that moves a child into a new session (`setsid`) escapes this.
 - Running work does not survive the last pi session closing. Five seconds after the last session disconnects, the daemon stops what is left and exits. Records and transcripts stay for 24 hours.
 - With the daemon binary installed in `~/.pi/agent/pi-famulus/bin`, replacing it on Linux or macOS makes the running daemon re-execute itself with the same pid. Running commands keep going and clients reconnect (a 30 to 46 ms gap was measured).
 - The `pi-famulus` command inspects what happened: `doctor` (health), `ls` (what is running), `show <id>` (why it ended and what it printed), `agent <id>` (a subagent's transcript), `stats` (CPU per agent), `events` (why a notification did or did not arrive). See the [CLI manual](https://github.com/Leechael/pi-famulus/blob/main/docs/cli.md).
@@ -108,7 +108,7 @@ pi-famulus, `pi-subagents` and `pi-background-tasks` are alternatives. Pick one.
 
 - [`pi-subagents`](https://github.com/nicobailon/pi-subagents): choose it if you want ready-made roles (`scout`, `reviewer`, `oracle` and others), saved workflows, `/council`, or background children that run in a detached process. It cannot be installed alongside pi-famulus (same `subagent` tool). In pi-famulus, subagents run inside pi and stop when the last session closes.
 - [`pi-background-tasks`](https://github.com/ismailsaleekh/pi-background-tasks): choose it if you want named background shell jobs with output files, a read-only delegated agent, or its multi-model Fusion workflows. It shares the `/tasks` command with pi-famulus and covers the same ground.
-- Choose pi-famulus if you want one daemon that owns every shell and monitor process across your pi sessions, a shared cap on concurrent subagents, and a command-line tool for inspecting past runs.
+- Choose pi-famulus if you want one daemon that starts and cleans up every shell and monitor process across your pi sessions, a shared cap on concurrent subagents, and a command-line tool for inspecting past runs.
 
 ## FAQ
 
