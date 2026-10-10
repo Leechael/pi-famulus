@@ -478,12 +478,25 @@ fn t14_wait_budget_expires_while_running() {
 }
 
 /// T16: multi-byte characters written one byte at a time are never split or
-/// replaced, in `output` reads and in watch events.
+/// replaced, in `output` reads and in watch events. Also covers a late
+/// `watch`: bytes that land before the subscription must still be pushed.
 fn t16_utf8_split_across_writes() {
     let home = Home::new("w-t16");
     let _d = home.start_daemon();
     let mut c = ext(&home, "sess-a");
     let (id, _) = c.start(&kit(&["utf8"]));
+    // Force the late-subscribe path: wait until at least the leading ASCII
+    // byte exists on disk/fanout before watching. Without catch-up, that
+    // byte is lost forever (CI saw `é中😀b\n` instead of `aé中😀b\n`).
+    assert!(
+        poll_true(S(3), || {
+            c.task(&id)
+                .and_then(|t| t["output_size"].as_u64())
+                .unwrap_or(0)
+                >= 1
+        }),
+        "leading byte never appeared before watch",
+    );
     c.request_ok(json!({"type":"watch","task_id":id}));
     c.wait_terminal(&id, S(10)).unwrap();
     assert_eq!(output_of(&mut c, &id), "aé中😀b\n");

@@ -1226,37 +1226,8 @@ fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
             h.lock().unwrap().insert(tid.clone(), from);
         }
         let to = e.delivered_cursor;
-        let mut cursor = from.max(to.saturating_sub(REPLAY_MAX));
-        while cursor < to {
-            let want = ((to - cursor) as usize).min(256 * 1024);
-            let Ok((bytes, _)) =
-                task::read_file_range(std::path::Path::new(&e.record.output_path), cursor, want)
-            else {
-                break;
-            };
-            if bytes.is_empty() {
-                break;
-            }
-            // `to` is on a character boundary (the fanout never counts a
-            // held-back tail), so only the 256 KiB cut needs care.
-            let n = task::utf8_chunk_len(
-                &bytes,
-                want,
-                CHUNK_JSON_BUDGET,
-                cursor + (bytes.len() as u64) < to,
-            )
-            .max(1);
-            let chunk = &bytes[..n.min(bytes.len())];
-            cursor += chunk.len() as u64;
-            let ev = encode_event_bytes(&EventKind::Output {
-                task_id: tid.clone(),
-                chunk: String::from_utf8_lossy(chunk).into_owned(),
-                next_cursor: cursor,
-            });
-            if tx.try_send(OutFrame::output(ev, tid, cursor)).is_err() {
-                break; // queue full: the client catches up with output(cursor)
-            }
-        }
+        let path = e.record.output_path.clone();
+        queue_output_replay(tx, tid, &path, from, to);
     }
 }
 
@@ -1524,10 +1495,15 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             .await
         }
         RequestKind::Watch { task_id } => {
-            respond(&tx, &id, handle_watch(&state, conn_id, &task_id, true)).await
+            // Catch-up must be queued under the state lock (with the ok),
+            // or a live fanout chunk can overtake the replay and leave a
+            // gap at the start of the stream.
+            if let Err(error) = handle_watch_on(&state, conn_id, &task_id, &id) {
+                respond::<UnitOk>(&tx, &id, Err(error)).await;
+            }
         }
         RequestKind::Unwatch { task_id } => {
-            respond(&tx, &id, handle_watch(&state, conn_id, &task_id, false)).await
+            respond(&tx, &id, handle_unwatch(&state, conn_id, &task_id)).await
         }
         RequestKind::ShutdownSession => {
             respond(&tx, &id, handle_shutdown_session(&state, conn_id)).await
@@ -2221,29 +2197,84 @@ fn parse_list_cursor(s: &str) -> Option<(u64, String)> {
     Some((at.parse().ok()?, tid.to_string()))
 }
 
-fn handle_watch(
+/// Subscribe to a task's output stream, replaying anything the fanout has
+/// already advanced past. A late `watch` used to start at `delivered_cursor`
+/// with no catch-up, so bytes that landed with no watchers (CI: the leading
+/// `a` of `aé中😀b`) were never pushed.
+fn handle_watch_on(
     state: &Shared,
     conn_id: u64,
     task_id: &str,
-    on: bool,
+    req_id: &str,
+) -> Result<(), ProtoError> {
+    let mut st = state.lock().unwrap();
+    let acc = access_for(&st, conn_id);
+    let e = st.registry.visible_mut(task_id, &acc)?;
+    e.watchers.insert(conn_id);
+    let path = e.record.output_path.clone();
+    let to = e.delivered_cursor;
+    let Some(h) = st.conns.get(&conn_id) else {
+        return Err(ProtoError::new(E_INTERNAL, "connection gone"));
+    };
+    let tx = h.tx.clone();
+    let from = {
+        let mut written = h.written.lock().unwrap();
+        // First watch starts at 0 so catch-up covers the gap; a repeat
+        // watch keeps the cursor the writer already flushed (idempotent).
+        *written.entry(task_id.to_string()).or_insert(0)
+    };
+    // ok before replay so the client sees the response, then the gap, then
+    // live chunks — and all of it is ordered ahead of any fanout still
+    // waiting on this same lock.
+    let _ = tx.try_send(encode_ok(req_id, &UnitOk {}));
+    queue_output_replay(&tx, task_id, &path, from, to);
+    Ok(())
+}
+
+fn handle_unwatch(
+    state: &Shared,
+    conn_id: u64,
+    task_id: &str,
 ) -> Result<UnitOk, ProtoError> {
     let mut st = state.lock().unwrap();
     let acc = access_for(&st, conn_id);
     let e = st.registry.visible_mut(task_id, &acc)?;
-    if on {
-        e.watchers.insert(conn_id);
-        let base = e.delivered_cursor;
-        if let Some(h) = st.conns.get(&conn_id) {
-            h.written
-                .lock()
-                .unwrap()
-                .entry(task_id.to_string())
-                .or_insert(base);
-        }
-    } else {
-        e.watchers.remove(&conn_id);
-    }
+    e.watchers.remove(&conn_id);
     Ok(UnitOk {})
+}
+
+/// Queue `[from, to)` from the on-disk output onto `tx` as `output` events.
+/// `to` is on a character boundary (fanout never counts a held-back tail).
+fn queue_output_replay(tx: &OutTx, task_id: &str, path: &str, from: u64, to: u64) {
+    let mut cursor = from.max(to.saturating_sub(REPLAY_MAX));
+    while cursor < to {
+        let want = ((to - cursor) as usize).min(256 * 1024);
+        let Ok((bytes, _)) =
+            task::read_file_range(std::path::Path::new(path), cursor, want)
+        else {
+            break;
+        };
+        if bytes.is_empty() {
+            break;
+        }
+        let n = task::utf8_chunk_len(
+            &bytes,
+            want,
+            CHUNK_JSON_BUDGET,
+            cursor + (bytes.len() as u64) < to,
+        )
+        .max(1);
+        let chunk = &bytes[..n.min(bytes.len())];
+        cursor += chunk.len() as u64;
+        let ev = encode_event_bytes(&EventKind::Output {
+            task_id: task_id.to_string(),
+            chunk: String::from_utf8_lossy(chunk).into_owned(),
+            next_cursor: cursor,
+        });
+        if tx.try_send(OutFrame::output(ev, task_id, cursor)).is_err() {
+            break; // queue full: the client catches up with output(cursor)
+        }
+    }
 }
 
 fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessionOk, ProtoError> {
