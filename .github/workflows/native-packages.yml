@@ -170,7 +170,10 @@ jobs:
       - name: Prepare and pack actual native and root tarballs
         shell: bash
         run: |
-          node scripts/prepare-native.mjs "$PLATFORM" "$RUNNER_TEMP/packages"
+          # prepare-native prints the real tarball path; package names may diverge
+          # from matrix platform ids (Windows publishes as pi-famulus-win-x64).
+          native_tgz=$(node scripts/prepare-native.mjs "$PLATFORM" "$RUNNER_TEMP/packages")
+          echo "NATIVE_TGZ=$native_tgz" >> "$GITHUB_ENV"
           npm pack ./extension --pack-destination "$RUNNER_TEMP/packages"
       - name: Install tarballs and verify automatic CLI and extension resolution
         shell: bash
@@ -188,7 +191,7 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund \
             "@earendil-works/pi-coding-agent@$pi_version" \
             "$RUNNER_TEMP/packages/pi-famulus-$version.tgz" \
-            "$RUNNER_TEMP/packages/pi-famulus-$PLATFORM-$version.tgz"
+            "$NATIVE_TGZ"
           # No global manager or ~/.pi/agent/pi-famulus/bin: use the optional package.
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
@@ -239,7 +242,8 @@ jobs:
       - uses: actions/upload-artifact@v5
         with:
           name: npm-${{ matrix.platform }}
-          path: ${{ runner.temp }}/packages/pi-famulus-${{ matrix.platform }}-*.tgz
+          # Exact path from prepare-native (not matrix.platform); Windows is win-x64.
+          path: ${{ env.NATIVE_TGZ }}
           if-no-files-found: error
       - uses: actions/upload-artifact@v5
         if: failure()

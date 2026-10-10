@@ -235,6 +235,12 @@ test('Windows npm package uses win, not win32, to avoid registry spam filters', 
   assert.equal(windows?.name, 'pi-famulus-win-x64');
   assert.equal(windows?.directory, 'npm/win32-x64');
   assert.deepEqual(windows && { os: windows.os, cpu: windows.arch }, { os: 'win32', cpu: 'x64' });
+  const native = workflow('native-packages');
+  assert.match(native, /native_tgz=\$\(node scripts\/prepare-native\.mjs "\$PLATFORM" "\$RUNNER_TEMP\/packages"\)/);
+  assert.match(native, /NATIVE_TGZ=\$native_tgz/);
+  assert.match(native, /"\$NATIVE_TGZ"/);
+  assert.ok(!native.includes('pi-famulus-$PLATFORM-$version.tgz'), 'smoke install must not assume package name equals platform id');
+  assert.ok(!native.includes('pi-famulus-${{ matrix.platform }}-*.tgz'), 'artifact upload must use the prepare-native path');
 });
 
 test('release versions, literal repository and metadata contracts', t => {

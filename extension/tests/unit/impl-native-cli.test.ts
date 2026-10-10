@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import pkg from "../../package.json";
+import { nativePackageName } from "../../src/native-manager.js";
 
 const WINDOWS = process.platform === "win32";
 const itPosix = it.skipIf(WINDOWS);
@@ -59,8 +60,9 @@ function consumer(native = true, exit = 0, nativeText?: string) {
   copyFileSync(new URL("../../src/native-manager.js", import.meta.url), join(main, "src", "native-manager.js"));
   copyFileSync(new URL("../../bin/pi-famulus.js", import.meta.url), join(main, "bin", "pi-famulus.js"));
   if (native) {
-    const name = `pi-famulus-${process.platform}-${process.arch}`;
-    const dir = join(root, "node_modules", name);
+    const name = nativePackageName(process.platform, process.arch);
+    expect(name).toBeTruthy();
+    const dir = join(root, "node_modules", name!);
     mkdirSync(join(dir, "bin"), { recursive: true });
     const file = WINDOWS ? "./bin/pi-famulus.exe" : "./bin/pi-famulus";
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name, version: pkg.version,
