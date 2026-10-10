@@ -98,7 +98,7 @@ The repository's `npm` GitHub environment was created and its single `main` bran
 
 The next version is the bump of `max(package.json, npm published stables, git tags vX.Y.Z)`. Prerelease counters come from existing npm versions and git tags. You never type the number.
 
-CI rewrites release metadata in the job workspace (package manifests, Cargo, `EXTENSION_VERSION`, lockfiles) so packed tarballs carry that version. It does **not** commit the bump to `main`. After a real publish, npm is the source of truth for the next increment even if git still shows the previous version.
+CI rewrites release metadata in the job workspace (package manifests, Cargo, `EXTENSION_VERSION`, lockfiles) with `scripts/bump-release.mjs` so packed tarballs carry that version. After a real stable publish, the `record-version` job commits that same rewrite to `main` (see below), so source shows the last released version. npm remains the source of truth for the next increment.
 
 Publication is explicitly dispatched from **main**; publishing a GitHub release does not itself trigger npm publication. A tag-triggered workflow runs under a tag ref, not main, and is deliberately incompatible with the main-only environment gate.
 
@@ -115,6 +115,17 @@ A dry run proves package validity, **not** OIDC authentication or npm-side trust
 Native packages publish before the root. The script preflights all registry names/versions before its first mutation. Existing versions are skipped only if their SHA-512 tarball integrity equals the candidate; a mismatch or registry error stops publication. Releases are serialized with GitHub's `queue: max`: one active run and up to 100 pending runs. Active publication is not auto-cancelled. GitHub cancels additional arrivals beyond that queue limit; operators must inspect and explicitly redispatch those requests. npm versions cannot be overwritten. If a partial retry rebuilds different artifacts, fail closed and publish a new synchronized version rather than bypassing the integrity check.
 
 After a real npm publish, the same job creates the GitHub tag at the validated commit and a generated GitHub Release (`scripts/github-release.mjs`). Tag existence is resolved through the commits API so annotated tags peel to their commit SHA (`git/ref/tags` returns the tag-object SHA). A missing tag is HTTP 404 **or** the commits-API 422 `No commit found for SHA:`; other 4xx/5xx responses fail closed and never retarget an existing tag. Retries reuse this run's tag and SHA. A later dispatch computes a new version from npm, so a failed GitHub tag step must be recovered by re-running that same job (after this helper is on the job's SHA) or by creating that exact tag/release manually — not by dispatching a new channel bump.
+
+### Version write-back to `main`
+
+The `record-version` job runs only when `publish` succeeded (so npm, the tag, and the GitHub Release exist) and `dry_run` was false. It checks out the **latest** `main` (not the tagged commit), runs `scripts/writeback-release.mjs <version>`, validates the result with `validate-release.mjs --tag`, and pushes `chore(release): vX.Y.Z` as `github-actions[bot]` using the job's `GITHUB_TOKEN` (`contents: write`; no npm credentials).
+
+- Stable versions only. `beta` and `nightly` releases never change `main`.
+- Idempotent and monotonic: if `main` already has that version or a newer one, the script prints `skip` and nothing is committed.
+- Main moved since the tag: the job edits only version fields, so nothing is rebased. If the push is rejected it fetches, resets to the new `main`, redoes the edit, and pushes once more; a second rejection fails the job. Re-running the job is safe.
+- `main` must allow `github-actions[bot]` to push directly. If branch protection or a ruleset is added later, this job will fail after a successful publish; the release itself is unaffected. Either exempt the bot or switch to a PR-based flow.
+- Pushes made with `GITHUB_TOKEN` do not trigger workflows, so `ci.yml` does not run on the release commit. It changes only version fields that the release run just built and tested at that version.
+- Keep the versioned-file list in `bump-release.mjs` and the carrier list in `scripts/release.test.mjs` in sync; the test fails if a file is left on the old version.
 
 Verify a completed release with `npm view <package>@X.Y.Z version dist.integrity`, the provenance link, and clean installs on the four supported platforms. Roll back by installing a previously complete root version; its exact optional dependencies select the corresponding native build.
 

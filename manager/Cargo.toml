@@ -1,6 +1,6 @@
 [package]
 name = "pi-famulus"
-version = "0.1.2"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.91"
 description = "Cross-platform process management daemon for pi-famulus"
