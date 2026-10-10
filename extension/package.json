@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus",
-  "version": "0.1.2",
+  "version": "0.1.6",
   "description": "Subagents, monitoring, and auto-backgrounding bash for pi",
   "type": "module",
   "license": "MIT",
@@ -9,20 +9,38 @@
     "url": "https://github.com/Leechael/pi-famulus",
     "directory": "extension"
   },
-  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" },
-  "os": ["linux", "darwin", "win32"],
-  "cpu": ["x64", "arm64"],
-  "files": ["src", "bin", "README.md"],
-  "bin": { "pi-famulus": "./bin/pi-famulus.js" },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "files": [
+    "src",
+    "bin",
+    "README.md"
+  ],
+  "bin": {
+    "pi-famulus": "./bin/pi-famulus.js"
+  },
   "optionalDependencies": {
-    "pi-famulus-linux-x64": "0.1.2",
-    "pi-famulus-linux-arm64": "0.1.2",
-    "pi-famulus-darwin-x64": "0.1.2",
-    "pi-famulus-darwin-arm64": "0.1.2",
-    "pi-famulus-win-x64": "0.1.2"
+    "pi-famulus-linux-x64": "0.1.6",
+    "pi-famulus-linux-arm64": "0.1.6",
+    "pi-famulus-darwin-x64": "0.1.6",
+    "pi-famulus-darwin-arm64": "0.1.6",
+    "pi-famulus-win-x64": "0.1.6"
   },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "scripts": {
     "deps": "nub install --frozen-lockfile --node-linker hoisted",

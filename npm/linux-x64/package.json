@@ -1,17 +1,30 @@
 {
   "name": "pi-famulus-linux-x64",
-  "version": "0.1.2",
+  "version": "0.1.6",
   "description": "Linux x64 native manager for pi-famulus (static musl)",
   "license": "MIT",
-  "os": ["linux"],
-  "cpu": ["x64"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "main": "./bin/pi-famulus",
-  "exports": { "./package.json": "./package.json", "./bin/pi-famulus": "./bin/pi-famulus" },
-  "files": ["bin/pi-famulus", "README.md"],
+  "exports": {
+    "./package.json": "./package.json",
+    "./bin/pi-famulus": "./bin/pi-famulus"
+  },
+  "files": [
+    "bin/pi-famulus",
+    "README.md"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/Leechael/pi-famulus",
     "directory": "npm/linux-x64"
   },
-  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" }
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
 }
