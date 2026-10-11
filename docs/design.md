@@ -69,9 +69,10 @@ Conventional paths (Unix; Windows uses the named pipe `\\.\pipe\pi-famulus-<fnv1
 └── sessions/<session_id>/
     ├── events.jsonl                  # the session's event log
     ├── agents/                       # agent records and transcripts
-    └── tasks/<task_id>.json          # task state
-              ├─ <task_id>.output     # full merged stdout+stderr stream
-              └─ <task_id>.stderr     # stderr only, for inspection
+    └── tasks/
+        ├── <task_id>.json          # task state
+        ├── <task_id>.output        # full merged stdout+stderr stream
+        └── <task_id>.stderr        # stderr only, for inspection
 ```
 
 Startup flow (client side, whether extension or CLI):

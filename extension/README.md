@@ -115,7 +115,7 @@ The session model writes the plan. `subagent` runs `worker` by default, and `wor
 
 pi-famulus starts and stops processes for you. This section states what it guarantees and where the guarantee ends.
 
-- The daemon starts every shell and monitor task as a process group, and is its parent. However the daemon ends (`shutdown`, `kill -9`, panic), each task's group gets SIGTERM, then SIGKILL 2 seconds later.
+- On Unix, the daemon starts every shell and monitor task in a process group, and is its parent. When the daemon ends (`shutdown`, `kill -9`, panic), each group gets SIGTERM, then SIGKILL 2 seconds later. Windows tasks run in Job Objects and are terminated as a unit when stopped or when the daemon exits.
 - A command that moves a child into a new session (`setsid`) leaves the group and escapes this. A process left running with `&` keeps running until it exits or the daemon stops it.
 - Running work does not survive the last pi session closing. Five seconds after the last session disconnects, the daemon stops what is left and exits. Records, output and transcripts stay on disk for 24 hours.
 - A subagent still running when its 30-minute turn budget ends is not killed, unless you set `hardTimeoutMs`. The parent is told and chooses to extend, steer or interrupt it.
@@ -132,7 +132,7 @@ pi-famulus starts and stops processes for you. This section states what it guara
 - **What happens to background tasks when pi exits?** Five seconds after the last pi session closes, the daemon stops whatever is still running and exits. Read the records afterwards with `pi-famulus show <id>`.
 - **Why does my pi bash command hang on long builds?** With pi-famulus, `bash` stops waiting after 20 seconds and moves the command to the background, so the turn continues. To change the limit, set `foregroundBudgetMs` in `~/.pi/agent/pi-famulus/config.json` ([configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)).
 - **How do I see or stop running work?** Type `/tasks` in the pi TUI and press `ctrl+x` on an item. From a terminal, `pi-famulus ls` lists what is running.
-- **Does it work on Windows?** Yes, on x64. There is no arm64 build. The in-place upgrade, where the daemon re-executes itself, works only on Linux and macOS. On Windows, an upgrade replaces the binary and restarts the daemon.
+- **Does it work on Windows?** Yes, on x64. There is no arm64 build. The in-place upgrade, where the daemon re-executes itself, works only on Linux and macOS. On Windows, replace the binary and restart the daemon manually.
 - **What if a notification does not arrive?** Run `pi-famulus events --id <id>` to see whether the wake was emitted, delivered and injected. Run `pi-famulus doctor` to check daemon health.
 
 ## Docs

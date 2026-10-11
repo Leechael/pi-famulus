@@ -113,7 +113,7 @@ model: haiku
 
 pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及保证到哪里为止。
 
-- 守护进程把每个 shell 和 monitor 任务作为一个进程组启动，并作为它的父进程。不管守护进程以什么方式结束（`shutdown`、`kill -9`、panic），每个任务的进程组都会先收到 SIGTERM，2 秒后收到 SIGKILL。
+- 在 Unix 上，守护进程把每个 shell 和 monitor 任务作为一个进程组启动，并作为它的父进程。守护进程结束时（`shutdown`、`kill -9`、panic），每个进程组先收到 SIGTERM，2 秒后收到 SIGKILL。Windows 上的任务跑在 Job Object 里，被停止或守护进程退出时作为一个整体终止。
 - 把子进程移到新会话（`setsid`）的命令会离开进程组，不受上面的约束。用 `&` 留在后台的进程会一直运行，直到它自己退出或被守护进程停止。
 - 最后一个 pi 会话关闭后，运行中的任务不会保留。最后一个会话断开 5 秒后，守护进程停止剩下的任务并退出。记录、输出和 transcript 在磁盘上保留 24 小时。
 - 子代理的 30 分钟回合预算用完时还在运行，不会被杀掉，除非你设置了 `hardTimeoutMs`。父代理会收到通知，再决定延长、改方向还是中断。
@@ -130,7 +130,7 @@ pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及
 - **pi 退出后后台任务会怎样？** 最后一个 pi 会话关闭 5 秒后，守护进程停止仍在运行的任务并退出。之后可以用 `pi-famulus show <id>` 查看记录。
 - **为什么 pi 的 bash 命令在长时间构建时卡住？** 装了 pi-famulus 后，`bash` 等 20 秒就不再等，把命令转到后台，这一回合继续。要改这个时限，在 `~/.pi/agent/pi-famulus/config.json` 里设置 `foregroundBudgetMs`（[配置说明](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)）。
 - **怎么查看或停止运行中的任务？** 在 pi TUI 里输入 `/tasks`，选中一项后按 `ctrl+x`。在终端里，`pi-famulus ls` 列出正在运行的任务。
-- **支持 Windows 吗？** 支持 x64，没有 arm64 构建。守护进程原地重新执行自己的升级方式只在 Linux 和 macOS 上可用。在 Windows 上，升级会替换二进制并重启守护进程。
+- **支持 Windows 吗？** 支持 x64，没有 arm64 构建。守护进程原地重新执行自己的升级方式只在 Linux 和 macOS 上可用。在 Windows 上，需要替换二进制并手动重启守护进程。
 - **通知没到怎么办？** 运行 `pi-famulus events --id <id>`，查看唤醒有没有发出、送达和注入。运行 `pi-famulus doctor` 检查守护进程的状态。
 
 ## Docs

@@ -1,6 +1,6 @@
 # 2026-10-09: candidate P control-mode clarification
 
-**Status: targeted validation passed; adoption/merge scope gate pending.** Candidate P is not adopted or merge-ready. Final review has verified the targeted evidence, but [BASELINES.md](BASELINES.md#when-to-rerun) requires all ten default scenarios across its listed models for globally visible tool descriptions. Q/R do not satisfy that gate. No new maintainer waiver has been granted; adoption requires that decision or the prescribed rerun. The user-requested full round S was parent-halted and is **INTERRUPTED / INCOMPLETE**, not completed or passed. The historical release-specific waiver is not a standing exemption.
+**Status: targeted validation passed; full-baseline/adoption gate still open after merge.** [PR #62](https://github.com/Leechael/pi-famulus/pull/62) merged candidate P on 2026-10-09. Final review has verified the targeted evidence, but [BASELINES.md](BASELINES.md#when-to-rerun) still requires all ten default scenarios across its listed models for globally visible tool descriptions. Q/R do not satisfy that gate. No new maintainer waiver has been granted; closing the gate still needs that decision or the prescribed rerun. The user-requested full round S was parent-halted and is **INTERRUPTED / INCOMPLETE**, not completed or passed. The historical release-specific waiver is not a standing exemption.
 
 ## Proposed product change
 
@@ -104,7 +104,7 @@ for original snapshots. No unscored launch/orphan transcript was found; a scoped
 controller/runner. Original evidence hashes and P source/manager, runtime and operations seals are unchanged.
 Local ignored evidence: `eval/results/2026-10-09s-full-p-baseline/{interrupted-summary.json,interrupted-invocation-evidence.json}`.
 No inference, restart, resume, cap relaxation or product changes during closeout. **Full-baseline/adoption
-gate remains pending; CI green does not waive it. PR #62 remains Draft, without a maintainer waiver.**
+gate remains open after PR #62 merged on 2026-10-09; CI green does not waive it, and no maintainer waiver has closed the gate.**
 
 ## Frozen provenance and free checks
 

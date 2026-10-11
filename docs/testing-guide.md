@@ -121,4 +121,4 @@ Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the
 
 ## Prompt eval (optional, costs model credits)
 
-See [eval/README.md](../eval/README.md). The smoke tier runs one model × 10 scenarios × 3 repeats; `node ablation/run.ts --tier smoke` without `--yes` prints the plan and a cost estimate first; pick models in `eval/models.json`, authentication comes from your `pi` login.
+See [eval/README.md](../eval/README.md). The smoke tier runs one model × 10 scenarios × 3 repeats; `(cd eval && node ablation/run.ts --tier smoke)` without `--yes` prints the plan and a cost estimate first; pick models in `eval/models.json`, authentication comes from your `pi` login.

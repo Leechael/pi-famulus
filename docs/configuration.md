@@ -46,7 +46,7 @@ The daemon reads these keys from the same file:
 |---|---|---|
 | `goneSessionRetention` | `"24h"` | How long a disconnected session's files stay on disk. See [CLI: retention](cli.md#retention-of-gone-sessions). |
 | `finishedTaskRetention` | `"24h"` | How long a finished task's record and output stay on disk, even in a connected session. |
-| `maxAgents`, `max<Kind>` | 8, per kind | Machine-wide subagent limits. Change them with `pi-famulus config set`; see [global capacity](global-capacity.md). |
+| `maxAgents`, `max<Kind>` | 8 (except `maxTestSuite` and `maxTest`: 2) | Machine-wide subagent limits. Change them with `pi-famulus config set`; see [global capacity](global-capacity.md). |
 
 The retention keys take a duration such as `"30m"` or `"0s"` and are read when the daemon starts, so restart the daemon after changing them. An invalid value falls back to 24h and is reported by `pi-famulus doctor`.
 

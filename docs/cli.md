@@ -57,7 +57,7 @@ The extension prioritizes executable config `managerPath`, executable `PI_FAMULU
 
 Priority: `--home` > `PI_FAMULUS_HOME` > default.
 
-**Pager.** When stdout is a terminal, `sessions`, `ls`, `show`, `stats`, `top`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PI_FAMULUS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text.
+**Pager.** On Unix, when stdout is a terminal, `sessions`, `ls`, `show`, `stats`, `top`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PI_FAMULUS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text. Windows does not page these commands yet.
 
 Layout under home:
 

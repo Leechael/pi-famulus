@@ -62,7 +62,7 @@ The publish job requires the **`npm` GitHub environment**. In repository Setting
 
 Repository configuration does not create npm packages or their trusted-publisher bindings. All packages in the release set must first exist in npm and be controlled by the intended maintainer. This repository cannot assert that those remote settings are configured just because the workflow passes a dry run.
 
-1. Confirm the public license/ownership and all release-set npm names before adding a new package to the release set (0.1.6 is already published).
+1. Confirm the public license/ownership and all release-set npm names before adding a new package to the release set (the root package is already published as 0.1.6).
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
 3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and **checking** `dry_run` (the UI default is now unchecked and would publish for real). The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
 4. Download all `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
@@ -84,7 +84,7 @@ done
 
 Use npm's website if your npm version lacks `npm trust`. Refresh and verify the saved bindings; do not merely assume form submission proved authentication. After verifying OIDC on a subsequent version, restrict token publishing as appropriate for the maintainer's npm account policy.
 
-The repository's `npm` GitHub environment was created and its single `main` branch-only deployment rule verified through GitHub's API. This is not npm-side authorization. At implementation time local `npm whoami` returned 401 and the root package lookup returned 404. No public package was created or published, and no npm trust binding was changed. Those observations are setup status only: `whoami` returning 401 inside an OIDC-only job is expected and must not block publishing.
+The repository's `npm` GitHub environment was created and its single `main` branch-only deployment rule verified through GitHub's API. This is not npm-side authorization. The next paragraph records the earlier implementation-time setup state, before 0.1.6 existed on npm: local `npm whoami` returned 401 and the root package lookup returned 404. No public package was created or published in that pass, and no npm trust binding was changed. Those observations are historical setup status only: `whoami` returning 401 inside an OIDC-only job is expected and must not block publishing.
 
 ## Subsequent tokenless releases
 
