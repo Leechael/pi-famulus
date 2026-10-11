@@ -1,6 +1,6 @@
 # Eval results
 
-One section per run of the baseline prompt (smoke tier), newest first. Rows are scenarios (their prompt and what they test: [`scenarios/`](scenarios/)); columns are model specs exactly as `pi --model` takes them (`id:thinking`). Every cell is the grader's verdict, with no hand corrections: when a verdict is wrong, the grader or the scenario is fixed and the cell is rerun.
+One section per baseline-only run (the full prompt, no ablation variants), newest first. Rows are scenarios (their prompt and what they test: [`scenarios/`](scenarios/)); columns are model specs as `pi --model` takes them (`id:thinking`), with the provider prefix dropped when the short name is unambiguous. The 2026-10-08 matrix ran before [PR #62](https://github.com/Leechael/pi-famulus/pull/62) changed the `subagent` and wake prompts. Every cell is the grader's verdict, with no hand corrections: when a verdict is wrong, the grader or the scenario is fixed and the cell is rerun.
 
 Generate a section from the run's result files (later files replace earlier ones cell by cell, e.g. a rerun of one scenario):
 

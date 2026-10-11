@@ -36,7 +36,7 @@ Manual acceptance checklist: [testing-guide.md](testing-guide.md). Model-facing 
 
 ## Releasing
 
-CI, five-package publishing, and the one-time npm Trusted Publisher setup: [releasing.md](releasing.md).
+CI, six-package publishing, and the one-time npm Trusted Publisher setup: [releasing.md](releasing.md).
 
 The npm page for `pi-famulus` shows `extension/README.md`. That file must be a byte-for-byte copy of the root `README.md`; `node --test scripts/*.test.mjs` fails when they differ. After editing the root README run `cp README.md extension/README.md`. Links in the README are absolute GitHub URLs because npm resolves relative links against `repository.directory` (`extension`), not the repository root.
 

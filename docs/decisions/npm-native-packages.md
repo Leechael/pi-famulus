@@ -20,7 +20,7 @@ The TypeScript extension requires a Rust manager. Users should install one npm p
 Publish `pi-famulus` plus `pi-famulus-{linux,darwin}-{x64,arm64}` and `pi-famulus-win-x64`. The Windows npm package uses `win` (not `win32`) because unscoped `*-win32-*` names were rejected by npm's spam detector on first publish; package `os` remains `win32`. The root declares exact-version optional dependencies; native packages declare `os` and `cpu`. Linux binaries use native-architecture static musl builds; macOS builds target macOS 13+; Windows x64 statically links the MSVC CRT. Other systems/architectures have no automatic native package. Windows ARM64 stays outside the release set until CI produces its artifact.
 
 ```
-release tag on main
+manual workflow_dispatch from main (version computed by the workflow)
   -> validate versions/repository -> full CI
   -> five native cargo builds -> five native npm tarballs
   -> root npm tarball -> per-host installed-package smoke tests
@@ -40,7 +40,7 @@ Entity: release set (see [domain vocabulary](../../npm/CONTEXT.md)).
 
 | State | Trigger | Source | Next state | Invariant |
 |---|---|---|---|---|
-| Draft | Stable tag/version/repository validation passes | Maintainer + validate job | Validated source | All six versions and actual GitHub identity agree; tag is on main ancestry |
+| Draft | Version/repository validation passes on a dispatch from main | Maintainer + validate job | Validated source | All six versions and actual GitHub identity agree; the source commit is on main |
 | Validated source | Build, pack, tests, installed-package checks pass | Five native builders + full CI | Verified artifacts | Correct targets; Linux static and Windows static CRT; six actual tarballs contain required files |
 | Validated source | Any build/test/package check fails | CI | Blocked | No publication is attempted |
 | Verified artifacts | Dry-run publish requested | Manual workflow | Verified artifacts | No registry mutation or claim of OIDC authentication |

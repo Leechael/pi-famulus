@@ -7,25 +7,28 @@ A **wake** is the message pi-famulus injects into the model's context when backg
 ## Tools
 
 ### bash (overrides the built-in)
-Adds a `run_in_background` parameter. Foreground commands that exceed `foregroundBudgetMs` (default 20s) move to the background automatically; completion arrives as a `<pi-famulus-wake kind="task">`. Bare `sleep` commands are rejected (use monitor or the background flag instead).
+Parameters: `command`, `timeout` (hard kill timeout in seconds; no default), `run_in_background`. Foreground commands that exceed `foregroundBudgetMs` (default 20s) move to the background automatically; completion arrives as a `<pi-famulus-wake kind="task">`. Bare `sleep` commands are rejected (use monitor or the background flag instead).
 
 ### subagent
 ```
-subagent({ tasks: [{agent?, prompt, name?}], ... })   // parallel, ≤10, concurrency 1..8
-subagent({ chain: [{agent?, prompt, label?}], ... })  // serial, {previous}/{outputs.<label>} interpolation
+subagent({ tasks: [{agent?, prompt, name?, work_kind?}], ... })   // parallel, ≤10
+subagent({ chain: [{agent?, prompt, label?, work_kind?}], ... })  // serial, {previous}/{outputs.<label>} interpolation
+// shared options: async?, concurrency? (1..8, default 4), fail_fast?, model?, timeout_ms? (default 1800000, max 3600000)
 subagent({ action: "list|get|status|interrupt|resume|steer|extend|models", run_id?, child_id?, message?, timeout_ms? })
 ```
+- `async: true` returns a `run_id` at once. `fail_fast` cancels subagents that have not started after the first failure; started ones finish. `work_kind` labels the planned workload for [machine-wide admission](global-capacity.md) (default `other`).
 - Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<pi-famulus-wake kind="subagent-done">`. **Never poll.**
 - `model` accepts fuzzy specs (`"haiku"`, `"openai/gpt-5.2"`, `"luna:high"`); the candidate set respects pi's whitelist (`enabledModels` / `--models`). Use `action:"models"` to list selectable values before choosing.
-- Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a no-background bash variant. The stall watchdog is 5 minutes of inactivity, paused while a tool is executing or a `need_decision` is pending. Each child turn has a 30-minute soft budget (`timeout_ms`): past it the child keeps running, its shell is not stopped, and the parent gets `<pi-famulus-wake kind="subagent-overrun">` (repeated every 10 minutes) to `extend`, steer, or `interrupt` it. `resume` takes `timeout_ms` for the new turn. An aborting ceiling, `hardTimeoutMs`, is opt-in. A decision request waits 10 minutes.
-- `resume` returns at once. When all `maxConcurrentChildren` slots are busy the child is queued (shown `pending`, the result says how many are ahead) and starts when a slot frees; its result arrives as a wake as usual.
-- Every wake carries `as-of` (when it was generated). Steered and turn-triggering wakes get `age-ms` (how old they are) when they enter the model's context. `subagent-handover` and `subagent-done` re-check child statuses then: a child resumed since the snapshot shows its current status with `status-as-of`. Re-checking `subagent-overrun` is deferred.
+- Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a foreground-only bash. The stall watchdog fires after 5 minutes of inactivity, paused while a tool is executing or a `need_decision` is pending. A stalled child is resumed once on the same session (`stallRetries`, default 1); if it stalls again it is marked failed. Each child turn has a 30-minute soft budget (`timeout_ms`): past it the child keeps running, its shell is not stopped, and the parent gets `<pi-famulus-wake kind="subagent-overrun">` (repeated every 10 minutes) to `extend`, steer, or `interrupt` it. `resume` takes `timeout_ms` for the new turn. An aborting ceiling, `hardTimeoutMs`, is opt-in. A decision request waits 10 minutes.
+- `resume` returns at once.
+- A launched or resumed child queues when no slot is free: either this session's `maxConcurrentChildren` (default 8) or the machine-wide `maxAgents` (default 8, see [global capacity](global-capacity.md)). A queued child shows `pending`, the result says how many are ahead, and it starts when a slot frees; its result arrives as a wake as usual.
+- Every wake carries `as-of` (when it was generated). Steered and turn-triggering wakes get `age-ms` (how old they are) when they enter the model's context. When a `subagent-handover` or `subagent-done` wake enters the context, it re-checks child statuses: a child resumed since the snapshot shows its current status with `status-as-of`. A `subagent-overrun` wake shows statuses as of generation.
 
 ### monitor
 ```
-monitor({ command, description, timeout_ms?, persistent? })
+monitor({ command, description, timeout_ms?, persistent? })   // timeout_ms default 300000, min 1000, max 3600000
 ```
-Each output line becomes an event (200ms batching, 500 chars/line and 3000 chars/batch caps, 10 events per 2s; batches over the limit are dropped). Exit and timeout produce notifications. Sustained saturation (at least 10 batches in a 30s window, half or more dropped) stops the monitor and notifies.
+Each output line becomes an event (200ms batching, 500 chars/line and 3000 chars/batch caps; a burst of 10 events, then one every 2s; batches over the limit are dropped). Exit and timeout produce notifications. Sustained saturation (at least 10 batches in a 30s window, half or more dropped) stops the monitor and notifies.
 
 After starting/re-arming a monitor or handling its event, finish any remaining work, then end the turn with a reply and no tool call. Simply wait for the next notification—do not poll, sleep, or call `wait_for` to yield. A UI extension's `wait_for` is for observed UI conditions, not monitor notifications.
 

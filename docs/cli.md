@@ -2,7 +2,7 @@
 
 Standalone operations manual for the `pi-famulus` binary.
 
-The pi extension talks to the daemon over a socket. These subcommands are the human and scripting surface for inspection, debugging, and smoke tests. Human-readable tables are **not** a wire contract; use `--json` (on `status`, `sessions`, `ls`, `show`, `stats`, `events`) for scripts.
+The pi extension talks to the daemon over a socket. These subcommands are the human and scripting surface for inspection, debugging, and smoke tests. Human-readable tables are **not** a wire contract; use `--json` (on `status`, `sessions`, `ls`, `show`, `top`, `stats`, `events`) for scripts.
 
 From the CLI alone you can answer: what is each session doing and where (cwd), what is running or just finished, why did it end, what did this subagent do, why didn't a notification arrive, and is the system healthy.
 
@@ -23,7 +23,7 @@ Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pi
 
 ## Install
 
-Install `pi-famulus` with optional dependencies enabled (`pi install npm:pi-famulus`). The main package automatically selects the matching Linux/macOS x64/arm64 or Windows x64 native package and exposes the CLI on its npm bin path; `npx pi-famulus --help` is a quick check. No compiler or separate binary download is needed. See the [README](../README.md#install).
+Install `pi-famulus` with optional dependencies enabled (`pi install npm:pi-famulus`). The main package automatically selects the matching Linux/macOS x64/arm64 or Windows x64 native package and exposes the CLI on its npm bin path; `npx pi-famulus --help` is a quick check. No compiler or separate binary download is needed. See the [README](../README.md#quick-start).
 
 ### Source build / separate manager
 
@@ -57,7 +57,7 @@ The extension prioritizes executable config `managerPath`, executable `PI_FAMULU
 
 Priority: `--home` > `PI_FAMULUS_HOME` > default.
 
-**Pager.** When stdout is a terminal, `sessions`, `ls`, `show`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PI_FAMULUS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text.
+**Pager.** When stdout is a terminal, `sessions`, `ls`, `show`, `stats`, `top`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PI_FAMULUS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text.
 
 Layout under home:
 
@@ -67,7 +67,7 @@ manager.pid
 manager.lock           # held by the running daemon for its whole lifetime
 manager.spawn.lock     # held by a client while it spawns the daemon
 manager.log
-events.jsonl           # daemon.start / daemon.shutdown
+events.jsonl           # daemon.start / shutdown / upgrade, session.gc, capacity.changed
 config.json            # optional
 sessions/<session_id>/events.jsonl
 sessions/<session_id>/tasks/<task_id>.{json,output,stderr}
@@ -79,10 +79,10 @@ sessions/<session_id>/agents/<child_id>.{json,jsonl}   # written by the extensio
 ```bash
 pi-famulus status [--json]
 pi-famulus sessions [--json]
-pi-famulus ls [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
+pi-famulus ls [-a] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
 pi-famulus show <id> [--json]
 pi-famulus top [--json]
-pi-famulus stats [--by agent|kind|agent,kind] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]
+pi-famulus stats [--by agent|kind|agent,kind] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # --by defaults to agent
 pi-famulus agent <ch_id> [--full] [-f]
 pi-famulus events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
 pi-famulus log [-f] [-n 100] [ID] [--stderr]
@@ -96,6 +96,7 @@ pi-famulus stop <id>
 pi-famulus kill-session <session_id>
 pi-famulus start [--session cli] [--kind shell|monitor] [--cwd DIR] [--timeout-ms N] [--background] '<cmd>'
 pi-famulus doctor
+pi-famulus upgrade
 pi-famulus shutdown
 pi-famulus daemon [--foreground]
 ```
@@ -108,7 +109,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show` and `stats` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show` and `stats` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `upgrade`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
@@ -125,11 +126,18 @@ Generate a dynamic completion script for bash, zsh, or fish with `pi-famulus com
 ### `status`
 
 ```text
-version:  0.1.0+066598ae00 (protocol 4)
+version:  0.1.0+066598ae00 (protocol 5)
 pid:      4321
 binary:   /Users/me/.pi/agent/pi-famulus/bin/pi-famulus
 uptime:   13m23s
 agent slots: 1/8 used
+  test-suite: 0/2 used
+  test: 0/2 used
+  build: 0/8 used
+  lint/type: 0/8 used
+  other: 1/8 used
+  git: 0/8 used
+  read/search: 0/8 used
 sessions: 2 (1 connected)
 tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 agent tokens: 8200 input / 460 output (cache read 6100 / write 280)
@@ -160,7 +168,7 @@ sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  2.1s  0.0   
 ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -     -     -    -        -       -            review (worker) m1
 sh_51d0c3aa  shell   0199aaaa  ~/src/app  completed 14:01:40 41s    2m28s 3.6   -    -        0       exited       cargo test
 mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    0.0s  0.0   -    -        SIGTERM  stopped:tui  tail -f log
-ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -     -     -    -        -       -            model-error  broken (worker) m1
+ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -     -     -    -        -       model-error  broken (worker) m1
 ```
 
 By default only running work, anywhere (a live process is never hidden, even in a gone session). `-a`/`--all` adds the finished work of connected sessions; a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Running rows come first, then finished ones, each newest first. `TIME` is a task's start and an agent's **last transcript message** (a long-running agent that just spoke sorts as recent; its start is in `show`). Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (TIME within). `--json` prints the rows in the same order as an array of objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `active_at` (= TIME), `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, `running`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known, and a task's `work_kind`).
@@ -242,7 +250,7 @@ Renders the transcript `sessions/<sid>/agents/<ch>.jsonl` (one JSON object per m
 
 The event log, merged and time-ordered across every session (plus daemon events). Filters: `--session PREFIX`, `--id ID` (matches `id`, `child_id`, or an entry of `ids`), `--since DUR`. `--json` prints one raw event per line with a `session` field added. `-f` follows all files, including sessions that appear later. Malformed lines are skipped, with a count on stderr.
 
-What is logged: see design §3.3 "Event log". The manager writes `session.connect/disconnect`, `task.start/background/stop/exit`, `daemon.start/shutdown`; the extension writes wake, monitor, agent and decision events.
+What is logged: see design §3.3 "Event log". The manager writes `session.connect/disconnect`, `session.gc`, `task.start/background/stop/exit`, `daemon.start/shutdown/upgrade`, `capacity.changed`; the extension writes wake, monitor, agent and decision events.
 
 ### `log` / `tail`
 
@@ -274,7 +282,7 @@ pi-famulus tail sh_a1b2c3d4       # = log -f; -f is accepted and ignored
 Health checks, one line each (`ok`, `fixed`, `warn`, `FAIL`), then `ok` or `N problem(s) found`. **Exit status 1 when any check fails.**
 
 - home exists (doctor never creates it)
-- socket path length fits a unix socket (103 bytes on macOS, 107 on Linux)
+- socket path length fits a unix socket (103 bytes on macOS, 107 on Linux); on Windows, the named pipe name is shown instead
 - `config.json` parses; the manager path from `PI_FAMULUS_MANAGER_PATH` or `managerPath` exists
 - daemon: running exactly when it holds `manager.lock` (the recorded pid is not trusted; it may belong to another process after a crash). Running → probe the socket. Not running → take the lock and remove stale socket/pid files (`fixed`, not a failure)
 - protocol: every connected session announced the manager's protocol

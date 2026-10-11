@@ -1,6 +1,6 @@
 # Machine-wide agent capacity
 
-The daemon owns `maxAgents` in `<home>/config.json` (default 8). Change it at runtime with `pi-famulus config set max-agents 12`; `config get max-agents` reads the same setting. Protocol 5 adds optional per-work-kind budgets. The supported CLI names and JSON fields are:
+The daemon owns `maxAgents` in `~/.pi/agent/pi-famulus/config.json` (or under `PI_FAMULUS_HOME`; see [configuration](configuration.md)), default 8. Change it at runtime with `pi-famulus config set max-agents 12`; `config get max-agents` reads the same setting. Protocol 5 adds optional per-work-kind budgets. The supported CLI names and JSON fields are:
 
 | CLI key | Config field | Default |
 |---|---|---:|
@@ -16,7 +16,7 @@ Unconfigured kinds inherit the global limit, except `test-suite` and `test`, whi
 
 ## Work-kind source
 
-`subagent({tasks:[...]})` items and `chain` steps may declare `work_kind` from `test-suite`, `test`, `build`, `lint/type`, `other`, `git`, or `read/search`; the default is `other`. This is an explicit planned-work annotation, not a guess from the natural-language prompt. That is the honest spawn-time boundary: `work-index.ts` and `task-tools.ts` know only that an item is an `agent`, while `manager/src/workkind.rs` classifies actual shell command text for task inspection/statistics. A subagent's future commands do not exist when its admission request is made, so prompt/name heuristics would claim evidence the extension does not have. The explicit label is retained as agent work-index metadata and in agent records/events; task-list rows keep their existing coarse `[agent]` label for compatibility. Shell-task `workkind.rs` classification remains unchanged.
+`subagent({tasks:[...]})` items and `chain` steps may declare `work_kind` from `test-suite`, `test`, `build`, `lint/type`, `other`, `git`, or `read/search`; the default is `other`. The label is never guessed from the prompt: a subagent's commands do not exist yet when it asks for a slot. Shell tasks get a separate `work_kind`, guessed from their command text, which `ls`, `show` and `stats` display; it does not affect admission. The subagent's label is kept in agent records and events.
 
 ## Admission and queue lifecycle
 

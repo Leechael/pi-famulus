@@ -5,7 +5,7 @@
  *   lifetime-lock holder cleans up stale socket/pid files.
  * - Request/response multiplexing over a single long-lived connection.
  * - Server events dispatched to registered handlers.
- * - On unexpected disconnect: immediate then exponential-backoff reconnect for 22s,
+ * - On unexpected disconnect: immediate then exponential-backoff reconnect for 27s,
  *   re-hello after reconnect. If all attempts fail the client is marked unavailable
  *   and callers are expected to degrade (bash falls back to local execution).
  */
