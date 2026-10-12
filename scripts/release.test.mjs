@@ -9,6 +9,7 @@ import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './vali
 import { npmSync, prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
 import { bumpRelease } from './bump-release.mjs';
+import { compareSemver, writebackDecision, writebackRelease } from './writeback-release.mjs';
 
 const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
@@ -95,6 +96,80 @@ test('bump-release writes every versioned manifest including prerelease', t => {
   assert.deepEqual(lock.packages[''].optionalDependencies, Object.fromEntries(PLATFORMS.map(p => [p.name, '0.1.3-beta.0'])));
   for (const p of PLATFORMS) assert.equal(lock.packages[`../npm/${p.id}`].version, '0.1.3-beta.0');
   validateMetadata(root, { tag: 'v0.1.3-beta.0', repository });
+});
+
+function lockedFixture(t, v) {
+  const f = fixture(t, v);
+  f.put('manager/Cargo.lock', `[[package]]\nname = "pi-famulus"\nversion = "${v}"\n`);
+  f.put('extension/package-lock.json', {
+    name: 'pi-famulus',
+    version: v,
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'pi-famulus', version: v, optionalDependencies: Object.fromEntries(PLATFORMS.map(p => [p.name, v])) },
+      ...Object.fromEntries(PLATFORMS.map(p => [`../npm/${p.id}`, { name: p.name, version: v }])),
+    },
+  });
+  return f;
+}
+// Every file that carries the release version. If bump-release learns a new
+// one, add it here; the writeback must leave none on the old value.
+function versionCarriers(root) {
+  const json = path => JSON.parse(readFileSync(join(root, path), 'utf8'));
+  const text = path => readFileSync(join(root, path), 'utf8');
+  const lock = json('extension/package-lock.json');
+  const distinct = values => [...new Set(Object.values(values))].join();
+  return {
+    'extension/package.json': json('extension/package.json').version,
+    'extension optionalDependencies': distinct(json('extension/package.json').optionalDependencies),
+    ...Object.fromEntries(PLATFORMS.map(p => [`${p.directory}/package.json`, json(`${p.directory}/package.json`).version])),
+    'manager/Cargo.toml': text('manager/Cargo.toml').match(/^version = "([^"]+)"/m)[1],
+    'manager/Cargo.lock': text('manager/Cargo.lock').match(/name = "pi-famulus"\r?\nversion = "([^"]+)"/)[1],
+    'extension/src/manager-client.ts': text('extension/src/manager-client.ts').match(/EXTENSION_VERSION = "([^"]+)"/)[1],
+    'package-lock root': lock.version,
+    'package-lock packages[""]': lock.packages[''].version,
+    'package-lock optionalDependencies': distinct(lock.packages[''].optionalDependencies),
+    ...Object.fromEntries(PLATFORMS.map(p => [`package-lock ../npm/${p.id}`, lock.packages[`../npm/${p.id}`].version])),
+  };
+}
+
+test('writeback-release moves every versioned file from the old version to the release', t => {
+  const { root } = lockedFixture(t, '0.1.2');
+  assert.ok(Object.values(versionCarriers(root)).every(v => v === '0.1.2'), 'fixture must start fully on the old version');
+  assert.equal(writebackRelease(root, '0.1.6').write, true);
+  assert.deepEqual(Object.entries(versionCarriers(root)).filter(([, v]) => v !== '0.1.6'), [], 'files left on a stale version');
+  validateMetadata(root, { tag: 'v0.1.6', repository });
+});
+
+test('writeback-release is idempotent and never moves main backwards or records prereleases', t => {
+  const { root } = lockedFixture(t, '0.1.6');
+  const snapshot = () => JSON.stringify(versionCarriers(root)) + readFileSync(join(root, 'extension/package.json'), 'utf8');
+  const before = snapshot();
+  for (const release of ['0.1.6', '0.1.5', '0.1.7-beta.0', '0.1.7-nightly.20261010']) {
+    assert.equal(writebackRelease(root, release).write, false, release);
+    assert.equal(snapshot(), before, `${release} must not touch the tree`);
+  }
+  assert.equal(writebackDecision('0.1.9', '0.2.0').write, true);
+  assert.equal(writebackDecision('0.9.0', '0.10.0').write, true, 'numeric, not lexical, comparison');
+  assert.equal(writebackDecision('1.0.0', '0.99.99').write, false);
+  assert.throws(() => writebackRelease(root, '0.1.7; rm -rf /'), /release tag/);
+});
+
+test('writeback compares by SemVer precedence, so a prerelease on main is not overwritten by an older stable', () => {
+  assert.equal(writebackDecision('0.2.0-beta.1', '0.1.9').write, false, 'older stable must not replace a newer prerelease');
+  assert.equal(writebackDecision('0.2.0-beta.1', '0.2.0').write, true, 'stable outranks its own prerelease');
+  assert.equal(writebackDecision('0.2.0-beta.1', '0.3.0').write, true);
+  assert.equal(writebackDecision('0.2.0', '0.2.0').write, false);
+  assert.equal(writebackDecision('0.2.0', '0.2.0-beta.1').write, false);
+  const ascending = ['0.2.0-alpha', '0.2.0-alpha.1', '0.2.0-alpha.beta', '0.2.0-beta', '0.2.0-beta.2', '0.2.0-beta.10', '0.2.0-rc.1', '0.2.0'];
+  for (let i = 0; i < ascending.length - 1; i++) {
+    assert.equal(compareSemver(ascending[i], ascending[i + 1]), -1, `${ascending[i]} < ${ascending[i + 1]}`);
+    assert.equal(compareSemver(ascending[i + 1], ascending[i]), 1);
+  }
+  assert.equal(compareSemver('0.2.0-beta.2', '0.2.0-beta.10'), -1, 'numeric identifiers compare numerically');
+  assert.equal(compareSemver('0.2.0-1', '0.2.0-a'), -1, 'numeric identifiers sort below alphanumeric');
+  assert.equal(compareSemver('1.0.0+a', '1.0.0+b'), 0, 'build metadata is ignored');
+  assert.throws(() => compareSemver('1.0', '1.0.0'), /not a SemVer/);
 });
 
 test('bump-release updates a CRLF Cargo.lock from a Windows checkout', t => {
@@ -501,4 +576,21 @@ test('workflow literal security, release graph and host/target contracts', () =>
   assert.ok(!/NPM_TOKEN|NODE_AUTH_TOKEN|npm whoami|npm login/.test(publish));
   const runBodies = workflowRunBodies(publish);
   assert.ok(!/\$\{\{[^}]+\}\}/.test(runBodies));
+});
+
+test('release version is written back to main only after a real, successful publish', () => {
+  const publish = workflow('publish');
+  const record = publish.match(/^  record-version:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
+  assert.ok(record, 'record-version job must exist');
+  assert.match(record, /^    needs: \[validate, publish\]$/m, 'must wait for the publish job (which creates the tag and release)');
+  assert.match(record, /^    if: needs\.validate\.outputs\.dry_run == 'false'$/m, 'dry runs must not write to main');
+  assert.match(record, /^          ref: main$/m, 'edit the latest main, not the tagged commit');
+  assert.match(record, /node scripts\/writeback-release\.mjs "\$RELEASE_VERSION"/);
+  assert.match(record, /^          set -euo pipefail$/m, 'GitHub default bash is `bash -e {0}`: without pipefail a failure is masked');
+  assert.ok(!/writeback-release\.mjs[^\n]*\|/.test(record), 'do not pipe the script: the pipe would hide its exit code');
+  assert.match(record, /origin HEAD:main/);
+  assert.match(record, /chore\(release\): v\$RELEASE_VERSION/);
+  assert.ok(!/id-token/.test(record) && !/environment:/.test(record), 'the write-back job needs neither npm OIDC nor the npm environment');
+  assert.match(record, /^      contents: write$/m);
+  assert.ok(!/NPM|npm publish/.test(record), 'no publish credentials in the write-back job');
 });
