@@ -1,7 +1,7 @@
 {
   "name": "pi-famulus",
   "version": "0.1.6",
-  "description": "Done means done: subagents and long-running background bash for Pi. One daemon owns every process and wakes the agent on completion. No polling, no orphans.",
+  "description": "Done means done: subagents and long-running background bash for Pi. One daemon owns every shell it starts and wakes the agent when work finishes. No polling.",
   "keywords": [
     "pi-package",
     "pi",
