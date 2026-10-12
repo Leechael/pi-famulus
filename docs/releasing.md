@@ -15,14 +15,14 @@ The main extension and native manager packages form one versioned release. The p
 
 Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Windows x64 builds use the MSVC toolchain with the CRT linked statically (`manager/.cargo/config.toml`, `target.x86_64-pc-windows-msvc` `+crt-static`). The package job sets `RUSTFLAGS` only on Linux, so that cargo config is what the Windows release binary is linked with. Before packing, CI inspects the actual PE dependencies with `dumpbin` and rejects VC runtime DLL imports; the hosted runner's installed redistributables must not hide a dependency. Node/pi's runtime requirements still apply. In-place upgrade (`exec` handover) remains Unix-only; on Windows, replace the binary and restart the manager.
 
-CI builds the Unix targets on native-architecture hosts and `win32-x64` on `windows-latest`, runs the ordinary and (Unix) manual-clock Rust suites, and verifies actual root/native npm tarball installation on Unix hosts and Windows x64. Windows ARM64 is not part of the required release set until a CI producer exists. Installation smoke tests explicitly select the pi version pinned in the extension lockfile rather than an unbounded latest peer. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
+CI builds the Unix targets on native-architecture hosts and `win32-x64` on `windows-latest`, runs the ordinary and manual-clock (`--features test-clock`) Rust suites on every target, and verifies actual root/native npm tarball installation on Unix hosts and Windows x64. Windows ARM64 is not part of the required release set until a CI producer exists. Installation smoke tests explicitly select the pi version pinned in the extension lockfile rather than an unbounded latest peer. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
 
 ## Exact release metadata
 
 Keep these at the same stable `X.Y.Z`:
 
 - `extension/package.json` version and its exact optional dependency versions.
-- All `npm/*/package.json` versions.
+- The `npm/*/package.json` versions of the five released native packages. `npm/win32-arm64` is excluded until CI builds it (`scripts/validate-release.mjs`).
 - `manager/Cargo.toml` version and the own-package Cargo lock record.
 - The extension lockfile's root metadata and first-party native-package version records.
 
@@ -37,15 +37,15 @@ node --test scripts/*.test.mjs
 
 ## Trusted Publishers: repository configuration
 
-The workflow is `.github/workflows/publish.yml`. It uses GitHub-hosted runners, Node 24, an explicit npm upgrade/check for npm >=11.5.1, and **publish-job-only** `id-token: write` plus `contents: read`. It does not use npm token secrets, login, or `npm whoami` as an OIDC check. Tokens and `.npmrc` contents must never be printed.
+The workflow is `.github/workflows/publish.yml`. It uses GitHub-hosted runners, Node 24, an explicit npm upgrade/check for npm >=11.5.1, and **publish-job-only** `id-token: write` plus `contents: write` (the job creates the tag and the GitHub release). It does not use npm token secrets, login, or `npm whoami` as an OIDC check. Tokens and `.npmrc` contents must never be printed.
 
-All five package manifests specify the exact public repository URL:
+All six package manifests specify the exact public repository URL:
 
 ```text
 https://github.com/Leechael/pi-famulus
 ```
 
-The GitHub repository has been renamed to `Leechael/pi-famulus`. Package metadata, the canonical release validator, and **all five npm trust bindings** must use this exact current identity. GitHub redirects from the previous repository name do not replace the matching OIDC identity.
+The GitHub repository has been renamed to `Leechael/pi-famulus`. Package metadata, the canonical release validator, and **all six npm trust bindings** must use this exact current identity. GitHub redirects from the previous repository name do not replace the matching OIDC identity.
 
 The publish job requires the **`npm` GitHub environment**. In repository Settings → Environments → npm, use **Selected branches and tags**, with exactly one **Branch** rule named `main` and no tag rules. This external policy blocks a non-main workflow from acquiring the trusted environment even if someone edits its in-file guards. Protect `main` against unreviewed changes as part of repository access policy. Bind each package separately; do not leave npm's Environment field blank:
 
@@ -62,7 +62,7 @@ The publish job requires the **`npm` GitHub environment**. In repository Setting
 
 Repository configuration does not create npm packages or their trusted-publisher bindings. All packages in the release set must first exist in npm and be controlled by the intended maintainer. This repository cannot assert that those remote settings are configured just because the workflow passes a dry run.
 
-1. Confirm the public license/ownership and all release-set npm names before the first public release.
+1. Confirm the public license/ownership and all release-set npm names before adding a new package to the release set (the root package is already published as 0.1.6).
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
 3. Verify the `npm` environment's main-only deployment policy. Run `publish.yml` via **workflow_dispatch** from **main**, selecting a channel (`patch` / `minor` / `major` / `beta` / `nightly`) and **checking** `dry_run` (the UI default is now unchecked and would publish for real). The workflow computes the next version from npm, git tags, and `package.json`. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
 4. Download all `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
@@ -84,7 +84,7 @@ done
 
 Use npm's website if your npm version lacks `npm trust`. Refresh and verify the saved bindings; do not merely assume form submission proved authentication. After verifying OIDC on a subsequent version, restrict token publishing as appropriate for the maintainer's npm account policy.
 
-The repository's `npm` GitHub environment was created and its single `main` branch-only deployment rule verified through GitHub's API. This is not npm-side authorization. At implementation time local `npm whoami` returned 401 and the root package lookup returned 404. No public package was created or published, and no npm trust binding was changed. Those observations are setup status only: `whoami` returning 401 inside an OIDC-only job is expected and must not block publishing.
+The repository's `npm` GitHub environment was created and its single `main` branch-only deployment rule verified through GitHub's API. This is not npm-side authorization. The next paragraph records the earlier implementation-time setup state, before 0.1.6 existed on npm: local `npm whoami` returned 401 and the root package lookup returned 404. No public package was created or published in that pass, and no npm trust binding was changed. Those observations are historical setup status only: `whoami` returning 401 inside an OIDC-only job is expected and must not block publishing.
 
 ## Subsequent tokenless releases
 
@@ -116,7 +116,7 @@ Native packages publish before the root. The script preflights all registry name
 
 After a real npm publish, the same job creates the GitHub tag at the validated commit and a generated GitHub Release (`scripts/github-release.mjs`). Tag existence is resolved through the commits API so annotated tags peel to their commit SHA (`git/ref/tags` returns the tag-object SHA). A missing tag is HTTP 404 **or** the commits-API 422 `No commit found for SHA:`; other 4xx/5xx responses fail closed and never retarget an existing tag. Retries reuse this run's tag and SHA. A later dispatch computes a new version from npm, so a failed GitHub tag step must be recovered by re-running that same job (after this helper is on the job's SHA) or by creating that exact tag/release manually — not by dispatching a new channel bump.
 
-Verify a completed release with `npm view <package>@X.Y.Z version dist.integrity`, the provenance link, and clean installs on the four supported platforms. Roll back by installing a previously complete root version; its exact optional dependencies select the corresponding native build.
+Verify a completed release with `npm view <package>@X.Y.Z version dist.integrity`, the provenance link, and clean installs on the five native targets. Roll back by installing a previously complete root version; its exact optional dependencies select the corresponding native build.
 
 ## References
 

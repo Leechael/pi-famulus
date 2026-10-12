@@ -1,11 +1,11 @@
 # pi-famulus design document
 
 Version: v0.1 (2026-09-17)
-Status: Confirmed baseline, entering implementation
+Status: Implemented (milestones M1–M5 done, see §7). Sections describe current behavior unless they say otherwise.
 
 ## 1. Background and goals
 
-pi (`@earendil-works/pi-coding-agent`) deliberately leaves subagents, background bash, monitoring, and similar capabilities out of core (see usage.md), delegating them to extensions. This repository implements a standalone pi extension + process-management daemon providing four capabilities:
+pi (`@earendil-works/pi-coding-agent`) deliberately leaves subagents, background bash, monitoring, and similar capabilities out of core, delegating them to extensions. This repository implements a standalone pi extension + process-management daemon providing four capabilities:
 
 1. **subagents** — Multiple parallel or sequential executions; synchronous waiting with a foreground budget, automatically switching to asynchronous execution when the budget expires
 2. **monitoring** — Create monitoring tasks (command-line event streams), with events actively injected
@@ -64,8 +64,15 @@ Conventional paths (Unix; Windows uses the named pipe `\\.\pipe\pi-famulus-<fnv1
 ├── manager.spawn.lock    # client spawn lock (valid while fd-lock is held)
 ├── manager.log           # manager's own log
 ├── config.json           # optional user configuration
-└── sessions/<session_id>/tasks/<task_id>.json    # task state
-                                └─ <task_id>.output   # full merged stdout+stderr stream
+├── events.jsonl          # daemon-level events (start/shutdown/upgrade, session.gc, capacity.changed)
+├── handover.json         # written only during an in-place upgrade
+└── sessions/<session_id>/
+    ├── events.jsonl                  # the session's event log
+    ├── agents/                       # agent records and transcripts
+    └── tasks/
+        ├── <task_id>.json          # task state
+        ├── <task_id>.output        # full merged stdout+stderr stream
+        └── <task_id>.stderr        # stderr only, for inspection
 ```
 
 Startup flow (client side, whether extension or CLI):
@@ -81,8 +88,8 @@ Startup flow (client side, whether extension or CLI):
    - Afterwards: when the lock is free, try connecting first; if nobody has started the successor, follow 2–4 (acquire spawn lock → spawn → wait 30s for socket), then reconnect + `hello`. A shutdown refusal on this second hello follows the same wait-and-spawn flow (a socket readiness probe may have reached the retiring daemon). Other failures after the one spawn attempt are returned normally
    - Bound: the entire connect/hello/wait/spawn flow has a 60s real-time deadline. If a daemon never releases its lock, report a startup timeout without spawning a competing daemon
 
-The TS client uses one 10s cold-start budget. A live child is not respawned
-just because the former 2s readiness interval elapsed. Only a child that exits
+The TS client uses one 10s cold-start budget. A child that is still alive is never
+respawned for being slow to become ready. Only a child that exits
 zero with the daemon's explicit `pi-famulus already running` message qualifies
 for contention retries, with 100ms–1s backoff. After an exact shutdown refusal,
 it re-probes hello with a 2s cap rather than waiting on pid liveness; a healthy
@@ -100,7 +107,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 - **Zero active connections for 5s → graceful shutdown**:
   1. Send SIGTERM to all running tasks (process groups); include tasks whose leader exited but whose group still contains members (background children)
   2. 2s grace → send SIGKILL to **process groups** that may still have members (even with a dead leader, SIGTERM-ignoring descendants are killed)
-  3. Persist task state as `killed` (reason: "manager_shutdown")
+  3. Persist task state as `killed` (`end_reason: "manager-shutdown"`)
   4. Remove socket/pid files and exit
 - During shutdown the manager still accepts new connections but immediately rejects their `hello` (`E_INTERNAL` "manager is shutting down"); clients follow §3.1 step 6, waiting for this manager to exit before spawning a successor rather than hanging until the response timeout
 - Background tasks must not outlive the last pi. Reattachment with `pi --resume` works only while "another pi is still alive"
@@ -119,7 +126,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
   - A session's pre-handover watches are restored automatically at re-hello, replaying its missed output range `[cursor delivered before handover, current)`, without gaps or duplicates.
   - `status` adds `generation` (in-place upgrades experienced by this pid) and `last_upgrade` (`at, ok, from_version, to_version?, error?, trigger: "cli"|"binary-changed"`).
 - **One-time name transition**: switching to this project name, binary name, environment namespace, and home directory is a breaking installation change, not an in-place upgrade. Wait for existing work to finish or stop it, close the sessions using the previous installation, and wait for its daemon to exit before reinstalling and reopening sessions. Migrate configuration only into `~/.pi/agent/pi-famulus/config.json`, updating explicit binary/home paths and environment overrides. Do not move runtime state or history wholesale: task and agent records contain absolute output/transcript paths, and moving their directory does not rewrite those references. Keep previous history separately if needed. Subsequent compatible upgrades under the same name and home retain the in-place handover support above.
-- **Disconnected-session retention**: sessions leave `ls` / `sessions` immediately after disconnecting; `sessions/<sid>/` remains for `goneSessionRetention` after its last write (config.json, default 24h), during which `show` / `agent` / `events` still work (postmortem inspection, `pi --resume`). On expiry the daemon deletes the directory and removes its tasks from memory. Sweep at startup and every `min(retention, 1h)`; connected sessions, or sessions still owning running tasks/live process groups, are never swept
+- **Disconnected-session retention**: sessions leave `ls` / `sessions` immediately after disconnecting, unless they still run something; `sessions/<sid>/` remains for `goneSessionRetention` after its last write (config.json, default 24h), during which `show` / `agent` / `events` still work (postmortem inspection, `pi --resume`). On expiry the daemon deletes the directory and removes its tasks from memory. Sweep at startup and every `min(retention, 1h)`; connected sessions, or sessions still owning running tasks/live process groups, are never swept. Separately, in every session, connected or not, a finished task's files (record, output, stderr) are deleted `finishedTaskRetention` (default 24h) after it ended, unless its process group still lingers
 
 ### 3.3 Transport and protocol
 
@@ -139,7 +146,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 **`start` idempotency**: `start` may carry an optional client-generated `key`; resending the same key within the same session returns the first task started, without starting another; keys survive in-place upgrades.
 
 **Supplemental rulings (2026-09-17)**:
-- `kind:"shell"` commands are interpreted by a shell: Unix uses `env.SHELL -c` (`/bin/sh -c` if env omits SHELL); Windows uses pi's shell: `PI_FAMULUS_SHELL` from the manager's environment, else Git Bash (`%ProgramFiles%\Git\bin\bash.exe`, then `%ProgramFiles(x86)%`), else a `bash.exe` on PATH outside `System32` (not WSL), each run as `-c <command>`; with no bash found (or `PI_FAMULUS_SHELL` naming `cmd`), `cmd.exe /d /s /c "<command>"` with the command verbatim
+- `kind:"shell"` commands are interpreted by a shell: Unix always uses `/bin/sh -c`; Windows uses pi's shell: `PI_FAMULUS_SHELL` from the manager's environment, else Git Bash (`%ProgramFiles%\Git\bin\bash.exe`, then `%ProgramFiles(x86)%`), else a `bash.exe` on PATH outside `System32` (not WSL), each run as `-c <command>`; with no bash found (or `PI_FAMULUS_SHELL` naming `cmd`), `cmd.exe /d /s /c "<command>"` with the command verbatim
 - Omitting `env` from `start` → the child inherits the manager's own environment (the extension always explicitly passes the complete env)
 - `stop` response = signal sent (SIGTERM→2s→SIGKILL flow started); the state change is determined by `task_exited`; killed tasks' `task_exited` carries `exit_code:null, signal:"SIGTERM"|"SIGKILL"`
 - CLI output is human-readable tables (not a contract); successful `shutdown` exits 0
@@ -335,6 +342,8 @@ pi-famulus doctor                       # health checks; any FAIL → exit 1
 pi-famulus shutdown
 ```
 
+This list is partial; `top`, `stats`, `config get/set`, `upgrade`, `start` and `completion` are described in `docs/cli.md`.
+
 ### 3.6 Rust structure
 
 ```
@@ -345,24 +354,33 @@ manager/
     ├── cli.rs        # usage-rs CLI declarations
     ├── daemon.rs     # listener, accept loop, connection registration, zero-connection shutdown
     ├── proto.rs      # frame codec + serde message types
+    ├── ipc.rs        # Unix domain socket / Windows named pipe
     ├── task.rs       # spawn (via runner, process groups), lifeline, output tee
     ├── runner.rs     # `__run`: task process-group leader, lifeline, status reporting, leftover-child guardian
-    ├── sys.rs        # sole production unsafe seam: setsid(pre_exec) + kill(pgid)/liveness
+    ├── sys/          # OS process-control seam: mod.rs, unix.rs (setsid, kill(pgid), liveness), windows.rs (Job Objects)
+    ├── handover/     # in-place exec upgrade: mod.rs, unix.rs
     ├── registry.rs   # task registry + session namespaces + disk persistence
     ├── lifecycle.rs  # spawn lock, pid claim, startup scan after crash (mark orphaned)
+    ├── capacity.rs   # machine-wide agent-slot budget and per-kind limits
+    ├── gc.rs         # retention of gone sessions and finished tasks
+    ├── clock.rs      # the daemon's time source for its own timers
+    ├── workkind.rs   # shell-command work-kind classifier
+    ├── stats.rs      # `stats`: shell time and CPU by agent / work kind
     ├── client.rs     # CLI: connect/spawn flow, daemon commands, log/tail, doctor
     ├── inspect.rs    # CLI: status/sessions/ls/show/agent/events and data layer
     ├── events.rs     # events.jsonl writes (manager) and reads (CLI)
+    ├── pager.rs      # CLI pager
     ├── fmt.rs        # display width (CJK), durations, local time
+    ├── winpath.rs    # Windows path normalization for the named-pipe identity
     └── out.rs        # stdout that exits quietly with 0 when a pipe closes
 ```
 
-Dependencies: tokio (full), usage-rs (derive CLI parser), serde + serde_json, interprocess (cross-platform sockets), fd-lock (spawn lock), libc (process groups wrapped only through `sys.rs`). Windows process groups use Job Objects (v1 may initially use `taskkill /T`).
+Dependencies: tokio (full), usage-rs (derive CLI parser), serde + serde_json, interprocess (cross-platform sockets), fd-lock (spawn lock), libc (process groups, mostly through `sys/`). Windows process groups use Job Objects.
 
 **Memory bounds (§3.4 hardening)**:
 - In-memory ring has a hard 64KB cap (`RING_CAPACITY`); full output goes only to `.output` on disk
 - tee→fanout uses bounded mpsc (`CHUNK_CHANNEL_CAP=64`, approximately ≤512KB in flight), preventing slow watches from exhausting the process
-- Connection map / sessions grow and shrink with connections; terminal task entries remain for list/output (not unbounded growth in the running tee)
+- Connection map / sessions grow and shrink with connections; terminal task entries remain for list/output until `finishedTaskRetention` (default 24h) removes them (not unbounded growth in the running tee)
 - Zero active connections → kill tasks → remove socket/pid → exit (§3.2)
 
 ## 4. pi extension (TypeScript)
@@ -373,7 +391,7 @@ Directory: `extension/`; `package.json` declares `"pi": {"extensions": ["./src/i
 
 - `connect()`: §3.1 startup flow → hello(session_id=pi session id, pi_pid=process.pid)
 - Multiplex requests/responses (id → Promise map); register event callbacks (`onEvent`)
-- Disconnection: reconnect with exponential backoff (0.5s/1s/2s, at most 3 attempts), then re-hello; **on complete failure bash falls back to pi's built-in local execution** (degrade, do not hang)
+- Disconnection: reconnect at once, then with exponential backoff from 100ms doubling to 2s, all within one 27s window (readiness and hello included), then re-hello; **on complete failure bash falls back to pi's built-in local execution** (degrade, do not hang)
 - `session_shutdown` → `shutdown_session` → close connection
 
 ### 4.2 bash override (`src/bash-override.ts`)
@@ -414,7 +432,7 @@ monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
 - Extension-side line handling (pure functions, easy to test):
   - `LineBatcher`: chunk → split on `\n` → 200ms batching; per-line cap 500 characters, per-batch cap 3000 characters
   - `RateLimiter`: token bucket (capacity 10, +1 every 2s); at least 10 batches in the last 30s with ≥50% dropped → automatic stop + notification
-- Event injection: `<pi-famulus-wake kind="monitor">` (see §4.5); idle→triggerTurn, busy→steer; while busy, coalesce per monitor and send after `agent_settled`, carrying `event-count` and `dropped-lines`
+- Event injection: `<pi-famulus-wake kind="monitor">` (see §4.5); idle→triggerTurn; while busy, events are never steered: they coalesce per monitor and are sent after `agent_settled`, carrying `event-count` and `dropped-lines`
 - Process exit → end notification; timeout expires → stop + "[Monitor timed out — re-arm if needed.]"
 - `persistent:true` → lives until session ends (no timeout)
 - All time sources and timers use the `Clock` injected from extension scope, including batching, rate limiting, and timeout; tests use `ManualClock`, not global fake-timer replacement
@@ -426,8 +444,9 @@ The sole injection outlet for all asynchronous events:
 
 ```ts
 notify({ customType, content, details }): void
-// idle → pi.sendMessage(msg, {triggerTurn:true})
-// busy → pi.sendMessage(msg, {deliverAs:"steer"})
+// idle    → pi.sendMessage(msg, {triggerTurn:true})
+// busy    → pi.sendMessage(msg, {deliverAs:"steer"})   (not monitor events: they wait for agent_settled)
+// passive → held until the agent settles, then pi.sendMessage(msg, {triggerTurn:false}): appended, no turn
 ```
 
 - 200ms batching window: merge multiple task_exited events into **one** `<pi-famulus-wake kind="task">`, containing multiple `<task>` elements
@@ -449,7 +468,7 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 | kind | Root attributes | Child elements | details |
 |---|---|---|---|
 | `task` | (none; still-running is not an attribute) | Optional `<still-running><item id>`; one or more `<task id kind status duration-ms exit-code? signal?>`, containing `summary` `command` `output-file` `preview` | `{ kind:"task"; stillRunning: {id,title}[]; tasks: [{ id, taskKind, status, summary, command, outputPath, preview, durationMs, exitCode: number\|null, signal?: string }] }` |
-| `monitor` | `id` `description` `status?` | `<event>` | `{ kind:"monitor"; id; description; status?; event }` |
+| `monitor` | `id` `description` `status?` `event-count?` (when >1) `dropped-lines?` (when >0) | `<event>` | `{ kind:"monitor"; id; description; status?; event; eventCount?; droppedLines? }` |
 | `subagent-handover` | `run-id` `child-id` `name` `status` `status-as-of?` | Optional `<still-running>`; `summary`; optional `changed-since-as-of`; `prompt` `result`; optional `error`, `warning` | `{ kind:"subagent-handover"; runId; childId; name; status; statusAsOf?; stillRunning: {id,title}[]; summary; prompt; result; error?; warning? }` |
 | `subagent-done` | `run-id` `status` `duration-ms` `status-now?` | `summary`; optional `changed-since-as-of`; then one `<child id name status status-as-of?>` per child, containing `prompt` (head capped at 2000), optional `error`, optional `warning`, `result` (tail capped at 2000) | `{ kind:"subagent-done"; runId; status; runStatusNow?; durationMs; summary; children: [{ childId, name, status, statusAsOf?, prompt, result, error?, warning? }] }` |
 | `supervisor-request` | `from` `name` | `message`, `reply-with` | `{ kind:"supervisor-request"; from; name; message }` |
@@ -498,11 +517,11 @@ subagent({
 - Parallel: worker pool (concurrency slots), results returned in tasks-array ordinal order
 - One child failure does not bring down the group: mark that result entry `status:"failed", error`; fail_fast=true cancels unstarted entries
 - Result text: each child's `session.getLastAssistantText()`; empty → "(no output)"
-- Depth: extension records its own depth (main=0); child-session tools **exclude subagent** (hard depth-1 cap, no deeper nesting in v1)
+- Depth: extension records its own depth (main=0); child-session tools **exclude subagent** (hard depth-1 cap, no deeper nesting in v1). pi-famulus does not initialize inside a child, so children also get no `monitor` or `task_*` tools; their bash is the foreground-only replacement
 - **Child configuration and isolation** (pi ≥1.0.0): each child uses a file-backed SettingsManager and ordinary resource discovery, preserving global/project paths and the parent’s project trust decision. Named built-in factories provide codemode, tool-search, and MCP while respecting user enable/disable settings; `bindExtensions()` runs startup/resource-discovery hooks. A session-local event-bus probe makes famulus return before parent initialization. SDK custom tools add communication and replace enabled bash without background support; children receive `CHILD_BEHAVIOR_GUIDELINES`. Omitted agent tools inherit `defaultTools`; explicit lists, including `[]`, restrict access plus communication. Explicit non-MCP allowlists exclude MCP tools across supported SDK versions. Disposal awaits child shutdown hooks and MCP cleanup, including sessions still being created. Parent-only CLI resource overrides are not copied. CI checks pi 1.0.0, 1.0.4, and latest.
 - **Unified clock and generation timer ownership**: the extension creates one `Clock` and injects it into time-dependent services. `ManualClock` deterministically runs timers by deadline, then insertion order for ties; already-due timers created during `advance()` also run, clearing a timer inside a callback prevents later execution, and intervals crossed by a large advance fire once per due point. Each child generation owns a `TimerScope`; settle, interrupt, resume, or dispose clears all timeouts in that scope, preventing expired generations from affecting later state. No Effect-TS required; the rejected pilot's rationale and measurements are in `docs/decisions/effect-child-runner-pilot.md`.
 - Child bash: `child-bash.ts` forbids backgrounding—schema has no `run_in_background`; execute uses manager start + wait (full timeout_ms), SIGKILLs on expiry and returns a timeout error (never backgrounds); bare-sleep interception matches main bash
-- Limits: global concurrency 8 (across runs); stall watchdog—no child events for `stallMs` (default 5min) → abort and automatically continue on the **same session** (continuation prompt, transcript preserved), up to `stallRetries` (default 1), only then mark `failed (stalled)`; session spawn budget 32 children/hour, error on excess
+- Limits: per-session concurrency `maxConcurrentChildren` 8 (across runs; the machine-wide `maxAgents`, also 8, is enforced by the daemon, see `docs/global-capacity.md`); stall watchdog—no child events for `stallMs` (default 5min) → abort and automatically continue on the **same session** (continuation prompt, transcript preserved), up to `stallRetries` (default 1), only then mark `failed (stalled)`; session spawn budget 32 children/hour, error on excess
 - Management actions: `list` (all runs + state in this session), `get` (run_id → full results), `status` (run_id → each child's state/elapsed time/last event), `interrupt` (abort a child or entire run), `steer` (running child → `session.steer(message)`), `extend` (running child → new soft deadline `now + timeout_ms`, default the child's spawn budget), `resume` (ended child → continue with `session.prompt(message)`, new turn with budget `timeout_ms` or the spawn budget, notify again on completion; returns at once, and says when the child is queued for an admission slot), **`models` (list selectable models for a pre-call check)**
 
 **Child lifecycle (state machine)** (runner.ts; decision record: `docs/decisions/subagent-soft-deadline.md`)
@@ -564,7 +583,7 @@ Invariants:
 
 Completion uses `<pi-famulus-wake kind="subagent-done">`, handover uses `<pi-famulus-wake kind="subagent-handover">`. Shapes are in §4.5; do not use `<subagent-notification>`.
 
-**Fleet widget** (part of M5 brought forward to M3 because it depends on the registry): `ui.setWidget("pi-famulus-fleet", lines, {placement:"belowEditor"})`, only when `ctx.hasUI`; content = one line per active child `● name (agent) — 12s`, cleared with `undefined` when none are active; updates on every registry state transition + a 5s elapsed-time refresh (while active).
+**Fleet widget** (part of M5 brought forward to M3 because it depends on the registry): `ui.setWidget("pi-famulus-fleet", lines, {placement:"belowEditor"})`, only when `ctx.hasUI`; content = one summary line of live work, e.g. `● 2 shells · 1 monitor · alpha 12s · beta 8s   /tasks`, cleared with `undefined` when none are active; updates on every registry state transition + a 5s elapsed-time refresh (while active).
 
 ### 4.7 comms (M4)
 
@@ -607,11 +626,7 @@ You are an explorer agent. ... (body = appended system prompt segment)
 
 ### 4.9 Configuration
 
-`~/.pi/agent/pi-famulus/config.json` (read by extension):
-
-```json
-{ "foregroundBudgetMs": 20000, "subagentBudgetMs": 45000, "managerPath": null, "logLevel": "info", "goneSessionRetention": "24h" }
-```
+`~/.pi/agent/pi-famulus/config.json` is read by both sides: the extension reads `foregroundBudgetMs`, `managerPath` and the `subagent` object; the daemon reads `goneSessionRetention`, `finishedTaskRetention`, `maxAgents` and the per-kind budgets. Keys, defaults and meanings: `docs/configuration.md`.
 
 ## 5. Testing strategy
 
@@ -621,7 +636,7 @@ No dependency on crate-internal APIs: spawn the compiled binary and send frames 
 
 - Protocol: round-trips for every hello/start/wait/output/stop/list/watch message
 - Events: task_exited push, output push after watch
-- Lifecycle: zero connections → manager exits and tasks are cleaned up; spawn-lock singleton (second daemon refuses to start)
+- Lifecycle: zero connections → manager exits and tasks are cleaned up; lifetime-lock singleton (`manager.lock`; a second daemon refuses to start)
 - Crash: kill -9 / panic manager → all task process groups are cleaned up with it (SIGTERM; SIGTERM-ignoring members receive SIGKILL only after the 2s grace; stubborn-group cleanup takes about 2s + process-kill time) → after restart, still-running records become orphaned (manager-crash), no adoption, no signals
 - Output: incremental cursor reads of large output, UTF-8 lossy decoding
 
@@ -639,9 +654,9 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 
 - Cross-session / cross-machine communication (belongs to agent-intercom)
 - Detached subagent runner (ChildRunner seam reserved)
-- Worktree isolation, workflow-script sandbox, watchdog, missions
+- Worktree isolation, workflow-script sandbox, a watchdog for a detached runner (the in-process stall watchdog of §4.6 exists), missions
 - Compatibility with pi-subagents / pi-intercom
-- Windows support: named-pipe IPC, Job Objects (KILL_ON_JOB_CLOSE lifeline), pi's bash (`cmd.exe` only as a fallback); in-place `exec` upgrade remains Unix-only
+- In-place `exec` upgrade on Windows (Unix-only; Windows replaces the binary and restarts). Windows itself is supported: named-pipe IPC and a Job Object lifeline (`KILL_ON_JOB_CLOSE`, manager/src/sys/windows.rs:6)
 
 ## Appendix A: TS pure-function signature contract (shared basis for implementation and tests)
 

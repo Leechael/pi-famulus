@@ -5,12 +5,12 @@ About 20 minutes. It walks every feature the way a user meets it, and says what 
 Automated suites (run first, all must be green):
 
 ```bash
-cd manager && cargo test && cargo test --features test-clock
-cd extension && npm ci && npx tsc --noEmit && npx vitest run   # CI
-cd extension && npm run deps && npx tsc --noEmit && npx vitest run   # local: nub (see eval/README.md)
-PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
-cd eval && npm ci && npm run test:e2e && npm run test:unit      # CI
-cd eval && npm run deps && npm run test:e2e && npm run test:unit   # local: nub
+(cd manager && cargo test && cargo test --features test-clock)
+(cd extension && npm ci && npx tsc --noEmit && npx vitest run)   # CI
+(cd extension && npm run deps && npx tsc --noEmit && npx vitest run)   # local: nub (see eval/README.md)
+(cd extension && PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts)
+(cd eval && npm ci && npm run test:e2e && npm run test:unit)      # CI
+(cd eval && npm run deps && npm run test:e2e && npm run test:unit)   # local: nub
 ```
 
 ## 0. Install into an isolated home
@@ -105,7 +105,7 @@ pi-famulus events -f
 
 ## F7. Manager lifecycle and degraded mode
 
-Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the one-time breaking name transition. For that transition, finish or stop work, close the previous installation's sessions, wait for its daemon to exit, reinstall, and migrate configuration only; see [README.md](../README.md#install). Do not move its runtime state/history tree, whose records contain absolute output/transcript paths.
+Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the one-time breaking name transition. For that transition, finish or stop work, close the previous installation's sessions, wait for its daemon to exit, reinstall, and migrate configuration only; see [development.md](development.md#one-time-name-transition). Do not move its runtime state/history tree, whose records contain absolute output/transcript paths.
 
 | # | Do | Expect |
 |---|---|---|
@@ -121,4 +121,4 @@ Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the
 
 ## Prompt eval (optional, costs model credits)
 
-See [eval/README.md](../eval/README.md). The smoke tier runs one model × 8 scenarios × 3 repeats (about $4 at list price); pick models in `eval/models.json`, authentication comes from your `pi` login.
+See [eval/README.md](../eval/README.md). The smoke tier runs one model × 10 scenarios × 3 repeats; `(cd eval && node ablation/run.ts --tier smoke)` without `--yes` prints the plan and a cost estimate first; pick models in `eval/models.json`, authentication comes from your `pi` login.

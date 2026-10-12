@@ -11,7 +11,7 @@ Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np 
 
 ## Prerequisites
 
-- Node ≥ 22.18 (runs `.ts` directly; no build step)
+- Node ≥ 22.19 (runs `.ts` directly; no build step)
 - `pi` on `PATH` (tested with 1.0.0) — override with `PI_BIN`
 - `cargo`: `pi-famulus` is built from `../manager` into `eval/.cache/target` on first use (never inside `manager/`); override with `PI_FAMULUS_MANAGER_PATH`
 - `tmux` for the TUI test
@@ -41,7 +41,7 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
-Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun). The [2026-10-08 campaign review](2026-10-08-REVIEW.md) records model/thinking preflight, grader fixes, scenario-version differences, and retained failure caveats. The separate [targeted prompt experiments](2026-10-08-PROMPT-REVIEW.md) record333 later episodes: C1 showed no benefit; C2's Luna improvement did not clear the K3 execution-risk gate. Both product prompts were retained unchanged. The [2026-10-09 candidate P review](2026-10-09-PROMPT-REVIEW.md) records targeted control-mode/silent-work validation; adoption and the all-default-scenario merge gate remain pending.
+Results of every run, as a scenario × model pass/fail matrix: [RESULTS.md](RESULTS.md). When they must be rerun: [BASELINES.md](BASELINES.md#when-to-rerun). The [2026-10-08 campaign review](2026-10-08-REVIEW.md) records model/thinking preflight, grader fixes, scenario-version differences, and retained failure caveats. The separate [targeted prompt experiments](2026-10-08-PROMPT-REVIEW.md) record 333 later episodes: C1 showed no benefit; C2's Luna improvement did not clear the K3 execution-risk gate. Both product prompts were retained unchanged. The [2026-10-09 candidate P review](2026-10-09-PROMPT-REVIEW.md) records targeted control-mode/silent-work validation. [PR #62](https://github.com/Leechael/pi-famulus/pull/62) later merged candidate P on 2026-10-09; the prescribed rerun of all ten default scenarios has still not been completed, so the review's full-baseline/adoption gate remains open.
 
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
@@ -63,7 +63,7 @@ A run is a grid of **cells**, one per (model × variant × scenario), each repea
 | `--models a,b` | Which models (`pi --model` specs) | smoke: first entry of `models.json`; full: all of it |
 | `--variants a,b` | Which prompt texts to remove, one at a time. `baseline` removes nothing and always runs | smoke: `baseline` only; full: baseline + every ablatable segment in `manifest.json` + the groups |
 | `--k N` | Repeats per cell | smoke: 3; full: 10 |
-| `--scenarios a,b` | Which behaviors to probe (see [Scenarios](#scenarios-ablationscenariosts)) | the 10 default ones; compatibility probes are opt-in |
+| `--scenarios a,b` | Which behaviors to probe (see [Scenarios](#scenarios-scenariosmd-graders-in-ablationscenariosts)) | the 10 default ones; compatibility probes are opt-in |
 
 So **smoke** answers "does this model behave with the full prompt?", and **full** answers "which pieces of the prompt does that depend on?". An explicit flag overrides the tier's preset: `--tier full --models x` runs every variant on model `x` only.
 
