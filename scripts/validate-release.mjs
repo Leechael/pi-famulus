@@ -5,8 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 export const REPOSITORY = 'Leechael/pi-famulus';
-// win32-arm64 is not required: CI does not build it, and publish.yml only
-// downloads artifacts from its own run. Add it back with a producer.
+// win32-arm64 is not released: CI does not build it, and publish.yml only
+// downloads artifacts from its own run. Add an npm/ package and a producer together.
 // npm package names use `win` for Windows. Unscoped `*-win32-*` names have
 // tripped npm's spam detector and blocked first publish.
 export const PLATFORMS = [

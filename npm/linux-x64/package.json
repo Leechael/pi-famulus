@@ -3,6 +3,11 @@
   "version": "0.1.6",
   "description": "Linux x64 native manager for pi-famulus (static musl)",
   "license": "MIT",
+  "author": "Leechael Yim",
+  "homepage": "https://github.com/Leechael/pi-famulus",
+  "bugs": {
+    "url": "https://github.com/Leechael/pi-famulus/issues"
+  },
   "os": [
     "linux"
   ],

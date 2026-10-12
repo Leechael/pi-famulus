@@ -22,7 +22,7 @@ CI builds the Unix targets on native-architecture hosts and `win32-x64` on `wind
 Keep these at the same stable `X.Y.Z`:
 
 - `extension/package.json` version and its exact optional dependency versions.
-- The `npm/*/package.json` versions of the five released native packages. `npm/win32-arm64` is excluded until CI builds it (`scripts/validate-release.mjs`).
+- The `npm/*/package.json` versions of the five released native packages. There is no win32-arm64 package until CI builds it (`scripts/validate-release.mjs`).
 - `manager/Cargo.toml` version and the own-package Cargo lock record.
 - The extension lockfile's root metadata and first-party native-package version records.
 

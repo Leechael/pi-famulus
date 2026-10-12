@@ -1,7 +1,7 @@
 {
   "name": "pi-famulus",
   "version": "0.1.6",
-  "description": "Subagents and long-running bash for pi. A daemon runs shell commands and monitors, cleans them up if it crashes, and reports results back when they finish: no polling.",
+  "description": "Done means done: subagents and long-running background bash for Pi. One daemon owns every shell it starts and wakes the agent when work finishes. No polling.",
   "keywords": [
     "pi-package",
     "pi",
@@ -9,16 +9,22 @@
     "pi-coding-agent",
     "subagent",
     "subagents",
+    "background",
     "background-tasks",
     "bash",
     "daemon",
-    "multi-agent"
+    "multi-agent",
+    "monitor",
+    "agent-orchestration"
   ],
   "author": "Leechael Yim",
   "homepage": "https://github.com/Leechael/pi-famulus",
   "bugs": {"url": "https://github.com/Leechael/pi-famulus/issues"},
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/Leechael/pi-famulus",
