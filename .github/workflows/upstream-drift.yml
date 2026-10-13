@@ -1,0 +1,83 @@
+name: Upstream drift
+
+# The compat jobs in ci.yml install pi with the pins from .github/pi-compat.json,
+# so they test pi-famulus itself. This workflow installs each pi version fresh,
+# with no pins, the way a new user would, and reports what upstream changed:
+#   - an unpinned version fails: pi plus its newest dependencies broke;
+#   - a pinned version now passes: the pin is no longer needed, remove it.
+# It runs on every PR and daily, so drift shows up even when nothing is merged.
+# It is a separate workflow so a red result here says "upstream", not "this PR".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pi-matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: read
+        run: echo "matrix=$(jq -c . .github/pi-compat.json)" >> "$GITHUB_OUTPUT"
+
+  drift:
+    name: drift (pi ${{ matrix.pi-version }})
+    needs: pi-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.pi-matrix.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm ci
+      - name: Install pi without pins
+        run: ../scripts/install-pi-compat.sh "$PI_VERSION"
+        env:
+          PI_VERSION: ${{ matrix.pi-version }}
+      - name: Typecheck and compat tests
+        id: compat
+        continue-on-error: true
+        run: |
+          npx tsc --noEmit
+          npm run test:compat
+      - name: Judge against .github/pi-compat.json
+        env:
+          PI_VERSION: ${{ matrix.pi-version }}
+          PI_PINS: ${{ matrix.pi-pins }}
+          PIN_REASON: ${{ matrix.pin-reason }}
+          OUTCOME: ${{ steps.compat.outcome }}
+        run: |
+          if [[ -z "$PI_PINS" ]]; then
+            if [[ "$OUTCOME" == success ]]; then
+              echo "pi $PI_VERSION installs and passes with fresh dependencies."
+              exit 0
+            fi
+            echo "::error title=Upstream break (pi $PI_VERSION)::A fresh install of pi $PI_VERSION fails the compat suite. If the cause is upstream, add a pin with a pin-reason to .github/pi-compat.json; if it is pi-famulus, fix it."
+            exit 1
+          fi
+          if [[ "$OUTCOME" == success ]]; then
+            echo "::error title=Stale pin (pi $PI_VERSION)::pi $PI_VERSION now passes without '$PI_PINS'. Remove the pin from .github/pi-compat.json."
+            exit 1
+          fi
+          echo "::warning title=Upstream still broken (pi $PI_VERSION)::Fresh pi $PI_VERSION still fails; ci.yml keeps the pin '$PI_PINS'. Reason: $PIN_REASON"

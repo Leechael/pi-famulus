@@ -67,6 +67,7 @@
     "deps": "nub install --frozen-lockfile --node-linker hoisted",
     "prompts": "node scripts/build-prompts.ts",
     "test": "vitest run",
+    "test:compat": "vitest run tests/unit/impl-child-resource-isolation.test.ts tests/unit/impl-child-tools.test.ts tests/unit/impl-child-guidelines.test.ts tests/unit/impl-subagent-lifecycle.test.ts tests/unit/impl-steering-drain.test.ts tests/unit/impl-model-spec.test.ts tests/unit/impl-eval-fixes.test.ts tests/integration/behavior-guidelines.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
