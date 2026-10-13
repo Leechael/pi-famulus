@@ -74,6 +74,7 @@ Requires pi 1.0.0 or newer. CI checks 1.0.0, 1.0.4, and the latest published ver
 | Shell / monitor details | `1` output · `2` stderr · `3` info (status, exit, end reason, times, paths). Tab cycles, `f` toggles follow, arrows / PgUp / PgDn / wheel scroll, Esc back |
 | Subagent details | Conversation (agent preamble hidden), result, info |
 | `/reply <child> <text>` | Answer a subagent's decision request without going through the model |
+| `/famulus` | Show the `pi-famulus` binary path (and its `--version`), the running manager's version and pid, and the extension version |
 | Transcript rows | A backgrounded bash call is one row that updates when the command finishes |
 | Notification pills | One line per wake (✓ done, ✗ failed, › monitor event, ? decision request). Ctrl+O expands labelled fields; the XML envelope is model-facing only |
 

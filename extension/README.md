@@ -36,7 +36,7 @@ pi-famulus is a pi extension, so it works wherever pi loads extensions: the pi T
 
 ## Quick Start
 
-> **Before you install**: pi-famulus registers the tools `bash` (replacing the built-in), `subagent`, `monitor`, `agent_message`, `task_list`, `task_output` and `task_stop`, and the commands `/tasks` and `/reply`. In pi 1.0.0, when two extensions register the same tool name, the extension loaded first keeps it, and the other one's tool is hidden.
+> **Before you install**: pi-famulus registers the tools `bash` (replacing the built-in), `subagent`, `monitor`, `agent_message`, `task_list`, `task_output` and `task_stop`, and the commands `/tasks`, `/famulus` and `/reply`. In pi 1.0.0, when two extensions register the same tool name, the extension loaded first keeps it, and the other one's tool is hidden.
 >
 > - `pi-subagents` also registers `subagent`. Do not install it alongside pi-famulus.
 > - `pi-background-tasks` also registers `/tasks`, so pi lists both as `/tasks:1` and `/tasks:2`. It overlaps with pi-famulus in purpose. Choose one of the two.
@@ -82,6 +82,7 @@ Run the full test suite and tell me what fails.
 | :--- | :--- |
 | `/tasks` | Live list of shells, monitors and subagents; `ctrl+x` stops the selected item |
 | `/reply <child> <text>` | Answers a subagent's question without going through the model |
+| `/famulus` | Shows the `pi-famulus` binary path and the manager and extension versions |
 | Fleet line (the status line below the editor) | Shows the shells, monitors and subagents that are running |
 
 **Plan with your strongest model, implement with a cheap one.** Select your strongest model in pi, then save this as `~/.pi/agent/agents/worker.md`:

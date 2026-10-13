@@ -19,6 +19,7 @@ import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
 const EXTENSION_VERSION = "0.1.6";
+export { EXTENSION_VERSION };
 // 5: speaks per-kind agent admission and queued acquire.
 const PROTOCOL = 5;
 const HELLO_TIMEOUT_MS = 5000;
@@ -281,6 +282,7 @@ export class ManagerClient {
   private eventHandlers = new Set<EventHandler>();
   private reconnectHandlers = new Set<() => void>();
   private protocolLevel_ = 0;
+  private daemonInfo: { version: string; pid: number } | null = null;
   private state: ClientState = "disconnected";
   private intentionalClose = false;
   private rebound = false;
@@ -311,6 +313,11 @@ export class ManagerClient {
   /** Maximum protocol level reported by the connected manager; 0 means unknown/legacy. */
   protocolLevel(): number {
     return this.protocolLevel_;
+  }
+
+  /** Version and pid the connected daemon reported on hello; null before the first hello. */
+  managerInfo(): { version: string; pid: number } | null {
+    return this.daemonInfo;
   }
 
   /** Last connect/reconnect failure reason (empty when never failed / currently connected). */
@@ -811,6 +818,10 @@ export class ManagerClient {
       if (entry.message.type === "hello") {
         const serverMaximum = typeof msg.protocol === "number" ? msg.protocol : 0;
         this.protocolLevel_ = Math.min(PROTOCOL, serverMaximum);
+        this.daemonInfo = {
+          version: typeof msg.version === "string" ? msg.version : "unknown",
+          pid: typeof msg.pid === "number" ? msg.pid : 0,
+        };
       }
       entry.resolve(msg);
     } else {

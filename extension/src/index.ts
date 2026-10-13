@@ -25,7 +25,7 @@ import { createAgentMessageTool, createContactSupervisorTool } from "./comms/too
 import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
 import type { TaskExitInfo } from "./format";
-import { ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
+import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
 import { NotifyCenter } from "./notify";
@@ -48,6 +48,7 @@ import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
 import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./task-tools";
+import { registerFamulusCommand } from "./tui/famulus-command";
 import { registerFamulusMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
 import { stderrPathFor } from "./tui/task-output-paths";
@@ -365,6 +366,12 @@ export default function (pi: ExtensionAPI): void {
     sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
     clock,
     syncWithManager: deps.syncWithManager,
+  });
+  registerFamulusCommand(pi, {
+    extensionVersion: EXTENSION_VERSION,
+    managerPath,
+    describeSearch: () => describeManagerSearch(config, home),
+    getClient: () => client,
   });
   monitorRegistry.onChange(() => {
     for (const mon of monitorRegistry.listActive()) {
