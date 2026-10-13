@@ -76,6 +76,9 @@ jobs:
           - platform: win32-x64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
+          - platform: win32-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
       PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
@@ -159,7 +162,7 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
-          $dumpbin = & $vswhere -latest -products '*' -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | Select-Object -First 1
+          $dumpbin = & $vswhere -latest -products '*' -find 'VC/Tools/MSVC/**/bin/Host*/*/dumpbin.exe' | Select-Object -First 1
           if (!$dumpbin) { throw 'Cannot locate dumpbin to inspect release dependencies' }
           $imports = & $dumpbin /dependents "manager/target/$env:TARGET/release/pi-famulus.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect release dependencies' }
@@ -171,7 +174,7 @@ jobs:
         shell: bash
         run: |
           # prepare-native prints the real tarball path; package names may diverge
-          # from matrix platform ids (Windows publishes as pi-famulus-win-x64).
+          # from matrix platform ids (Windows publishes as pi-famulus-win-<arch>).
           native_tgz=$(node scripts/prepare-native.mjs "$PLATFORM" "$RUNNER_TEMP/packages")
           echo "NATIVE_TGZ=$native_tgz" >> "$GITHUB_ENV"
           npm pack ./extension --pack-destination "$RUNNER_TEMP/packages"
@@ -242,7 +245,7 @@ jobs:
       - uses: actions/upload-artifact@v5
         with:
           name: npm-${{ matrix.platform }}
-          # Exact path from prepare-native (not matrix.platform); Windows is win-x64.
+          # Exact path from prepare-native (not matrix.platform); Windows is win-<arch>.
           path: ${{ env.NATIVE_TGZ }}
           if-no-files-found: error
       - uses: actions/upload-artifact@v5
