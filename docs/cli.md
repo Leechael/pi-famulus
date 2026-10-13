@@ -23,7 +23,7 @@ Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pi
 
 ## Install
 
-Install `pi-famulus` with optional dependencies enabled (`pi install npm:pi-famulus`). The main package automatically selects the matching Linux/macOS x64/arm64 or Windows x64 native package and exposes the CLI on its npm bin path; `npx pi-famulus --help` is a quick check. No compiler or separate binary download is needed. See the [README](../README.md#quick-start).
+Install `pi-famulus` with optional dependencies enabled (`pi install npm:pi-famulus`). The main package automatically selects the matching Linux/macOS/Windows x64/arm64 native package and exposes the CLI on its npm bin path; `npx pi-famulus --help` is a quick check. No compiler or separate binary download is needed. See the [README](../README.md#quick-start).
 
 ### Source build / separate manager
 
