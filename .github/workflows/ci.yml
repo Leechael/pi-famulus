@@ -44,7 +44,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi-version: ['1.0.0', '1.0.4', latest]
+        include:
+          - pi-version: '1.0.0'
+          # pi 1.0.4 asks for pi-codemode ^1.0.4, but 1.2.0 dropped the
+          # MCP_TYPESCRIPT_PREAMBLE export it imports. Pin the 1.1.x line it
+          # shipped against so this job tests pi-famulus, not that upstream break.
+          - pi-version: '1.0.4'
+            pi-pins: '@earendil-works/pi-codemode@~1.1.0'
+          - pi-version: latest
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -71,7 +78,8 @@ jobs:
         run: |
           # Resolve latest once, then install that exact release and assert it.
           resolved=$(npm view "@earendil-works/pi-coding-agent@$PI_VERSION" version)
-          npm install --no-save --package-lock=false "@earendil-works/pi-coding-agent@$resolved"
+          # PI_PINS is unquoted on purpose: empty adds nothing, otherwise one spec per word.
+          npm install --no-save --package-lock=false "@earendil-works/pi-coding-agent@$resolved" $PI_PINS
           PI_EXPECTED_VERSION="$resolved" node --input-type=commonjs -e '
             const actual = require("./node_modules/@earendil-works/pi-coding-agent/package.json").version;
             const expected = process.env.PI_EXPECTED_VERSION;
@@ -81,6 +89,7 @@ jobs:
           git diff --exit-code -- package.json package-lock.json
         env:
           PI_VERSION: ${{ matrix.pi-version }}
+          PI_PINS: ${{ matrix.pi-pins }}
       - run: npx tsc --noEmit
       # Real-SDK coverage guards inherited config and isolated child resources.
       # Limit overrides to these tests: npm install can resolve registry natives
