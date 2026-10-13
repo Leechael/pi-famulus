@@ -491,7 +491,7 @@ Modules: `src/subagent/` (types.ts / runner.ts / registry.ts / pool.ts / tool.ts
 
 **Strict pi-runtime isolation rule**: `createAgentSession` may be **dynamically imported** only in `pi-runtime.ts` (`await import("@earendil-works/pi-coding-agent")`); all other modules have zero runtime pi dependencies (`import type` is allowed). The runner creates child sessions through an injected `CreateSessionFn` factory, faked in tests. If dynamic import fails, the subagent tool returns explicit error text without affecting other tools.
 
-**Child-session construction** (pi SDK verified): `createAgentSession({ cwd, model?, thinkingLevel?, tools?: explicit allowlist, customTools: [contact_supervisor, etc.], sessionManager: SessionManager.inMemory() })`; model resolution uses `ctx.modelRegistry.find(provider, id)` / `getAvailable()`; default model = parent session's current model (`ctx.model`). Child-session objects remain in the registry until session_shutdown, so "resume" = another `prompt()` on the same object (v1 does not reconstruct across processes).
+**Child-session construction** (pi SDK verified): `createAgentSession({ cwd, model?, thinkingLevel?, tools?: explicit allowlist, customTools: [contact_supervisor, etc.], sessionManager: SessionManager.inMemory() })`; model resolution uses `ctx.modelRegistry.find(provider, id)` / `getAvailable()`; default model = parent session's current model (`ctx.model`). Child-session objects remain in the registry until session_shutdown (a `/reload` hands the registry to the reloaded extension, §4.1), so "resume" = another `prompt()` on the same object (v1 does not reconstruct across processes).
 
 **Tool schema** (typebox, field-name contract):
 
