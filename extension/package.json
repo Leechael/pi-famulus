@@ -19,7 +19,9 @@
   ],
   "author": "Leechael Yim",
   "homepage": "https://github.com/Leechael/pi-famulus",
-  "bugs": {"url": "https://github.com/Leechael/pi-famulus/issues"},
+  "bugs": {
+    "url": "https://github.com/Leechael/pi-famulus/issues"
+  },
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -56,7 +58,8 @@
     "pi-famulus-linux-arm64": "0.1.6",
     "pi-famulus-darwin-x64": "0.1.6",
     "pi-famulus-darwin-arm64": "0.1.6",
-    "pi-famulus-win-x64": "0.1.6"
+    "pi-famulus-win-x64": "0.1.6",
+    "pi-famulus-win-arm64": "0.1.6"
   },
   "pi": {
     "extensions": [

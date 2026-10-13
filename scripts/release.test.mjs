@@ -306,10 +306,12 @@ test('all packed packages include the approved MIT license', t => {
 });
 
 test('Windows npm package uses win, not win32, to avoid registry spam filters', () => {
-  const windows = PLATFORMS.find(p => p.os === 'win32' && p.arch === 'x64');
-  assert.equal(windows?.name, 'pi-famulus-win-x64');
-  assert.equal(windows?.directory, 'npm/win32-x64');
-  assert.deepEqual(windows && { os: windows.os, cpu: windows.arch }, { os: 'win32', cpu: 'x64' });
+  for (const arch of ['x64', 'arm64']) {
+    const windows = PLATFORMS.find(p => p.os === 'win32' && p.arch === arch);
+    assert.equal(windows?.name, `pi-famulus-win-${arch}`);
+    assert.equal(windows?.directory, `npm/win32-${arch}`);
+    assert.deepEqual(windows && { os: windows.os, cpu: windows.arch }, { os: 'win32', cpu: arch });
+  }
   const native = workflow('native-packages');
   assert.match(native, /native_tgz=\$\(node scripts\/prepare-native\.mjs "\$PLATFORM" "\$RUNNER_TEMP\/packages"\)/);
   assert.match(native, /NATIVE_TGZ=\$native_tgz/);

@@ -47,7 +47,7 @@ pi-famulus is a pi extension, so it works wherever pi loads extensions: the pi T
 pi install npm:pi-famulus
 ```
 
-Requires pi 1.0.0 or newer. Native daemon builds ship for Linux x64 and arm64, macOS x64 and arm64 (macOS 13+), and Windows x64. There is no Windows arm64 build. The daemon ships as an exact-version optional dependency of the npm package, so keep optional dependencies enabled. No Rust compiler or extra download is needed.
+Requires pi 1.0.0 or newer. Native daemon builds ship for Linux x64 and arm64, macOS x64 and arm64 (macOS 13+), and Windows x64 and arm64. The daemon ships as an exact-version optional dependency of the npm package, so keep optional dependencies enabled. No Rust compiler or extra download is needed.
 
 You do not write tool calls. After installing, ask the agent in plain language:
 
@@ -132,7 +132,7 @@ pi-famulus starts and stops processes for you. This section states what it guara
 - **What happens to background tasks when pi exits?** Five seconds after the last pi session closes, the daemon stops whatever is still running and exits. Read the records afterwards with `pi-famulus show <id>`.
 - **Why does my pi bash command hang on long builds?** With pi-famulus, `bash` stops waiting after 20 seconds and moves the command to the background, so the turn continues. To change the limit, set `foregroundBudgetMs` in `~/.pi/agent/pi-famulus/config.json` ([configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)).
 - **How do I see or stop running work?** Type `/tasks` in the pi TUI and press `ctrl+x` on an item. From a terminal, `pi-famulus ls` lists what is running.
-- **Does it work on Windows?** Yes, on x64. There is no arm64 build. The in-place upgrade, where the daemon re-executes itself, works only on Linux and macOS. On Windows, replace the binary and restart the daemon manually.
+- **Does it work on Windows?** Yes, on x64 and arm64. The in-place upgrade, where the daemon re-executes itself, works only on Linux and macOS. On Windows, replace the binary and restart the daemon manually.
 - **What if a notification does not arrive?** Run `pi-famulus events --id <id>` to see whether the wake was emitted, delivered and injected. Run `pi-famulus doctor` to check daemon health.
 
 ## Docs

@@ -45,7 +45,7 @@ pi-famulus 是一个 pi 扩展，pi 能加载扩展的地方它都能用：pi TU
 pi install npm:pi-famulus
 ```
 
-需要 pi 1.0.0 或更新版本。守护进程有这些平台的原生构建：Linux x64 和 arm64、macOS x64 和 arm64（macOS 13+）、Windows x64。没有 Windows arm64 构建。守护进程作为 npm 包的精确版本可选依赖（optional dependency）发布，所以不要关闭可选依赖。不需要 Rust 编译器，也不需要额外下载。
+需要 pi 1.0.0 或更新版本。守护进程有这些平台的原生构建：Linux x64 和 arm64、macOS x64 和 arm64（macOS 13+）、Windows x64 和 arm64。守护进程作为 npm 包的精确版本可选依赖（optional dependency）发布，所以不要关闭可选依赖。不需要 Rust 编译器，也不需要额外下载。
 
 不用自己写工具调用。装好后，直接用自然语言跟 agent 说：
 
@@ -130,7 +130,7 @@ pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及
 - **pi 退出后后台任务会怎样？** 最后一个 pi 会话关闭 5 秒后，守护进程停止仍在运行的任务并退出。之后可以用 `pi-famulus show <id>` 查看记录。
 - **为什么 pi 的 bash 命令在长时间构建时卡住？** 装了 pi-famulus 后，`bash` 等 20 秒就不再等，把命令转到后台，这一回合继续。要改这个时限，在 `~/.pi/agent/pi-famulus/config.json` 里设置 `foregroundBudgetMs`（[配置说明](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)）。
 - **怎么查看或停止运行中的任务？** 在 pi TUI 里输入 `/tasks`，选中一项后按 `ctrl+x`。在终端里，`pi-famulus ls` 列出正在运行的任务。
-- **支持 Windows 吗？** 支持 x64，没有 arm64 构建。守护进程原地重新执行自己的升级方式只在 Linux 和 macOS 上可用。在 Windows 上，需要替换二进制并手动重启守护进程。
+- **支持 Windows 吗？** 支持 x64 和 arm64。守护进程原地重新执行自己的升级方式只在 Linux 和 macOS 上可用。在 Windows 上，需要替换二进制并手动重启守护进程。
 - **通知没到怎么办？** 运行 `pi-famulus events --id <id>`，查看唤醒有没有发出、送达和注入。运行 `pi-famulus doctor` 检查守护进程的状态。
 
 ## Docs
