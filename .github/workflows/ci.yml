@@ -37,14 +37,27 @@ jobs:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
 
+  # Matrix and pins live in .github/pi-compat.json, shared with upstream-drift.yml.
+  pi-matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - id: read
+        run: echo "matrix=$(jq -c . .github/pi-compat.json)" >> "$GITHUB_OUTPUT"
+
   # The manager's Windows suites run in the native-packages matrix (win32-*).
   # Pi-version compatibility stays on Ubuntu; Windows gets the locked-suite unit tests.
+  # Pins keep this job about pi-famulus; upstream-drift.yml checks unpinned installs.
   extension-compat:
     name: extension (pi ${{ matrix.pi-version }})
+    needs: pi-matrix
     strategy:
       fail-fast: false
-      matrix:
-        pi-version: ['1.0.0', '1.0.4', latest]
+      matrix: ${{ fromJSON(needs.pi-matrix.outputs.matrix) }}
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -66,35 +79,17 @@ jobs:
       - run: npx vitest run
         if: matrix.pi-version == '1.0.0'
       # Test the minimum, a known later release, and the current registry release.
-      # Keep the development pin and lockfile untouched by matrix installs.
       - name: Install and verify selected pi version
-        run: |
-          # Resolve latest once, then install that exact release and assert it.
-          resolved=$(npm view "@earendil-works/pi-coding-agent@$PI_VERSION" version)
-          npm install --no-save --package-lock=false "@earendil-works/pi-coding-agent@$resolved"
-          PI_EXPECTED_VERSION="$resolved" node --input-type=commonjs -e '
-            const actual = require("./node_modules/@earendil-works/pi-coding-agent/package.json").version;
-            const expected = process.env.PI_EXPECTED_VERSION;
-            if (actual !== expected) throw new Error(`Expected pi ${expected}, installed ${actual}`);
-            console.log(`Verified pi ${actual}`);
-          '
-          git diff --exit-code -- package.json package-lock.json
+        # PI_PINS is unquoted on purpose: empty adds nothing, otherwise one spec per word.
+        run: ../scripts/install-pi-compat.sh "$PI_VERSION" $PI_PINS
         env:
           PI_VERSION: ${{ matrix.pi-version }}
+          PI_PINS: ${{ matrix.pi-pins }}
       - run: npx tsc --noEmit
       # Real-SDK coverage guards inherited config and isolated child resources.
-      # Limit overrides to these tests: npm install can resolve registry natives
+      # test:compat is a fixed file list: npm install can resolve registry natives
       # instead of local lock links, changing unrelated binary-search fixtures.
-      - run: >-
-          npx vitest run
-          tests/unit/impl-child-resource-isolation.test.ts
-          tests/unit/impl-child-tools.test.ts
-          tests/unit/impl-child-guidelines.test.ts
-          tests/unit/impl-subagent-lifecycle.test.ts
-          tests/unit/impl-steering-drain.test.ts
-          tests/unit/impl-model-spec.test.ts
-          tests/unit/impl-eval-fixes.test.ts
-          tests/integration/behavior-guidelines.test.ts
+      - run: npm run test:compat
 
   extension-windows:
     name: extension (windows-latest)

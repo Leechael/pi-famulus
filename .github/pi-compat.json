@@ -1,0 +1,11 @@
+{
+  "include": [
+    { "pi-version": "1.0.0" },
+    {
+      "pi-version": "1.0.4",
+      "pi-pins": "@earendil-works/pi-codemode@~1.1.0",
+      "pin-reason": "pi 1.0.4 asks for pi-codemode ^1.0.4, but 1.2.0 dropped the MCP_TYPESCRIPT_PREAMBLE export it imports"
+    },
+    { "pi-version": "latest" }
+  ]
+}
