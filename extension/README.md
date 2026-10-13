@@ -36,7 +36,7 @@ pi-famulus is a pi extension, so it works wherever pi loads extensions: the pi T
 
 ## Quick Start
 
-> **Before you install**: pi-famulus registers the tools `bash` (replacing the built-in), `subagent`, `monitor`, `agent_message`, `task_list`, `task_output` and `task_stop`, and the commands `/tasks`, `/bashes` and `/reply`. In pi 1.0.0, when two extensions register the same tool name, the extension loaded first keeps it, and the other one's tool is hidden.
+> **Before you install**: pi-famulus registers the tools `bash` (replacing the built-in), `subagent`, `monitor`, `agent_message`, `task_list`, `task_output` and `task_stop`, and the commands `/tasks`, `/famulus` and `/reply`. In pi 1.0.0, when two extensions register the same tool name, the extension loaded first keeps it, and the other one's tool is hidden.
 >
 > - `pi-subagents` also registers `subagent`. Do not install it alongside pi-famulus.
 > - `pi-background-tasks` also registers `/tasks`, so pi lists both as `/tasks:1` and `/tasks:2`. It overlaps with pi-famulus in purpose. Choose one of the two.
@@ -80,8 +80,9 @@ Run the full test suite and tell me what fails.
 
 | In the pi TUI | Does |
 | :--- | :--- |
-| `/tasks` (alias `/bashes`) | Live list of shells, monitors and subagents; `ctrl+x` stops the selected item |
+| `/tasks` | Live list of shells, monitors and subagents; `ctrl+x` stops the selected item |
 | `/reply <child> <text>` | Answers a subagent's question without going through the model |
+| `/famulus` | Shows the `pi-famulus` binary path and the manager and extension versions |
 | Fleet line (the status line below the editor) | Shows the shells, monitors and subagents that are running |
 
 **Plan with your strongest model, implement with a cheap one.** Select your strongest model in pi, then save this as `~/.pi/agent/agents/worker.md`:
@@ -130,6 +131,8 @@ pi-famulus starts and stops processes for you. This section states what it guara
 - **Does it work outside the pi TUI?** Yes. It loads wherever pi loads extensions, including RPC mode (`pi --mode rpc`) and agents built with the pi SDK. Print mode (`pi -p`) loads it too, but exits when the first run ends, so later results are not seen. In an SDK agent, load it through `DefaultResourceLoader` (for example with `additionalExtensionPaths`) and call `session.bindExtensions()`. The real-model eval drives pi in RPC mode.
 - **Can a subagent start its own subagents?** No. Nesting is limited to one level.
 - **What happens to background tasks when pi exits?** Five seconds after the last pi session closes, the daemon stops whatever is still running and exits. Read the records afterwards with `pi-famulus show <id>`.
+- **Does `/reload` stop running work?** No. Shells, monitors and subagents keep running, and their results still arrive. If the reload loads a different pi-famulus version, the old version's work is stopped first.
+- **Which binary and versions am I running?** Type `/famulus`. It shows the `pi-famulus` binary path and its version, the running manager's version and pid, and the extension version.
 - **Why does my pi bash command hang on long builds?** With pi-famulus, `bash` stops waiting after 20 seconds and moves the command to the background, so the turn continues. To change the limit, set `foregroundBudgetMs` in `~/.pi/agent/pi-famulus/config.json` ([configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)).
 - **How do I see or stop running work?** Type `/tasks` in the pi TUI and press `ctrl+x` on an item. From a terminal, `pi-famulus ls` lists what is running.
 - **Does it work on Windows?** Yes, on x64 and arm64. The in-place upgrade, where the daemon re-executes itself, works only on Linux and macOS. On Windows, replace the binary and restart the daemon manually.

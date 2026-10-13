@@ -64,10 +64,6 @@ export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): 
     description: "List and inspect background work",
     handler: async (_args, ctx) => openTasksUi(ctx, deps),
   });
-  pi.registerCommand("bashes", {
-    description: "Alias for /tasks",
-    handler: async (_args, ctx) => openTasksUi(ctx, deps),
-  });
 }
 
 type TaskListRow = { type: "run"; runId: string; count: number } | { type: "task"; item: WorkItem; indent: boolean };

@@ -80,6 +80,7 @@ pi-famulus events -f
 | 4.4 | Tab | Switches active+recent ↔ all |
 | 4.5 | Enter on a shell | `1` output · `2` stderr · `3` info (status, exit, reason, times, paths); `f` toggles follow |
 | 4.6 | Resize the terminal to 60 and to 40 columns while open | Nothing wraps or overflows; pi does not exit with "Rendered line exceeds terminal width" |
+| 4.7 | `/famulus` | Extension version, the binary path with its version, and the manager's version and pid (matches `pi-famulus status`) |
 
 ## F5. Fleet line and pills
 
@@ -110,6 +111,7 @@ Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the
 | # | Do | Expect |
 |---|---|---|
 | 7.1 | Start a background `sleep 300`, quit pi | Within ~7 s `pi-famulus status` says not running (exit 1) and the sleep is gone (`pgrep -f 'sleep 300'` empty) |
+| 7.1b | Start a background `sleep 60 && echo done`, a monitor on `while true; do date; sleep 1; done`, and an async subagent that runs `sleep 60` via bash; then `/reload` | No error or warning. `/tasks` still lists all three as running and the fleet line comes back; the monitor keeps delivering; when the sleeps end, the task wake and the subagent's result arrive. `pi-famulus events` shows no `session.disconnect` and no `task.stop` for the reload |
 | 7.2 | Two pi sessions at once, then quit one | Daemon stays; `sessions` and `ls` show only the remaining session at once; `show <id>` of the quit session's task still works |
 | 7.2b | Put `{"goneSessionRetention":"1m"}` in `~/.pi/agent/pi-famulus-test/config.json`, restart the daemon (`pi-famulus shutdown` with no pi open), repeat 7.2 | About a minute after quitting, `sessions/<sid>/` of the quit session is deleted and `show <id>` says not found; `manager.log` has `gc: removed` |
 | 7.3 | Start a background `sleep 300 & sleep 300` (a task with a grandchild), then `kill -9` the daemon | Within ~3s both sleeps are gone (`pgrep -f 'sleep 300'` empty). The extension reconnects to a fresh manager; the agent gets an exit wake with status `orphaned`; `ls -a` shows the task `orphaned`, REASON `manager-crash` |
@@ -117,7 +119,7 @@ Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the
 | 7.6 | While 7.3-style work runs (a background `for i in $(seq 1 600); do echo line-$i; sleep 0.5; done`, a monitor on `while true; do date; sleep 1; done`, and a `sleep 300 & sleep 300`), rebuild with any change and `install` the binary again, then `pi-famulus upgrade` | `upgraded in place: … (pid N, generation 1, … running task(s) kept)` with the SAME pid as before (`pi-famulus status`). No pi session shows an error or a warning; the background task later finishes with its real exit code and its output has every `line-$i` exactly once; the monitor keeps delivering; `pgrep -f 'sleep 300'` still shows both sleeps |
 | 7.7 | Just `install` a rebuilt binary again, no `upgrade` | Within ~5s `pi-famulus status` shows `upgrades: N (last: … binary-changed, …)` with N one higher; nothing interrupted |
 | 7.8 | `install` a broken file (e.g. `echo junk > x; install -m 755 x …/pi-famulus`), then `pi-famulus upgrade` | `upgrade not done, still running …`; everything keeps working. Restore the real binary afterwards |
-| 7.5 | Move the manager binary away, start pi | Warning lists the paths tried and says children lose bash; bash still runs locally; monitor/`task_*` report disabled (red); `/tasks` says the manager is unavailable |
+| 7.5 | Move the manager binary away, start pi | Warning lists the paths tried and says children lose bash; bash still runs locally; monitor/`task_*` report disabled (red); `/tasks` says the manager is unavailable; `/famulus` says the binary was not found and lists where it looked |
 
 ## Prompt eval (optional, costs model credits)
 

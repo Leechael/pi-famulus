@@ -34,7 +34,7 @@ pi-famulus 是一个 pi 扩展，pi 能加载扩展的地方它都能用：pi TU
 
 ## Quick Start
 
-> **安装前先看**：pi-famulus 会注册这些工具：`bash`（替换内置的 bash）、`subagent`、`monitor`、`agent_message`、`task_list`、`task_output`、`task_stop`；还会注册 `/tasks`、`/bashes`、`/reply` 三个命令。在 pi 1.0.0 中，两个扩展注册同名工具时，先加载的扩展保留这个名字，另一个扩展的同名工具会被隐藏。
+> **安装前先看**：pi-famulus 会注册这些工具：`bash`（替换内置的 bash）、`subagent`、`monitor`、`agent_message`、`task_list`、`task_output`、`task_stop`；还会注册 `/tasks`、`/famulus`、`/reply` 三个命令。在 pi 1.0.0 中，两个扩展注册同名工具时，先加载的扩展保留这个名字，另一个扩展的同名工具会被隐藏。
 >
 > - `pi-subagents` 也注册了 `subagent`，不要和 pi-famulus 一起装。
 > - `pi-background-tasks` 也注册了 `/tasks`，pi 会把两个命令分别列成 `/tasks:1` 和 `/tasks:2`。它和 pi-famulus 的用途重叠，两个里选一个。
@@ -78,8 +78,9 @@ pi install npm:pi-famulus
 
 | 在 pi TUI 里 | 作用 |
 | :--- | :--- |
-| `/tasks`（别名 `/bashes`） | 实时列出 shell、monitor 和子代理；`ctrl+x` 停止选中的项 |
+| `/tasks` | 实时列出 shell、monitor 和子代理；`ctrl+x` 停止选中的项 |
 | `/reply <child> <text>` | 直接回答子代理的问题，不经过模型 |
+| `/famulus` | 显示 `pi-famulus` 二进制路径，以及 manager 和扩展的版本 |
 | fleet 行（编辑器下方的状态行） | 显示正在运行的 shell、monitor 和子代理 |
 
 **用最强的模型做计划，用便宜的模型做实现。** 在 pi 里选好你最强的模型，然后把下面的内容存成 `~/.pi/agent/agents/worker.md`：
@@ -128,6 +129,8 @@ pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及
 - **能在 pi TUI 以外使用吗？** 能。pi 能加载扩展的地方它都能加载，包括 RPC 模式（`pi --mode rpc`）和用 pi SDK 开发的 agent。print 模式（`pi -p`）也能加载，但第一轮运行结束就退出，之后的结果收不到。在 SDK 开发的 agent 里，通过 `DefaultResourceLoader` 加载它（比如用 `additionalExtensionPaths`），再调用 `session.bindExtensions()`。真实模型评测就是在 RPC 模式下驱动 pi 的。
 - **子代理能再启动子代理吗？** 不能，嵌套只有一层。
 - **pi 退出后后台任务会怎样？** 最后一个 pi 会话关闭 5 秒后，守护进程停止仍在运行的任务并退出。之后可以用 `pi-famulus show <id>` 查看记录。
+- **`/reload` 会中断正在运行的任务吗？** 不会。shell、monitor 和子代理继续运行，结果照常送达。如果这次 reload 加载的是另一个版本的 pi-famulus，旧版本的任务会先被停止。
+- **怎么知道用的是哪个二进制、哪个版本？** 输入 `/famulus`，它显示 `pi-famulus` 二进制路径及其版本、正在运行的 manager 的版本和 pid，以及扩展的版本。
 - **为什么 pi 的 bash 命令在长时间构建时卡住？** 装了 pi-famulus 后，`bash` 等 20 秒就不再等，把命令转到后台，这一回合继续。要改这个时限，在 `~/.pi/agent/pi-famulus/config.json` 里设置 `foregroundBudgetMs`（[配置说明](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)）。
 - **怎么查看或停止运行中的任务？** 在 pi TUI 里输入 `/tasks`，选中一项后按 `ctrl+x`。在终端里，`pi-famulus ls` 列出正在运行的任务。
 - **支持 Windows 吗？** 支持 x64 和 arm64。守护进程原地重新执行自己的升级方式只在 Linux 和 macOS 上可用。在 Windows 上，需要替换二进制并手动重启守护进程。

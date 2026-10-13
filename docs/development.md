@@ -21,6 +21,8 @@ PI_FAMULUS_MANAGER_PATH="$HOME/.pi/agent/pi-famulus/bin/pi-famulus" \
 # For keeps: `pi install <source>`
 ```
 
+`/reload` keeps the running pi-famulus runtime when the extension version is unchanged (background work survives it), so it does not pick up edits to pi-famulus's own source. Restart pi to load them.
+
 An installed native npm manager takes precedence over home/bin and PATH. To test a separately built manager, set `PI_FAMULUS_MANAGER_PATH` as above, or set `managerPath` in `~/.pi/agent/pi-famulus/config.json` to its absolute path. An executable `managerPath` takes precedence over the environment override; update or clear it when using the latter. The full lookup order is in [configuration.md](configuration.md#manager-binary-discovery).
 
 ## Tests
@@ -53,7 +55,7 @@ Checked against the npm tarballs of `pi-subagents` and `pi-background-tasks` (20
 | `pi-subagents` | Tool `subagent`. Child sessions of both also get a `contact_supervisor` tool. | pi-subagents `src/extension/index.js:596`, `src/intercom/native-supervisor-channel.js:183`; pi-famulus `extension/src/index.ts:405` |
 | `pi-background-tasks` | Command `/tasks`. | pi-background-tasks `dist/src/extension.js:591`; pi-famulus `extension/src/tui/tasks-command.ts:63` |
 
-No other tool, command, shortcut or message-renderer name overlaps. pi-famulus registers tools `bash`, `task_list`, `task_output`, `task_stop`, `monitor`, `subagent`, `agent_message`, commands `/tasks`, `/bashes`, `/reply`, one message renderer for its wake messages, and no shortcuts. `pi-subagents` registers many `/subagents*` commands, `/run`, `/prompt-workflow`, `/subagent-cost`, a configurable detach shortcut and several renderers. `pi-background-tasks` registers `/bg`, `/jobs`, `/logs`, `/kill`, `/fusion` and others, and the shortcuts `shift+down`, `ctrl+alt+b` and `ctrl+alt+c`.
+No other tool, command, shortcut or message-renderer name overlaps. pi-famulus registers tools `bash`, `task_list`, `task_output`, `task_stop`, `monitor`, `subagent`, `agent_message`, commands `/tasks`, `/famulus`, `/reply`, one message renderer for its wake messages, and no shortcuts. `pi-subagents` registers many `/subagents*` commands, `/run`, `/prompt-workflow`, `/subagent-cost`, a configurable detach shortcut and several renderers. `pi-background-tasks` registers `/bg`, `/jobs`, `/logs`, `/kill`, `/fusion` and others, and the shortcuts `shift+down`, `ctrl+alt+b` and `ctrl+alt+c`.
 
 What pi does (read from `@earendil-works/pi-coding-agent` 1.0.0, `dist/core/extensions/runner.js`): for tools, the first registration of a name wins, in extension load order. Duplicate commands are all kept and get invocation names `/name:1`, `/name:2`. Duplicate shortcuts: the later extension wins and pi reports a diagnostic. Other pi versions may differ.
 
