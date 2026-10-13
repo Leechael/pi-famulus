@@ -40,7 +40,7 @@ export function formatFamulusInfo(info: FamulusInfo): string {
 
 export function readBinaryVersion(path: string): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile(path, ["--version"], { timeout: 2000 }, (err, stdout) => {
+    execFile(path, ["--version"], { timeout: 2000, windowsHide: true }, (err, stdout) => {
       if (err) return resolve(null);
       // "pi-famulus 0.1.6+<sha>"
       resolve(stdout.trim().replace(/^pi-famulus\s+/, "") || null);

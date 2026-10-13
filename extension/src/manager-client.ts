@@ -799,12 +799,22 @@ export class ManagerClient {
     }
     if (this.helloWaiter && typeof msg.ok === "boolean") {
       // Unnamed response: correlate by order with the outstanding hello.
-      if (msg.ok === true) this.helloWaiter.resolve();
+      if (msg.ok === true) {
+        this.recordDaemonInfo(msg);
+        this.helloWaiter.resolve();
+      }
       else this.helloWaiter.reject(errorFromResponse(msg));
       this.helloWaiter = null;
       return;
     }
     this.log(`unmatched message: ${JSON.stringify(msg).slice(0, 200)}`);
+  }
+
+  private recordDaemonInfo(hello: Record<string, unknown>): void {
+    this.daemonInfo = {
+      version: typeof hello.version === "string" ? hello.version : "unknown",
+      pid: typeof hello.pid === "number" ? hello.pid : 0,
+    };
   }
 
   private settle(id: string, msg: Record<string, unknown>): void {
@@ -818,10 +828,7 @@ export class ManagerClient {
       if (entry.message.type === "hello") {
         const serverMaximum = typeof msg.protocol === "number" ? msg.protocol : 0;
         this.protocolLevel_ = Math.min(PROTOCOL, serverMaximum);
-        this.daemonInfo = {
-          version: typeof msg.version === "string" ? msg.version : "unknown",
-          pid: typeof msg.pid === "number" ? msg.pid : 0,
-        };
+        this.recordDaemonInfo(msg);
       }
       entry.resolve(msg);
     } else {
