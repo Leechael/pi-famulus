@@ -392,7 +392,7 @@ Directory: `extension/`; `package.json` declares `"pi": {"extensions": ["./src/i
 - `connect()`: §3.1 startup flow → hello(session_id=pi session id, pi_pid=process.pid)
 - Multiplex requests/responses (id → Promise map); register event callbacks (`onEvent`)
 - Disconnection: reconnect at once, then with exponential backoff from 100ms doubling to 2s, all within one 27s window (readiness and hello included), then re-hello; **on complete failure bash falls back to pi's built-in local execution** (degrade, do not hang)
-- `session_shutdown` → `shutdown_session` → close connection
+- `session_shutdown` → `shutdown_session` → close connection. Exception: `session_shutdown` with reason `reload` (`/reload`) parks the whole runtime (this connection, the subagent registry, monitors) on `globalThis`; the re-imported extension adopts it on its `session_start`, so the session's shells, monitors and subagents keep running. Registrations go through a recording stand-in for `ExtensionAPI` (`src/reload-handoff.ts`) and are replayed on the new pi. A runtime parked by a different extension version, or not adopted within 60s, gets the normal teardown
 
 ### 4.2 bash override (`src/bash-override.ts`)
 

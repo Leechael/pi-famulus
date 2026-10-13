@@ -21,6 +21,8 @@ PI_FAMULUS_MANAGER_PATH="$HOME/.pi/agent/pi-famulus/bin/pi-famulus" \
 # For keeps: `pi install <source>`
 ```
 
+`/reload` keeps the running pi-famulus runtime when the extension version is unchanged (background work survives it), so it does not pick up edits to pi-famulus's own source. Restart pi to load them.
+
 An installed native npm manager takes precedence over home/bin and PATH. To test a separately built manager, set `PI_FAMULUS_MANAGER_PATH` as above, or set `managerPath` in `~/.pi/agent/pi-famulus/config.json` to its absolute path. An executable `managerPath` takes precedence over the environment override; update or clear it when using the latter. The full lookup order is in [configuration.md](configuration.md#manager-binary-discovery).
 
 ## Tests

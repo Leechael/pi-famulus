@@ -48,6 +48,7 @@ import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
 import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./task-tools";
+import { createPiBinding, parkRuntime, takeParkedRuntime } from "./reload-handoff";
 import { registerFamulusCommand } from "./tui/famulus-command";
 import { registerFamulusMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
@@ -70,8 +71,31 @@ function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
   return "failed";
 }
 
+interface FamulusRuntime {
+  attach(pi: ExtensionAPI): void;
+}
+
 export default function (pi: ExtensionAPI): void {
   if (isFamulusChildSession(pi)) return;
+  // A /reload parked the previous instance's runtime: adopt it so its shells,
+  // monitors and subagents keep running (see reload-handoff.ts). Another
+  // version's runtime is torn down instead; its code may not match ours.
+  const parked = takeParkedRuntime<FamulusRuntime>();
+  if (parked?.version === EXTENSION_VERSION) {
+    parked.runtime.attach(pi);
+    return;
+  }
+  const retiring = parked?.dispose().catch(() => {});
+  createFamulusRuntime(retiring).attach(pi);
+}
+
+/**
+ * Everything one pi session owns. It registers on a PiBinding rather than on
+ * pi directly, so a /reload can re-attach it to the next extension instance.
+ */
+function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
+  const binding = createPiBinding();
+  const pi = binding.api;
   registerBehaviorGuidelines(pi);
   const home = getFamulusHome();
   const config = loadConfig(home);
@@ -439,8 +463,36 @@ export default function (pi: ExtensionAPI): void {
   // each child session via customTools, see below).
   pi.registerTool(createAgentMessageTool(comms, { kind: "parent" }, commsHost, clock));
 
-  pi.on("session_start", async (_event, startCtx) => {
+  /** Session whose runtime a /reload parked; the reloaded instance's session_start resumes it. */
+  let parkedSessionId: string | null = null;
+  const startFleetWidget = (startCtx: ExtensionContext) => {
+    if (!startCtx.hasUI) return;
+    fleetWidget = new FleetWidget({
+      index: workIndex,
+      getUi: () => (ctx?.hasUI ? (ctx.ui as never) : null),
+      clock,
+    });
+    fleetWidget.start();
+  };
+
+  pi.on("session_start", async (event, startCtx) => {
+    if (parkedSessionId !== null) {
+      const resumed = event.reason === "reload" && startCtx.sessionManager.getSessionId() === parkedSessionId;
+      parkedSessionId = null;
+      if (resumed) {
+        // Same session after /reload: the client, registry and monitors kept
+        // running; only the context and the UI belong to the new instance.
+        ctx = startCtx;
+        binding.ready();
+        startFleetWidget(startCtx);
+        void syncWithManager();
+        return;
+      }
+      await teardown();
+    }
+    await retiring;
     ctx = startCtx;
+    binding.ready();
     notifyCenter?.dispose();
     notifyCenter = new NotifyCenter({
       sendMessage: (msg, opts) => pi.sendMessage(msg, opts),
@@ -593,11 +645,15 @@ export default function (pi: ExtensionAPI): void {
         return tools;
       },
     });
+    // The registry outlives startCtx across a /reload, which leaves startCtx
+    // stale; its closures keep plain values instead.
+    const sessionId = startCtx.sessionManager.getSessionId();
+    const sessionCwd = startCtx.cwd;
     const transcripts = new TranscriptWriter(home, clock);
     const syncTranscript = (childId: string): string | undefined => {
       const handle = registry.handle(childId);
       if (!handle) return undefined;
-      return transcripts.sync(startCtx.sessionManager.getSessionId(), childId, handle.conversation());
+      return transcripts.sync(sessionId, childId, handle.conversation());
     };
     const runner = new InProcessRunner({
       createSession,
@@ -664,7 +720,7 @@ export default function (pi: ExtensionAPI): void {
     registry.setRunner(runner);
     subagentRegistry = registry;
     // Persist child records so `pi-famulus ls` / task_list can see in-process agents.
-    const sessionIdForAgents = () => startCtx.sessionManager.getSessionId();
+    const sessionIdForAgents = () => sessionId;
     const previousAgentStatus = new Map<string, string>();
     registry.onTransition((run) => {
       const sid = sessionIdForAgents();
@@ -750,7 +806,7 @@ export default function (pi: ExtensionAPI): void {
           workKind: c.workKind ?? "other",
           ...(c.queueMs !== undefined ? { queueMs: c.queueMs } : {}),
           ...(c.model !== undefined ? { model: c.model } : {}),
-          cwd: startCtx.cwd,
+          cwd: sessionCwd,
           ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
           ...(c.preamble !== undefined ? { preamble: c.preamble } : {}),
           ...(c.result?.text ? { text: c.result.text } : {}),
@@ -758,14 +814,7 @@ export default function (pi: ExtensionAPI): void {
         });
       }
     });
-    if (startCtx.hasUI) {
-      fleetWidget = new FleetWidget({
-        index: workIndex,
-        getUi: () => (ctx?.hasUI ? (ctx.ui as never) : null),
-        clock,
-      });
-      fleetWidget.start();
-    }
+    startFleetWidget(startCtx);
 
     // Connect in the background: a cold manager spawn must not stall the
     // first prompt. Tools call ensureAvailable() lazily before use.
@@ -792,7 +841,7 @@ export default function (pi: ExtensionAPI): void {
       .catch(() => {});
   });
 
-  pi.on("session_shutdown", async () => {
+  const teardown = async (): Promise<void> => {
     exitWatchdog.dispose();
     fleetWidget?.dispose();
     fleetWidget = null;
@@ -814,6 +863,22 @@ export default function (pi: ExtensionAPI): void {
       }
     }
     ctx = null;
+  };
+  const runtime: FamulusRuntime = { attach: (host) => binding.attach(host) };
+
+  pi.on("session_shutdown", async (event) => {
+    if (event.reason === "reload" && ctx) {
+      // Keep the session's shells, monitors and subagents running; the
+      // reloaded instance adopts this runtime.
+      parkedSessionId = ctx.sessionManager.getSessionId();
+      fleetWidget?.dispose();
+      fleetWidget = null;
+      ctx = null;
+      binding.detach();
+      parkRuntime({ version: EXTENSION_VERSION, runtime, dispose: teardown });
+      return;
+    }
+    await teardown();
   });
 
   pi.on("agent_settled", async () => {
@@ -829,4 +894,6 @@ export default function (pi: ExtensionAPI): void {
     });
     return message ? { message } : undefined;
   });
+
+  return runtime;
 }
