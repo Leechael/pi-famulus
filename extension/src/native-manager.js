@@ -17,8 +17,6 @@ const resolveInstalled = createRequire(import.meta.url).resolve;
 /** The native optional packages are selected by npm's os/cpu constraints. */
 export function nativePackageName(platform, arch) {
   if (!["linux", "darwin", "win32"].includes(platform) || !["x64", "arm64"].includes(arch)) return null;
-  // Windows ARM64 has no release producer yet; manual binary lookup still works.
-  if (platform === "win32" && arch === "arm64") return null;
   // npm package names use `win` (not `win32`) after unscoped `*-win32-*` names
   // were blocked by registry spam detection on first publish.
   const packageOs = platform === "win32" ? "win" : platform;
