@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus-linux-arm64",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Linux arm64 native manager for pi-famulus (static musl)",
   "license": "MIT",
   "author": "Leechael Yim",

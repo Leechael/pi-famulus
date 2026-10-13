@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Done means done: subagents and long-running background bash for Pi. One daemon owns every shell it starts and wakes the agent when work finishes. No polling.",
   "keywords": [
     "pi-package",
@@ -54,12 +54,12 @@
     "pi-famulus": "./bin/pi-famulus.js"
   },
   "optionalDependencies": {
-    "pi-famulus-linux-x64": "0.1.6",
-    "pi-famulus-linux-arm64": "0.1.6",
-    "pi-famulus-darwin-x64": "0.1.6",
-    "pi-famulus-darwin-arm64": "0.1.6",
-    "pi-famulus-win-x64": "0.1.6",
-    "pi-famulus-win-arm64": "0.1.6"
+    "pi-famulus-linux-x64": "0.1.7",
+    "pi-famulus-linux-arm64": "0.1.7",
+    "pi-famulus-darwin-x64": "0.1.7",
+    "pi-famulus-darwin-arm64": "0.1.7",
+    "pi-famulus-win-x64": "0.1.7",
+    "pi-famulus-win-arm64": "0.1.7"
   },
   "pi": {
     "extensions": [
