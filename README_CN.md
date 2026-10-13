@@ -34,7 +34,7 @@ pi-famulus 是一个 pi 扩展，pi 能加载扩展的地方它都能用：pi TU
 
 ## Quick Start
 
-> **安装前先看**：pi-famulus 会注册这些工具：`bash`（替换内置的 bash）、`subagent`、`monitor`、`agent_message`、`task_list`、`task_output`、`task_stop`；还会注册 `/tasks`、`/bashes`、`/reply` 三个命令。在 pi 1.0.0 中，两个扩展注册同名工具时，先加载的扩展保留这个名字，另一个扩展的同名工具会被隐藏。
+> **安装前先看**：pi-famulus 会注册这些工具：`bash`（替换内置的 bash）、`subagent`、`monitor`、`agent_message`、`task_list`、`task_output`、`task_stop`；还会注册 `/tasks`、`/reply` 两个命令。在 pi 1.0.0 中，两个扩展注册同名工具时，先加载的扩展保留这个名字，另一个扩展的同名工具会被隐藏。
 >
 > - `pi-subagents` 也注册了 `subagent`，不要和 pi-famulus 一起装。
 > - `pi-background-tasks` 也注册了 `/tasks`，pi 会把两个命令分别列成 `/tasks:1` 和 `/tasks:2`。它和 pi-famulus 的用途重叠，两个里选一个。
@@ -78,7 +78,7 @@ pi install npm:pi-famulus
 
 | 在 pi TUI 里 | 作用 |
 | :--- | :--- |
-| `/tasks`（别名 `/bashes`） | 实时列出 shell、monitor 和子代理；`ctrl+x` 停止选中的项 |
+| `/tasks` | 实时列出 shell、monitor 和子代理；`ctrl+x` 停止选中的项 |
 | `/reply <child> <text>` | 直接回答子代理的问题，不经过模型 |
 | fleet 行（编辑器下方的状态行） | 显示正在运行的 shell、monitor 和子代理 |
 
