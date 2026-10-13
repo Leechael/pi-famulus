@@ -176,4 +176,16 @@ describe("PiBinding", () => {
     expect(second.sent).toEqual([{ n: 2 }, { n: 3 }]);
     expect(first.sent).toEqual([{ n: 1 }]);
   });
+
+  it("does not deliver messages discarded before the next session starts", () => {
+    const binding = createPiBinding();
+    binding.attach(fakePi().api);
+    binding.detach();
+    binding.api.sendMessage({ n: 1 } as never);
+    const next = fakePi();
+    binding.attach(next.api);
+    binding.discardQueued();
+    binding.ready();
+    expect(next.sent).toEqual([]);
+  });
 });

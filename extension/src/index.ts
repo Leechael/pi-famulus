@@ -488,6 +488,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         void syncWithManager();
         return;
       }
+      binding.discardQueued();
       await teardown();
     }
     await retiring;
@@ -826,11 +827,13 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
           if (c.protocolLevel() >= 4) void reconcileAgentLeases(c).catch(() => {});
           return;
         }
-        if (startCtx.hasUI) {
+        // A /reload may have replaced startCtx by now; report to the live one.
+        const current = ctx;
+        if (current?.hasUI) {
           const detail = c.lastError();
           const reason = detail ? ` (${detail})` : "";
           const searched = managerPath ? `using ${managerPath}` : `looked in: ${describeManagerSearch(config, home)}`;
-          startCtx.ui.notify(
+          current.ui.notify(
             `pi-famulus unavailable${reason}; ${searched}. ` +
               "Bash runs locally without auto-backgrounding, task_*/monitor are disabled, " +
               "and subagents cannot run bash. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",

@@ -41,6 +41,8 @@ export interface PiBinding {
   ready(): void;
   /** Stop calling the attached pi (it is about to go stale). */
   detach(): void;
+  /** Drop queued messages; they belong to a session that is not coming back. */
+  discardQueued(): void;
 }
 
 export function createPiBinding(): PiBinding {
@@ -87,6 +89,9 @@ export function createPiBinding(): PiBinding {
     detach() {
       current = null;
       live = false;
+    },
+    discardQueued() {
+      queued.length = 0;
     },
   };
 }
