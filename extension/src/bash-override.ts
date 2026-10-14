@@ -224,8 +224,7 @@ async function executeLocal(
           : null;
       if (timer !== null) clock.unref?.(timer);
       signal?.addEventListener("abort", onAbort, { once: true });
-      child.stdout?.on("data", (d: Buffer) => collector.append(d));
-      child.stderr?.on("data", (d: Buffer) => collector.append(d));
+      collector.attach(child.stdout, child.stderr);
       child.on("error", (err) => {
         if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);

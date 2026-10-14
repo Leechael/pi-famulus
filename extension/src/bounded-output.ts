@@ -8,6 +8,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { createWriteStream, type WriteStream } from "node:fs";
+import type { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -43,15 +44,29 @@ export class BoundedOutput {
   private stream: WriteStream | null = null;
   private streamFailed = false;
   private path: string | undefined;
+  private sources: Readable[] = [];
+  private waitingForDrain = false;
 
   constructor(private readonly opts: BoundedOutputOptions) {}
+
+  /**
+   * Collect from these streams, pausing them while the spill file drains so
+   * output faster than the disk cannot pile up in the write stream's buffer.
+   */
+  attach(...streams: Array<Readable | null | undefined>): void {
+    for (const stream of streams) {
+      if (!stream) continue;
+      this.sources.push(stream);
+      stream.on("data", (d: Buffer) => this.append(d));
+    }
+  }
 
   append(data: Buffer): void {
     if (data.length === 0) return;
     this.totalBytes += data.length;
     for (let i = data.indexOf(10); i !== -1; i = data.indexOf(10, i + 1)) this.newlines++;
     if (this.stream === null && !this.streamFailed && this.exceedsLimits()) this.openSpill();
-    if (this.stream !== null) this.stream.write(data);
+    if (this.stream !== null && !this.stream.write(data)) this.applyBackpressure(this.stream);
     this.chunks.push(data);
     this.bufferedBytes += data.length;
     // Trim lazily (at 2x) so trimming cost is amortized over many chunks.
@@ -59,6 +74,11 @@ export class BoundedOutput {
   }
 
   async finish(): Promise<BoundedOutputResult> {
+    // Sources have ended; drop any pause left from the last write.
+    if (this.waitingForDrain) {
+      this.waitingForDrain = false;
+      for (const source of this.sources) source.resume();
+    }
     this.trim();
     let raw = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks);
     if (this.headDropped) raw = skipPartialUtf8(raw);
@@ -82,6 +102,20 @@ export class BoundedOutput {
     };
   }
 
+  private applyBackpressure(stream: WriteStream): void {
+    if (this.waitingForDrain || this.sources.length === 0) return;
+    this.waitingForDrain = true;
+    for (const source of this.sources) source.pause();
+    const release = () => {
+      stream.off("drain", release);
+      stream.off("close", release);
+      this.waitingForDrain = false;
+      for (const source of this.sources) source.resume();
+    };
+    stream.on("drain", release);
+    stream.on("close", release);
+  }
+
   private exceedsLimits(): boolean {
     return this.totalBytes > this.opts.maxBytes || this.newlines + 1 > this.opts.maxLines;
   }
@@ -91,11 +125,16 @@ export class BoundedOutput {
     const stream = createWriteStream(this.path);
     stream.on("error", () => {
       this.streamFailed = true;
+      // Stop writing to a failed spill; keep collecting the in-memory tail.
+      // autoDestroy then emits "close", which releases paused sources.
+      if (this.stream === stream) this.stream = null;
     });
     // Everything seen so far is still in memory: the head is only dropped
     // after the spill file exists.
-    for (const chunk of this.chunks) stream.write(chunk);
     this.stream = stream;
+    let drained = true;
+    for (const chunk of this.chunks) drained = stream.write(chunk);
+    if (!drained) this.applyBackpressure(stream);
   }
 
   private trim(): void {
