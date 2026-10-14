@@ -26,6 +26,7 @@ mod shellstart;
 mod stats;
 mod sys;
 mod task;
+mod top;
 mod workkind;
 
 use cli::{Cli, Sub};
