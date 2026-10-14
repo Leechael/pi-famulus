@@ -32,7 +32,7 @@ const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
 /// only: normally the runner guards its group and its exit says "empty").
 const GROUP_POLL: Duration = Duration::from_millis(500);
 /// Best-effort live process-group CPU refresh interval.
-const LIVE_CPU_POLL: Duration = Duration::from_secs(5);
+const LIVE_CPU_POLL: Duration = Duration::from_secs(2);
 
 type OutTx = mpsc::Sender<OutFrame>;
 

@@ -587,7 +587,7 @@ pub fn max_rss_bytes() -> u64 {
     0
 }
 
-/// Live CPU sampling is Linux `/proc` only; Windows callers treat this as unavailable.
+/// Live CPU sampling is Unix-only (Linux `/proc`, Darwin `proc_pidinfo`).
 pub fn clock_ticks_per_second() -> Option<u64> {
     None
 }

@@ -11,11 +11,10 @@
 //! cumulative CPU by measured task wall. Unmeasured tasks still count in
 //! TASKS/WALL and are shown in their own column.
 //!
-//! deferred | live process-group sample completeness on other platforms |
-//! impact | samples can miss descendants that exit between polls and are
-//! unavailable without Linux `/proc`; hard-killed runners remain unmeasured |
-//! trigger | observed under-reporting materially changes a CPU comparison,
-//! or live sampling is needed on macOS.
+//! deferred | live process-group sample completeness |
+//! impact | samples can miss descendants that exit between polls;
+//! hard-killed runners remain unmeasured; Windows has no live sampler |
+//! trigger | observed under-reporting materially changes a CPU comparison
 
 use crate::fmt;
 use crate::inspect::{self, Live};
