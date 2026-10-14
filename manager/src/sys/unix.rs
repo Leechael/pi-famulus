@@ -553,6 +553,23 @@ pub fn localtime(secs: i64) -> super::LocalTime {
     }
 }
 
+/// Whether stdin (fd 0) is a terminal.
+pub fn stdin_is_tty() -> bool {
+    // SAFETY: isatty on a valid fd number has no side effects.
+    unsafe { libc::isatty(0) == 1 }
+}
+
+/// Whether stdout (fd 1) is a terminal.
+pub fn stdout_is_tty() -> bool {
+    // SAFETY: isatty on a valid fd number has no side effects.
+    unsafe { libc::isatty(1) == 1 }
+}
+
+/// Interactive TUI requires both stdin and stdout to be terminals.
+pub fn stdio_interactive() -> bool {
+    stdin_is_tty() && stdout_is_tty()
+}
+
 /// Columns of the terminal on stdout, or None when stdout is not a tty.
 ///
 /// # Safety boundary

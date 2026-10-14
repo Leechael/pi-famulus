@@ -355,6 +355,7 @@ pub struct Metrics {
     pub llm_ms: Option<u64>,
     pub tool_ms: Option<u64>,
     pub queue_ms: Option<u64>,
+    #[allow(dead_code)]
     pub wall_other_ms: Option<u64>,
     pub running: bool,
     pub started_at: u64,
@@ -496,9 +497,9 @@ pub struct TopState {
     pub events_id: Option<String>,
     pub nodes: HashMap<String, Node>,
     pub roots: Vec<String>,
-    pub agent_ids: Vec<String>,
     pub task_rows: Vec<Row>,
     pub events: Vec<EventRow>,
+    pub preview_lines: Vec<String>,
     pub header: Header,
     pub visible: Vec<VisibleRow>,
     pub now: u64,
@@ -530,9 +531,9 @@ impl TopState {
             events_id: None,
             nodes: HashMap::new(),
             roots: Vec::new(),
-            agent_ids: Vec::new(),
             task_rows: Vec::new(),
             events: Vec::new(),
+            preview_lines: Vec::new(),
             header: Header::default(),
             visible: Vec::new(),
             now: 0,
@@ -914,6 +915,23 @@ impl TopState {
         self.visible.iter().position(|r| r.id == *id)
     }
 
+    pub fn page(&mut self, pages: isize, page_rows: usize) {
+        let delta = pages.saturating_mul(page_rows.max(1) as isize);
+        self.move_sel(delta);
+    }
+
+    pub fn ensure_scroll(&mut self, page_rows: usize) {
+        let page = page_rows.max(1);
+        let i = self.selected_index().unwrap_or(0);
+        if i < self.scroll {
+            self.scroll = i;
+        } else if i >= self.scroll.saturating_add(page) {
+            self.scroll = i + 1 - page;
+        }
+        let max = self.visible.len().saturating_sub(page);
+        self.scroll = self.scroll.min(max);
+    }
+
     pub fn move_sel(&mut self, delta: isize) {
         let Some(i) = self.selected_index() else {
             if !self.visible.is_empty() {
@@ -1020,11 +1038,6 @@ impl TopState {
 
     pub fn selected_node(&self) -> Option<&Node> {
         self.selected.as_ref().and_then(|id| self.nodes.get(id))
-    }
-
-    pub fn selected_task_row(&self) -> Option<&Row> {
-        let id = self.selected.as_ref()?;
-        self.task_rows.iter().find(|r| r.id == *id)
     }
 
     pub fn bump_interval(&mut self, up: bool) {

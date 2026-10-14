@@ -1210,6 +1210,11 @@ pub struct EventsOpts {
 /// per file, the offset just past the last complete line read. `-f`
 /// continues from exactly those offsets, so a line written while history is
 /// printed is neither lost nor shown twice.
+pub(crate) fn load_events(home: &Path, session_prefix: Option<&str>) -> (Vec<EventLine>, usize) {
+    let (evs, bad, _) = read_all_events(home, session_prefix);
+    (evs, bad)
+}
+
 fn read_all_events(
     home: &Path,
     session_prefix: Option<&str>,

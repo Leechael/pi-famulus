@@ -127,7 +127,7 @@ fn help_and_version_are_served_by_the_cli_framework() {
         commands.contains("completion") && commands.contains("help"),
         "ungrouped commands stay with the built-in help: {help}"
     );
-    for name in ["status", "sessions", "list", "show", "stats", "agent", "events", "log", "tail", "doctor"]
+    for name in ["status", "sessions", "list", "show", "top", "stats", "agent", "events", "log", "tail", "doctor"]
     {
         assert!(
             section_has_command(inspection, name),
@@ -146,6 +146,13 @@ fn help_and_version_are_served_by_the_cli_framework() {
             "{name} should be under Daemon: {help}"
         );
     }
+    let top_help = run(&["top", "--help"]);
+    assert!(top_help.status.success(), "{}", String::from_utf8_lossy(&top_help.stderr));
+    let top_help = String::from_utf8_lossy(&top_help.stdout);
+    for flag in ["--once", "--interval", "--session", "--cwd", "--json"] {
+        assert!(top_help.contains(flag), "{flag} missing from top --help: {top_help}");
+    }
+
     let status_at = inspection.find("status").expect("status");
     let doctor_at = inspection.find("doctor").expect("doctor");
     assert!(status_at < doctor_at, "inspection order: {help}");
