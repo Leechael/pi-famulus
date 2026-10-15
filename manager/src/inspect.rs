@@ -1190,6 +1190,109 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
 // agent transcript
 // ---------------------------------------------------------------------------
 
+/// One conversation turn from a child transcript jsonl line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub role: String,
+    pub tool: Option<String>,
+    pub args: Option<String>,
+    pub text: String,
+    pub ts: Option<u64>,
+    pub error: bool,
+}
+
+impl TranscriptTurn {
+    /// `user`, `assistant`, `tool bash`, `assistant error`.
+    pub fn speaker(&self) -> String {
+        if let Some(tool) = &self.tool {
+            format!("tool {tool}")
+        } else if self.error && self.role == "assistant" {
+            "assistant error".into()
+        } else {
+            self.role.clone()
+        }
+    }
+
+    pub fn heading(&self) -> String {
+        let speaker = self.speaker();
+        match self.ts {
+            Some(ts) => {
+                let stamp = fmt::datetime(ts);
+                let clock = stamp.split(' ').nth(1).unwrap_or("");
+                if clock.is_empty() {
+                    speaker
+                } else {
+                    format!("{speaker} · {clock}")
+                }
+            }
+            None => speaker,
+        }
+    }
+}
+
+/// Parse one transcript line. `None` hides it (system/preamble unless `full`).
+/// Transcript lines: {role, text, tool?, args?, isError?, ts?}.
+pub fn parse_transcript_line(line: &str, full: bool, prompt_head: Option<&str>, first_user: &mut bool) -> Option<TranscriptTurn> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("?").to_string();
+    let mut text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let ts = v.get("ts").and_then(|t| t.as_u64());
+    let error = v
+        .get("isError")
+        .or_else(|| v.get("is_error"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    if !full && (role == "system" || v.get("preamble").and_then(|p| p.as_bool()) == Some(true)) {
+        return None;
+    }
+    let tool = v.get("tool").and_then(|t| t.as_str()).map(|s| s.to_string());
+    let args = match v.get("args") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(other) if !other.is_null() => Some(other.to_string()),
+        _ => None,
+    };
+    if role == "user" && *first_user {
+        *first_user = false;
+        if !full {
+            if let Some(p) = prompt_head {
+                if text != p && text.contains(p) {
+                    text = p.to_string();
+                }
+            }
+        }
+    } else if role == "user" {
+        *first_user = false;
+    }
+    Some(TranscriptTurn {
+        role,
+        tool,
+        args,
+        text,
+        ts,
+        error,
+    })
+}
+
+/// `── role ──` blocks, matching the extension `/tasks` conversation pane.
+pub fn format_conversation(turns: &[TranscriptTurn]) -> Vec<String> {
+    if turns.is_empty() {
+        return vec!["(no conversation yet)".into()];
+    }
+    let mut out = Vec::new();
+    for (i, t) in turns.iter().enumerate() {
+        if i > 0 {
+            out.push(String::new());
+        }
+        out.push(format!("── {} ──", t.heading()));
+        if t.text.is_empty() {
+            out.push(String::new());
+        } else {
+            out.extend(t.text.lines().map(|s| s.to_string()));
+        }
+    }
+    out
+}
+
 /// Render one transcript line. `None` hides it (system/preamble lines unless
 /// `full`). Transcript lines: {role, text, tool?, args?, isError?, ts?}.
 pub fn render_transcript_line(line: &str, full: bool, prompt_head: Option<&str>, first_user: &mut bool) -> Option<String> {
@@ -1307,16 +1410,10 @@ pub struct EventsOpts {
     pub json: bool,
 }
 
-/// Read every events file; returns (events, malformed line count).
 /// Every event line so far, time-ordered, plus the malformed-line count and,
 /// per file, the offset just past the last complete line read. `-f`
 /// continues from exactly those offsets, so a line written while history is
 /// printed is neither lost nor shown twice.
-pub(crate) fn load_events(home: &Path, session_prefix: Option<&str>) -> (Vec<EventLine>, usize) {
-    let (evs, bad, _) = read_all_events(home, session_prefix);
-    (evs, bad)
-}
-
 fn read_all_events(
     home: &Path,
     session_prefix: Option<&str>,
@@ -1804,5 +1901,27 @@ mod tests {
         let t = r#"{"role":"tool","tool":"bash","args":"ls","isError":true,"text":"boom"}"#;
         assert_eq!(render_transcript_line(t, false, head, &mut first).unwrap(), "tool bash(ls) ✗ → boom");
         assert_eq!(render_transcript_line("not json", false, head, &mut first), None);
+    }
+
+    #[test]
+    fn conversation_layout_is_turns_not_one_liners() {
+        let mut first = true;
+        let head = Some("inspect the loader");
+        let u = r#"{"role":"user","text":"You are a worker...\n\ninspect the loader","ts":1}"#;
+        let a = r#"{"role":"assistant","text":"I will inspect it."}"#;
+        let t = r#"{"role":"tool","tool":"read","text":"file body"}"#;
+        let turns = [
+            parse_transcript_line(u, false, head, &mut first).unwrap(),
+            parse_transcript_line(a, false, head, &mut first).unwrap(),
+            parse_transcript_line(t, false, head, &mut first).unwrap(),
+        ];
+        assert_eq!(turns[0].text, "inspect the loader");
+        let lines = format_conversation(&turns);
+        let joined = lines.join("\n");
+        assert!(joined.contains("── user"), "{joined}");
+        assert!(joined.contains("── assistant"), "{joined}");
+        assert!(joined.contains("── tool read"), "{joined}");
+        assert!(joined.contains("file body"), "{joined}");
+        assert!(!joined.contains("user:"), "{joined}");
     }
 }

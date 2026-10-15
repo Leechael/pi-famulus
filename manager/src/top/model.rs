@@ -5,7 +5,7 @@
 
 use crate::events::EventLine;
 use crate::fmt;
-use crate::inspect::{self, AgentRecord, Row, SessionView, Snapshot};
+use crate::inspect::{self, AgentRecord, Row, SessionView, Snapshot, TranscriptTurn};
 use crate::proto::{TaskRecord, TaskStatus};
 use crate::stats::{self, By};
 use std::cmp::Ordering;
@@ -51,10 +51,10 @@ impl Tab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
+    /// Only sessions/agents/tasks that are currently running. Default for `top`.
+    ActiveOnly,
     /// Connected sessions, plus a gone session that still has running work.
     Connected,
-    /// Only sessions/agents/tasks that are currently running.
-    ActiveOnly,
     /// Every retained record.
     AllRetained,
 }
@@ -62,9 +62,9 @@ pub enum Scope {
 impl Scope {
     pub fn next(self) -> Scope {
         match self {
-            Scope::Connected => Scope::ActiveOnly,
-            Scope::ActiveOnly => Scope::AllRetained,
-            Scope::AllRetained => Scope::Connected,
+            Scope::ActiveOnly => Scope::Connected,
+            Scope::Connected => Scope::AllRetained,
+            Scope::AllRetained => Scope::ActiveOnly,
         }
     }
 
@@ -254,7 +254,7 @@ pub fn header_height(h: HeightClass) -> u16 {
 
 pub fn tree_cols(w: WidthClass) -> &'static [Col] {
     match w {
-        WidthClass::Compact => &[Col::Node, Col::Status, Col::Tasks, Col::Wall, Col::Cpu, Col::Now],
+        WidthClass::Compact => &[Col::Node, Col::Status, Col::Wall, Col::Cpu, Col::Now, Col::TokIo],
         WidthClass::Standard => &[
             Col::Node,
             Col::CwdModel,
@@ -291,7 +291,7 @@ pub fn agent_cols(w: WidthClass) -> &'static [Col] {
 
 pub fn task_cols(w: WidthClass) -> &'static [Col] {
     match w {
-        WidthClass::Compact => &[Col::Id, Col::Kind, Col::Status, Col::Dur, Col::Cpu, Col::Now, Col::Title],
+        WidthClass::Compact => &[Col::Id, Col::Kind, Col::Status, Col::Dur, Col::Now, Col::TokIo, Col::Title],
         WidthClass::Standard => &[
             Col::Id,
             Col::Kind,
@@ -299,6 +299,7 @@ pub fn task_cols(w: WidthClass) -> &'static [Col] {
             Col::Dur,
             Col::Cpu,
             Col::Now,
+            Col::TokIo,
             Col::Sess,
             Col::Cwd,
             Col::Cores,
@@ -461,6 +462,43 @@ impl Default for Header {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HitRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl HitRect {
+    pub fn from_xywh(x: u16, y: u16, w: u16, h: u16) -> HitRect {
+        HitRect { x, y, w, h }
+    }
+
+    pub fn contains(self, col: u16, row: u16) -> bool {
+        col >= self.x && col < self.x.saturating_add(self.w) && row >= self.y && row < self.y.saturating_add(self.h)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MouseHit {
+    pub tabs: HitRect,
+    pub table: HitRect,
+    pub detail: HitRect,
+    pub tab_line: String,
+    pub last: Option<(String, std::time::Instant)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DetailBody {
+    #[default]
+    Empty,
+    Conversation(Vec<TranscriptTurn>),
+    /// Task output/stderr: a short identity header, then the file tail.
+    Log { header: Vec<String>, lines: Vec<String> },
+    Text(Vec<String>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Detail {
     pub id: String,
@@ -469,7 +507,9 @@ pub struct Detail {
     pub scroll: usize,
     pub title: String,
     pub tabs: Vec<String>,
-    pub lines: Vec<String>,
+    pub body: DetailBody,
+    /// Wrapped line count from the last draw; used to clamp scroll.
+    pub wrap_len: usize,
 }
 
 #[derive(Debug)]
@@ -499,17 +539,21 @@ pub struct TopState {
     pub roots: Vec<String>,
     pub task_rows: Vec<Row>,
     pub events: Vec<EventRow>,
+    pub event_index: HashMap<String, usize>,
+    pub task_index: HashMap<String, usize>,
     pub preview_lines: Vec<String>,
     pub header: Header,
     pub visible: Vec<VisibleRow>,
     pub now: u64,
+    pub want_refresh: bool,
+    pub mouse: MouseHit,
 }
 
 impl TopState {
     pub fn new(interval_ms: u64, session: Option<String>, cwd: Option<String>) -> TopState {
         TopState {
             tab: Tab::Tree,
-            scope: Scope::Connected,
+            scope: Scope::ActiveOnly,
             sort: SortKey::Cpu,
             sort_desc: true,
             filter: String::new(),
@@ -533,10 +577,14 @@ impl TopState {
             roots: Vec::new(),
             task_rows: Vec::new(),
             events: Vec::new(),
+            event_index: HashMap::new(),
+            task_index: HashMap::new(),
             preview_lines: Vec::new(),
             header: Header::default(),
             visible: Vec::new(),
             now: 0,
+            want_refresh: false,
+            mouse: MouseHit::default(),
         }
     }
 
@@ -569,7 +617,14 @@ impl TopState {
         self.roots = roots;
         self.rebuild_header(snap, kind_slots);
         self.task_rows = inspect::all_rows(snap);
+        self.task_index = self.task_rows.iter().enumerate().map(|(i, r)| (r.id.clone(), i)).collect();
         self.events = events.iter().map(|e| event_row(e, &prefixes)).collect();
+        self.event_index = self
+            .events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (event_visible_id(e), i))
+            .collect();
         self.recompute_visible();
         if self.selected.as_ref() != prev.as_ref() {
             for a in ancestors {
@@ -586,15 +641,28 @@ impl TopState {
         let prefixes = inspect::session_prefixes(
             snap.sessions.keys().map(|s| s.as_str()).chain(snap.tasks.iter().map(|t| t.session_id.as_str())),
         );
-        let tasks: Vec<&TaskRecord> = snap.tasks.iter().collect();
+        let tasks: Vec<&TaskRecord> = snap
+            .tasks
+            .iter()
+            .filter(|t| match self.scope {
+                Scope::ActiveOnly => t.status == TaskStatus::Running,
+                Scope::Connected => t.status == TaskStatus::Running || snap.connected.contains(&t.session_id),
+                Scope::AllRetained => true,
+            })
+            .collect();
         let kind_groups = stats::group(&tasks, By::Kind, &names, &prefixes, snap.now);
         let agent_groups = stats::group(&tasks, By::Agent, &names, &prefixes, snap.now);
         let tot = stats::total(&agent_groups);
-        let tokens_in = sum_partial(snap.agents.iter().map(|a| a.tokens_input));
-        let tokens_out = sum_partial(snap.agents.iter().map(|a| a.tokens_output));
-        let llm = sum_partial(snap.agents.iter().map(|a| a.llm_ms));
-        let tool = sum_partial(snap.agents.iter().map(|a| a.tool_ms));
-        let queue = sum_partial(snap.agents.iter().map(|a| a.queue_ms));
+        let agents_for_tokens = snap.agents.iter().filter(|a| match self.scope {
+            Scope::ActiveOnly => !inspect::agent_status_terminal(&a.status),
+            Scope::Connected => !inspect::agent_status_terminal(&a.status) || snap.connected.contains(&a.session_id),
+            Scope::AllRetained => true,
+        });
+        let tokens_in = sum_partial(agents_for_tokens.clone().map(|a| a.tokens_input));
+        let tokens_out = sum_partial(agents_for_tokens.clone().map(|a| a.tokens_output));
+        let llm = sum_partial(agents_for_tokens.clone().map(|a| a.llm_ms));
+        let tool = sum_partial(agents_for_tokens.clone().map(|a| a.tool_ms));
+        let queue = sum_partial(agents_for_tokens.clone().map(|a| a.queue_ms));
         let wall_split = llm.unwrap_or(0) + tool.unwrap_or(0) + queue.unwrap_or(0);
         let share = |part: Option<u64>| part.filter(|_| wall_split > 0).map(|p| p * 100 / wall_split);
         let running_agents = snap.agents.iter().filter(|a| !inspect::agent_status_terminal(&a.status)).count();
@@ -630,8 +698,16 @@ impl TopState {
             agents_used,
             agents_total,
             tasks_run: snap.tasks.iter().filter(|t| t.status == TaskStatus::Running).count(),
-            tasks_sh: snap.tasks.len(),
-            tasks_ag: snap.agents.len(),
+            tasks_sh: tasks.len(),
+            tasks_ag: snap
+                .agents
+                .iter()
+                .filter(|a| match self.scope {
+                    Scope::ActiveOnly => !inspect::agent_status_terminal(&a.status),
+                    Scope::Connected => !inspect::agent_status_terminal(&a.status) || snap.connected.contains(&a.session_id),
+                    Scope::AllRetained => true,
+                })
+                .count(),
             cpu_now: tot.cpu_now_percent,
             cpu_tot: (tot.measured > 0).then(|| tot.cpu_ms()),
             tokens_in,
@@ -758,6 +834,17 @@ impl TopState {
         self.in_scope(n) || n.children.iter().any(|c| self.show_child(child, c))
     }
 
+    fn visible_ancestor(&self, id: &str) -> Option<String> {
+        let mut cur = self.nodes.get(id).and_then(|n| n.parent.clone());
+        while let Some(p) = cur {
+            if self.visible.iter().any(|r| r.id == p) {
+                return Some(p);
+            }
+            cur = self.nodes.get(&p).and_then(|n| n.parent.clone());
+        }
+        None
+    }
+
     fn flatten_tree(&self) -> Vec<VisibleRow> {
         let mut out = Vec::new();
         let mut roots: Vec<&String> = self.roots.iter().filter(|id| {
@@ -776,6 +863,16 @@ impl TopState {
             return;
         };
         if self.scope == Scope::ActiveOnly && !n.metrics.running && !n.children.iter().any(|c| self.nodes.get(c).is_some_and(|x| x.metrics.running)) {
+            return;
+        }
+        // Active view: skip the synthetic "main" bucket so session-owned
+        // monitors sit directly under the session.
+        if n.kind == NodeKind::Main && self.scope == Scope::ActiveOnly {
+            let mut kids: Vec<&String> = n.children.iter().filter(|c| self.show_child(id, c)).collect();
+            kids.sort_by(|a, b| self.cmp_nodes(a, b));
+            for c in kids {
+                self.walk(c, depth, out);
+            }
             return;
         }
         let kids: Vec<&String> = n.children.iter().filter(|c| self.show_child(id, c)).collect();
@@ -799,7 +896,7 @@ impl TopState {
         let mut ids: Vec<String> = self
             .nodes
             .values()
-            .filter(|n| matches!(n.kind, NodeKind::Agent | NodeKind::Main))
+            .filter(|n| n.kind == NodeKind::Agent)
             .filter(|n| self.in_scope(n) && self.matches_filter(n))
             .map(|n| n.id.clone())
             .collect();
@@ -869,7 +966,7 @@ impl TopState {
                     || e.session.to_ascii_lowercase().contains(&q)
             })
             .map(|e| VisibleRow {
-                id: format!("{}:{}:{}", e.ts, e.ty, e.id),
+                id: event_visible_id(e),
                 depth: 0,
                 expanded: false,
                 has_hidden_children: false,
@@ -896,7 +993,7 @@ impl TopState {
                 self.scroll = self.scroll.min(i);
                 return;
             }
-            if let Some(parent) = self.nodes.get(id).and_then(|n| n.parent.clone()) {
+            if let Some(parent) = self.visible_ancestor(id) {
                 if let Some(i) = self.visible.iter().position(|r| r.id == parent) {
                     self.selected = Some(parent);
                     self.scroll = self.scroll.min(i);
@@ -968,7 +1065,7 @@ impl TopState {
             self.revealed.remove(&id);
             self.collapsed.insert(id);
             self.recompute_visible();
-        } else if let Some(parent) = self.nodes.get(&id).and_then(|n| n.parent.clone()) {
+        } else if let Some(parent) = self.visible_ancestor(&id) {
             self.selected = Some(parent);
         }
     }
@@ -1047,6 +1144,56 @@ impl TopState {
     pub fn selected_is_stoppable_task(&self) -> Option<&Node> {
         self.selected_node().filter(|n| n.kind == NodeKind::Task && n.metrics.running)
     }
+
+    pub fn count_tab(&self, tab: Tab) -> usize {
+        match tab {
+            Tab::Tree => self
+                .roots
+                .iter()
+                .filter(|id| {
+                    self.nodes.get(id.as_str()).is_some_and(|n| self.in_scope(n) || n.children.iter().any(|c| self.show_child(id, c)))
+                        && (self.filter.is_empty() || self.subtree_matches(id))
+                })
+                .count(),
+            Tab::Agents => self
+                .nodes
+                .values()
+                .filter(|n| n.kind == NodeKind::Agent)
+                .filter(|n| self.in_scope(n) && self.matches_filter(n))
+                .count(),
+            Tab::Tasks => self
+                .task_rows
+                .iter()
+                .filter(|r| self.session_allowed(&r.session_id))
+                .filter(|r| self.cwd_allowed(r.cwd.as_deref()))
+                .filter(|r| match self.scope {
+                    Scope::AllRetained => true,
+                    Scope::ActiveOnly => r.running,
+                    Scope::Connected => {
+                        r.running || self.nodes.get(&session_key(&r.session_id)).is_some_and(|s| s.status == "connected")
+                    }
+                })
+                .filter(|r| {
+                    if self.filter.is_empty() {
+                        return true;
+                    }
+                    let q = self.filter.to_ascii_lowercase();
+                    [
+                        r.id.as_str(),
+                        r.title.as_str(),
+                        r.status.as_str(),
+                        r.kind.as_str(),
+                        r.work_kind.as_deref().unwrap_or(""),
+                        r.cwd.as_deref().unwrap_or(""),
+                        r.session_id.as_str(),
+                    ]
+                    .iter()
+                    .any(|s| s.to_ascii_lowercase().contains(&q))
+                })
+                .count(),
+            Tab::Events => self.events.len(),
+        }
+    }
 }
 
 pub fn snap_interval(ms: u64) -> u64 {
@@ -1073,6 +1220,22 @@ fn main_key(sid: &str) -> String {
     format!("m:{sid}")
 }
 
+fn session_display_name(prefix: &str, cwd: Option<&str>, pid: Option<u32>) -> String {
+    let place = cwd
+        .and_then(|c| std::path::Path::new(c).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty() && n != "." && n != "/");
+    let head = match place {
+        Some(p) if p != prefix => format!("{p} · {prefix}"),
+        Some(p) => p,
+        None => prefix.to_string(),
+    };
+    match pid {
+        Some(p) => format!("{head} (pi:{p})"),
+        None => head,
+    }
+}
+
 fn build_forest(snap: &Snapshot, prefixes: &HashMap<String, String>) -> (HashMap<String, Node>, Vec<String>) {
     let mut nodes: HashMap<String, Node> = HashMap::new();
     let mut session_ids: HashSet<String> = snap.sessions.keys().cloned().collect();
@@ -1089,10 +1252,7 @@ fn build_forest(snap: &Snapshot, prefixes: &HashMap<String, String>) -> (HashMap
         let cwd = view.and_then(|v| v.cwd.clone());
         let state = view.map(|v| v.state.as_str()).unwrap_or("gone");
         let pid = view.and_then(|v| v.pi_pid);
-        let label = match pid {
-            Some(p) => format!("{prefix} (pi:{p})"),
-            None => prefix,
-        };
+        let label = session_display_name(&prefix, cwd.as_deref(), pid);
         let id = session_key(sid);
         nodes.insert(
             id.clone(),
@@ -1110,7 +1270,7 @@ fn build_forest(snap: &Snapshot, prefixes: &HashMap<String, String>) -> (HashMap
                 cwd,
                 exit: None,
                 metrics: Metrics {
-                    running: state == "connected",
+                    running: false,
                     started_at: view.and_then(|v| v.since).unwrap_or(0),
                     active_at: view.and_then(|v| v.last_seen).unwrap_or(0),
                     ..Default::default()
@@ -1235,7 +1395,14 @@ fn agent_node(a: &AgentRecord, session: Option<&SessionView>, now: u64) -> Node 
         kind: NodeKind::Agent,
         session_id: a.session_id.clone(),
         parent: None,
-        label: format!("{} {}", a.name, short_id(&a.child_id)),
+        label: {
+            let tok = tok_io_cell(a.tokens_input, a.tokens_output);
+            if tok == "-" {
+                format!("{} {}", a.name, short_id(&a.child_id))
+            } else {
+                format!("{} {}  {tok}", a.name, short_id(&a.child_id))
+            }
+        },
         extra: a.model.clone().unwrap_or_else(|| a.agent.clone()),
         title: a.title(),
         status: a.status.clone(),
@@ -1309,9 +1476,9 @@ fn task_node(t: &TaskRecord, now: u64) -> Node {
         kind: NodeKind::Task,
         session_id: t.session_id.clone(),
         parent: None,
-        label: short_id(&t.task_id),
+        label: inspect::task_title(t),
         extra: inspect::work_kind(t).to_string(),
-        title: fmt::first_line(&t.command).to_string(),
+        title: inspect::task_title(t),
         status,
         reason: t.end_reason.clone(),
         work_kind: Some(inspect::work_kind(t).to_string()),
@@ -1460,6 +1627,10 @@ fn short_id(id: &str) -> String {
             format!("{prefix}_{}", &rest[..8.min(rest.len())])
         }
     }
+}
+
+pub fn event_visible_id(e: &EventRow) -> String {
+    format!("{}:{}:{}", e.ts, e.ty, e.id)
 }
 
 fn event_row(e: &EventLine, prefixes: &HashMap<String, String>) -> EventRow {
@@ -1763,6 +1934,7 @@ mod tests {
         assert_eq!(work.metrics.tasks, 2);
         assert_eq!(work.metrics.cpu_now, Some(85.0));
         assert!(work.metrics.running);
+        assert!(work.label.contains("100/20"), "subagent tokens on the node: {}", work.label);
 
         let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains(&"s:sessA"), "{ids:?}");
@@ -1783,24 +1955,62 @@ mod tests {
             vec![
                 rec("sh_live", "sessA", Some("ch_work"), Some("run_1"), "sleep 1", 100, None, TaskStatus::Running, Some(10.0)),
                 rec("sh_old", "sessB", None, None, "echo", 50, Some((1, 0)), TaskStatus::Completed, None),
+                rec("sh_done", "sessC", Some("ch_done"), Some("run_3"), "rg foo", 50, Some((1, 0)), TaskStatus::Completed, None),
             ],
-            vec![agent("ch_work", "sessA", "run_1", "w", "running", Some(1))],
-            vec![("sessA", "connected"), ("sessB", "gone")],
+            vec![
+                agent("ch_work", "sessA", "run_1", "w", "running", Some(1)),
+                agent("ch_done", "sessC", "run_3", "done", "completed", None),
+            ],
+            vec![("sessA", "connected"), ("sessB", "gone"), ("sessC", "connected")],
         );
         let mut s = TopState::new(1_000, None, None);
         s.apply(&snap, &[], &HashMap::new());
         let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.iter().any(|id| id.contains("sessA")), "{ids:?}");
         assert!(!ids.iter().any(|id| id.contains("sessB")), "gone idle hidden: {ids:?}");
+        assert!(!ids.iter().any(|id| id.contains("sessC")), "idle connected hidden: {ids:?}");
+        assert!(!ids.iter().any(|id| *id == "ch_done" || *id == "sh_done" || *id == "sh_old"), "completed hidden: {ids:?}");
+        assert_eq!(s.scope, Scope::ActiveOnly);
+
+        s.scope = Scope::Connected;
+        s.recompute_visible();
+        let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.iter().any(|id| id.contains("sessC")), "connected idle session: {ids:?}");
 
         s.scope = Scope::AllRetained;
         s.recompute_visible();
         let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.iter().any(|id| id.contains("sessB")), "{ids:?}");
+    }
 
-        s.scope = Scope::ActiveOnly;
-        s.recompute_visible();
-        assert!(s.visible.iter().all(|r| s.nodes.get(&r.id).is_some_and(|n| n.metrics.running) || r.id == "sh_live" || r.id.starts_with("s:") || r.id == "run_1" || r.id == "ch_work"));
+    #[test]
+    fn default_hides_completed_even_when_unfolded() {
+        let snap = snapshot(
+            vec![
+                rec("sh_live", "sessA", Some("ch_work"), Some("run_1"), "pytest", 100, None, TaskStatus::Running, Some(10.0)),
+                rec("sh_old", "sessA", Some("ch_work"), Some("run_1"), "rg foo", 50, Some((1, 0)), TaskStatus::Completed, None),
+            ],
+            vec![
+                agent("ch_work", "sessA", "run_1", "w", "running", Some(1)),
+                agent("ch_done", "sessA", "run_2", "done", "completed", None),
+            ],
+            vec![("sessA", "connected")],
+        );
+        let mut s = TopState::new(1_000, None, None);
+        s.apply(&snap, &[], &HashMap::new());
+        let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"sh_live"), "{ids:?}");
+        assert!(!ids.contains(&"sh_old"), "{ids:?}");
+        assert!(!ids.contains(&"ch_done"), "{ids:?}");
+
+        s.selected = Some("ch_work".into());
+        s.unfold();
+        s.toggle_expand_all();
+        let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
+        assert!(!ids.contains(&"sh_old"), "active scope never reveals completed: {ids:?}");
+        assert!(!ids.contains(&"ch_done"), "{ids:?}");
+        assert_eq!(s.count_tab(Tab::Tasks), 2, "running shell + running agent");
+        assert_eq!(s.count_tab(Tab::Agents), 1);
     }
 
     #[test]
@@ -1873,13 +2083,85 @@ mod tests {
             assert!(t.contains(&Col::Title) && t.iter().any(|c| c.width().is_none()));
         }
         assert!(tree_cols(WidthClass::Wide).contains(&Col::WallSplit));
+        assert!(tree_cols(WidthClass::Compact).contains(&Col::TokIo));
         assert!(task_cols(WidthClass::Wide).contains(&Col::WorkKind));
+        assert!(task_cols(WidthClass::Compact).contains(&Col::TokIo));
     }
 
     #[test]
     fn partial_token_sum_skips_missing_records() {
         assert_eq!(sum_partial([Some(10), None, Some(5)]), Some(15));
         assert_eq!(sum_partial([None, None]), None);
+    }
+
+    #[test]
+    fn monitor_row_uses_readable_description() {
+        let mut t = rec("mon_watch", "sessA", None, None, "tail -n +1 -F app.log | grep --line-buffered ERROR", 100, None, TaskStatus::Running, None);
+        t.kind = TaskKind::Monitor;
+        t.label = Some("dev server errors".into());
+        assert_eq!(inspect::task_title(&t), "dev server errors");
+        let snap = snapshot(vec![t], vec![], vec![("sessA", "connected")]);
+        let mut s = TopState::new(1_000, None, None);
+        s.apply(&snap, &[], &HashMap::new());
+        let n = s.nodes.get("mon_watch").unwrap();
+        assert_eq!(n.label, "dev server errors");
+        assert_eq!(n.title, "dev server errors");
+        let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"mon_watch"), "{ids:?}");
+        assert!(!ids.iter().any(|id| id.starts_with("m:")), "Active skips main: {ids:?}");
+        let sess = s.nodes.get(&session_key("sessA")).unwrap();
+        assert!(sess.label.starts_with("app · sessA"), "{}", sess.label);
+    }
+
+    #[test]
+    fn unlabeled_monitor_title_comes_from_the_command() {
+        let mut incident = rec(
+            "mon_inc",
+            "sessA",
+            None,
+            None,
+            "bash /Users/me/storage/2026-09-27-stripe-risk-block-cooldown/watch.sh",
+            100,
+            None,
+            TaskStatus::Running,
+            None,
+        );
+        incident.kind = TaskKind::Monitor;
+        let mut ssh = rec(
+            "mon_ssh",
+            "sessA",
+            None,
+            None,
+            "ssh -o BatchMode=yes phala@phala-cloud-01 'sudo journalctl -fu teehouse'",
+            100,
+            None,
+            TaskStatus::Running,
+            None,
+        );
+        ssh.kind = TaskKind::Monitor;
+        let mut tick = rec(
+            "mon_tick",
+            "sessA",
+            None,
+            None,
+            "while true; do sleep 120; echo TICK; done",
+            100,
+            None,
+            TaskStatus::Running,
+            None,
+        );
+        tick.kind = TaskKind::Monitor;
+        let snap = snapshot(vec![incident, ssh, tick], vec![], vec![("sessA", "connected")]);
+        let mut s = TopState::new(1_000, None, None);
+        s.apply(&snap, &[], &HashMap::new());
+        assert_eq!(s.nodes.get("mon_inc").unwrap().label, "stripe-risk-block-cooldown");
+        assert_eq!(s.nodes.get("mon_ssh").unwrap().label, "journalctl @phala-cloud-01");
+        assert_eq!(s.nodes.get("mon_tick").unwrap().label, "tick every 2m");
+        let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.iter().filter(|id| id.starts_with("s:")).count(), 1);
+        assert!(ids.contains(&"mon_inc") && ids.contains(&"mon_ssh") && ids.contains(&"mon_tick"), "{ids:?}");
+        assert!(!ids.iter().any(|id| id.starts_with("m:")), "{ids:?}");
+        assert_eq!(s.count_tab(Tab::Agents), 0);
     }
 
     #[test]

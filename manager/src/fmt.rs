@@ -88,6 +88,63 @@ pub fn truncate_width_left(s: &str, max: usize) -> String {
     out
 }
 
+/// Wrap `s` to `max` display columns. Existing newlines stay paragraph
+/// breaks. Prefers a space; otherwise hard-breaks (CJK, long tokens).
+pub fn wrap_width(s: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut out = Vec::new();
+    for para in s.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        wrap_paragraph(para, max, &mut out);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn wrap_paragraph(para: &str, max: usize, out: &mut Vec<String>) {
+    let mut line = String::new();
+    let mut w = 0;
+    let mut brk: Option<usize> = None;
+    for c in para.chars() {
+        let cw = char_width(c);
+        if cw == 0 {
+            line.push(c);
+            continue;
+        }
+        if w + cw > max && !line.is_empty() {
+            if let Some(bi) = brk {
+                let rest = line[bi..].to_string();
+                out.push(line[..bi].trim_end().to_string());
+                line = rest;
+                w = display_width(&line);
+                brk = None;
+            } else {
+                out.push(std::mem::take(&mut line));
+                w = 0;
+            }
+            if c == ' ' {
+                continue;
+            }
+        }
+        if c == ' ' {
+            line.push(c);
+            w += cw;
+            brk = Some(line.len());
+            continue;
+        }
+        line.push(c);
+        w += cw;
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+}
+
 /// Pad `s` with spaces to `w` display columns (left-aligned).
 pub fn pad(s: &str, w: usize) -> String {
     let dw = display_width(s);
@@ -230,6 +287,9 @@ mod tests {
         assert_eq!(truncate_width_left("/a/b/c", 4), "…b/c");
         assert_eq!(pad("中", 4), "中  ");
         assert_eq!(display_width(&pad("中", 4)), 4);
+        assert_eq!(wrap_width("hello world", 8), vec!["hello", "world"]);
+        assert_eq!(wrap_width("中文字符", 5), vec!["中文", "字符"]);
+        assert_eq!(wrap_width("abc\n\ndef", 10), vec!["abc", "", "def"]);
     }
 
     #[test]

@@ -2,9 +2,11 @@
 //! the frame `Rect`; no I/O.
 
 use crate::fmt;
+use crate::inspect::TranscriptTurn;
 use crate::top::model::{
     self, agent_cols, compact_num, cpu_cell, header_height, height_class, now_cell, task_cols, tok_io_cell,
-    tree_cols, wall_cell, width_class, Col, HeightClass, Node, NodeKind, Tab, TopState, VisibleRow, WidthClass,
+    tree_cols, wall_cell, width_class, Col, DetailBody, HeightClass, HitRect, Node, NodeKind, Tab, TopState,
+    VisibleRow, WidthClass,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -44,8 +46,14 @@ pub fn draw(frame: &mut Frame, state: &mut TopState) {
     if state.help {
         draw_help(frame, area);
     }
-    if let Some(d) = &state.detail {
-        draw_detail(frame, area, d);
+    if state.detail.is_some() {
+        let rect = area.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
+        state.mouse.detail = hit_rect(rect);
+        if let Some(d) = state.detail.as_mut() {
+            draw_detail(frame, area, d);
+        }
+    } else {
+        state.mouse.detail = HitRect::default();
     }
 }
 
@@ -158,29 +166,19 @@ fn draw_workspace(frame: &mut Frame, area: Rect, state: &mut TopState, wclass: W
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
-    let tabs = format!(
-        " [1:Tree ({})]  2:Agents ({})  3:Tasks ({})  4:Events ── Scope:{}(a) Sort:{}{}",
-        count_tab(state, Tab::Tree),
-        count_tab(state, Tab::Agents),
-        count_tab(state, Tab::Tasks),
-        state.scope.label(),
-        state.sort.label(),
-        if state.sort_desc { "▼" } else { "▲" },
-    );
-    let marked = match state.tab {
-        Tab::Tree => tabs.replacen(" [1:", " [", 1),
-        Tab::Agents => tabs.replace("  2:", " [2:").replace("  3:", "]  3:"),
-        Tab::Tasks => tabs.replace("  3:", " [3:").replace("  4:", "]  4:"),
-        Tab::Events => tabs.replace("  4:", " [4:"),
-    };
-    // Highlight the active tab by wrapping its label; keep it one line.
+    let n_tree = state.count_tab(Tab::Tree);
+    let n_agents = state.count_tab(Tab::Agents);
+    let n_tasks = state.count_tab(Tab::Tasks);
+    let sort = format!("{}{}", state.sort.label(), if state.sort_desc { "▼" } else { "▲" });
+    let scope = state.scope.label();
     let tab_line = match state.tab {
-        Tab::Tree => format!(" [1:Tree ({})]  2:Agents ({})  3:Tasks ({})  4:Events ── Scope:{}(a) Sort:{}{}", count_tab(state, Tab::Tree), count_tab(state, Tab::Agents), count_tab(state, Tab::Tasks), state.scope.label(), state.sort.label(), if state.sort_desc { "▼" } else { "▲" }),
-        Tab::Agents => format!("  1:Tree ({})  [2:Agents ({})]  3:Tasks ({})  4:Events ── Scope:{}(a) Sort:{}{}", count_tab(state, Tab::Tree), count_tab(state, Tab::Agents), count_tab(state, Tab::Tasks), state.scope.label(), state.sort.label(), if state.sort_desc { "▼" } else { "▲" }),
-        Tab::Tasks => format!("  1:Tree ({})  2:Agents ({})  [3:Tasks ({})]  4:Events ── Scope:{}(a) Sort:{}{}", count_tab(state, Tab::Tree), count_tab(state, Tab::Agents), count_tab(state, Tab::Tasks), state.scope.label(), state.sort.label(), if state.sort_desc { "▼" } else { "▲" }),
-        Tab::Events => format!("  1:Tree ({})  2:Agents ({})  3:Tasks ({})  [4:Events] ── Scope:{}(a) Sort:{}{}", count_tab(state, Tab::Tree), count_tab(state, Tab::Agents), count_tab(state, Tab::Tasks), state.scope.label(), state.sort.label(), if state.sort_desc { "▼" } else { "▲" }),
+        Tab::Tree => format!(" [1:Tree ({n_tree})]  2:Agents ({n_agents})  3:Tasks ({n_tasks})  4:Events ── Scope:{scope}(a) Sort:{sort}"),
+        Tab::Agents => format!("  1:Tree ({n_tree})  [2:Agents ({n_agents})]  3:Tasks ({n_tasks})  4:Events ── Scope:{scope}(a) Sort:{sort}"),
+        Tab::Tasks => format!("  1:Tree ({n_tree})  2:Agents ({n_agents})  [3:Tasks ({n_tasks})]  4:Events ── Scope:{scope}(a) Sort:{sort}"),
+        Tab::Events => format!("  1:Tree ({n_tree})  2:Agents ({n_agents})  3:Tasks ({n_tasks})  [4:Events] ── Scope:{scope}(a) Sort:{sort}"),
     };
-    let _ = marked;
+    state.mouse.tabs = hit_rect(chunks[0]);
+    state.mouse.tab_line = tab_line.clone();
     frame.render_widget(Paragraph::new(clip(&tab_line, chunks[0].width)).style(Style::default().fg(Color::Cyan)), chunks[0]);
 
     let cols = match state.tab {
@@ -195,6 +193,10 @@ fn draw_workspace(frame: &mut Frame, area: Rect, state: &mut TopState, wclass: W
     draw_table(frame, chunks[1], state, cols);
 }
 
+fn hit_rect(area: Rect) -> HitRect {
+    HitRect::from_xywh(area.x, area.y, area.width, area.height)
+}
+
 fn tree_or_agent_cols(tab: Tab, w: WidthClass) -> &'static [Col] {
     if tab == Tab::Agents {
         agent_cols(w)
@@ -203,16 +205,8 @@ fn tree_or_agent_cols(tab: Tab, w: WidthClass) -> &'static [Col] {
     }
 }
 
-fn count_tab(state: &TopState, tab: Tab) -> usize {
-    match tab {
-        Tab::Tree => state.roots.len(),
-        Tab::Agents => state.nodes.values().filter(|n| matches!(n.kind, NodeKind::Agent | NodeKind::Main)).count(),
-        Tab::Tasks => state.task_rows.len(),
-        Tab::Events => state.events.len(),
-    }
-}
-
 fn draw_table(frame: &mut Frame, area: Rect, state: &mut TopState, cols: &[Col]) {
+    state.mouse.table = hit_rect(area);
     let page = area.height.saturating_sub(1) as usize;
     state.ensure_scroll(page);
     let widths = col_widths(cols, area.width);
@@ -240,6 +234,7 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &mut TopState, cols: &[Col])
 }
 
 fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
+    state.mouse.table = hit_rect(area);
     let page = area.height.saturating_sub(1) as usize;
     state.ensure_scroll(page);
     let start = state.scroll;
@@ -250,9 +245,10 @@ fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
         Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     ))];
     for vr in &state.visible[start..end] {
-        let Some(ev) = state.events.iter().find(|e| format!("{}:{}:{}", e.ts, e.ty, e.id) == vr.id) else {
+        let Some(&i) = state.event_index.get(&vr.id) else {
             continue;
         };
+        let ev = &state.events[i];
         let text = format!(
             " {:<19} {:<9} {:<9} {:<18} {:<12} {}",
             fmt::datetime_ms(ev.ts),
@@ -280,12 +276,33 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &TopState) {
     let block = Block::default().borders(Borders::TOP).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let start = state.preview_lines.len().saturating_sub(inner.height as usize);
-    let lines: Vec<Line> = state.preview_lines[start..]
+    let width = inner.width.max(1) as usize;
+    let mut wrapped = Vec::new();
+    for (i, src) in state.preview_lines.iter().enumerate() {
+        if src.starts_with("── ") && src.ends_with(" ──") {
+            if i > 0 && wrapped.last().is_some_and(|s: &String| !s.is_empty()) {
+                wrapped.push(String::new());
+            }
+            wrapped.push(src.clone());
+        } else {
+            wrapped.extend(fmt::wrap_width(src, width));
+        }
+    }
+    let start = wrapped.len().saturating_sub(inner.height as usize);
+    let lines: Vec<Line> = wrapped[start..]
         .iter()
-        .map(|l| Line::from(clip(l, inner.width)))
+        .map(|l| Line::from(paint_preview_line(l, inner.width)))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn paint_preview_line(l: &str, width: u16) -> Span<'static> {
+    let style = if l.starts_with("── ") && l.ends_with(" ──") {
+        tone_style(Tone::Rule)
+    } else {
+        Style::default()
+    };
+    Span::styled(clip(l, width), style)
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TopState) {
@@ -316,8 +333,9 @@ g G Home End        top / bottom   p Space      pause
 + -                 interval       v            preview
 Enter               detail         e            events for selection
 x Ctrl+X F9         stop task      ?            this help
-q Ctrl+C            quit           Esc          close overlay";
-    let rect = centered(area, 64, 16);
+q Ctrl+C            quit           Esc          close overlay
+click / wheel       select, fold,  tabs, sort";
+    let rect = centered(area, 64, 17);
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" keys ")),
@@ -325,7 +343,7 @@ q Ctrl+C            quit           Esc          close overlay";
     );
 }
 
-fn draw_detail(frame: &mut Frame, area: Rect, d: &model::Detail) {
+fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail) {
     let rect = area.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
     frame.render_widget(Clear, rect);
     let block = Block::default().borders(Borders::ALL).title(format!(" {} ", d.title));
@@ -351,19 +369,169 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &model::Detail) {
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
     frame.render_widget(Paragraph::new(clip(&head, chunks[0].width)), chunks[0]);
-    let start = d.scroll.min(d.lines.len());
-    let lines: Vec<Line> = d.lines[start..]
+    let width = chunks[1].width.max(1) as usize;
+    let height = chunks[1].height as usize;
+    let painted = layout_detail(&d.body, width);
+    d.wrap_len = painted.len();
+    if d.follow {
+        d.scroll = painted.len().saturating_sub(height);
+    } else if !painted.is_empty() {
+        d.scroll = d.scroll.min(painted.len().saturating_sub(1));
+    }
+    let start = d.scroll.min(painted.len());
+    let lines: Vec<Line> = painted[start..]
         .iter()
-        .take(chunks[1].height as usize)
-        .map(|l| Line::from(clip(l, chunks[1].width)))
+        .take(height)
+        .map(|p| Line::from(Span::styled(clip(&p.text, chunks[1].width), tone_style(p.tone))))
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[1]);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    User,
+    Assistant,
+    Tool,
+    Error,
+    Body,
+    Dim,
+    Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Painted {
+    tone: Tone,
+    text: String,
+}
+
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::User | Tone::Rule => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Tone::Assistant => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Tone::Tool => Style::default().fg(Color::Yellow),
+        Tone::Error => Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+        Tone::Dim => Style::default().fg(Color::DarkGray),
+        Tone::Body => Style::default(),
+    }
+}
+
+fn speaker_tone(speaker: &str, error: bool) -> Tone {
+    if error || speaker.contains("error") {
+        Tone::Error
+    } else if speaker == "user" || speaker.starts_with("user ") {
+        Tone::User
+    } else if speaker.starts_with("tool") {
+        Tone::Tool
+    } else if speaker.starts_with("assistant") {
+        Tone::Assistant
+    } else {
+        Tone::Dim
+    }
+}
+
+fn layout_detail(body: &DetailBody, width: usize) -> Vec<Painted> {
+    match body {
+        DetailBody::Empty => vec![Painted { tone: Tone::Dim, text: "(nothing to show)".into() }],
+        DetailBody::Conversation(turns) => layout_conversation(turns, width),
+        DetailBody::Log { header, lines } => {
+            let mut out = Vec::new();
+            for (i, h) in header.iter().enumerate() {
+                let tone = if i == 0 { Tone::Dim } else if h.starts_with('$') { Tone::Tool } else { Tone::Assistant };
+                for l in fmt::wrap_width(h, width) {
+                    out.push(Painted { tone, text: l });
+                }
+            }
+            if !header.is_empty() {
+                out.push(Painted { tone: Tone::Body, text: String::new() });
+            }
+            for line in lines {
+                for l in fmt::wrap_width(line, width) {
+                    out.push(Painted { tone: Tone::Body, text: l });
+                }
+            }
+            out
+        }
+        DetailBody::Text(lines) => {
+            let mut out = Vec::new();
+            for line in lines {
+                let tone = if line.contains("error") || line.starts_with("error") {
+                    Tone::Error
+                } else {
+                    Tone::Body
+                };
+                for l in fmt::wrap_width(line, width) {
+                    out.push(Painted { tone, text: l });
+                }
+            }
+            if out.is_empty() {
+                out.push(Painted { tone: Tone::Dim, text: "(empty)".into() });
+            }
+            out
+        }
+    }
+}
+
+fn layout_conversation(turns: &[TranscriptTurn], width: usize) -> Vec<Painted> {
+    if turns.is_empty() {
+        return vec![Painted { tone: Tone::Dim, text: "(no conversation yet)".into() }];
+    }
+    let mut out = Vec::new();
+    for (i, turn) in turns.iter().enumerate() {
+        if i > 0 {
+            out.push(Painted { tone: Tone::Body, text: String::new() });
+        }
+        let speaker = turn.speaker();
+        let rule_tone = speaker_tone(&speaker, turn.error);
+        out.push(Painted {
+            tone: rule_tone,
+            text: format!("── {} ──", turn.heading()),
+        });
+        if turn.role == "assistant" {
+            if let Some((name, summary)) = tool_call_summary(&turn.text) {
+                out.push(Painted { tone: Tone::Tool, text: format!("▸ {name}") });
+                for l in fmt::wrap_width(&summary, width) {
+                    out.push(Painted { tone: Tone::Dim, text: l });
+                }
+                continue;
+            }
+        }
+        let body_tone = if turn.error {
+            Tone::Error
+        } else if turn.tool.is_some() {
+            Tone::Dim
+        } else {
+            Tone::Body
+        };
+        if turn.text.is_empty() {
+            out.push(Painted { tone: Tone::Dim, text: String::new() });
+        } else {
+            for l in fmt::wrap_width(&turn.text, width) {
+                out.push(Painted { tone: body_tone, text: l });
+            }
+        }
+    }
+    out
+}
+
+fn tool_call_summary(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix("tool ")?;
+    let (name, json) = rest.split_once(' ')?;
+    if !json.starts_with('{') {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let summary = ["command", "path", "query", "pattern"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| json.to_string());
+    Some((name.to_string(), summary))
+}
+
 fn cell_text(state: &TopState, vr: &VisibleRow, col: Col) -> String {
     if state.tab == Tab::Tasks {
-        if let Some(r) = state.task_rows.iter().find(|r| r.id == vr.id) {
-            return task_cell(state, r, col);
+        if let Some(&i) = state.task_index.get(&vr.id) {
+            return task_cell(state, &state.task_rows[i], col);
         }
     }
     let Some(n) = state.nodes.get(&vr.id) else {
@@ -424,6 +592,11 @@ fn task_cell(state: &TopState, r: &crate::inspect::Row, col: Col) -> String {
         Col::WorkKind => r.work_kind.clone().unwrap_or_else(|| "-".into()),
         Col::Sample => r.live_cpu_sampled_at.map(|t| fmt::short_time(t, state.now)).unwrap_or_else(|| "-".into()),
         Col::Reason => r.end_reason.clone().unwrap_or_else(|| "-".into()),
+        Col::TokIo => state
+            .nodes
+            .get(&r.id)
+            .map(|n| tok_io_cell(n.metrics.tokens_in, n.metrics.tokens_out))
+            .unwrap_or_else(|| "-".into()),
         _ => String::new(),
     }
 }
@@ -634,5 +807,45 @@ mod tests {
         assert_eq!(width_class(80), WidthClass::Compact);
         assert_eq!(width_class(120), WidthClass::Standard);
         assert_eq!(width_class(160), WidthClass::Wide);
+    }
+
+    #[test]
+    fn conversation_detail_wraps_and_names_speakers() {
+        let turns = vec![
+            TranscriptTurn {
+                role: "user".into(),
+                tool: None,
+                args: None,
+                text: "inspect the loader please and then report".into(),
+                ts: None,
+                error: false,
+            },
+            TranscriptTurn {
+                role: "assistant".into(),
+                tool: None,
+                args: None,
+                text: r#"tool bash {"command":"rg loader"}"#.into(),
+                ts: None,
+                error: false,
+            },
+            TranscriptTurn {
+                role: "tool".into(),
+                tool: Some("bash".into()),
+                args: None,
+                text: "src/loader.rs\nsrc/main.rs".into(),
+                ts: None,
+                error: false,
+            },
+        ];
+        let painted = layout_detail(&DetailBody::Conversation(turns), 20);
+        let text: Vec<&str> = painted.iter().map(|p| p.text.as_str()).collect();
+        assert!(text.iter().any(|l| l.starts_with("── user")), "{text:?}");
+        assert!(text.iter().any(|l| l.starts_with("── assistant")), "{text:?}");
+        assert!(text.iter().any(|l| l.starts_with("── tool bash")), "{text:?}");
+        assert!(text.contains(&"▸ bash"), "{text:?}");
+        assert!(text.contains(&"rg loader"), "{text:?}");
+        assert!(text.contains(&"src/loader.rs"), "{text:?}");
+        assert!(painted.iter().any(|p| p.tone == Tone::User));
+        assert!(painted.iter().filter(|p| p.text.contains("inspect")).all(|p| fmt::display_width(&p.text) <= 20));
     }
 }
