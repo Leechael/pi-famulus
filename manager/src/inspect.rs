@@ -443,6 +443,108 @@ pub struct Row {
     pub running: bool,
 }
 
+/// Monitor `description` when the client sent one; otherwise a short guess
+/// from the command (incident folder, ssh host + what it tails, …).
+pub fn task_title(t: &TaskRecord) -> String {
+    if let Some(label) = t.label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return label.to_string();
+    }
+    guess_command_title(&t.command)
+}
+
+pub fn guess_command_title(command: &str) -> String {
+    let line = fmt::first_line(command).trim();
+    if line.is_empty() {
+        return String::new();
+    }
+    if let Some(slug) = incident_folder_title(line) {
+        return slug;
+    }
+    if let Some(ssh) = ssh_watch_title(line) {
+        return ssh;
+    }
+    if let Some(tick) = heartbeat_title(line) {
+        return tick;
+    }
+    compact_command_head(line)
+}
+
+fn incident_folder_title(cmd: &str) -> Option<String> {
+    for part in cmd.split('/') {
+        let part = part.trim();
+        let b = part.as_bytes();
+        if b.len() > 11 && b[4] == b'-' && b[7] == b'-' && b[10] == b'-'
+            && b[..4].iter().all(|c| c.is_ascii_digit())
+            && b[5..7].iter().all(|c| c.is_ascii_digit())
+            && b[8..10].iter().all(|c| c.is_ascii_digit())
+        {
+            let slug = &part[11..];
+            if !slug.is_empty() && slug.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                return Some(slug.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn ssh_watch_title(cmd: &str) -> Option<String> {
+    if !cmd.split_whitespace().any(|w| w == "ssh") {
+        return None;
+    }
+    let host = cmd
+        .split_whitespace()
+        .find(|w| w.contains('@'))
+        .map(|w| w.rsplit('@').next().unwrap_or(w))?;
+    let remote = cmd.split('\'').nth(1).or_else(|| cmd.split('"').nth(1)).unwrap_or("");
+    let hint = remote_watch_hint(remote);
+    Some(match hint {
+        Some(h) => format!("{h} @{host}"),
+        None => format!("ssh @{host}"),
+    })
+}
+
+fn remote_watch_hint(remote: &str) -> Option<String> {
+    if let Some(path) = remote.split_whitespace().rev().find(|w| w.contains('/')) {
+        let name = std::path::Path::new(path).file_name()?.to_string_lossy();
+        if !name.is_empty() {
+            return Some(name.into_owned());
+        }
+    }
+    remote
+        .split_whitespace()
+        .find(|w| !w.starts_with('-') && *w != "sudo")
+        .map(|s| s.to_string())
+}
+
+fn heartbeat_title(cmd: &str) -> Option<String> {
+    if !cmd.contains("while true") || !cmd.contains("sleep") {
+        return None;
+    }
+    let after = cmd.split("sleep").nth(1)?;
+    let n: u64 = after.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok()?;
+    if n >= 60 && n % 60 == 0 {
+        Some(format!("tick every {}m", n / 60))
+    } else {
+        Some(format!("tick every {n}s"))
+    }
+}
+
+fn compact_command_head(line: &str) -> String {
+    let mut toks = line.split_whitespace().peekable();
+    while toks.peek().is_some_and(|t| t.contains('=') && !t.starts_with('-')) {
+        toks.next();
+    }
+    let rest: Vec<&str> = toks.take(4).collect();
+    let s = rest.join(" ");
+    if s.chars().count() > 48 {
+        fmt::truncate_width(&s, 48)
+    } else if s.is_empty() {
+        fmt::first_line(line).to_string()
+    } else {
+        s
+    }
+}
+
 /// What a task's command does (`crate::workkind`). A monitor's wall time
 /// is watching, not work, so monitors are their own kind.
 pub fn work_kind(t: &TaskRecord) -> &'static str {
@@ -474,7 +576,7 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         exit_code: t.exit_code,
         signal: t.signal.clone(),
         end_reason: t.end_reason.clone(),
-        title: fmt::first_line(&t.command).to_string(),
+        title: task_title(t),
         work_kind: Some(work_kind(t).to_string()),
         cpu_user_ms: t.cpu_user_ms,
         cpu_sys_ms: t.cpu_sys_ms,
@@ -1623,6 +1725,27 @@ mod tests {
             "{combined}"
         );
         assert!(!combined.contains("not delivered"), "{combined}");
+    }
+
+    #[test]
+    fn guess_command_title_prefers_incident_ssh_and_tick() {
+        assert_eq!(
+            guess_command_title("bash /Users/me/storage/2026-09-27-stripe-risk-block-cooldown/watch.sh"),
+            "stripe-risk-block-cooldown"
+        );
+        assert_eq!(
+            guess_command_title("ssh -o BatchMode=yes phala@phala-cloud-01 'sudo tail -n +1 -F /var/log/nginx/teehouse-api-access.log'"),
+            "teehouse-api-access.log @phala-cloud-01"
+        );
+        assert_eq!(
+            guess_command_title("ssh phala@phala-cloud-01 'sudo journalctl -fu teehouse'"),
+            "journalctl @phala-cloud-01"
+        );
+        assert_eq!(
+            guess_command_title("while true; do sleep 120; echo TICK; done"),
+            "tick every 2m"
+        );
+        assert_eq!(guess_command_title("pytest -n 4"), "pytest -n 4");
     }
 
     #[test]
