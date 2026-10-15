@@ -1444,6 +1444,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             timeout_ms,
             origin,
             key,
+            label,
             ..
         } => {
             let spec = StartSpec {
@@ -1454,6 +1455,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
                 timeout_ms,
                 origin,
                 key,
+                label,
             };
             respond(&tx, &id, handle_start(&state, conn_id, spec)).await
         }
@@ -1696,6 +1698,7 @@ pub struct StartSpec {
     pub timeout_ms: Option<u64>,
     pub origin: Option<Origin>,
     pub key: Option<String>,
+    pub label: Option<String>,
 }
 
 fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk, ProtoError> {
@@ -1707,6 +1710,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         timeout_ms,
         origin,
         key,
+        label,
     } = spec;
     let (session_id, home) = {
         let st = state.lock().unwrap();
@@ -1799,6 +1803,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         live_cpu_percent: None,
         live_cpu_sampled_at: None,
         live_cpu_stale: false,
+        label: label.clone(),
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -1821,6 +1826,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
                 "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
                 "origin": origin,
                 "pid": pid,
+                "label": label,
             }),
         );
         let mut entry = TaskEntry::new_running(record, parts, output, timeout_ms);

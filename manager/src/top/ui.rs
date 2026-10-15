@@ -537,6 +537,7 @@ mod tests {
             live_cpu_percent: running.then_some(40.0),
             live_cpu_sampled_at: running.then_some(2_000),
             live_cpu_stale: false,
+            label: None,
         }
     }
 

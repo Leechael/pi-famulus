@@ -1663,6 +1663,7 @@ mod tests {
             live_cpu_percent: now_pct,
             live_cpu_sampled_at: now_pct.map(|_| 2_000),
             live_cpu_stale: false,
+            label: None,
         }
     }
 

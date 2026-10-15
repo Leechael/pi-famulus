@@ -168,8 +168,10 @@ export class MonitorRegistry {
       run_in_background: true,
       timeout_ms: null, // timeout is enforced extension-side to control the notice
       origin: { via: "monitor" },
+      label: params.description,
     });
     this.deps.trackTask(task_id, { kind: "monitor", command: params.command, cwd: ctx.cwd });
+    this.deps.logEvent?.("monitor.start", { id: task_id, description: params.description });
 
     const entry: MonitorEntry = {
       taskId: task_id,

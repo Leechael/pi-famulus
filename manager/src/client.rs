@@ -611,6 +611,7 @@ pub async fn cmd_start(
             timeout_ms,
             origin: None,
             key: None,
+            label: None,
         })
         .await?;
     outln!("task_id={} pid={}", res.task_id, res.pid);

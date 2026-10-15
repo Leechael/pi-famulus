@@ -52,6 +52,8 @@ export interface StartRequest {
   run_in_background?: boolean;
   timeout_ms?: number | null;
   origin?: TaskOrigin;
+  /** Human-readable name (monitor description). */
+  label?: string;
 }
 
 export interface StartResponse {
