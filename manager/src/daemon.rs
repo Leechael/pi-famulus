@@ -3508,6 +3508,18 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
                 .clone()
                 .unwrap_or_else(|| end_reason::EXITED.to_string()),
         );
+        // Git Bash crashed while starting (MSYS runtime race, see
+        // `shellstart`): the command never ran, so say so instead of
+        // reporting an ordinary failure.
+        #[cfg(windows)]
+        if entry.kill_reason.is_none() && crate::sys::task_shell().kind == crate::sys::ShellKind::Posix {
+            let out = entry.output.lock().unwrap();
+            let skip = out.ring.len().saturating_sub(crate::shellstart::MAX_STARTUP_FAILURE_OUTPUT as usize);
+            let tail = out.ring.slice(skip, out.ring.len() - skip);
+            if crate::shellstart::is_startup_crash(code, out.total_size, &tail) {
+                entry.record.end_reason = Some(crate::shellstart::SHELL_START_FAILED.to_string());
+            }
+        }
         if let Err(e) = registry::persist_record(&home, &entry.record) {
             lifecycle::log_line(
                 &home,
