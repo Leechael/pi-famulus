@@ -100,7 +100,7 @@ describe("conversation thread", () => {
 
 describe("detail chrome helpers", () => {
   it("spreads left and right, dropping right when it does not fit", () => {
-    expect(spread("ab", "cd", 10)).toBe("ab      cd");
+    expect(spread("ab", "cd", 20)).toBe(`ab${" ".repeat(16)}cd`);
     expect(spread("abcdef", "cd", 8)).toBe("abcdef");
   });
 
@@ -121,5 +121,17 @@ describe("detail chrome helpers", () => {
     const bottom = scrollThumb(100, 10, 90)!;
     expect(top.start).toBe(0);
     expect(bottom.end).toBe(10);
+  });
+});
+
+describe("narrow terminals", () => {
+  it("never paints a thread line wider than the pane", () => {
+    for (let width = 1; width <= 60; width++) {
+      for (const expanded of [false, true]) {
+        for (const line of renderConversation(sample, width, plainTheme, { expanded, agent: "scout" })) {
+          expect(visibleWidth(line), `width ${width}: ${JSON.stringify(line)}`).toBeLessThanOrEqual(width);
+        }
+      }
+    }
   });
 });

@@ -1260,7 +1260,7 @@ fn layout_log(lines: &[String], width: usize, view: &model::LogView, current_row
 
 /// Pinned panel above a task's output: state, cost, command, and where.
 fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
-    let color = status_color(&info.status, info.running);
+    let color = glyph_color(&info.status, info.running);
     let glyph = if info.running { spin_glyph() } else { status_glyph(&info.status, false) };
     let pair = |label: &str, value: String| vec![sp(fg(DIM), format!("   {label} ")), val(value)];
     let mut l1 = vec![
@@ -1956,27 +1956,41 @@ fn tool_call_summary(text: &str) -> Option<(String, String)> {
     parse_tool_call_at(text.trim()).map(|(_, name, summary)| (name, summary))
 }
 
+/// The one status mapping, shared with the pi extension's `statusGlyph`:
+/// running ● green, pending ○ dim, done ✓, failed ✗ red, stopped / timeout ■
+/// amber; sessions: connected ● accent. Finished rows keep a quiet word.
 fn status_color(status: &str, running: bool) -> Color {
-    if running || status == "running" || status == "pending" {
+    if running || status == "running" {
         OK
     } else if matches!(status, "failed" | "killed" | "orphaned" | "interrupted") {
         ERR
     } else if status == "connected" {
         ACCENT
-    } else if matches!(status, "timeout" | "stopped" | "partial") {
+    } else if matches!(status, "timeout" | "stopped" | "partial") || status.starts_with("stopped:") {
         WARN
     } else {
         DIM
     }
 }
 
+/// Glyph color: like the word, except a done ✓ is green (the word stays dim).
+fn glyph_color(status: &str, running: bool) -> Color {
+    if status == "completed" && !running {
+        OK
+    } else {
+        status_color(status, running)
+    }
+}
+
 fn status_glyph(status: &str, running: bool) -> &'static str {
-    if running || status == "running" || status == "pending" || status == "connected" {
+    if running || status == "running" || status == "connected" {
         "●"
     } else if matches!(status, "failed" | "killed" | "orphaned" | "interrupted") {
         "✗"
     } else if status == "completed" {
         "✓"
+    } else if matches!(status, "timeout" | "stopped" | "partial") || status.starts_with("stopped:") {
+        "■"
     } else {
         "○"
     }
@@ -1990,7 +2004,7 @@ fn cell_spans(state: &TopState, vr: &VisibleRow, col: Col) -> Vec<Span<'static>>
         if let Some(&i) = state.task_index.get(&vr.id) {
             let r = &state.task_rows[i];
             let glyph = if r.running { spin_glyph() } else { status_glyph(&r.status, false) };
-            return vec![sp(fg(status_color(&r.status, r.running)), format!("{glyph} ")), sp(fg(MUTED), r.id.clone())];
+            return vec![sp(fg(glyph_color(&r.status, r.running)), format!("{glyph} ")), sp(fg(MUTED), r.id.clone())];
         }
     }
     if state.tab != Tab::Tasks || !state.task_index.contains_key(&vr.id) {
@@ -2046,7 +2060,7 @@ fn node_spans(vr: &VisibleRow, n: &Node) -> Vec<Span<'static>> {
     vec![
         Span::raw("  ".repeat(vr.depth)),
         sp(fg(DIM), chevron),
-        sp(fg(status_color(&n.status, n.metrics.running)), format!("{} ", row_glyph(n))),
+        sp(fg(glyph_color(&n.status, n.metrics.running)), format!("{} ", row_glyph(n))),
         sp(label_style, n.label.clone()),
     ]
 }

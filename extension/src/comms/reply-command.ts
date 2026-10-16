@@ -38,7 +38,7 @@ export function registerReplyCommand(pi: ExtensionAPI, comms: Comms): void {
     handler: async (args, ctx: ExtensionContext) => {
       const resolved = resolveReplyCommand(args, comms.pendingRequests());
       if ("error" in resolved) {
-        ctx.ui.notify(resolved.error, "info");
+        ctx.ui.notify(resolved.error, "warning");
         return;
       }
       try {

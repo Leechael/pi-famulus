@@ -530,7 +530,7 @@ describe("pi-famulus-wake pill", () => {
     const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text };
     const render = (details: unknown) => map.get(FAMULUS_WAKE_CUSTOM_TYPE)!({ content: "", details }, { expanded: false, outputPad: 0 }, theme).render(120).join("\\n");
     const task = render({ kind: "task", stillRunning: [{ id: "sh_2", title: "compile" }], tasks: [{ id: "sh_1", taskKind: "shell", status: "completed", summary: "done", command: "true", outputPath: "", preview: "", durationMs: 1200, exitCode: 0 }] });
-    expect(task).toContain("1.2s · exit 0");
+    expect(task).toContain("1s · exit 0");
     expect(task).toContain("1 still running");
     expect(render({ kind: "subagent-handover", runId: "run_1", childId: "ch_1", name: "alpha", status: "completed", stillRunning: [], summary: "done", prompt: "inspect", result: "Found the root cause" })).toContain("Found the root cause");
     const request = render({ kind: "supervisor-request", from: "ch_1", name: "alpha", message: "Which option?" });

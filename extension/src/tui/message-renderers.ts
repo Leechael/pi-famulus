@@ -9,6 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN, type FamulusWake, type TaskWake } from "../wake";
 import { fitLines, loadPiTui } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
+import { formatDuration } from "../format";
 
 type Theme = {
   fg(color: string, text: string): string;
@@ -42,15 +43,20 @@ function countStatuses(statuses: string[]): string {
   return parts.join(" · ");
 }
 
-function badExit(status: string | undefined, exitCode?: number | null): boolean {
-  if (exitCode !== undefined && exitCode !== null && exitCode !== 0) return true;
-  return status === "failed" || status === "killed" || status === "orphaned" || status === "interrupted";
+/** A non-zero exit fails a task even when it "completed". */
+function effectiveStatus(status: string | undefined, exitCode?: number | null): string {
+  if (exitCode !== undefined && exitCode !== null && exitCode !== 0) return "failed";
+  return status ?? "completed";
 }
 
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+const FAILED = new Set(["failed", "killed", "orphaned", "interrupted"]);
+const STOPPED = new Set(["stopped", "timeout", "partial"]);
+
+/** Worst of a batch: any failure, else any stop, else done. */
+function worstStatus(statuses: string[]): string {
+  if (statuses.some((s) => FAILED.has(s))) return "failed";
+  const stopped = statuses.find((s) => STOPPED.has(s));
+  return stopped ?? "completed";
 }
 
 function taskExit(task: TaskWake): string {
@@ -70,8 +76,7 @@ function taskHead(details: Extract<FamulusWake, { kind: "task" }>): string {
 function collapsedText(details: FamulusWake, theme: Theme): string {
   switch (details.kind) {
     case "task": {
-      const bad = details.tasks.some((task) => badExit(task.status, task.exitCode));
-      const { color, glyph } = statusGlyph(bad ? "failed" : "completed");
+      const { color, glyph } = statusGlyph(worstStatus(details.tasks.map((task) => effectiveStatus(task.status, task.exitCode))));
       return `${theme.fg(color, glyph)} ${theme.fg("muted", "task")} ${taskHead(details)}`;
     }
     case "monitor": {
@@ -94,8 +99,8 @@ function collapsedText(details: FamulusWake, theme: Theme): string {
       return `${theme.fg(color, glyph)} ${theme.fg("muted", "handover")} ${details.name} ${details.status}${snippet ? ` · ${snippet}` : ""}`;
     }
     case "subagent-done": {
-      const bad = details.children.some((child) => badExit(child.status));
-      const { color, glyph } = statusGlyph(bad ? "failed" : details.status);
+      const worst = worstStatus(details.children.map((child) => effectiveStatus(child.status)));
+      const { color, glyph } = statusGlyph(worst === "completed" ? details.status : worst);
       return `${theme.fg(color, glyph)} ${theme.fg("muted", "subagent")} ${countStatuses(details.children.map((child) => child.status))}`;
     }
     case "subagent-overrun": {

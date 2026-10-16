@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { infoCard, layoutLog, matchRanges, parseQuery, tabRow, type LogView, type TaskTheme } from "../../src/tui/task-detail-view";
+import { infoCard, layoutLog, matchRanges, parseQuery, type LogView, type TaskTheme } from "../../src/tui/task-detail-view";
+import { fitKeys, spread, tabRow } from "../../src/tui/scroll-detail-view";
 import { visibleWidth } from "../../src/tui/pi-tui-load";
 import type { WorkItem } from "../../src/work-index";
 
@@ -83,12 +84,28 @@ describe("task detail chrome", () => {
 
   it("cuts stream tabs into a rule and reports their click ranges", () => {
     const row = tabRow(["output", "stderr"], "stderr", "3 lines", plain, 60);
-    expect(row.line.startsWith("─┐1 output┌┐2 stderr┌")).toBe(true);
+    expect(row.line.startsWith("─┐¹output┌┐²stderr┌")).toBe(true);
     expect(row.line.endsWith("┐3 lines┌─")).toBe(true);
     expect(visibleWidth(row.line)).toBe(60);
     const at = row.line.indexOf("stderr");
     const [x0, x1, tab] = row.hits[1];
     expect(tab).toBe("stderr");
     expect(at >= x0 && at < x1).toBe(true);
+  });
+});
+
+describe("shared detail chrome", () => {
+  it("truncates the title before it drops the right-hand pill", () => {
+    const line = spread(`◆ ${"x".repeat(80)}`, "● following", 40);
+    expect(visibleWidth(line)).toBe(40);
+    expect(line.endsWith("● following")).toBe(true);
+  });
+
+  it("drops the least important hints first and keeps esc", () => {
+    const keys = [["/", "search", 1], ["b", "show blank", 4], ["esc", "close", 0]] as const;
+    const narrow = fitKeys(plain, "", keys, 22);
+    expect(narrow).toContain("esc close");
+    expect(narrow).toContain("/ search");
+    expect(narrow).not.toContain("show blank");
   });
 });

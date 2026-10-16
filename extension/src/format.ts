@@ -17,6 +17,20 @@ import {
 } from "./wake";
 import { fill } from "./prompts.generated";
 import { shellStartStatus } from "./shell-start";
+import { statusGlyph } from "./tui/tool-component";
+
+/** `850ms`, `12s`, `4m05s`, `2h03m`, `3d04h`: the same style as `pi-famulus top`. */
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms));
+  if (total < 1000) return `${total}ms`;
+  const secs = Math.floor(total / 1000);
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  if (m < 60) return `${m}m${String(secs % 60).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h${String(m % 60).padStart(2, "0")}m`;
+  return `${Math.floor(h / 24)}d${String(h % 24).padStart(2, "0")}h`;
+}
 
 export { FAMULUS_WAKE_LEAD_IN } from "./wake";
 export type { FormattedWake, WakeItem } from "./wake";
@@ -168,15 +182,16 @@ export function backgroundRowText(
   now: number,
 ): { glyph: string; color: string; text: string } {
   if (!item || item.status === "running" || item.status === "pending") {
-    return { glyph: "⏵", color: "accent", text: `${taskId} running in background · /tasks` };
+    const { glyph, color } = statusGlyph(item?.status ?? "running");
+    return { glyph, color, text: `${taskId} running in background · /tasks` };
   }
-  const secs = ((item.endedAt ?? now) - item.startedAt) / 1000;
-  const dur = secs < 60 ? `${secs.toFixed(1)}s` : `${Math.floor(secs / 60)}m${Math.round(secs % 60)}s`;
+  const dur = formatDuration((item.endedAt ?? now) - item.startedAt);
   const exit = item.exitCode === null || item.exitCode === undefined ? "" : ` · exit ${item.exitCode}`;
   const ok = item.status === "completed" && (item.exitCode === 0 || item.exitCode === null || item.exitCode === undefined);
-  return ok
-    ? { glyph: "✓", color: "success", text: `${taskId} finished${exit} · ${dur}` }
-    : { glyph: "✗", color: "error", text: `${taskId} ${item.status}${exit} · ${dur} · /tasks` };
+  if (ok) return { ...statusGlyph("completed"), text: `${taskId} finished${exit} · ${dur}` };
+  // A non-zero exit fails the row even when the task "completed".
+  const { glyph, color } = statusGlyph(item.status === "completed" ? "failed" : item.status);
+  return { glyph, color, text: `${taskId} ${item.status}${exit} · ${dur} · /tasks` };
 }
 
 /** Injected payload for a batch of monitor output lines (§4.4 / §4.5). */

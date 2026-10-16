@@ -177,7 +177,7 @@ export function renderConversation(
   theme: ChatTheme,
   options: ChatOptions,
 ): string[] {
-  const w = Math.max(12, width);
+  const w = Math.max(1, width);
   if (turns.length === 0) return [MARGIN + theme.fg("dim", "(no conversation yet)")];
   const out: string[] = [];
   let last: Group | undefined;

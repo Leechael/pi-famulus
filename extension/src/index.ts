@@ -382,7 +382,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       noteStopRequested: (id) => monitorRegistry?.noteStopRequested(id),
     }),
   );
-  pi.registerTool(createMonitorTool(monitorRegistry));
+  pi.registerTool(createMonitorTool(monitorRegistry, () => workIndex));
   registerTasksCommand(pi, {
     getRegistry: () => subagentRegistry,
     getIndex: () => workIndex,

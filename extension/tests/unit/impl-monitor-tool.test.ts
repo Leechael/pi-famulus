@@ -23,7 +23,7 @@ describe("monitor tool result rendering", () => {
     const text = result.render(120).join("\n");
     expect(text).toContain("✗");
     expect(text).not.toContain("✓");
-    expect(text).toContain("manage via /tasks");
+    expect(text).toContain("· /tasks");
     expect(text).not.toContain("↓");
   });
 });

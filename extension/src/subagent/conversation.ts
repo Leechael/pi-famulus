@@ -119,8 +119,3 @@ export function turnsFromMessages(messages: readonly LooseMessage[]): Conversati
   }
   return turns;
 }
-
-export function formatConversation(turns: readonly ConversationTurn[]): string {
-  if (turns.length === 0) return "(no messages yet)";
-  return turns.map((turn) => `── ${turn.role} ──\n${turn.text}`).join("\n\n");
-}

@@ -19,7 +19,7 @@ import { realClock, type Clock, type ClockTimer } from "../clock";
 import { formatAge, type WorkItem } from "../work-index";
 import { scrubTty } from "./conversation-view";
 import { fitLines, loadPiTui, truncateToWidth, visibleWidth } from "./pi-tui-load";
-import { keyHints, scrollThumb, spread, type PaneTheme } from "./scroll-detail-view";
+import { fitKeys, positionPill, spread, tabRow, withThumb, type Key, type PaneTheme } from "./scroll-detail-view";
 import { readTaskFileTailCached } from "./task-output-paths";
 import { statusGlyph } from "./tool-component";
 
@@ -116,7 +116,7 @@ export function layoutLog(text: string, width: number, view: LogView, theme: Tas
   const source = text.replace(/\n$/, "").split("\n");
   const out: LogLayout = { lines: [], matches: [], shown: 0, total: source.length };
   if (isPlaceholder(text)) {
-    return { lines: [` ${theme.fg("dim", text.trim())}`], matches: [], shown: 1, total: 1 };
+    return { lines: [truncateToWidth(` ${theme.fg("dim", text.trim())}`, Math.max(1, width), "…")], matches: [], shown: 1, total: 1 };
   }
   const query = parseQuery(view.query);
   for (const raw of source) {
@@ -179,33 +179,6 @@ export function infoCard(item: WorkItem, now: number, theme: TaskTheme, width: n
 
 function truncateLeft(text: string, width: number): string {
   return text.length <= width ? text : `…${text.slice(text.length - width + 1)}`;
-}
-
-/** `─┐1 output┌┐2 stderr┌───── right ─` and each tab's [x0, x1) column range. */
-export function tabRow(
-  tabs: readonly TaskStream[],
-  active: TaskStream,
-  right: string,
-  theme: TaskTheme,
-  width: number,
-): { line: string; hits: Array<[number, number, TaskStream]> } {
-  const rule = (text: string) => theme.fg("borderMuted", text);
-  let line = rule("─");
-  let x = 1;
-  const hits: Array<[number, number, TaskStream]> = [];
-  tabs.forEach((tab, index) => {
-    const name = tab === active
-      ? theme.bold(theme.fg("accent", theme.underline ? theme.underline(tab) : tab))
-      : theme.fg("muted", tab);
-    const seg = `${rule("┐")}${theme.fg("dim", String(index + 1))} ${name}${rule("┌")}`;
-    const w = visibleWidth(seg);
-    hits.push([x, x + w, tab]);
-    x += w;
-    line += seg;
-  });
-  const tail = right ? `${rule("┐")}${right}${rule("┌─")}` : rule("─");
-  const fill = Math.max(0, width - x - visibleWidth(tail));
-  return { line: truncateToWidth(line + rule("─".repeat(fill)) + tail, Math.max(1, width), ""), hits };
 }
 
 /** File tail, or why it is empty (live vs finished). */
@@ -293,41 +266,39 @@ export async function showTaskDetail(ui: ExtensionUIContext, options: TaskDetail
         }
         const dim = (s: string) => theme.fg("dim", s);
         const live = item.status === "running" || item.status === "pending";
-        const status = follow && live
-          ? `${theme.fg("success", "●")} ${dim("following")}`
-          : laid.lines.length > height ? dim(`${Math.round((scroll / Math.max(1, max)) * 100)}%`) : "";
-        const head = spread(`${theme.fg("accent", "◆")} ${theme.bold(options.title)}`, status, width);
+        const pill = positionPill(theme, follow, live, laid.lines.length, height, scroll);
+        const head = spread(`${theme.fg("accent", "◆")} ${theme.bold(options.title)}`, pill, width);
         const q = view.query.length > 0;
         let right: string;
-        if (q && view.filter) right = `${laid.shown}${dim(` of ${laid.total} lines`)}`;
+        const lines = (n: number) => (n === 1 ? " line" : " lines");
+        if (q && view.filter) right = `${laid.shown}${dim(` of ${laid.total}${lines(laid.total)}`)}`;
         else if (q) {
           const at = matches.length === 0 ? 0 : current + 1;
           right = `${theme.fg(matches.length === 0 ? "error" : "text", `${at}/${matches.length}`)}${dim(" matching rows")}`;
         } else {
           const hidden = laid.total - laid.shown;
-          right = `${laid.total}${dim(" lines")}${hidden > 0 && !view.showBlank ? dim(` · ${hidden} blank hidden`) : ""}`;
+          right = `${laid.total}${dim(lines(laid.total))}${hidden > 0 && !view.showBlank ? dim(` · ${hidden} blank hidden`) : ""}`;
         }
         const row = tabRow(tabs, stream, right, theme, width);
         tabHits = row.hits;
         tabY = 1 + INFO_ROWS;
         const visible = laid.lines.slice(scroll, scroll + height);
         while (visible.length < height) visible.push("");
-        const thumb = scrollThumb(laid.lines.length, height, scroll);
-        const body = visible.map((line, i) => {
-          if (!thumb) return line;
-          const pad = Math.max(0, width - 1 - visibleWidth(line));
-          return line + " ".repeat(pad) + (i >= thumb.start && i < thumb.end ? theme.fg("muted", "┃") : " ");
-        });
+        const body = withThumb(visible, width, laid.lines.length, height, scroll, theme);
+        // Keys name the mode they switch to; the least important drop first.
         const mode = view.filter ? "highlight" : "filter";
         let foot: string;
         if (view.editing) {
-          foot = `${theme.bold(theme.fg("accent", "/ "))}${view.query}${theme.fg("accent", "▏")}  ${keyHints(theme, [["tab", mode], ["enter", "keep"], ["esc", "clear"]])}`;
+          const prompt = `${theme.bold(theme.fg("accent", "/ "))}${view.query}${theme.fg("accent", "▏")}`;
+          foot = fitKeys(theme, prompt, [["enter", "apply", 0], ["tab", mode, 1], ["esc", "clear", 0]], width - 1);
         } else {
-          const pairs: Array<[string, string]> = q ? [["n N", "next"]] : [["/", "search"]];
-          pairs.push(["&", mode], ["b", view.showBlank ? "hide blank" : "show blank"], ["1 2", "tab"], ["f", follow ? "unfollow" : "follow"], ["esc", q ? "clear" : "close"]);
-          foot = `${q ? `${theme.fg("accent", "/ ")}${view.query}  ` : ""}${keyHints(theme, pairs)}`;
+          const keys: Key[] = q ? [["n N", "next", 1]] : [["/", "search", 1]];
+          keys.push(["&", mode, 2], ["b", view.showBlank ? "hide blank" : "show blank", 4], ["1 2", "stream", 5]);
+          if (live) keys.push(["f", follow ? "unfollow" : "follow", 3]);
+          keys.push(["esc", q ? "clear" : "close", 0]);
+          foot = fitKeys(theme, q ? `${theme.fg("accent", "/ ")}${view.query}` : "", keys, width - 1);
         }
-        return [head, ...infoCard(item, now, theme, width), row.line, ...body, truncateToWidth(` ${foot}`, width, "…")];
+        return [head, ...infoCard(item, now, theme, width), row.line, ...body, ` ${foot}`];
       };
       const searchInput = (data: string) => {
         if (matchesKey(data, "escape")) {

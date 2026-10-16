@@ -26,6 +26,7 @@ import { taskOutputPath, type FamulusConfig } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 import { backgroundRowText, formatBackgroundNotice, truncateTail } from "./format";
 import { toolComponent } from "./tui/tool-component";
+import { scrubTty } from "./tui/conversation-view";
 import type { WorkIndex } from "./work-index";
 import type { ManagerClient } from "./manager-client";
 import { fill, PROMPTS } from "./prompts.generated";
@@ -333,7 +334,8 @@ export function createBashOverride(
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const lines = text.split("\n");
+      // Progress \r, tabs, and cursor sequences would scramble the row.
+      const lines = scrubTty(text).split("\n");
       const shown = expanded ? lines : lines.slice(0, PREVIEW_LINES);
       const out = shown.map((l) => theme.fg("toolOutput", l));
       if (shown.length < lines.length) {
