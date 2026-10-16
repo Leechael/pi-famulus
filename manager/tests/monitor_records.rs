@@ -33,6 +33,10 @@ fn monitor_live_records_include_eof_tail_before_exit_and_preserve_raw_reads() {
         .flat_map(|v| v["monitor_records"].as_array().into_iter().flatten())
         .cloned()
         .collect();
+    assert!(
+        records.iter().all(|r| r["kind"] == "line"),
+        "a short command must not emit an immediate progress tick: {output:?}"
+    );
     assert_eq!(records.len(), 2, "line and EOF tail metadata: {output:?}");
     assert_eq!(records[0]["preview"], "hello 世界");
     assert_eq!(records[0]["cursor_end"], 13);
@@ -65,16 +69,18 @@ fn monitor_live_records_include_eof_tail_before_exit_and_preserve_raw_reads() {
         .cloned()
         .collect();
     assert_eq!(replay, records);
-    let count = late.events.len();
+    late.events.clear();
     late.request_ok(json!({"type":"watch","task_id":tid}));
-    late.drain(Duration::from_millis(50));
-    let same_cursor = &late.events[count..];
-    assert!(
-        same_cursor.iter().any(|v| v["chunk"] == ""
+    late.wait_event(Duration::from_secs(1), |v| {
+        v["event"] == "output"
+            && v["chunk"] == ""
             && v["next_cursor"] == 21
-            && v["monitor_records"][0] == records[1]),
-        "EOF metadata is replayable even when raw cursor is caught up: {same_cursor:?}"
-    );
+            && v["monitor_records"].as_array().is_some_and(|rs| {
+                rs.iter()
+                    .any(|r| r["kind"] == "line" && r["preview"] == "trailing")
+            })
+    })
+    .expect("EOF metadata is replayable even when raw cursor is caught up");
 }
 
 #[test]

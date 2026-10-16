@@ -3043,7 +3043,12 @@ async fn run_output_fanout(
         .tasks
         .get(&tid)
         .is_some_and(|e| e.monitor.is_some());
-    let mut progress = tokio::time::interval(crate::monitor::PROGRESS_INTERVAL);
+    // Delay the first tick: tokio::interval fires immediately, which would
+    // emit progress for a complete-but-not-yet-EOF tail on short commands.
+    let mut progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + crate::monitor::PROGRESS_INTERVAL,
+        crate::monitor::PROGRESS_INTERVAL,
+    );
     progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let received = tokio::select! {
