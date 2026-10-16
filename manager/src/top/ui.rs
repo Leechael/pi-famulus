@@ -5,14 +5,17 @@ use crate::fmt;
 use crate::inspect::TranscriptTurn;
 use crate::top::model::{
     self, agent_cols, compact_num, cpu_cell, header_height, height_class, now_cell, task_cols, tok_io_cell,
-    tree_cols, wall_cell, width_class, Col, DetailBody, HeightClass, HitRect, Node, NodeKind, Tab, TopState,
-    VisibleRow, WidthClass,
+    tree_cols, wall_cell, width_class, Chat, Col, DetailBody, FoldHit, HeightClass, HitRect, Node, NodeKind, Tab,
+    TopState, VisibleRow, WidthClass,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
+use std::collections::HashSet;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 pub fn draw(frame: &mut Frame, state: &mut TopState) {
     let area = frame.area();
@@ -46,14 +49,13 @@ pub fn draw(frame: &mut Frame, state: &mut TopState) {
     if state.help {
         draw_help(frame, area);
     }
-    if state.detail.is_some() {
-        let rect = area.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
-        state.mouse.detail = hit_rect(rect);
-        if let Some(d) = state.detail.as_mut() {
-            draw_detail(frame, area, d);
-        }
+    if let Some(d) = state.detail.as_mut() {
+        draw_detail(frame, area, d, &mut state.mouse);
     } else {
         state.mouse.detail = HitRect::default();
+        state.mouse.chat = HitRect::default();
+        state.mouse.scrollbar = HitRect::default();
+        state.mouse.dragging_bar = false;
     }
 }
 
@@ -298,7 +300,7 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &TopState) {
 
 fn paint_preview_line(l: &str, width: u16) -> Span<'static> {
     let style = if l.starts_with("── ") && l.ends_with(" ──") {
-        tone_style(Tone::Rule)
+        Style::default().fg(Color::Cyan)
     } else {
         Style::default()
     };
@@ -332,10 +334,11 @@ z                   expand all     /            filter
 g G Home End        top / bottom   p Space      pause
 + -                 interval       v            preview
 Enter               detail         e            events for selection
+o / click           expand tools / thinking
 x Ctrl+X F9         stop task      ?            this help
 q Ctrl+C            quit           Esc          close overlay
 click / wheel       select, fold,  tabs, sort";
-    let rect = centered(area, 64, 17);
+    let rect = centered(area, 64, 18);
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" keys ")),
@@ -343,71 +346,209 @@ click / wheel       select, fold,  tabs, sort";
     );
 }
 
-fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail) {
-    let rect = area.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
+fn detail_frame(area: Rect) -> Rect {
+    let h = if area.width < 50 { 1 } else { 2 };
+    let v = if area.height < 16 { 1 } else { 2 };
+    area.inner(ratatui::layout::Margin { horizontal: h, vertical: v })
+}
+
+fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
+    let rect = detail_frame(area);
     frame.render_widget(Clear, rect);
     let block = Block::default().borders(Borders::ALL).title(format!(" {} ", d.title));
-    let inner = block.inner(rect);
+    let inner = block.inner(rect).inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
     frame.render_widget(block, rect);
-    let tabs: String = d
-        .tabs
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            if i == d.tab {
-                format!("[{}:{}]", i + 1, t)
-            } else {
-                format!(" {}:{} ", i + 1, t)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let follow = if d.follow { " follow" } else { "" };
-    let head = format!(" {tabs}{follow}  ·  f toggle follow · Esc close");
+    let chat_meta = match &d.body {
+        DetailBody::Conversation(c) => Some((c.stats.clone(), c.running)),
+        _ => None,
+    };
+    let head_h = if d.tabs.is_empty() { 0 } else { 1 };
+    let run_h = if chat_meta.as_ref().is_some_and(|(_, running)| *running) { 1 } else { 0 };
+    let stats_h = if chat_meta.is_some() { 1 } else { 0 };
+    let foot_gap = if run_h + stats_h > 0 { 1 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(head_h),
+            Constraint::Min(1),
+            Constraint::Length(foot_gap),
+            Constraint::Length(run_h),
+            Constraint::Length(stats_h),
+        ])
         .split(inner);
-    frame.render_widget(Paragraph::new(clip(&head, chunks[0].width)), chunks[0]);
-    let width = chunks[1].width.max(1) as usize;
-    let height = chunks[1].height as usize;
-    let painted = layout_detail(&d.body, width);
-    d.wrap_len = painted.len();
-    if d.follow {
-        d.scroll = painted.len().saturating_sub(height);
-    } else if !painted.is_empty() {
-        d.scroll = d.scroll.min(painted.len().saturating_sub(1));
+    if head_h > 0 {
+        let tabs: String = d
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                if i == d.tab {
+                    format!("[{}:{}]", i + 1, t)
+                } else {
+                    format!(" {}:{} ", i + 1, t)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let follow = if d.follow { " follow" } else { "" };
+        let head = format!("{tabs}{follow}  ·  f follow · Esc close");
+        frame.render_widget(Paragraph::new(clip(&head, chunks[0].width)), chunks[0]);
     }
+    let body = chunks[1];
+    let bar_w = 1u16;
+    let gap = 1u16;
+    let text_w = body.width.saturating_sub(bar_w + gap).max(1);
+    let width = text_w as usize;
+    let height = body.height as usize;
+    let painted = layout_detail(&d.body, width, &d.open, d.tools_expanded);
+    d.wrap_len = painted.len();
+    d.view_h = height;
+    let (follow, scroll) = stick_scroll(d.follow, d.scroll, painted.len(), height);
+    d.follow = follow;
+    d.scroll = scroll;
     let start = d.scroll.min(painted.len());
+    d.hits = painted[start..].iter().take(height).map(|p| p.fold).collect();
     let lines: Vec<Line> = painted[start..]
         .iter()
         .take(height)
-        .map(|p| Line::from(Span::styled(clip(&p.text, chunks[1].width), tone_style(p.tone))))
+        .map(|p| {
+            let avail = (text_w as usize).saturating_sub(p.gutter).max(1);
+            let mut spans = Vec::new();
+            if p.gutter > 0 {
+                spans.push(Span::raw(" ".repeat(p.gutter)));
+            }
+            spans.push(Span::styled(fit_width(&p.text, avail), p.style));
+            Line::from(spans)
+        })
         .collect();
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    let chat = Rect { x: body.x, y: body.y, width: text_w, height: body.height };
+    frame.render_widget(Clear, chat);
+    let bar = Rect {
+        x: body.x + text_w + gap,
+        y: body.y,
+        width: bar_w,
+        height: body.height,
+    };
+    mouse.detail = hit_rect(rect);
+    mouse.chat = hit_rect(chat);
+    mouse.scrollbar = hit_rect(bar);
+    frame.render_widget(Paragraph::new(lines), chat);
+    draw_scrollbar(frame, bar, painted.len(), height, d.scroll);
+    if run_h > 0 {
+        frame.render_widget(
+            Paragraph::new(clip(&format!("{} running", spin_glyph()), chunks[3].width))
+                .style(Style::default().fg(Color::LightGreen).add_modifier(Modifier::ITALIC)),
+            chunks[3],
+        );
+    }
+    if let Some((stats, _)) = chat_meta {
+        let hint = if d.tools_expanded { "  ·  o collapse" } else { "  ·  click ▸ / o" };
+        frame.render_widget(
+            Paragraph::new(clip(&format!("{stats}{hint}"), chunks[4].width))
+                .style(Style::default().fg(Color::DarkGray)),
+            chunks[4],
+        );
+    }
 }
 
+const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const SPIN_MS: u128 = 80;
+/// Left/right inset inside user bands and tool cards.
+const BOX_PAD: usize = 2;
+/// Tool cards sit further in than user / assistant messages.
+const TOOL_INDENT: usize = 2;
+
+fn spin_index(ms: u128) -> usize {
+    (ms as usize / SPIN_MS as usize) % SPIN.len()
+}
+
+fn spin_glyph() -> &'static str {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let t = START.get_or_init(Instant::now);
+    SPIN[spin_index(t.elapsed().as_millis())]
+}
+
+/// Stick to the end while following; scrolling up unsticks, hitting the
+/// bottom resticks. Scroll never jumps back while the user is reading.
+fn stick_scroll(follow: bool, scroll: usize, len: usize, height: usize) -> (bool, usize) {
+    let max = len.saturating_sub(height);
+    if follow || scroll >= max {
+        (true, max)
+    } else {
+        (false, scroll)
+    }
+}
+
+fn draw_scrollbar(frame: &mut Frame, area: Rect, len: usize, height: usize, scroll: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let track = height.max(1);
+    let marks = scrollbar_marks(len, height, scroll, track);
+    let lines: Vec<Line> = marks
+        .into_iter()
+        .map(|c| {
+            let style = if c == '█' {
+                Style::default().fg(Color::Gray)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Line::from(Span::styled(c.to_string(), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn scrollbar_marks(len: usize, height: usize, scroll: usize, track: usize) -> Vec<char> {
+    if track == 0 {
+        return Vec::new();
+    }
+    if len <= height {
+        return vec!['│'; track];
+    }
+    let thumb = ((height * track) / len).max(1).min(track);
+    let max_scroll = len - height;
+    let pos = if max_scroll == 0 {
+        0
+    } else {
+        (scroll * (track - thumb) + max_scroll / 2) / max_scroll
+    };
+    let pos = pos.min(track - thumb);
+    (0..track)
+        .map(|i| if i >= pos && i < pos + thumb { '█' } else { '│' })
+        .collect()
+}
+
+/// Pi dark-theme chat colors (okhsl approximations).
+const USER_BG: Color = Color::Rgb(42, 54, 84);
+const USER_FG: Color = Color::Rgb(220, 222, 228);
+const TOOL_OK_BG: Color = Color::Rgb(28, 64, 52);
+const TOOL_ERR_BG: Color = Color::Rgb(72, 36, 28);
+const TOOL_PENDING_BG: Color = Color::Rgb(38, 40, 48);
+const TOOL_OUT_FG: Color = Color::Rgb(150, 156, 168);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tone {
-    User,
     Assistant,
     Tool,
     Error,
     Body,
     Dim,
-    Rule,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Painted {
-    tone: Tone,
+    style: Style,
     text: String,
+    gutter: usize,
+    fold: Option<FoldHit>,
 }
 
 fn tone_style(tone: Tone) -> Style {
     match tone {
-        Tone::User | Tone::Rule => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        Tone::Assistant => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Tone::Assistant => Style::default().fg(Color::Green),
         Tone::Tool => Style::default().fg(Color::Yellow),
         Tone::Error => Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
         Tone::Dim => Style::default().fg(Color::DarkGray),
@@ -415,38 +556,59 @@ fn tone_style(tone: Tone) -> Style {
     }
 }
 
-fn speaker_tone(speaker: &str, error: bool) -> Tone {
-    if error || speaker.contains("error") {
-        Tone::Error
-    } else if speaker == "user" || speaker.starts_with("user ") {
-        Tone::User
-    } else if speaker.starts_with("tool") {
-        Tone::Tool
-    } else if speaker.starts_with("assistant") {
-        Tone::Assistant
+fn paint(tone: Tone, text: impl Into<String>) -> Painted {
+    paint_style(tone_style(tone), text)
+}
+
+fn paint_style(style: Style, text: impl Into<String>) -> Painted {
+    Painted { style, text: text.into(), gutter: 0, fold: None }
+}
+
+fn paint_fold(style: Style, text: impl Into<String>, gutter: usize, fold: Option<FoldHit>) -> Painted {
+    Painted { style, text: text.into(), gutter, fold }
+}
+
+fn toggle_hit(id: usize, gutter: usize) -> FoldHit {
+    let x0 = (gutter + BOX_PAD) as u16;
+    FoldHit { id, x0, x1: x0.saturating_add(2) }
+}
+
+fn fit_width(text: &str, width: usize) -> String {
+    let t = if fmt::display_width(text) > width {
+        fmt::truncate_width(text, width)
     } else {
-        Tone::Dim
+        text.to_string()
+    };
+    fmt::pad(&t, width)
+}
+
+fn fill_width(text: &str, width: usize) -> String {
+    let w = fmt::display_width(text);
+    if w >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - w))
     }
 }
 
-fn layout_detail(body: &DetailBody, width: usize) -> Vec<Painted> {
+fn layout_detail(body: &DetailBody, width: usize, open: &HashSet<usize>, expand_all: bool) -> Vec<Painted> {
     match body {
-        DetailBody::Empty => vec![Painted { tone: Tone::Dim, text: "(nothing to show)".into() }],
-        DetailBody::Conversation(turns) => layout_conversation(turns, width),
+        DetailBody::Empty => vec![paint(Tone::Dim, "(nothing to show)")],
+        DetailBody::Conversation(chat) => layout_conversation(chat, width, open, expand_all),
         DetailBody::Log { header, lines } => {
             let mut out = Vec::new();
             for (i, h) in header.iter().enumerate() {
                 let tone = if i == 0 { Tone::Dim } else if h.starts_with('$') { Tone::Tool } else { Tone::Assistant };
                 for l in fmt::wrap_width(h, width) {
-                    out.push(Painted { tone, text: l });
+                    out.push(paint(tone, l));
                 }
             }
             if !header.is_empty() {
-                out.push(Painted { tone: Tone::Body, text: String::new() });
+                out.push(paint(Tone::Body, ""));
             }
             for line in lines {
                 for l in fmt::wrap_width(line, width) {
-                    out.push(Painted { tone: Tone::Body, text: l });
+                    out.push(paint(Tone::Body, l));
                 }
             }
             out
@@ -460,72 +622,382 @@ fn layout_detail(body: &DetailBody, width: usize) -> Vec<Painted> {
                     Tone::Body
                 };
                 for l in fmt::wrap_width(line, width) {
-                    out.push(Painted { tone, text: l });
+                    out.push(paint(tone, l));
                 }
             }
             if out.is_empty() {
-                out.push(Painted { tone: Tone::Dim, text: "(empty)".into() });
+                out.push(paint(Tone::Dim, "(empty)"));
             }
             out
         }
     }
 }
 
-fn layout_conversation(turns: &[TranscriptTurn], width: usize) -> Vec<Painted> {
-    if turns.is_empty() {
-        return vec![Painted { tone: Tone::Dim, text: "(no conversation yet)".into() }];
+fn is_open(id: usize, open: &HashSet<usize>, expand_all: bool) -> bool {
+    expand_all || open.contains(&id)
+}
+
+fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_all: bool) -> Vec<Painted> {
+    if chat.turns.is_empty() {
+        return vec![paint(Tone::Dim, "(no conversation yet)")];
     }
+    let main = if chat.main.is_empty() { "main" } else { chat.main.as_str() };
+    let agent = if chat.agent.is_empty() {
+        "subagent".to_string()
+    } else {
+        format!("subagent · {}", chat.agent)
+    };
     let mut out = Vec::new();
-    for (i, turn) in turns.iter().enumerate() {
-        if i > 0 {
-            out.push(Painted { tone: Tone::Body, text: String::new() });
+    let mut voice: Option<&str> = None;
+    let mut fold = 0usize;
+    let mut i = 0;
+    while i < chat.turns.len() {
+        let turn = &chat.turns[i];
+        if turn.role == "user" {
+            speak(main, true, turn.ts, &mut voice, width, &mut out);
+            gap_if_boxed(&mut out);
+            user_band(&turn.text, turn.ts, width, &mut out);
+            i += 1;
+            continue;
         }
-        let speaker = turn.speaker();
-        let rule_tone = speaker_tone(&speaker, turn.error);
-        out.push(Painted {
-            tone: rule_tone,
-            text: format!("── {} ──", turn.heading()),
-        });
-        if turn.role == "assistant" {
-            if let Some((name, summary)) = tool_call_summary(&turn.text) {
-                out.push(Painted { tone: Tone::Tool, text: format!("▸ {name}") });
-                for l in fmt::wrap_width(&summary, width) {
-                    out.push(Painted { tone: Tone::Dim, text: l });
+        if turn.role == "thinking" {
+            speak(&agent, false, turn.ts, &mut voice, width, &mut out);
+            let id = fold;
+            fold += 1;
+            thinking_block(&turn.text, turn.ts, is_open(id, open, expand_all), id, width, &mut out);
+            i += 1;
+            continue;
+        }
+        if turn.tool.is_some() {
+            speak(&agent, false, turn.ts, &mut voice, width, &mut out);
+            let title = tool_card_title(turn, i.checked_sub(1).and_then(|j| chat.turns.get(j)));
+            gap_if_boxed(&mut out);
+            let id = fold;
+            fold += 1;
+            tool_card(&title, &turn.text, turn.ts, turn.error, false, is_open(id, open, expand_all), id, width, &mut out);
+            i += 1;
+            continue;
+        }
+        if turn.role == "assistant" || turn.role == "assistant error" {
+            speak(&agent, false, turn.ts, &mut voice, width, &mut out);
+            let segs = assistant_segments(&turn.text);
+            let has_tools = segs.iter().any(|s| matches!(s, Seg::ToolCall { .. }));
+            let mut seen_tool = false;
+            i += 1;
+            for seg in segs {
+                match seg {
+                    Seg::Text(text) => {
+                        if has_tools && !seen_tool {
+                            let id = fold;
+                            fold += 1;
+                            thinking_block(&text, turn.ts, is_open(id, open, expand_all), id, width, &mut out);
+                        } else {
+                            let style = if turn.error {
+                                tone_style(Tone::Error)
+                            } else {
+                                Style::default()
+                            };
+                            for l in wrap_padded(text.trim(), width) {
+                                out.push(paint_style(style, l));
+                            }
+                        }
+                    }
+                    Seg::ToolCall { name, summary } => {
+                        seen_tool = true;
+                        let title = format!("{name} {summary}").trim().to_string();
+                        gap_if_boxed(&mut out);
+                        let id = fold;
+                        fold += 1;
+                        if chat.turns.get(i).is_some_and(|n| n.tool.as_deref() == Some(name.as_str())) {
+                            let result = &chat.turns[i];
+                            tool_card(&title, &result.text, result.ts.or(turn.ts), result.error, false, is_open(id, open, expand_all), id, width, &mut out);
+                            i += 1;
+                        } else {
+                            tool_card(&title, "", turn.ts, false, true, is_open(id, open, expand_all), id, width, &mut out);
+                        }
+                    }
                 }
-                continue;
             }
+            continue;
         }
-        let body_tone = if turn.error {
-            Tone::Error
-        } else if turn.tool.is_some() {
-            Tone::Dim
-        } else {
-            Tone::Body
-        };
-        if turn.text.is_empty() {
-            out.push(Painted { tone: Tone::Dim, text: String::new() });
-        } else {
-            for l in fmt::wrap_width(&turn.text, width) {
-                out.push(Painted { tone: body_tone, text: l });
-            }
-        }
+        i += 1;
+    }
+    if out.is_empty() {
+        out.push(paint(Tone::Dim, "(no conversation yet)"));
     }
     out
 }
 
-fn tool_call_summary(text: &str) -> Option<(String, String)> {
-    let rest = text.strip_prefix("tool ")?;
-    let (name, json) = rest.split_once(' ')?;
-    if !json.starts_with('{') {
+fn speak<'a>(label: &'a str, is_main: bool, ts: Option<u64>, last: &mut Option<&'a str>, width: usize, out: &mut Vec<Painted>) {
+    if last.as_deref() == Some(label) {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(paint(Tone::Body, ""));
+    }
+    let style = if is_main {
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    };
+    out.push(paint_style(style, titled(label, ts, width)));
+    *last = Some(label);
+}
+
+fn thinking_block(text: &str, ts: Option<u64>, expanded: bool, fold: usize, width: usize, out: &mut Vec<Painted>) {
+    let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+    let label = if expanded { "▾ Thinking" } else { "▸ Thinking…" };
+    out.push(paint_fold(style, titled(label, ts, width), 0, Some(toggle_hit(fold, 0))));
+    if !expanded {
+        return;
+    }
+    for l in wrap_padded(&fmt::scrub_tty(text.trim()), width) {
+        out.push(paint_style(style, l));
+    }
+}
+
+fn box_inner(width: usize) -> usize {
+    width.saturating_sub(BOX_PAD * 2).max(1)
+}
+
+fn pad_text(text: &str, width: usize) -> String {
+    fit_width(&format!("{}{}", " ".repeat(BOX_PAD), fmt::truncate_width(text, box_inner(width))), width)
+}
+
+fn clock(ts: Option<u64>) -> String {
+    ts.map(fmt::datetime)
+        .and_then(|s| s.split(' ').nth(1).map(|t| t.to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+fn titled(label: &str, ts: Option<u64>, width: usize) -> String {
+    let time = clock(ts);
+    if time.is_empty() {
+        return pad_text(label, width);
+    }
+    let inner = box_inner(width);
+    let budget = inner.saturating_sub(time.len() + 3).max(1);
+    let left = fmt::truncate_width(label, budget);
+    pad_text(&format!("{left}  {time}"), width)
+}
+
+fn wrap_padded(text: &str, width: usize) -> Vec<String> {
+    fmt::wrap_width(text, box_inner(width))
+        .into_iter()
+        .map(|l| fit_width(&format!("{}{l}", " ".repeat(BOX_PAD)), width))
+        .collect()
+}
+
+fn gap_if_boxed(out: &mut Vec<Painted>) {
+    if out.last().is_some_and(|p| p.style.bg.is_some()) {
+        out.push(paint(Tone::Body, ""));
+    }
+}
+
+enum Seg {
+    Text(String),
+    ToolCall { name: String, summary: String },
+}
+
+fn assistant_segments(text: &str) -> Vec<Seg> {
+    let mut segs = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(rel) = text[i..].find("tool ") {
+            let start = i + rel;
+            if let Some((end, name, summary)) = parse_tool_call_at(&text[start..]) {
+                let prev = text[i..start].trim();
+                if !prev.is_empty() {
+                    segs.push(Seg::Text(prev.to_string()));
+                }
+                segs.push(Seg::ToolCall { name, summary });
+                i = start + end;
+                continue;
+            }
+            i = start + 5;
+            continue;
+        }
+        let rest = text[i..].trim();
+        if !rest.is_empty() {
+            segs.push(Seg::Text(rest.to_string()));
+        }
+        break;
+    }
+    segs
+}
+
+fn parse_tool_call_at(s: &str) -> Option<(usize, String, String)> {
+    let rest = s.strip_prefix("tool ")?;
+    let brace = rest.find('{')?;
+    let name = rest[..brace].trim();
+    if name.is_empty() || name.contains(char::is_whitespace) {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let summary = ["command", "path", "query", "pattern"]
+    let json_start = 5 + brace;
+    let json = &s[json_start..];
+    let json_len = take_json_object(json)?;
+    let raw = &json[..json_len];
+    Some((json_start + json_len, name.to_string(), summary_from_raw(name, raw)))
+}
+
+fn take_json_object(s: &str) -> Option<usize> {
+    if !s.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if c == '\\' {
+                escape = true;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn summary_from_raw(name: &str, json: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+        return pick_summary(name, &v);
+    }
+    extract_json_string(json, "path")
+        .or_else(|| extract_json_string(json, "command"))
+        .or_else(|| extract_json_string(json, "query"))
+        .or_else(|| extract_json_string(json, "pattern"))
+        .unwrap_or_default()
+}
+
+fn pick_summary(name: &str, v: &serde_json::Value) -> String {
+    let _ = name;
+    ["path", "command", "query", "pattern", "file"]
         .iter()
         .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| json.to_string());
-    Some((name.to_string(), summary))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":\"");
+    let rest = json.split(&pat).nth(1)?;
+    let mut out = String::new();
+    let mut escape = false;
+    for c in rest.chars() {
+        if escape {
+            out.push(c);
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            break;
+        }
+        if c == '\n' {
+            break;
+        }
+        out.push(c);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn user_band(text: &str, _ts: Option<u64>, width: usize, out: &mut Vec<Painted>) {
+    let style = Style::default().fg(USER_FG).bg(USER_BG);
+    out.push(paint_style(style, fill_width(" ", width)));
+    let body = if text.trim().is_empty() { " " } else { text.trim() };
+    for l in wrap_padded(body, width) {
+        out.push(paint_style(style, l));
+    }
+    out.push(paint_style(style, fill_width(" ", width)));
+}
+
+fn tool_card_title(turn: &TranscriptTurn, prev: Option<&TranscriptTurn>) -> String {
+    let name = turn.tool.as_deref().unwrap_or("tool");
+    if let Some(prev) = prev {
+        if let Some((call, summary)) = tool_call_summary(&prev.text) {
+            if call == name {
+                return format!("{name} {summary}").trim().to_string();
+            }
+        }
+    }
+    if let Some(args) = turn.args.as_deref().filter(|s| !s.is_empty()) {
+        let summary = summary_from_raw(name, args);
+        if !summary.is_empty() {
+            return format!("{name} {summary}");
+        }
+    }
+    name.to_string()
+}
+
+fn tool_card(
+    title: &str,
+    output: &str,
+    ts: Option<u64>,
+    error: bool,
+    pending: bool,
+    expanded: bool,
+    fold: usize,
+    width: usize,
+    out: &mut Vec<Painted>,
+) {
+    let bg = if error {
+        TOOL_ERR_BG
+    } else if pending {
+        TOOL_PENDING_BG
+    } else {
+        TOOL_OK_BG
+    };
+    let title_style = Style::default().fg(USER_FG).bg(bg).add_modifier(Modifier::BOLD);
+    let out_style = Style::default().fg(if error { Color::LightRed } else { TOOL_OUT_FG }).bg(bg);
+    let mark = if pending {
+        "·"
+    } else if expanded || output.trim().is_empty() {
+        "▾"
+    } else {
+        "▸"
+    };
+    let card_w = width.saturating_sub(TOOL_INDENT).max(8);
+    out.push(paint_fold(
+        title_style,
+        titled(&format!("{mark} {title}"), ts, card_w),
+        TOOL_INDENT,
+        Some(toggle_hit(fold, TOOL_INDENT)),
+    ));
+    if output.trim().is_empty() || !expanded {
+        return;
+    }
+    for para in fmt::scrub_tty(output).lines() {
+        for l in wrap_padded(para, card_w) {
+            out.push(paint_fold(out_style, l, TOOL_INDENT, None));
+        }
+    }
+}
+
+fn tool_call_summary(text: &str) -> Option<(String, String)> {
+    parse_tool_call_at(text.trim()).map(|(_, name, summary)| (name, summary))
 }
 
 fn cell_text(state: &TopState, vr: &VisibleRow, col: Col) -> String {
@@ -675,6 +1147,7 @@ mod tests {
     use super::*;
     use crate::inspect::{AgentRecord, SessionView, Snapshot};
     use crate::proto::{Origin, TaskKind, TaskRecord, TaskStatus};
+    use crate::top::collector::open_detail;
     use crate::top::model::{width_class, TopState};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -809,25 +1282,36 @@ mod tests {
         assert_eq!(width_class(160), WidthClass::Wide);
     }
 
+    fn mk_turn(role: &str, text: &str) -> TranscriptTurn {
+        TranscriptTurn {
+            role: role.into(),
+            tool: None,
+            args: None,
+            text: text.into(),
+            ts: None,
+            error: false,
+        }
+    }
+
+    fn chat_body(turns: Vec<TranscriptTurn>) -> DetailBody {
+        DetailBody::Conversation(Chat {
+            turns,
+            main: "main".into(),
+            agent: "worker".into(),
+            stats: "tokens - · - tok/s · wall - · shells 0".into(),
+            running: false,
+        })
+    }
+
+    fn layout(body: &DetailBody, width: usize, expand_all: bool) -> Vec<Painted> {
+        layout_detail(body, width, &HashSet::new(), expand_all)
+    }
+
     #[test]
-    fn conversation_detail_wraps_and_names_speakers() {
+    fn conversation_detail_is_a_chat_not_role_headers() {
         let turns = vec![
-            TranscriptTurn {
-                role: "user".into(),
-                tool: None,
-                args: None,
-                text: "inspect the loader please and then report".into(),
-                ts: None,
-                error: false,
-            },
-            TranscriptTurn {
-                role: "assistant".into(),
-                tool: None,
-                args: None,
-                text: r#"tool bash {"command":"rg loader"}"#.into(),
-                ts: None,
-                error: false,
-            },
+            mk_turn("user", "inspect the loader please and then report"),
+            mk_turn("assistant", r#"tool bash {"command":"rg loader"}"#),
             TranscriptTurn {
                 role: "tool".into(),
                 tool: Some("bash".into()),
@@ -837,15 +1321,190 @@ mod tests {
                 error: false,
             },
         ];
-        let painted = layout_detail(&DetailBody::Conversation(turns), 20);
-        let text: Vec<&str> = painted.iter().map(|p| p.text.as_str()).collect();
-        assert!(text.iter().any(|l| l.starts_with("── user")), "{text:?}");
-        assert!(text.iter().any(|l| l.starts_with("── assistant")), "{text:?}");
-        assert!(text.iter().any(|l| l.starts_with("── tool bash")), "{text:?}");
-        assert!(text.contains(&"▸ bash"), "{text:?}");
-        assert!(text.contains(&"rg loader"), "{text:?}");
-        assert!(text.contains(&"src/loader.rs"), "{text:?}");
-        assert!(painted.iter().any(|p| p.tone == Tone::User));
-        assert!(painted.iter().filter(|p| p.text.contains("inspect")).all(|p| fmt::display_width(&p.text) <= 20));
+        let painted = layout(&chat_body(turns), 40, false);
+        let text: Vec<&str> = painted.iter().map(|p| p.text.trim()).collect();
+        assert!(!text.iter().any(|l| l.starts_with("── ")), "{text:?}");
+        assert!(text.iter().any(|l| *l == "main"), "{text:?}");
+        assert!(text.iter().any(|l| *l == "subagent · worker"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("inspect the loader")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("bash") && l.contains("rg loader")), "{text:?}");
+        assert!(!text.iter().any(|l| l.contains("src/loader.rs")), "{text:?}");
+        assert!(
+            painted.iter().any(|p| p.style.bg == Some(USER_BG) && p.text.contains("inspect")),
+            "user turn is a full-width band"
+        );
+        assert!(
+            painted.iter().any(|p| p.style.bg == Some(TOOL_OK_BG)),
+            "tool result is a card"
+        );
+        assert!(painted.iter().all(|p| fmt::display_width(&p.text) <= 40));
+    }
+
+    #[test]
+    fn stacked_tools_have_gaps_and_one_line_titles() {
+        let long = format!("bash {}", "x".repeat(80));
+        let tools: Vec<TranscriptTurn> = (0..3)
+            .map(|_| TranscriptTurn {
+                role: "tool".into(),
+                tool: Some("bash".into()),
+                args: None,
+                text: long.clone(),
+                ts: None,
+                error: false,
+            })
+            .collect();
+        let painted = layout(&chat_body(tools), 48, false);
+        assert!(painted.iter().all(|p| fmt::display_width(&p.text) <= 48));
+        let mut runs = 0;
+        let mut in_card = false;
+        for p in &painted {
+            let bg = p.style.bg == Some(TOOL_OK_BG);
+            if bg && !in_card {
+                runs += 1;
+            }
+            in_card = bg;
+        }
+        assert_eq!(runs, 3, "each tool is its own card, not one wall: {painted:?}");
+        let titles: Vec<_> = painted
+            .iter()
+            .filter(|p| p.style.bg == Some(TOOL_OK_BG) && p.text.contains('▸'))
+            .collect();
+        assert_eq!(titles.len(), 3);
+        for t in titles {
+            assert!(!t.text.contains(&"x".repeat(20)), "title must truncate: {}", t.text);
+            assert!(t.text.starts_with("  "), "title needs side pad: {:?}", t.text);
+            assert_eq!(t.gutter, TOOL_INDENT, "tool cards indent past messages");
+        }
+    }
+
+    #[test]
+    fn expanded_tool_output_is_not_a_toggle_target() {
+        let turn = TranscriptTurn {
+            role: "tool".into(),
+            tool: Some("bash".into()),
+            args: Some(r#"{"command":"git log"}"#.into()),
+            text: "\x1b[32mcdcdcfe\x1b[0m ok\rRebasing (2/2)\nDone".into(),
+            ts: None,
+            error: false,
+        };
+        let painted = layout(&chat_body(vec![turn]), 48, true);
+        let text = painted.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(!text.contains("\x1b"), "{text}");
+        assert!(!text.contains("[32m"), "{text}");
+        assert!(text.contains("Rebasing (2/2)"), "{text}");
+        assert!(!text.contains("Rebasing (1/"), "{text}");
+        let headers = painted.iter().filter(|p| p.fold.is_some()).count();
+        let body = painted.iter().filter(|p| p.text.contains("Done") || p.text.contains("ok")).count();
+        assert_eq!(headers, 1, "only the ▸/▾ row is clickable");
+        assert!(body > 0);
+        assert!(painted.iter().any(|p| p.fold.is_some_and(|h| h.x0 > 0 && h.x1 > h.x0)));
+    }
+
+    #[test]
+    fn write_tool_call_does_not_dump_file_content() {
+        let dumped = concat!(
+            r#"tool write{"path":"/tmp/assemble-policy-gate.py","content":"from pathlib import Path"#,
+            "\nimport subprocess\nprint(1)\n\"}"
+        );
+        let painted = layout(&chat_body(vec![mk_turn("assistant", dumped)]), 60, false);
+        let text = painted.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("write"), "{text}");
+        assert!(text.contains("assemble-policy-gate.py"), "{text}");
+        assert!(!text.contains("from pathlib"), "{text}");
+        assert!(!text.contains("import subprocess"), "{text}");
+        assert!(painted.iter().any(|p| p.fold.is_some() && p.gutter == TOOL_INDENT), "{painted:?}");
+    }
+
+    #[test]
+    fn each_block_shows_a_clock() {
+        let mut user = mk_turn("user", "look at src");
+        user.ts = Some(1_774_000_000_000);
+        let tool = TranscriptTurn {
+            role: "tool".into(),
+            tool: Some("bash".into()),
+            args: Some(r#"{"command":"ls"}"#.into()),
+            text: "ok".into(),
+            ts: Some(1_774_000_030_000),
+            error: false,
+        };
+        let painted = layout(&chat_body(vec![user, tool]), 48, false);
+        let text = painted.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains(':'), "expected a clock in\n{text}");
+    }
+
+    #[test]
+    fn tool_and_thinking_collapse_until_expanded() {
+        let turn = TranscriptTurn {
+            role: "tool".into(),
+            tool: Some("bash".into()),
+            args: None,
+            text: (0..12).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n"),
+            ts: None,
+            error: false,
+        };
+        let thinking = mk_turn("thinking", "I should search the loader first.");
+        let mixed = mk_turn(
+            "assistant",
+            "need the files\ntool bash {\"command\":\"rg loader\"}",
+        );
+        let collapsed = layout(&chat_body(vec![thinking.clone(), mixed, turn.clone()]), 40, false);
+        let expanded = layout(&chat_body(vec![thinking, turn]), 40, true);
+        let c = collapsed.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join("\n");
+        let e = expanded.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join("\n");
+        assert!(c.contains("Thinking…"), "{c}");
+        assert!(!c.contains("I should search"), "{c}");
+        assert!(!c.contains("need the files"), "{c}");
+        assert!(!c.contains("line-0"), "{c}");
+        assert!(!c.contains("line-11"), "{c}");
+        assert!(c.contains("bash"), "{c}");
+        assert!(e.contains("I should search"), "{e}");
+        assert!(e.contains("line-0") && e.contains("line-11"), "{e}");
+        assert!(!e.contains("Thinking…"), "{e}");
+    }
+
+    #[test]
+    fn agent_detail_footer_is_stats_not_tabs() {
+        let snap = snap();
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        state.selected = Some("ch_a".into());
+        state.now = 1_200;
+        let mut d = open_detail(&state).expect("agent opens");
+        assert!(d.tabs.is_empty());
+        assert!(d.title.contains("subagent"));
+        d.body = chat_body(vec![mk_turn("user", "inspect the loader")]);
+        if let DetailBody::Conversation(c) = &mut d.body {
+            c.stats = "tokens 100 in / 20 out · 20.0 tok/s · wall LLM 1s / tool - / queue - · shells 1".into();
+            c.running = true;
+        }
+        state.detail = Some(d);
+        let text = render(80, 24, &mut state);
+        assert!(!text.contains("1:Conversation"), "{text}");
+        assert!(!text.contains("2:Result"), "{text}");
+        assert!(!text.contains("3:Info"), "{text}");
+        assert!(text.contains("tokens 100"), "{text}");
+        assert!(text.contains("tok/s"), "{text}");
+        assert!(text.contains("running"), "{text}");
+        assert!(text.contains("main"), "{text}");
+        assert!(text.contains("subagent · worker"), "{text}");
+    }
+
+    #[test]
+    fn follow_resticks_at_the_bottom() {
+        assert_eq!(stick_scroll(true, 3, 40, 10), (true, 30));
+        assert_eq!(stick_scroll(false, 12, 40, 10), (false, 12));
+        assert_eq!(stick_scroll(false, 30, 40, 10), (true, 30));
+        assert_eq!(stick_scroll(false, 99, 40, 10), (true, 30));
+    }
+
+    #[test]
+    fn scrollbar_thumb_moves_with_progress() {
+        let top = scrollbar_marks(40, 10, 0, 10);
+        let bottom = scrollbar_marks(40, 10, 30, 10);
+        assert!(top.iter().any(|c| *c == '█'), "{top:?}");
+        assert!(bottom.iter().any(|c| *c == '█'), "{bottom:?}");
+        let top_pos = top.iter().position(|c| *c == '█').unwrap();
+        let bot_pos = bottom.iter().position(|c| *c == '█').unwrap();
+        assert!(top_pos < bot_pos, "top {top_pos} bottom {bot_pos}");
     }
 }

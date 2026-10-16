@@ -12,7 +12,7 @@ use crate::inspect::{self, AgentRecord, SessionView, Snapshot};
 use crate::proto::{now_ms, RequestKind, StatusOk, TaskRecord, TaskStatus};
 use crate::registry;
 use crate::task;
-use crate::top::model::{Detail, DetailBody, NodeKind, TopState};
+use crate::top::model::{compact_num, Chat, Detail, DetailBody, NodeKind, TopState};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -448,14 +448,8 @@ fn tail_for(
         };
     }
     if let Some(a) = agents.iter().find(|a| a.child_id == id) {
-        return match tab {
-            1 => {
-                let text = a.result_tail.as_deref().unwrap_or("(no result)");
-                DetailBody::Text(text.lines().map(|s| s.to_string()).collect())
-            }
-            2 => DetailBody::Text(info_agent(a, tasks)),
-            _ => DetailBody::Conversation(load_transcript(home, a)),
-        };
+        let _ = tab;
+        return agent_chat(home, a, tasks);
     }
     DetailBody::Empty
 }
@@ -463,7 +457,7 @@ fn tail_for(
 fn flatten_body(body: &DetailBody) -> Vec<String> {
     match body {
         DetailBody::Empty => Vec::new(),
-        DetailBody::Conversation(turns) => inspect::format_conversation(turns),
+        DetailBody::Conversation(chat) => inspect::format_conversation(&chat.turns),
         DetailBody::Log { header, lines } => {
             let mut out = header.clone();
             if !header.is_empty() && !lines.is_empty() {
@@ -534,16 +528,34 @@ fn tail_file(path: &Path) -> Vec<String> {
     }
 }
 
+/// Read the whole transcript (not a 64 KiB tail). Files over 2 MiB keep the
+/// newest complete lines so a long run still opens as a conversation.
+const TRANSCRIPT_CAP: u64 = 2 * 1024 * 1024;
+
 fn load_transcript(home: &Path, a: &AgentRecord) -> Vec<inspect::TranscriptTurn> {
     let path = a.transcript_path(home);
-    let raw = tail_file(&path);
-    let mut first_user = true;
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Vec::new();
+    };
+    let len = meta.len();
+    let off = len.saturating_sub(TRANSCRIPT_CAP);
+    let Ok((bytes, _)) = task::read_file_range(&path, off, (len - off) as usize) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let body = if off > 0 {
+        text.split_once('\n').map(|(_, rest)| rest).unwrap_or(&text)
+    } else {
+        &text
+    };
+    // Mid-file windows must not treat the first user line as the task prompt.
+    let mut first_user = off == 0;
     let mut out = Vec::new();
-    for line in raw {
-        if line.starts_with("(no file") || line == "(empty)" {
+    for line in body.lines() {
+        if line.is_empty() {
             continue;
         }
-        if let Some(turn) = inspect::parse_transcript_line(&line, false, a.prompt_head.as_deref(), &mut first_user) {
+        if let Some(turn) = inspect::parse_transcript_line(line, false, a.prompt_head.as_deref(), &mut first_user) {
             out.push(turn);
         }
     }
@@ -573,26 +585,37 @@ fn info_task(t: &TaskRecord, now: u64) -> Vec<String> {
     ]
 }
 
-fn info_agent(a: &AgentRecord, tasks: &[TaskRecord]) -> Vec<String> {
+fn agent_chat(home: &Path, a: &AgentRecord, tasks: &[TaskRecord]) -> DetailBody {
     let shells = tasks
         .iter()
         .filter(|t| t.origin.as_ref().and_then(|o| o.child_id.as_deref()) == Some(a.child_id.as_str()))
         .count();
-    vec![
-        format!("id           {}", a.child_id),
-        format!("name         {}", a.name),
-        format!("agent        {}", a.agent),
-        format!("model        {}", a.model.as_deref().unwrap_or("-")),
-        format!("run          {}", a.run_id.as_deref().unwrap_or("-")),
-        format!("session      {}", a.session_id),
-        format!("status       {}", a.status),
-        format!("tokens       {} in / {} out", a.tokens_input.map(|n| n.to_string()).unwrap_or_else(|| "-".into()), a.tokens_output.map(|n| n.to_string()).unwrap_or_else(|| "-".into())),
-        format!("tok/s        {}", inspect::agent_output_tokens_per_second(a.tokens_output, a.llm_ms).map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into())),
-        format!("wall         LLM {} / tool {} / queue {}", dur(a.llm_ms), dur(a.tool_ms), dur(a.queue_ms)),
-        format!("shells       {shells}"),
-        format!("error        {}", a.error.as_deref().unwrap_or("-")),
-        format!("prompt       {}", a.prompt_head.as_deref().unwrap_or("-")),
-    ]
+    let tok_in = a.tokens_input.map(compact_num).unwrap_or_else(|| "-".into());
+    let tok_out = a.tokens_output.map(compact_num).unwrap_or_else(|| "-".into());
+    let tps = inspect::agent_output_tokens_per_second(a.tokens_output, a.llm_ms)
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "-".into());
+    let name = if a.name.is_empty() {
+        if a.agent.is_empty() {
+            "subagent".into()
+        } else {
+            a.agent.clone()
+        }
+    } else {
+        a.name.clone()
+    };
+    DetailBody::Conversation(Chat {
+        turns: load_transcript(home, a),
+        main: "main".into(),
+        agent: name,
+        stats: format!(
+            "tokens {tok_in} in / {tok_out} out · {tps} tok/s · wall LLM {} / tool {} / queue {} · shells {shells}",
+            dur(a.llm_ms),
+            dur(a.tool_ms),
+            dur(a.queue_ms)
+        ),
+        running: !inspect::agent_status_terminal(&a.status) && !a.stale,
+    })
 }
 
 fn dur(ms: Option<u64>) -> String {
@@ -602,7 +625,7 @@ fn dur(ms: Option<u64>) -> String {
 pub fn detail_tabs(kind: NodeKind) -> Vec<String> {
     match kind {
         NodeKind::Task => vec!["Output".into(), "Stderr".into(), "Info".into()],
-        NodeKind::Agent => vec!["Conversation".into(), "Result".into(), "Info".into()],
+        NodeKind::Agent => Vec::new(),
         _ => vec!["Info".into()],
     }
 }
@@ -612,15 +635,25 @@ pub fn open_detail(state: &TopState) -> Option<Detail> {
     if matches!(n.kind, NodeKind::Session | NodeKind::Main | NodeKind::Run) {
         return None;
     }
+    let title = if n.kind == NodeKind::Agent {
+        let name = n.title.split(" (").next().unwrap_or(n.label.as_str());
+        format!("subagent · {name}")
+    } else {
+        format!("{} · {}", n.id, n.label)
+    };
     Some(Detail {
         id: n.id.clone(),
         tab: 0,
         follow: true,
         scroll: 0,
-        title: format!("{} · {}", n.id, n.label),
+        title,
         tabs: detail_tabs(n.kind),
         body: DetailBody::Empty,
         wrap_len: 0,
+        view_h: 0,
+        tools_expanded: false,
+        open: HashSet::new(),
+        hits: Vec::new(),
     })
 }
 
@@ -662,6 +695,12 @@ mod tests {
             live_cpu_stale: false,
             label: None,
         }
+    }
+
+    #[test]
+    fn agent_detail_has_no_result_or_info_tabs() {
+        assert!(detail_tabs(NodeKind::Agent).is_empty());
+        assert_eq!(detail_tabs(NodeKind::Task), vec!["Output", "Stderr", "Info"]);
     }
 
     #[test]

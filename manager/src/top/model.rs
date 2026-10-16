@@ -485,15 +485,30 @@ pub struct MouseHit {
     pub tabs: HitRect,
     pub table: HitRect,
     pub detail: HitRect,
+    pub chat: HitRect,
+    pub scrollbar: HitRect,
+    pub dragging_bar: bool,
     pub tab_line: String,
     pub last: Option<(String, std::time::Instant)>,
+}
+
+/// Agent conversation plus the footer identity/stats the chat view needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chat {
+    pub turns: Vec<TranscriptTurn>,
+    /// Parent / assigner label, shown on user turns.
+    pub main: String,
+    /// Child display name, shown on assistant / tool / thinking turns.
+    pub agent: String,
+    pub stats: String,
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DetailBody {
     #[default]
     Empty,
-    Conversation(Vec<TranscriptTurn>),
+    Conversation(Chat),
     /// Task output/stderr: a short identity header, then the file tail.
     Log { header: Vec<String>, lines: Vec<String> },
     Text(Vec<String>),
@@ -510,6 +525,22 @@ pub struct Detail {
     pub body: DetailBody,
     /// Wrapped line count from the last draw; used to clamp scroll.
     pub wrap_len: usize,
+    /// Viewport height from the last draw; used to map scrollbar drags.
+    pub view_h: usize,
+    /// `o` expands every foldable block.
+    pub tools_expanded: bool,
+    /// Per-block open set (thinking / tool cards). Click toggles one id.
+    pub open: HashSet<usize>,
+    /// Toggle hit for each visible line. Only the ▸/▾ cell is armed.
+    pub hits: Vec<Option<FoldHit>>,
+}
+
+/// Click target for one foldable header. Coordinates are relative to the chat pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldHit {
+    pub id: usize,
+    pub x0: u16,
+    pub x1: u16,
 }
 
 #[derive(Debug)]
@@ -1135,6 +1166,14 @@ impl TopState {
 
     pub fn selected_node(&self) -> Option<&Node> {
         self.selected.as_ref().and_then(|id| self.nodes.get(id))
+    }
+
+    /// Redraw on a short cadence so the running indicator can spin.
+    pub fn wants_anim(&self) -> bool {
+        self.detail.as_ref().is_some_and(|d| match &d.body {
+            DetailBody::Conversation(c) => c.running,
+            _ => false,
+        })
     }
 
     pub fn bump_interval(&mut self, up: bool) {

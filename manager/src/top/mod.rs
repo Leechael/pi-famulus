@@ -11,7 +11,7 @@ pub mod ui;
 use crate::client::{self, HelloMode};
 use crate::proto::{RequestKind, UnitOk};
 use crate::top::collector::{open_detail, CollectView, Collector, Tick};
-use crate::top::model::{NodeKind, Tab, TopState};
+use crate::top::model::{Detail, NodeKind, Tab, TopState};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -102,6 +102,7 @@ pub async fn run(home: &Path, interval_ms: u64, session: Option<String>, cwd: Op
 
     loop {
         terminal.draw(|f| ui::draw(f, &mut state)).map_err(|e| e.to_string())?;
+        let anim = state.wants_anim();
         tokio::select! {
             Some(res) = tick_rx.recv() => apply_latest(&mut state, &mut tick_rx, res),
             Some(ev) = ev_rx.recv() => {
@@ -109,6 +110,7 @@ pub async fn run(home: &Path, interval_ms: u64, session: Option<String>, cwd: Op
                     break;
                 }
             }
+            _ = tokio::time::sleep(Duration::from_millis(80)), if anim => {}
         }
         while let Ok(ev) = ev_rx.try_recv() {
             if dispatch_event(&mut state, ev, home, &cmd_tx).await? {
@@ -256,21 +258,25 @@ fn handle_mouse(state: &mut TopState, ev: MouseEvent) {
     match ev.kind {
         MouseEventKind::ScrollDown => {
             if let Some(d) = state.detail.as_mut() {
-                d.follow = false;
-                d.scroll = d.scroll.saturating_add(3).min(d.wrap_len.saturating_sub(1));
+                detail_scroll_down(d, 3);
             } else {
                 state.move_sel(1);
             }
         }
         MouseEventKind::ScrollUp => {
             if let Some(d) = state.detail.as_mut() {
-                d.follow = false;
-                d.scroll = d.scroll.saturating_sub(3);
+                detail_scroll_up(d, 3);
             } else {
                 state.move_sel(-1);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => handle_mouse_click(state, ev.column, ev.row),
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if state.mouse.dragging_bar {
+                drag_scrollbar(state, ev.row);
+            }
+        }
+        MouseEventKind::Up(_) => state.mouse.dragging_bar = false,
         _ => {}
     }
 }
@@ -284,6 +290,15 @@ fn handle_mouse_click(state: &mut TopState, col: u16, row: u16) {
         return;
     }
     if state.detail.is_some() {
+        if state.mouse.scrollbar.contains(col, row) {
+            state.mouse.dragging_bar = true;
+            drag_scrollbar(state, row);
+            return;
+        }
+        if state.mouse.chat.contains(col, row) {
+            toggle_fold_at(state, col, row);
+            return;
+        }
         if !state.mouse.detail.contains(col, row) {
             state.detail = None;
         }
@@ -379,6 +394,48 @@ fn handle_filter(state: &mut TopState, key: KeyEvent) -> bool {
     false
 }
 
+fn toggle_fold_at(state: &mut TopState, col: u16, row: u16) {
+    let Some(d) = state.detail.as_mut() else {
+        return;
+    };
+    let i = row.saturating_sub(state.mouse.chat.y) as usize;
+    let Some(hit) = d.hits.get(i).copied().flatten() else {
+        return;
+    };
+    let x = col.saturating_sub(state.mouse.chat.x);
+    if x < hit.x0 || x >= hit.x1 {
+        return;
+    }
+    d.tools_expanded = false;
+    if !d.open.remove(&hit.id) {
+        d.open.insert(hit.id);
+    }
+}
+
+fn drag_scrollbar(state: &mut TopState, row: u16) {
+    let Some(d) = state.detail.as_mut() else {
+        return;
+    };
+    let bar = state.mouse.scrollbar;
+    let max = d.wrap_len.saturating_sub(d.view_h);
+    let h = bar.h.max(1) as usize;
+    let y = (row.saturating_sub(bar.y) as usize).min(h.saturating_sub(1));
+    d.follow = false;
+    d.scroll = if h <= 1 { 0 } else { y * max / (h - 1) };
+}
+
+fn detail_scroll_up(d: &mut Detail, n: usize) {
+    d.follow = false;
+    d.scroll = d.scroll.saturating_sub(n);
+}
+
+fn detail_scroll_down(d: &mut Detail, n: usize) {
+    if d.follow {
+        return;
+    }
+    d.scroll = d.scroll.saturating_add(n);
+}
+
 fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
     let Some(d) = state.detail.as_mut() else {
         return false;
@@ -389,27 +446,16 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
         KeyCode::Char('2') if d.tabs.len() > 1 => d.tab = 1,
         KeyCode::Char('3') if d.tabs.len() > 2 => d.tab = 2,
         KeyCode::Char('f') | KeyCode::Char('F') => d.follow = !d.follow,
-        KeyCode::Up | KeyCode::Char('k') => {
-            d.follow = false;
-            d.scroll = d.scroll.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            d.follow = false;
-            d.scroll = d.scroll.saturating_add(1).min(d.wrap_len.saturating_sub(1));
-        }
-        KeyCode::PageUp => {
-            d.follow = false;
-            d.scroll = d.scroll.saturating_sub(16);
-        }
-        KeyCode::PageDown => {
-            d.follow = false;
-            d.scroll = d.scroll.saturating_add(16).min(d.wrap_len.saturating_sub(1));
-        }
+        KeyCode::Char('o') | KeyCode::Char('O') => d.tools_expanded = !d.tools_expanded,
+        KeyCode::Up | KeyCode::Char('k') => detail_scroll_up(d, 1),
+        KeyCode::Down | KeyCode::Char('j') => detail_scroll_down(d, 1),
+        KeyCode::PageUp => detail_scroll_up(d, 16),
+        KeyCode::PageDown => detail_scroll_down(d, 16),
         KeyCode::Home | KeyCode::Char('g') => {
             d.follow = false;
             d.scroll = 0;
         }
-        KeyCode::End | KeyCode::Char('G') => d.scroll = d.wrap_len.saturating_sub(1),
+        KeyCode::End | KeyCode::Char('G') => d.follow = true,
         _ => {}
     }
     false
