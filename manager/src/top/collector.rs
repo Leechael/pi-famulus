@@ -98,9 +98,8 @@ impl Collector {
 
     pub async fn refresh_disk(&mut self) {
         let home = self.home.clone();
-        match tokio::task::spawn_blocking(move || registry::load_all_records(&home)).await {
-            Ok(tasks) => self.disk_tasks = tasks,
-            Err(_) => {}
+        if let Ok(tasks) = tokio::task::spawn_blocking(move || registry::load_all_records(&home)).await {
+            self.disk_tasks = tasks;
         }
         self.last_disk = Some(Instant::now());
     }
@@ -189,9 +188,8 @@ impl Collector {
     async fn refresh_agents(&mut self, connected: &HashSet<String>) {
         let home = self.home.clone();
         let connected = connected.clone();
-        match tokio::task::spawn_blocking(move || inspect::load_agent_records(&home, &connected)).await {
-            Ok(agents) => self.agents = agents,
-            Err(_) => {}
+        if let Ok(agents) = tokio::task::spawn_blocking(move || inspect::load_agent_records(&home, &connected)).await {
+            self.agents = agents;
         }
     }
 

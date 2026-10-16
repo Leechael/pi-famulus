@@ -329,10 +329,8 @@ pub fn task_cols(w: WidthClass) -> &'static [Col] {
 /// the total (unlike `inspect::sum_agent_field`'s strict `try_fold`).
 pub fn sum_partial(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
     let mut out = None;
-    for v in values {
-        if let Some(n) = v {
-            out = Some(out.unwrap_or(0u64).saturating_add(n));
-        }
+    for n in values.into_iter().flatten() {
+        out = Some(out.unwrap_or(0u64).saturating_add(n));
     }
     out
 }
@@ -857,10 +855,12 @@ impl TopState {
         let Some(n) = self.nodes.get(child) else {
             return false;
         };
-        if !self.in_scope(n) && self.scope != Scope::AllRetained {
-            if !n.metrics.running && self.scope == Scope::ActiveOnly {
-                return false;
-            }
+        if !self.in_scope(n)
+            && self.scope != Scope::AllRetained
+            && !n.metrics.running
+            && self.scope == Scope::ActiveOnly
+        {
+            return false;
         }
         if !self.filter.is_empty() {
             return self.subtree_matches(child);
@@ -1837,6 +1837,7 @@ mod tests {
     use crate::proto::{Origin, TaskKind};
     use std::collections::BTreeMap;
 
+    #[allow(clippy::too_many_arguments)]
     fn rec(
         id: &str,
         sid: &str,
