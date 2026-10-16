@@ -4,14 +4,15 @@
  * Type to filter, ↑↓ selects, Enter opens, Ctrl+X asks before stopping, Tab
  * switches between active/recent and the manager's complete task history.
  */
-import { DynamicBorder, keyHint, rawKeyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realClock, type Clock } from "../clock";
 import type { ManagerClient, TaskRecord } from "../manager-client";
 import { taskOutputPath } from "../config";
 import { formatConversation } from "../subagent/conversation";
 import type { SubagentRegistry } from "../subagent/registry";
 import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
-import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
+import { keyHints, notifyPlainFallback, showScrollDetail, spread, type PaneRenderer, type PaneTheme } from "./scroll-detail-view";
+import { renderConversation } from "./conversation-view";
 import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
 import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
@@ -150,20 +151,6 @@ export function formatWorkRows(
   });
 }
 
-function selectorHint(theme: { fg(color: string, text: string): string }): string {
-  try {
-    return [
-      keyHint("tui.select.up", ""),
-      keyHint("tui.select.down", ""),
-      keyHint("tui.select.confirm", "view"),
-      rawKeyHint("ctrl+x", "stop"),
-      keyHint("tui.select.cancel", "close"),
-    ].join("  ");
-  } catch {
-    return theme.fg("dim", "↑↓ select · Enter view · Ctrl+X stop · Esc close · type to filter");
-  }
-}
-
 export interface TaskListChoice {
   action: "close" | "view" | "stop" | "already-finished";
   id?: string;
@@ -286,7 +273,6 @@ async function showTaskList(
         tui.requestRender();
         scheduleAgeTick();
       });
-      const border = new DynamicBorder((text) => theme.fg("border", text));
       const pageSize = () => Math.max(1, (tui.terminal?.rows ?? 24) - 8);
       const matches = (data: string, id: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel") => {
         try { return kb.matches(data, id); } catch { return false; }
@@ -336,6 +322,8 @@ async function showTaskList(
       };
       return {
         render(width: number) {
+          const t = theme as unknown as PaneTheme;
+          const dim = (text: string) => t.fg("dim", text);
           const items = visibleItems();
           if (!items.some((item) => item.id === selectedId)) selectedId = items[0]?.id;
           const rows = groupTaskRows(items);
@@ -346,33 +334,44 @@ async function showTaskList(
           const window = rows.slice(start, start + height);
           const inner = Math.max(1, width);
           const active = items.filter(isLive).length;
-          const scopeLabel = scope === "all" ? "All" : "Active + recent";
-          const titleText = `Tasks ${selectedTask + (items.length ? 1 : 0)}/${items.length} · ${active} active · ${scopeLabel}`;
-          const title = truncateToWidth(theme.fg("accent", titleText), inner, "…");
-          const filterLine = truncateToWidth(theme.fg("dim", `Filter: ${filter || "(type to filter)"} · Tab scope`), inner, "…");
-          const hintLine = hint ? truncateToWidth(theme.fg(hint.startsWith("Already") ? "dim" : "warning", hint), inner, "…") : "";
-          const confirmLine = confirmId
-            ? truncateToWidth(theme.fg("error", `Stop ${confirmId}? Enter confirm · Esc cancel`), inner, "…")
-            : "";
+          const scopeLabel = scope === "all" ? "all history" : "active + recent";
+          const rule = t.fg("borderMuted", "─".repeat(inner));
+          const counts = `${active > 0 ? t.fg("success", `${active} active`) : dim("0 active")}${dim(` · ${items.length} shown · ${scopeLabel}`)}`;
+          const title = spread(`${t.fg("accent", "◆")} ${t.bold("Tasks")}`, counts, inner);
+          const prompt = filter
+            ? `${t.fg("accent", "›")} ${filter}${t.fg("accent", "▏")}`
+            : `${t.fg("accent", "›")} ${dim("type to filter")}`;
+          const notice = confirmId
+            ? `  ${t.bold(t.fg("error", `■ stop ${confirmId}?`))}  ${keyHints(t, [["enter", "confirm"], ["esc", "cancel"]])}`
+            : hint
+              ? `  ${t.fg(hint.startsWith("Already") || hint.startsWith("Stop requested") ? "dim" : "warning", hint)}`
+              : "";
+          const kindWidth = width >= 60 ? 8 : 0;
           const body = window.map((row) => {
-            if (row.type === "run") return truncateToWidth(theme.fg("muted", `Run ${row.runId} · ${row.count} child${row.count === 1 ? "" : "ren"}`), inner, "…");
-            const selected = row.item.id === selectedId;
-            const marker = selected ? "▸" : " ";
-            const { color, glyph } = statusGlyph(row.item.status);
-            const age = formatAge(row.item.startedAt, row.item.endedAt, clock.now());
-            const terminal = row.item.exitCode !== undefined && row.item.exitCode !== null
-              ? ` exit=${row.item.exitCode}`
-              : row.item.signal ? ` ${row.item.signal}` : row.item.endReason ? ` ${row.item.endReason}` : "";
-            const kind = width >= 60 ? `${row.item.kind.padEnd(7)} ` : "";
-            const title = row.item.error ? `${row.item.title} · ${row.item.error}` : row.item.title;
-            const prefix = row.indent ? "  " : "";
-            const text = `${prefix}${marker} ${theme.fg(color as never, glyph)} ${kind}${row.item.status.padEnd(10)} ${age.padEnd(6)}${terminal} ${title}`;
-            return fitLines(truncateToWidth(text, inner, "…"), inner);
-          }).flat();
-          const page = theme.fg("dim", `(${items.length ? selectedTask + 1 : 0}/${items.length}) PgUp/PgDn Home/End · Ctrl+X stop · Enter view`);
-          return [...border.render(inner), title, filterLine, ...(confirmLine ? [confirmLine] : []), ...(hintLine ? [hintLine] : []), ...body, page, ...border.render(inner)];
+            if (row.type === "run") {
+              return truncateToWidth(`  ${dim("▾")} ${t.fg("muted", row.runId)} ${dim(`· ${row.count} child${row.count === 1 ? "" : "ren"}`)}`, inner, "…");
+            }
+            const item = row.item;
+            const selected = item.id === selectedId;
+            const { color, glyph } = statusGlyph(item.status);
+            const age = formatAge(item.startedAt, item.endedAt, clock.now());
+            const terminal = item.exitCode !== undefined && item.exitCode !== null
+              ? `exit=${item.exitCode}`
+              : item.signal ?? item.endReason ?? "";
+            const name = item.error ? `${item.title} ${t.fg("error", `· ${item.error}`)}` : item.title;
+            const lead = (selected ? t.fg("accent", "▌") : " ") + (row.indent ? "   " : " ");
+            const kind = kindWidth ? t.fg("muted", item.kind.padEnd(kindWidth)) : "";
+            const status = t.fg(isLive(item) ? "success" : color, item.status.padEnd(10));
+            const left = `${lead}${t.fg(color, glyph)} ${kind}${status}${selected ? t.bold(name) : name}`;
+            const right = dim(`${terminal ? `${terminal}  ` : ""}${age}`);
+            return spread(left, right, inner);
+          });
+          if (body.length === 0) body.push(`  ${dim(filter ? "No task matches the filter." : "No background tasks.")}`);
+          const place = items.length ? dim(`${selectedTask + 1} of ${items.length}`) : "";
+          const keys = keyHints(t, [["↑↓", "select"], ["enter", "open"], ["ctrl+x", "stop"], ["tab", "scope"], ["esc", "close"]]);
+          return [rule, title, prompt, ...(notice ? [truncateToWidth(notice, inner, "…")] : []), "", ...body, "", spread(`  ${keys}`, place, inner), rule];
         },
-        invalidate() { border.invalidate(); },
+        invalidate() {},
         handleInput(data: string) {
           const items = visibleItems();
           const current = items[selectedIndex(items, selectedId)];
@@ -503,6 +502,13 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
       const turns = conversation();
       return turns.length > 0 ? formatConversation(turns) : item.prompt ? `Task prompt:\n${item.prompt}` : "(no conversation yet)";
     };
+    const thread: PaneRenderer = {
+      render(width, theme, state) {
+        const turns = conversation();
+        const shown = turns.length > 0 ? turns : item.prompt ? [{ role: "user", text: item.prompt }] : [];
+        return renderConversation(shown, width, theme, state);
+      },
+    };
     const resultText = () => {
       const latest = [...conversation()].reverse().find((turn) => turn.role === "assistant")?.text;
       return latest ?? item.text ?? "(no result yet)";
@@ -510,9 +516,9 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
     const infoText = () => taskDetailInfo(deps.getIndex()?.get(item.id) ?? item, clock.now());
     try {
       await showScrollDetail(ctx.ui, {
-        title: `subagent ${item.title}`,
+        title: `subagent · ${item.title}`,
         tabs: {
-          conversation: conversationText,
+          conversation: thread,
           result: resultText,
           info: infoText,
         },
@@ -530,7 +536,7 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
   const infoText = tabs.info;
   try {
     await showScrollDetail(ctx.ui, {
-      title: `${item.kind} ${item.title}`,
+      title: `${item.kind} · ${item.title}`,
       tabs,
       pollMs: 500,
       clock: deps.clock,
