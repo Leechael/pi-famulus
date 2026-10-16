@@ -45,6 +45,97 @@ pub fn is_startup_crash(exit_code: Option<i32>, output_size: u64, output: &[u8])
         && mentions_msys_startup_failure(output)
 }
 
+/// Executable names that are the posix shell itself rather than the
+/// command: the configured shell (Git's `bin\bash.exe` is a launcher that
+/// starts `usr\bin\bash.exe`, same name), `bash.exe` and `sh.exe`.
+pub fn is_shell_image(name: &str, shell_program: &str) -> bool {
+    let shell = shell_program.rsplit(['\\', '/']).next().unwrap_or(shell_program);
+    name.eq_ignore_ascii_case(shell)
+        || name.eq_ignore_ascii_case("bash.exe")
+        || name.eq_ignore_ascii_case("sh.exe")
+}
+
+/// Where a task's start-up stands, from its job's processes other than the
+/// runner (`names`: image names, None when one could not be queried).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum StartPhase {
+    /// No shell process yet (the runner has not started it).
+    NotStarted,
+    /// Only shell processes: MSYS is still initializing, or the command is
+    /// shell builtins only.
+    ShellOnly,
+    /// A process other than the shell runs: the shell is up and ran the
+    /// command (or one could not be identified; assume it is past start-up).
+    Running,
+}
+
+pub fn start_phase(names: &[Option<String>], shell_program: &str) -> StartPhase {
+    if names.is_empty() {
+        return StartPhase::NotStarted;
+    }
+    let only_shell = names
+        .iter()
+        .all(|n| n.as_deref().is_some_and(|n| is_shell_image(n, shell_program)));
+    if only_shell {
+        StartPhase::ShellOnly
+    } else {
+        StartPhase::Running
+    }
+}
+
+/// Windows: one posix-shell start at a time.
+///
+/// The race needs two MSYS processes initializing the shared section at
+/// once, so a task's shell is only released (its gate written) when no other
+/// task's shell is still starting. A start counts as done when a process
+/// other than the shell appears in its job (the shell ran the command), the
+/// shell exits, or `START_HOLD_MAX` passes (a builtin-only command, or a
+/// start that hangs anyway, must not stall every later task).
+#[cfg(windows)]
+pub mod serialize {
+    use super::{start_phase, StartPhase};
+    use std::time::{Duration, Instant};
+
+    static STARTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    /// Longest one start holds back the next.
+    pub const START_HOLD_MAX: Duration = Duration::from_millis(500);
+    const POLL: Duration = Duration::from_millis(10);
+
+    /// Start-up phase of the task led by `runner_pid`, or None once its job
+    /// has no process left.
+    pub fn phase(runner_pid: u32) -> Option<StartPhase> {
+        let members = crate::sys::group_members(runner_pid).ok()?;
+        if members.is_empty() {
+            return None;
+        }
+        let names: Vec<Option<String>> = members
+            .into_iter()
+            .filter(|p| *p != runner_pid)
+            .map(crate::sys::image_name)
+            .collect();
+        Some(start_phase(&names, &crate::sys::task_shell().program.to_string_lossy()))
+    }
+
+    /// Run `release` (writes the runner's gate, which starts the shell) once
+    /// no other start is in progress, then hold the turn until this start is
+    /// done.
+    pub async fn start(runner_pid: u32, release: impl std::future::Future<Output = ()>) {
+        let _turn = STARTS.acquire().await.ok();
+        release.await;
+        let t0 = Instant::now();
+        let mut seen_shell = false;
+        while t0.elapsed() < START_HOLD_MAX {
+            match phase(runner_pid) {
+                None | Some(StartPhase::Running) => return,
+                Some(StartPhase::ShellOnly) => seen_shell = true,
+                Some(StartPhase::NotStarted) if seen_shell => return, // shell exited
+                Some(StartPhase::NotStarted) => {}
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+}
+
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -54,6 +145,17 @@ mod tests {
     use super::*;
 
     const FATAL: &[u8] = b"     24 [main] bash (10372) C:\\Program Files\\Git\\bin\\..\\usr\\bin\\bash.exe: *** fatal error - add_item (\"\\??\\C:\\Program Files\\Git\", \"/\", ...) failed, errno 1\n";
+
+    #[test]
+    fn start_phases() {
+        let git = r"C:\Program Files\Git\bin\bash.exe";
+        let n = |v: &[&str]| v.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(start_phase(&[], git), StartPhase::NotStarted);
+        assert_eq!(start_phase(&n(&["bash.exe", "BASH.EXE"]), git), StartPhase::ShellOnly);
+        assert_eq!(start_phase(&n(&["bash.exe", "python.exe"]), git), StartPhase::Running);
+        assert_eq!(start_phase(&[Some("bash.exe".into()), None], git), StartPhase::Running);
+        assert_eq!(start_phase(&n(&["zsh.exe"]), r"C:\tools\zsh.exe"), StartPhase::ShellOnly);
+    }
 
     #[test]
     fn crash_codes() {

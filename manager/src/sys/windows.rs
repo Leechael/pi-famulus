@@ -257,21 +257,26 @@ fn job_members(job: HANDLE) -> io::Result<Vec<u32>> {
 }
 
 fn is_console_host(pid: u32) -> bool {
+    image_name(pid).is_some_and(|n| n.eq_ignore_ascii_case("conhost.exe"))
+}
+
+/// File name of `pid`'s executable (`bash.exe`), or None when it cannot be
+/// queried (gone, or access denied).
+pub fn image_name(pid: u32) -> Option<String> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() || h == INVALID_HANDLE_VALUE {
-            return false;
+            return None;
         }
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
         CloseHandle(h);
         if ok == 0 {
-            return false;
+            return None;
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
-        let name = path.rsplit(['\\', '/']).next().unwrap_or("");
-        name.eq_ignore_ascii_case("conhost.exe")
+        Some(path.rsplit(['\\', '/']).next().unwrap_or("").to_string())
     }
 }
 
