@@ -349,6 +349,9 @@ pub struct Metrics {
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
     pub tok_s: Option<f64>,
+    /// Output tokens and LLM ms summed only over agents that have both; the
+    /// source of `tok_s` on run / session roll-ups.
+    pub rate: Option<(u64, u64)>,
     pub cache_r: Option<u64>,
     pub cache_w: Option<u64>,
     pub llm_ms: Option<u64>,
@@ -747,7 +750,9 @@ impl TopState {
             cpu_tot: (tot.measured > 0).then(|| tot.cpu_ms()),
             tokens_in,
             tokens_out,
-            tok_s: inspect::agent_output_tokens_per_second(tokens_out, llm),
+            tok_s: inspect::pooled_output_tokens_per_second(
+                agents_for_tokens.clone().map(|a| inspect::rate_pair(a.tokens_output, a.llm_ms)),
+            ),
             llm_share: share(llm),
             tool_share: share(tool),
             queue_share: share(queue),
@@ -1468,6 +1473,7 @@ fn agent_node(a: &AgentRecord, session: Option<&SessionView>, now: u64) -> Node 
             tokens_in: a.tokens_input,
             tokens_out: a.tokens_output,
             tok_s: inspect::agent_output_tokens_per_second(a.tokens_output, a.llm_ms),
+            rate: inspect::rate_pair(a.tokens_output, a.llm_ms),
             cache_r: a.tokens_cache_read,
             cache_w: a.tokens_cache_write,
             llm_ms: a.llm_ms,
@@ -1567,6 +1573,7 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
             n.metrics.tokens_in,
             n.metrics.tokens_out,
             n.metrics.tok_s,
+            n.metrics.rate,
             n.metrics.cache_r,
             n.metrics.cache_w,
             n.metrics.llm_ms,
@@ -1578,11 +1585,12 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
         )
     });
     let mut m = Metrics::default();
-    if let Some((tin, tout, toks, cr, cw, llm, tool, queue, running, started, wall)) = own_tokens {
+    if let Some((tin, tout, toks, rate, cr, cw, llm, tool, queue, running, started, wall)) = own_tokens {
         if kind == NodeKind::Agent {
             m.tokens_in = tin;
             m.tokens_out = tout;
             m.tok_s = toks;
+            m.rate = rate;
             m.cache_r = cr;
             m.cache_w = cw;
             m.llm_ms = llm;
@@ -1610,6 +1618,10 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
             m.cache_r = add_partial(m.cache_r, cn.metrics.cache_r);
             m.cache_w = add_partial(m.cache_w, cn.metrics.cache_w);
             m.llm_ms = add_partial(m.llm_ms, cn.metrics.llm_ms);
+            m.rate = match (m.rate, cn.metrics.rate) {
+                (Some((t, ms)), Some((ct, cms))) => Some((t.saturating_add(ct), ms.saturating_add(cms))),
+                (a, b) => a.or(b),
+            };
             m.tool_ms = add_partial(m.tool_ms, cn.metrics.tool_ms);
             m.queue_ms = add_partial(m.queue_ms, cn.metrics.queue_ms);
         }
@@ -1622,7 +1634,7 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
         m.active_at = m.active_at.max(cn.metrics.active_at);
     }
     if kind != NodeKind::Agent {
-        m.tok_s = inspect::agent_output_tokens_per_second(m.tokens_out, m.llm_ms);
+        m.tok_s = inspect::pooled_output_tokens_per_second([m.rate]);
     }
     if let Some(n) = nodes.get_mut(id) {
         if m.running && n.kind != NodeKind::Task && n.status == "completed" {
@@ -1642,6 +1654,7 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
             n.metrics.tokens_in = m.tokens_in;
             n.metrics.tokens_out = m.tokens_out;
             n.metrics.tok_s = m.tok_s;
+            n.metrics.rate = m.rate;
             n.metrics.cache_r = m.cache_r;
             n.metrics.cache_w = m.cache_w;
             n.metrics.llm_ms = m.llm_ms;
@@ -2145,6 +2158,30 @@ mod tests {
     fn partial_token_sum_skips_missing_records() {
         assert_eq!(sum_partial([Some(10), None, Some(5)]), Some(15));
         assert_eq!(sum_partial([None, None]), None);
+    }
+
+    #[test]
+    fn tok_s_rollups_skip_agents_without_llm_time() {
+        // 1000 out over 10 s = 100 tok/s. The second agent has tokens but an
+        // unmeasured (0 / missing) LLM time; it must not add tokens alone.
+        let mut fast = agent("ch_a", "sessA", "run_1", "a", "running", Some(5_000));
+        fast.tokens_output = Some(1_000);
+        fast.llm_ms = Some(10_000);
+        let mut zero = agent("ch_b", "sessA", "run_1", "b", "running", Some(5_000));
+        zero.tokens_output = Some(9_000);
+        zero.llm_ms = Some(0);
+        let mut missing = agent("ch_c", "sessA", "run_1", "c", "running", Some(5_000));
+        missing.tokens_output = Some(9_000);
+        missing.llm_ms = None;
+        let snap = snapshot(vec![], vec![fast, zero, missing], vec![("sessA", "connected")]);
+        let mut s = TopState::new(1_000, None, None);
+        s.apply(&snap, &[], &HashMap::new());
+        let run = s.nodes.values().find(|n| n.kind == NodeKind::Run).expect("run node");
+        assert_eq!(run.metrics.tok_s, Some(100.0));
+        assert_eq!(s.nodes.get(&session_key("sessA")).unwrap().metrics.tok_s, Some(100.0));
+        assert_eq!(s.header.tok_s, Some(100.0));
+        assert_eq!(s.nodes.get("ch_b").unwrap().metrics.tok_s, None);
+        assert_eq!(run.metrics.tokens_out, Some(19_000), "token totals still count every agent");
     }
 
     #[test]

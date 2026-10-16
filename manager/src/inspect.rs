@@ -87,6 +87,26 @@ pub fn agent_output_tokens_per_second(tokens_output: Option<u64>, llm_ms: Option
     }
 }
 
+/// Output tokens and LLM milliseconds from agents that have both, for a
+/// pooled rate. An agent with tokens but no LLM time (an older record, or one
+/// written before any assistant message finished) would otherwise add tokens
+/// without their time and inflate the rate.
+pub fn rate_pair(tokens_output: Option<u64>, llm_ms: Option<u64>) -> Option<(u64, u64)> {
+    match (tokens_output, llm_ms) {
+        (Some(tokens), Some(ms)) if ms > 0 => Some((tokens, ms)),
+        _ => None,
+    }
+}
+
+/// Pooled output tok/s over [`rate_pair`]s: total tokens / total LLM time.
+pub fn pooled_output_tokens_per_second(pairs: impl IntoIterator<Item = Option<(u64, u64)>>) -> Option<f64> {
+    let (tokens, ms) = pairs
+        .into_iter()
+        .flatten()
+        .fold((0u64, 0u64), |(t, m), (pt, pm)| (t.saturating_add(pt), m.saturating_add(pm)));
+    agent_output_tokens_per_second(Some(tokens), Some(ms))
+}
+
 fn token_count_label(value: Option<u64>) -> String {
     value.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into())
 }
@@ -1599,7 +1619,7 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let tokens_cache_read = sum_agent_field(&agents, |a| a.tokens_cache_read);
     let tokens_cache_write = sum_agent_field(&agents, |a| a.tokens_cache_write);
     let llm_ms = sum_agent_field(&agents, |a| a.llm_ms);
-    let tokens_per_second = agent_output_tokens_per_second(tokens_output, llm_ms);
+    let tokens_per_second = pooled_output_tokens_per_second(agents.iter().map(|a| rate_pair(a.tokens_output, a.llm_ms)));
     if json_out {
         let mut v = serde_json::to_value(&st).unwrap();
         v["agent_counts"] = json!({"running": a_running, "terminal": a_done});
