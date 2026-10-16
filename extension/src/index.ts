@@ -556,7 +556,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         return;
       }
       if (event.event === "output" && event.task_id && typeof event.chunk === "string") {
-        monitorRegistry?.handleOutput(event.task_id, event.chunk, event.next_cursor);
+        monitorRegistry?.handleOutput(event.task_id, event.chunk, event.next_cursor, event.monitor_records);
         return;
       }
       if (event.event === "task_exited" && event.task_id) {

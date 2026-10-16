@@ -4,6 +4,10 @@
 
 <!--seg:wake.lead-in-->System wake — not a new user message. Handle this <pi-famulus-wake> before other work.<!--/seg-->
 
+# monitor: output-hint
+
+Read original bytes with task_output using this monitor id and cursor-start, with a bounded max_bytes (for example 8192); next_cursor continues the read. The range may include interleaved events. A preview is not the full log.
+
 # handover: changed-active
 
 Its result arrives as a new wake when it finishes.

@@ -67,7 +67,7 @@ describe("LineBatcher", () => {
     const { batches, batcher } = collect({ maxLineChars: 5 });
     batcher.push("1234567890\n");
     clock.advanceBy(200);
-    expect(batches).toEqual(["12345"]);
+    expect(batches).toEqual(["12…90"]);
     batcher.dispose();
   });
 
@@ -77,7 +77,8 @@ describe("LineBatcher", () => {
     clock.advanceBy(200);
     expect(batches).toHaveLength(1);
     expect(batches[0].length).toBe(10);
-    expect(batches[0].startsWith("…")).toBe(true);
+    expect(batches[0].startsWith("aaaa")).toBe(true);
+    expect(batches[0]).toContain("…");
     expect(batches[0].endsWith("cccc")).toBe(true);
     batcher.dispose();
   });

@@ -8,6 +8,7 @@ import {
   formatFamulusWake,
   shellWakeTitle,
   type FamulusWake,
+  type MonitorOutputInfo,
   wakeDuration,
   type FormattedWake,
   type OverrunShell,
@@ -179,7 +180,7 @@ export function formatMonitorEvent(
   taskId: string,
   batchText: string,
   status?: string,
-  extras: { eventCount?: number; droppedLines?: number } = {},
+  extras: { eventCount?: number; droppedLines?: number; output?: MonitorOutputInfo } = {},
 ): FormattedWake {
   return formatFamulusWake({
     kind: "monitor",
@@ -189,6 +190,7 @@ export function formatMonitorEvent(
     event: batchText,
     ...(extras.eventCount !== undefined ? { eventCount: extras.eventCount } : {}),
     ...(extras.droppedLines !== undefined ? { droppedLines: extras.droppedLines } : {}),
+    ...(extras.output ? { output: extras.output } : {}),
   });
 }
 
