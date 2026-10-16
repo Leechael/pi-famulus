@@ -209,7 +209,6 @@ async fn handle_event(state: &mut TopState, ev: Event, home: &Path) -> Result<bo
             handle_mouse(state, mouse);
             Ok(false)
         }
-        Event::Resize(_, _) => Ok(false),
         _ => Ok(false),
     }
 }
@@ -217,6 +216,10 @@ async fn handle_event(state: &mut TopState, ev: Event, home: &Path) -> Result<bo
 async fn handle_key(state: &mut TopState, key: KeyEvent, home: &Path) -> Result<bool, String> {
     if key.kind != KeyEventKind::Press {
         return Ok(false);
+    }
+    // Ctrl+C quits from anywhere, overlays and prompts included.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+        return Ok(true);
     }
     if state.confirm_stop.is_some() {
         return handle_confirm(state, key, home).await;
@@ -233,7 +236,7 @@ async fn handle_key(state: &mut TopState, key: KeyEvent, home: &Path) -> Result<
     if state.detail.is_some() {
         return Ok(handle_detail(state, key));
     }
-    handle_main(state, key, home).await
+    handle_main(state, key).await
 }
 
 async fn handle_confirm(state: &mut TopState, key: KeyEvent, home: &Path) -> Result<bool, String> {
@@ -255,7 +258,10 @@ async fn handle_confirm(state: &mut TopState, key: KeyEvent, home: &Path) -> Res
 }
 
 fn handle_mouse(state: &mut TopState, ev: MouseEvent) {
+    // The wheel never moves the table under the help or stop prompt.
+    let blocked = state.help || state.confirm_stop.is_some();
     match ev.kind {
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if blocked => {}
         MouseEventKind::ScrollDown => {
             if let Some(d) = state.detail.as_mut() {
                 detail_scroll_down(d, 3);
@@ -304,9 +310,6 @@ fn handle_mouse_click(state: &mut TopState, col: u16, row: u16) {
         if state.mouse.chat.contains(col, row) {
             toggle_fold_at(state, col, row);
             return;
-        }
-        if !state.mouse.detail.contains(col, row) {
-            state.detail = None;
         }
         return;
     }
@@ -397,7 +400,11 @@ fn toggle_fold_at(state: &mut TopState, col: u16, row: u16) {
     if x < hit.x0 || x >= hit.x1 {
         return;
     }
-    d.tools_expanded = false;
+    // Leaving "unfold all" by clicking one block folds only that block.
+    if d.tools_expanded {
+        d.tools_expanded = false;
+        d.open = (0..d.fold_count).collect();
+    }
     if !d.open.remove(&hit.id) {
         d.open.insert(hit.id);
     }
@@ -512,10 +519,9 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
     false
 }
 
-async fn handle_main(state: &mut TopState, key: KeyEvent, home: &Path) -> Result<bool, String> {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-        return Ok(true);
-    }
+async fn handle_main(state: &mut TopState, key: KeyEvent) -> Result<bool, String> {
+    // A status message lasts until the next key; the key may set a new one.
+    state.message = None;
     if (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')))
         || key.code == KeyCode::F(9)
     {
@@ -551,11 +557,17 @@ async fn handle_main(state: &mut TopState, key: KeyEvent, home: &Path) -> Result
             state.message = None;
         }
         KeyCode::Esc if !state.filter.is_empty() => state.set_filter(String::new()),
+        KeyCode::Esc if state.events_id.is_some() => {
+            state.events_id = None;
+            state.recompute_visible();
+        }
         KeyCode::Char('v') => {
             if crate::top::model::height_class(crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24))
                 != crate::top::model::HeightClass::Short
             {
                 state.preview = !state.preview;
+            } else {
+                state.message = Some("preview needs a taller terminal (20+ rows); Enter opens the detail".into());
             }
         }
         KeyCode::Enter => {
@@ -571,7 +583,6 @@ async fn handle_main(state: &mut TopState, key: KeyEvent, home: &Path) -> Result
         KeyCode::Char('?') => state.help = true,
         _ => {}
     }
-    let _ = home;
     Ok(false)
 }
 
@@ -653,6 +664,7 @@ mod tests {
             open: HashSet::new(),
             hits: Vec::new(),
             log: LogView::default(),
+            fold_count: 0,
         }
     }
 
@@ -687,6 +699,19 @@ mod tests {
         assert!(state.detail.as_ref().is_some_and(|d| d.log.query.is_empty()), "first esc clears the search");
         handle_detail(&mut state, key(KeyCode::Esc));
         assert!(state.detail.is_none(), "second esc closes");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_quits_from_a_detail_and_messages_clear_on_the_next_key() {
+        let home = std::env::temp_dir();
+        let mut state = TopState::new(1_000, None, None);
+        state.detail = Some(log_detail());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut state, ctrl_c, &home).await.unwrap());
+        state.detail = None;
+        state.message = Some("stopped sh_x".into());
+        assert!(!handle_key(&mut state, key(KeyCode::Down), &home).await.unwrap());
+        assert_eq!(state.message, None);
     }
 
     #[test]

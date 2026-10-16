@@ -1,11 +1,12 @@
 //! Ratatui drawing for interactive `top`. Pure function of [`TopState`] and
 //! the frame `Rect`; no I/O.
 //!
-//! Visual language: no boxed panels on the main screen, dim labels next to
-//! bright values, color reserved for status glyphs and the accent. The agent
-//! chat is a thread: user turns hang off an accent rail, assistant text is
-//! plain, and tools / thinking are one-line rows that unfold in place under a
-//! thin rule.
+//! Visual language (btop-like): rounded boxes with colored borders, titles
+//! and hotkeys cut into the border as `┐title┌`, key hints as `┘key label└`
+//! in the bottom border, dim labels beside bright values, and color kept for
+//! status and load. The agent chat is a thread: parent messages hang off an
+//! accent rail, the child's output opens with `● agent`, and tools / thinking
+//! are one-line rows that unfold in place under a thin rule.
 
 use crate::fmt;
 use crate::inspect::TranscriptTurn;
@@ -88,17 +89,83 @@ fn split_line(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: us
     left
 }
 
-/// `key label` pairs for footers: key bright, label dim.
-fn hints(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
-    let mut out = Vec::new();
-    for (i, (k, l)) in pairs.iter().enumerate() {
-        if i > 0 {
-            out.push(Span::raw("  "));
-        }
-        out.push(sp(fg(MUTED).add_modifier(Modifier::BOLD), *k));
-        out.push(sp(fg(DIM), format!(" {l}")));
+/// `┘key label└`: the one key-hint style, used in every bottom border.
+/// First 12 columns of an id for compact labels.
+fn short(id: &str) -> String {
+    fmt::truncate_width(id, 12)
+}
+
+/// `1 line`, `24 lines`.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
     }
-    out
+}
+
+fn key_seg(k: &str, l: &str) -> Vec<Span<'static>> {
+    seg_bottom(BOX_MAIN, vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), k.to_string()), sp(fg(MUTED), format!(" {l}"))])
+}
+
+/// A hint and its priority: 0 always stays, higher numbers drop first.
+type Key<'a> = (&'a str, &'a str, u8);
+
+/// `prefix` (a prompt or message) then as many key hints as fit in `room`,
+/// dropping the least important first but keeping display order.
+fn fit_keys(prefix: Vec<Span<'static>>, keys: &[Key], room: usize) -> Vec<Span<'static>> {
+    let mut keep: Vec<bool> = vec![true; keys.len()];
+    let width = |keep: &[bool]| {
+        spans_width(&prefix)
+            + keys.iter().zip(keep).filter(|(_, k)| **k).map(|((k, l, _), _)| spans_width(&key_seg(k, l))).sum::<usize>()
+    };
+    while width(&keep) > room {
+        let drop = keys
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, _, p))| keep[*i] && *p > 0)
+            .max_by_key(|(i, (_, _, p))| (*p, *i))
+            .map(|(i, _)| i);
+        match drop {
+            Some(i) => keep[i] = false,
+            None => break,
+        }
+    }
+    let mut out = prefix;
+    for ((k, l, _), on) in keys.iter().zip(&keep) {
+        if *on {
+            out.extend(key_seg(k, l));
+        }
+    }
+    fit_spans(out, room)
+}
+
+/// Right-hand pill on a detail: scroll position when scrolled back,
+/// `● following` while live at the end, nothing otherwise.
+fn pos_pill(follow: bool, running: bool, len: usize, height: usize, scroll: usize) -> Vec<Span<'static>> {
+    if !follow && len > height {
+        let max = len - height;
+        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(DIM), format!("{}%", scroll * 100 / max.max(1)))]))
+    } else if follow && running {
+        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(OK), "● "), sp(fg(MUTED), "following")]))
+    } else {
+        Vec::new()
+    }
+}
+
+/// Full-screen detail frame: title, pill (dropped when it would collide),
+/// and the bottom-border keys.
+fn detail_block(title: &str, pill: Vec<Span<'static>>, prefix: Vec<Span<'static>>, keys: &[Key], width: u16) -> Block<'static> {
+    let w = width as usize;
+    let block = panel(title);
+    let title_w = fmt::display_width(title) + 6;
+    let block = if !pill.is_empty() && title_w + spans_width(&pill) + 2 <= w {
+        block.title_top(Line::from(pill).right_aligned())
+    } else {
+        block
+    };
+    let bottom = lead(BOX_MAIN, fit_keys(prefix, keys, w.saturating_sub(4)));
+    block.title_bottom(Line::from(bottom))
 }
 
 // ── screen ─────────────────────────────────────────────────────────────────
@@ -266,10 +333,12 @@ fn interval_text(ms: u64) -> String {
 /// Compact two-line header for short terminals: no boxes.
 fn brand_line(state: &TopState, width: usize) -> Line<'static> {
     let h = &state.header;
+    // The version goes first when the live pill would not fit.
+    let version = if 50 + h.version.len() <= width { format!(" {}", h.version) } else { String::new() };
     let mut left = vec![
         sp(fg(ACCENT).add_modifier(Modifier::BOLD), " ◆ "),
         sp(bold(), "pi-famulus"),
-        sp(fg(DIM), format!(" {}", h.version)),
+        sp(fg(DIM), version),
         sp(fg(DIM), "   sessions "),
         sp(fg(MUTED), format!("{}", h.sessions_conn)),
         sp(fg(DIM), format!("/{}", h.sessions_tot)),
@@ -356,7 +425,7 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
     // rather than let them overwrite each other.
     let room = (area.width as usize).saturating_sub(4);
     let pill = trail(BOX_OVERVIEW, seg(BOX_OVERVIEW, live_pill(state)));
-    let mut title = lead(BOX_OVERVIEW, titled_seg(BOX_OVERVIEW, "¹", "pi-famulus"));
+    let mut title = lead(BOX_OVERVIEW, titled_seg(BOX_OVERVIEW, "", "pi-famulus"));
     let versioned = {
         let mut t = title.clone();
         t.insert(t.len() - 1, sp(fg(DIM), format!(" {}", h.version)));
@@ -389,15 +458,24 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
     agents.push(unit(format!("/{}", h.sessions_tot).as_str()));
     rows.push(stat_row("agents", agents));
 
+    let narrow = w < 70;
     let mut tasks = sparkline(&state.run_hist, graph_w, 1.0);
     tasks.extend([
         Span::raw(" "),
         running_count(h.tasks_run),
-        unit(" running · "),
+        unit(if narrow { " run · " } else { " running · " }),
         val(h.tasks_sh.to_string()),
-        unit(" shells · "),
+        unit(match (narrow, h.tasks_sh == 1) {
+            (true, _) => " sh · ",
+            (false, true) => " shell · ",
+            (false, false) => " shells · ",
+        }),
         val(h.tasks_ag.to_string()),
-        unit(" agents"),
+        unit(match (narrow, h.tasks_ag == 1) {
+            (true, _) => " ag",
+            (false, true) => " agent",
+            (false, false) => " agents",
+        }),
     ]);
     rows.push(stat_row("tasks", tasks));
 
@@ -419,7 +497,7 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
             val(compact_num(h.tokens_out.unwrap_or(0))),
             unit(" out · "),
             val(h.tok_s.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into())),
-            unit(" tok/s per agent"),
+            unit(if narrow { " tok/s" } else { " tok/s per agent" }),
         ],
     ));
     let (llm, tool, queue) = (h.llm_share.unwrap_or(0), h.tool_share.unwrap_or(0), h.queue_share.unwrap_or(0));
@@ -439,17 +517,38 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
 }
 
 fn draw_kinds(frame: &mut Frame, area: Rect, state: &TopState) {
-    let block = panel_box(BOX_KINDS).title(Line::from(lead(BOX_KINDS, titled_seg(BOX_KINDS, "²", "work kinds"))));
+    let block = panel_box(BOX_KINDS).title(Line::from(lead(BOX_KINDS, titled_seg(BOX_KINDS, "", "work kinds"))));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let w = inner.width as usize;
+    // Columns drop whole, least useful first, rather than clipping mid-word:
+    // kind 12 + slots 10 always; now 7, tasks 6, wall 8, cpu 7 while they fit.
+    let mut room = w.saturating_sub(22);
+    let mut take = |n: usize| {
+        let ok = room >= n;
+        if ok {
+            room -= n;
+        }
+        ok
+    };
+    let (show_now, show_tasks, show_wall, show_cpu) = (take(7), take(6), take(8), take(7));
     let kinds = &state.header.work_kinds;
-    let mut lines = vec![Line::from(fit_spans(
-        vec![sp(fg(MUTED), format!(" {:<11} {:<9} {:>5} {:>7} {:>6} {:>6}", "kind", "slots", "tasks", "wall", "cpu", "now"))],
-        w,
-    ))];
-    let room = (inner.height as usize).saturating_sub(1);
-    let shown = if kinds.len() > room { room.saturating_sub(1) } else { kinds.len() };
+    let mut head = format!(" {:<11} {:<9}", "kind", "slots");
+    if show_tasks {
+        head.push_str(&format!("{:>5}", "tasks"));
+    }
+    if show_wall {
+        head.push_str(&format!(" {:>7}", "wall"));
+    }
+    if show_cpu {
+        head.push_str(&format!(" {:>6}", "cpu"));
+    }
+    if show_now {
+        head.push_str(&format!(" {:>6}", "now"));
+    }
+    let mut lines = vec![Line::from(fit_spans(vec![sp(fg(MUTED), head)], w))];
+    let rows_room = (inner.height as usize).saturating_sub(1);
+    let shown = if kinds.len() > rows_room { rows_room.saturating_sub(1) } else { kinds.len() };
     for k in kinds.iter().take(shown) {
         let mut row = vec![sp(fg(if k.used > 0 { TEXT } else { MUTED }), format!(" {:<11} ", fmt::truncate_width(&k.kind, 11)))];
         if k.total > 0 {
@@ -459,16 +558,24 @@ fn draw_kinds(frame: &mut Frame, area: Rect, state: &TopState) {
             // No budget: monitors never wait for a slot.
             row.push(sp(fg(DIM), format!("{:<9}", "-")));
         }
-        row.push(val(format!("{:>5}", k.tasks)));
-        row.push(val(format!(" {:>7}", fmt::human_duration(k.wall_ms))));
-        row.push(match k.cpu_ms {
-            Some(c) => val(format!(" {:>6}", fmt::human_duration(c))),
-            None => sp(fg(DIM), format!(" {:>6}", "-")),
-        });
-        row.push(match k.cpu_now.filter(|p| *p > 0.0) {
-            Some(p) => sp(fg(grad((p / 400.0).min(1.0))), format!(" {:>6}", format!("{p:.0}%"))),
-            None => sp(fg(DIM), format!(" {:>6}", "-")),
-        });
+        if show_tasks {
+            row.push(val(format!("{:>5}", k.tasks)));
+        }
+        if show_wall {
+            row.push(val(format!(" {:>7}", fmt::human_duration(k.wall_ms))));
+        }
+        if show_cpu {
+            row.push(match k.cpu_ms {
+                Some(c) => val(format!(" {:>6}", fmt::human_duration(c))),
+                None => sp(fg(DIM), format!(" {:>6}", "-")),
+            });
+        }
+        if show_now {
+            row.push(match k.cpu_now.filter(|p| *p > 0.0) {
+                Some(p) => sp(fg(grad((p / 400.0).min(1.0))), format!(" {:>6}", format!("{p:.0}%"))),
+                None => sp(fg(DIM), format!(" {:>6}", "-")),
+            });
+        }
         lines.push(Line::from(fit_spans(row, w)));
     }
     if shown < kinds.len() {
@@ -495,6 +602,12 @@ fn tab_segments(state: &TopState) -> (Vec<Span<'static>>, Vec<(u16, u16, TabHit)
             Tab::Tasks => ("tasks", Some(state.count_tab(Tab::Tasks))),
             Tab::Events => ("events", None),
         };
+        // `e` narrows events to one id; say so, Esc clears it.
+        let name = match (&state.events_id, tab) {
+            (Some(id), Tab::Events) => format!("events for {}", short(id)),
+            _ => name.to_string(),
+        };
+        let name = name.as_str();
         let active = state.tab == tab;
         let mut body = vec![sp(fg(HOT), ["¹", "²", "³", "⁴"][i].to_string())];
         body.push(if active {
@@ -531,39 +644,43 @@ fn scope_sort_segments(state: &TopState) -> (Vec<Span<'static>>, usize, usize) {
     (trail(BOX_MAIN, spans), sw, tw)
 }
 
-/// Bottom border: the live prompt (stop confirm / filter / message) or key
-/// hints on the left, `n/total` on the right.
-fn bottom_segments(state: &TopState) -> Vec<Span<'static>> {
-    let key = |k: &str, l: &str| {
-        seg_bottom(BOX_MAIN, vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), k.to_string()), sp(fg(MUTED), format!(" {l}"))])
-    };
+/// Bottom border: the live prompt (stop confirm / filter / message) and
+/// the keys that apply to this tab, fitted to `room`.
+fn bottom_segments(state: &TopState, room: usize) -> Vec<Span<'static>> {
     if let Some(id) = &state.confirm_stop {
-        let mut s = seg_bottom(BOX_MAIN, vec![sp(fg(ERR).add_modifier(Modifier::BOLD), format!("■ stop {id}?"))]);
-        s.extend(key("y", "confirm"));
-        s.extend(key("n", "cancel"));
-        return s;
+        let prefix = seg_bottom(BOX_MAIN, vec![sp(fg(ERR).add_modifier(Modifier::BOLD), format!("■ stop {id}?"))]);
+        return fit_keys(prefix, &[("y ⏎", "confirm", 0), ("n esc", "cancel", 0)], room);
     }
     if state.filter_editing {
-        let mut s = seg_bottom(
+        let prefix = seg_bottom(
             BOX_MAIN,
             vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), state.filter.clone()), sp(fg(ACCENT), "▏")],
         );
-        s.extend(key("enter", "apply"));
-        s.extend(key("esc", "clear"));
-        return s;
+        return fit_keys(prefix, &[("enter", "apply", 0), ("esc", "clear", 0)], room);
     }
-    let mut s = Vec::new();
+    let mut prefix = Vec::new();
     if !state.filter.is_empty() {
-        s.extend(seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), state.filter.clone())]));
+        prefix.extend(seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), state.filter.clone())]));
     }
     if let Some(m) = &state.message {
-        s.extend(seg_bottom(BOX_MAIN, vec![sp(fg(WARN), m.clone())]));
-        return s;
+        prefix.extend(seg_bottom(BOX_MAIN, vec![sp(fg(WARN), m.clone())]));
     }
-    for (k, l) in [("↑↓", "select"), ("⏎", "open"), ("←→", "fold"), ("v", "preview"), ("a", "scope"), ("s", "sort"), ("/", "filter"), ("x", "stop"), ("?", "help"), ("q", "quit")] {
-        s.extend(key(k, l));
+    let mut keys: Vec<Key> = vec![("↑↓", "select", 3)];
+    if state.tab != Tab::Events {
+        keys.push(("⏎", "open", 1));
     }
-    s
+    if state.tab == Tab::Tree {
+        keys.push(("←→", "fold", 4));
+    }
+    if state.tab != Tab::Events {
+        keys.push(("v", "preview", 6));
+    }
+    keys.extend([("a", "scope", 5), ("s", "sort", 5), ("/", "filter", 2)]);
+    if state.tab != Tab::Events {
+        keys.push(("x", "stop", 6));
+    }
+    keys.extend([("?", "help", 0), ("q", "quit", 0)]);
+    fit_keys(prefix, &keys, room)
 }
 
 fn position(state: &TopState) -> Vec<Span<'static>> {
@@ -590,12 +707,12 @@ fn draw_workspace(frame: &mut Frame, area: Rect, state: &mut TopState, wclass: W
         hits.push(((rx + scope_w) as u16, (rx + scope_w + sort_w) as u16, TabHit::Sort));
         block = block.title(Line::from(right).right_aligned());
     }
-    let bottom = lead(BOX_MAIN, bottom_segments(state));
+    // The position always shows; hints fit in what is left.
     let pos = trail(BOX_MAIN, position(state));
-    if spans_width(&bottom) + spans_width(&pos) + 4 <= width {
-        block = block.title_bottom(Line::from(pos).right_aligned());
-    }
-    block = block.title_bottom(Line::from(fit_spans(bottom, width.saturating_sub(2))));
+    let room = width.saturating_sub(spans_width(&pos) + 5);
+    let bottom = lead(BOX_MAIN, bottom_segments(state, room));
+    block = block.title_bottom(Line::from(pos).right_aligned());
+    block = block.title_bottom(Line::from(bottom));
     state.mouse.tabs = HitRect::from_xywh(area.x, area.y, area.width, 1);
     state.mouse.tab_hits = hits;
     let inner = block.inner(area);
@@ -749,8 +866,8 @@ fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
 fn draw_preview(frame: &mut Frame, area: Rect, state: &TopState) {
     let mut body = vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), "preview")];
     if let Some(n) = state.selected_node() {
-        body.push(sp(fg(MUTED), format!(" {}", n.label)));
-        body.push(sp(fg(DIM), format!(" {}", n.id)));
+        body.push(sp(fg(DIM), " · "));
+        body.push(sp(fg(MUTED), format!("{} · {}", n.id, n.label)));
     }
     let block = panel_box(BOX_PREVIEW)
         .title(Line::from(fit_spans(lead(BOX_PREVIEW, seg(BOX_PREVIEW, body)), area.width.saturating_sub(2) as usize)));
@@ -765,27 +882,38 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &TopState) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Help rows; a row with an empty key is a section heading.
 const HELP: &[(&str, &str)] = &[
-    ("1 2 3 4  Tab", "switch view"),
-    ("↑↓  j k", "move"),
-    ("←→  h l", "fold / unfold"),
-    ("z", "expand all"),
+    ("", "main"),
+    ("1 2 3 4  Tab", "tree · agents · tasks · events"),
+    ("↑↓ j k  PgUp PgDn", "move"),
     ("g G  Home End", "top / bottom"),
-    ("Enter", "open detail"),
+    ("←→ h l  z", "fold · unfold · all"),
+    ("Enter  dbl-click", "open detail"),
     ("v", "preview pane"),
     ("e", "events for selection"),
     ("a", "cycle scope"),
-    ("s S  < >", "cycle sort"),
-    ("I", "invert sort"),
-    ("/", "filter"),
-    ("p  Space", "pause"),
-    ("+ -", "refresh interval"),
-    ("x  Ctrl+X  F9", "stop task"),
-    ("o  click ▸", "unfold tools & thinking"),
-    ("/  n N", "search task output"),
-    ("&  b", "filter mode · blank lines"),
-    ("Esc", "close overlay"),
+    ("s >  S <  I", "sort next · prev · invert"),
+    ("/", "filter rows"),
+    ("p Space  + -", "pause · refresh rate"),
+    ("x  Ctrl+X  F9", "stop task (y or ⏎)"),
+    ("Esc", "clear filter / events"),
     ("q  Ctrl+C", "quit"),
+    ("", "detail"),
+    ("↑↓ j k  PgUp PgDn", "scroll"),
+    ("g G", "top / end (follows)"),
+    ("f", "follow live output"),
+    ("o  click ▸", "unfold tools & thinking"),
+    ("Esc  q", "close"),
+    ("", "task output"),
+    ("1 2  click", "output · stderr"),
+    ("/  n N", "search · next · prev"),
+    ("&  Tab", "filter or highlight"),
+    ("b", "show blank lines"),
+    ("", "mouse"),
+    ("click  wheel", "select · scroll"),
+    ("tabs · scope · sort", "click to switch"),
+    ("scrollbar", "drag in detail"),
 ];
 
 /// Overlay panel in the main box's color, title cut into the border.
@@ -796,78 +924,66 @@ fn panel(title: &str) -> Block<'static> {
     )))
 }
 
+fn help_lines(rows: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|(k, d)| {
+            if k.is_empty() {
+                Line::from(sp(fg(MUTED).add_modifier(Modifier::BOLD), d.to_string()))
+            } else {
+                Line::from(fit_spans(vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), format!("  {k:<19}")), sp(fg(MUTED), d.to_string())], width))
+            }
+        })
+        .collect()
+}
+
+/// Keys in two columns when the terminal is wide, one otherwise.
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 50, HELP.len() as u16 + 4);
+    let two = area.width >= 104;
+    let split = HELP.iter().position(|(k, d)| k.is_empty() && *d == "detail").unwrap_or(HELP.len());
+    let rows = if two { split.max(HELP.len() - split) } else { HELP.len() };
+    let rect = centered(area, if two { 100 } else { 52 }, rows as u16 + 4);
     frame.render_widget(Clear, rect);
-    let block = panel("keys");
+    let block = panel("keys").title_bottom(Line::from(lead(BOX_MAIN, key_seg("esc ? q", "close"))));
     let inner = block.inner(rect).inner(Margin { horizontal: 2, vertical: 1 });
     frame.render_widget(block, rect);
-    let lines: Vec<Line> = HELP
-        .iter()
-        .map(|(k, d)| {
-            Line::from(fit_spans(
-                vec![sp(fg(ACCENT), format!("{:<16}", k)), sp(fg(MUTED), d.to_string())],
-                inner.width as usize,
-            ))
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    if two {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(help_lines(&HELP[..split], cols[0].width as usize)), cols[0]);
+        frame.render_widget(Paragraph::new(help_lines(&HELP[split..], cols[1].width as usize)), cols[1]);
+    } else {
+        frame.render_widget(Paragraph::new(help_lines(HELP, inner.width as usize)), inner);
+    }
 }
 
 // ── detail overlay ─────────────────────────────────────────────────────────
 
-fn detail_tabs_line(d: &model::Detail) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (i, t) in d.tabs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("   "));
-        }
-        spans.push(sp(fg(DIM), format!("{} ", i + 1)));
-        if i == d.tab {
-            spans.push(sp(fg(ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED), t.clone()));
-        } else {
-            spans.push(sp(fg(MUTED), t.clone()));
-        }
-    }
-    Line::from(spans)
-}
-
 fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
-    if matches!(d.body, DetailBody::Log { .. }) {
+    // Tasks always use the task view, also before their first body arrives.
+    if !d.tabs.is_empty() || matches!(d.body, DetailBody::Log { .. }) {
         draw_task_detail(frame, area, d, mouse);
         return;
     }
-    // Full screen: the table keys in the main footer do not apply here.
-    let rect = area;
-    frame.render_widget(Clear, rect);
-    let roomy = rect.height >= 18;
-    let inner = Block::bordered().inner(rect).inner(Margin { horizontal: 1, vertical: if roomy { 1 } else { 0 } });
+    frame.render_widget(Clear, area);
+    let inner = Block::bordered().inner(area).inner(Margin { horizontal: 1, vertical: 0 });
     let chat = match &d.body {
         DetailBody::Conversation(c) => Some((c.stats.clone(), c.running, c.note.clone())),
         _ => None,
     };
-    let tabs_h = if d.tabs.is_empty() { 0 } else { 2 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(tabs_h),
-            Constraint::Min(1),
-            Constraint::Length(if roomy { 1 } else { 0 }),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
-    if tabs_h > 0 {
-        frame.render_widget(Paragraph::new(detail_tabs_line(d)), chunks[0]);
-    }
-    let body = chunks[1];
-    let bar_w = 1u16;
-    let gap = 1u16;
-    let text_w = body.width.saturating_sub(bar_w + gap).max(1);
+    let body = chunks[0];
+    let text_w = body.width.saturating_sub(2).max(1);
     let width = text_w as usize;
     let height = body.height as usize;
     let painted = layout_detail(&d.body, width, &d.open, d.tools_expanded);
     d.wrap_len = painted.len();
     d.view_h = height;
+    d.fold_count = painted.iter().filter_map(|p| p.fold.map(|f| f.id + 1)).max().unwrap_or(0);
     let (follow, scroll) = stick_scroll(d.follow, d.scroll, painted.len(), height);
     d.follow = follow;
     d.scroll = scroll;
@@ -875,72 +991,48 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
     d.hits = painted[start..].iter().take(height).map(|p| p.fold).collect();
     let lines: Vec<Line> =
         painted[start..].iter().take(height).map(|p| Line::from(fit_spans(p.spans.clone(), width))).collect();
-
-    let scrolled = painted.len() > height && !d.follow;
-    let pos = if scrolled {
-        let max = painted.len() - height;
-        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(DIM), format!("{}%", d.scroll * 100 / max.max(1)))]))
-    } else if d.follow && chat.as_ref().is_some_and(|(_, running, _)| *running) {
-        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(OK), "● "), sp(fg(MUTED), "following")]))
-    } else {
-        Vec::new()
-    };
-    let block = panel(&d.title).title_top(Line::from(pos).right_aligned());
-    frame.render_widget(block, rect);
-
     let chat_rect = Rect { x: body.x, y: body.y, width: text_w, height: body.height };
-    let bar = Rect { x: body.x + text_w + gap, y: body.y, width: bar_w, height: body.height };
-    mouse.detail = hit_rect(rect);
+    let bar = Rect { x: body.x + body.width.saturating_sub(1), y: body.y, width: 1, height: body.height };
+    mouse.detail = hit_rect(area);
     mouse.chat = hit_rect(chat_rect);
     mouse.scrollbar = hit_rect(bar);
     frame.render_widget(Paragraph::new(lines), chat_rect);
     draw_scrollbar(frame, bar, painted.len(), height, d.scroll);
 
-    let foot_w = chunks[3].width as usize;
+    // Status line: live spinner, then usage (or why there is none).
+    let running = chat.as_ref().is_some_and(|c| c.1);
     let mut left = Vec::new();
-    let keys: Vec<(&str, &str)> = match &chat {
-        Some((stats, running, note)) => {
-            if *running {
-                left.push(sp(fg(ACCENT), format!("{} ", spin_glyph())));
-                left.push(sp(fg(ACCENT).add_modifier(Modifier::ITALIC), "working   "));
-            }
-            // Without recorded usage only the shell count (from tasks) is real.
-            let shown: &[(String, String)] = match note {
-                Some(n) => {
-                    left.push(sp(fg(WARN), n.clone()));
-                    left.push(sp(fg(RULE), " · "));
-                    stats.last().map(std::slice::from_ref).unwrap_or(&[])
-                }
-                None => stats,
-            };
-            for (i, (v, l)) in shown.iter().enumerate() {
-                if i > 0 {
-                    left.push(sp(fg(RULE), " · "));
-                }
-                left.push(val(v.clone()));
-                left.push(unit(&format!(" {l}")));
-            }
-            vec![("o", if d.tools_expanded { "fold all" } else { "unfold all" }), ("esc", "close")]
+    if let Some((stats, running, note)) = &chat {
+        if *running {
+            left.push(sp(fg(ACCENT), format!("{} ", spin_glyph())));
+            left.push(sp(fg(ACCENT).add_modifier(Modifier::ITALIC), "working   "));
         }
-        None => {
-            if d.tabs.len() > 1 {
-                vec![("1-3", "tab"), ("f", if d.follow { "unfollow" } else { "follow" }), ("esc", "close")]
-            } else {
-                vec![("f", if d.follow { "unfollow" } else { "follow" }), ("esc", "close")]
+        // Without recorded usage only the shell count (from tasks) is real.
+        let shown: &[(String, String)] = match note {
+            Some(n) => {
+                left.push(sp(fg(WARN), n.clone()));
+                left.push(sp(fg(RULE), " · "));
+                stats.last().map(std::slice::from_ref).unwrap_or(&[])
             }
+            None => stats,
+        };
+        for (i, (v, l)) in shown.iter().enumerate() {
+            if i > 0 {
+                left.push(sp(fg(RULE), " · "));
+            }
+            left.push(val(v.clone()));
+            left.push(unit(&format!(" {l}")));
         }
-    };
-    let right = hints(&keys);
-    let line = if left.is_empty() {
-        let mut l = vec![Span::raw("")];
-        let pad = foot_w.saturating_sub(spans_width(&right));
-        l.push(Span::raw(" ".repeat(pad)));
-        l.extend(right);
-        fit_spans(l, foot_w)
-    } else {
-        split_line(left, right, foot_w)
-    };
-    frame.render_widget(Paragraph::new(Line::from(line)), chunks[3]);
+    }
+    frame.render_widget(Paragraph::new(Line::from(fit_spans(left, chunks[1].width as usize))), chunks[1]);
+
+    let mut keys: Vec<Key> = vec![("esc", "close", 0), ("o", if d.tools_expanded { "fold all" } else { "unfold all" }, 1)];
+    if running {
+        keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 2));
+    }
+    keys.extend([("↑↓", "scroll", 3), ("g G", "top / end", 4)]);
+    let pill = pos_pill(d.follow, running, painted.len(), height, d.scroll);
+    frame.render_widget(detail_block(&d.title, pill, Vec::new(), &keys, area.width), area);
 }
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -1179,7 +1271,9 @@ fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
     l1.extend(pair("wall", fmt::human_duration(info.wall_ms)));
     l1.extend(pair("cpu", info.cpu_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into())));
     if info.running {
-        l1.extend(pair("now", now_cell(info.cpu_now, info.cpu_stale)));
+        let now = now_cell(info.cpu_now, info.cpu_stale);
+        let now = if now.parse::<f64>().is_ok() { format!("{now}%") } else { now };
+        l1.extend(pair("now", now));
     }
     if let Some(exit) = &info.exit {
         let bad = exit != "0";
@@ -1216,8 +1310,14 @@ fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
 
 fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
     frame.render_widget(Clear, area);
-    let DetailBody::Log { info, lines } = &d.body else { return };
-    let (info, lines) = (info.clone(), lines.clone());
+    let (info, lines) = match &d.body {
+        DetailBody::Log { info, lines } => ((**info).clone(), lines.clone()),
+        // First frame, before the collector delivers the body.
+        _ => (
+            model::TaskInfo { id: d.id.clone(), status: "loading".into(), ..Default::default() },
+            vec!["(loading…)".to_string()],
+        ),
+    };
     let inner = Block::bordered().inner(area).inner(Margin { horizontal: 1, vertical: 0 });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1259,7 +1359,10 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
     draw_scrollbar(frame, bar, laid.lines.len(), height, d.scroll);
 
     // Tab row: `─┐¹output┌┐²stderr┌──────┐17 of 1203 lines┌─`.
-    let mut tabs = vec![sp(fg(BOX_MAIN), "─")];
+    // The tab row joins the box border: `├─┐¹output┌┐²stderr┌───┐24 lines┌─┤`.
+    let row = Rect { x: area.x, y: chunks[1].y, width: area.width, height: 1 };
+    let w = row.width as usize;
+    let mut tabs = vec![sp(fg(BOX_MAIN), "├─")];
     let mut hits = Vec::new();
     for (i, t) in d.tabs.iter().enumerate() {
         let name = if i == d.tab {
@@ -1269,72 +1372,64 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
         };
         let s = seg(BOX_MAIN, vec![sp(fg(HOT), ["¹", "²", "³"][i.min(2)].to_string()), name]);
         let x0 = spans_width(&tabs);
-        hits.push((chunks[1].x + x0 as u16, chunks[1].x + (x0 + spans_width(&s)) as u16, i));
+        hits.push((row.x + x0 as u16, row.x + (x0 + spans_width(&s)) as u16, i));
         tabs.extend(s);
     }
     let q = !d.log.query.is_empty();
     let count = if q && d.log.filter {
-        vec![sp(fg(TEXT), laid.shown.to_string()), sp(fg(DIM), format!(" of {} lines", laid.total))]
+        vec![sp(fg(TEXT), laid.shown.to_string()), sp(fg(DIM), format!(" of {}", plural(laid.total, "line")))]
     } else if q {
         let n = laid.matches.len();
         let at = if n == 0 { 0 } else { d.log.current + 1 };
         vec![sp(fg(if n == 0 { ERR } else { TEXT }), format!("{at}/{n}")), sp(fg(DIM), " matching rows")]
     } else {
         let hidden = laid.total - laid.shown;
-        let mut v = vec![sp(fg(TEXT), laid.total.to_string()), sp(fg(DIM), " lines")];
+        let mut v = vec![sp(fg(TEXT), laid.total.to_string()), sp(fg(DIM), if laid.total == 1 { " line" } else { " lines" })];
         if hidden > 0 && !d.log.show_blank {
             v.push(sp(fg(DIM), format!(" · {hidden} blank hidden")));
         }
         v
     };
-    let right = trail(BOX_MAIN, seg(BOX_MAIN, count));
+    let mut right = seg(BOX_MAIN, count);
+    right.push(sp(fg(BOX_MAIN), "─┤"));
     let fill = w.saturating_sub(spans_width(&tabs) + spans_width(&right));
     tabs.push(sp(fg(BOX_MAIN), "─".repeat(fill)));
     tabs.extend(right);
-    frame.render_widget(Paragraph::new(Line::from(fit_spans(tabs, w))), chunks[1]);
     d.log.tab_hits = hits;
-    d.log.tab_y = chunks[1].y;
+    d.log.tab_y = row.y;
 
     // Frame: title, follow state, and keys / search prompt in the bottom border.
-    let pos = if d.follow && info.running {
-        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(OK), "● "), sp(fg(MUTED), "following")]))
-    } else if laid.lines.len() > height {
-        let max = laid.lines.len() - height;
-        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(DIM), format!("{}%", d.scroll * 100 / max.max(1)))]))
-    } else {
-        Vec::new()
-    };
-    let key = |k: &str, l: &str| {
-        seg_bottom(BOX_MAIN, vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), k.to_string()), sp(fg(MUTED), format!(" {l}"))])
-    };
     // Keys name the mode they switch to.
     let mode = if d.log.filter { "highlight" } else { "filter" };
-    let mut bottom = vec![sp(fg(BOX_MAIN), "─")];
-    if d.log.editing {
-        bottom.extend(seg_bottom(
-            BOX_MAIN,
-            vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), d.log.query.clone()), sp(fg(ACCENT), "▏")],
-        ));
-        bottom.extend(key("tab", mode));
-        bottom.extend(key("enter", "keep"));
-        bottom.extend(key("esc", "clear"));
+    let (prefix, keys): (Vec<Span<'static>>, Vec<Key>) = if d.log.editing {
+        (
+            seg_bottom(
+                BOX_MAIN,
+                vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), d.log.query.clone()), sp(fg(ACCENT), "▏")],
+            ),
+            vec![("enter", "apply", 0), ("tab", mode, 1), ("esc", "clear", 0)],
+        )
     } else {
-        if q {
-            bottom.extend(seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), d.log.query.clone())]));
-            bottom.extend(key("n N", "next"));
+        let mut keys: Vec<Key> = Vec::new();
+        let prefix = if q {
+            keys.push(("n N", "next", 1));
+            seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), d.log.query.clone())])
         } else {
-            bottom.extend(key("/", "search"));
+            keys.push(("/", "search", 1));
+            Vec::new()
+        };
+        keys.push(("&", mode, 2));
+        keys.push(("b", if d.log.show_blank { "hide blank" } else { "show blank" }, 4));
+        keys.push(("1 2", "stream", 5));
+        if info.running {
+            keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 3));
         }
-        bottom.extend(key("&", mode));
-        bottom.extend(key("b", if d.log.show_blank { "hide blank" } else { "show blank" }));
-        bottom.extend(key("1 2", "tab"));
-        bottom.extend(key("f", if d.follow { "unfollow" } else { "follow" }));
-        bottom.extend(key("esc", if q { "clear" } else { "close" }));
-    }
-    let block = panel(&d.title)
-        .title_top(Line::from(pos).right_aligned())
-        .title_bottom(Line::from(fit_spans(bottom, (area.width as usize).saturating_sub(2))));
-    frame.render_widget(block, area);
+        keys.push(("esc", if q { "clear" } else { "close" }, 0));
+        (prefix, keys)
+    };
+    let pill = pos_pill(d.follow, info.running, laid.lines.len(), height, d.scroll);
+    frame.render_widget(detail_block(&d.title, pill, prefix, &keys, area.width), area);
+    frame.render_widget(Paragraph::new(Line::from(fit_spans(tabs, w))), row);
     mouse.detail = hit_rect(area);
     mouse.chat = HitRect::default();
     mouse.scrollbar = hit_rect(bar);
@@ -1422,24 +1517,17 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
         }
         if turn.role == "assistant" || turn.role == "assistant error" {
             let error = turn.error || turn.role == "assistant error";
+            // Reasoning arrives as its own `thinking` turn; text beside a
+            // tool call is what the agent said, so it stays visible.
             let segs = assistant_segments(&turn.text);
-            let has_tools = segs.iter().any(|s| matches!(s, Seg::ToolCall { .. }));
-            let mut seen_tool = false;
             i += 1;
             for seg in segs {
                 match seg {
                     Seg::Text(text) => {
-                        if has_tools && !seen_tool {
-                            t.begin(Group::Activity);
-                            let id = t.next_fold();
-                            thinking_row(&text, turn.ts, is_open(id, open, expand_all), id, width, &mut t.out);
-                        } else {
-                            t.begin(Group::Text);
-                            assistant_text(&text, error, width, &mut t.out);
-                        }
+                        t.begin(Group::Text);
+                        assistant_text(&text, error, width, &mut t.out);
                     }
                     Seg::ToolCall { name, summary } => {
-                        seen_tool = true;
                         t.begin(Group::Activity);
                         let id = t.next_fold();
                         let paired = chat.turns.get(i).is_some_and(|n| n.tool.as_deref() == Some(name.as_str()));
@@ -1533,11 +1621,7 @@ fn thinking_row(text: &str, ts: Option<u64>, expanded: bool, fold: usize, width:
     let style = fg(DIM).add_modifier(Modifier::ITALIC);
     let left =
         vec![margin(), sp(fg(DIM), format!("{} ", chevron(expanded))), sp(fg(MUTED), "∴ "), sp(style, "Thinking")];
-    let right = match clock(ts) {
-        t if t.is_empty() => Vec::new(),
-        t => vec![sp(fg(DIM), t)],
-    };
-    out.push(Painted { spans: split_line(left, right, width), fold: Some(fold_hit(fold)) });
+    out.push(Painted { spans: split_line(left, clock_spans(ts), width), fold: Some(fold_hit(fold)) });
     if expanded {
         hang(&fmt::scrub_tty(text.trim()), style, width, out);
     }
@@ -1761,7 +1845,7 @@ fn parse_tool_call_at(s: &str) -> Option<(usize, String, String)> {
     let json = &s[json_start..];
     let json_len = take_json_object(json)?;
     let raw = &json[..json_len];
-    Some((json_start + json_len, name.to_string(), summary_from_raw(name, raw)))
+    Some((json_start + json_len, name.to_string(), summary_from_raw(raw)))
 }
 
 fn take_json_object(s: &str) -> Option<usize> {
@@ -1801,9 +1885,9 @@ fn take_json_object(s: &str) -> Option<usize> {
     None
 }
 
-fn summary_from_raw(name: &str, json: &str) -> String {
+fn summary_from_raw(json: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
-        return pick_summary(name, &v);
+        return pick_summary(&v);
     }
     extract_json_string(json, "path")
         .or_else(|| extract_json_string(json, "command"))
@@ -1812,8 +1896,7 @@ fn summary_from_raw(name: &str, json: &str) -> String {
         .unwrap_or_default()
 }
 
-fn pick_summary(name: &str, v: &serde_json::Value) -> String {
-    let _ = name;
+fn pick_summary(v: &serde_json::Value) -> String {
     ["path", "command", "query", "pattern", "file"]
         .iter()
         .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
@@ -1861,7 +1944,7 @@ fn tool_card_title(turn: &TranscriptTurn, prev: Option<&TranscriptTurn>) -> Stri
         }
     }
     if let Some(args) = turn.args.as_deref().filter(|s| !s.is_empty()) {
-        let summary = summary_from_raw(name, args);
+        let summary = summary_from_raw(args);
         if !summary.is_empty() {
             return format!("{name} {summary}");
         }
@@ -1902,6 +1985,14 @@ fn status_glyph(status: &str, running: bool) -> &'static str {
 /// Styled cell: the tree label gets chevron + status glyph, status words are
 /// colored, and placeholders are dim.
 fn cell_spans(state: &TopState, vr: &VisibleRow, col: Col) -> Vec<Span<'static>> {
+    // Flat task table: the id carries the same status glyph as the tree.
+    if state.tab == Tab::Tasks && col == Col::Id {
+        if let Some(&i) = state.task_index.get(&vr.id) {
+            let r = &state.task_rows[i];
+            let glyph = if r.running { spin_glyph() } else { status_glyph(&r.status, false) };
+            return vec![sp(fg(status_color(&r.status, r.running)), format!("{glyph} ")), sp(fg(MUTED), r.id.clone())];
+        }
+    }
     if state.tab != Tab::Tasks || !state.task_index.contains_key(&vr.id) {
         if let Some(n) = state.nodes.get(&vr.id) {
             if matches!(col, Col::Node | Col::Id) {
@@ -2184,7 +2275,7 @@ mod tests {
                     fmt::display_width(line)
                 );
             }
-            assert!(text.contains("Tree") || text.contains("pi-famulus"), "{c}x{r}: {text}");
+            assert!(text.contains("tree") || text.contains("pi-famulus"), "{c}x{r}: {text}");
         }
     }
 
@@ -2346,7 +2437,7 @@ mod tests {
         let e = texts(&expanded).join("\n");
         assert!(c.contains("▸ ∴ Thinking"), "{c}");
         assert!(!c.contains("I should search"), "{c}");
-        assert!(!c.contains("need the files"), "{c}");
+        assert!(c.contains("need the files"), "prose beside a tool call stays visible: {c}");
         assert!(!c.contains("line-0"), "{c}");
         assert!(c.contains("bash"), "{c}");
         assert!(e.contains("▾ ∴ Thinking"), "{e}");
@@ -2385,7 +2476,7 @@ mod tests {
         state.now = 1_200;
         let mut d = open_detail(&state).expect("agent opens");
         assert!(d.tabs.is_empty());
-        assert!(d.title.contains("subagent"));
+        assert_eq!(d.title, "ch_a · worker", "detail titles are `id · label`");
         d.body = DetailBody::Conversation(Chat {
             turns: vec![mk_turn("user", "inspect the loader")],
             agent: "worker".into(),
@@ -2529,6 +2620,34 @@ mod tests {
     }
 
     #[test]
+    fn narrow_footers_keep_help_quit_esc_and_position() {
+        let snap = snap();
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        state.message = Some("stopped sh_x".into());
+        let text = render(80, 24, &mut state);
+        let bottom = text.lines().last().unwrap();
+        assert!(bottom.contains("? help") && bottom.contains("q quit") && bottom.contains("1/4"), "{bottom}");
+        assert!(bottom.contains("stopped sh_x"), "messages sit beside the keys: {bottom}");
+        for (w, h) in [(40u16, 12u16), (60, 20)] {
+            let mut state = task_detail(log_lines());
+            let text = render(w, h, &mut state);
+            let bottom = text.lines().last().unwrap();
+            assert!(bottom.contains("esc"), "{w}x{h}: {bottom}");
+            assert!(!text.lines().next().unwrap().contains("┌ following"), "{w}x{h}: pill collides with the title");
+        }
+    }
+
+    #[test]
+    fn fit_keys_drops_least_important_first() {
+        let keys: Vec<Key> = vec![("a", "one", 3), ("b", "two", 0), ("c", "three", 1)];
+        let all: String = fit_keys(Vec::new(), &keys, 200).iter().map(|s| s.content.to_string()).collect();
+        assert!(all.contains("a one") && all.contains("c three"));
+        let some: String = fit_keys(Vec::new(), &keys, 22).iter().map(|s| s.content.to_string()).collect();
+        assert!(!some.contains("a one") && some.contains("b two") && some.contains("c three"), "{some}");
+    }
+
+    #[test]
     fn tab_bar_clicks_land_on_tabs_scope_and_sort() {
         let snap = snap();
         let mut state = TopState::new(1_000, None, None);
@@ -2564,7 +2683,9 @@ mod tests {
         assert!(!state.wants_anim(), "paused stays still");
         state.paused = false;
         state.set_tab(Tab::Tasks);
-        assert!(!state.wants_anim(), "the task table has no glyphs to spin");
+        assert!(state.wants_anim(), "the task table spins running ids too");
+        state.set_tab(Tab::Events);
+        assert!(!state.wants_anim(), "events have no glyphs to spin");
     }
 
     #[test]

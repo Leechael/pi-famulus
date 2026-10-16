@@ -623,7 +623,8 @@ pub fn detail_tabs(kind: NodeKind) -> Vec<String> {
     match kind {
         NodeKind::Task => vec!["output".into(), "stderr".into()],
         NodeKind::Agent => Vec::new(),
-        _ => vec!["Info".into()],
+        // Sessions, mains and runs open no detail (see `open_detail`).
+        _ => Vec::new(),
     }
 }
 
@@ -634,7 +635,7 @@ pub fn open_detail(state: &TopState) -> Option<Detail> {
     }
     let title = if n.kind == NodeKind::Agent {
         let name = n.title.split(" (").next().unwrap_or(n.label.as_str());
-        format!("subagent · {name}")
+        format!("{} · {name}", n.id)
     } else {
         format!("{} · {}", n.id, n.label)
     };
@@ -652,6 +653,7 @@ pub fn open_detail(state: &TopState) -> Option<Detail> {
         open: HashSet::new(),
         hits: Vec::new(),
         log: LogView::default(),
+        fold_count: 0,
     })
 }
 

@@ -594,6 +594,8 @@ pub struct Detail {
     pub hits: Vec<Option<FoldHit>>,
     /// Task output search / filter state.
     pub log: LogView,
+    /// Foldable blocks in the chat from the last draw (for expand-all).
+    pub fold_count: usize,
 }
 
 /// Click target for one foldable header. Coordinates are relative to the chat pane.
@@ -1255,10 +1257,14 @@ impl TopState {
     /// footer in detail, or running rows on the table. Paused stays still.
     pub fn wants_anim(&self) -> bool {
         if let Some(d) = &self.detail {
-            return matches!(&d.body, DetailBody::Conversation(c) if c.running);
+            return match &d.body {
+                DetailBody::Conversation(c) => c.running,
+                DetailBody::Log { info, .. } => info.running,
+                DetailBody::Empty => false,
+            };
         }
         !self.paused
-            && matches!(self.tab, Tab::Tree | Tab::Agents)
+            && self.tab != Tab::Events
             && self.visible.iter().any(|v| {
                 self.nodes
                     .get(&v.id)
@@ -1491,7 +1497,7 @@ fn ensure_run(nodes: &mut HashMap<String, Node>, rid: &str, session_id: &str, se
             session_id: session_id.to_string(),
             parent: Some(sess.to_string()),
             label: rid.to_string(),
-            extra: "children".into(),
+            extra: String::new(),
             title: rid.to_string(),
             status: "completed".into(),
             reason: None,
@@ -1524,14 +1530,8 @@ fn agent_node(a: &AgentRecord, session: Option<&SessionView>, now: u64) -> Node 
         kind: NodeKind::Agent,
         session_id: a.session_id.clone(),
         parent: None,
-        label: {
-            let tok = tok_io_cell(a.tokens_input, a.tokens_output);
-            if tok == "-" {
-                format!("{} {}", a.name, short_id(&a.child_id))
-            } else {
-                format!("{} {}  {tok}", a.name, short_id(&a.child_id))
-            }
-        },
+        // Tokens have their own column on every width; keep the label short.
+        label: format!("{} {}", a.name, short_id(&a.child_id)),
         extra: a.model.clone().unwrap_or_else(|| a.agent.clone()),
         title: a.title(),
         status: a.status.clone(),
@@ -1734,9 +1734,9 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
             n.metrics.queue_ms = m.queue_ms;
         }
         if n.kind == NodeKind::Main {
-            n.extra = format!("{} shells", n.metrics.tasks);
+            n.extra = plural(n.metrics.tasks as usize, "shell", "shells");
         } else if n.kind == NodeKind::Run {
-            n.extra = format!("{} children", n.children.len());
+            n.extra = plural(n.children.len(), "child", "children");
         }
     }
 }
@@ -1918,6 +1918,11 @@ pub fn compact_num(n: u64) -> String {
 
 /// Budget for a kind the daemon did not report: the configured default for
 /// budgeted kinds, 0 for kinds that take no slot (monitors).
+/// `1 child`, `3 children`.
+pub fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 fn kind_slot_default(kind: &str) -> usize {
     match kind {
         "test-suite" | "test" => crate::capacity::DEFAULT_MAX_TEST,
@@ -2075,7 +2080,8 @@ mod tests {
         assert_eq!(work.metrics.tasks, 2);
         assert_eq!(work.metrics.cpu_now, Some(85.0));
         assert!(work.metrics.running);
-        assert!(work.label.contains("100/20"), "subagent tokens on the node: {}", work.label);
+        assert_eq!((work.metrics.tokens_in, work.metrics.tokens_out), (Some(100), Some(20)));
+        assert!(!work.label.contains("100/20"), "tokens live in the tok i/o column: {}", work.label);
 
         let ids: Vec<&str> = s.visible.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains(&"s:sessA"), "{ids:?}");
