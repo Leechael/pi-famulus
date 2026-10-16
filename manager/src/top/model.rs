@@ -406,6 +406,7 @@ pub struct EventRow {
 pub struct WorkKindRow {
     pub kind: String,
     pub used: usize,
+    /// Slot budget; 0 for kinds without one (monitors).
     pub total: usize,
     pub tasks: u64,
     pub wall_ms: u64,
@@ -1867,10 +1868,13 @@ pub fn compact_num(n: u64) -> String {
     }
 }
 
+/// Budget for a kind the daemon did not report: the configured default for
+/// budgeted kinds, 0 for kinds that take no slot (monitors).
 fn kind_slot_default(kind: &str) -> usize {
     match kind {
         "test-suite" | "test" => crate::capacity::DEFAULT_MAX_TEST,
-        _ => crate::capacity::DEFAULT_MAX_AGENTS,
+        k if crate::capacity::WORK_KINDS.contains(&k) => crate::capacity::DEFAULT_MAX_AGENTS,
+        _ => 0,
     }
 }
 
@@ -2175,6 +2179,13 @@ mod tests {
         assert!(tree_cols(WidthClass::Compact).contains(&Col::TokIo));
         assert!(task_cols(WidthClass::Wide).contains(&Col::WorkKind));
         assert!(task_cols(WidthClass::Compact).contains(&Col::TokIo));
+    }
+
+    #[test]
+    fn monitors_have_no_slot_budget() {
+        assert_eq!(kind_slot_default("monitor"), 0);
+        assert_eq!(kind_slot_default("test"), crate::capacity::DEFAULT_MAX_TEST);
+        assert_eq!(kind_slot_default("build"), crate::capacity::DEFAULT_MAX_AGENTS);
     }
 
     #[test]

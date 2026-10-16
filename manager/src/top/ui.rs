@@ -452,8 +452,13 @@ fn draw_kinds(frame: &mut Frame, area: Rect, state: &TopState) {
     let shown = if kinds.len() > room { room.saturating_sub(1) } else { kinds.len() };
     for k in kinds.iter().take(shown) {
         let mut row = vec![sp(fg(if k.used > 0 { TEXT } else { MUTED }), format!(" {:<11} ", fmt::truncate_width(&k.kind, 11)))];
-        row.extend(grad_meter(k.used, k.total, 4));
-        row.push(sp(fg(if k.used > 0 { TEXT } else { DIM }), format!(" {:<4}", format!("{}/{}", k.used, k.total))));
+        if k.total > 0 {
+            row.extend(grad_meter(k.used, k.total, 4));
+            row.push(sp(fg(if k.used > 0 { TEXT } else { DIM }), format!(" {:<4}", format!("{}/{}", k.used, k.total))));
+        } else {
+            // No budget: monitors never wait for a slot.
+            row.push(sp(fg(DIM), format!("{:<9}", "-")));
+        }
         row.push(val(format!("{:>5}", k.tasks)));
         row.push(val(format!(" {:>7}", fmt::human_duration(k.wall_ms))));
         row.push(match k.cpu_ms {
