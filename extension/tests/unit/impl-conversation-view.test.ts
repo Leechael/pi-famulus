@@ -36,10 +36,12 @@ describe("conversation thread", () => {
   });
 
   it("stacks activity rows tight and separates other blocks with one blank line", () => {
-    const lines = renderConversation(sample, 80, plainTheme, { expanded: false });
+    const lines = renderConversation(sample, 80, plainTheme, { expanded: false, agent: "scout" });
     expect(lines).toEqual([
+      "┃ main → scout",
       "┃ inspect the loader please and then report back on what you find",
       "",
+      "● scout",
       "  ▸ ∴ Thinking",
       "  ▸ ✓ bash  rg loader",
       "",
@@ -68,20 +70,21 @@ describe("conversation thread", () => {
       { role: "assistant", text: 'tool bash {"command":"make"}' },
     ];
     const lines = renderConversation(turns, 60, plainTheme, { expanded: false });
-    expect(lines[0]).toBe("  ▸ ✗ read  a.ts");
-    expect(lines[1].startsWith("    ● bash  make")).toBe(true);
-    expect(lines[1].endsWith("running")).toBe(true);
+    expect(lines[0]).toBe("● subagent");
+    expect(lines[1]).toBe("  ▸ ✗ read  a.ts");
+    expect(lines[2].startsWith("    ● bash  make")).toBe(true);
+    expect(lines[2].endsWith("running")).toBe(true);
   });
 
   it("renders light markdown", () => {
     const text = "## Plan\n- one\n1. two\n> quoted\n```\ncode()\n```";
     const lines = renderConversation([{ role: "assistant", text }], 60, plainTheme, { expanded: false });
-    expect(lines).toEqual(["  Plan", "  • one", "  1. two", "  │ quoted", "  │ code()"]);
+    expect(lines).toEqual(["● subagent", "  Plan", "  • one", "  1. two", "  │ quoted", "  │ code()"]);
   });
 
   it("shows model errors in red with a cross", () => {
     const lines = renderConversation([{ role: "assistant error", text: "529 overloaded" }], 60, tagged, { expanded: false });
-    expect(lines).toEqual(["  <error>✗ </error><error>529 overloaded</error>"]);
+    expect(lines).toEqual(["<success>● </success><b><success>subagent</success></b>", "  <error>✗ </error><error>529 overloaded</error>"]);
   });
 
   it("summarizes tool arguments without dumping file content", () => {

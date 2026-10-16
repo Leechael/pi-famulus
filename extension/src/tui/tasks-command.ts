@@ -506,7 +506,7 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
       render(width, theme, state) {
         const turns = conversation();
         const shown = turns.length > 0 ? turns : item.prompt ? [{ role: "user", text: item.prompt }] : [];
-        return renderConversation(shown, width, theme, state);
+        return renderConversation(shown, width, theme, { ...state, agent: item.name ?? item.title });
       },
     };
     const resultText = () => {

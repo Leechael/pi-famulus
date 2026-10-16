@@ -1,8 +1,10 @@
 /**
  * Subagent conversation as a thread (same visual language as `pi-famulus top`).
  *
- *   ┃ inspect the loader and report          user turn on an accent rail
+ *   ┃ main → scout                           message from the parent
+ *   ┃ inspect the loader and report          on an accent rail
  *
+ *   ● scout                                  the child starts speaking
  *     ▸ ∴ Thinking                           folded reasoning
  *     ▸ ✓ read  src/loader.ts                one line per tool call
  *     ▾ ✓ bash  rg loader                    unfolded: output hangs off a rule
@@ -26,6 +28,8 @@ export interface ChatTheme {
 export interface ChatOptions {
   /** Unfold every tool output and thinking block. */
   expanded: boolean;
+  /** Child display name for the speaker headers (default "subagent"). */
+  agent?: string;
 }
 
 const MARGIN = "  ";
@@ -177,8 +181,14 @@ export function renderConversation(
   if (turns.length === 0) return [MARGIN + theme.fg("dim", "(no conversation yet)")];
   const out: string[] = [];
   let last: Group | undefined;
+  const agent = options.agent?.trim() || "subagent";
+  // Blank line between blocks, and a `● agent` header whenever the child
+  // starts speaking after the parent (or at the top of the thread).
   const begin = (group: Group) => {
     if (last !== undefined && !(group === "activity" && last === "activity")) out.push("");
+    if (group !== "user" && (last === undefined || last === "user")) {
+      out.push(theme.fg("success", "● ") + theme.bold(theme.fg("success", agent)));
+    }
     last = group;
   };
   const chevron = (open: boolean, foldable: boolean) =>
@@ -203,6 +213,7 @@ export function renderConversation(
     if (turn.role === "user") {
       begin("user");
       const rail = theme.fg("accent", "┃ ");
+      out.push(rail + theme.bold(theme.fg("accent", "main")) + theme.fg("dim", ` → ${agent}`));
       for (const line of fitLines(turn.text.trim() || " ", w - 2)) out.push(rail + line);
       continue;
     }
