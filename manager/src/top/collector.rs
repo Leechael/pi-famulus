@@ -31,7 +31,7 @@ pub struct Tick {
     pub snap: Option<Snapshot>,
     pub events: Vec<EventLine>,
     pub kind_slots: HashMap<String, (usize, usize)>,
-    pub preview_lines: Vec<String>,
+    pub preview_body: DetailBody,
     pub detail_body: Option<DetailBody>,
 }
 
@@ -150,7 +150,7 @@ impl Collector {
             snap: None,
             events: Vec::new(),
             kind_slots: HashMap::new(),
-            preview_lines: self.preview_lines(view),
+            preview_body: self.preview_body(view),
             detail_body: self.detail_body(view),
         }
     }
@@ -160,23 +160,23 @@ impl Collector {
             snap,
             events: self.events.clone(),
             kind_slots,
-            preview_lines: self.preview_lines(view),
+            preview_body: self.preview_body(view),
             detail_body: self.detail_body(view),
         }
     }
 
-    fn preview_lines(&self, view: &CollectView) -> Vec<String> {
+    fn preview_body(&self, view: &CollectView) -> DetailBody {
         if view.preview {
-            flatten_body(&tail_for(
+            tail_for(
                 &self.home,
                 &self.last_tasks,
                 &self.agents,
                 self.last_now,
                 view.selected.as_deref(),
                 0,
-            ))
+            )
         } else {
-            Vec::new()
+            DetailBody::Empty
         }
     }
 
@@ -454,22 +454,6 @@ fn tail_for(
     DetailBody::Empty
 }
 
-fn flatten_body(body: &DetailBody) -> Vec<String> {
-    match body {
-        DetailBody::Empty => Vec::new(),
-        DetailBody::Conversation(chat) => inspect::format_conversation(&chat.turns),
-        DetailBody::Log { header, lines } => {
-            let mut out = header.clone();
-            if !header.is_empty() && !lines.is_empty() {
-                out.push(String::new());
-            }
-            out.extend(lines.iter().cloned());
-            out
-        }
-        DetailBody::Text(v) => v.clone(),
-    }
-}
-
 fn task_log(t: &TaskRecord, now: u64, path: &Path, stderr: bool) -> DetailBody {
     let kind = match t.kind {
         crate::proto::TaskKind::Monitor => "monitor",
@@ -595,25 +579,18 @@ fn agent_chat(home: &Path, a: &AgentRecord, tasks: &[TaskRecord]) -> DetailBody 
     let tps = inspect::agent_output_tokens_per_second(a.tokens_output, a.llm_ms)
         .map(|v| format!("{v:.1}"))
         .unwrap_or_else(|| "-".into());
-    let name = if a.name.is_empty() {
-        if a.agent.is_empty() {
-            "subagent".into()
-        } else {
-            a.agent.clone()
-        }
-    } else {
-        a.name.clone()
-    };
+    let shells_label = if shells == 1 { "shell" } else { "shells" };
     DetailBody::Conversation(Chat {
         turns: load_transcript(home, a),
-        main: "main".into(),
-        agent: name,
-        stats: format!(
-            "tokens {tok_in} in / {tok_out} out · {tps} tok/s · wall LLM {} / tool {} / queue {} · shells {shells}",
-            dur(a.llm_ms),
-            dur(a.tool_ms),
-            dur(a.queue_ms)
-        ),
+        stats: vec![
+            (tok_in, "in".into()),
+            (tok_out, "out".into()),
+            (tps, "tok/s".into()),
+            (dur(a.llm_ms), "llm".into()),
+            (dur(a.tool_ms), "tool".into()),
+            (dur(a.queue_ms), "queue".into()),
+            (shells.to_string(), shells_label.into()),
+        ],
         running: !inspect::agent_status_terminal(&a.status) && !a.stale,
     })
 }

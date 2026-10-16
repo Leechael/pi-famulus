@@ -1201,35 +1201,6 @@ pub struct TranscriptTurn {
     pub error: bool,
 }
 
-impl TranscriptTurn {
-    /// `user`, `assistant`, `tool bash`, `assistant error`.
-    pub fn speaker(&self) -> String {
-        if let Some(tool) = &self.tool {
-            format!("tool {tool}")
-        } else if self.error && self.role == "assistant" {
-            "assistant error".into()
-        } else {
-            self.role.clone()
-        }
-    }
-
-    pub fn heading(&self) -> String {
-        let speaker = self.speaker();
-        match self.ts {
-            Some(ts) => {
-                let stamp = fmt::datetime(ts);
-                let clock = stamp.split(' ').nth(1).unwrap_or("");
-                if clock.is_empty() {
-                    speaker
-                } else {
-                    format!("{speaker} · {clock}")
-                }
-            }
-            None => speaker,
-        }
-    }
-}
-
 /// Parse one transcript line. `None` hides it (system/preamble unless `full`).
 /// Transcript lines: {role, text, tool?, args?, isError?, ts?}.
 pub fn parse_transcript_line(line: &str, full: bool, prompt_head: Option<&str>, first_user: &mut bool) -> Option<TranscriptTurn> {
@@ -1271,26 +1242,6 @@ pub fn parse_transcript_line(line: &str, full: bool, prompt_head: Option<&str>, 
         ts,
         error,
     })
-}
-
-/// `── role ──` blocks, matching the extension `/tasks` conversation pane.
-pub fn format_conversation(turns: &[TranscriptTurn]) -> Vec<String> {
-    if turns.is_empty() {
-        return vec!["(no conversation yet)".into()];
-    }
-    let mut out = Vec::new();
-    for (i, t) in turns.iter().enumerate() {
-        if i > 0 {
-            out.push(String::new());
-        }
-        out.push(format!("── {} ──", t.heading()));
-        if t.text.is_empty() {
-            out.push(String::new());
-        } else {
-            out.extend(t.text.lines().map(|s| s.to_string()));
-        }
-    }
-    out
 }
 
 /// Render one transcript line. `None` hides it (system/preamble lines unless
@@ -1916,12 +1867,8 @@ mod tests {
             parse_transcript_line(t, false, head, &mut first).unwrap(),
         ];
         assert_eq!(turns[0].text, "inspect the loader");
-        let lines = format_conversation(&turns);
-        let joined = lines.join("\n");
-        assert!(joined.contains("── user"), "{joined}");
-        assert!(joined.contains("── assistant"), "{joined}");
-        assert!(joined.contains("── tool read"), "{joined}");
-        assert!(joined.contains("file body"), "{joined}");
-        assert!(!joined.contains("user:"), "{joined}");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[2].tool.as_deref(), Some("read"));
+        assert_eq!(turns[2].text, "file body");
     }
 }

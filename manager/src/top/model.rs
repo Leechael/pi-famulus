@@ -480,6 +480,14 @@ impl HitRect {
     }
 }
 
+/// What a click on the tab bar lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabHit {
+    Tab(Tab),
+    Scope,
+    Sort,
+}
+
 #[derive(Debug, Default)]
 pub struct MouseHit {
     pub tabs: HitRect,
@@ -488,19 +496,17 @@ pub struct MouseHit {
     pub chat: HitRect,
     pub scrollbar: HitRect,
     pub dragging_bar: bool,
-    pub tab_line: String,
+    /// Column ranges `[x0, x1)` on the tab bar, relative to `tabs.x`.
+    pub tab_hits: Vec<(u16, u16, TabHit)>,
     pub last: Option<(String, std::time::Instant)>,
 }
 
-/// Agent conversation plus the footer identity/stats the chat view needs.
+/// Agent conversation plus the footer stats the chat view needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chat {
     pub turns: Vec<TranscriptTurn>,
-    /// Parent / assigner label, shown on user turns.
-    pub main: String,
-    /// Child display name, shown on assistant / tool / thinking turns.
-    pub agent: String,
-    pub stats: String,
+    /// `(value, label)` pairs for the footer, e.g. `("12k", "in")`.
+    pub stats: Vec<(String, String)>,
     pub running: bool,
 }
 
@@ -572,7 +578,7 @@ pub struct TopState {
     pub events: Vec<EventRow>,
     pub event_index: HashMap<String, usize>,
     pub task_index: HashMap<String, usize>,
-    pub preview_lines: Vec<String>,
+    pub preview_body: DetailBody,
     pub header: Header,
     pub visible: Vec<VisibleRow>,
     pub now: u64,
@@ -610,7 +616,7 @@ impl TopState {
             events: Vec::new(),
             event_index: HashMap::new(),
             task_index: HashMap::new(),
-            preview_lines: Vec::new(),
+            preview_body: DetailBody::Empty,
             header: Header::default(),
             visible: Vec::new(),
             now: 0,

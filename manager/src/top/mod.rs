@@ -11,7 +11,7 @@ pub mod ui;
 use crate::client::{self, HelloMode};
 use crate::proto::{RequestKind, UnitOk};
 use crate::top::collector::{open_detail, CollectView, Collector, Tick};
-use crate::top::model::{Detail, NodeKind, Tab, TopState};
+use crate::top::model::{Detail, NodeKind, Tab, TabHit, TopState};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -196,7 +196,7 @@ fn apply_tick(state: &mut TopState, tick: Tick) {
             state.message = None;
         }
     }
-    state.preview_lines = tick.preview_lines;
+    state.preview_body = tick.preview_body;
     if let (Some(d), Some(body)) = (state.detail.as_mut(), tick.detail_body) {
         d.body = body;
     }
@@ -347,29 +347,14 @@ fn handle_mouse_click(state: &mut TopState, col: u16, row: u16) {
 }
 
 fn click_tab_bar(state: &mut TopState, col: u16) {
-    let line = &state.mouse.tab_line;
-    let x = col.saturating_sub(state.mouse.tabs.x) as usize;
-    if let Some(i) = line.find("Scope:") {
-        if x >= i {
-            state.cycle_scope();
-            return;
-        }
+    let x = col.saturating_sub(state.mouse.tabs.x);
+    let hit = state.mouse.tab_hits.iter().find(|(x0, x1, _)| x >= *x0 && x < *x1).map(|h| h.2);
+    match hit {
+        Some(TabHit::Tab(tab)) => state.set_tab(tab),
+        Some(TabHit::Scope) => state.cycle_scope(),
+        Some(TabHit::Sort) => state.cycle_sort(false),
+        None => {}
     }
-    if let Some(i) = line.find("Sort:") {
-        if x >= i {
-            state.cycle_sort(false);
-            return;
-        }
-    }
-    let mut hit = Tab::Tree;
-    for (digit, tab) in [('1', Tab::Tree), ('2', Tab::Agents), ('3', Tab::Tasks), ('4', Tab::Events)] {
-        if let Some(i) = line.find(&format!("{digit}:")) {
-            if x >= i {
-                hit = tab;
-            }
-        }
-    }
-    state.set_tab(hit);
 }
 
 fn handle_filter(state: &mut TopState, key: KeyEvent) -> bool {
