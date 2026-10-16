@@ -578,8 +578,10 @@ fn agent_chat(home: &Path, a: &AgentRecord, tasks: &[TaskRecord]) -> DetailBody 
         .map(|v| format!("{v:.1}"))
         .unwrap_or_else(|| "-".into());
     let shells_label = if shells == 1 { "shell" } else { "shells" };
+    let agent = [&a.name, &a.agent].into_iter().find(|s| !s.is_empty()).cloned().unwrap_or_default();
     DetailBody::Conversation(Chat {
         turns: load_transcript(home, a),
+        agent,
         stats: vec![
             (tok_in, "in".into()),
             (tok_out, "out".into()),

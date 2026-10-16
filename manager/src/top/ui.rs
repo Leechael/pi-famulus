@@ -957,16 +957,25 @@ enum Group {
     Activity,
 }
 
-struct Thread {
+struct Thread<'a> {
     out: Vec<Painted>,
     last: Option<Group>,
     fold: usize,
+    /// Child display name for speaker headers.
+    agent: &'a str,
+    width: usize,
 }
 
-impl Thread {
+impl Thread<'_> {
+    /// Space the block, and open a `● agent` header when the subagent
+    /// starts speaking after main (or at the top of the thread).
     fn begin(&mut self, kind: Group) {
         if self.last.is_some() && !(kind == Group::Activity && self.last == Some(Group::Activity)) {
             self.out.push(Painted::blank());
+        }
+        if kind != Group::User && matches!(self.last, None | Some(Group::User)) {
+            let left = vec![sp(fg(OK), "● "), sp(fg(OK).add_modifier(Modifier::BOLD), self.agent.to_string())];
+            self.out.push(Painted::new(fit_spans(left, self.width)));
         }
         self.last = Some(kind);
     }
@@ -982,13 +991,14 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
     if chat.turns.is_empty() {
         return vec![dim_line("(no conversation yet)")];
     }
-    let mut t = Thread { out: Vec::new(), last: None, fold: 0 };
+    let agent = if chat.agent.is_empty() { "subagent" } else { chat.agent.as_str() };
+    let mut t = Thread { out: Vec::new(), last: None, fold: 0, agent, width };
     let mut i = 0;
     while i < chat.turns.len() {
         let turn = &chat.turns[i];
         if turn.role == "user" {
             t.begin(Group::User);
-            user_block(&turn.text, turn.ts, width, &mut t.out);
+            user_block(&turn.text, turn.ts, agent, width, &mut t.out);
             i += 1;
             continue;
         }
@@ -1079,19 +1089,26 @@ fn clock(ts: Option<u64>) -> String {
         .unwrap_or_default()
 }
 
-/// User turn: an accent rail down the left edge, text beside it, clock on
-/// the first line.
-fn user_block(text: &str, ts: Option<u64>, width: usize, out: &mut Vec<Painted>) {
-    let time = clock(ts);
-    let reserve = if time.is_empty() { 0 } else { time.len() + 2 };
-    let inner = width.saturating_sub(MARGIN + reserve).max(1);
+fn clock_spans(ts: Option<u64>) -> Vec<Span<'static>> {
+    match clock(ts) {
+        t if t.is_empty() => Vec::new(),
+        t => vec![sp(fg(DIM), t)],
+    }
+}
+
+/// Message from main to the child: an accent rail down the left edge under a
+/// `main → agent` header that carries the clock.
+fn user_block(text: &str, ts: Option<u64>, agent: &str, width: usize, out: &mut Vec<Painted>) {
+    let head = vec![
+        sp(fg(ACCENT), "┃ "),
+        sp(fg(ACCENT).add_modifier(Modifier::BOLD), "main"),
+        sp(fg(DIM), format!(" → {agent}")),
+    ];
+    out.push(Painted::new(split_line(head, clock_spans(ts), width)));
+    let inner = width.saturating_sub(MARGIN).max(1);
     let body = if text.trim().is_empty() { " " } else { text.trim() };
-    for (i, l) in fmt::wrap_width(body, inner).into_iter().enumerate() {
-        let mut spans = vec![sp(fg(ACCENT), "┃ "), sp(Style::default(), l)];
-        if i == 0 && !time.is_empty() {
-            spans = split_line(spans, vec![sp(fg(DIM), time.clone())], width);
-        }
-        out.push(Painted::new(spans));
+    for l in fmt::wrap_width(body, inner) {
+        out.push(Painted::new(vec![sp(fg(ACCENT), "┃ "), sp(Style::default(), l)]));
     }
 }
 
@@ -1800,6 +1817,7 @@ mod tests {
     fn chat_body(turns: Vec<TranscriptTurn>) -> DetailBody {
         DetailBody::Conversation(Chat {
             turns,
+            agent: "worker".into(),
             stats: vec![("-".into(), "in".into()), ("0".into(), "shells".into())],
             running: false,
         })
@@ -1849,8 +1867,9 @@ mod tests {
         let tools: Vec<TranscriptTurn> = (0..3).map(|_| tool_turn("bash", Some(&args), "ok")).collect();
         let painted = layout(&chat_body(tools), 48, false);
         assert_fits(&painted, 48);
-        assert_eq!(painted.len(), 3, "no gaps between activity rows: {:?}", texts(&painted));
-        for p in &painted {
+        assert_eq!(painted.len(), 4, "no gaps between activity rows: {:?}", texts(&painted));
+        assert_eq!(painted[0].text(), "● worker");
+        for p in &painted[1..] {
             let t = p.text();
             assert!(t.starts_with("  ▸ ✓ bash"), "{t:?}");
             assert!(t.ends_with('…'), "summary truncates: {t:?}");
@@ -1867,13 +1886,10 @@ mod tests {
             mk_turn("assistant", "done"),
         ];
         let text = texts(&layout(&chat_body(turns), 60, false));
-        assert_eq!(text.len(), 6, "{text:?}");
-        assert!(text[0].starts_with("┃ go"));
-        assert_eq!(text[1], "");
-        assert!(text[2].contains("Thinking"));
-        assert!(text[3].contains("read") && text[3].contains("a.rs"));
-        assert_eq!(text[4], "");
-        assert_eq!(text[5], "  done");
+        assert_eq!(
+            text,
+            vec!["┃ main → worker", "┃ go", "", "● worker", "  ▸ ∴ Thinking", "  ▸ ✓ read  a.rs", "", "  done"],
+        );
     }
 
     #[test]
@@ -1888,7 +1904,7 @@ mod tests {
         assert!(!text.contains("Rebasing (1/"), "{text}");
         assert!(text.contains("▾"), "{text}");
         assert_eq!(painted.iter().filter(|p| p.fold.is_some()).count(), 1, "only the chevron row is clickable");
-        let body: Vec<_> = painted.iter().skip(1).map(|p| p.text()).collect();
+        let body: Vec<_> = painted.iter().skip(2).map(|p| p.text()).collect();
         assert!(body.iter().all(|l| l.starts_with("  │ ")), "{body:?}");
     }
 
@@ -1916,7 +1932,9 @@ mod tests {
         let painted = layout(&chat_body(vec![user, tool]), 48, false);
         assert_fits(&painted, 48);
         let text = texts(&painted);
-        assert!(text[0].starts_with("┃ look at src") && text[0].contains(':'), "{text:?}");
+        assert!(text[0].starts_with("┃ main → worker") && text[0].contains(':'), "{text:?}");
+        assert_eq!(text[1], "┃ look at src");
+        assert_eq!(text[3], "● worker", "the agent header does not repeat the clock");
         assert!(text.last().unwrap().contains(':'), "{text:?}");
     }
 
@@ -1944,20 +1962,21 @@ mod tests {
         let text = "## Plan\n- run `cargo test` now\n- **ship** it\n```\nfn main() {}\n```";
         let painted = layout(&chat_body(vec![mk_turn("assistant", text)]), 60, false);
         let lines = texts(&painted);
-        assert_eq!(lines[0], "  Plan");
-        assert_eq!(lines[1], "  • run cargo test now");
-        assert_eq!(lines[2], "  • ship it");
-        assert_eq!(lines[3], "  │ fn main() {}");
-        let code = painted[1].spans.iter().find(|s| s.content == "cargo test").expect("code span");
+        assert_eq!(lines[0], "● worker");
+        assert_eq!(lines[1], "  Plan");
+        assert_eq!(lines[2], "  • run cargo test now");
+        assert_eq!(lines[3], "  • ship it");
+        assert_eq!(lines[4], "  │ fn main() {}");
+        let code = painted[2].spans.iter().find(|s| s.content == "cargo test").expect("code span");
         assert_eq!(code.style.fg, Some(CODE));
-        let strong = painted[2].spans.iter().find(|s| s.content == "ship").expect("bold span");
+        let strong = painted[3].spans.iter().find(|s| s.content == "ship").expect("bold span");
         assert!(strong.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn assistant_error_is_marked() {
         let painted = layout(&chat_body(vec![mk_turn("assistant error", "529 overloaded")]), 40, false);
-        assert_eq!(texts(&painted), vec!["  ✗ 529 overloaded".to_string()]);
+        assert_eq!(texts(&painted), vec!["● worker".to_string(), "  ✗ 529 overloaded".to_string()]);
     }
 
     #[test]
@@ -1972,6 +1991,7 @@ mod tests {
         assert!(d.title.contains("subagent"));
         d.body = DetailBody::Conversation(Chat {
             turns: vec![mk_turn("user", "inspect the loader")],
+            agent: "worker".into(),
             stats: vec![
                 ("100".into(), "in".into()),
                 ("20".into(), "out".into()),

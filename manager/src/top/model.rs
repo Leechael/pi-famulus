@@ -506,6 +506,8 @@ pub struct MouseHit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chat {
     pub turns: Vec<TranscriptTurn>,
+    /// Child display name for speaker headers.
+    pub agent: String,
     /// `(value, label)` pairs for the footer, e.g. `("12k", "in")`.
     pub stats: Vec<(String, String)>,
     pub running: bool,
