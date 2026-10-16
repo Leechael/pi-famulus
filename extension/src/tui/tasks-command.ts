@@ -13,6 +13,7 @@ import type { SubagentRegistry } from "../subagent/registry";
 import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
 import { keyHints, notifyPlainFallback, showScrollDetail, spread, type PaneRenderer, type PaneTheme } from "./scroll-detail-view";
 import { renderConversation } from "./conversation-view";
+import { showTaskDetail } from "./task-detail-view";
 import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
 import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
@@ -466,32 +467,6 @@ export function taskDetailInfo(item: WorkItem, now: number): string {
   return lines.join("\n");
 }
 
-function isLiveStatus(status: string): boolean {
-  return status === "running" || status === "pending";
-}
-
-/**
- * Tab bodies for a shell or monitor. `getItem` is read on every poll so the
- * header follows the task (a view opened while it ran must not keep saying
- * "running"), and an empty file says why it is empty.
- */
-export function taskDetailTabs(
-  getItem: () => WorkItem,
-  paths: { outputPath: string; stderrPath: string },
-  now: () => number,
-): { output: () => string; stderr: () => string; info: () => string } {
-  const body = (path: string, emptyLive: string, emptyDone: string) => {
-    const text = readTaskFileTailCached(path);
-    if (text !== "(empty)") return text;
-    return isLiveStatus(getItem().status) ? emptyLive : emptyDone;
-  };
-  return {
-    output: () => `${taskDetailHeader(getItem(), now())}\n\n${body(paths.outputPath, "(no output yet)", "(no output; the command printed nothing)")}`,
-    stderr: () => `${taskDetailHeader(getItem(), now())}\n\n${body(paths.stderrPath, "(nothing on stderr yet)", "(nothing on stderr)")}`,
-    info: () => taskDetailInfo({ ...getItem(), ...paths }, now()),
-  };
-}
-
 async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksCommandDeps): Promise<void> {
   if (!ctx.hasUI) return;
   const clock = deps.clock ?? realClock;
@@ -532,16 +507,20 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
   }
   const outputPath = resolveTaskOutputPath(item, deps.home, deps.sessionId?.());
   const stderrPath = item.stderrPath || stderrPathFor(outputPath);
-  const tabs = taskDetailTabs(() => deps.getIndex()?.get(item.id) ?? item, { outputPath, stderrPath }, () => clock.now());
-  const infoText = tabs.info;
+  const getItem = () => deps.getIndex()?.get(item.id) ?? item;
   try {
-    await showScrollDetail(ctx.ui, {
-      title: `${item.kind} · ${item.title}`,
-      tabs,
+    await showTaskDetail(ctx.ui, {
+      title: `${item.id} · ${item.title}`,
+      getItem,
+      paths: { outputPath, stderrPath },
       pollMs: 500,
       clock: deps.clock,
     });
   } catch {
-    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, `${infoText()}\n\n${readTaskFileTailCached(outputPath)}`);
+    notifyPlainFallback(
+      ctx.ui.notify.bind(ctx.ui),
+      item.title,
+      `${taskDetailInfo({ ...getItem(), outputPath, stderrPath }, clock.now())}\n\n${readTaskFileTailCached(outputPath)}`,
+    );
   }
 }
