@@ -247,8 +247,9 @@ pub fn height_class(rows: u16) -> HeightClass {
 pub fn header_height(h: HeightClass) -> u16 {
     match h {
         HeightClass::Short => 2,
-        HeightClass::Standard => 5,
-        HeightClass::Tall => 6,
+        // Boxed bands: border + 4 / 5 stat rows.
+        HeightClass::Standard => 6,
+        HeightClass::Tall => 7,
     }
 }
 
@@ -589,6 +590,20 @@ pub struct TopState {
     pub now: u64,
     pub want_refresh: bool,
     pub mouse: MouseHit,
+    /// Recent machine CPU% samples, oldest first, one per snapshot.
+    pub cpu_hist: Vec<f64>,
+    /// Recent running-task counts, oldest first, one per snapshot.
+    pub run_hist: Vec<f64>,
+}
+
+/// Samples kept for the header graphs (two minutes at the default 1s).
+pub const HIST_CAP: usize = 120;
+
+fn push_hist(hist: &mut Vec<f64>, v: f64) {
+    hist.push(v);
+    if hist.len() > HIST_CAP {
+        hist.drain(..hist.len() - HIST_CAP);
+    }
 }
 
 impl TopState {
@@ -627,6 +642,8 @@ impl TopState {
             now: 0,
             want_refresh: false,
             mouse: MouseHit::default(),
+            cpu_hist: Vec::new(),
+            run_hist: Vec::new(),
         }
     }
 
@@ -762,6 +779,8 @@ impl TopState {
             queue_share: share(queue),
             work_kinds,
         };
+        push_hist(&mut self.cpu_hist, self.header.cpu_now.unwrap_or(0.0));
+        push_hist(&mut self.run_hist, self.header.tasks_run as f64);
     }
 
     pub fn recompute_visible(&mut self) {

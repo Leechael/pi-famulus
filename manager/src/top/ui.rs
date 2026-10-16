@@ -111,18 +111,13 @@ pub fn draw(frame: &mut Frame, state: &mut TopState) {
     let preview_on = state.preview && hclass != HeightClass::Short && state.detail.is_none();
     let preview_h = if preview_on {
         let rest = area.height.saturating_sub(head_h + 2);
-        ((rest as u32 * if hclass == HeightClass::Tall { 35 } else { 30 } / 100) as u16).max(3)
+        ((rest as u32 * if hclass == HeightClass::Tall { 35 } else { 30 } / 100) as u16).max(4)
     } else {
         0
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(head_h),
-            Constraint::Min(3),
-            Constraint::Length(preview_h),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(head_h), Constraint::Min(4), Constraint::Length(preview_h)])
         .split(area);
 
     draw_header(frame, chunks[0], state, hclass);
@@ -130,7 +125,6 @@ pub fn draw(frame: &mut Frame, state: &mut TopState) {
     if preview_h > 0 {
         draw_preview(frame, chunks[2], state);
     }
-    draw_footer(frame, chunks[3], state);
 
     if state.help {
         draw_help(frame, area);
@@ -145,21 +139,119 @@ pub fn draw(frame: &mut Frame, state: &mut TopState) {
     }
 }
 
-/// Refresh state plus the clock of the last snapshot, so each refresh is
-/// visible even when no number on screen changed.
+// ── boxes ──────────────────────────────────────────────────────────────────
+
+/// Border colors per panel, muted so the content stays brighter.
+const BOX_OVERVIEW: Color = Color::Rgb(86, 124, 98);
+const BOX_KINDS: Color = Color::Rgb(128, 122, 80);
+const BOX_MAIN: Color = Color::Rgb(98, 94, 156);
+const BOX_PREVIEW: Color = Color::Rgb(136, 90, 96);
+/// Hotkey digits in box titles.
+const HOT: Color = Color::Rgb(238, 112, 112);
+
+/// `┐title┌` cut into a border line.
+fn seg(color: Color, body: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut out = vec![sp(fg(color), "┐")];
+    out.extend(body);
+    out.push(sp(fg(color), "┌"));
+    out
+}
+
+/// `┘key label└` for bottom borders.
+fn seg_bottom(color: Color, body: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut out = vec![sp(fg(color), "┘")];
+    out.extend(body);
+    out.push(sp(fg(color), "└"));
+    out
+}
+
+/// Box title: superscript hotkey digit, then the name in bold.
+fn titled_seg(color: Color, hot: &str, name: &str) -> Vec<Span<'static>> {
+    let mut body = Vec::new();
+    if !hot.is_empty() {
+        body.push(sp(fg(HOT), hot.to_string()));
+    }
+    body.push(sp(fg(TEXT).add_modifier(Modifier::BOLD), name.to_string()));
+    seg(color, body)
+}
+
+/// One `─` of border before a left title / after a right one, so segments
+/// sit off the rounded corner like btop's `╭─┐cpu┌`.
+fn lead(color: Color, mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    spans.insert(0, sp(fg(color), "─"));
+    spans
+}
+
+fn trail(color: Color, mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    spans.push(sp(fg(color), "─"));
+    spans
+}
+
+fn panel_box(color: Color) -> Block<'static> {
+    Block::bordered().border_type(BorderType::Rounded).border_style(fg(color))
+}
+
+/// Linear blend between two RGB colors.
+fn mix(a: Color, b: Color, t: f64) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let l = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t.clamp(0.0, 1.0)).round() as u8;
+            Color::Rgb(l(r1, r2), l(g1, g2), l(b1, b2))
+        }
+        _ => a,
+    }
+}
+
+const GRAD_MID: Color = Color::Rgb(226, 196, 92);
+
+/// Load gradient: green → yellow → red as `t` goes 0 → 1.
+fn grad(t: f64) -> Color {
+    if t < 0.5 {
+        mix(OK, GRAD_MID, t * 2.0)
+    } else {
+        mix(GRAD_MID, ERR, (t - 0.5) * 2.0)
+    }
+}
+
+/// `■■■■□□□□` with each filled cell colored by its position on the gradient.
+fn grad_meter(used: usize, total: usize, cells: usize) -> Vec<Span<'static>> {
+    let fill = (used * cells).checked_div(total).map_or(0, |_| (used * cells).div_ceil(total)).min(cells);
+    let mut out: Vec<Span> = (0..fill)
+        .map(|i| sp(fg(grad(i as f64 / (cells.max(2) - 1) as f64)), "■"))
+        .collect();
+    out.push(sp(fg(RULE), "■".repeat(cells - fill)));
+    out
+}
+
+const SPARK: [&str; 5] = ["⠀", "⣀", "⣤", "⣶", "⣿"];
+
+/// One-row braille graph of the newest `cells` samples, scaled to `ceil`
+/// (or the window's max when that is higher), colored by level.
+fn sparkline(hist: &[f64], cells: usize, ceil: f64) -> Vec<Span<'static>> {
+    let start = hist.len().saturating_sub(cells);
+    let window = &hist[start..];
+    let max = window.iter().copied().fold(ceil, f64::max).max(f64::EPSILON);
+    let mut out = vec![sp(fg(RULE), "⠀".repeat(cells - window.len()))];
+    for v in window {
+        let t = (v / max).clamp(0.0, 1.0);
+        let level = if *v <= 0.0 { 0 } else { 1 + ((t * 3.0).round() as usize).min(3) };
+        let color = if level == 0 { RULE } else { grad(t) };
+        out.push(sp(fg(color), SPARK[level]));
+    }
+    out
+}
+
+// ── header ─────────────────────────────────────────────────────────────────
+
 fn live_pill(state: &TopState) -> Vec<Span<'static>> {
     let at = clock((state.now > 0).then_some(state.now));
     let at = if at.is_empty() { String::new() } else { format!(" · {at}") };
     if state.paused {
-        vec![sp(fg(WARN), "‖ paused"), sp(fg(DIM), format!("{at} "))]
+        vec![sp(fg(WARN), "‖ paused"), sp(fg(DIM), at)]
     } else if state.header.live {
-        vec![
-            sp(fg(OK), "● "),
-            sp(fg(MUTED), format!("live {}", interval_text(state.interval_ms))),
-            sp(fg(DIM), format!("{at} ")),
-        ]
+        vec![sp(fg(OK), "● "), sp(fg(TEXT), format!("live {}", interval_text(state.interval_ms))), sp(fg(DIM), at)]
     } else {
-        vec![sp(fg(DIM), format!("○ offline · disk snapshot{at} "))]
+        vec![sp(fg(DIM), format!("○ offline · disk snapshot{at}"))]
     }
 }
 
@@ -171,183 +263,40 @@ fn interval_text(ms: u64) -> String {
     }
 }
 
+/// Compact two-line header for short terminals: no boxes.
 fn brand_line(state: &TopState, width: usize) -> Line<'static> {
     let h = &state.header;
     let mut left = vec![
         sp(fg(ACCENT).add_modifier(Modifier::BOLD), " ◆ "),
         sp(bold(), "pi-famulus"),
         sp(fg(DIM), format!(" {}", h.version)),
+        sp(fg(DIM), "   sessions "),
+        sp(fg(MUTED), format!("{}", h.sessions_conn)),
+        sp(fg(DIM), format!("/{}", h.sessions_tot)),
     ];
-    if let Some(pid) = h.pid {
-        left.push(sp(fg(DIM), "   pid "));
-        left.push(sp(fg(MUTED), pid.to_string()));
-        left.push(sp(fg(DIM), " · up "));
-        left.push(sp(fg(MUTED), h.uptime_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into())));
-    }
-    left.push(sp(fg(DIM), "   sessions "));
-    left.push(sp(fg(MUTED), format!("{}", h.sessions_conn)));
-    left.push(sp(fg(DIM), format!("/{}", h.sessions_tot)));
-    Line::from(split_line(left, live_pill(state), width))
-}
-
-/// `▰▰▱▱▱▱▱▱` meter; filled cells in `color`.
-fn meter(used: usize, total: usize, cells: usize, color: Color) -> Vec<Span<'static>> {
-    let fill = (used * cells).checked_div(total).map_or(0, |_| (used * cells).div_ceil(total)).min(cells);
-    vec![sp(fg(color), "▰".repeat(fill)), sp(fg(RULE), "▱".repeat(cells - fill))]
-}
-
-/// One bar split into LLM / tool / queue shares.
-fn wall_bar(llm: u64, tool: u64, queue: u64, cells: usize) -> Vec<Span<'static>> {
-    let total = (llm + tool + queue).max(1);
-    let l = (llm as usize * cells + total as usize / 2) / total as usize;
-    let t = (tool as usize * cells + total as usize / 2) / total as usize;
-    let l = l.min(cells);
-    let t = t.min(cells - l);
-    let q = if llm + tool + queue == 0 { 0 } else { cells - l - t };
-    let rest = cells - l - t - q;
-    vec![
-        sp(fg(ACCENT), "▰".repeat(l)),
-        sp(fg(OK), "▰".repeat(t)),
-        sp(fg(WARN), "▰".repeat(q)),
-        sp(fg(RULE), "▱".repeat(rest)),
-    ]
+    left.push(Span::raw(" "));
+    let mut right = live_pill(state);
+    right.push(Span::raw(" "));
+    Line::from(split_line(left, right, width))
 }
 
 fn stat_row(label: &str, value: Vec<Span<'static>>) -> Vec<Span<'static>> {
-    let mut out = vec![sp(fg(DIM), format!("   {label:<8}"))];
+    let mut out = vec![sp(fg(MUTED), format!(" {label:<8}"))];
     out.extend(value);
     out
 }
 
 fn val(text: impl Into<String>) -> Span<'static> {
     let t: String = text.into();
-    if t == "-" {
+    if t == "-" || t == "stale" {
         sp(fg(DIM), t)
     } else {
-        sp(Style::default(), t)
+        sp(fg(TEXT), t)
     }
 }
 
 fn unit(text: &str) -> Span<'static> {
     sp(fg(DIM), text.to_string())
-}
-
-fn draw_header(frame: &mut Frame, area: Rect, state: &TopState, hclass: HeightClass) {
-    let h = &state.header;
-    let width = area.width as usize;
-    if hclass == HeightClass::Short {
-        let mut line2 = vec![sp(fg(DIM), "   agents ")];
-        line2.extend(meter(h.agents_used, h.agents_total, 4, ACCENT));
-        line2.push(val(format!(" {}/{}", h.agents_used, h.agents_total)));
-        line2.push(unit("  running "));
-        line2.push(running_count(h.tasks_run));
-        line2.push(unit("  cpu "));
-        line2.push(val(now_cell(h.cpu_now, false)));
-        line2.push(unit("  tok "));
-        line2.push(val(compact_num(h.tokens_in.unwrap_or(0))));
-        line2.push(unit("/"));
-        line2.push(val(compact_num(h.tokens_out.unwrap_or(0))));
-        for k in h.work_kinds.iter().take(4) {
-            line2.push(unit(format!("  {} ", k.kind).as_str()));
-            line2.push(val(format!("{:.0}%", k.cpu_now.unwrap_or(0.0))));
-        }
-        frame.render_widget(Paragraph::new(vec![brand_line(state, width), Line::from(fit_spans(line2, width))]), area);
-        return;
-    }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
-    frame.render_widget(Paragraph::new(brand_line(state, width)), rows[0]);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-        .split(rows[1]);
-    let lw = cols[0].width as usize;
-    let mut left = Vec::new();
-    let mut slots = meter(h.agents_used, h.agents_total, 8, ACCENT);
-    slots.push(val(format!(" {}/{}", h.agents_used, h.agents_total)));
-    left.push(stat_row("agents", slots));
-    left.push(stat_row(
-        "tasks",
-        vec![
-            running_count(h.tasks_run),
-            unit(" running · "),
-            val(h.tasks_sh.to_string()),
-            unit(" shells · "),
-            val(h.tasks_ag.to_string()),
-            unit(" agents"),
-        ],
-    ));
-    left.push(stat_row(
-        "cpu",
-        vec![
-            val(h.cpu_now.map(|p| format!("{p:.1}%")).unwrap_or_else(|| "-".into())),
-            unit(" now · "),
-            val(h.cpu_tot.map(fmt::human_duration).unwrap_or_else(|| "-".into())),
-            unit(" total"),
-        ],
-    ));
-    left.push(stat_row(
-        "tokens",
-        vec![
-            val(compact_num(h.tokens_in.unwrap_or(0))),
-            unit(" in · "),
-            val(compact_num(h.tokens_out.unwrap_or(0))),
-            unit(" out · "),
-            val(h.tok_s.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into())),
-            unit(" tok/s"),
-        ],
-    ));
-    let (llm, tool, queue) = (h.llm_share.unwrap_or(0), h.tool_share.unwrap_or(0), h.queue_share.unwrap_or(0));
-    let mut wall = wall_bar(llm, tool, queue, 8);
-    wall.extend([
-        sp(fg(ACCENT), " llm "),
-        val(format!("{llm}%")),
-        sp(fg(OK), " tool "),
-        val(format!("{tool}%")),
-        sp(fg(WARN), " queue "),
-        val(format!("{queue}%")),
-    ]);
-    left.push(stat_row("wall", wall));
-    let left: Vec<Line> =
-        left.into_iter().take(cols[0].height as usize).map(|l| Line::from(fit_spans(l, lw))).collect();
-    frame.render_widget(Paragraph::new(left), cols[0]);
-
-    let rw = cols[1].width as usize;
-    let mut kind_lines = vec![Line::from(fit_spans(
-        vec![sp(
-            fg(DIM),
-            format!(" {:<11} {:>5} {:>6} {:>7} {:>7} {:>6}", "work kind", "slots", "tasks", "wall", "cpu", "now"),
-        )],
-        rw,
-    ))];
-    let room = (cols[1].height as usize).saturating_sub(1);
-    let kinds = &h.work_kinds;
-    let shown = if kinds.len() > room { room.saturating_sub(1) } else { kinds.len() };
-    for k in kinds.iter().take(shown) {
-        let busy = k.used > 0;
-        let now = k.cpu_now.filter(|p| *p > 0.0);
-        let row = vec![
-            sp(if busy { Style::default() } else { fg(MUTED) }, format!(" {:<11}", fmt::truncate_width(&k.kind, 11))),
-            sp(if busy { fg(ACCENT) } else { fg(DIM) }, format!(" {:>5}", format!("{}/{}", k.used, k.total))),
-            val(format!(" {:>5}", k.tasks)),
-            val(format!(" {:>7}", fmt::human_duration(k.wall_ms))),
-            match k.cpu_ms {
-                Some(c) => val(format!(" {:>7}", fmt::human_duration(c))),
-                None => sp(fg(DIM), format!(" {:>7}", "-")),
-            },
-            match now {
-                Some(p) => sp(fg(OK), format!(" {:>6}", format!("{p:.1}%"))),
-                None => sp(fg(DIM), format!(" {:>6}", "-")),
-            },
-        ];
-        kind_lines.push(Line::from(fit_spans(row, rw)));
-    }
-    if shown < kinds.len() {
-        kind_lines.push(Line::from(sp(fg(DIM), format!(" +{} more", kinds.len() - shown))));
-    }
-    frame.render_widget(Paragraph::new(kind_lines), cols[1]);
 }
 
 fn running_count(n: usize) -> Span<'static> {
@@ -358,63 +307,297 @@ fn running_count(n: usize) -> Span<'static> {
     }
 }
 
-fn tab_bar(state: &TopState, width: usize) -> (Vec<Span<'static>>, Vec<(u16, u16, TabHit)>) {
-    let mut spans = vec![Span::raw(" ")];
+/// Stacked LLM / tool / queue share bar.
+fn wall_bar(llm: u64, tool: u64, queue: u64, cells: usize) -> Vec<Span<'static>> {
+    let total = llm + tool + queue;
+    if total == 0 {
+        return vec![sp(fg(RULE), "■".repeat(cells))];
+    }
+    let part = |v: u64| ((v as usize * cells) + total as usize / 2) / total as usize;
+    let l = part(llm).min(cells);
+    let t = part(tool).min(cells - l);
+    let q = cells - l - t;
+    vec![sp(fg(ACCENT), "■".repeat(l)), sp(fg(OK), "■".repeat(t)), sp(fg(WARN), "■".repeat(q))]
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, state: &TopState, hclass: HeightClass) {
+    let h = &state.header;
+    let width = area.width as usize;
+    if hclass == HeightClass::Short {
+        let mut line2 = vec![sp(fg(MUTED), "   agents ")];
+        line2.extend(grad_meter(h.agents_used, h.agents_total, 4));
+        line2.push(val(format!(" {}/{}", h.agents_used, h.agents_total)));
+        line2.push(unit("  running "));
+        line2.push(running_count(h.tasks_run));
+        line2.push(unit("  cpu "));
+        line2.extend(sparkline(&state.cpu_hist, 8, 100.0));
+        line2.push(val(format!(" {}", now_cell(h.cpu_now, false))));
+        line2.push(unit("  tok "));
+        line2.push(val(compact_num(h.tokens_in.unwrap_or(0))));
+        line2.push(unit("/"));
+        line2.push(val(compact_num(h.tokens_out.unwrap_or(0))));
+        frame.render_widget(
+            Paragraph::new(vec![brand_line(state, width), Line::from(fit_spans(line2, width))]),
+            area,
+        );
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(area);
+    draw_overview(frame, cols[0], state);
+    draw_kinds(frame, cols[1], state);
+}
+
+fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
+    let h = &state.header;
+    // Titles share one border row: drop the version, then the live pill,
+    // rather than let them overwrite each other.
+    let room = (area.width as usize).saturating_sub(4);
+    let pill = trail(BOX_OVERVIEW, seg(BOX_OVERVIEW, live_pill(state)));
+    let mut title = lead(BOX_OVERVIEW, titled_seg(BOX_OVERVIEW, "¹", "pi-famulus"));
+    let versioned = {
+        let mut t = title.clone();
+        t.insert(t.len() - 1, sp(fg(DIM), format!(" {}", h.version)));
+        t
+    };
+    if spans_width(&versioned) + spans_width(&pill) <= room {
+        title = versioned;
+    }
+    let mut block = panel_box(BOX_OVERVIEW).title(Line::from(title.clone()));
+    if spans_width(&title) + spans_width(&pill) <= room {
+        block = block.title(Line::from(pill).right_aligned());
+    }
+    if let Some(pid) = h.pid {
+        let up = h.uptime_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into());
+        block = block.title_bottom(Line::from(lead(
+            BOX_OVERVIEW,
+            seg_bottom(BOX_OVERVIEW, vec![sp(fg(DIM), format!("pid {pid} · up {up}"))]),
+        )));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let w = inner.width as usize;
+    let graph_w = w.saturating_sub(40).clamp(8, 32);
+
+    let mut rows = Vec::new();
+    let mut agents = grad_meter(h.agents_used, h.agents_total, 10);
+    agents.push(val(format!(" {}/{}", h.agents_used, h.agents_total)));
+    agents.push(unit("   sessions "));
+    agents.push(val(h.sessions_conn.to_string()));
+    agents.push(unit(format!("/{}", h.sessions_tot).as_str()));
+    rows.push(stat_row("agents", agents));
+
+    let mut tasks = sparkline(&state.run_hist, graph_w, 1.0);
+    tasks.extend([
+        Span::raw(" "),
+        running_count(h.tasks_run),
+        unit(" running · "),
+        val(h.tasks_sh.to_string()),
+        unit(" shells · "),
+        val(h.tasks_ag.to_string()),
+        unit(" agents"),
+    ]);
+    rows.push(stat_row("tasks", tasks));
+
+    let mut cpu = sparkline(&state.cpu_hist, graph_w, 100.0);
+    cpu.extend([
+        Span::raw(" "),
+        val(h.cpu_now.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into())),
+        unit(" now · "),
+        val(h.cpu_tot.map(fmt::human_duration).unwrap_or_else(|| "-".into())),
+        unit(" total"),
+    ]);
+    rows.push(stat_row("cpu", cpu));
+
+    rows.push(stat_row(
+        "tokens",
+        vec![
+            val(compact_num(h.tokens_in.unwrap_or(0))),
+            unit(" in · "),
+            val(compact_num(h.tokens_out.unwrap_or(0))),
+            unit(" out · "),
+            val(h.tok_s.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into())),
+            unit(" tok/s per agent"),
+        ],
+    ));
+    let (llm, tool, queue) = (h.llm_share.unwrap_or(0), h.tool_share.unwrap_or(0), h.queue_share.unwrap_or(0));
+    let mut wall = wall_bar(llm, tool, queue, 10);
+    wall.extend([
+        sp(fg(ACCENT), " llm "),
+        val(format!("{llm}%")),
+        sp(fg(OK), "  tool "),
+        val(format!("{tool}%")),
+        sp(fg(WARN), "  queue "),
+        val(format!("{queue}%")),
+    ]);
+    rows.push(stat_row("wall", wall));
+
+    let lines: Vec<Line> = rows.into_iter().take(inner.height as usize).map(|r| Line::from(fit_spans(r, w))).collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_kinds(frame: &mut Frame, area: Rect, state: &TopState) {
+    let block = panel_box(BOX_KINDS).title(Line::from(lead(BOX_KINDS, titled_seg(BOX_KINDS, "²", "work kinds"))));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let w = inner.width as usize;
+    let kinds = &state.header.work_kinds;
+    let mut lines = vec![Line::from(fit_spans(
+        vec![sp(fg(MUTED), format!(" {:<11} {:<9} {:>5} {:>7} {:>6} {:>6}", "kind", "slots", "tasks", "wall", "cpu", "now"))],
+        w,
+    ))];
+    let room = (inner.height as usize).saturating_sub(1);
+    let shown = if kinds.len() > room { room.saturating_sub(1) } else { kinds.len() };
+    for k in kinds.iter().take(shown) {
+        let mut row = vec![sp(fg(if k.used > 0 { TEXT } else { MUTED }), format!(" {:<11} ", fmt::truncate_width(&k.kind, 11)))];
+        row.extend(grad_meter(k.used, k.total, 4));
+        row.push(sp(fg(if k.used > 0 { TEXT } else { DIM }), format!(" {:<4}", format!("{}/{}", k.used, k.total))));
+        row.push(val(format!("{:>5}", k.tasks)));
+        row.push(val(format!(" {:>7}", fmt::human_duration(k.wall_ms))));
+        row.push(match k.cpu_ms {
+            Some(c) => val(format!(" {:>6}", fmt::human_duration(c))),
+            None => sp(fg(DIM), format!(" {:>6}", "-")),
+        });
+        row.push(match k.cpu_now.filter(|p| *p > 0.0) {
+            Some(p) => sp(fg(grad((p / 400.0).min(1.0))), format!(" {:>6}", format!("{p:.0}%"))),
+            None => sp(fg(DIM), format!(" {:>6}", "-")),
+        });
+        lines.push(Line::from(fit_spans(row, w)));
+    }
+    if shown < kinds.len() {
+        lines.push(Line::from(sp(fg(DIM), format!(" +{} more", kinds.len() - shown))));
+    }
+    if kinds.is_empty() {
+        lines.push(Line::from(sp(fg(DIM), " (no work yet)")));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ── main box ───────────────────────────────────────────────────────────────
+
+/// Tabs cut into the main box's top border, with click ranges relative to
+/// the box's left edge.
+fn tab_segments(state: &TopState) -> (Vec<Span<'static>>, Vec<(u16, u16, TabHit)>) {
+    let mut spans = vec![sp(fg(BOX_MAIN), "─")];
     let mut hits = Vec::new();
-    let mut x = 1usize;
-    for tab in [Tab::Tree, Tab::Agents, Tab::Tasks, Tab::Events] {
+    let mut x = 2usize; // after the corner and the lead dash
+    for (i, tab) in [Tab::Tree, Tab::Agents, Tab::Tasks, Tab::Events].into_iter().enumerate() {
         let (name, count) = match tab {
-            Tab::Tree => ("Tree", Some(state.count_tab(Tab::Tree))),
-            Tab::Agents => ("Agents", Some(state.count_tab(Tab::Agents))),
-            Tab::Tasks => ("Tasks", Some(state.count_tab(Tab::Tasks))),
-            Tab::Events => ("Events", None),
+            Tab::Tree => ("tree", Some(state.count_tab(Tab::Tree))),
+            Tab::Agents => ("agents", Some(state.count_tab(Tab::Agents))),
+            Tab::Tasks => ("tasks", Some(state.count_tab(Tab::Tasks))),
+            Tab::Events => ("events", None),
         };
         let active = state.tab == tab;
-        let start = x;
-        let name_style =
-            if active { fg(ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { fg(MUTED) };
-        spans.push(sp(name_style, name));
-        x += fmt::display_width(name);
+        let mut body = vec![sp(fg(HOT), ["¹", "²", "³", "⁴"][i].to_string())];
+        body.push(if active {
+            sp(fg(ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED), name)
+        } else {
+            sp(fg(MUTED), name)
+        });
         if let Some(c) = count {
-            let t = format!(" {c}");
-            x += t.len();
-            spans.push(sp(if active { fg(ACCENT) } else { fg(DIM) }, t));
+            body.push(sp(fg(if active { ACCENT } else { DIM }), format!(" {c}")));
         }
-        hits.push((start as u16, x as u16, TabHit::Tab(tab)));
-        spans.push(Span::raw("   "));
-        x += 3;
+        let s = seg(BOX_MAIN, body);
+        let w = spans_width(&s);
+        hits.push((x as u16, (x + w) as u16, TabHit::Tab(tab)));
+        x += w;
+        spans.extend(s);
     }
-    let scope = state.scope.label().to_lowercase();
-    let sort = format!("{} {}", state.sort.label().to_lowercase(), if state.sort_desc { "↓" } else { "↑" });
-    let right = vec![
-        sp(fg(DIM), "scope "),
-        sp(fg(MUTED), scope.clone()),
-        sp(fg(DIM), "   sort "),
-        sp(fg(MUTED), sort.clone()),
-        Span::raw(" "),
-    ];
-    let rw = spans_width(&right);
-    if x + rw + 2 <= width {
-        let rx = width - rw;
-        let scope_end = rx + "scope ".len() + scope.len();
-        hits.push((rx as u16, scope_end as u16, TabHit::Scope));
-        hits.push((scope_end as u16, width as u16, TabHit::Sort));
+    (spans, hits)
+}
+
+fn scope_sort_segments(state: &TopState) -> (Vec<Span<'static>>, usize, usize) {
+    let scope = seg(BOX_MAIN, vec![sp(fg(DIM), "scope "), sp(fg(TEXT), state.scope.label().to_lowercase())]);
+    let sort = seg(
+        BOX_MAIN,
+        vec![
+            sp(fg(DIM), "sort "),
+            sp(fg(TEXT), state.sort.label().to_lowercase()),
+            sp(fg(ACCENT), if state.sort_desc { " ↓" } else { " ↑" }),
+        ],
+    );
+    let (sw, tw) = (spans_width(&scope), spans_width(&sort));
+    let mut spans = scope;
+    spans.extend(sort);
+    // Trailing dash: hit ranges cover the segments, not the dash.
+    (trail(BOX_MAIN, spans), sw, tw)
+}
+
+/// Bottom border: the live prompt (stop confirm / filter / message) or key
+/// hints on the left, `n/total` on the right.
+fn bottom_segments(state: &TopState) -> Vec<Span<'static>> {
+    let key = |k: &str, l: &str| {
+        seg_bottom(BOX_MAIN, vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), k.to_string()), sp(fg(MUTED), format!(" {l}"))])
+    };
+    if let Some(id) = &state.confirm_stop {
+        let mut s = seg_bottom(BOX_MAIN, vec![sp(fg(ERR).add_modifier(Modifier::BOLD), format!("■ stop {id}?"))]);
+        s.extend(key("y", "confirm"));
+        s.extend(key("n", "cancel"));
+        return s;
     }
-    (split_line(spans, right, width), hits)
+    if state.filter_editing {
+        let mut s = seg_bottom(
+            BOX_MAIN,
+            vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), state.filter.clone()), sp(fg(ACCENT), "▏")],
+        );
+        s.extend(key("enter", "apply"));
+        s.extend(key("esc", "clear"));
+        return s;
+    }
+    let mut s = Vec::new();
+    if !state.filter.is_empty() {
+        s.extend(seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), state.filter.clone())]));
+    }
+    if let Some(m) = &state.message {
+        s.extend(seg_bottom(BOX_MAIN, vec![sp(fg(WARN), m.clone())]));
+        return s;
+    }
+    for (k, l) in [("↑↓", "select"), ("⏎", "open"), ("←→", "fold"), ("v", "preview"), ("a", "scope"), ("s", "sort"), ("/", "filter"), ("x", "stop"), ("?", "help"), ("q", "quit")] {
+        s.extend(key(k, l));
+    }
+    s
+}
+
+fn position(state: &TopState) -> Vec<Span<'static>> {
+    let total = state.visible.len();
+    let at = state
+        .selected
+        .as_deref()
+        .and_then(|id| state.visible.iter().position(|v| v.id == id))
+        .map_or(0, |i| i + 1);
+    seg_bottom(BOX_MAIN, vec![sp(fg(TEXT), format!("{at}")), sp(fg(DIM), format!("/{total}"))])
 }
 
 fn draw_workspace(frame: &mut Frame, area: Rect, state: &mut TopState, wclass: WidthClass) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
-    let (bar, hits) = tab_bar(state, chunks[0].width as usize);
-    state.mouse.tabs = hit_rect(chunks[0]);
+    let (tabs, hits) = tab_segments(state);
+    let (right, scope_w, sort_w) = scope_sort_segments(state);
+    let width = area.width as usize;
+    let mut hits = hits;
+    let tabs_w = spans_width(&tabs);
+    let right_w = scope_w + sort_w + 1;
+    let mut block = panel_box(BOX_MAIN).title(Line::from(tabs));
+    if tabs_w + right_w + 4 <= width {
+        let rx = width - 1 - right_w;
+        hits.push((rx as u16, (rx + scope_w) as u16, TabHit::Scope));
+        hits.push(((rx + scope_w) as u16, (rx + scope_w + sort_w) as u16, TabHit::Sort));
+        block = block.title(Line::from(right).right_aligned());
+    }
+    let bottom = lead(BOX_MAIN, bottom_segments(state));
+    let pos = trail(BOX_MAIN, position(state));
+    if spans_width(&bottom) + spans_width(&pos) + 4 <= width {
+        block = block.title_bottom(Line::from(pos).right_aligned());
+    }
+    block = block.title_bottom(Line::from(fit_spans(bottom, width.saturating_sub(2))));
+    state.mouse.tabs = HitRect::from_xywh(area.x, area.y, area.width, 1);
     state.mouse.tab_hits = hits;
-    frame.render_widget(Paragraph::new(Line::from(bar)), chunks[0]);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
     if state.tab == Tab::Events {
-        draw_events(frame, chunks[1], state);
+        draw_events(frame, inner, state);
         return;
     }
     let cols = match state.tab {
@@ -422,7 +605,7 @@ fn draw_workspace(frame: &mut Frame, area: Rect, state: &mut TopState, wclass: W
         Tab::Tasks => task_cols(wclass),
         _ => tree_cols(wclass),
     };
-    draw_table(frame, chunks[1], state, cols);
+    draw_table(frame, inner, state, cols);
 }
 
 fn hit_rect(area: Rect) -> HitRect {
@@ -438,19 +621,40 @@ fn marker(selected: bool) -> Span<'static> {
     }
 }
 
+/// Placeholder cells: a column with nothing else in view is dropped.
+fn is_blank_cell(text: &str) -> bool {
+    matches!(text.trim(), "" | "-" | "-/-/-" | "stale")
+}
+
+/// Columns worth showing for the rows in view. The label, status, and
+/// title columns always stay; any other column that is blank on every
+/// visible row gives its width back to the flex column.
+fn live_cols(state: &TopState, rows: &[VisibleRow], cols: &[Col]) -> Vec<Col> {
+    cols.iter()
+        .copied()
+        .filter(|c| {
+            matches!(c, Col::Node | Col::Id | Col::Status | Col::Title)
+                || rows.is_empty()
+                || rows.iter().any(|vr| !is_blank_cell(&cell_text(state, vr, *c)))
+        })
+        .collect()
+}
+
 fn draw_table(frame: &mut Frame, area: Rect, state: &mut TopState, cols: &[Col]) {
     state.mouse.table = hit_rect(area);
     let page = area.height.saturating_sub(1) as usize;
     state.ensure_scroll(page);
-    let widths = col_widths(cols, area.width);
-    let header = Row::new(cols.iter().enumerate().map(|(i, c)| {
-        let label = if i == 0 { format!(" {}", c.header().to_lowercase()) } else { c.header().to_lowercase() };
-        Cell::from(Line::from(sp(fg(DIM), fmt::truncate_width(&label, widths[i] as usize))))
-    }));
-    let sel = state.selected.clone();
     let start = state.scroll;
     let end = (start + page).min(state.visible.len());
-    let rows: Vec<Row> = state.visible[start..end]
+    let window: Vec<VisibleRow> = state.visible[start..end].to_vec();
+    let cols = live_cols(state, &window, cols);
+    let widths = col_widths(&cols, area.width);
+    let header = Row::new(cols.iter().enumerate().map(|(i, c)| {
+        let label = if i == 0 { format!(" {}", c.header().to_lowercase()) } else { c.header().to_lowercase() };
+        Cell::from(Line::from(sp(fg(MUTED).add_modifier(Modifier::BOLD), fmt::truncate_width(&label, widths[i] as usize))))
+    }));
+    let sel = state.selected.clone();
+    let rows: Vec<Row> = window
         .iter()
         .map(|vr| {
             let selected = sel.as_deref() == Some(vr.id.as_str());
@@ -471,7 +675,7 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &mut TopState, cols: &[Col])
                 .collect();
             let row = Row::new(cells);
             if selected {
-                row.style(Style::default().bg(SEL_BG).fg(TEXT))
+                row.style(Style::default().bg(SEL_BG).fg(TEXT).add_modifier(Modifier::BOLD))
             } else {
                 row
             }
@@ -505,7 +709,7 @@ fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
     let width = area.width as usize;
     let mut lines = vec![Line::from(fit_spans(
         vec![sp(
-            fg(DIM),
+            fg(MUTED).add_modifier(Modifier::BOLD),
             format!("  {:<19} {:<9} {:<9} {:<18} {:<12} {}", "time", "session", "source", "type", "id", "detail"),
         )],
         width,
@@ -523,7 +727,7 @@ fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
             sp(fg(MUTED), format!("{:<9} ", ev.session)),
             sp(fg(MUTED), format!("{:<9} ", ev.src)),
             sp(fg(event_color(&ev.ty)), format!("{:<18} ", ev.ty)),
-            sp(Style::default(), format!("{:<12} ", ev.id)),
+            sp(fg(TEXT), format!("{:<12} ", ev.id)),
             sp(fg(MUTED), ev.summary.clone()),
         ];
         let mut line = Line::from(fit_spans(spans, width));
@@ -537,88 +741,23 @@ fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// `── label ─────` rule across `width`.
-fn rule(label: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let mut spans = vec![sp(fg(RULE), "── ")];
-    spans.extend(label);
-    spans.push(Span::raw(" "));
-    let used = spans_width(&spans);
-    if used < width {
-        spans.push(sp(fg(RULE), "─".repeat(width - used)));
-    }
-    Line::from(fit_spans(spans, width))
-}
-
 fn draw_preview(frame: &mut Frame, area: Rect, state: &TopState) {
-    let width = area.width as usize;
-    let label = match state.selected_node() {
-        Some(n) => {
-            vec![sp(fg(MUTED), "preview "), sp(Style::default(), n.label.clone()), sp(fg(DIM), format!("  {}", n.id))]
-        }
-        None => vec![sp(fg(MUTED), "preview")],
-    };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
-    frame.render_widget(Paragraph::new(rule(label, width)), rows[0]);
-    let body = rows[1];
-    let painted = layout_detail(&state.preview_body, body.width as usize, &HashSet::new(), false);
-    let start = painted.len().saturating_sub(body.height as usize);
-    let lines: Vec<Line> =
-        painted[start..].iter().map(|p| Line::from(fit_spans(p.spans.clone(), body.width as usize))).collect();
-    frame.render_widget(Paragraph::new(lines), body);
-}
-
-fn draw_footer(frame: &mut Frame, area: Rect, state: &TopState) {
-    let width = area.width as usize;
-    let spans = if let Some(id) = &state.confirm_stop {
-        let mut s = vec![sp(fg(ERR).add_modifier(Modifier::BOLD), format!(" ■ stop {id}?  "))];
-        s.extend(hints(&[("y", "confirm"), ("n", "cancel")]));
-        s
-    } else if state.filter_editing {
-        let mut s = vec![
-            sp(fg(ACCENT).add_modifier(Modifier::BOLD), " / "),
-            sp(Style::default(), state.filter.clone()),
-            sp(fg(ACCENT), "▏"),
-            Span::raw("   "),
-        ];
-        s.extend(hints(&[("enter", "apply"), ("esc", "clear")]));
-        s
-    } else {
-        let mut left = vec![Span::raw(" ")];
-        if !state.filter.is_empty() {
-            left.push(sp(fg(ACCENT), "/ "));
-            left.push(sp(Style::default(), state.filter.clone()));
-            left.push(Span::raw("   "));
-        }
-        left.extend(hints(&[
-            ("↑↓", "move"),
-            ("←→", "fold"),
-            ("⏎", "open"),
-            ("v", "preview"),
-            ("a", "scope"),
-            ("s", "sort"),
-            ("/", "filter"),
-            ("x", "stop"),
-            ("?", "help"),
-            ("q", "quit"),
-        ]));
-        let right = match &state.message {
-            Some(m) => vec![sp(fg(WARN), format!("{m} "))],
-            None => Vec::new(),
-        };
-        if right.is_empty() {
-            left
-        } else if spans_width(&left) + spans_width(&right) + 2 > width {
-            let mut s = vec![Span::raw(" ")];
-            s.extend(right);
-            s
-        } else {
-            split_line(left, right, width)
-        }
-    };
-    frame.render_widget(Paragraph::new(Line::from(fit_spans(spans, width))), area);
+    let mut body = vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), "preview")];
+    if let Some(n) = state.selected_node() {
+        body.push(sp(fg(MUTED), format!(" {}", n.label)));
+        body.push(sp(fg(DIM), format!(" {}", n.id)));
+    }
+    let block = panel_box(BOX_PREVIEW)
+        .title(Line::from(fit_spans(lead(BOX_PREVIEW, seg(BOX_PREVIEW, body)), area.width.saturating_sub(2) as usize)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let painted = layout_detail(&state.preview_body, inner.width as usize, &HashSet::new(), false);
+    let start = painted.len().saturating_sub(inner.height as usize);
+    let lines: Vec<Line> = painted[start..]
+        .iter()
+        .map(|p| Line::from(fit_spans(p.spans.clone(), inner.width as usize)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 const HELP: &[(&str, &str)] = &[
@@ -642,11 +781,12 @@ const HELP: &[(&str, &str)] = &[
     ("q  Ctrl+C", "quit"),
 ];
 
+/// Overlay panel in the main box's color, title cut into the border.
 fn panel(title: &str) -> Block<'static> {
-    Block::bordered().border_type(BorderType::Rounded).border_style(fg(RULE)).title(Line::from(vec![
-        sp(fg(ACCENT).add_modifier(Modifier::BOLD), " ◆ "),
-        sp(fg(Color::Reset).add_modifier(Modifier::BOLD), format!("{title} ")),
-    ]))
+    panel_box(BOX_MAIN).title(Line::from(lead(
+        BOX_MAIN,
+        seg(BOX_MAIN, vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "◆ "), sp(fg(TEXT).add_modifier(Modifier::BOLD), title.to_string())]),
+    )))
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
@@ -728,9 +868,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
     let scrolled = painted.len() > height && !d.follow;
     let pos = if scrolled {
         let max = painted.len() - height;
-        vec![sp(fg(DIM), format!(" {}% ", d.scroll * 100 / max.max(1))), sp(fg(RULE), "─")]
+        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(DIM), format!("{}%", d.scroll * 100 / max.max(1)))]))
     } else if d.follow && chat.as_ref().is_some_and(|(_, running, _)| *running) {
-        vec![sp(fg(OK), " ● "), sp(fg(MUTED), "following "), sp(fg(RULE), "─")]
+        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(OK), "● "), sp(fg(MUTED), "following")]))
     } else {
         Vec::new()
     };
@@ -2049,15 +2189,15 @@ mod tests {
         let mut state = TopState::new(1_000, None, None);
         state.apply(&snap, &[], &HashMap::new());
         let text = render(120, 30, &mut state);
-        assert!(text.contains("Tree") && text.contains("Agents") && text.contains("scope"), "{text}");
+        assert!(text.contains("tree") && text.contains("agents") && text.contains("scope"), "{text}");
         let hits = state.mouse.tab_hits.clone();
         let agents = hits.iter().find(|h| h.2 == TabHit::Tab(Tab::Agents)).expect("agents hit");
         let scope = hits.iter().find(|h| h.2 == TabHit::Scope).expect("scope hit");
         let sort = hits.iter().find(|h| h.2 == TabHit::Sort).expect("sort hit");
         assert!(agents.0 < agents.1 && agents.1 <= scope.0 && scope.1 <= sort.0, "{hits:?}");
-        let line = text.lines().find(|l| l.contains("Agents")).unwrap();
+        let line = text.lines().find(|l| l.contains("¹tree")).unwrap();
         let col = |needle: &str| fmt::display_width(&line[..line.find(needle).unwrap()]) as u16;
-        assert!(agents.0 <= col("Agents") && col("Agents") < agents.1, "{line:?} {hits:?}");
+        assert!(agents.0 <= col("agents") && col("agents") < agents.1, "{line:?} {hits:?}");
         assert!(scope.0 <= col("active") && col("active") < scope.1, "{line:?} {hits:?}");
     }
 
