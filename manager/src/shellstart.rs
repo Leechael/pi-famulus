@@ -17,6 +17,13 @@
 /// A task the shell crashed under at start-up (exit code was a Windows crash
 /// status and the output is the MSYS runtime's fatal error).
 pub const SHELL_START_FAILED: &str = "shell-start-failed";
+/// end_reason of a task killed because its shell never got past start-up
+/// (the race's hang case: no output, nothing but the shell in the job).
+pub const SHELL_START_HUNG: &str = "shell-start-hung";
+/// How long a job may hold nothing but the shell, with no output, before it
+/// counts as hung. The race's losers spin ~15 s before failing; a working
+/// shell runs the command in milliseconds.
+pub const START_HANG_AFTER_MS: u64 = 20_000;
 
 /// Output larger than this is a command that ran and printed; a start-up
 /// failure prints one fatal line before the command could run.
@@ -83,6 +90,46 @@ pub fn start_phase(names: &[Option<String>], shell_program: &str) -> StartPhase 
     }
 }
 
+/// Start-up watchdog decision, fed one observation at a time.
+#[derive(Debug, Default)]
+pub struct HangWatch {
+    shell_only_since_ms: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HangVerdict {
+    /// Keep watching.
+    Wait,
+    /// Start-up is over (output, a real process, or the job is gone).
+    Done,
+    /// No output and only the shell for `START_HANG_AFTER_MS`: kill it.
+    Hung,
+}
+
+impl HangWatch {
+    /// `phase`: None once the job has no process left.
+    pub fn observe(&mut self, now_ms: u64, output_size: u64, phase: Option<StartPhase>) -> HangVerdict {
+        if output_size > 0 {
+            return HangVerdict::Done;
+        }
+        match phase {
+            None | Some(StartPhase::Running) => HangVerdict::Done,
+            Some(StartPhase::NotStarted) => {
+                self.shell_only_since_ms = None;
+                HangVerdict::Wait
+            }
+            Some(StartPhase::ShellOnly) => {
+                let since = *self.shell_only_since_ms.get_or_insert(now_ms);
+                if now_ms.saturating_sub(since) >= START_HANG_AFTER_MS {
+                    HangVerdict::Hung
+                } else {
+                    HangVerdict::Wait
+                }
+            }
+        }
+    }
+}
+
 /// Windows: one posix-shell start at a time.
 ///
 /// The race needs two MSYS processes initializing the shared section at
@@ -145,6 +192,21 @@ mod tests {
     use super::*;
 
     const FATAL: &[u8] = b"     24 [main] bash (10372) C:\\Program Files\\Git\\bin\\..\\usr\\bin\\bash.exe: *** fatal error - add_item (\"\\??\\C:\\Program Files\\Git\", \"/\", ...) failed, errno 1\n";
+
+    #[test]
+    fn hang_watch() {
+        use HangVerdict::*;
+        let sh = Some(StartPhase::ShellOnly);
+        let mut w = HangWatch::default();
+        assert_eq!(w.observe(0, 0, Some(StartPhase::NotStarted)), Wait);
+        assert_eq!(w.observe(1_000, 0, sh), Wait);
+        assert_eq!(w.observe(1_000 + START_HANG_AFTER_MS - 1, 0, sh), Wait);
+        assert_eq!(w.observe(1_000 + START_HANG_AFTER_MS, 0, sh), Hung);
+        // Output, a real process, or a gone job end the watch.
+        assert_eq!(HangWatch::default().observe(0, 1, sh), Done);
+        assert_eq!(HangWatch::default().observe(0, 0, Some(StartPhase::Running)), Done);
+        assert_eq!(HangWatch::default().observe(0, 0, None), Done);
+    }
 
     #[test]
     fn start_phases() {

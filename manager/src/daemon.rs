@@ -1843,6 +1843,10 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     }
     start_task_io(state, &task_id);
     spawn_exit_watch(state, &task_id);
+    #[cfg(windows)]
+    if crate::sys::task_shell().kind == crate::sys::ShellKind::Posix {
+        tokio::spawn(watch_shell_start(state.clone(), task_id.clone(), pid));
+    }
     // §3.3: task_started is always pushed to the owning session.
     send_event_to_session(
         state,
@@ -3258,6 +3262,44 @@ async fn read_status_line(
 ///
 /// The watch resumes from the entry (`exit_phase`, runner, status pipe,
 /// partial status line) and, when parked, puts all of it back there.
+/// Kill a task whose Git Bash never got past start-up (MSYS runtime race,
+/// see `shellstart`): no output and nothing but the shell in its job for
+/// `START_HANG_AFTER_MS`. Ends with the task's start-up; a daemon upgrade
+/// drops it (the next daemon does not re-arm it).
+#[cfg(windows)]
+async fn watch_shell_start(state: Shared, tid: String, pid: u32) {
+    use crate::shellstart::{serialize::phase, HangVerdict, HangWatch};
+    let mut watch = HangWatch::default();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let output_size = {
+            let st = state.lock().unwrap();
+            match st.registry.tasks.get(&tid) {
+                Some(e) if e.record.status == TaskStatus::Running && e.kill_reason.is_none() => {
+                    e.output.lock().unwrap().total_size
+                }
+                _ => return,
+            }
+        };
+        match watch.observe(now_ms(), output_size, phase(pid)) {
+            HangVerdict::Wait => {}
+            HangVerdict::Done => return,
+            HangVerdict::Hung => {
+                {
+                    let mut st = state.lock().unwrap();
+                    let home = st.home.clone();
+                    if let Some(e) = st.registry.tasks.get_mut(&tid) {
+                        e.request_kill(crate::shellstart::SHELL_START_HUNG);
+                    }
+                    lifecycle::log_line(&home, &format!("task {tid}: shell start-up hung; killing"));
+                }
+                kill_group_hard(pid).await;
+                return;
+            }
+        }
+    }
+}
+
 pub fn spawn_exit_watch(state: &Shared, task_id: &str) {
     let handle = tokio::spawn(run_exit_watch(state.clone(), task_id.to_string()));
     if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(task_id) {
