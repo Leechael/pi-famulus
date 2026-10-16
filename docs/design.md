@@ -284,7 +284,7 @@ Protocol 5 preserves the immediate `global_capacity` rejection when the machine 
 | event | Fields | Push condition |
 |---|---|---|
 | `task_started` | task_id, kind, command, pid, ts | Always (to owning session) |
-| `output` | task_id, chunk, next_cursor | Only after watch |
+| `output` | task_id, chunk, next_cursor, monitor_records? | Only after watch; optional Rust-framed monitor records, see [metadata v1](../manager/MONITOR_OUTPUT.md) |
 | `task_exited` | task_id, exit_code, signal, duration_ms, output_path, output_size, ts, end_reason | Always (except orphan marking during crash scan, below) |
 | `session_rebound` | — | To the replaced old connection |
 
@@ -425,18 +425,24 @@ execute:
 
 ```
 monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
-          persistent = false })
+          persistent = false, dedup_window_ms = 60000, fingerprint_mode = "exact" })
 ```
 
 - `manager.start({kind:"monitor", run_in_background:true})` + `watch(task_id)`
-- Extension-side line handling (pure functions, easy to test):
-  - `LineBatcher`: chunk → split on `\n` → 200ms batching; per-line cap 500 characters, per-batch cap 3000 characters
-  - `RateLimiter`: token bucket (capacity 10, +1 every 2s); at least 10 batches in the last 30s with ≥50% dropped → automatic stop + notification
+- Rust preserves the raw output/cursor contract and adds optional logical-line records with versioned BLAKE3 fingerprints, bounded head/tail previews, original observation times and byte ranges. Complete-line hashes cover full bytes before preview truncation; non-newline progress emits unhashed incremental fragments after 250ms. The [metadata v1 contract](../manager/MONITOR_OUTPUT.md) specifies framing, strict opt-in ISO-edge normalization, EOF ordering, bounded history and safe raw replay/upgrade fallback.
+- Extension-side notification handling:
+  - `MonitorOutputBuffer`: default exact identity; optional `ignore-timestamps` selects Rust's ISO-edge fingerprint. Per-monitor maps retain at most 2048 identities. Pending repeats coalesce; actual delivery starts a fixed `dedup_window_ms` (0 disables; max 3600000). Repeats never extend the window, expiry alone sends nothing. Capacity eviction fails open. Legacy/raw fallback is not content-deduplicated and never hashes in TS.
+  - `LineBatcher`: 200ms batching with bounded retained memory, per-line 500 and per-batch 3000 UTF-16-unit head/tail previews, truncation metadata. Rust line previews count Unicode scalars.
+  - `RateLimiter`: token bucket (capacity 10, +1 every 2s); at least 10 batches in the last 30s with ≥50% dropped → automatic stop + notification. Suppressed repeats do not consume tokens or count as overload drops.
+  - `NotifyCenter`: while busy, retains bounded head/tail content instead of overwriting with only the latest batch; output range/timing/count metadata merges, and one stable callback per pending monitor acknowledges delivery.
 - Event injection: `<pi-famulus-wake kind="monitor">` (see §4.5); idle→triggerTurn; while busy, events are never steered: they coalesce per monitor and are sent after `agent_settled`, carrying `event-count` and `dropped-lines`
 - Process exit → end notification; timeout expires → stop + "[Monitor timed out — re-arm if needed.]"
 - `persistent:true` → lives until session ends (no timeout)
 - All time sources and timers use the `Clock` injected from extension scope, including batching, rate limiting, and timeout; tests use `ManualClock`, not global fake-timer replacement
-- Prompt wording (misuse prevention): commands must be line-buffered; "silence is not success" (grep must cover failure patterns); events are not user replies; do not poll
+- Prompt wording (misuse prevention): commands must be line-buffered; print explicit success and terminal failures, but routine unchanged retries may remain silent. Handling an event does not require a user-visible reply. On-demand `task_output` details/paging are allowed; polling to wait is not.
+- Delivery acknowledgement starts a dedup window only for complete representative preview lines present in the actual delivered event, after both local and busy-agent truncation. Omitted/partially retained representatives fail open; they may appear on a later repeat rather than being silently suppressed. Pending metadata that exceeds the early-start buffer budget falls back to original bytes when they fit.
+- Monitor wakes carry optional `output` metadata: original `firstObservedAt`/`lastObservedAt`, `cursorStart`/`cursorEnd` range envelope (may include interleaved events), `truncated`, `suppressedCount`, and `omittedChars`. Repeats are summarized with subsequent admitted output or terminal notices, not separate repeat-only wakes. `monitor.dedupe` is distinct from `monitor.drop`.
+- Raw retrieval uses existing `task_output({task_id,cursor,max_bytes})` and bypasses all monitor transforms. The running-task poll guard records actual returned ranges, not only file size, permitting distinct pages while rejecting unchanged rereads. Reads default to a 64KiB tail and clamp at 1MiB before tail selection; prefer smaller detail ranges. Logs remain subject to existing retention and I/O failures.
 
 ### 4.5 NotifyCenter (`src/notify.ts`)
 
@@ -468,7 +474,7 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 | kind | Root attributes | Child elements | details |
 |---|---|---|---|
 | `task` | (none; still-running is not an attribute) | Optional `<still-running><item id>`; one or more `<task id kind status duration-ms exit-code? signal?>`, containing `summary` `command` `output-file` `preview` | `{ kind:"task"; stillRunning: {id,title}[]; tasks: [{ id, taskKind, status, summary, command, outputPath, preview, durationMs, exitCode: number\|null, signal?: string }] }` |
-| `monitor` | `id` `description` `status?` `event-count?` (when >1) `dropped-lines?` (when >0) | `<event>` | `{ kind:"monitor"; id; description; status?; event; eventCount?; droppedLines? }` |
+| `monitor` | `id` `description` `status?` `event-count?` (when >1) `dropped-lines?` (when >0) | `<event>`; optional `<output first-observed-at? last-observed-at? cursor-start? cursor-end? truncated? duplicates-suppressed? omitted-chars?>` with raw retrieval hint | `{ kind:"monitor"; id; description; status?; event; eventCount?; droppedLines?; output?: MonitorOutputInfo }` |
 | `subagent-handover` | `run-id` `child-id` `name` `status` `status-as-of?` | Optional `<still-running>`; `summary`; optional `changed-since-as-of`; `prompt` `result`; optional `error`, `warning` | `{ kind:"subagent-handover"; runId; childId; name; status; statusAsOf?; stillRunning: {id,title}[]; summary; prompt; result; error?; warning? }` |
 | `subagent-done` | `run-id` `status` `duration-ms` `status-now?` | `summary`; optional `changed-since-as-of`; then one `<child id name status status-as-of?>` per child, containing `prompt` (head capped at 2000), optional `error`, optional `warning`, `result` (tail capped at 2000) | `{ kind:"subagent-done"; runId; status; runStatusNow?; durationMs; summary; children: [{ childId, name, status, statusAsOf?, prompt, result, error?, warning? }] }` |
 | `supervisor-request` | `from` `name` | `message`, `reply-with` | `{ kind:"supervisor-request"; from; name; message }` |
@@ -483,7 +489,7 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 - `reply-with` text is `agent_message { action: "reply", to: "<childId>", message: "<your decision>" }`, not included in `message`.
 - The subagent-done pill shows per-status counts, e.g. `3 completed · 1 failed`.
 - Parent behavior guidelines use a named `pi-famulus` section, not an entire forced system prompt. `before_agent_start` initializes user turns; `context_with_system` restores only that section in each model request if pi's base-prompt rebuild removed it. Wake turns skip `before_agent_start`, and tool-result continuations can remove run-local sections. The repair neither rewrites the persisted transcript nor replaces other system content/sections. Ordinary `session_start` contexts do not provide the command-only `getSystemPromptOptions` method.
-- Handle `<pi-famulus-wake>` before continuing. After starting/re-arming a monitor or handling its event, complete any remaining work, then end the turn with a reply and no tool call; wait for the next notification. Do not poll, sleep, fabricate a state, or call a UI extension's `wait_for` to yield. Legitimate UI-condition waits remain available. Instruction visibility is deterministic; model compliance is measured separately by opt-in compatibility evals.
+- Handle `<pi-famulus-wake>` before continuing. After starting/re-arming a monitor or handling its event, complete immediate work, then end the turn with no tool call; wait for the next notification. Unchanged/intermediate events can be handled without a user-visible reply; read original details on demand, never as a waiting loop. Do not poll, sleep, fabricate a state, or call a UI extension's `wait_for` to yield. Legitimate UI-condition waits remain available. Instruction visibility is deterministic; model compliance is measured separately by opt-in compatibility evals.
 
 ### 4.6 subagent tool (M3)
 
@@ -662,7 +668,7 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 
 **Ruling notes (2026-09-17, added after contract-test disagreements; revised the same day after implementation-side convergence)**:
 
-- `maxLineChars` / `maxBatchChars` are **hard caps, plain cuts, no ellipsis marker**. (The initial ruling counted a marker within the cap; implementation and tests independently converged on plain cuts because the semantics are simplest and caps strict. Monitor-event context makes truncation evident.)
+- `maxLineChars` / `maxBatchChars` are **hard retained-text caps with bounded head/tail previews**. Truncation is reported through `onFlush` metadata; omission markers consume the retained-text budget. A bounded preview is not evidence that every original line was displayed.
 - LineBatcher's timed flush **drains the entire buffer, including an unterminated trailing line** ("no data lost at window end"). (The initial ruling sent only complete lines; implementation converged on drain-at-end, friendlier to progress bars / slow lines—partial lines become visible immediately rather than being held indefinitely.)
 - `truncateTail`'s maxBytes is a **hard cap**: if the last retained line alone exceeds it, truncate that line's tail by bytes at a UTF-8-safe character boundary; result always ≤ maxBytes, no U+FFFD overflow
 - `truncateTail`'s `totalLines`: original text's line count; empty string = 0 lines. On truncation the first output line is the marker `… (truncated: showing last K of N lines)`
@@ -677,9 +683,9 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 // extension/src/monitor-batching.ts
 export interface LineBatcherOptions {
   flushMs?: number;          // batching window, default 200
-  maxLineChars?: number;     // per-line hard cap, default 500 (plain cut, no marker)
-  maxBatchChars?: number;    // per-batch hard cap, default 3000 (plain cut, no marker)
-  onFlush: (text: string) => void;
+  maxLineChars?: number;     // per-line retained-text cap, default 500
+  maxBatchChars?: number;    // per-batch retained-text cap, default 3000
+  onFlush: (text: string, info: { truncated: boolean; omittedChars: number }) => void;
 }
 export class LineBatcher {
   constructor(opts: LineBatcherOptions);

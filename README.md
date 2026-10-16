@@ -74,7 +74,7 @@ Run the full test suite and tell me what fails.
 | Ask the agent | What happens |
 | :--- | :--- |
 | `Run the full test suite and tell me what fails.` | `bash` moves the run to the background after 20 seconds; the result arrives when it exits |
-| `Start the dev server and tell me if an error shows up in its output.` | `monitor` turns each output line into an event and wakes the agent when one arrives |
+| `Start the dev server and tell me if an error shows up in its output.` | `monitor` batches new output into bounded events; repeated lines are deduplicated within a configurable window |
 | `Review these three modules in parallel with subagents.` | `subagent` runs the tasks in parallel; each subagent reports back when it finishes |
 | `Which models can subagents use?` | The agent calls `subagent({action: "models"})` and lists the choices |
 
@@ -121,7 +121,7 @@ pi-famulus starts and stops processes for you. This section states what it guara
 - Running work does not survive the last pi session closing. Five seconds after the last session disconnects, the daemon stops what is left and exits. Records, output and transcripts stay on disk for 24 hours.
 - A subagent still running when its 30-minute turn budget ends is not killed, unless you set `hardTimeoutMs`. The parent is told and chooses to extend, steer or interrupt it.
 - A subagent with no activity for 5 minutes is resumed once on the same session, with its transcript kept. The timer pauses while a tool runs or a `contact_supervisor` question waits for an answer. If the subagent stalls again, it is marked failed.
-- `monitor` batches output every 200 ms. It allows a burst of 10 events, then one event every 2 seconds. Batches over that limit are dropped. If at least half the batches are dropped over a 30-second window that holds at least 10 batches, the monitor stops and you are told.
+- `monitor` batches output every 200 ms. Repeated complete lines from the same monitor are deduplicated for 60 seconds by default; exact matching is the default, with timestamp normalization opt-in. Previews are bounded; original output remains readable with `task_output`. Deduplication does not count as overload loss. Admitted batches allow a burst of 10 events, then one event every 2 seconds. Batches over that limit are dropped. If at least half the batches are dropped over a 30-second window that holds at least 10 batches, the monitor stops and you are told.
 - On Linux and macOS, the daemon checks its own executable every 2 seconds. When the file is replaced, the running daemon re-executes itself with the same pid. `pi-famulus upgrade` does the same on demand. Running commands keep going and clients reconnect. The measured gap was 30 to 46 ms.
 
 ## FAQ
