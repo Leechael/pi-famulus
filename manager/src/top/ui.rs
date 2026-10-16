@@ -470,6 +470,12 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
             (false, true) => " shell · ",
             (false, false) => " shells · ",
         }),
+        val(h.tasks_mon.to_string()),
+        unit(match (narrow, h.tasks_mon == 1) {
+            (true, _) => " mon · ",
+            (false, true) => " monitor · ",
+            (false, false) => " monitors · ",
+        }),
         val(h.tasks_ag.to_string()),
         unit(match (narrow, h.tasks_ag == 1) {
             (true, _) => " ag",
@@ -492,9 +498,10 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
     rows.push(stat_row(
         "tokens",
         vec![
-            val(compact_num(h.tokens_in.unwrap_or(0))),
+            // `-` when no agent in scope recorded usage, not a fake 0.
+            val(h.tokens_in.map(compact_num).unwrap_or_else(|| "-".into())),
             unit(" in · "),
-            val(compact_num(h.tokens_out.unwrap_or(0))),
+            val(h.tokens_out.map(compact_num).unwrap_or_else(|| "-".into())),
             unit(" out · "),
             val(h.tok_s.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into())),
             unit(if narrow { " tok/s" } else { " tok/s per agent" }),
@@ -1505,8 +1512,9 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
             let title = tool_card_title(turn, i.checked_sub(1).and_then(|j| chat.turns.get(j)));
             let id = t.next_fold();
             let (name, summary) = split_title(&title);
+            let args = turn.args.as_deref().unwrap_or("");
             tool_row(
-                ToolRow { name, summary, output: &turn.text, ts: turn.ts, error: turn.error, pending: false },
+                ToolRow { name, summary, args, output: &turn.text, ts: turn.ts, error: turn.error, pending: false },
                 is_open(id, open, expand_all),
                 id,
                 width,
@@ -1527,7 +1535,8 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
                         t.begin(Group::Text);
                         assistant_text(&text, error, width, &mut t.out);
                     }
-                    Seg::ToolCall { name, summary } => {
+                    Seg::ToolCall { name, args } => {
+                        let summary = summary_from_raw(&args);
                         t.begin(Group::Activity);
                         let id = t.next_fold();
                         let paired = chat.turns.get(i).is_some_and(|n| n.tool.as_deref() == Some(name.as_str()));
@@ -1537,6 +1546,7 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
                             ToolRow {
                                 name: &name,
                                 summary: &summary,
+                                args: &args,
                                 output: &result.text,
                                 ts: result.ts.or(turn.ts),
                                 error: result.error,
@@ -1546,6 +1556,7 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
                             ToolRow {
                                 name: &name,
                                 summary: &summary,
+                                args: &args,
                                 output: "",
                                 ts: turn.ts,
                                 error: false,
@@ -1630,6 +1641,8 @@ fn thinking_row(text: &str, ts: Option<u64>, expanded: bool, fold: usize, width:
 struct ToolRow<'a> {
     name: &'a str,
     summary: &'a str,
+    /// Raw call arguments (JSON, maybe cut), for write / edit previews.
+    args: &'a str,
     output: &'a str,
     ts: Option<u64>,
     error: bool,
@@ -1645,7 +1658,9 @@ fn split_title(title: &str) -> (&str, &str) {
 
 /// `▸ ✓ bash  rg loader                     12:01:03`
 fn tool_row(row: ToolRow, expanded: bool, fold: usize, width: usize, out: &mut Vec<Painted>) {
-    let has_body = !row.pending && !row.output.trim().is_empty();
+    let preview = call_preview(row.name, row.args);
+    let output = row.output.trim_end();
+    let has_body = preview.is_some() || (!row.pending && !output.trim().is_empty());
     let (glyph, gstyle) = if row.pending {
         (spin_glyph(), fg(ACCENT))
     } else if row.error {
@@ -1663,15 +1678,56 @@ fn tool_row(row: ToolRow, expanded: bool, fold: usize, width: usize, out: &mut V
     if !row.summary.is_empty() {
         left.push(sp(fg(MUTED), format!("  {}", fmt::first_line(row.summary))));
     }
+    // The stat sits with the clock so a long path truncates, not the stat.
+    let mut right = preview.as_ref().map(|p| p.stat.clone()).unwrap_or_default();
     let time = clock(row.ts);
-    let right = if time.is_empty() { Vec::new() } else { vec![sp(fg(DIM), time.clone())] };
-    let room = if time.is_empty() { width } else { width.saturating_sub(time.len() + 2) };
+    if !time.is_empty() {
+        if !right.is_empty() {
+            right.push(Span::raw("  "));
+        }
+        right.push(sp(fg(DIM), time));
+    }
+    let room = width.saturating_sub(spans_width(&right) + 2);
     let spans = split_line(fit_spans(left, room), right, width);
     out.push(Painted { spans, fold: has_body.then(|| fold_hit(fold)) });
-    if has_body && expanded {
-        let style = if row.error { fg(ERR) } else { fg(MUTED) };
-        hang(&fmt::scrub_tty(row.output.trim_end()), style, width, out);
+    if !(has_body && expanded) {
+        return;
     }
+    if let Some(p) = &preview {
+        let gutter_w = p.body.iter().map(|(g, _, _)| fmt::display_width(g)).max().unwrap_or(0);
+        let inner = width.saturating_sub(HANG + gutter_w).max(1);
+        let mut rows = 0;
+        'outer: for (gutter, style, text) in &p.body {
+            for (j, seg) in fmt::wrap_width(&fmt::scrub_tty(text), inner).into_iter().enumerate() {
+                if rows == PREVIEW_ROWS {
+                    break 'outer;
+                }
+                let g = if j == 0 { gutter.clone() } else { " ".repeat(fmt::display_width(gutter)) };
+                let gstyle = if gutter.trim().chars().all(|c| c.is_ascii_digit()) { fg(DIM) } else { *style };
+                out.push(Painted::new(vec![
+                    margin(),
+                    sp(fg(RULE), "│ "),
+                    sp(gstyle, format!("{g:>gutter_w$}")),
+                    sp(*style, seg),
+                ]));
+                rows += 1;
+            }
+        }
+        let more = p.body.len().saturating_sub(rows.min(p.body.len()));
+        if rows == PREVIEW_ROWS && more > 0 {
+            out.push(Painted::new(vec![margin(), sp(fg(RULE), "│ "), sp(fg(DIM), format!("… {} more", plural(more, "line")))]));
+        }
+        if p.cut {
+            out.push(Painted::new(vec![margin(), sp(fg(RULE), "│ "), sp(fg(DIM), "… cut short in the transcript")]));
+        }
+        if !row.pending && !output.trim().is_empty() {
+            let style = if row.error { fg(ERR) } else { fg(DIM) };
+            hang(&fmt::scrub_tty(output), style, width, out);
+        }
+        return;
+    }
+    let style = if row.error { fg(ERR) } else { fg(MUTED) };
+    hang(&fmt::scrub_tty(output), style, width, out);
 }
 
 fn assistant_text(text: &str, error: bool, width: usize, out: &mut Vec<Painted>) {
@@ -1804,7 +1860,8 @@ fn inline_spans(line: &str, base: Style, st: &mut Inline) -> Vec<Span<'static>> 
 
 enum Seg {
     Text(String),
-    ToolCall { name: String, summary: String },
+    /// `args` is the raw JSON, possibly cut by the transcript's line cap.
+    ToolCall { name: String, args: String },
 }
 
 fn assistant_segments(text: &str) -> Vec<Seg> {
@@ -1813,12 +1870,12 @@ fn assistant_segments(text: &str) -> Vec<Seg> {
     while i < text.len() {
         if let Some(rel) = text[i..].find("tool ") {
             let start = i + rel;
-            if let Some((end, name, summary)) = parse_tool_call_at(&text[start..]) {
+            if let Some((end, name, args)) = parse_tool_call_at(&text[start..]) {
                 let prev = text[i..start].trim();
                 if !prev.is_empty() {
                     segs.push(Seg::Text(prev.to_string()));
                 }
-                segs.push(Seg::ToolCall { name, summary });
+                segs.push(Seg::ToolCall { name, args });
                 i = start + end;
                 continue;
             }
@@ -1843,9 +1900,126 @@ fn parse_tool_call_at(s: &str) -> Option<(usize, String, String)> {
     }
     let json_start = 5 + brace;
     let json = &s[json_start..];
-    let json_len = take_json_object(json)?;
-    let raw = &json[..json_len];
-    Some((json_start + json_len, name.to_string(), summary_from_raw(raw)))
+    match take_json_object(json) {
+        Some(json_len) => Some((json_start + json_len, name.to_string(), json[..json_len].to_string())),
+        // The transcript caps long lines (`… (N chars)`), cutting big write /
+        // edit payloads mid-JSON: keep what is there and read it leniently.
+        None => Some((s.len(), name.to_string(), strip_cap_suffix(json).to_string())),
+    }
+}
+
+/// Drop the transcript's `… (3666 chars)` cap marker.
+fn strip_cap_suffix(s: &str) -> &str {
+    match s.rfind("… (") {
+        Some(i) if s[i..].trim_end().ends_with(" chars)") => &s[..i],
+        _ => s,
+    }
+}
+
+/// Every string value of `key`, in order, from JSON that may be cut short.
+/// Escapes are decoded; the flag says whether the string was closed.
+fn json_strings(json: &str, key: &str) -> Vec<(String, bool)> {
+    let pat = format!("\"{key}\"");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = json[from..].find(&pat) {
+        let mut rest = json[from + at + pat.len()..].trim_start();
+        from += at + pat.len();
+        let Some(r) = rest.strip_prefix(':') else { continue };
+        rest = r.trim_start();
+        let Some(r) = rest.strip_prefix('"') else { continue };
+        let mut value = String::new();
+        let mut closed = false;
+        let mut chars = r.char_indices();
+        while let Some((_, c)) = chars.next() {
+            match c {
+                '"' => {
+                    closed = true;
+                    break;
+                }
+                '\\' => match chars.next().map(|(_, e)| e) {
+                    Some('n') => value.push('\n'),
+                    Some('t') => value.push('\t'),
+                    Some('r') => {}
+                    Some('u') => {
+                        let hex: String = chars.by_ref().take(4).map(|(_, h)| h).collect();
+                        if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                            value.push(ch);
+                        }
+                    }
+                    Some(other) => value.push(other),
+                    None => break,
+                },
+                c => value.push(c),
+            }
+        }
+        out.push((value, closed));
+    }
+    out
+}
+
+/// What a write / edit call changes, for its row and unfolded preview.
+struct CallPreview {
+    /// Right-hand stat: `+62 lines`, `−3 +5`.
+    stat: Vec<Span<'static>>,
+    /// Unfolded body rows: (gutter, style, text).
+    body: Vec<(String, Style, String)>,
+    /// The transcript cut the payload short.
+    cut: bool,
+}
+
+const PREVIEW_ROWS: usize = 60;
+
+fn call_preview(name: &str, args: &str) -> Option<CallPreview> {
+    match name {
+        "write" => {
+            let (content, closed) = json_strings(args, "content").into_iter().next()?;
+            let lines: Vec<&str> = content.lines().collect();
+            let digits = lines.len().max(1).to_string().len();
+            let body = lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (format!("{:>digits$} ", i + 1), Style::default(), l.to_string()))
+                .collect();
+            let n = if closed { format!("+{}", plural(lines.len(), "line")) } else { format!("+{}+ lines", lines.len()) };
+            Some(CallPreview { stat: vec![sp(fg(OK), n)], body, cut: !closed })
+        }
+        "edit" => {
+            let olds = json_strings(args, "oldText");
+            let news = json_strings(args, "newText");
+            if olds.is_empty() && news.is_empty() {
+                return None;
+            }
+            let pairs = olds.len().max(news.len());
+            let (mut minus, mut plus, mut cut) = (0, 0, false);
+            let mut body = Vec::new();
+            for k in 0..pairs {
+                if pairs > 1 {
+                    body.push((String::new(), fg(DIM), format!("@@ edit {}/{pairs}", k + 1)));
+                }
+                if let Some((old, closed)) = olds.get(k) {
+                    cut |= !closed;
+                    for l in old.lines() {
+                        minus += 1;
+                        body.push(("- ".into(), fg(ERR), l.to_string()));
+                    }
+                }
+                if let Some((new, closed)) = news.get(k) {
+                    cut |= !closed;
+                    for l in new.lines() {
+                        plus += 1;
+                        body.push(("+ ".into(), fg(OK), l.to_string()));
+                    }
+                }
+            }
+            let mut stat = vec![sp(fg(ERR), format!("−{minus}")), sp(fg(OK), format!(" +{plus}"))];
+            if pairs > 1 {
+                stat.push(sp(fg(DIM), format!(" · {pairs} edits")));
+            }
+            Some(CallPreview { stat, body, cut })
+        }
+        _ => None,
+    }
 }
 
 fn take_json_object(s: &str) -> Option<usize> {
@@ -1953,7 +2127,7 @@ fn tool_card_title(turn: &TranscriptTurn, prev: Option<&TranscriptTurn>) -> Stri
 }
 
 fn tool_call_summary(text: &str) -> Option<(String, String)> {
-    parse_tool_call_at(text.trim()).map(|(_, name, summary)| (name, summary))
+    parse_tool_call_at(text.trim()).map(|(_, name, args)| (name, summary_from_raw(&args)))
 }
 
 /// The one status mapping, shared with the pi extension's `statusGlyph`:
@@ -2422,7 +2596,35 @@ mod tests {
         assert!(text.contains("assemble-policy-gate.py"), "{text}");
         assert!(!text.contains("from pathlib"), "{text}");
         assert!(!text.contains("import subprocess"), "{text}");
-        assert!(painted.iter().all(|p| p.fold.is_none()), "a pending call has nothing to unfold");
+        assert!(painted.iter().any(|p| p.fold.is_some()), "the cut write still unfolds to its content");
+        let open = layout(&chat_body(vec![mk_turn("assistant", dumped)]), 60, true);
+        let text = texts(&open).join("\n");
+        assert!(text.contains("from pathlib import Path") && text.contains("import subprocess"), "{text}");
+    }
+
+    #[test]
+    fn capped_write_and_multi_edit_show_stats_and_previews() {
+        // The transcript cut this write mid-content (see `capText`).
+        let cut = format!(
+            "tool write {{\"path\":\"storage/final_verify.py\",\"content\":\"from pathlib import Path\\nprint(1)\\n{}… (3666 chars)",
+            "x = 1\\n".repeat(3)
+        );
+        let painted = layout(&chat_body(vec![mk_turn("assistant", &cut)]), 80, false);
+        let row = texts(&painted).into_iter().find(|l| l.contains("write")).expect("write row");
+        assert!(row.contains("storage/final_verify.py") && row.contains("+5+ lines"), "{row}");
+        assert!(!row.contains("pathlib"), "collapsed rows never dump content: {row}");
+        let open = texts(&layout(&chat_body(vec![mk_turn("assistant", &cut)]), 80, true)).join("\n");
+        assert!(open.contains("1 from pathlib import Path") && open.contains("cut short"), "{open}");
+
+        let edit = r#"tool edit {"path":"src/a.rs","edits":[{"oldText":"let a = 1;","newText":"let a = 2;\nlet b = 3;"},{"oldText":"x","newText":"y"}]}"#;
+        let result = tool_turn("edit", None, "Successfully replaced 2 blocks");
+        let painted = layout(&chat_body(vec![mk_turn("assistant", edit), result]), 80, true);
+        let text = texts(&painted);
+        let row = text.iter().find(|l| l.contains("edit")).unwrap();
+        assert!(row.contains("src/a.rs") && row.contains("−2 +3") && row.contains("2 edits"), "{row}");
+        assert!(text.iter().any(|l| l.contains("@@ edit 1/2")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("- let a = 1;")) && text.iter().any(|l| l.contains("+ let b = 3;")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("Successfully replaced")), "{text:?}");
     }
 
     #[test]

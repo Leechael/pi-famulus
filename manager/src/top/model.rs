@@ -425,7 +425,9 @@ pub struct Header {
     pub agents_used: usize,
     pub agents_total: usize,
     pub tasks_run: usize,
+    /// Shells / monitors in scope (not running counts).
     pub tasks_sh: usize,
+    pub tasks_mon: usize,
     pub tasks_ag: usize,
     pub cpu_now: Option<f64>,
     pub cpu_tot: Option<u64>,
@@ -451,6 +453,7 @@ impl Default for Header {
             agents_total: 0,
             tasks_run: 0,
             tasks_sh: 0,
+            tasks_mon: 0,
             tasks_ag: 0,
             cpu_now: None,
             cpu_tot: None,
@@ -776,11 +779,13 @@ impl TopState {
         let wall_split = llm.unwrap_or(0) + tool.unwrap_or(0) + queue.unwrap_or(0);
         let share = |part: Option<u64>| part.filter(|_| wall_split > 0).map(|p| p * 100 / wall_split);
         let running_agents = snap.agents.iter().filter(|a| !inspect::agent_status_terminal(&a.status)).count();
+        // The daemon counts slot leases; an agent from an extension that takes
+        // no lease (pre-capacity) still runs, so never show fewer than that.
         let (agents_used, agents_total) = snap
             .daemon
             .as_ref()
             .and_then(|d| d.agent_capacity.as_ref())
-            .map(|c| (c.used, c.total))
+            .map(|c| (c.used.max(running_agents), c.total))
             .unwrap_or((running_agents, crate::capacity::DEFAULT_MAX_AGENTS));
         let work_kinds = kind_groups
             .iter()
@@ -808,7 +813,8 @@ impl TopState {
             agents_used,
             agents_total,
             tasks_run: snap.tasks.iter().filter(|t| t.status == TaskStatus::Running).count(),
-            tasks_sh: tasks.len(),
+            tasks_sh: tasks.iter().filter(|t| t.kind == crate::proto::TaskKind::Shell).count(),
+            tasks_mon: tasks.iter().filter(|t| t.kind == crate::proto::TaskKind::Monitor).count(),
             tasks_ag: snap
                 .agents
                 .iter()
@@ -2233,6 +2239,30 @@ mod tests {
         assert!(tree_cols(WidthClass::Compact).contains(&Col::TokIo));
         assert!(task_cols(WidthClass::Wide).contains(&Col::WorkKind));
         assert!(task_cols(WidthClass::Compact).contains(&Col::TokIo));
+    }
+
+    #[test]
+    fn header_counts_running_agents_shells_and_monitors_separately() {
+        let mut mon = rec("mon_1", "sessA", None, None, "tail -F app.log", 100, None, TaskStatus::Running, None);
+        mon.kind = TaskKind::Monitor;
+        let sh = rec("sh_1", "sessA", None, None, "pytest", 100, None, TaskStatus::Running, None);
+        let live = agent("ch_old", "sessA", "run_1", "worker", "running", None);
+        let mut snap = snapshot(vec![mon, sh], vec![live], vec![("sessA", "connected")]);
+        // A daemon that saw no slot lease: the agent's extension took none.
+        snap.daemon = Some(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.7", "pid": 1, "uptime_ms": 1, "sessions": [],
+                "task_counts": {"running": 2, "terminal": 0},
+                "agent_capacity": {"used": 0, "total": 8}
+            }))
+            .unwrap(),
+        );
+        let mut s = TopState::new(1_000, None, None);
+        s.apply(&snap, &[], &HashMap::new());
+        let h = &s.header;
+        assert_eq!((h.agents_used, h.agents_total), (1, 8), "a running agent counts even without a lease");
+        assert_eq!((h.tasks_run, h.tasks_sh, h.tasks_mon, h.tasks_ag), (2, 1, 1, 1));
+        assert_eq!(h.tokens_in, None, "no recorded usage reads as -, not 0");
     }
 
     #[test]
