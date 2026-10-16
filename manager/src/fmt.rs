@@ -145,6 +145,70 @@ fn wrap_paragraph(para: &str, max: usize, out: &mut Vec<String>) {
     }
 }
 
+/// Strip CSI/OSC, expand tabs, and collapse CR progress so TUI wrap matches
+/// what the terminal will actually paint.
+pub fn scrub_tty(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut line = String::new();
+    let mut col = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if x.is_ascii_alphabetic() || x == '~' {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if x == '\u{7}' {
+                            break;
+                        }
+                        if x == '\u{1b}' {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    let _ = chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if c == '\r' {
+            if chars.peek() != Some(&'\n') {
+                line.clear();
+                col = 0;
+            }
+            continue;
+        }
+        if c == '\n' {
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+            col = 0;
+            continue;
+        }
+        if c == '\t' {
+            let n = 8 - (col % 8);
+            line.extend(std::iter::repeat(' ').take(n));
+            col += n;
+            continue;
+        }
+        line.push(c);
+        col += char_width(c);
+    }
+    out.push_str(&line);
+    out
+}
+
 /// Pad `s` with spaces to `w` display columns (left-aligned).
 pub fn pad(s: &str, w: usize) -> String {
     let dw = display_width(s);
@@ -290,6 +354,9 @@ mod tests {
         assert_eq!(wrap_width("hello world", 8), vec!["hello", "world"]);
         assert_eq!(wrap_width("中文字符", 5), vec!["中文", "字符"]);
         assert_eq!(wrap_width("abc\n\ndef", 10), vec!["abc", "", "def"]);
+        assert_eq!(scrub_tty("\x1b[32mok\x1b[0m"), "ok");
+        assert_eq!(scrub_tty("Rebasing (1/2)\rRebasing (2/2)\nDone"), "Rebasing (2/2)\nDone");
+        assert_eq!(scrub_tty("a\tb"), "a       b");
     }
 
     #[test]
