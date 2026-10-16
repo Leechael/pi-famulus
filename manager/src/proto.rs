@@ -595,6 +595,10 @@ pub enum EventKind {
         task_id: String,
         chunk: String,
         next_cursor: u64,
+        /// Missing means legacy/unavailable metadata; an empty array means
+        /// framing is active but no logical record is ready yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monitor_records: Option<Vec<crate::monitor::MonitorOutputRecord>>,
     },
     /// Always pushed to the owning session.
     TaskExited {

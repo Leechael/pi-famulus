@@ -16,6 +16,7 @@ mod handover;
 mod inspect;
 mod ipc;
 mod lifecycle;
+mod monitor;
 mod winpath;
 mod pager;
 mod proto;
