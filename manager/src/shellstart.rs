@@ -143,7 +143,9 @@ pub mod serialize {
     use super::{start_phase, StartPhase};
     use std::time::{Duration, Instant};
 
-    static STARTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    /// Per logon session, shared by every pi-famulus daemon of the user.
+    const START_LOCK: &str = "Local\\pi-famulus-shell-start";
+    const START_LOCK_WAIT_MAX_MS: u32 = 30_000;
     /// Longest one start holds back the next.
     pub const START_HOLD_MAX: Duration = Duration::from_millis(500);
     const POLL: Duration = Duration::from_millis(10);
@@ -166,8 +168,26 @@ pub mod serialize {
     /// Run `release` (writes the runner's gate, which starts the shell) once
     /// no other start is in progress, then hold the turn until this start is
     /// done.
+    ///
+    /// The turn is a named mutex, not an in-process lock: the MSYS shared
+    /// section is per user, so shells started by another pi-famulus daemon
+    /// (another `PI_FAMULUS_HOME`, a test suite running daemons in
+    /// parallel) race with ours just the same. Mutex ownership is per
+    /// thread, so one OS thread takes it, waits for this start to finish,
+    /// and releases it.
     pub async fn start(runner_pid: u32, release: impl std::future::Future<Output = ()>) {
-        let _turn = STARTS.acquire().await.ok();
+        let (taken_tx, taken_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            // Waiting longer than this means a holder is stuck: go ahead
+            // rather than stall every task.
+            let held = crate::sys::lock_named_mutex(START_LOCK, START_LOCK_WAIT_MAX_MS);
+            let _ = taken_tx.send(());
+            let _ = done_rx.recv(); // Err once `done_tx` is dropped
+            drop(held);
+        });
+        let _ = taken_rx.await;
+        let _turn = done_tx;
         release.await;
         let t0 = Instant::now();
         let mut seen_shell = false;

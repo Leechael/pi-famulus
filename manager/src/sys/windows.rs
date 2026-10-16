@@ -260,6 +260,40 @@ fn is_console_host(pid: u32) -> bool {
     image_name(pid).is_some_and(|n| n.eq_ignore_ascii_case("conhost.exe"))
 }
 
+/// A held machine-wide (per logon session) named mutex; released on drop.
+/// Mutex ownership belongs to a thread: drop it on the thread that took it.
+pub struct NamedMutexGuard(HANDLE);
+
+impl Drop for NamedMutexGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// Take the named mutex `name` (`Local\…`), waiting at most `timeout_ms`.
+/// None when it could not be created or the wait timed out. A mutex left
+/// by a process that died holding it is handed over (WAIT_ABANDONED).
+pub fn lock_named_mutex(name: &str, timeout_ms: u32) -> Option<NamedMutexGuard> {
+    const WAIT_ABANDONED: u32 = 0x80;
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let h = windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, wide.as_ptr());
+        if h.is_null() {
+            return None;
+        }
+        match WaitForSingleObject(h, timeout_ms) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(NamedMutexGuard(h)),
+            _ => {
+                CloseHandle(h);
+                None
+            }
+        }
+    }
+}
+
 /// File name of `pid`'s executable (`bash.exe`), or None when it cannot be
 /// queried (gone, or access denied).
 pub fn image_name(pid: u32) -> Option<String> {
