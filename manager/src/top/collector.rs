@@ -12,7 +12,7 @@ use crate::inspect::{self, AgentRecord, SessionView, Snapshot};
 use crate::proto::{now_ms, RequestKind, StatusOk, TaskRecord, TaskStatus};
 use crate::registry;
 use crate::task;
-use crate::top::model::{compact_num, Chat, Detail, DetailBody, NodeKind, TopState};
+use crate::top::model::{compact_num, Chat, Detail, DetailBody, LogView, NodeKind, TaskInfo, TopState};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -452,7 +452,6 @@ fn tail_for(
     if let Some(t) = tasks.iter().find(|t| t.task_id == id) {
         return match tab {
             1 => task_log(t, now, &task::stderr_path_for(Path::new(&t.output_path)), true),
-            2 => DetailBody::Text(info_task(t, now)),
             _ => task_log(t, now, Path::new(&t.output_path), false),
         };
     }
@@ -464,42 +463,59 @@ fn tail_for(
 }
 
 fn task_log(t: &TaskRecord, now: u64, path: &Path, stderr: bool) -> DetailBody {
-    let kind = match t.kind {
-        crate::proto::TaskKind::Monitor => "monitor",
-        crate::proto::TaskKind::Shell => "shell",
-    };
-    let status = serde_json::to_value(t.status)
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| format!("{:?}", t.status));
-    let wall = t.ended_at.unwrap_or(now).saturating_sub(t.started_at);
-    let title = inspect::task_title(t);
-    let mut header = vec![
-        format!("{} · {kind} · {status} · {}", t.task_id, crate::fmt::human_duration(wall)),
-    ];
-    if title != crate::fmt::first_line(&t.command) {
-        header.push(title);
-    }
-    header.push(format!("$ {}", crate::fmt::first_line(&t.command)));
     let lines = tail_file(path);
     let empty = lines.len() == 1 && (lines[0] == "(empty)" || lines[0].starts_with("(no file"));
+    let running = t.status == TaskStatus::Running;
     let lines = if empty {
-        let running = t.status == TaskStatus::Running;
-        vec![if stderr {
-            if running {
-                "(nothing on stderr yet)".into()
-            } else {
-                "(nothing on stderr)".into()
-            }
-        } else if running {
-            "(no output yet)".into()
-        } else {
-            "(no output; the command printed nothing)".into()
+        vec![match (stderr, running) {
+            (true, true) => "(nothing on stderr yet)".into(),
+            (true, false) => "(nothing on stderr)".into(),
+            (false, true) => "(no output yet)".into(),
+            (false, false) => "(no output; the command printed nothing)".into(),
         }]
     } else {
         lines
     };
-    DetailBody::Log { header, lines }
+    DetailBody::Log { info: Box::new(task_info(t, now)), lines }
+}
+
+#[cfg(test)]
+pub fn task_info_for_test(t: &TaskRecord, now: u64) -> TaskInfo {
+    task_info(t, now)
+}
+
+fn task_info(t: &TaskRecord, now: u64) -> TaskInfo {
+    let running = t.status == TaskStatus::Running;
+    let cpu = if running {
+        inspect::cpu_ms(t.live_cpu_user_ms, t.live_cpu_sys_ms)
+    } else {
+        inspect::cpu_ms(t.cpu_user_ms, t.cpu_sys_ms)
+    };
+    TaskInfo {
+        id: t.task_id.clone(),
+        kind: match t.kind {
+            crate::proto::TaskKind::Monitor => "monitor".into(),
+            crate::proto::TaskKind::Shell => "shell".into(),
+        },
+        status: serde_json::to_value(t.status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("{:?}", t.status)),
+        running,
+        command: t.command.clone(),
+        cwd: t.cwd.clone(),
+        pid: t.pid,
+        session: t.session_id.clone(),
+        started_at: t.started_at,
+        wall_ms: t.ended_at.unwrap_or(now).saturating_sub(t.started_at),
+        cpu_ms: cpu,
+        cpu_now: if running { t.live_cpu_percent } else { None },
+        cpu_stale: running && t.live_cpu_stale,
+        work_kind: inspect::work_kind(t).to_string(),
+        exit: t.signal.clone().or_else(|| t.exit_code.map(|c| c.to_string())),
+        reason: t.end_reason.clone(),
+        output: t.output_path.clone(),
+    }
 }
 
 fn tail_file(path: &Path) -> Vec<String> {
@@ -510,7 +526,8 @@ fn tail_file(path: &Path) -> Vec<String> {
     match task::read_file_range(path, off, TAIL as usize) {
         Ok((bytes, _)) => {
             let text = String::from_utf8_lossy(&bytes);
-            let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+            // `lines` strips one `\r` of a CRLF; pty output can carry a second.
+            let lines: Vec<String> = text.lines().map(|s| s.trim_end_matches('\r').to_string()).collect();
             if lines.is_empty() {
                 vec!["(empty)".into()]
             } else {
@@ -553,29 +570,6 @@ fn load_transcript(home: &Path, a: &AgentRecord) -> Vec<inspect::TranscriptTurn>
         }
     }
     out
-}
-
-fn info_task(t: &TaskRecord, now: u64) -> Vec<String> {
-    let wall = t.ended_at.unwrap_or(now).saturating_sub(t.started_at);
-    let cpu = if t.status == TaskStatus::Running {
-        inspect::cpu_ms(t.live_cpu_user_ms, t.live_cpu_sys_ms)
-    } else {
-        inspect::cpu_ms(t.cpu_user_ms, t.cpu_sys_ms)
-    };
-    vec![
-        format!("id           {}", t.task_id),
-        format!("session      {}", t.session_id),
-        format!("status       {:?}", t.status),
-        format!("cwd          {}", t.cwd),
-        format!("pid          {}", t.pid),
-        format!("wall         {}", crate::fmt::human_duration(wall)),
-        format!("cpu          {}", inspect::cpu_text(cpu)),
-        format!("now          {}", t.live_cpu_percent.map(|p| format!("{p:.1}%")).unwrap_or_else(|| "-".into())),
-        format!("reason       {}", t.end_reason.as_deref().unwrap_or("-")),
-        format!("work kind    {}", inspect::work_kind(t)),
-        format!("command      {}", crate::fmt::first_line(&t.command)),
-        format!("output       {}", t.output_path),
-    ]
 }
 
 /// Why an agent has no usage at all: extensions before 0.1.4 never wrote
@@ -627,7 +621,7 @@ fn dur(ms: Option<u64>) -> String {
 
 pub fn detail_tabs(kind: NodeKind) -> Vec<String> {
     match kind {
-        NodeKind::Task => vec!["Output".into(), "Stderr".into(), "Info".into()],
+        NodeKind::Task => vec!["output".into(), "stderr".into()],
         NodeKind::Agent => Vec::new(),
         _ => vec!["Info".into()],
     }
@@ -657,6 +651,7 @@ pub fn open_detail(state: &TopState) -> Option<Detail> {
         tools_expanded: false,
         open: HashSet::new(),
         hits: Vec::new(),
+        log: LogView::default(),
     })
 }
 
@@ -725,7 +720,7 @@ mod tests {
     #[test]
     fn agent_detail_has_no_result_or_info_tabs() {
         assert!(detail_tabs(NodeKind::Agent).is_empty());
-        assert_eq!(detail_tabs(NodeKind::Task), vec!["Output", "Stderr", "Info"]);
+        assert_eq!(detail_tabs(NodeKind::Task), vec!["output", "stderr"]);
     }
 
     #[test]

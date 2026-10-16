@@ -782,6 +782,8 @@ const HELP: &[(&str, &str)] = &[
     ("+ -", "refresh interval"),
     ("x  Ctrl+X  F9", "stop task"),
     ("o  click ▸", "unfold tools & thinking"),
+    ("/  n N", "search task output"),
+    ("&  b", "filter mode · blank lines"),
     ("Esc", "close overlay"),
     ("q  Ctrl+C", "quit"),
 ];
@@ -831,6 +833,10 @@ fn detail_tabs_line(d: &model::Detail) -> Line<'static> {
 }
 
 fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
+    if matches!(d.body, DetailBody::Log { .. }) {
+        draw_task_detail(frame, area, d, mouse);
+        return;
+    }
     // Full screen: the table keys in the main footer do not apply here.
     let rect = area;
     frame.render_widget(Clear, rect);
@@ -1036,66 +1042,302 @@ fn layout_detail(body: &DetailBody, width: usize, open: &HashSet<usize>, expand_
     match body {
         DetailBody::Empty => vec![dim_line("(nothing to show)")],
         DetailBody::Conversation(chat) => layout_conversation(chat, width, open, expand_all),
-        DetailBody::Log { header, lines } => layout_log(header, lines, width),
-        DetailBody::Text(lines) => layout_info(lines, width),
+        DetailBody::Log { lines, .. } => layout_log(lines, width, &model::LogView::default(), None).lines,
     }
 }
 
-fn layout_log(header: &[String], lines: &[String], width: usize) -> Vec<Painted> {
-    let mut out = Vec::new();
-    let inner = width.saturating_sub(MARGIN).max(1);
-    for (i, h) in header.iter().enumerate() {
-        if let Some(cmd) = h.strip_prefix('$') {
-            for (j, l) in fmt::wrap_width(cmd.trim_start(), inner.saturating_sub(2).max(1)).into_iter().enumerate() {
-                let lead = if j == 0 { sp(fg(ACCENT).add_modifier(Modifier::BOLD), "$ ") } else { Span::raw("  ") };
-                out.push(Painted::new(vec![margin(), lead, sp(bold(), l)]));
+// ── task output ────────────────────────────────────────────────────────────
+
+/// Parsed search: `a|b` alternatives, case-insensitive unless the query has
+/// an uppercase letter (ASCII folding keeps byte offsets stable).
+struct Query {
+    terms: Vec<String>,
+    fold: bool,
+}
+
+fn parse_query(q: &str) -> Option<Query> {
+    let fold = !q.chars().any(|c| c.is_ascii_uppercase());
+    let terms: Vec<String> = q
+        .split('|')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| if fold { t.to_ascii_lowercase() } else { t.to_string() })
+        .collect();
+    (!terms.is_empty()).then_some(Query { terms, fold })
+}
+
+/// Merged byte ranges of every match in `line`, left to right.
+fn match_ranges(line: &str, q: &Query) -> Vec<(usize, usize)> {
+    let hay = if q.fold { line.to_ascii_lowercase() } else { line.to_string() };
+    let mut found = Vec::new();
+    for t in &q.terms {
+        let mut from = 0;
+        while let Some(i) = hay[from..].find(t.as_str()) {
+            found.push((from + i, from + i + t.len()));
+            from += i + t.len();
+        }
+    }
+    found.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in found {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
+const HIT: Color = Color::Rgb(116, 92, 24);
+const HIT_CURRENT: Color = Color::Rgb(226, 170, 60);
+
+fn highlighted(seg: &str, q: Option<&Query>, current: bool) -> (Vec<Span<'static>>, bool) {
+    let ranges = q.map(|q| match_ranges(seg, q)).unwrap_or_default();
+    if ranges.is_empty() {
+        return (vec![sp(Style::default(), seg.to_string())], false);
+    }
+    let hit = if current {
+        Style::default().bg(HIT_CURRENT).fg(Color::Rgb(20, 20, 24)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(HIT).fg(TEXT).add_modifier(Modifier::BOLD)
+    };
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for (s, e) in ranges {
+        if s > at {
+            spans.push(sp(Style::default(), seg[at..s].to_string()));
+        }
+        spans.push(sp(hit, seg[s..e].to_string()));
+        at = e;
+    }
+    if at < seg.len() {
+        spans.push(sp(Style::default(), seg[at..].to_string()));
+    }
+    (spans, true)
+}
+
+/// Painted output plus what the chrome reports about it.
+struct LogLayout {
+    lines: Vec<Painted>,
+    /// Painted rows holding a match.
+    matches: Vec<usize>,
+    /// Source lines shown / in the tail.
+    shown: usize,
+    total: usize,
+}
+
+/// Task output: control sequences scrubbed, blank lines hidden unless asked
+/// for, matches highlighted (or the rest filtered out).
+fn layout_log(lines: &[String], width: usize, view: &model::LogView, current_row: Option<usize>) -> LogLayout {
+    let inner = width.saturating_sub(1).max(1);
+    let q = parse_query(&view.query);
+    let placeholder = lines.len() == 1 && lines[0].starts_with('(');
+    let mut out = LogLayout { lines: Vec::new(), matches: Vec::new(), shown: 0, total: lines.len() };
+    for line in lines {
+        // A trailing `\r` (CRLF from a pty) is a line ending, not CR progress.
+        let clean = fmt::scrub_tty(line.trim_end_matches('\r'));
+        if placeholder {
+            out.lines.push(Painted::new(vec![Span::raw(" "), sp(fg(DIM), clean)]));
+            out.shown = 1;
+            break;
+        }
+        if !view.show_blank && clean.trim().is_empty() {
+            continue;
+        }
+        if view.filter && q.as_ref().is_some_and(|q| match_ranges(&clean, q).is_empty()) {
+            continue;
+        }
+        out.shown += 1;
+        for seg in fmt::wrap_width(&clean, inner) {
+            let row = out.lines.len();
+            let (spans, hit) = highlighted(&seg, q.as_ref(), current_row == Some(row));
+            if hit {
+                out.matches.push(row);
             }
+            let mut all = vec![Span::raw(" ")];
+            all.extend(spans);
+            out.lines.push(Painted::new(all));
+        }
+    }
+    if out.lines.is_empty() {
+        let why = if q.is_some() && view.filter { "(no line matches)" } else { "(only blank lines)" };
+        out.lines.push(Painted::new(vec![Span::raw(" "), sp(fg(DIM), why)]));
+    }
+    out
+}
+
+/// Pinned panel above a task's output: state, cost, command, and where.
+fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
+    let color = status_color(&info.status, info.running);
+    let glyph = if info.running { spin_glyph() } else { status_glyph(&info.status, false) };
+    let pair = |label: &str, value: String| vec![sp(fg(DIM), format!("   {label} ")), val(value)];
+    let mut l1 = vec![
+        sp(fg(color), format!("{glyph} ")),
+        sp(fg(color).add_modifier(Modifier::BOLD), info.status.clone()),
+        sp(fg(MUTED), format!("   {} · {}", info.kind, info.work_kind)),
+    ];
+    l1.extend(pair("wall", fmt::human_duration(info.wall_ms)));
+    l1.extend(pair("cpu", info.cpu_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into())));
+    if info.running {
+        l1.extend(pair("now", now_cell(info.cpu_now, info.cpu_stale)));
+    }
+    if let Some(exit) = &info.exit {
+        let bad = exit != "0";
+        l1.push(sp(fg(DIM), "   exit "));
+        l1.push(sp(fg(if bad { ERR } else { OK }).add_modifier(Modifier::BOLD), exit.clone()));
+    }
+    if let Some(reason) = info.reason.as_ref().filter(|r| r.as_str() != "exited") {
+        l1.extend(pair("ended", reason.clone()));
+    }
+    let more = if info.command.trim_end().contains('\n') { " …" } else { "" };
+    let l2 = vec![
+        sp(fg(ACCENT).add_modifier(Modifier::BOLD), "$ "),
+        sp(fg(TEXT).add_modifier(Modifier::BOLD), fmt::first_line(&info.command).to_string()),
+        sp(fg(DIM), more),
+    ];
+    let started = fmt::datetime(info.started_at);
+    let mut l3 = vec![
+        sp(fg(DIM), "cwd "),
+        sp(fg(MUTED), fmt::tilde(&info.cwd)),
+        sp(fg(DIM), "   pid "),
+        sp(fg(MUTED), info.pid.to_string()),
+        sp(fg(DIM), "   started "),
+        sp(fg(MUTED), started),
+        sp(fg(DIM), "   session "),
+        sp(fg(MUTED), info.session.chars().take(8).collect::<String>()),
+    ];
+    let used = spans_width(&l3) + 5;
+    if !info.output.is_empty() && used + 12 < width {
+        l3.push(sp(fg(DIM), "   "));
+        l3.push(sp(fg(DIM), fmt::truncate_width_left(&info.output, width - used)));
+    }
+    [l1, l2, l3].into_iter().map(|l| Line::from(fit_spans(l, width))).collect()
+}
+
+fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
+    frame.render_widget(Clear, area);
+    let DetailBody::Log { info, lines } = &d.body else { return };
+    let (info, lines) = (info.clone(), lines.clone());
+    let inner = Block::bordered().inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    let w = inner.width as usize;
+    frame.render_widget(Paragraph::new(info_card(&info, w)), chunks[0]);
+
+    // Body first: the tab row reports what the body ended up showing.
+    let body = chunks[2];
+    let text_w = body.width.saturating_sub(2).max(1);
+    let height = body.height as usize;
+    let current_row = d.log.matches.get(d.log.current).copied();
+    let laid = layout_log(&lines, text_w as usize, &d.log, current_row);
+    d.wrap_len = laid.lines.len();
+    d.view_h = height;
+    d.log.matches = laid.matches.clone();
+    if d.log.seek && !d.log.matches.is_empty() {
+        let next = d.log.matches.iter().position(|&m| m >= d.scroll).unwrap_or(d.log.matches.len() - 1);
+        d.log.current = next;
+        d.follow = false;
+        d.scroll = d.log.matches[next].saturating_sub(height / 3);
+    }
+    d.log.seek = false;
+    d.log.current = d.log.current.min(d.log.matches.len().saturating_sub(1));
+    let (follow, scroll) = stick_scroll(d.follow, d.scroll, laid.lines.len(), height);
+    d.follow = follow;
+    d.scroll = scroll;
+    d.hits.clear();
+    let start = d.scroll.min(laid.lines.len());
+    let rows: Vec<Line> = laid.lines[start..]
+        .iter()
+        .take(height)
+        .map(|p| Line::from(fit_spans(p.spans.clone(), text_w as usize)))
+        .collect();
+    let text = Rect { x: body.x, y: body.y, width: text_w, height: body.height };
+    let bar = Rect { x: body.x + body.width.saturating_sub(1), y: body.y, width: 1, height: body.height };
+    frame.render_widget(Paragraph::new(rows), text);
+    draw_scrollbar(frame, bar, laid.lines.len(), height, d.scroll);
+
+    // Tab row: `─┐¹output┌┐²stderr┌──────┐17 of 1203 lines┌─`.
+    let mut tabs = vec![sp(fg(BOX_MAIN), "─")];
+    let mut hits = Vec::new();
+    for (i, t) in d.tabs.iter().enumerate() {
+        let name = if i == d.tab {
+            sp(fg(ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED), t.clone())
         } else {
-            let style = if i == 0 { fg(MUTED) } else { fg(DIM) };
-            for l in fmt::wrap_width(h, inner) {
-                out.push(Painted::new(vec![margin(), sp(style, l)]));
-            }
-        }
-    }
-    if !header.is_empty() {
-        out.push(Painted::blank());
-    }
-    for line in lines {
-        for l in fmt::wrap_width(line, inner) {
-            out.push(Painted::new(vec![margin(), sp(Style::default(), l)]));
-        }
-    }
-    if lines.is_empty() {
-        out.push(dim_line("(empty)"));
-    }
-    out
-}
-
-/// `key      value` rows: key dim, value bright.
-fn layout_info(lines: &[String], width: usize) -> Vec<Painted> {
-    let mut out = Vec::new();
-    let inner = width.saturating_sub(MARGIN).max(1);
-    for line in lines {
-        let err = line.starts_with("error") || line.contains(" error");
-        let (key, value) = match line.find("  ") {
-            Some(i) if i > 0 && !line[..i].contains(' ') => {
-                let rest = line[i..].trim_start();
-                let kw = line.len() - rest.len();
-                (&line[..kw], rest)
-            }
-            _ => ("", line.as_str()),
+            sp(fg(MUTED), t.clone())
         };
-        let vstyle = if err { fg(ERR) } else { Style::default() };
-        let kw = fmt::display_width(key);
-        for (j, l) in fmt::wrap_width(value, inner.saturating_sub(kw).max(1)).into_iter().enumerate() {
-            let k = if j == 0 { sp(fg(DIM), key.to_string()) } else { Span::raw(" ".repeat(kw)) };
-            out.push(Painted::new(vec![margin(), k, sp(vstyle, l)]));
+        let s = seg(BOX_MAIN, vec![sp(fg(HOT), ["¹", "²", "³"][i.min(2)].to_string()), name]);
+        let x0 = spans_width(&tabs);
+        hits.push((chunks[1].x + x0 as u16, chunks[1].x + (x0 + spans_width(&s)) as u16, i));
+        tabs.extend(s);
+    }
+    let q = !d.log.query.is_empty();
+    let count = if q && d.log.filter {
+        vec![sp(fg(TEXT), laid.shown.to_string()), sp(fg(DIM), format!(" of {} lines", laid.total))]
+    } else if q {
+        let n = laid.matches.len();
+        let at = if n == 0 { 0 } else { d.log.current + 1 };
+        vec![sp(fg(if n == 0 { ERR } else { TEXT }), format!("{at}/{n}")), sp(fg(DIM), " matching rows")]
+    } else {
+        let hidden = laid.total - laid.shown;
+        let mut v = vec![sp(fg(TEXT), laid.total.to_string()), sp(fg(DIM), " lines")];
+        if hidden > 0 && !d.log.show_blank {
+            v.push(sp(fg(DIM), format!(" · {hidden} blank hidden")));
         }
+        v
+    };
+    let right = trail(BOX_MAIN, seg(BOX_MAIN, count));
+    let fill = w.saturating_sub(spans_width(&tabs) + spans_width(&right));
+    tabs.push(sp(fg(BOX_MAIN), "─".repeat(fill)));
+    tabs.extend(right);
+    frame.render_widget(Paragraph::new(Line::from(fit_spans(tabs, w))), chunks[1]);
+    d.log.tab_hits = hits;
+    d.log.tab_y = chunks[1].y;
+
+    // Frame: title, follow state, and keys / search prompt in the bottom border.
+    let pos = if d.follow && info.running {
+        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(OK), "● "), sp(fg(MUTED), "following")]))
+    } else if laid.lines.len() > height {
+        let max = laid.lines.len() - height;
+        trail(BOX_MAIN, seg(BOX_MAIN, vec![sp(fg(DIM), format!("{}%", d.scroll * 100 / max.max(1)))]))
+    } else {
+        Vec::new()
+    };
+    let key = |k: &str, l: &str| {
+        seg_bottom(BOX_MAIN, vec![sp(fg(TEXT).add_modifier(Modifier::BOLD), k.to_string()), sp(fg(MUTED), format!(" {l}"))])
+    };
+    // Keys name the mode they switch to.
+    let mode = if d.log.filter { "highlight" } else { "filter" };
+    let mut bottom = vec![sp(fg(BOX_MAIN), "─")];
+    if d.log.editing {
+        bottom.extend(seg_bottom(
+            BOX_MAIN,
+            vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), d.log.query.clone()), sp(fg(ACCENT), "▏")],
+        ));
+        bottom.extend(key("tab", mode));
+        bottom.extend(key("enter", "keep"));
+        bottom.extend(key("esc", "clear"));
+    } else {
+        if q {
+            bottom.extend(seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), d.log.query.clone())]));
+            bottom.extend(key("n N", "next"));
+        } else {
+            bottom.extend(key("/", "search"));
+        }
+        bottom.extend(key("&", mode));
+        bottom.extend(key("b", if d.log.show_blank { "hide blank" } else { "show blank" }));
+        bottom.extend(key("1 2", "tab"));
+        bottom.extend(key("f", if d.follow { "unfollow" } else { "follow" }));
+        bottom.extend(key("esc", if q { "clear" } else { "close" }));
     }
-    if out.is_empty() {
-        out.push(dim_line("(empty)"));
-    }
-    out
+    let block = panel(&d.title)
+        .title_top(Line::from(pos).right_aligned())
+        .title_bottom(Line::from(fit_spans(bottom, (area.width as usize).saturating_sub(2))));
+    frame.render_widget(block, area);
+    mouse.detail = hit_rect(area);
+    mouse.chat = HitRect::default();
+    mouse.scrollbar = hit_rect(bar);
 }
 
 fn is_open(id: usize, open: &HashSet<usize>, expand_all: bool) -> bool {
@@ -2186,6 +2428,104 @@ mod tests {
         let text = render(120, 24, &mut state);
         assert!(text.contains("usage not recorded") && text.contains("12 shells"), "{text}");
         assert!(!text.contains("- in"), "{text}");
+    }
+
+    fn log_lines() -> Vec<String> {
+        vec![
+            "GET /api/apps STATUS=200 DUR_MS=2843".into(),
+            "".into(),
+            "POST /api/verify STATUS=500 DUR_MS=130617".into(),
+            "".into(),
+            "\x1b[32mGET\x1b[0m /api/apps STATUS=200 DUR_MS=8038\r".into(),
+        ]
+    }
+
+    #[test]
+    fn search_is_smart_case_with_alternatives() {
+        let q = parse_query("verify|status=500").unwrap();
+        assert_eq!(match_ranges("POST /api/verify STATUS=500", &q), vec![(10, 16), (17, 27)]);
+        let strict = parse_query("Verify").unwrap();
+        assert!(match_ranges("POST /api/verify", &strict).is_empty(), "uppercase makes it case-sensitive");
+        assert_eq!(match_ranges("aaaa", &parse_query("aa|aaa").unwrap()), vec![(0, 4)], "overlaps merge");
+        assert!(parse_query(" | ").is_none());
+    }
+
+    #[test]
+    fn task_output_hides_blank_lines_and_filters_or_highlights() {
+        let lines = log_lines();
+        let mut view = model::LogView::default();
+        let laid = layout_log(&lines, 80, &view, None);
+        let text: Vec<String> = laid.lines.iter().map(|p| p.text()).collect();
+        assert_eq!(laid.lines.len(), 3, "blank lines hidden: {text:?}");
+        assert!(text[2].starts_with(" GET /api/apps") && !text[2].contains('\x1b'), "{text:?}");
+        assert_eq!((laid.shown, laid.total), (3, 5));
+
+        view.show_blank = true;
+        assert_eq!(layout_log(&lines, 80, &view, None).lines.len(), 5);
+
+        view.show_blank = false;
+        view.query = "get".into();
+        let laid = layout_log(&lines, 80, &view, None);
+        assert_eq!(laid.matches, vec![0, 2], "highlight keeps every line, marks matching rows");
+        let hit = laid.lines[0].spans.iter().find(|s| s.content == "GET").expect("match span");
+        assert_eq!(hit.style.bg, Some(HIT));
+
+        view.filter = true;
+        let laid = layout_log(&lines, 80, &view, Some(0));
+        assert_eq!(laid.lines.len(), 2, "filter drops non-matching lines");
+        assert_eq!(laid.lines[0].spans.iter().find(|s| s.content == "GET").unwrap().style.bg, Some(HIT_CURRENT));
+
+        view.query = "nothing-like-this".into();
+        assert_eq!(layout_log(&lines, 80, &view, None).lines[0].text(), " (no line matches)");
+    }
+
+    fn task_detail(lines: Vec<String>) -> TopState {
+        let snap = snap();
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        state.selected = Some("sh_live".into());
+        let mut d = open_detail(&state).expect("task opens");
+        let info = crate::top::collector::task_info_for_test(&snap.tasks[0], 10_000);
+        d.body = DetailBody::Log { info: Box::new(info), lines };
+        state.detail = Some(d);
+        state
+    }
+
+    #[test]
+    fn task_detail_pins_info_and_shows_stream_tabs() {
+        let mut state = task_detail(log_lines());
+        let text = render(110, 20, &mut state);
+        assert!(!text.contains("Info"), "info is pinned, not a tab: {text}");
+        assert!(text.contains("¹output") && text.contains("²stderr"), "{text}");
+        assert!(text.contains("running") && text.contains("$ pytest -n 4") && text.contains("cwd /tmp/app"), "{text}");
+        assert!(text.contains("5 lines · 2 blank hidden"), "{text}");
+        assert!(text.contains("/ search") && text.contains("& filter"), "{text}");
+        let d = state.detail.as_ref().unwrap();
+        assert_eq!(d.log.tab_hits.len(), 2);
+        let row: Vec<&str> = text.lines().collect();
+        let tab_line = row[d.log.tab_y as usize];
+        let col = fmt::display_width(&tab_line[..tab_line.find("stderr").unwrap()]) as u16;
+        let (x0, x1, tab) = d.log.tab_hits[1];
+        assert!(x0 <= col && col < x1 && tab == 1, "{tab_line:?} {:?}", d.log.tab_hits);
+    }
+
+    #[test]
+    fn search_seeks_to_the_first_match_and_reports_counts() {
+        let mut lines: Vec<String> = (0..60).map(|i| format!("line {i} ok")).collect();
+        lines[42] = "line 42 FAILED here".into();
+        let mut state = task_detail(lines);
+        {
+            let d = state.detail.as_mut().unwrap();
+            d.follow = false;
+            d.scroll = 0;
+            d.log.query = "failed".into();
+            d.log.seek = true;
+        }
+        let text = render(100, 20, &mut state);
+        let d = state.detail.as_ref().unwrap();
+        assert_eq!(d.log.matches, vec![42]);
+        assert!(!d.follow && d.scroll <= 42 && 42 < d.scroll + d.view_h, "match in view: scroll {}", d.scroll);
+        assert!(text.contains("1/1 matching rows") && text.contains("/ failed"), "{text}");
     }
 
     #[test]

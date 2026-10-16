@@ -522,9 +522,55 @@ pub enum DetailBody {
     #[default]
     Empty,
     Conversation(Chat),
-    /// Task output/stderr: a short identity header, then the file tail.
-    Log { header: Vec<String>, lines: Vec<String> },
-    Text(Vec<String>),
+    /// Task output or stderr tail, with the task's identity for the pinned
+    /// info panel.
+    Log { info: Box<TaskInfo>, lines: Vec<String> },
+}
+
+/// What the pinned panel above a task's output shows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskInfo {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub running: bool,
+    pub command: String,
+    pub cwd: String,
+    pub pid: u32,
+    pub session: String,
+    pub started_at: u64,
+    pub wall_ms: u64,
+    pub cpu_ms: Option<u64>,
+    pub cpu_now: Option<f64>,
+    pub cpu_stale: bool,
+    pub work_kind: String,
+    pub exit: Option<String>,
+    pub reason: Option<String>,
+    pub output: String,
+}
+
+impl Eq for TaskInfo {}
+
+/// Search and display state for a task's output view.
+#[derive(Debug, Clone, Default)]
+pub struct LogView {
+    /// Search text; `a|b` matches either, lowercase is case-insensitive.
+    pub query: String,
+    /// Typing into the search prompt.
+    pub editing: bool,
+    /// Show only matching lines instead of highlighting them.
+    pub filter: bool,
+    /// Keep blank lines (hidden by default).
+    pub show_blank: bool,
+    /// Index into `matches` of the match `n` / `N` last jumped to.
+    pub current: usize,
+    /// Painted line indexes holding a match, from the last draw.
+    pub matches: Vec<usize>,
+    /// Scroll to the first match at or below the view on the next draw.
+    pub seek: bool,
+    /// Tab click ranges `(x0, x1, tab)` on row `tab_y`, absolute.
+    pub tab_hits: Vec<(u16, u16, usize)>,
+    pub tab_y: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +592,8 @@ pub struct Detail {
     pub open: HashSet<usize>,
     /// Toggle hit for each visible line. Only the ▸/▾ cell is armed.
     pub hits: Vec<Option<FoldHit>>,
+    /// Task output search / filter state.
+    pub log: LogView,
 }
 
 /// Click target for one foldable header. Coordinates are relative to the chat pane.

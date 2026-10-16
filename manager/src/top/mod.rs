@@ -11,7 +11,7 @@ pub mod ui;
 use crate::client::{self, HelloMode};
 use crate::proto::{RequestKind, UnitOk};
 use crate::top::collector::{open_detail, CollectView, Collector, Tick};
-use crate::top::model::{Detail, NodeKind, Tab, TabHit, TopState};
+use crate::top::model::{Detail, DetailBody, NodeKind, Tab, TabHit, TopState};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -289,7 +289,13 @@ fn handle_mouse_click(state: &mut TopState, col: u16, row: u16) {
         state.help = false;
         return;
     }
-    if state.detail.is_some() {
+    if let Some(d) = state.detail.as_mut() {
+        if row == d.log.tab_y && !d.log.tab_hits.is_empty() {
+            if let Some(&(_, _, tab)) = d.log.tab_hits.iter().find(|(x0, x1, _)| col >= *x0 && col < *x1) {
+                set_detail_tab(d, tab);
+                return;
+            }
+        }
         if state.mouse.scrollbar.contains(col, row) {
             state.mouse.dragging_bar = true;
             drag_scrollbar(state, row);
@@ -421,15 +427,75 @@ fn detail_scroll_down(d: &mut Detail, n: usize) {
     d.scroll = d.scroll.saturating_add(n);
 }
 
+/// Switch the detail tab and start the new stream at its live end.
+fn set_detail_tab(d: &mut Detail, tab: usize) {
+    if tab >= d.tabs.len().max(1) || tab == d.tab {
+        return;
+    }
+    d.tab = tab;
+    d.scroll = 0;
+    d.follow = true;
+    d.log.matches.clear();
+    d.log.current = 0;
+}
+
+/// `n` / `N`: move to the next / previous painted row holding a match.
+fn jump_match(d: &mut Detail, forward: bool) {
+    let n = d.log.matches.len();
+    if n == 0 {
+        return;
+    }
+    d.log.current = if forward { (d.log.current + 1) % n } else { (d.log.current + n - 1) % n };
+    d.follow = false;
+    d.scroll = d.log.matches[d.log.current].saturating_sub(d.view_h / 3);
+}
+
+/// Typing into a task output's search prompt.
+fn handle_search(d: &mut Detail, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            d.log.query.clear();
+            d.log.editing = false;
+        }
+        KeyCode::Enter => d.log.editing = false,
+        KeyCode::Tab => d.log.filter = !d.log.filter,
+        KeyCode::Backspace => {
+            d.log.query.pop();
+            d.log.seek = true;
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            d.log.query.push(c);
+            d.log.seek = true;
+        }
+        _ => {}
+    }
+}
+
 fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
     let Some(d) = state.detail.as_mut() else {
         return false;
     };
+    let log = matches!(d.body, DetailBody::Log { .. });
+    if log && d.log.editing {
+        handle_search(d, key);
+        return false;
+    }
     match key.code {
+        KeyCode::Esc if log && !d.log.query.is_empty() => {
+            d.log.query.clear();
+            d.log.matches.clear();
+        }
         KeyCode::Esc | KeyCode::Char('q') => state.detail = None,
-        KeyCode::Char('1') => d.tab = 0,
-        KeyCode::Char('2') if d.tabs.len() > 1 => d.tab = 1,
-        KeyCode::Char('3') if d.tabs.len() > 2 => d.tab = 2,
+        KeyCode::Char('1') => set_detail_tab(d, 0),
+        KeyCode::Char('2') => set_detail_tab(d, 1),
+        KeyCode::Char('/') if log => {
+            d.log.editing = true;
+            d.log.seek = true;
+        }
+        KeyCode::Char('&') if log => d.log.filter = !d.log.filter,
+        KeyCode::Char('n') if log => jump_match(d, true),
+        KeyCode::Char('N') if log => jump_match(d, false),
+        KeyCode::Char('b') if log => d.log.show_blank = !d.log.show_blank,
         KeyCode::Char('f') | KeyCode::Char('F') => d.follow = !d.follow,
         KeyCode::Char('o') | KeyCode::Char('O') => d.tools_expanded = !d.tools_expanded,
         KeyCode::Up | KeyCode::Char('k') => detail_scroll_up(d, 1),
@@ -564,4 +630,80 @@ fn restore() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::top::model::{LogView, TaskInfo};
+    use std::collections::HashSet;
+
+    fn log_detail() -> Detail {
+        Detail {
+            id: "sh_1".into(),
+            tab: 0,
+            follow: true,
+            scroll: 0,
+            title: "sh_1".into(),
+            tabs: vec!["output".into(), "stderr".into()],
+            body: DetailBody::Log { info: Box::new(TaskInfo::default()), lines: vec![] },
+            wrap_len: 100,
+            view_h: 9,
+            tools_expanded: false,
+            open: HashSet::new(),
+            hits: Vec::new(),
+            log: LogView::default(),
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn slash_types_a_query_tab_flips_mode_and_n_walks_matches() {
+        let mut state = TopState::new(1_000, None, None);
+        state.detail = Some(log_detail());
+        for c in ['/', 'e', 'r', 'r'] {
+            handle_detail(&mut state, key(KeyCode::Char(c)));
+        }
+        let d = state.detail.as_mut().unwrap();
+        assert!(d.log.editing && d.log.seek);
+        assert_eq!(d.log.query, "err");
+        handle_search(d, key(KeyCode::Tab));
+        assert!(d.log.filter, "tab flips to filter while typing");
+        handle_search(d, key(KeyCode::Enter));
+        assert!(!d.log.editing);
+
+        d.log.matches = vec![10, 30, 50];
+        handle_detail(&mut state, key(KeyCode::Char('n')));
+        let d = state.detail.as_ref().unwrap();
+        assert_eq!((d.log.current, d.scroll, d.follow), (1, 27, false));
+        handle_detail(&mut state, key(KeyCode::Char('N')));
+        handle_detail(&mut state, key(KeyCode::Char('N')));
+        assert_eq!(state.detail.as_ref().unwrap().log.current, 2, "N wraps backwards");
+
+        handle_detail(&mut state, key(KeyCode::Esc));
+        assert!(state.detail.as_ref().is_some_and(|d| d.log.query.is_empty()), "first esc clears the search");
+        handle_detail(&mut state, key(KeyCode::Esc));
+        assert!(state.detail.is_none(), "second esc closes");
+    }
+
+    #[test]
+    fn number_keys_and_tab_clicks_switch_streams() {
+        let mut state = TopState::new(1_000, None, None);
+        let mut d = log_detail();
+        d.follow = false;
+        d.scroll = 40;
+        d.log.tab_y = 5;
+        d.log.tab_hits = vec![(2, 12, 0), (12, 22, 1)];
+        state.detail = Some(d);
+        handle_mouse_click(&mut state, 15, 5);
+        let d = state.detail.as_ref().unwrap();
+        assert_eq!((d.tab, d.scroll, d.follow), (1, 0, true), "a new stream starts at its live end");
+        handle_detail(&mut state, key(KeyCode::Char('1')));
+        assert_eq!(state.detail.as_ref().unwrap().tab, 0);
+        handle_detail(&mut state, key(KeyCode::Char('3')));
+        assert_eq!(state.detail.as_ref().unwrap().tab, 0, "no third tab");
+    }
 }
