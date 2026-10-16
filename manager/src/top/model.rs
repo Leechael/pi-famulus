@@ -1174,12 +1174,19 @@ impl TopState {
         self.selected.as_ref().and_then(|id| self.nodes.get(id))
     }
 
-    /// Redraw on a short cadence so the running indicator can spin.
+    /// Redraw on a short cadence so running indicators spin: the chat's
+    /// footer in detail, or running rows on the table. Paused stays still.
     pub fn wants_anim(&self) -> bool {
-        self.detail.as_ref().is_some_and(|d| match &d.body {
-            DetailBody::Conversation(c) => c.running,
-            _ => false,
-        })
+        if let Some(d) = &self.detail {
+            return matches!(&d.body, DetailBody::Conversation(c) if c.running);
+        }
+        !self.paused
+            && matches!(self.tab, Tab::Tree | Tab::Agents)
+            && self.visible.iter().any(|v| {
+                self.nodes
+                    .get(&v.id)
+                    .is_some_and(|n| n.metrics.running && matches!(n.kind, NodeKind::Task | NodeKind::Agent))
+            })
     }
 
     pub fn bump_interval(&mut self, up: bool) {

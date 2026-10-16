@@ -145,13 +145,21 @@ pub fn draw(frame: &mut Frame, state: &mut TopState) {
     }
 }
 
+/// Refresh state plus the clock of the last snapshot, so each refresh is
+/// visible even when no number on screen changed.
 fn live_pill(state: &TopState) -> Vec<Span<'static>> {
+    let at = clock((state.now > 0).then_some(state.now));
+    let at = if at.is_empty() { String::new() } else { format!(" · {at}") };
     if state.paused {
-        vec![sp(fg(WARN), "‖ paused ")]
+        vec![sp(fg(WARN), "‖ paused"), sp(fg(DIM), format!("{at} "))]
     } else if state.header.live {
-        vec![sp(fg(OK), "● "), sp(fg(MUTED), format!("live {} ", interval_text(state.interval_ms)))]
+        vec![
+            sp(fg(OK), "● "),
+            sp(fg(MUTED), format!("live {}", interval_text(state.interval_ms))),
+            sp(fg(DIM), format!("{at} ")),
+        ]
     } else {
-        vec![sp(fg(DIM), "○ offline · disk snapshot ")]
+        vec![sp(fg(DIM), format!("○ offline · disk snapshot{at} "))]
     }
 }
 
@@ -1507,6 +1515,15 @@ fn cell_spans(state: &TopState, vr: &VisibleRow, col: Col) -> Vec<Span<'static>>
     vec![sp(style, text)]
 }
 
+/// Running tasks and agents spin; everything else keeps its status glyph.
+fn row_glyph(n: &Node) -> &'static str {
+    if n.metrics.running && matches!(n.kind, NodeKind::Task | NodeKind::Agent) {
+        spin_glyph()
+    } else {
+        status_glyph(&n.status, n.metrics.running)
+    }
+}
+
 fn node_spans(vr: &VisibleRow, n: &Node) -> Vec<Span<'static>> {
     let chevron = if vr.has_hidden_children {
         if vr.expanded {
@@ -1525,7 +1542,7 @@ fn node_spans(vr: &VisibleRow, n: &Node) -> Vec<Span<'static>> {
     vec![
         Span::raw("  ".repeat(vr.depth)),
         sp(fg(DIM), chevron),
-        sp(fg(status_color(&n.status, n.metrics.running)), format!("{} ", status_glyph(&n.status, n.metrics.running))),
+        sp(fg(status_color(&n.status, n.metrics.running)), format!("{} ", row_glyph(n))),
         sp(label_style, n.label.clone()),
     ]
 }
@@ -1991,6 +2008,27 @@ mod tests {
         let col = |needle: &str| fmt::display_width(&line[..line.find(needle).unwrap()]) as u16;
         assert!(agents.0 <= col("Agents") && col("Agents") < agents.1, "{line:?} {hits:?}");
         assert!(scope.0 <= col("active") && col("active") < scope.1, "{line:?} {hits:?}");
+    }
+
+    #[test]
+    fn running_rows_animate_and_the_header_shows_the_refresh_clock() {
+        let snap = snap();
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        state.header.live = true;
+        assert!(state.wants_anim(), "a visible running task keeps the table redrawing");
+        let text = render(120, 30, &mut state);
+        let clock = clock(Some(snap.now));
+        assert!(!clock.is_empty());
+        let header = text.lines().next().unwrap();
+        assert!(header.contains("live 1s") && header.contains(&clock), "{header}");
+        let row = text.lines().find(|l| l.contains("pytest")).unwrap();
+        assert!(SPIN.iter().any(|g| row.contains(g)), "running task spins: {row}");
+        state.paused = true;
+        assert!(!state.wants_anim(), "paused stays still");
+        state.paused = false;
+        state.set_tab(Tab::Tasks);
+        assert!(!state.wants_anim(), "the task table has no glyphs to spin");
     }
 
     #[test]
