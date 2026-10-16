@@ -39,14 +39,115 @@ type Group = "user" | "text" | "activity";
 interface ToolCall {
   name: string;
   summary: string;
+  /** Raw JSON arguments, possibly cut short; read leniently. */
+  args?: string;
 }
 
 /** `tool read {"path":"src"}` → name + one-line summary of the arguments. */
 export function parseToolCall(text: string): ToolCall | undefined {
   const match = /^tool (\S+?)(?:\s*(\{[\s\S]*))?$/.exec(text.trim());
   if (!match) return undefined;
-  return { name: match[1], summary: argsSummary(match[2] ?? "") };
+  const args = stripCapSuffix(match[2] ?? "");
+  return { name: match[1], summary: argsSummary(args), args };
 }
+
+/** Drop a transcript cap marker such as `… (3666 chars)`. */
+function stripCapSuffix(raw: string): string {
+  return raw.replace(/… \(\d+ chars\)\s*$/, "");
+}
+
+/** Every string value of `key`, in order, from JSON that may be cut short. */
+export function jsonStrings(json: string, key: string): Array<{ value: string; closed: boolean }> {
+  const out: Array<{ value: string; closed: boolean }> = [];
+  const pat = new RegExp(`"${key}"\\s*:\\s*"`, "g");
+  let m: RegExpExecArray | null;
+  while ((m = pat.exec(json)) !== null) {
+    let value = "";
+    let closed = false;
+    let i = m.index + m[0].length;
+    for (; i < json.length; i++) {
+      const c = json[i];
+      if (c === '"') {
+        closed = true;
+        break;
+      }
+      if (c !== "\\") {
+        value += c;
+        continue;
+      }
+      const e = json[++i];
+      if (e === undefined) break;
+      if (e === "n") value += "\n";
+      else if (e === "t") value += "\t";
+      else if (e === "r") continue;
+      else if (e === "u") {
+        const code = Number.parseInt(json.slice(i + 1, i + 5), 16);
+        if (!Number.isNaN(code)) value += String.fromCharCode(code);
+        i += 4;
+      } else value += e;
+    }
+    out.push({ value, closed });
+    pat.lastIndex = Math.max(pat.lastIndex, i);
+  }
+  return out;
+}
+
+/** What a write / edit call changes: a stat for its row, rows for unfolding. */
+export interface CallPreview {
+  stat: string;
+  rows: Array<{ gutter: string; color: string; text: string }>;
+  cut: boolean;
+}
+
+export function callPreview(name: string, args: string | undefined, theme: ChatTheme): CallPreview | undefined {
+  if (!args) return undefined;
+  if (name === "write") {
+    const content = jsonStrings(args, "content")[0];
+    if (!content) return undefined;
+    const lines = content.value.replace(/\n$/, "").split("\n");
+    const digits = String(lines.length).length;
+    const count = content.closed ? `+${lines.length} line${lines.length === 1 ? "" : "s"}` : `+${lines.length}+ lines`;
+    return {
+      stat: theme.fg("success", count),
+      rows: lines.map((text, i) => ({ gutter: `${String(i + 1).padStart(digits)} `, color: "text", text })),
+      cut: !content.closed,
+    };
+  }
+  if (name === "edit") {
+    const olds = jsonStrings(args, "oldText");
+    const news = jsonStrings(args, "newText");
+    const pairs = Math.max(olds.length, news.length);
+    if (pairs === 0) return undefined;
+    const rows: CallPreview["rows"] = [];
+    let minus = 0;
+    let plus = 0;
+    let cut = false;
+    for (let k = 0; k < pairs; k++) {
+      if (pairs > 1) rows.push({ gutter: "", color: "dim", text: `@@ edit ${k + 1}/${pairs}` });
+      const old = olds[k];
+      const neu = news[k];
+      if (old) {
+        cut ||= !old.closed;
+        for (const line of old.value.split("\n")) {
+          minus++;
+          rows.push({ gutter: "- ", color: "toolDiffRemoved", text: line });
+        }
+      }
+      if (neu) {
+        cut ||= !neu.closed;
+        for (const line of neu.value.split("\n")) {
+          plus++;
+          rows.push({ gutter: "+ ", color: "toolDiffAdded", text: line });
+        }
+      }
+    }
+    const edits = pairs > 1 ? theme.fg("dim", ` · ${pairs} edits`) : "";
+    return { stat: `${theme.fg("error", `−${minus}`)} ${theme.fg("success", `+${plus}`)}${edits}`, rows, cut };
+  }
+  return undefined;
+}
+
+const PREVIEW_ROWS = 60;
 
 function argsSummary(raw: string): string {
   if (!raw) return "";
@@ -198,14 +299,41 @@ export function renderConversation(
     begin("activity");
     const pending = result === undefined;
     const body = pending ? "" : scrubTty(result.text).trimEnd();
-    const foldable = body.trim().length > 0;
+    const preview = callPreview(call.name, call.args, theme);
+    const foldable = preview !== undefined || body.trim().length > 0;
     const glyph = pending
       ? theme.fg("accent", "● ")
       : result.error ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
     const summary = call.summary ? theme.fg("muted", `  ${call.summary}`) : "";
-    const tail = pending ? theme.fg("dim", "running") : "";
+    // The stat sits on the right so a long path truncates, not the stat.
+    const tail = [preview?.stat, pending ? theme.fg("dim", "running") : ""].filter(Boolean).join("  ");
     out.push(padBetween(MARGIN + chevron(options.expanded, foldable) + glyph + theme.bold(call.name) + summary, tail, w));
-    if (foldable && options.expanded) out.push(...hang(body, result?.error ? "error" : "toolOutput", w, theme));
+    if (!foldable || !options.expanded) return;
+    if (preview) {
+      const rule = theme.fg("borderMuted", "│ ");
+      const gw = Math.max(0, ...preview.rows.map((r) => r.gutter.length));
+      const inner = Math.max(1, w - MARGIN.length - 2 - gw);
+      let shown = 0;
+      let rows = 0;
+      for (const row of preview.rows) {
+        if (rows >= PREVIEW_ROWS) break;
+        const gutterColor = /^\s*\d+ $/.test(row.gutter) ? "dim" : row.color;
+        fitLines(scrubTty(row.text), inner).forEach((seg, j) => {
+          if (rows >= PREVIEW_ROWS) return;
+          // Headers (no gutter) sit flush; gutters align under each other.
+          const g = row.gutter === "" ? "" : j === 0 ? row.gutter.padStart(gw) : " ".repeat(gw);
+          out.push(MARGIN + rule + theme.fg(gutterColor, g) + theme.fg(row.color, seg));
+          rows++;
+        });
+        shown++;
+      }
+      const more = preview.rows.length - shown;
+      if (more > 0) out.push(MARGIN + rule + theme.fg("dim", `… ${more} more line${more === 1 ? "" : "s"}`));
+      if (preview.cut) out.push(MARGIN + rule + theme.fg("dim", "… cut short in the transcript"));
+      if (body.trim()) out.push(...hang(body, result?.error ? "error" : "dim", w, theme));
+      return;
+    }
+    out.push(...hang(body, result?.error ? "error" : "toolOutput", w, theme));
   };
 
   for (let i = 0; i < turns.length; i++) {

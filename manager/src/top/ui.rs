@@ -1702,12 +1702,19 @@ fn tool_row(row: ToolRow, expanded: bool, fold: usize, width: usize, out: &mut V
                 if rows == PREVIEW_ROWS {
                     break 'outer;
                 }
-                let g = if j == 0 { gutter.clone() } else { " ".repeat(fmt::display_width(gutter)) };
+                // Headers (no gutter) sit flush; gutters align under each other.
+                let g = if gutter.is_empty() {
+                    String::new()
+                } else if j == 0 {
+                    format!("{gutter:>gutter_w$}")
+                } else {
+                    " ".repeat(gutter_w)
+                };
                 let gstyle = if gutter.trim().chars().all(|c| c.is_ascii_digit()) { fg(DIM) } else { *style };
                 out.push(Painted::new(vec![
                     margin(),
                     sp(fg(RULE), "│ "),
-                    sp(gstyle, format!("{g:>gutter_w$}")),
+                    sp(gstyle, g),
                     sp(*style, seg),
                 ]));
                 rows += 1;
@@ -2622,7 +2629,7 @@ mod tests {
         let text = texts(&painted);
         let row = text.iter().find(|l| l.contains("edit")).unwrap();
         assert!(row.contains("src/a.rs") && row.contains("−2 +3") && row.contains("2 edits"), "{row}");
-        assert!(text.iter().any(|l| l.contains("@@ edit 1/2")), "{text:?}");
+        assert!(text.iter().any(|l| l == "  │ @@ edit 1/2"), "headers sit flush: {text:?}");
         assert!(text.iter().any(|l| l.contains("- let a = 1;")) && text.iter().any(|l| l.contains("+ let b = 3;")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("Successfully replaced")), "{text:?}");
     }

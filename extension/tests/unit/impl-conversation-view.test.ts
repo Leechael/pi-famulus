@@ -88,8 +88,8 @@ describe("conversation thread", () => {
   });
 
   it("summarizes tool arguments without dumping file content", () => {
-    expect(parseToolCall('tool write {"path":"/tmp/a.py","content":"import os\\nprint(1)"}')).toEqual({ name: "write", summary: "/tmp/a.py" });
-    expect(parseToolCall('tool write {"path":"/tmp/cut.py","content":"unterminated')).toEqual({ name: "write", summary: "/tmp/cut.py" });
+    expect(parseToolCall('tool write {"path":"/tmp/a.py","content":"import os\\nprint(1)"}')).toMatchObject({ name: "write", summary: "/tmp/a.py" });
+    expect(parseToolCall('tool write {"path":"/tmp/cut.py","content":"unterminated')).toMatchObject({ name: "write", summary: "/tmp/cut.py" });
     expect(parseToolCall("hello there")).toBeUndefined();
   });
 
@@ -133,5 +133,36 @@ describe("narrow terminals", () => {
         }
       }
     }
+  });
+});
+
+describe("write and edit calls", () => {
+  it("show a line stat and unfold to numbered content, even when the transcript cut them", () => {
+    const cut = `tool write {"path":"storage/final_verify.py","content":"from pathlib import Path\\nprint(1)\\nx = 1\\n… (3666 chars)`;
+    const folded = renderConversation([{ role: "assistant", text: cut }], 80, plainTheme, { expanded: false });
+    const row = folded.find((l) => l.includes("write"))!;
+    expect(row).toContain("storage/final_verify.py");
+    expect(row).toContain("+3+ lines");
+    expect(folded.join("\n")).not.toContain("pathlib");
+    const open = renderConversation([{ role: "assistant", text: cut }], 80, plainTheme, { expanded: true }).join("\n");
+    expect(open).toContain("│ 1 from pathlib import Path");
+    expect(open).toContain("cut short in the transcript");
+  });
+
+  it("show an edit as a -/+ stat and a diff per edit", () => {
+    const call = 'tool edit {"path":"src/a.ts","edits":[{"oldText":"let a = 1;","newText":"let a = 2;\\nlet b = 3;"},{"oldText":"x","newText":"y"}]}';
+    const lines = renderConversation(
+      [{ role: "assistant", text: call }, { role: "tool edit", text: "Successfully replaced 2 blocks" }],
+      90,
+      plainTheme,
+      { expanded: true },
+    );
+    const row = lines.find((l) => l.includes("edit") && l.includes("src/a.ts"))!;
+    expect(row).toContain("−2 +3");
+    expect(row).toContain("2 edits");
+    expect(lines).toContain("  │ @@ edit 1/2");
+    expect(lines).toContain("  │ - let a = 1;");
+    expect(lines).toContain("  │ + let b = 3;");
+    expect(lines.join("\n")).toContain("Successfully replaced");
   });
 });
