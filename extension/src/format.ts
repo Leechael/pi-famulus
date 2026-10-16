@@ -16,6 +16,7 @@ import {
   type WakeItem,
 } from "./wake";
 import { fill } from "./prompts.generated";
+import { shellStartStatus } from "./shell-start";
 
 export { FAMULUS_WAKE_LEAD_IN } from "./wake";
 export type { FormattedWake, WakeItem } from "./wake";
@@ -85,6 +86,8 @@ export interface TaskExitInfo {
   preview: string;
   /** Signal name from the manager, when the exit was a signal. */
   signal?: string;
+  /** The manager's end_reason, when it sent one. */
+  endReason?: string;
 }
 
 /** Shorten a command for one-line display inside notifications. */
@@ -93,6 +96,8 @@ function displayCommand(command: string): string {
 }
 
 function statusPhrase(info: TaskExitInfo): string {
+  const startFailure = shellStartStatus(info.endReason);
+  if (startFailure) return `did not run. ${startFailure}`;
   const code = info.exitCode === null ? null : `exit code ${info.exitCode}`;
   switch (info.status) {
     case "completed":

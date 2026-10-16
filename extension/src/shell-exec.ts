@@ -3,6 +3,7 @@
  * Previously copied in both files.
  */
 import type { BashToolDetails } from "@earendil-works/pi-coding-agent";
+import { shellStartStatus } from "./shell-start";
 import { truncateTail } from "./format";
 import type { ManagerClient } from "./manager-client";
 import { fill } from "./prompts.generated";
@@ -134,9 +135,34 @@ export function appendStatus(text: string, status: string): string {
  * kill for a command still running (eval batch 4).
  */
 export async function killedStatus(client: ManagerClient, taskId: string, timeoutSeconds: number | undefined): Promise<string> {
-  const record = (await client.list(true).catch(() => [])).find((t) => t.task_id === taskId);
+  const record = await taskRecord(client, taskId);
   if (record?.end_reason === "timeout" && timeoutSeconds !== undefined) return timedOutStatus(timeoutSeconds);
-  return killedBy(record?.signal);
+  return shellStartStatus(record?.end_reason) ?? killedBy(record?.signal);
+}
+
+/**
+ * Status line for a non-zero exit. On Windows the manager marks a Git Bash
+ * that crashed while starting (shell-start-failed); elsewhere that cannot
+ * happen, so skip the record lookup.
+ */
+export async function exitedStatus(
+  client: ManagerClient,
+  taskId: string,
+  exitCode: number,
+  platform: NodeJS.Platform = process.platform,
+): Promise<string> {
+  const plain = `Command exited with code ${exitCode}`;
+  if (platform !== "win32") return plain;
+  const hint = shellStartStatus((await taskRecord(client, taskId))?.end_reason);
+  return hint ? `${hint} (exit code ${exitCode})` : plain;
+}
+
+async function taskRecord(client: ManagerClient, taskId: string) {
+  try {
+    return (await client.list(true)).find((t) => t.task_id === taskId);
+  } catch {
+    return undefined;
+  }
 }
 
 /** The one wording of a timeout kill, on every bash path. */

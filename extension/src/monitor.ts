@@ -8,6 +8,7 @@
  * 30-second window.
  */
 import { Type } from "typebox";
+import { shellStartStatus } from "./shell-start";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatMonitorEvent } from "./format";
 import { MONITOR_IDLE_INSTRUCTION } from "./behavior-guidelines";
@@ -330,7 +331,7 @@ export class MonitorRegistry {
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). No further events will be delivered.${entry.droppedLinesPending > 0 ? ` ${entry.droppedLinesPending} output lines were dropped.` : ""}`,
+        `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}).${startFailureNote(event.end_reason)} No further events will be delivered.${entry.droppedLinesPending > 0 ? ` ${entry.droppedLinesPending} output lines were dropped.` : ""}`,
         "exited",
         { droppedLines: entry.droppedLinesPending, ...(summary.suppressedCount ? { output: summary } : {}) },
       ),
@@ -577,4 +578,10 @@ export function createMonitorTool(
       return toolComponent([line]) as never;
     },
   };
+}
+
+/** " <why>" when the monitor's Git Bash never started; "" otherwise. */
+function startFailureNote(endReason: string | undefined): string {
+  const status = shellStartStatus(endReason);
+  return status ? ` ${status}` : "";
 }
