@@ -127,7 +127,9 @@ fn wrap_paragraph(para: &str, max: usize, out: &mut Vec<String>) {
                 out.push(std::mem::take(&mut line));
                 w = 0;
             }
-            if c == ' ' {
+            // Drop the space only when it would lead the new line; after a
+            // word carried down from the break it separates two words.
+            if c == ' ' && line.is_empty() {
                 continue;
             }
         }
@@ -335,6 +337,17 @@ pub fn first_line(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_keeps_the_space_after_a_carried_word() {
+        let s = "arrived after your continue; hold STARTING normal prek/source edits under hooks until we coordinate";
+        for w in 12..=100 {
+            let joined = wrap_width(s, w).join(" ");
+            assert_eq!(joined, s, "width {w}");
+        }
+    }
+
     use super::*;
 
     #[test]
