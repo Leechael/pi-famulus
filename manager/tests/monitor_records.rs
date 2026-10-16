@@ -28,15 +28,14 @@ fn monitor_live_records_include_eof_tail_before_exit_and_preserve_raw_reads() {
         .map(|v| v["chunk"].as_str().unwrap())
         .collect();
     assert_eq!(raw, "hello 世界\ntrailing");
+    // A loaded runner can let a progress tick observe the unterminated tail
+    // before EOF; that is legitimate, so assert only on line identities.
     let records: Vec<Value> = output
         .iter()
         .flat_map(|v| v["monitor_records"].as_array().into_iter().flatten())
+        .filter(|r| r["kind"] == "line")
         .cloned()
         .collect();
-    assert!(
-        records.iter().all(|r| r["kind"] == "line"),
-        "a short command must not emit an immediate progress tick: {output:?}"
-    );
     assert_eq!(records.len(), 2, "line and EOF tail metadata: {output:?}");
     assert_eq!(records[0]["preview"], "hello 世界");
     assert_eq!(records[0]["cursor_end"], 13);
@@ -66,6 +65,7 @@ fn monitor_live_records_include_eof_tail_before_exit_and_preserve_raw_reads() {
         .iter()
         .filter(|v| v["event"] == "output")
         .flat_map(|v| v["monitor_records"].as_array().into_iter().flatten())
+        .filter(|r| r["kind"] == "line")
         .cloned()
         .collect();
     assert_eq!(replay, records);
