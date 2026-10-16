@@ -692,7 +692,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
     let roomy = rect.height >= 18;
     let inner = Block::bordered().inner(rect).inner(Margin { horizontal: 1, vertical: if roomy { 1 } else { 0 } });
     let chat = match &d.body {
-        DetailBody::Conversation(c) => Some((c.stats.clone(), c.running)),
+        DetailBody::Conversation(c) => Some((c.stats.clone(), c.running, c.note.clone())),
         _ => None,
     };
     let tabs_h = if d.tabs.is_empty() { 0 } else { 2 };
@@ -729,7 +729,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
     let pos = if scrolled {
         let max = painted.len() - height;
         vec![sp(fg(DIM), format!(" {}% ", d.scroll * 100 / max.max(1))), sp(fg(RULE), "─")]
-    } else if d.follow && chat.as_ref().is_some_and(|(_, running)| *running) {
+    } else if d.follow && chat.as_ref().is_some_and(|(_, running, _)| *running) {
         vec![sp(fg(OK), " ● "), sp(fg(MUTED), "following "), sp(fg(RULE), "─")]
     } else {
         Vec::new()
@@ -748,12 +748,21 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
     let foot_w = chunks[3].width as usize;
     let mut left = Vec::new();
     let keys: Vec<(&str, &str)> = match &chat {
-        Some((stats, running)) => {
+        Some((stats, running, note)) => {
             if *running {
                 left.push(sp(fg(ACCENT), format!("{} ", spin_glyph())));
                 left.push(sp(fg(ACCENT).add_modifier(Modifier::ITALIC), "working   "));
             }
-            for (i, (v, l)) in stats.iter().enumerate() {
+            // Without recorded usage only the shell count (from tasks) is real.
+            let shown: &[(String, String)] = match note {
+                Some(n) => {
+                    left.push(sp(fg(WARN), n.clone()));
+                    left.push(sp(fg(RULE), " · "));
+                    stats.last().map(std::slice::from_ref).unwrap_or(&[])
+                }
+                None => stats,
+            };
+            for (i, (v, l)) in shown.iter().enumerate() {
                 if i > 0 {
                     left.push(sp(fg(RULE), " · "));
                 }
@@ -1818,6 +1827,7 @@ mod tests {
         DetailBody::Conversation(Chat {
             turns,
             agent: "worker".into(),
+            note: None,
             stats: vec![("-".into(), "in".into()), ("0".into(), "shells".into())],
             running: false,
         })
@@ -1992,6 +2002,7 @@ mod tests {
         d.body = DetailBody::Conversation(Chat {
             turns: vec![mk_turn("user", "inspect the loader")],
             agent: "worker".into(),
+            note: None,
             stats: vec![
                 ("100".into(), "in".into()),
                 ("20".into(), "out".into()),
@@ -2010,6 +2021,26 @@ mod tests {
         assert!(text.contains("following"), "{text}");
         assert!(text.contains("┃ inspect the loader"), "{text}");
         assert!(text.contains("╭"), "rounded panel: {text}");
+    }
+
+    #[test]
+    fn footer_explains_missing_usage_instead_of_dashes() {
+        let snap = snap();
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        state.selected = Some("ch_a".into());
+        let mut d = open_detail(&state).expect("agent opens");
+        d.body = DetailBody::Conversation(Chat {
+            turns: vec![mk_turn("user", "go")],
+            agent: "worker".into(),
+            note: Some("usage not recorded: this session runs extension 0.1.3".into()),
+            stats: vec![("-".into(), "in".into()), ("12".into(), "shells".into())],
+            running: false,
+        });
+        state.detail = Some(d);
+        let text = render(120, 24, &mut state);
+        assert!(text.contains("usage not recorded") && text.contains("12 shells"), "{text}");
+        assert!(!text.contains("- in"), "{text}");
     }
 
     #[test]

@@ -510,6 +510,8 @@ pub struct Chat {
     pub agent: String,
     /// `(value, label)` pairs for the footer, e.g. `("12k", "in")`.
     pub stats: Vec<(String, String)>,
+    /// Shown in place of `stats` when the record carries no usage at all.
+    pub note: Option<String>,
     pub running: bool,
 }
 

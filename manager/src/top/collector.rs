@@ -75,6 +75,8 @@ pub struct Collector {
     event_prefix: Option<String>,
     last_tasks: Vec<TaskRecord>,
     last_now: u64,
+    /// Extension version each session reported on hello, by session id.
+    ext_versions: HashMap<String, String>,
 }
 
 impl Collector {
@@ -89,6 +91,7 @@ impl Collector {
             event_prefix: None,
             last_tasks: Vec::new(),
             last_now: 0,
+            ext_versions: HashMap::new(),
         }
     }
 
@@ -133,6 +136,10 @@ impl Collector {
         let kind_slots = kind_slots(&self.home, daemon.as_ref());
         self.last_tasks = tasks.clone();
         self.last_now = now;
+        self.ext_versions = sessions
+            .values()
+            .filter_map(|s| s.extension_version.clone().map(|v| (s.session_id.clone(), v)))
+            .collect();
         let snap = Snapshot {
             now,
             daemon,
@@ -168,6 +175,7 @@ impl Collector {
         if view.preview {
             tail_for(
                 &self.home,
+                &self.ext_versions,
                 &self.last_tasks,
                 &self.agents,
                 self.last_now,
@@ -182,7 +190,9 @@ impl Collector {
     fn detail_body(&self, view: &CollectView) -> Option<DetailBody> {
         view.detail
             .as_ref()
-            .map(|d| tail_for(&self.home, &self.last_tasks, &self.agents, self.last_now, Some(&d.id), d.tab))
+            .map(|d| {
+                tail_for(&self.home, &self.ext_versions, &self.last_tasks, &self.agents, self.last_now, Some(&d.id), d.tab)
+            })
     }
 
     async fn refresh_agents(&mut self, connected: &HashSet<String>) {
@@ -429,6 +439,7 @@ fn kind_slots(home: &Path, daemon: Option<&StatusOk>) -> HashMap<String, (usize,
 
 fn tail_for(
     home: &Path,
+    ext_versions: &HashMap<String, String>,
     tasks: &[TaskRecord],
     agents: &[AgentRecord],
     now: u64,
@@ -447,7 +458,7 @@ fn tail_for(
     }
     if let Some(a) = agents.iter().find(|a| a.child_id == id) {
         let _ = tab;
-        return agent_chat(home, a, tasks);
+        return agent_chat(home, a, tasks, ext_versions.get(&a.session_id).map(String::as_str));
     }
     DetailBody::Empty
 }
@@ -567,7 +578,21 @@ fn info_task(t: &TaskRecord, now: u64) -> Vec<String> {
     ]
 }
 
-fn agent_chat(home: &Path, a: &AgentRecord, tasks: &[TaskRecord]) -> DetailBody {
+/// Why an agent has no usage at all: extensions before 0.1.4 never wrote
+/// tokens or wall time into the record, so `-` everywhere is not a bug in
+/// the numbers.
+fn usage_note(a: &AgentRecord, ext_version: Option<&str>) -> Option<String> {
+    let recorded = a.tokens_input.is_some() || a.tokens_output.is_some() || a.llm_ms.is_some();
+    if recorded {
+        return None;
+    }
+    Some(match ext_version {
+        Some(v) => format!("usage not recorded: this session runs extension {v}; 0.1.4+ records tokens and wall time"),
+        None => "usage not recorded by this session's extension (0.1.4+ records tokens and wall time)".into(),
+    })
+}
+
+fn agent_chat(home: &Path, a: &AgentRecord, tasks: &[TaskRecord], ext_version: Option<&str>) -> DetailBody {
     let shells = tasks
         .iter()
         .filter(|t| t.origin.as_ref().and_then(|o| o.child_id.as_deref()) == Some(a.child_id.as_str()))
@@ -582,6 +607,7 @@ fn agent_chat(home: &Path, a: &AgentRecord, tasks: &[TaskRecord]) -> DetailBody 
     DetailBody::Conversation(Chat {
         turns: load_transcript(home, a),
         agent,
+        note: usage_note(a, ext_version),
         stats: vec![
             (tok_in, "in".into()),
             (tok_out, "out".into()),
@@ -672,6 +698,28 @@ mod tests {
             live_cpu_stale: false,
             label: None,
         }
+    }
+
+    #[test]
+    fn agent_without_usage_says_which_extension_left_it_out() {
+        // Shape written by extension 0.1.3: identity and status, no usage.
+        let old: AgentRecord = serde_json::from_str(
+            r#"{"child_id":"ch_old","session_id":"s","name":"worker","agent":"worker","status":"running"}"#,
+        )
+        .unwrap();
+        let home = std::env::temp_dir();
+        let DetailBody::Conversation(chat) = agent_chat(&home, &old, &[], Some("0.1.3")) else { panic!("chat") };
+        let note = chat.note.expect("note");
+        assert!(note.contains("0.1.3") && note.contains("0.1.4+"), "{note}");
+        let DetailBody::Conversation(chat) = agent_chat(&home, &old, &[], None) else { panic!("chat") };
+        assert!(chat.note.is_some());
+
+        let mut new = old.clone();
+        new.tokens_input = Some(0);
+        new.tokens_output = Some(0);
+        new.llm_ms = Some(0);
+        let DetailBody::Conversation(chat) = agent_chat(&home, &new, &[], Some("0.1.7")) else { panic!("chat") };
+        assert_eq!(chat.note, None, "zeros are recorded usage, not missing usage");
     }
 
     #[test]

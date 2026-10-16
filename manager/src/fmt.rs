@@ -337,8 +337,6 @@ pub fn first_line(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn wrap_keeps_the_space_after_a_carried_word() {
         let s = "arrived after your continue; hold STARTING normal prek/source edits under hooks until we coordinate";
