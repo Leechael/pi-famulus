@@ -282,13 +282,16 @@ fn fail(state: &Shared, from: &str, to: Option<String>, trigger: &str, error: St
 
 /// Wait for every task's pumps, fanout and exit watch to stop, collecting
 /// the pumps' descriptors back into the entries.
+/// A task being parked: id, its output tee, and the tee's reader tasks.
+type ParkedJob = (String, Option<task::Tee>, Option<tokio::task::JoinHandle<()>>, Option<tokio::task::JoinHandle<()>>);
+
 async fn park_all(state: &Shared) {
     // In-flight requests are cancelled at their next await; wait for them.
     let inflight = state.lock().unwrap().inflight.clone();
     while inflight.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    let jobs: Vec<(String, Option<task::Tee>, Option<tokio::task::JoinHandle<()>>, Option<tokio::task::JoinHandle<()>>)> = {
+    let jobs: Vec<ParkedJob> = {
         let mut st = state.lock().unwrap();
         st.registry
             .tasks

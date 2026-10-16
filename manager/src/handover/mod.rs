@@ -72,7 +72,7 @@ pub(crate) fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
         if !original.starts_with(b"/") || original.is_empty() {
             return path;
         }
-        return PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()));
+        PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()))
     }
     #[cfg(not(unix))]
     {
@@ -116,12 +116,14 @@ pub fn check_line() -> String {
     format!("{CHECK_PREFIX} {FORMAT} {}", crate::VERSION)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub fn file_path(home: &Path) -> PathBuf {
     home.join("handover.json")
 }
 
 /// A preflighted upgrade, waiting for the accept loop.
 pub struct Ready {
+    #[cfg_attr(windows, allow(dead_code))]
     pub exe: PathBuf,
     pub to_version: String,
     pub trigger: String,
@@ -152,6 +154,7 @@ pub fn fail_unsupported(state: &Shared, ready: Ready) -> String {
 }
 
 #[cfg(windows)]
+#[cfg_attr(windows, allow(dead_code))]
 pub fn request(_state: &Shared, _trigger: &str) -> bool {
     false
 }

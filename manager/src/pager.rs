@@ -22,6 +22,7 @@ pub struct Pager {
 /// `PAGER`, so `PI_FAMULUS_PAGER=` lets `PAGER` take over rather than disabling
 /// paging outright; `cat` (from either variable) is the explicit way to
 /// disable it.
+#[cfg_attr(windows, allow(dead_code))]
 fn command(env: impl Fn(&str) -> Option<String>) -> Option<String> {
     let chosen = env("PI_FAMULUS_PAGER")
         .filter(|v| !v.is_empty())
@@ -48,6 +49,7 @@ fn command(env: impl Fn(&str) -> Option<String>) -> Option<String> {
 /// less`), or shell metacharacters we're not going to parse. Those cases
 /// return true — "assume it runs, let sh find out" — so a valid pager isn't
 /// mistaken for a missing one.
+#[cfg_attr(windows, allow(dead_code))]
 fn program_exists(cmd: &str) -> bool {
     if cmd.contains(['$', '`', '|', ';', '&', '<', '>', '(', ')', '\'', '"']) {
         return true;
@@ -95,7 +97,7 @@ pub fn start() -> Option<Pager> {
     {
         // Known gap this PR: no portable dup2 onto a pager pipe on Windows yet.
         // Listings print unpaged; PI_FAMULUS_PAGER / PAGER are ignored here.
-        return None;
+        None
     }
     #[cfg(unix)]
     {

@@ -1,3 +1,7 @@
+// Daemons and task children spawned here are reaped by the harness
+// (`Home::drop` kills them), not by `wait()` at each call site.
+#![allow(clippy::zombie_processes)]
+
 #![cfg(unix)]
 //! Adversarial black-box lifecycle tests for pi-famulus.
 //!

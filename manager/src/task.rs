@@ -246,6 +246,7 @@ pub struct OutputChunk {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub struct SpawnedTask {
     /// The task's runner (`pi-famulus __run`), leader of its process group.
     pub child: Child,
@@ -262,6 +263,7 @@ pub struct SpawnedTask {
 /// A task's runner process, as the daemon waits for it: the tokio `Child`
 /// it spawned, or a bare pid inherited across an in-place upgrade (still
 /// our child, so `waitpid` works, but tokio cannot adopt it).
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 pub enum RunnerProc {
     Child(Child),
     #[allow(dead_code)] // built by the in-place upgrade's restore
@@ -347,7 +349,7 @@ pub fn runner_exe() -> io::Result<PathBuf> {
         if let Some(profile_dir) = exe.parent().and_then(|d| d.parent()) {
             return Ok(profile_dir.join("pi-famulus"));
         }
-        return Ok(exe);
+        Ok(exe)
     }
     #[cfg(all(not(test), target_os = "linux"))]
     {
@@ -417,12 +419,12 @@ fn spawn_process_unix(command: &str, cwd: &str, env: &HashMap<String, String>) -
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stdout pipe missing"))?
+        .ok_or_else(|| io::Error::other("child stdout pipe missing"))?
         .into_owned_fd()?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stderr pipe missing"))?
+        .ok_or_else(|| io::Error::other("child stderr pipe missing"))?
         .into_owned_fd()?;
     let pid = child.id().unwrap_or(0);
     Ok(ProcessParts { child, status, pid, stdout, stderr, job_generation: 0 })
@@ -463,7 +465,7 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
     let pid = child.id().unwrap_or(0);
     let process = child
         .raw_handle()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "runner exited at spawn"))?;
+        .ok_or_else(|| io::Error::other("runner exited at spawn"))?;
     // The runner waits on stdin for the gate, so nothing has started yet.
     let generation = match crate::sys::assign_job(pid, process) {
         Ok(g) => g,
@@ -492,7 +494,7 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stdin pipe missing"))?;
+        .ok_or_else(|| io::Error::other("child stdin pipe missing"))?;
     tokio::spawn(async move {
         let _ = stdin.write_all(gate.as_bytes()).await;
         let _ = stdin.shutdown().await;
@@ -501,11 +503,11 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stdout pipe missing"))?;
+        .ok_or_else(|| io::Error::other("child stdout pipe missing"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stderr pipe missing"))?;
+        .ok_or_else(|| io::Error::other("child stderr pipe missing"))?;
     Ok(ProcessParts {
         child,
         status,
@@ -581,22 +583,16 @@ pub fn start_tee(
     {
         let (o, t, p, n) = (output.clone(), tx.clone(), park.clone(), open.clone());
         let stdout = tokio::spawn(async move {
-            match stdout {
-                Some(r) => {
-                    let parked = pump_async(r, o.clone(), t, None, p).await;
-                    pump_done(&n, &o, parked);
-                }
-                None => {}
+            if let Some(r) = stdout {
+                let parked = pump_async(r, o.clone(), t, None, p).await;
+                pump_done(&n, &o, parked);
             }
             None
         });
         let stderr = tokio::spawn(async move {
-            match stderr {
-                Some(r) => {
-                    let parked = pump_async(r, output.clone(), tx, stderr_mirror, park).await;
-                    pump_done(&open, &output, parked);
-                }
-                None => {}
+            if let Some(r) = stderr {
+                let parked = pump_async(r, output.clone(), tx, stderr_mirror, park).await;
+                pump_done(&open, &output, parked);
             }
             None
         });
@@ -625,6 +621,7 @@ fn pump_done(open: &AtomicUsize, output: &Mutex<OutputState>, parked: bool) {
 /// runner, the output state over `output_path`, and the chunk channel.
 /// Must be called from inside a Tokio runtime.
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub fn spawn(
     command: &str,
     cwd: &str,
@@ -979,7 +976,7 @@ mod tests {
                 let end = (pos + max + UTF8_LOOKAHEAD).min(s.len());
                 let n = utf8_chunk_len(&s.as_bytes()[pos..end], max, big, end < s.len());
                 assert!(n > 0, "no progress at {pos} max {max}");
-                out.push_str(std::str::from_utf8(&s.as_bytes()[pos..pos + n]).unwrap());
+                out.push_str(&s[pos..pos + n]);
                 pos += n;
             }
             assert_eq!(out, s, "max {max}");
@@ -1009,6 +1006,7 @@ mod tests {
         assert!(!pid_alive(99_999_999)); // invalid/ESRCH/EINVAL all map to dead
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn unique_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "pi-famulus-task-test-{tag}-{}-{}",
@@ -1019,6 +1017,7 @@ mod tests {
         dir
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     async fn drain_chunks(rx: &mut mpsc::Receiver<OutputChunk>) -> Vec<u8> {
         let mut collected = Vec::new();
         let drain = async {
@@ -1035,6 +1034,7 @@ mod tests {
     /// Wait for the child while concurrently draining the bounded tee channel.
     /// Draining after `wait` alone deadlocks once the channel fills (pump stops
     /// reading → child blocks on write → wait never finishes).
+    #[cfg_attr(windows, allow(dead_code))]
     async fn wait_and_drain(
         t: &mut SpawnedTask,
     ) -> (std::process::ExitStatus, Vec<u8>) {
@@ -1048,6 +1048,7 @@ mod tests {
         (status.unwrap(), collected)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     async fn wait_tee_idle(tee: &Arc<AtomicUsize>) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tee.load(Ordering::SeqCst) != 0 {

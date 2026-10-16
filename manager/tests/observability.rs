@@ -1,3 +1,7 @@
+// Daemons and task children spawned here are reaped by the harness
+// (`Home::drop` kills them), not by `wait()` at each call site.
+#![allow(clippy::zombie_processes)]
+
 #![cfg(unix)]
 //! Black-box tests for the observability contract (manager + CLI side):
 //! protocol additions (origin, mark_background, stop.reason, end_reason,
@@ -56,7 +60,7 @@ fn wait_event(home: &Home, sid: &str, ty: &str, id: Option<&str>) -> Value {
     poll_until(S(5), || {
         events_of(home, sid)
             .into_iter()
-            .find(|e| e["type"] == ty && id.map_or(true, |i| e["id"] == i))
+            .find(|e| e["type"] == ty && id.is_none_or(|i| e["id"] == i))
     })
     .unwrap_or_else(|| panic!("no {ty} event for {id:?} in {sid}: {:?}", events_of(home, sid)))
 }
@@ -751,7 +755,7 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
     assert!(report["agents"].as_array().unwrap().iter().any(|a| a["child_id"] == "ch_0000e002" && a["tasks"] == 0));
     let suite = report["work_kinds"].as_array().unwrap().iter().find(|k| k["kind"] == "test-suite").unwrap();
     assert_eq!((suite["tasks"].as_u64(), suite["cpu_ms"].as_u64()), (Some(1), Some(1_500)));
-    assert_eq!(report["cpu_note"].as_str().unwrap().contains("100% equals one core"), true);
+    assert!(report["cpu_note"].as_str().unwrap().contains("100% equals one core"));
 
     let text = cli_ok(&home, &["top"]).stdout;
     assert!(text.contains("AGENTS") && text.contains("WORK KINDS") && text.contains("10.0 output tok/s") && text.contains("test-suite"), "{text}");

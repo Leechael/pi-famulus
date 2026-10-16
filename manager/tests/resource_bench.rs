@@ -17,6 +17,10 @@
 //! `harness = false` for the same reason as `tests/platform.rs`: the binary
 //! is also the `taskkit` task program.
 
+// Daemons and task children spawned here are reaped by the harness
+// (`Home::drop` kills them), not by `wait()` at each call site.
+#![allow(clippy::zombie_processes)]
+
 mod common;
 
 use common::kit::{self, kit};

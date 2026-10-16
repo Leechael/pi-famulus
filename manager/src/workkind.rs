@@ -368,7 +368,7 @@ fn simple_kind_fed(words: &[String], depth: usize, fed_by_xargs: bool) -> Option
                 break;
             }
         }
-        let Some(&prog) = w.first() else { return None };
+        let &prog = w.first()?;
         let prog = base(prog);
         let rest = &w[1..];
         match prog {
@@ -460,7 +460,7 @@ fn program_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKin
         },
         "go" => match sub {
             Some("test") => {
-                let targeted = args.iter().any(|a| *a == "-run")
+                let targeted = args.contains(&"-run")
                     || args.iter().skip(1).any(|a| !a.starts_with('-') && *a != "./..." && looks_like_target(a));
                 if targeted { WorkKind::Test } else { WorkKind::TestSuite }
             }
@@ -469,7 +469,7 @@ fn program_kind(prog: &str, args: &[&str], fed_by_xargs: bool) -> Option<WorkKin
             _ => WorkKind::Other,
         },
         "tsc" => {
-            if args.iter().any(|a| *a == "--noEmit") {
+            if args.contains(&"--noEmit") {
                 WorkKind::LintType
             } else {
                 WorkKind::Build

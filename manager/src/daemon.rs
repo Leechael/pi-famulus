@@ -76,6 +76,7 @@ pub struct ConnHandle {
     pub die: Arc<Notify>,
     pub written: Written,
     /// Its writer task, aborted when an upgrade cannot wait for it to flush.
+    #[cfg_attr(windows, allow(dead_code))]
     pub writer: tokio::task::AbortHandle,
 }
 
@@ -133,6 +134,7 @@ pub struct DaemonState {
     /// Right after an in-place upgrade: every client is reconnecting, so the
     /// zero-connection idle shutdown must not fire yet.
     pub hold_idle: bool,
+    #[cfg_attr(windows, allow(dead_code))]
     pub foreground: bool,
     /// Requests being served, and connection writers still flushing (an
     /// upgrade waits for both).
@@ -320,6 +322,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
 
 /// Clients get this long to reconnect after an in-place upgrade before the
 /// zero-connection idle rule (§3.2) applies again.
+#[cfg_attr(windows, allow(dead_code))]
 const HANDOVER_GRACE: Duration = Duration::from_secs(30);
 
 /// The new image after an in-place upgrade (`daemon --handover <file>`).
@@ -452,6 +455,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
 
 /// Handover keeps permits while sessions have a chance to reconnect. Once
 /// that grace ends, sessions still disconnected cannot own live children.
+#[cfg_attr(windows, allow(dead_code))]
 fn reap_disconnected_agent_permits(st: &mut DaemonState) {
     let connected: HashSet<String> = st
         .sessions
@@ -1128,6 +1132,7 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
 
 /// A session's subscription to carry over an upgrade, and how far its
 /// connection's writer got (known only once the writers have flushed).
+#[cfg_attr(windows, allow(dead_code))]
 pub struct Carried {
     task_id: String,
     session_id: String,
@@ -1137,6 +1142,7 @@ pub struct Carried {
 /// Close every client connection (an in-place upgrade). Returns the output
 /// subscriptions to carry over and the connections' writers; call
 /// [`carry_watches`] once the writers flushed or were aborted.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn close_all_connections(
     state: &Shared,
     why: &str,
@@ -1173,6 +1179,7 @@ pub fn close_all_connections(
 /// Remember each carried subscription with the cursor its connection was
 /// really written up to: what it did not receive is replayed when the
 /// session reconnects.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn carry_watches(state: &Shared, carried: Vec<Carried>) {
     let mut st = state.lock().unwrap();
     for c in carried {
@@ -2074,6 +2081,7 @@ fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
 }
 
 /// Re-arm a stop's SIGKILL escalation with the time it had left.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn rearm_kill_reaper(state: &Shared, task_id: &str, pid: u32, left: Duration) {
     let clock = state.lock().unwrap().clock.clone();
     arm_kill_reaper(state, task_id, pid, clock, left);
@@ -2877,10 +2885,10 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
     #[cfg(windows)]
     {
         let _ = state;
-        return Err(ProtoError::new(
+        Err(ProtoError::new(
             E_INTERNAL,
             "in-place upgrade is not supported on Windows; restart the manager after replacing the binary",
-        ));
+        ))
     }
     #[cfg(unix)]
     {

@@ -1,3 +1,9 @@
+// Every test here installs the Linux npm layout.
+#![cfg(target_os = "linux")]
+// Daemons and task children spawned here are reaped by the harness
+// (`Home::drop` kills them), not by `wait()` at each call site.
+#![allow(clippy::zombie_processes)]
+
 mod common;
 
 use common::*;
@@ -42,7 +48,6 @@ fn assert_upgrade(home: &Home) {
 }
 
 /// Stable-layout startup followed by npm retirement, deletion and reinstall.
-#[cfg(target_os = "linux")]
 #[test]
 fn stable_install_survives_rename_delete_and_reinstall() {
     let home = Home::new("stable-retirement");
@@ -63,7 +68,6 @@ fn stable_install_survives_rename_delete_and_reinstall() {
 
 /// A daemon initially launched from npm's already-retired package layout must
 /// map <retired>/bin/pi-famulus to the stable sibling's bin/pi-famulus.
-#[cfg(target_os = "linux")]
 #[test]
 fn retired_layout_startup_maps_bin_executable_to_stable_sibling() {
     let home = Home::new("retired-layout");
@@ -82,7 +86,6 @@ fn retired_layout_startup_maps_bin_executable_to_stable_sibling() {
 
 /// A daemon launched from npm's retired layout should auto-upgrade to an
 /// already-installed stable sibling rather than snapshotting its identity.
-#[cfg(target_os = "linux")]
 #[test]
 fn retired_layout_startup_auto_upgrades_to_stable_sibling() {
     let home = Home::new("retired-auto-upgrade");
@@ -114,7 +117,6 @@ fn retired_layout_startup_auto_upgrades_to_stable_sibling() {
 
 /// A daemon started before npm creates the stable sibling must recover its
 /// executable path after npm deletes the retired directory.
-#[cfg(target_os = "linux")]
 #[test]
 fn daemon_started_mid_reinstall_re_resolves_its_executable() {
     let home = Home::new("mid-reinstall");

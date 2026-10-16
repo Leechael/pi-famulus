@@ -635,7 +635,7 @@ pub fn filter_rows(
     let mut rows: Vec<Row> = rows
         .into_iter()
         .filter(|r| r.running || (o.all && connected.contains(&r.session_id)))
-        .filter(|r| o.session.as_ref().map_or(true, |p| r.session_id.starts_with(p.as_str())))
+        .filter(|r| o.session.as_ref().is_none_or(|p| r.session_id.starts_with(p.as_str())))
         .filter(|r| match (&dir, &r.cwd) {
             (None, _) => true,
             (Some(d), Some(c)) => under_dir(c, d),
@@ -650,7 +650,7 @@ pub fn filter_rows(
             }
         }
     }
-    rows.retain(|r| since.map_or(true, |s| r.active_at.unwrap_or(0) >= s));
+    rows.retain(|r| since.is_none_or(|s| r.active_at.unwrap_or(0) >= s));
     Ok(rows)
 }
 
@@ -1097,7 +1097,7 @@ pub fn render_transcript_line(line: &str, full: bool, prompt_head: Option<&str>,
     let ts = v
         .get("ts")
         .and_then(|t| t.as_u64())
-        .map(|t| format!("[{}] ", fmt::datetime(t).split(' ').nth(1).unwrap_or("").to_string()))
+        .map(|t| format!("[{}] ", fmt::datetime(t).split(' ').nth(1).unwrap_or("")))
         .unwrap_or_default();
     let is_err = v
         .get("isError")
@@ -1282,7 +1282,7 @@ pub async fn cmd_events(home: &Path, o: EventsOpts) -> Result<(), String> {
         None => None,
     };
     let keep = |e: &EventLine| -> bool {
-        since.map_or(true, |s| e.ts >= s) && o.id.as_deref().map_or(true, |id| event_mentions(e, id))
+        since.is_none_or(|s| e.ts >= s) && o.id.as_deref().is_none_or(|id| event_mentions(e, id))
     };
     let (evs, bad, mut offsets) = read_all_events(home, o.session.as_deref());
     if bad > 0 {

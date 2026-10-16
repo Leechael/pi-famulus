@@ -527,6 +527,7 @@ pub fn random_bytes(buf: &mut [u8]) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub fn max_rss_bytes() -> u64 {
     0
 }

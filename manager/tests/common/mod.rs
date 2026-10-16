@@ -390,7 +390,7 @@ impl Drop for Home {
         #[cfg(windows)]
         {
             let pidfile = self.pidfile_pid();
-            let tracked_ok = pidfile.is_some_and(|pid| win::kill_if_tracked(pid));
+            let tracked_ok = pidfile.is_some_and(win::kill_if_tracked);
             if !tracked_ok {
                 for pid in daemon_pids_for(&self.path) {
                     kill_pid(pid, SIGKILL);
@@ -699,7 +699,7 @@ pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
             let words: Vec<&str> = cmd.split_whitespace().collect();
             if cmd.contains("pi-famulus")
                 && words.iter().any(|w| *w == home_s)
-                && words.iter().any(|w| *w == "daemon")
+                && words.contains(&"daemon")
             {
                 let pid: u32 = pid.parse().ok()?;
                 if pid_running(pid) {
