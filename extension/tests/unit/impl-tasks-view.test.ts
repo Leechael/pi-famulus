@@ -173,6 +173,26 @@ describe("tasks view", () => {
     expect(stderrPathFor("/tmp/tasks/sh_ab.output")).toBe("/tmp/tasks/sh_ab.stderr");
   });
 
+  it("emits thinking as its own turn so the TUI can collapse it", () => {
+    const turns = turnsFromMessages([
+      { role: "user", content: "look at src" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "I should read the file first" },
+          { type: "text", text: "reading" },
+          { type: "toolCall", name: "read", arguments: { path: "src" } },
+        ],
+      },
+    ]);
+    expect(turns).toEqual([
+      { role: "user", text: "look at src" },
+      { role: "thinking", text: "I should read the file first" },
+      { role: "assistant", text: "reading" },
+      { role: "assistant", text: 'tool read {"path":"src"}' },
+    ]);
+  });
+
   it("wraps ANSI and CJK by visible width", () => {
     const colored = `\x1b[31m${"字".repeat(10)}\x1b[0m`;
     const lines = wrapLines(colored, 4);
