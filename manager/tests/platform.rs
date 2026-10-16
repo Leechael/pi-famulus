@@ -280,7 +280,11 @@ fn t3_timeout_ms_hard_kill() {
     let _d = home.start_daemon();
     let mut c = ext(&home, "sess-a");
     let mut slow = start_req(&kit(&["tree", "60000"]));
-    slow["timeout_ms"] = json!(500);
+    // Long enough for the tree to print its pids first: on Windows, shell
+    // starts wait their turn (Git Bash start-up race, see
+    // src/shellstart.rs), and with the suite's other daemons starting
+    // shells too, that wait counts against timeout_ms.
+    slow["timeout_ms"] = json!(3_000);
     let (slow, _) = c.start_with(slow);
     let pids = wait_for_pids(&mut c, &slow, 2);
     let mut fast = start_req(&kit(&["echo", "ok"]));
