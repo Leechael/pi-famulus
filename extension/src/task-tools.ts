@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import { realClock, type Clock } from "./clock";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient, TaskRecord } from "./manager-client";
+import { fnv1a64 } from "./config";
 import { fill, PROMPTS } from "./prompts.generated";
 import {
   formatAgentCommand,
@@ -206,14 +207,14 @@ export function createTaskOutputTool(
   // ranges so tail/explicit reads (or different limits hitting EOF) agree.
   // Bound both task and range histories for long-lived extension sessions.
   const runningReads = new Map<string, { size: number; ranges: Set<string> }>();
-  const guardPoll = (id: string, running: boolean, size: number, start: number, end: number) => {
+  const guardPoll = (id: string, running: boolean, size: number, start: number, end: number, identity = "") => {
     if (!running) {
       runningReads.delete(id);
       return;
     }
     const previous = runningReads.get(id);
     const entry = previous?.size === size ? previous : { size, ranges: new Set<string>() };
-    const range = start === end ? "empty" : `${start}:${end}`;
+    const range = `${start === end ? "empty" : `${start}:${end}`}:${identity}`;
     if (entry.ranges.has(range)) {
       throw new Error(fill("tools.task_output.error.no-new-output", { taskId: id, hint: END_TURN_HINT }));
     }
@@ -240,7 +241,9 @@ export function createTaskOutputTool(
       if (agentText !== undefined) {
         const status = deps.getIndex?.()?.get(params.task_id)?.status ?? "unknown";
         const running = status === "pending" || status === "running";
-        guardPoll(params.task_id, running, agentText.length, 0, agentText.length);
+        // Length alone hides a same-length conversation rewrite. Hash the
+        // snapshot so a changed child transcript is a new range.
+        guardPoll(params.task_id, running, agentText.length, 0, agentText.length, fnv1a64(agentText));
         const body = (agentText || "(no output yet)") + (running ? `\n\n${END_TURN_HINT}` : "");
         return {
           content: [{ type: "text", text: body }],

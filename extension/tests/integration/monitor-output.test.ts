@@ -8,9 +8,11 @@ import { MonitorRegistry } from "../../src/monitor";
 import { NotifyCenter } from "../../src/notify";
 import type { FamulusWake } from "../../src/wake";
 
-const BIN = process.env.PI_FAMULUS_MANAGER_PATH ?? join(__dirname, "../../../manager/target/debug/pi-famulus");
+const BIN =
+  process.env.PI_FAMULUS_MANAGER_PATH ??
+  join(__dirname, "../../../manager/target/debug", process.platform === "win32" ? "pi-famulus.exe" : "pi-famulus");
 const RUN = process.env.PI_FAMULUS_INTEG === "1";
-if (RUN && !existsSync(BIN)) throw new Error(`Missing requested manager: ${BIN}`);
+if (RUN && process.platform !== "win32" && !existsSync(BIN)) throw new Error(`Missing requested manager: ${BIN}`);
 
 // Regression: actual manager framing -> TS window gate -> emitted model context.
 // The original incident printed unchanged state with a new timestamp each check.

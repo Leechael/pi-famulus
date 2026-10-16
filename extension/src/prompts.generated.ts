@@ -74,7 +74,7 @@ export const PROMPTS = {
   "tools.task_list.snippet": "List background shell/monitor tasks and subagents",
   "tools.task_list.param.all": "Also include finished work (default: running only). Always limited to this session.",
   "tools.task_list.hint.running": "Running work wakes you with a <pi-famulus-wake> when it finishes. Reply to the user now with no tool call instead of checking again.",
-  "tools.task_output.description": "Read original output of a background task, including a monitor's truncated or deduplicated output. Without a cursor, returns the tail plus the current file pointer; pass next_cursor as cursor to page forward. Use small max_bytes ranges for details. Reading a different range is allowed; rereading an unchanged range is rejected. This is not a way to wait: when no further details are needed, end your turn with no tool call and resume on the next notification.",
+  "tools.task_output.description": "Read original output of a background task, including a monitor's truncated or deduplicated output. Without a cursor, returns the tail plus the current file pointer; pass next_cursor as cursor to page forward. Use small max_bytes ranges for details. Reading a different range is allowed; while a task is running, recently read ranges may be rejected if the output size is unchanged. This is not a way to wait: when no further details are needed, end your turn with no tool call and resume on the next notification.",
   "tools.task_output.snippet": "Read background task output",
   "tools.task_output.param.task_id": "Task id, e.g. sh_a1b2c3d4",
   "tools.task_output.param.cursor": "Byte offset to read from (for incremental reads). Omit to read the tail of the output.",

@@ -56,11 +56,21 @@ export class MonitorOutputBuffer {
   readonly onDelivered = (visiblePreview?: string): void => {
     const now = this.now();
     const visibleLines = visiblePreview === undefined ? undefined : new Set(visiblePreview ? visiblePreview.split("\n") : []);
+    const queuedPreviews = new Map<string, number>();
+    if (visibleLines) {
+      for (const identity of this.identities.values()) {
+        if (identity.phase === "queued") {
+          queuedPreviews.set(identity.preview, (queuedPreviews.get(identity.preview) ?? 0) + 1);
+        }
+      }
+    }
     for (const [key, identity] of this.identities) {
       if (identity.phase !== "queued") continue;
       // Both local batching and busy coalescing can omit an entire identity.
       // Never pretend the model saw it: truncated representatives fail open.
-      if (visibleLines && !visibleLines.has(identity.preview)) {
+      // Distinct fingerprints can share a truncated preview; fail those open too.
+      const ambiguous = (queuedPreviews.get(identity.preview) ?? 0) > 1;
+      if (visibleLines && (ambiguous || !visibleLines.has(identity.preview))) {
         if (identity.lastEmitted === undefined) this.identities.delete(key);
         else identity.phase = "emitted";
       } else {

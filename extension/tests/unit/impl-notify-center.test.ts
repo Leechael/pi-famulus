@@ -43,6 +43,27 @@ describe("NotifyCenter monitor batching", () => {
     center.dispose();
   });
 
+  it("does not split a surrogate pair at a preview boundary", () => {
+    let idle = false;
+    const sent: { details?: unknown }[] = [];
+    const center = new NotifyCenter({
+      sendMessage: (message) => sent.push(message),
+      isIdle: () => idle,
+      clock: new ManualClock(),
+    });
+    const emoji = "😀";
+    center.notifyMonitorEvent("noisy", "mon_1", `${"h".repeat(1449)}${emoji}${"t".repeat(2000)}`);
+    idle = true;
+    center.settled();
+    const wake = sent[0].details as Extract<FamulusWake, { kind: "monitor" }>;
+    const lone = [...wake.event].filter((ch) => {
+      const code = ch.charCodeAt(0);
+      return ch.length === 1 && code >= 0xd800 && code <= 0xdfff;
+    });
+    expect(lone).toEqual([]);
+    center.dispose();
+  });
+
   it("bounds a long busy preview with its original head, latest tail, and an exact omission count", () => {
     let idle = false;
     const sent: { details?: unknown }[] = [];

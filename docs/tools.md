@@ -28,7 +28,7 @@ subagent({ action: "list|get|status|interrupt|resume|steer|extend|models", run_i
 ```
 monitor({ command, description, timeout_ms?, persistent?, dedup_window_ms?, fingerprint_mode? })
 ```
-`timeout_ms` defaults to 300000 (min 1000, max 3600000); `persistent:true` disables the timeout. Output is a bounded preview, not a complete log:
+`timeout_ms` defaults to 300000 (min 1000, max 3600000); `persistent:true` disables the timeout. Exit and timeout produce notifications. Output is a bounded preview, not a complete log:
 
 - Rust frames complete lines and supplies full-content BLAKE3 fingerprints, observation times and original byte ranges. Preview truncation does not affect identity. Unfinished lines produce incremental, non-deduplicated progress after 250ms; EOF finalizes the line. See [the metadata protocol](../manager/MONITOR_OUTPUT.md).
 - `dedup_window_ms` defaults to **60000**, accepts 0–3600000, and 0 disables content deduplication. The same fingerprint in the same monitor emits once per window, starting on notification delivery. Repeats do not extend the window. Pending repeats are counted without waking the model. Expiration itself sends nothing; another occurrence may emit again.

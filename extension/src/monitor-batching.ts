@@ -17,27 +17,54 @@ export interface LineBatcherOptions {
   clock?: Clock;
 }
 
-/** Fixed-memory head/tail preview. Counts omitted UTF-16 units, not original bytes. */
+function sourceOfSlice(text: string, source: number, start: number, end: number): number {
+  if (text.length === 0 || end <= start) return 0;
+  return Math.round(source * ((end - start) / text.length));
+}
+
+/** Fixed-memory head/tail preview. Counts omitted source units, not generated ellipses. */
 export class BoundedPreview {
   private head = "";
   private tail = "";
+  private sourceHead = 0;
+  private sourceTail = 0;
   total = 0;
+  private sourceTotal = 0;
   constructor(readonly limit: number) {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("preview limit must be positive");
   }
-  append(text: string): void {
+  append(text: string, sourceChars = text.length): void {
     const headLimit = Math.ceil((this.limit - 1) / 2);
     if (this.total + text.length <= this.limit) {
       this.head += text;
+      this.sourceHead += sourceChars;
     } else {
       const old = this.head;
-      this.head = (old + text.slice(0, headLimit)).slice(0, headLimit);
+      const oldSourceHead = this.sourceHead;
+      if (this.total <= this.limit) {
+        const combined = old + text;
+        const combinedSource = oldSourceHead + sourceChars;
+        this.head = combined.slice(0, headLimit);
+        this.sourceHead = sourceOfSlice(combined, combinedSource, 0, this.head.length);
+      }
       const tailLimit = this.limit - 1 - headLimit;
-      this.tail = tailLimit > 0 ? (this.tail || old).concat(text).slice(-tailLimit) : "";
+      if (tailLimit > 0) {
+        const from = (this.tail || old).concat(text);
+        const fromSource = (this.tail ? this.sourceTail : oldSourceHead) + sourceChars;
+        this.tail = from.slice(-tailLimit);
+        this.sourceTail = sourceOfSlice(from, fromSource, from.length - this.tail.length, from.length);
+      } else {
+        this.tail = "";
+        this.sourceTail = 0;
+      }
     }
     this.total += text.length;
+    this.sourceTotal += sourceChars;
   }
-  get omittedChars(): number { return Math.max(0, this.total - this.head.length - this.tail.length); }
+  get omittedChars(): number {
+    if (this.total <= this.limit) return 0;
+    return Math.max(0, this.sourceTotal - this.sourceHead - this.sourceTail);
+  }
   get text(): string { return this.total > this.limit ? `${this.head}…${this.tail}` : this.head; }
 }
 
@@ -88,8 +115,9 @@ export class LineBatcher {
   }
 
   private finishLine(): void {
-    if (this.lineCount++ > 0) this.lines.append("\n");
-    this.lines.append(this.partial.text);
+    if (this.lineCount++ > 0) this.lines.append("\n", 1);
+    const displayed = this.partial.text;
+    this.lines.append(displayed, this.partial.total - this.partial.omittedChars);
     this.omittedLineChars += this.partial.omittedChars;
     this.partial = new BoundedPreview(this.maxLineChars);
   }

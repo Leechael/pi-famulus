@@ -54,6 +54,20 @@ interface MonitorPreview {
   omittedChars: number;
 }
 
+function clipUtf16Start(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const out = text.slice(0, max);
+  const last = out.charCodeAt(out.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? out.slice(0, -1) : out;
+}
+
+function clipUtf16End(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const out = text.slice(-max);
+  const first = out.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? out.slice(1) : out;
+}
+
 function appendMonitorPreview(previous: MonitorPreview | undefined, event: string): MonitorPreview {
   const total = previous
     ? previous.head.length + previous.tail.length + previous.omittedChars + 1 + event.length
@@ -62,11 +76,11 @@ function appendMonitorPreview(previous: MonitorPreview | undefined, event: strin
     return { head: previous ? `${previous.head}\n${event}` : event, tail: "", omittedChars: 0 };
   }
   const head = previous
-    ? `${previous.head}\n${event.slice(0, MONITOR_PREVIEW_HALF)}`.slice(0, MONITOR_PREVIEW_HALF)
-    : event.slice(0, MONITOR_PREVIEW_HALF);
+    ? clipUtf16Start(`${previous.head}\n${clipUtf16Start(event, MONITOR_PREVIEW_HALF)}`, MONITOR_PREVIEW_HALF)
+    : clipUtf16Start(event, MONITOR_PREVIEW_HALF);
   const tail = event.length >= MONITOR_PREVIEW_HALF
-    ? event.slice(-MONITOR_PREVIEW_HALF)
-    : `${previous?.tail || previous?.head || ""}\n${event}`.slice(-MONITOR_PREVIEW_HALF);
+    ? clipUtf16End(event, MONITOR_PREVIEW_HALF)
+    : clipUtf16End(`${previous?.tail || previous?.head || ""}\n${event}`, MONITOR_PREVIEW_HALF);
   return { head, tail, omittedChars: total - head.length - tail.length };
 }
 

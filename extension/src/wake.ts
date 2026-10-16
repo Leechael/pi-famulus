@@ -330,11 +330,11 @@ function renderMonitor(details: Extract<FamulusWake, { kind: "monitor" }>): stri
   }
   const output = details.output;
   const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <event>${escapeXml(details.event)}</event>`];
-  if (output) {
+  if (output?.cursorStart !== undefined) {
     const fields: string[] = [];
     if (output.firstObservedAt !== undefined) fields.push(`first-observed-at="${wakeTimestamp(output.firstObservedAt)}"`);
     if (output.lastObservedAt !== undefined) fields.push(`last-observed-at="${wakeTimestamp(output.lastObservedAt)}"`);
-    if (output.cursorStart !== undefined) fields.push(`cursor-start="${output.cursorStart}"`);
+    fields.push(`cursor-start="${output.cursorStart}"`);
     if (output.cursorEnd !== undefined) fields.push(`cursor-end="${output.cursorEnd}"`);
     if (output.truncated) fields.push('truncated="true"');
     if (output.suppressedCount) fields.push(`duplicates-suppressed="${output.suppressedCount}"`);

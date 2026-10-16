@@ -92,6 +92,8 @@ interface MonitorEntry {
   lastEventAt?: number;
   /** The model asked to stop it (task_stop): what is left is not news. */
   stopRequested?: boolean;
+  /** Prevents autoStop from re-entering while it drains the 200ms batcher. */
+  stopping?: boolean;
 }
 
 export class MonitorRegistry {
@@ -391,6 +393,8 @@ export class MonitorRegistry {
 
   private onBatch(entry: MonitorEntry, text: string, output?: MonitorOutputInfo, onDelivered?: () => void): boolean {
     if (entry.stopped) return false;
+    const center = this.deps.getNotifyCenter();
+    if (!center) return false;
     const now = this.clock.now();
     const accepted = entry.limiter.tryConsume();
     entry.saturation.record(!accepted, now);
@@ -398,8 +402,9 @@ export class MonitorRegistry {
       const droppedLines = text.split("\n").length;
       this.deps.logEvent?.("monitor.drop", { id: entry.taskId, lines: droppedLines });
       entry.droppedLinesPending += droppedLines;
-      // Already stopping at the model's request: no rate-limit stop or wake.
-      if (entry.saturation.isSaturated(now) && !entry.stopRequested) void this.autoStop(entry);
+      // Already stopping at the model's request, or draining for autoStop:
+      // no nested rate-limit stop or wake.
+      if (entry.saturation.isSaturated(now) && !entry.stopRequested && !entry.stopping) void this.autoStop(entry);
       return false;
     }
     const droppedLines = entry.droppedLinesPending;
@@ -407,7 +412,7 @@ export class MonitorRegistry {
     entry.lastEventAt = now;
     // Lines still buffered when the model stopped it: recorded, coalesced
     // with that monitor's other pending output, and never a wake.
-    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines, {
+    center.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines, {
       quiet: entry.stopRequested === true,
       output,
       onDelivered,
@@ -442,6 +447,10 @@ export class MonitorRegistry {
 
   /** Rate limiter saturated for too long: stop and notify (§4.4). */
   private async autoStop(entry: MonitorEntry): Promise<void> {
+    if (entry.stopped || entry.stopping) return;
+    entry.stopping = true;
+    entry.batcher.flush();
+    entry.output.flush();
     if (entry.stopped) return;
     entry.stopped = true;
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "rate-limit" });

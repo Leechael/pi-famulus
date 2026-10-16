@@ -2,7 +2,7 @@
 
 # description
 
-Read original output of a background task, including a monitor's truncated or deduplicated output. Without a cursor, returns the tail plus the current file pointer; pass next_cursor as cursor to page forward. Use small max_bytes ranges for details. Reading a different range is allowed; rereading an unchanged range is rejected. This is not a way to wait: when no further details are needed, end your turn with no tool call and resume on the next notification.
+Read original output of a background task, including a monitor's truncated or deduplicated output. Without a cursor, returns the tail plus the current file pointer; pass next_cursor as cursor to page forward. Use small max_bytes ranges for details. Reading a different range is allowed; while a task is running, recently read ranges may be rejected if the output size is unchanged. This is not a way to wait: when no further details are needed, end your turn with no tool call and resume on the next notification.
 
 # snippet
 

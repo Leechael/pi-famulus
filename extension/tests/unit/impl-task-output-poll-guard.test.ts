@@ -94,6 +94,17 @@ describe("task_output poll guard", () => {
     await expect(read()).rejects.toThrow(/no new output/i);
   });
 
+  it("allows a same-length rewrite of a running subagent snapshot", async () => {
+    const index = new WorkIndex({ clock: new ManualClock(0) });
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "c", startedAt: 0, countsAsWorker: false, text: "hello" });
+    const tool = createTaskOutputTool({ getClient: () => null, getIndex: () => index });
+    const read = () => tool.execute("t", { task_id: "ch_1" }, undefined as never, undefined as never, {} as never);
+    expect(((await read()).content[0] as { text: string }).text).toContain("hello");
+    index.patch("ch_1", { text: "world" });
+    expect(((await read()).content[0] as { text: string }).text).toContain("world");
+    await expect(read()).rejects.toThrow(/no new output/i);
+  });
+
   it("says in its description that it is not a way to wait", () => {
     const tool = createTaskOutputTool({ getClient: () => null });
     expect(tool.description).toMatch(/not.*wait/i);

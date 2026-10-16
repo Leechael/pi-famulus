@@ -134,6 +134,27 @@ describe("monitor output window (regression: repeated SSH checks)", () => {
     buffer.dispose();
   });
 
+  it("does not start a suppression window when no NotifyCenter is available", async () => {
+    const clock = new ManualClock();
+    const sent: { content: string }[] = [];
+    let center: NotifyCenter | null = null;
+    const client = { ensureAvailable: async () => true, start: async () => ({ task_id: "mon_1" }), watch: async () => {} } as unknown as ManagerClient;
+    const registry = new MonitorRegistry({
+      clock, getClient: () => client, sessionEnv: () => ({}),
+      getNotifyCenter: () => center, trackTask: () => {},
+    });
+    await registry.start({ command: "SSH checks", description: "SSH", persistent: true }, { cwd: "/tmp" } as never);
+    registry.handleOutput("mon_1", "ssh_login_fail\n", 15, [record("ssh_login_fail", 15)]);
+    clock.advanceBy(200);
+    expect(sent).toHaveLength(0);
+    center = new NotifyCenter({ clock, isIdle: () => true, sendMessage: (m) => sent.push(m) });
+    registry.handleOutput("mon_1", "ssh_login_fail\n", 30, [record("ssh_login_fail", 30)]);
+    clock.advanceBy(200);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].content).toContain("ssh_login_fail");
+    registry.disposeAll(); center.dispose();
+  });
+
   it("does not reserve a suppression window when a batch is dropped by overload protection", () => {
     const clock = new ManualClock();
     const text: string[] = [];
@@ -208,6 +229,23 @@ describe("monitor output window (regression: repeated SSH checks)", () => {
     buffer.onDelivered("NOT_READY");
     buffer.push(record("READY", 12)); clock.advanceBy(200);
     expect(batches).toHaveLength(2);
+    buffer.dispose();
+  });
+
+  it("fails open when distinct fingerprints share a truncated preview", () => {
+    const { clock, batches, buffer } = setup("exact", false);
+    const preview = "long shared preview…";
+    const a = { ...record(preview, 1000, 0, "tail-A"), truncated: true };
+    const b = { ...record(preview, 2000, 1, "tail-B"), truncated: true, cursor_start: 1000 };
+    buffer.push(a);
+    buffer.push(b);
+    clock.advanceBy(200);
+    buffer.onDelivered(batches[0].text);
+    buffer.push({ ...a, cursor_start: 2000, cursor_end: 3000 });
+    clock.advanceBy(200);
+    buffer.push({ ...b, cursor_start: 3000, cursor_end: 4000 });
+    clock.advanceBy(200);
+    expect(batches).toHaveLength(3);
     buffer.dispose();
   });
 

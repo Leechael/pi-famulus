@@ -71,6 +71,22 @@ describe("LineBatcher", () => {
     batcher.dispose();
   });
 
+  it("does not count generated ellipses as omitted source characters", () => {
+    const infos: { omittedChars: number }[] = [];
+    const batcher = new LineBatcher({
+      maxLineChars: 5,
+      maxBatchChars: 10_000,
+      clock,
+      onFlush: (_text, info) => infos.push(info),
+    });
+    for (let i = 0; i < 10; i++) batcher.push("1234567890\n");
+    clock.advanceBy(200);
+    // Each 10-char line keeps 4 source characters and inserts one ellipsis.
+    // Omission is 6 source chars/line, not 7.
+    expect(infos[0].omittedChars).toBe(60);
+    batcher.dispose();
+  });
+
   it("caps a batch at maxBatchChars keeping the tail", () => {
     const { batches, batcher } = collect({ maxBatchChars: 10 });
     batcher.push("aaaa\nbbbb\ncccc\n");
