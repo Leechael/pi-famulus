@@ -522,7 +522,7 @@ fn heartbeat_title(cmd: &str) -> Option<String> {
     }
     let after = cmd.split("sleep").nth(1)?;
     let n: u64 = after.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok()?;
-    if n >= 60 && n % 60 == 0 {
+    if n >= 60 && n.is_multiple_of(60) {
         Some(format!("tick every {}m", n / 60))
     } else {
         Some(format!("tick every {n}s"))

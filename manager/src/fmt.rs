@@ -198,7 +198,7 @@ pub fn scrub_tty(s: &str) -> String {
         }
         if c == '\t' {
             let n = 8 - (col % 8);
-            line.extend(std::iter::repeat(' ').take(n));
+            line.extend(std::iter::repeat_n(' ', n));
             col += n;
             continue;
         }
