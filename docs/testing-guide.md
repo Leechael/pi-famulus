@@ -48,7 +48,7 @@ pi-famulus events -f
 | # | Do | Expect |
 |---|---|---|
 | 2.1 | Ask for a monitor on `while true; do date; sleep 2; done`, timeout 20s | `› monitor …` pills while events flow (merged while the agent is busy), then a timeout notice. The tool row shows the monitor as a failure if the manager is missing (F7.5) |
-| 2.2 | Ask for a monitor on `yes` with `dedup_window_ms:0` (exercise overload, not dedup) | Drops are reported (`dropped-lines`), and after sustained saturation the monitor stops itself with a rate-limit notice; it does not wake the model every 2 s until timeout |
+| 2.2 | Ask for a monitor on `while true; do date +%s%N; sleep 0.05; done` with `dedup_window_ms:0` (exercise overload, not dedup; distinct, low-volume lines keep the log small) | Drops are reported (`dropped-lines`), and after sustained saturation the monitor stops itself with a rate-limit notice; it does not wake the model every 2 s until timeout |
 | 2.3 | `/tasks` during 2.1 | The monitor is listed; Enter → output tab shows its lines |
 | 2.4 | Ask for a monitor on `echo noop` | One event pill with `noop`, then an exit notice right away (not a timeout later). `/tasks` shows it finished; the fleet line never keeps counting it |
 | 2.5 | Ask the agent to stop a running monitor | It ends as killed in `/tasks` and drops out of the fleet line at once |
