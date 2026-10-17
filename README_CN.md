@@ -1,9 +1,9 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/Leechael/pi-famulus/main/assets/logo.png" alt="pi-famulus" width="120" />
   <h1>pi-famulus</h1>
-  <p><b>让 agent 把活分出去，自己接着干。</b></p>
+  <p><b>让主 agent 专注主线，其余的交出去。</b></p>
   <p><a href="https://github.com/Leechael/pi-famulus/blob/main/README.md">English</a> · 中文</p>
-  <p>为 <a href="https://pi.dev">pi</a> 以及基于 pi 开发的 agent 提供子代理和长时间运行的 bash。任务结束时结果会唤醒 agent，它不用轮询。每个 shell 都由同一个守护进程启动和管理。</p>
+  <p>为 <a href="https://pi.dev">pi</a> 以及基于 pi 开发的 agent 提供子代理和长时间运行的 bash。任务结束时结果会唤醒 agent，对话可以一直往下走。shell 和 monitor 由同一个 Rust 守护进程启动并运行。</p>
   <p>
     <a href="https://github.com/Leechael/pi-famulus/blob/main/docs/tools.md">工具</a> ·
     <a href="https://github.com/Leechael/pi-famulus/blob/main/docs/cli.md">CLI</a> ·
@@ -20,6 +20,8 @@
 
 ## Why
 
+pi-famulus 关心的与其说是子代理，不如说是主 agent：让它的上下文保持干净，让它盯住目标，活在跑的时候你也能一直跟它对话。用主 agent 做规划，把写代码交给跑在更便宜模型上的子代理，让测试和日志在后台跑，到需要处理时再来找它。
+
 famulus 是替学者跑腿的助手，《浮士德》里的瓦格纳就是浮士德的 famulus。pi 的核心有意把子代理、后台 bash 和输出监控留给扩展来做（[设计文档第 1 节](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md#1-background-and-goals)），pi-famulus 补上了这几样。它面向在真实项目里用 pi 或基于 pi 开发的 agent、想把慢活或并行的活交出去又不想卡住对话的人，比如跑测试、构建、起开发服务器、做代码评审。
 
 agent 需要等待时，会出三种问题：
@@ -31,6 +33,10 @@ agent 需要等待时，会出三种问题：
 整台机器只有一个守护进程（`pi-famulus`，用 Rust 编写）。它启动每一条 shell 命令和每一个 monitor，包括子代理运行的那些，并作为它们的父进程。守护进程崩溃或被杀掉时，它启动的进程组都会被停止；用 `setsid` 进入新会话的命令除外。子代理本身运行在 pi 内部。
 
 pi-famulus 是一个 pi 扩展，pi 能加载扩展的地方它都能用：pi TUI、RPC 模式，以及用 pi SDK 开发的 agent。离开 TUI 就没有 `/tasks` 列表和 fleet 行，但结果照样会唤醒 agent。print 模式（`pi -p`）在第一轮运行结束时就退出，之后才到的结果收不到。
+
+### 不是 pane 管理器
+
+如果你在用 Herdr 或 tmux pane，继续用就好。pane 是用来看着 agent、必要时接手的。pi-famulus 服务的是主 agent：子代理超出预算、需要决定或结束时，它都会被唤醒，不用盯着 pane 也知道活干完了没有。卡住的子代理会自动重试，父代理收到的是最终结果。
 
 ## Quick Start
 
@@ -61,7 +67,8 @@ pi install npm:pi-famulus
 - **完成即唤醒**：命令结束、monitor 产生事件、子代理返回结果时，内容会注入对话，agent 接着往下做，不用轮询。
 - **子代理**：一次调用最多 10 个子代理，默认同时跑 4 个；也可以用 `chain` 按顺序执行。等待超过 45 秒时，调用先返回，任务在后台继续。每个子代理完成后各自汇报。
 - **干净收尾**：子代理的 `bash` 在前台运行，直到命令退出或超时；子代理不能启动子代理或 monitor。所以子代理完成后，它通过 pi-famulus 启动的东西都不会留下。例外是用 `setsid` 脱离出去的命令，以及用 `&` 留在后台的进程。
-- **一个守护进程管所有进程**：守护进程是你所有 pi 会话里每个 shell 和 monitor 任务的父进程。它崩溃或被 `kill -9` 杀掉时，每个任务的进程组都会被停止。用 `setsid` 进入新会话的命令不受这个约束。
+- **出问题早知道**：按默认设置，子代理 5 分钟没有任何动静，会在同一个会话里自动恢复一次；再卡住就标记为失败。工具执行期间，以及 `contact_supervisor` 的问题等待回答期间，都不计时。超过 30 分钟的软预算（`timeout_ms`）后，子代理继续运行，父代理每 10 分钟收到一次超预算唤醒（`subagent-overrun`），可以延长时间、引导或中断它；子代理等待回答期间，这个唤醒会先压着。这些值在[配置](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)的 `subagent` 部分设置。
+- **一个守护进程管所有 shell 和 monitor**：守护进程是你所有 pi 会话里每个 shell 和 monitor 任务的父进程。它崩溃或被 `kill -9` 杀掉时，每个任务的进程组都会被停止。用 `setsid` 进入新会话的命令不受这个约束。
 - **共享并发上限**：默认情况下，整台机器上所有 pi 会话加起来最多同时运行 8 个子代理（用 `pi-famulus config set max-agents <n>` 修改），其余的排队等待。标为 `work_kind: "test-suite"` 或 `"test"` 的子代理同时最多 2 个；没有标注的子代理算作 `other`。
 - **父子对话**：子代理用 `contact_supervisor` 向父代理提问并等待回答，你也可以用 `/reply` 自己回答。`agent_message` 在父代理和子代理之间传消息。
 - **可查**：`pi-famulus top`、`ls`、`show`、`agent`、`events` 能看到跑了什么、为什么结束、通知为什么到了或没到。
