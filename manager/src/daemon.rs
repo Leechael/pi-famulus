@@ -1701,12 +1701,14 @@ pub struct StartSpec {
     pub label: Option<String>,
 }
 
-/// A client label is display text: one line, no control characters, and no
-/// longer than a clipped command, so it cannot break a row or bloat records.
+/// A client label is display text: one line, no control or bidi formatting
+/// characters, and no longer than a clipped command, so it cannot break,
+/// reorder, or spoof a row, or bloat records.
 fn clean_label(raw: &str) -> Option<String> {
+    let bidi = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
     let line: String = raw
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if c.is_control() || bidi(c) { ' ' } else { c })
         .collect();
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     (!line.is_empty()).then(|| crate::events::clip_chars(&line, crate::events::COMMAND_CHARS))
@@ -3918,6 +3920,7 @@ mod tests {
     fn client_labels_are_one_clipped_line() {
         assert_eq!(clean_label("watch\n\x1b[31mbuild\t "), Some("watch [31mbuild".into()));
         assert_eq!(clean_label(" \n "), None);
+        assert_eq!(clean_label("tail \u{202E}gol.exe"), Some("tail gol.exe".into()));
         let long = clean_label(&"x".repeat(500)).unwrap();
         assert_eq!(long.chars().count(), crate::events::COMMAND_CHARS);
     }

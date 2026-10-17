@@ -221,7 +221,7 @@ pi-famulus top [--once] [--interval 1s] [--session PREFIX] [--cwd DIR] [--json]
 - `s` cycles the sort: CPU / NOW% / WALL / TASKS / TOKENS / TIME. `/` filters by id, name, command, cwd, kind, or status.
 - `v` toggles a bottom preview; `Enter` opens a full-screen detail. Detail titles are `<id> · <label>`.
 - `x` stops a selected running `sh_`/`mon_` task (`stopped:tui`) after confirmation, and never starts the daemon to do it.
-- `+`/`-` steps the refresh interval across 500ms, 1s, 2s, 5s (default `--interval 1s`).
+- `+`/`-` steps the refresh interval across 500ms, 1s, 2s, 5s (default `--interval 1s`). `p` or `Space` pauses and resumes refreshing.
 - `q` quits; `Ctrl+C` quits from anywhere. Status messages clear on the next key.
 - Mouse: click a row to select it (click again to fold or open, double-click for detail), click tabs, Scope, or Sort, and use the wheel to move.
 
@@ -231,12 +231,12 @@ pi-famulus top [--once] [--interval 1s] [--session PREFIX] [--cwd DIR] [--json]
 - Search is case-insensitive unless the query has an uppercase letter; `a|b` matches either.
 - `Esc` clears the search, then closes.
 
-**Agent conversation.** For an agent, the detail is the full transcript as a thread, not a 64 KiB tail or a clipped one-liner dump.
+**Agent conversation.** For an agent, the detail is the transcript as a thread (the newest 2 MiB when it is larger), not a 64 KiB tail or a clipped one-liner dump.
 
 - Messages from the parent sit on an accent rail under a `┃ main → <agent>` header; each stretch of the child's own output opens with `● <agent>`.
 - Assistant prose is plain text with light markdown (headings, bullets, quotes, fenced and `inline` code, **bold**). Text the agent writes beside a tool call stays visible; only real reasoning folds as `∴ Thinking`.
 - Each tool call or thinking block is one line (`▸ ✓ bash  rg loader`, `▸ ∴ Thinking`) that unfolds in place under a thin rule; click its chevron, or press `o` to unfold all. Consecutive tool and thinking rows stack without gaps.
-- Follow-tail is the default: scroll up to read history, scroll to the end to stick again. A scroll thumb shows progress and the title shows `● following` or the scroll position.
+- Follow-tail is the default: scroll up to read history, scroll to the end to stick again. `f` turns following off or on, and `g`/`G` jump to the top or the end. A scroll thumb shows progress and the title shows `● following` or the scroll position.
 - A status line shows a `working` spinner while the child is live, plus tokens / tok/s / llm / tool / queue / shells.
 
 **Look.** The screen is laid out like btop: rounded boxes with colored borders, titles and hotkey digits cut into the border (`¹pi-famulus`, `²work kinds`, `¹tree ²agents ³tasks ⁴events`), key hints and the `n/total` position in the main box's bottom border, green→yellow→red gradient meters, and braille history graphs of CPU and running tasks.

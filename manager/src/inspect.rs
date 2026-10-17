@@ -1677,7 +1677,7 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         a_done
     );
     // The caption's time is the time the rate was pooled over, not every agent's.
-    let rate_ms: u64 = agents.iter().filter_map(|a| rate_pair(a.tokens_output, a.llm_ms)).map(|(_, ms)| ms).sum();
+    let rate_ms: u64 = agents.iter().filter_map(|a| rate_pair(a.tokens_output, a.llm_ms)).fold(0u64, |sum, (_, ms)| sum.saturating_add(ms));
     let rate = tokens_per_second
         .map(|v| (v, rate_ms))
         .map(|(v, ms)| format!(" ({v:.1} output tok/s over {ms} ms of LLM time)"))

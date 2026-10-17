@@ -105,7 +105,7 @@ export function callPreview(name: string, args: string | undefined, theme: ChatT
     const content = jsonStrings(args, "content")[0];
     if (!content) return undefined;
     const text = content.value.replace(/\n$/, "");
-    const lines = text === "" ? [] : text.split("\n");
+    const lines = content.value === "" ? [] : text.split("\n");
     const digits = String(lines.length).length;
     const count = content.closed ? `+${lines.length} line${lines.length === 1 ? "" : "s"}` : `+${lines.length}+ lines`;
     return {

@@ -317,10 +317,11 @@ export function createBashOverride(
         const index = deps.getIndex?.() ?? null;
         const state = context.state as { unsubscribe?: () => void };
         const item = index?.get(taskId);
-        if (index && !state.unsubscribe && isActiveStatus(item?.status)) {
-          // Redraw this row when the task finishes, then stop listening.
+        if (index && !state.unsubscribe && (!item || isActiveStatus(item.status))) {
+          // Redraw this row as the task appears or finishes; stop once it has.
           state.unsubscribe = index.onChange(() => {
-            if (!isActiveStatus(index.get(taskId)?.status)) {
+            const now = index.get(taskId);
+            if (now && !isActiveStatus(now.status)) {
               state.unsubscribe?.();
               state.unsubscribe = () => {};
             }

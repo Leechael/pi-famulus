@@ -142,8 +142,8 @@ describe("formatBackgroundNotice", () => {
 
   it("draws the transcript row from live task state, not from the model text", () => {
     expect(backgroundRowText("sh_1", undefined, 0)).toMatchObject({ glyph: "●", text: "sh_1 running in background · /tasks" });
-    // Pruned from a live index: finished, outcome unknown — never "running".
-    expect(backgroundRowText("sh_1", undefined, 0, true)).toEqual({ glyph: "✓", color: "dim", text: "sh_1 ended · /tasks" });
+    // Missing from a live index: pruned or not yet re-listed — claim neither state.
+    expect(backgroundRowText("sh_1", undefined, 0, true)).toEqual({ glyph: "·", color: "dim", text: "sh_1 · status in /tasks" });
     expect(backgroundRowText("sh_1", { status: "running", startedAt: 0 }, 5_000).glyph).toBe("●");
     expect(backgroundRowText("sh_1", { status: "completed", exitCode: 0, startedAt: 0, endedAt: 14_000 }, 20_000)).toEqual({
       glyph: "✓",

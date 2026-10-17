@@ -42,12 +42,16 @@ export interface Query {
   fold: boolean;
 }
 
-/** Lower-case that keeps every index in place (`İ` would grow under toLowerCase). */
+/**
+ * Lower-case that keeps every index in place (`İ` would grow under
+ * toLowerCase). Final sigma folds to σ so `ος` matches `ΟΣ`, which a
+ * per-character fold lowers to `οσ`.
+ */
 function foldCase(text: string): string {
   let out = "";
   for (const ch of text) {
     const lower = ch.toLowerCase();
-    out += lower.length === ch.length ? lower : ch;
+    out += lower === "ς" ? "σ" : lower.length === ch.length ? lower : ch;
   }
   return out;
 }

@@ -333,6 +333,9 @@ pub async fn cmd_top(home: &Path, json: bool, session: Option<&str>, cwd: Option
     inspect::warn_if_older_daemon(&snap);
     // The same --session / --cwd scope as the live view: tasks by their own
     // cwd, agents by their session's.
+    // Names come from every agent: a kept task can belong to an agent whose
+    // session is outside --cwd.
+    let names: HashMap<String, String> = snap.agents.iter().map(|a| (a.child_id.clone(), a.name.clone())).collect();
     let dir = cwd.map(inspect::normalize_dir);
     let session_ok = |sid: &str| session.is_none_or(|p| sid.starts_with(p));
     snap.tasks
@@ -346,7 +349,6 @@ pub async fn cmd_top(home: &Path, json: bool, session: Option<&str>, cwd: Option
             })
     });
     let tasks: Vec<&TaskRecord> = snap.tasks.iter().collect();
-    let names: HashMap<String, String> = snap.agents.iter().map(|a| (a.child_id.clone(), a.name.clone())).collect();
     let prefixes = inspect::session_prefixes(snap.sessions.keys().map(|s| s.as_str()).chain(tasks.iter().map(|t| t.session_id.as_str())));
     let agent_groups = group(&tasks, By::Agent, &names, &prefixes, snap.now);
     let kind_groups = group(&tasks, By::Kind, &names, &prefixes, snap.now);

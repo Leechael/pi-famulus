@@ -29,6 +29,7 @@ describe("task output search", () => {
     expect(matchRanges("POST /api/verify", parseQuery("Verify")!)).toEqual([]);
     expect(matchRanges("aaaa", parseQuery("aa|aaa")!)).toEqual([[0, 4]]);
     expect(parseQuery(" | ")).toBeNull();
+    expect(matchRanges("ΟΣ", parseQuery("ος")!)).toEqual([[0, 2]]);
   });
 
   it("hides blank lines, scrubs control sequences, and keeps a CRLF line", () => {
