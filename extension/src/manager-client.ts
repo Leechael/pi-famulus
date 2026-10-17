@@ -285,7 +285,7 @@ function delay(clock: Clock, ms: number): Promise<void> {
 export class ManagerClient {
   private readonly home: string;
   private readonly sessionId: string;
-  private readonly managerPath: string | null;
+  private managerPath: string | null;
   private readonly piPid: number;
   private readonly cwd: string | undefined;
   private readonly log: (message: string) => void;
@@ -325,6 +325,11 @@ export class ManagerClient {
 
   isAvailable(): boolean {
     return this.state === "connected";
+  }
+
+  /** A binary found after construction. The first path wins. */
+  useManagerPath(path: string): void {
+    if (!this.managerPath) this.managerPath = path;
   }
 
   /** Maximum protocol level reported by the connected manager; 0 means unknown/legacy. */

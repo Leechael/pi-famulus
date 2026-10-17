@@ -7,7 +7,7 @@
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, win32 } from "node:path";
-import { nativePackageName, resolveNativeManagerPath } from "./native-manager.js";
+import { describeNativeLookup, resolveNativeManagerPath } from "./native-manager.js";
 
 export interface FamulusConfig {
   /** Foreground budget for bash before auto-backgrounding (ms). */
@@ -290,11 +290,7 @@ export function describeManagerSearch(
   const tried: string[] = [];
   if (config.managerPath) tried.push(`config managerPath ${describeCandidate(config.managerPath)}`);
   if (env.PI_FAMULUS_MANAGER_PATH) tried.push(`PI_FAMULUS_MANAGER_PATH ${describeCandidate(env.PI_FAMULUS_MANAGER_PATH)}`);
-  const nativeName = nativePackageName(process.platform, process.arch);
-  const native = resolveNativeManagerPath();
-  tried.push(nativeName
-    ? `npm ${nativeName}${native ? ` ${native}` : " (missing or unusable, ignored)"}`
-    : `npm native manager (unsupported ${process.platform}/${process.arch})`);
+  tried.push(describeNativeLookup());
   tried.push(describeCandidate(join(home, "bin", MANAGER_FILE_NAME)));
   tried.push("pi-famulus on PATH");
   return tried.join("; ");
