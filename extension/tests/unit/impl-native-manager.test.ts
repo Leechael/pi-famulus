@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   describeNativeLookup,
   ensureNativeManagerInstalled,
+  nativeCacheDir,
   nativePackageName,
   resolveNativeManagerPath,
 } from "../../src/native-manager.js";
@@ -216,5 +217,89 @@ describe.skipIf(!hostNativeName)("native package walk and cache", () => {
       from, stopAt: root, cacheDir: false, env: { PI_FAMULUS_NO_NATIVE_FETCH: "1" },
       spawn() { throw new Error("fetched"); },
     })).toBeNull();
+  });
+});
+
+/** Every published native package. The file name is what that package's export maps `./bin/pi-famulus` to. */
+const PUBLISHED_PLATFORMS = [
+  ["linux", "x64", "pi-famulus-linux-x64", "pi-famulus"],
+  ["linux", "arm64", "pi-famulus-linux-arm64", "pi-famulus"],
+  ["darwin", "x64", "pi-famulus-darwin-x64", "pi-famulus"],
+  ["darwin", "arm64", "pi-famulus-darwin-arm64", "pi-famulus"],
+  ["win32", "x64", "pi-famulus-win-x64", "pi-famulus.exe"],
+  ["win32", "arm64", "pi-famulus-win-arm64", "pi-famulus.exe"],
+] as const;
+
+describe("native lookup for every published platform", () => {
+  let root = "";
+  afterEach(() => {
+    if (root) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    root = "";
+  });
+
+  function tree() {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "native-platforms-")));
+    const from = join(root, "ext", "src", "native-manager.js");
+    mkdirSync(dirname(from), { recursive: true });
+    writeFileSync(from, "");
+    return from;
+  }
+
+  function plant(parent: string, platformName: string, file: string) {
+    const dir = join(parent, "node_modules", platformName);
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name: platformName, version: pkg.version,
+      exports: { "./package.json": "./package.json", "./bin/pi-famulus": `./bin/${file}` },
+    }));
+    const binary = join(dir, "bin", file);
+    writeFileSync(binary, "#!/bin/sh\nexit 0\n");
+    chmodSync(binary, 0o755);
+    return binary;
+  }
+
+  it.each(PUBLISHED_PLATFORMS)("selects only the %s/%s package %s (%s)", (platform, arch, platformName, file) => {
+    const from = tree();
+    for (const [otherPlatform, otherArch, otherName, otherFile] of PUBLISHED_PLATFORMS) {
+      if (otherName !== platformName) plant(root, otherName, otherFile);
+      expect(nativePackageName(otherPlatform, otherArch)).toBe(otherName);
+    }
+    const binary = plant(root, platformName, file);
+    const lookup = { platform, arch, from, stopAt: root, cacheDir: false as const };
+    expect(resolveNativeManagerPath(lookup)).toBe(binary);
+    expect(describeNativeLookup(lookup)).toBe(`npm ${platformName} ${binary}`);
+  });
+
+  it.each(PUBLISHED_PLATFORMS)("cache install fetches only %s/%s via %s", (platform, arch, platformName, file) => {
+    const from = tree();
+    const cache = join(root, "cache");
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const found = ensureNativeManagerInstalled({
+      platform, arch, from, stopAt: root, cacheDir: cache, env: {},
+      spawn(command, args) {
+        calls.push({ command, args });
+        plant(cache, platformName, file);
+        return { status: 0 };
+      },
+    });
+    expect(calls).toEqual([{
+      command: platform === "win32" ? "npm.cmd" : "npm",
+      args: [
+        "install", `${platformName}@${pkg.version}`,
+        "--prefix", cache,
+        "--ignore-scripts", "--no-fund", "--no-audit", "--loglevel=error",
+      ],
+    }]);
+    expect(found).toBe(join(cache, "node_modules", platformName, "bin", file));
+  });
+
+  it("keeps Windows and POSIX caches under different roots", () => {
+    const env = { LOCALAPPDATA: "/local-app-data", XDG_CACHE_HOME: "/xdg-cache" };
+    expect(nativeCacheDir({ platform: "win32", arch: "arm64", version: pkg.version, env, home: "/home/ignored" }))
+      .toBe(join("/local-app-data", "pi-famulus", "native", pkg.version, "win32-arm64"));
+    expect(nativeCacheDir({ platform: "darwin", arch: "x64", version: pkg.version, env, home: "/home/ignored" }))
+      .toBe(join("/xdg-cache", "pi-famulus", "native", pkg.version, "darwin-x64"));
+    expect(nativeCacheDir({ platform: "linux", arch: "x64", version: pkg.version, env: {}, home: "/home/u" }))
+      .toBe(join("/home/u", ".cache", "pi-famulus", "native", pkg.version, "linux-x64"));
   });
 });
