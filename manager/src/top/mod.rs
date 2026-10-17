@@ -419,11 +419,13 @@ fn drag_scrollbar(state: &mut TopState, row: u16) {
     let h = bar.h.max(1) as usize;
     let y = (row.saturating_sub(bar.y) as usize).min(h.saturating_sub(1));
     d.follow = false;
+    d.hold = false;
     d.scroll = if h <= 1 { 0 } else { y * max / (h - 1) };
 }
 
 fn detail_scroll_up(d: &mut Detail, n: usize) {
     d.follow = false;
+    d.hold = false;
     d.scroll = d.scroll.saturating_sub(n);
 }
 
@@ -431,6 +433,7 @@ fn detail_scroll_down(d: &mut Detail, n: usize) {
     if d.follow {
         return;
     }
+    d.hold = false;
     d.scroll = d.scroll.saturating_add(n);
 }
 
@@ -505,7 +508,10 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
         KeyCode::Char('n') if log => jump_match(d, true),
         KeyCode::Char('N') if log => jump_match(d, false),
         KeyCode::Char('b') if log => d.log.show_blank = !d.log.show_blank,
-        KeyCode::Char('f') | KeyCode::Char('F') => d.follow = !d.follow,
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            d.follow = !d.follow;
+            d.hold = !d.follow;
+        }
         KeyCode::Char('o') | KeyCode::Char('O') => d.tools_expanded = !d.tools_expanded,
         KeyCode::Up | KeyCode::Char('k') => detail_scroll_up(d, 1),
         KeyCode::Down | KeyCode::Char('j') => detail_scroll_down(d, 1),
@@ -515,7 +521,10 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
             d.follow = false;
             d.scroll = 0;
         }
-        KeyCode::End | KeyCode::Char('G') => d.follow = true,
+        KeyCode::End | KeyCode::Char('G') => {
+            d.follow = true;
+            d.hold = false;
+        }
         _ => {}
     }
     false
@@ -669,6 +678,7 @@ mod tests {
             id: "sh_1".into(),
             tab: 0,
             follow: true,
+            hold: false,
             scroll: 0,
             title: "sh_1".into(),
             tabs: vec!["output".into(), "stderr".into()],

@@ -647,6 +647,7 @@ pub fn open_detail(state: &TopState) -> Option<Detail> {
         id: n.id.clone(),
         tab: 0,
         follow: true,
+        hold: false,
         scroll: 0,
         title,
         tabs: detail_tabs(n.kind),

@@ -180,7 +180,11 @@ export function backgroundRowText(
   taskId: string,
   item: { status: string; exitCode?: number | null; startedAt: number; endedAt?: number } | undefined,
   now: number,
+  indexed = false,
 ): { glyph: string; color: string; text: string } {
+  // Live tasks are indexed before the row renders, so a row missing from an
+  // index finished and was pruned (or predates a reload); its exit is unknown.
+  if (!item && indexed) return { glyph: statusGlyph("completed").glyph, color: "dim", text: `${taskId} ended · /tasks` };
   if (!item || item.status === "running" || item.status === "pending") {
     const { glyph, color } = statusGlyph(item?.status ?? "running");
     return { glyph, color, text: `${taskId} running in background · /tasks` };

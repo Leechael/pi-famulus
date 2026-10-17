@@ -584,6 +584,8 @@ pub struct Detail {
     pub id: String,
     pub tab: usize,
     pub follow: bool,
+    /// `f` turned follow off: stay put at the end until the user scrolls.
+    pub hold: bool,
     pub scroll: usize,
     pub title: String,
     pub tabs: Vec<String>,

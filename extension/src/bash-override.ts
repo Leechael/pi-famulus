@@ -327,7 +327,7 @@ export function createBashOverride(
             context.invalidate();
           });
         }
-        const row = backgroundRowText(taskId, item, (deps.clock ?? realClock).now());
+        const row = backgroundRowText(taskId, item, (deps.clock ?? realClock).now(), index !== null);
         return toolComponent([`${theme.fg(row.color as never, row.glyph)} ${theme.fg("muted", row.text)}`]) as never;
       }
       const text = result.content

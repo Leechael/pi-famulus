@@ -991,7 +991,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
     d.wrap_len = painted.len();
     d.view_h = height;
     d.fold_count = painted.iter().filter_map(|p| p.fold.map(|f| f.id + 1)).max().unwrap_or(0);
-    let (follow, scroll) = stick_scroll(d.follow, d.scroll, painted.len(), height);
+    let (follow, scroll) = stick_scroll(d.follow, d.hold, d.scroll, painted.len(), height);
     d.follow = follow;
     d.scroll = scroll;
     let start = d.scroll.min(painted.len());
@@ -1060,13 +1060,14 @@ fn spin_glyph() -> &'static str {
 }
 
 /// Stick to the end while following; scrolling up unsticks, hitting the
-/// bottom resticks. Scroll never jumps back while the user is reading.
-fn stick_scroll(follow: bool, scroll: usize, len: usize, height: usize) -> (bool, usize) {
+/// bottom resticks (unless `f` turned follow off there). Scroll never jumps
+/// back while the user is reading.
+fn stick_scroll(follow: bool, hold: bool, scroll: usize, len: usize, height: usize) -> (bool, usize) {
     let max = len.saturating_sub(height);
-    if follow || scroll >= max {
+    if follow || (scroll >= max && !hold) {
         (true, max)
     } else {
-        (false, scroll)
+        (false, scroll.min(max))
     }
 }
 
@@ -1350,7 +1351,7 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
     }
     d.log.seek = false;
     d.log.current = d.log.current.min(d.log.matches.len().saturating_sub(1));
-    let (follow, scroll) = stick_scroll(d.follow, d.scroll, laid.lines.len(), height);
+    let (follow, scroll) = stick_scroll(d.follow, d.hold, d.scroll, laid.lines.len(), height);
     d.follow = follow;
     d.scroll = scroll;
     d.hits.clear();
@@ -1527,9 +1528,30 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
             let error = turn.error || turn.role == "assistant error";
             // Reasoning arrives as its own `thinking` turn; text beside a
             // tool call is what the agent said, so it stays visible.
-            let segs = assistant_segments(&turn.text);
+            let mut segs = assistant_segments(&turn.text);
+            let mut call_ts = vec![turn.ts; segs.len()];
             i += 1;
-            for seg in segs {
+            // Parallel calls are logged one per line, then their results in
+            // call order: take the run of call-only turns, then the run of
+            // results, and pair them by name, first unused result first.
+            let has_calls = segs.iter().any(|s| matches!(s, Seg::ToolCall { .. }));
+            if has_calls {
+                while let Some(next) = chat.turns.get(i).filter(|n| n.role == "assistant" && n.tool.is_none() && !n.error) {
+                    let more = assistant_segments(&next.text);
+                    if more.is_empty() || !more.iter().all(|s| matches!(s, Seg::ToolCall { .. })) {
+                        break;
+                    }
+                    call_ts.extend(std::iter::repeat_n(next.ts, more.len()));
+                    segs.extend(more);
+                    i += 1;
+                }
+            }
+            let first_result = i;
+            while has_calls && chat.turns.get(i).is_some_and(|n| n.tool.is_some()) {
+                i += 1;
+            }
+            let mut used = vec![false; i - first_result];
+            for (seg, ts) in segs.into_iter().zip(call_ts) {
                 match seg {
                     Seg::Text(text) => {
                         t.begin(Group::Text);
@@ -1539,33 +1561,37 @@ fn layout_conversation(chat: &Chat, width: usize, open: &HashSet<usize>, expand_
                         let summary = summary_from_raw(&args);
                         t.begin(Group::Activity);
                         let id = t.next_fold();
-                        let paired = chat.turns.get(i).is_some_and(|n| n.tool.as_deref() == Some(name.as_str()));
-                        let row = if paired {
-                            let result = &chat.turns[i];
-                            i += 1;
-                            ToolRow {
-                                name: &name,
-                                summary: &summary,
-                                args: &args,
-                                output: &result.text,
-                                ts: result.ts.or(turn.ts),
-                                error: result.error,
-                                pending: false,
+                        let hit = (first_result..i)
+                            .find(|&k| !used[k - first_result] && chat.turns[k].tool.as_deref() == Some(name.as_str()));
+                        let row = match hit {
+                            Some(k) => {
+                                used[k - first_result] = true;
+                                let result = &chat.turns[k];
+                                ToolRow {
+                                    name: &name,
+                                    summary: &summary,
+                                    args: &args,
+                                    output: &result.text,
+                                    ts: result.ts.or(ts),
+                                    error: result.error,
+                                    pending: false,
+                                }
                             }
-                        } else {
-                            ToolRow {
-                                name: &name,
-                                summary: &summary,
-                                args: &args,
-                                output: "",
-                                ts: turn.ts,
-                                error: false,
-                                pending: true,
-                            }
+                            None => ToolRow { name: &name, summary: &summary, args: &args, output: "", ts, error: false, pending: true },
                         };
                         tool_row(row, is_open(id, open, expand_all), id, width, &mut t.out);
                     }
                 }
+            }
+            // A result no call claimed (its call fell outside the window).
+            for k in (first_result..i).filter(|&k| !used[k - first_result]) {
+                let r = &chat.turns[k];
+                t.begin(Group::Activity);
+                let id = t.next_fold();
+                let name = r.tool.as_deref().unwrap_or("tool");
+                let args = r.args.as_deref().unwrap_or("");
+                let row = ToolRow { name, summary: "", args, output: &r.text, ts: r.ts, error: r.error, pending: false };
+                tool_row(row, is_open(id, open, expand_all), id, width, &mut t.out);
             }
             continue;
         }
@@ -2544,6 +2570,25 @@ mod tests {
     }
 
     #[test]
+    fn parallel_calls_pair_with_their_own_results() {
+        let turns = vec![
+            mk_turn("assistant", r#"tool read {"path":"a.rs"}"#),
+            mk_turn("assistant", r#"tool read {"path":"b.rs"}"#),
+            mk_turn("assistant", r#"tool bash {"command":"ls"}"#),
+            tool_turn("read", None, "AAA"),
+            tool_turn("bash", None, "LS"),
+            tool_turn("read", None, "BBB"),
+        ];
+        let text = texts(&layout(&chat_body(turns), 60, true));
+        let pos = |needle: &str| text.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}: {text:?}"));
+        assert!(pos("a.rs") < pos("AAA") && pos("AAA") < pos("b.rs"), "{text:?}");
+        assert!(pos("b.rs") < pos("BBB") && pos("BBB") < pos("bash"), "{text:?}");
+        assert!(pos("bash") < pos("LS"), "{text:?}");
+        assert!(!text.iter().any(|l| l.contains("running")), "no call left pending: {text:?}");
+        assert_eq!(text.iter().filter(|l| l.contains('✓')).count(), 3, "{text:?}");
+    }
+
+    #[test]
     fn stacked_tools_are_tight_one_line_rows() {
         let long = "x".repeat(80);
         let args = format!(r#"{{"command":"{long}"}}"#);
@@ -2913,10 +2958,13 @@ mod tests {
 
     #[test]
     fn follow_resticks_at_the_bottom() {
-        assert_eq!(stick_scroll(true, 3, 40, 10), (true, 30));
-        assert_eq!(stick_scroll(false, 12, 40, 10), (false, 12));
-        assert_eq!(stick_scroll(false, 30, 40, 10), (true, 30));
-        assert_eq!(stick_scroll(false, 99, 40, 10), (true, 30));
+        assert_eq!(stick_scroll(true, false, 3, 40, 10), (true, 30));
+        assert_eq!(stick_scroll(false, false, 12, 40, 10), (false, 12));
+        assert_eq!(stick_scroll(false, false, 30, 40, 10), (true, 30));
+        assert_eq!(stick_scroll(false, false, 99, 40, 10), (true, 30));
+        // `f` at the end holds there instead of re-following on the next draw.
+        assert_eq!(stick_scroll(false, true, 30, 40, 10), (false, 30));
+        assert_eq!(stick_scroll(false, true, 99, 40, 10), (false, 30));
     }
 
     #[test]
