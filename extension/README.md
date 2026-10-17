@@ -22,6 +22,8 @@
 
 ## Why
 
+pi-famulus is less about subagents than about the main agent: keep its context clean, keep it on the goal, and keep talking to it while work runs. Plan with the main agent, hand the coding to a subagent on a cheaper model, and let tests and logs run in the background until they need attention.
+
 A famulus is the assistant who runs a scholar's errands, as Wagner does for Faust. pi's core leaves subagents, background bash and monitoring to extensions on purpose ([design, section 1](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md#1-background-and-goals)). pi-famulus adds them. It is for people who run pi, or an agent built on pi, on real projects and want to hand off slow or parallel work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
 
 Three things go wrong when an agent has to wait:
