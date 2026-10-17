@@ -24,6 +24,7 @@ import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool, createContactSupervisorTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
+import { ensureNativeManagerInstalled } from "./native-manager.js";
 import type { TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
@@ -99,7 +100,13 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   registerBehaviorGuidelines(pi);
   const home = getFamulusHome();
   const config = loadConfig(home);
-  const managerPath = resolveManagerPath(config, home);
+  // pi update reinstalls extensions with npm. omit=optional drops the platform
+  // package during that install; put the exact version back before lookup.
+  let managerPath = resolveManagerPath(config, home);
+  if (!managerPath) {
+    ensureNativeManagerInstalled();
+    managerPath = resolveManagerPath(config, home);
+  }
   const clock = realClock;
 
   // Claude-style transcript pills for notifications (TUI only; no-ops elsewhere).

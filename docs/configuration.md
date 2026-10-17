@@ -65,14 +65,14 @@ The npm package installs the matching native manager through an exact-version op
 
 1. Executable `managerPath` from `config.json`.
 2. Executable `PI_FAMULUS_MANAGER_PATH`.
-3. The exact-version native npm package.
+3. The exact-version native npm package. If that optional dependency is missing, the same version installed under the user cache (`~/.cache/pi-famulus/native/<version>/<platform>-<arch>` on Linux and macOS, `%LOCALAPPDATA%\pi-famulus\native\...` on Windows).
 4. Executable `~/.pi/agent/pi-famulus/bin/pi-famulus` (or the equivalent under `PI_FAMULUS_HOME`).
 5. Executable `pi-famulus` on `PATH`.
 
-On Windows the file name in steps 4 and 5, and inside the native package, is `pi-famulus.exe`. An arbitrary different-version native npm package is never substituted. Installing or updating the npm package does not move runtime state or copy a binary into the shared home. The `pi-famulus` CLI that npm installs (`npx pi-famulus --help`) always runs its own native package.
+On Windows the file name in steps 4 and 5, and inside the native package, is `pi-famulus.exe`. An arbitrary different-version native npm package is never substituted. Installing or updating the npm package does not move runtime state or copy a binary into the shared home. The `pi-famulus` CLI that npm installs (`npx pi-famulus --help`) runs this same native package.
 
 ## Degraded startup
 
-If the manager is missing or cannot start, the extension warns in the TUI. Bash then runs locally, so auto-backgrounding and manager-backed output and history are unavailable. `task_*` and `monitor` report that they are disabled. In-process subagents still run, but their `bash` tool fails until the manager is available. Fix the installation, or point to a binary with `PI_FAMULUS_MANAGER_PATH` or `managerPath`. If optional dependencies were omitted at install time, reinstall with them enabled.
+If the manager is missing or cannot start, the extension warns in the TUI. Bash then runs locally, so auto-backgrounding and manager-backed output and history are unavailable. `task_*` and `monitor` report that they are disabled. In-process subagents still run, but their `bash` tool fails until the manager is available. Fix the installation, or point to a binary with `PI_FAMULUS_MANAGER_PATH` or `managerPath`. If optional dependencies were omitted at install time, reinstall with them enabled. `pi update --extensions` runs npm install; an `omit=optional` npm setting removes the platform package during that update. The next session installs that exact package into the cache in step 3. Set `PI_FAMULUS_NO_NATIVE_FETCH=1` to keep the missing package as a degraded start.
 
 If the extension is loaded outside pi and pi's bundled `pi-tui` cannot be resolved, a one-time console warning says the interactive `/tasks` views use a reduced text fallback. Load the extension through pi for the full UI.

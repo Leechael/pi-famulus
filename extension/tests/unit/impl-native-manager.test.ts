@@ -1,9 +1,14 @@
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { nativePackageName, resolveNativeManagerPath } from "../../src/native-manager.js";
+import {
+  describeNativeLookup,
+  ensureNativeManagerInstalled,
+  nativePackageName,
+  resolveNativeManagerPath,
+} from "../../src/native-manager.js";
 import pkg from "../../package.json";
 
 describe("npm native manager selection", () => {
@@ -123,5 +128,93 @@ describe("installed native manager", () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "native-test-")));
     const resolve = createRequire(join(root, "consumer.cjs")).resolve;
     expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();
+  });
+});
+
+const hostNativeName = nativePackageName(process.platform, process.arch);
+const hostExe = process.platform === "win32" ? "pi-famulus.exe" : "pi-famulus";
+
+describe.skipIf(!hostNativeName)("native package walk and cache", () => {
+  let root = "";
+  afterEach(() => {
+    if (root) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    root = "";
+  });
+
+  const name = hostNativeName!;
+  const exe = hostExe;
+
+  function layout() {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "native-walk-")));
+    const from = join(root, "nested", "src", "native-manager.js");
+    mkdirSync(dirname(from), { recursive: true });
+    writeFileSync(from, "");
+    return from;
+  }
+
+  function plant(parent: string, version: string, opts: { binary?: boolean; mode?: number } = {}) {
+    if (!name) throw new Error("unsupported platform");
+    const dir = join(parent, "node_modules", name);
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    const rel = `./bin/${exe}`;
+    writeFileSync(join(dir, "package.json"), JSON.stringify({
+      name, version,
+      exports: { "./package.json": "./package.json", "./bin/pi-famulus": rel },
+    }));
+    const binary = join(dir, "bin", exe);
+    if (opts.binary !== false) {
+      writeFileSync(binary, "#!/bin/sh\nexit 0\n");
+      chmodSync(binary, opts.mode ?? 0o755);
+    }
+    return binary;
+  }
+
+  it("skips a closer unusable package and uses an exact executable higher up", () => {
+    const from = layout();
+    plant(join(root, "nested"), pkg.version, { binary: false });
+    const binary = plant(root, pkg.version);
+    const lookup = { from, stopAt: root, cacheDir: false as const };
+    expect(resolveNativeManagerPath(lookup)).toBe(binary);
+    expect(describeNativeLookup(lookup)).toBe(`npm ${name} ${binary}`);
+  });
+
+  it("does not use a different native package version from the cache or the walk", () => {
+    const from = layout();
+    plant(root, "999.0.0");
+    const cache = join(root, "cache");
+    plant(cache, "999.0.0");
+    const lookup = { from, stopAt: root, cacheDir: cache };
+    expect(resolveNativeManagerPath(lookup)).toBeNull();
+    expect(describeNativeLookup(lookup)).toContain("npm install --include=optional pi-famulus");
+  });
+
+  it("installs the exact platform package into the cache when none is installed", () => {
+    const from = layout();
+    const cache = join(root, "cache");
+    const calls: string[][] = [];
+    const found = ensureNativeManagerInstalled({
+      from, stopAt: root, cacheDir: cache, env: {},
+      spawn(_command, args) {
+        calls.push(args);
+        plant(cache, pkg.version);
+        return { status: 0 };
+      },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain(`${name}@${pkg.version}`);
+    expect(calls[0]?.[calls[0].indexOf("--prefix") + 1]).toBe(cache);
+    expect(found).toBe(join(cache, "node_modules", name, "bin", exe));
+    expect(ensureNativeManagerInstalled({
+      from, stopAt: root, cacheDir: cache, env: {},
+      spawn() { throw new Error("already installed"); },
+    })).toBe(found);
+  });
+
+  it("does not fetch when the optional package was intentionally left missing", () => {
+    const from = layout();
+    expect(ensureNativeManagerInstalled({
+      from, stopAt: root, cacheDir: false, env: { PI_FAMULUS_NO_NATIVE_FETCH: "1" },
+      spawn() { throw new Error("fetched"); },
+    })).toBeNull();
   });
 });

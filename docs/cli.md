@@ -43,7 +43,7 @@ If you already hit `killed` after a reinstall, fix with another atomic replace (
 
 **Subsequent same-name upgrades while pi sessions run work:** just `install` the new binary. A running daemon notices within a few seconds and upgrades itself in place (see [`upgrade`](#upgrade)); `pi-famulus upgrade` does it now and reports the result. Nothing running is interrupted and no pi session needs a restart; reload or reopen pi sessions only when you also want the new extension code. A `/reload` that loads a different extension version stops the session's running work, like reopening it; a `/reload` with the same version keeps that work running and keeps the extension code already loaded. `/famulus` shows which versions a session runs. This applies to compatible builds under the same name and home, not the one-time transition above.
 
-The extension prioritizes executable config `managerPath`, executable `PI_FAMULUS_MANAGER_PATH`, the exact-version native npm package, this home/bin path, then executable PATH. The npm CLI always runs its own native package. Restart sessions when changing installation method/binary location; the daemon's in-place monitor follows its current path, not a different package's executable.
+The extension prioritizes executable config `managerPath`, executable `PI_FAMULUS_MANAGER_PATH`, the exact-version native npm package (then the same version in the user cache if the optional dependency is missing), this home/bin path, then executable PATH. The npm CLI runs that same native package. Restart sessions when changing installation method/binary location; the daemon's in-place monitor follows its current path, not a different package's executable.
 
 ## Global options
 

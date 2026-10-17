@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { nativePackageName, resolveNativeManagerPath } from "../src/native-manager.js";
+import { ensureNativeManagerInstalled, nativePackageName } from "../src/native-manager.js";
 
-const binary = resolveNativeManagerPath();
+const binary = ensureNativeManagerInstalled();
 if (!binary) {
   const name = nativePackageName(process.platform, process.arch);
   console.error(name
