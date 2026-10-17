@@ -136,3 +136,107 @@ describe("child warnings in subagent wakes", () => {
     expect(wake.details).not.toHaveProperty("warning");
   });
 });
+
+/**
+ * A finished child's result is capped to its tail (format.ts capTail). The
+ * wake must say so, the same way a monitor wake does (truncated="true" and
+ * omitted-chars), and tell the parent how to read the rest. Monitor wakes
+ * already do this; subagent-done and subagent-handover currently do not.
+ */
+describe("subagent result truncation is visible", () => {
+  const KEPT = 2000;
+  const text = `HEAD${"x".repeat(3000)}TAIL`;
+  const omitted = text.length - KEPT;
+
+  it("counts the characters this construction drops", () => {
+    expect(text.length).toBe(3008);
+    expect(omitted).toBe(1008);
+  });
+
+  it("marks a subagent-done child result and says how to read the full text", () => {
+    const wake = formatSubagentNotification({
+      runId: "run_x",
+      status: "completed",
+      durationMs: 1,
+      children: [{ childId: "ch_a", name: "a", status: "completed", text, prompt: "inspect" }],
+    });
+    expectTruncatedResult(wake.content, wake.details as TruncationDetails, "child", omitted);
+  });
+
+  it("marks a subagent-handover result and says how to read the full text", () => {
+    const wake = formatSubagentHandover({
+      runId: "run_a",
+      childId: "ch_1",
+      name: "worker-1",
+      status: "completed",
+      prompt: "inspect",
+      text,
+      stillRunning: [{ id: "ch_2", title: "worker-2" }],
+    });
+    expectTruncatedResult(wake.content, wake.details as TruncationDetails, "handover", omitted);
+  });
+
+  it.each([2000, 1999])("does not mark a %i-character result", (length) => {
+    const exact = "y".repeat(length);
+    const done = formatSubagentNotification({
+      runId: "run_x",
+      status: "completed",
+      durationMs: 1,
+      children: [{ childId: "ch_a", name: "a", status: "completed", text: exact, prompt: "inspect" }],
+    });
+    const handover = formatSubagentHandover({
+      runId: "run_a",
+      childId: "ch_1",
+      name: "worker-1",
+      status: "completed",
+      prompt: "inspect",
+      text: exact,
+      stillRunning: [{ id: "ch_2", title: "worker-2" }],
+    });
+    for (const wake of [done, handover]) {
+      expect(wake.content).not.toContain('truncated="true"');
+      expect(wake.content).not.toMatch(/omitted-chars=/);
+      expect(wake.content).toContain(`<result>${exact}</result>`);
+    }
+    expect(done.details.kind).toBe("subagent-done");
+    if (done.details.kind === "subagent-done") {
+      expect(done.details.children[0]).not.toHaveProperty("truncated");
+      expect(done.details.children[0]).not.toHaveProperty("omittedChars");
+    }
+    expect(handover.details.kind).toBe("subagent-handover");
+    if (handover.details.kind === "subagent-handover") {
+      expect(handover.details).not.toHaveProperty("truncated");
+      expect(handover.details).not.toHaveProperty("omittedChars");
+    }
+  });
+});
+
+interface TruncationDetails {
+  kind: string;
+  result?: string;
+  truncated?: boolean;
+  omittedChars?: number;
+  children?: Array<{ result?: string; truncated?: boolean; omittedChars?: number }>;
+}
+
+function expectTruncatedResult(
+  content: string,
+  details: TruncationDetails,
+  where: "child" | "handover",
+  omitted: number,
+): void {
+  const result = content.match(/<result(?:\s[^>]*)?>([\s\S]*?)<\/result>/);
+  expect(result?.[1].endsWith("TAIL")).toBe(true);
+  expect(result?.[1].includes("HEAD")).toBe(false);
+  expect(result?.[1].length).toBe(2000);
+  expect(content).toContain('truncated="true"');
+  expect(content).toContain(`omitted-chars="${omitted}"`);
+  expect(content.includes('action:"get"') || /(?:\/|\.jsonl\b)/.test(content)).toBe(true);
+  if (where === "child") {
+    expect(details.children?.[0]).toMatchObject({ truncated: true, omittedChars: omitted });
+    expect(details.children?.[0]?.result?.endsWith("TAIL")).toBe(true);
+  } else {
+    expect(details).toMatchObject({ truncated: true, omittedChars: omitted });
+    expect(details.result?.endsWith("TAIL")).toBe(true);
+  }
+}
