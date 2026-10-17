@@ -694,6 +694,10 @@ pub enum EventKind {
         command: String,
         pid: u32,
         ts: u64,
+        /// Present when the starter named an origin. A hosted child's foreground
+        /// bash is how the parent session learns which shell that child is blocked on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
     },
     /// Only pushed after `watch`.
     Output {
@@ -741,6 +745,9 @@ pub enum EventKind {
         session_id: Option<String>,
     },
     /// A hosted child is asking its parent (or an attached UI).
+    /// The wire name stays `agent_comms`: the parent extension matches that,
+    /// not the Rust variant name.
+    #[serde(rename = "agent_comms")]
     AgentCommsEvent {
         child_id: String,
         request_id: String,
@@ -1084,6 +1091,18 @@ mod tests {
             v,
             serde_json::json!({"v": 1, "type": "event", "event": "session_rebound"})
         );
+
+        let ev = Event::new(EventKind::AgentCommsEvent {
+            child_id: "ch_a1b2c3d4".into(),
+            request_id: "req".into(),
+            reason: "need_decision".into(),
+            message: "which?".into(),
+            name: "worker".into(),
+        });
+        let v: serde_json::Value = serde_json::from_slice(&encode(&ev)).unwrap();
+        assert_eq!(v["event"], serde_json::json!("agent_comms"));
+        assert_eq!(v["child_id"], serde_json::json!("ch_a1b2c3d4"));
+        assert_eq!(v["request_id"], serde_json::json!("req"));
     }
 
     #[test]

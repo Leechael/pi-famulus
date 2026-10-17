@@ -124,6 +124,8 @@ export interface ManagerEvent {
   output_size?: number;
   end_reason?: string;
   ts?: number;
+  /** Set on task_started when the daemon recorded who asked for the task. */
+  origin?: { via: string; child_id?: string; run_id?: string };
 }
 
 export class ManagerError extends Error {

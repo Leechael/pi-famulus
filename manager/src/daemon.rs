@@ -2037,7 +2037,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
             serde_json::json!({
                 "kind": kind,
                 "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
-                "origin": origin,
+                "origin": origin.clone(),
                 "pid": pid,
                 "label": label,
             }),
@@ -2076,6 +2076,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
             command,
             pid,
             ts: now,
+            origin: origin.clone(),
         },
     );
     Ok(StartOk { task_id, pid })

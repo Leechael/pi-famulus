@@ -140,6 +140,8 @@ export interface SubagentToolDeps {
   /** Agent definition resolver (M5 wires the real loader; default: worker). */
   resolveAgent?: (name: string | undefined) => AgentDefinition;
   /** Selectable models for action:"models" (§4.6); absent → action errors. */
+  /** Receives the watcher for turns started by agent_message send. */
+  registerResumeWatch?: (watch: (childId: string) => void) => void;
   listModels?: () => {
     provider: string;
     id: string;
@@ -345,6 +347,20 @@ export function createSubagentTool(
     );
     return true;
   };
+
+  const armResumeWake = (childId: string): void => {
+    const registry = deps.getRegistry();
+    if (!registry) return;
+    const record = registry.list().find((run) => run.children.some((c) => c.childId === childId));
+    if (!record) return;
+    const handedOver = new Set<string>();
+    void registry.getResult(childId)?.then(() => {
+      if (!notifyChildHandover(registry, record.runId, childId, handedOver)) {
+        notifyRunCompleted(registry, record.runId);
+      }
+    });
+  };
+  deps.registerResumeWatch?.(armResumeWake);
 
   const startRun = async (
     params: SubagentParams,
@@ -620,6 +636,7 @@ export function createSubagentTool(
         : record.children.length === 1 ? record.children[0] : undefined;
       if (named && named.status !== "running" && named.status !== "pending") {
         const { queuedBehind } = await registry.resumeChild(named.childId, params.message);
+        armResumeWake(named.childId);
         return {
           content: [{ type: "text", text: `Started a new turn on idle subagent ${named.name} (${named.childId}) in run ${record.runId}.${queuedBehind === null ? "" : ` Queued behind ${queuedBehind}.`}` }],
           details: { run_id: record.runId, child_id: named.childId, queued_behind: queuedBehind },
@@ -673,12 +690,7 @@ export function createSubagentTool(
     );
     // Resume is asynchronous. If siblings are still running, hand this child
     // back as soon as it finishes; otherwise the run-complete wake covers it.
-    const handedOver = new Set<string>();
-    void registry.getResult(child.childId)?.then(() => {
-      if (!notifyChildHandover(registry, record.runId, child.childId, handedOver)) {
-        notifyRunCompleted(registry, record.runId);
-      }
-    });
+    armResumeWake(child.childId);
     return {
       content: [
         {

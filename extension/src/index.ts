@@ -23,7 +23,7 @@ import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
-import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
+import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
 import type { TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
@@ -435,9 +435,11 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   // M4: comms host bridges the registry and the NotifyCenter. A single Comms
   // instance lives at extension scope (mailbox is per-run namespaced; pending
   // waiters are resolved via dispose() on session_shutdown).
+  let watchResume: (childId: string) => void = () => {};
   const commsHost = createRegistryCommsHost({
     getRegistry: () => subagentRegistry,
     getNotifyCenter: () => notifyCenter,
+    onResumeAccepted: (childId) => watchResume(childId),
   });
   const comms: CommsWithOrigin = createComms(commsHost, {
     decisionTimeoutMs: subagentConfig.decisionTimeoutMs,
@@ -454,6 +456,9 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       defaultTimeoutMs: subagentConfig.timeoutMs,
       defaultConcurrency: subagentConfig.concurrency,
       clock,
+      registerResumeWatch: (watch) => {
+        watchResume = watch;
+      },
       resolveAgent: (name) => {
         const loader = agentLoader;
         if (!loader) return resolveAgentDef([], name); // builtins-only fallback
@@ -539,6 +544,11 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       log: () => {}, // keep quiet; degradation is surfaced via tools
     });
 
+    // Hosted children run bash in their own process. The parent learns the
+    // foreground shell from task_started (origin child-bash) so overrun wakes
+    // still carry <shell>.
+    const childShells = new ChildShellTracker();
+    const parentSessionId = startCtx.sessionManager.getSessionId();
     client.onEvent((event) => {
       const hosted = event as ManagerEvent & {
         child_id?: string;
@@ -582,6 +592,14 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
               ? { startedAt: prior.startedAt }
               : {}),
         });
+        if (event.origin?.via === "child-bash" && event.origin.child_id) {
+          childShells.start(event.origin.child_id, {
+            taskId: event.task_id,
+            command: event.command ?? "",
+            startedAt: typeof event.ts === "number" ? event.ts : clock.now(),
+            outputPath: taskOutputPath(home, parentSessionId, event.task_id),
+          });
+        }
         if (notifyOnExit.has(event.task_id) && typeof event.ts === "number") {
           upsertBackgroundTask(event.task_id, event.ts);
         }
@@ -604,6 +622,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         return;
       }
       if (event.event === "task_exited" && event.task_id) {
+        childShells.endByTask(event.task_id);
         // A known monitor closes (and patches the index via onExited); an
         // unknown id is buffered in case a monitor start is about to claim it.
         if (monitorRegistry?.handleExit(event.task_id, event)) return;
@@ -653,8 +672,6 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         "warning",
       );
     }
-    // The foreground shell each child is blocked on, for its overrun wake.
-    const childShells = new ChildShellTracker();
     const createSession = createHostedSessionFn({
       getModelRegistry: () => ctx?.modelRegistry ?? null,
       getModelRuntime: () => {

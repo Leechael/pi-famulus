@@ -26,7 +26,11 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
     if (!first.startsWith("Use the subagent tool")) {
       // Child session.
       if (last?.role === "toolResult") return say("apple");
-      if (/append/i.test(lastText)) return call("bash", { command: "echo done >> fruit.txt" });
+      // Resume is the turn that finishes the file. A send to an idle child
+      // also starts a turn; that turn must not satisfy the scenario goal or
+      // the episode ends before the scripted resume.
+      if (/new line/i.test(lastText)) return call("bash", { command: "echo done >> fruit.txt" });
+      if (/append/i.test(lastText)) return call("bash", { command: "echo more >> fruit.txt" });
       return call("write", { path: "fruit.txt", content: "apple\n" });
     }
     // Parent session.
@@ -40,7 +44,22 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
       return call("agent_message", { action: "send", to: "worker-1", message: "append the word done to fruit.txt" });
     }
     if (mode !== "send-only" && !already("subagent", "resume")) {
-      return call("subagent", { action: "resume", run_id: runId, message: "append the word done to fruit.txt on a new line" });
+      // Send to an idle child starts its own turn. Resume only after that
+      // turn has finished; a resume while it is still pending is rejected.
+      if (mode === "send-then-resume") {
+        const sendAt = ctx.messages.findIndex(
+          (m) => m.role === "assistant" && JSON.stringify(m.content).includes('"action":"send"'),
+        );
+        const later = sendAt >= 0 ? ctx.messages.slice(sendAt + 1) : [];
+        const finished = later.some((m) => /kind="subagent-(done|handover)"/.test(textOf(m)));
+        if (!finished) return say("ok");
+      }
+      return call("subagent", {
+        action: "resume",
+        run_id: runId,
+        child_id: "worker-1",
+        message: "append the word done to fruit.txt on a new line",
+      });
     }
     return say("Done.");
   };

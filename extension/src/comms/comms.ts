@@ -159,6 +159,7 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
           );
         }
         await resume(child.handle.childId, message);
+        host.onResumeAccepted?.(child.handle.childId);
       } else {
         throw new Error(
           `Child ${toChildId} (${child.name}) is ${child.status}; ` +

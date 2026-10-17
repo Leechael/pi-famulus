@@ -45,6 +45,8 @@ export interface CommsHost {
   notifySupervisor(wake: { content: string; details: FamulusWake }): void;
   /** Continue an idle child. Absent on test hosts that still reject send-to-finished. */
   resumeChild?(childId: string, message: string): Promise<void>;
+  /** Fired after resumeChild accepts a turn, so the parent can be woken when it settles. */
+  onResumeAccepted?(childId: string): void;
 }
 
 export interface MailboxEntry {
