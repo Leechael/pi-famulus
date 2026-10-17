@@ -1,7 +1,3 @@
-// Daemons and task children spawned here are reaped by the harness
-// (`Home::drop` kills them), not by `wait()` at each call site.
-#![allow(clippy::zombie_processes)]
-
 #![cfg(unix)]
 //! Black-box tests for the observability contract (manager + CLI side):
 //! protocol additions (origin, mark_background, stop.reason, end_reason,

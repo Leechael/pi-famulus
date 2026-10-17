@@ -1,7 +1,3 @@
-// Daemons and task children spawned here are reaped by the harness
-// (`Home::drop` kills them), not by `wait()` at each call site.
-#![allow(clippy::zombie_processes)]
-
 #![cfg(unix)]
 //! In-place upgrade (design doc §3.2, `handover.rs`): the daemon execs the
 //! binary now at its path, with the same pid, and every task keeps running.

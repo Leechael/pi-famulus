@@ -1,7 +1,3 @@
-// Daemons and task children spawned here are reaped by the harness
-// (`Home::drop` kills them), not by `wait()` at each call site.
-#![allow(clippy::zombie_processes)]
-
 #![cfg(unix)]
 //! Adversarial black-box lifecycle tests for pi-famulus.
 //!
@@ -66,7 +62,7 @@ fn spawn_lock_observer_daemon(
     home: &Home,
     blocked: &std::path::Path,
     barrier: Option<&std::path::Path>,
-) -> std::process::Child {
+) -> DaemonChild {
     let mut command = std::process::Command::new(BIN);
     command
         .arg("--home")
@@ -88,7 +84,7 @@ fn spawn_lock_observer_daemon(
     if let Some(barrier) = barrier {
         command.env("PI_FAMULUS_TEST_DAEMON_LOCK_BARRIER", barrier);
     }
-    command.spawn().expect("spawn lock-observing daemon")
+    home.adopt(command.spawn().expect("spawn lock-observing daemon"))
 }
 
 fn blocked_lock_attempts(path: &std::path::Path) -> usize {
@@ -1233,11 +1229,7 @@ fn stale_files_recover_after_transient_lifetime_lock_contention() {
     let barrier_path = home.path.join("b.sock");
     let listener = UnixListener::bind(&barrier_path).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut successor = KillOnDrop(Some(spawn_lock_observer_daemon(
-        &home,
-        &blocked,
-        Some(&barrier_path),
-    )));
+    let mut successor = spawn_lock_observer_daemon(&home, &blocked, Some(&barrier_path));
 
     // The debug hook sends an ACK on its first WouldBlock and blocks reading
     // this socket. The retry cannot proceed until after we release manager.lock
@@ -1279,11 +1271,11 @@ fn stale_files_recover_after_transient_lifetime_lock_contention() {
     let mut client = home.connect();
     assert_eq!(client.hello_cli()["pid"], new_pid);
     assert_ne!(new_pid, old_pid);
-    assert!(successor.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    assert!(successor.try_wait().unwrap().is_none());
     drop(client);
 
     assert!(home.cli(&["shutdown"], S(10)).status.success());
-    assert!(wait_child(successor.0.as_mut().unwrap(), S(10)).is_some());
+    assert!(wait_child(&mut successor, S(10)).is_some());
 }
 
 /// A real daemon that owns manager.lock still wins after the bounded retry
@@ -1299,12 +1291,12 @@ fn real_lifetime_lock_owner_gets_bounded_refusal_without_second_server() {
     let mut owner_client = home.connect();
     assert_eq!(owner_client.hello_cli()["pid"], owner_pid);
     let blocked = home.path.join("blocked-lock-attempts");
-    let mut duplicate = KillOnDrop(Some(spawn_lock_observer_daemon(&home, &blocked, None)));
+    let mut duplicate = spawn_lock_observer_daemon(&home, &blocked, None);
 
     // The bounded policy is the retry cap, not a wall-clock promise that can
     // be distorted by process scheduling on a busy CI runner. Keep an outer
     // safety deadline only to catch a stuck contender.
-    let status = wait_child(duplicate.0.as_mut().unwrap(), S(15))
+    let status = wait_child(&mut duplicate, S(15))
         .expect("contender did not refuse before the safety deadline");
     assert!(status.success(), "duplicate daemon exited with {status}");
     assert_eq!(
@@ -1312,7 +1304,7 @@ fn real_lifetime_lock_owner_gets_bounded_refusal_without_second_server() {
         DAEMON_LOCK_RETRY_ATTEMPTS,
         "real owner must keep the contender blocked through the retry cap"
     );
-    let out = duplicate.0.take().unwrap().wait_with_output().unwrap();
+    let out = duplicate.collect_output();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(&format!("already running (pid {owner_pid})")),
@@ -2214,7 +2206,7 @@ fn t14_tasks_inherit_only_stdio() {
             Ok(())
         });
     }
-    let _d = cmd.spawn().expect("spawn daemon");
+    let _d = home.adopt(cmd.spawn().expect("spawn daemon"));
     drop(extra);
     assert!(poll_true(S(3), || UnixStream::connect(home.sock()).is_ok()), "daemon did not start");
     let mut c = home.connect();

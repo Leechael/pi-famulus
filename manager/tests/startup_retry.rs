@@ -1,7 +1,3 @@
-// Daemons and task children spawned here are reaped by the harness
-// (`Home::drop` kills them), not by `wait()` at each call site.
-#![allow(clippy::zombie_processes)]
-
 #![cfg(unix)]
 //! Black-box shutdown-wait regressions: real CLI processes, framed sockets,
 //! OS lifetime locks, and real successor daemons. No manager internals linked.

@@ -1,7 +1,3 @@
-// Daemons and task children spawned here are reaped by the harness
-// (`Home::drop` kills them), not by `wait()` at each call site.
-#![allow(clippy::zombie_processes)]
-
 #![cfg(unix)]
 //! Black-box integration tests for `pi-famulus`.
 //!
@@ -41,52 +37,116 @@ fn sock_path(home: &Path) -> PathBuf {
     home.join("manager.sock")
 }
 
-fn test_home(name: &str) -> PathBuf {
+/// Deletes its directory on drop, including when an assertion fails.
+struct TestHome(PathBuf);
+
+impl Drop for TestHome {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TestHome {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TestHome {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TestHome {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+fn test_home(name: &str) -> TestHome {
     let dir = env::temp_dir().join(format!("pi-famulus-test-{}-{}", std::process::id(), name));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create test home");
-    dir
+    TestHome(dir)
 }
 
-fn spawn_daemon(home: &Path) -> Child {
-    Command::new(BIN)
-        .arg("daemon")
-        .env("PI_FAMULUS_HOME", home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn pi-famulus daemon")
+/// Kills and reaps on drop, including when an assertion fails.
+/// `try_wait` first so a child the test already reaped is not killed again
+/// by pid (that pid may have been reused).
+struct ReapedChild(Option<Child>);
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else { return };
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(_) => {
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
-fn spawn_daemon_with_agent_budget_pause(
-    home: &Path,
-    marker: &Path,
-    release_marker: &Path,
-) -> Child {
-    Command::new(BIN)
-        .arg("daemon")
-        .env("PI_FAMULUS_HOME", home)
-        .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD", "ch-old")
-        .env("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER", marker)
-        .env("PI_FAMULUS_TEST_AGENT_BUDGET_RELEASE_MARKER", release_marker)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn pi-famulus daemon with budget pause")
+impl std::ops::Deref for ReapedChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        self.0.as_ref().expect("daemon child used after drop")
+    }
 }
 
-fn spawn_daemon_with_writer_queue_marker(home: &Path, marker: &Path) -> Child {
-    Command::new(BIN)
-        .arg("daemon")
-        .env("PI_FAMULUS_HOME", home)
-        .env("PI_FAMULUS_TEST_WRITER_QUEUE_FULL_MARKER", marker)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn pi-famulus daemon with writer queue marker")
+impl std::ops::DerefMut for ReapedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("daemon child used after drop")
+    }
+}
+
+fn spawn_daemon(home: &Path) -> ReapedChild {
+    ReapedChild(Some(
+        Command::new(BIN)
+            .arg("daemon")
+            .env("PI_FAMULUS_HOME", home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pi-famulus daemon"),
+    ))
+}
+
+fn spawn_daemon_with_agent_budget_pause(home: &Path, marker: &Path, release_marker: &Path) -> ReapedChild {
+    ReapedChild(Some(
+        Command::new(BIN)
+            .arg("daemon")
+            .env("PI_FAMULUS_HOME", home)
+            .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD", "ch-old")
+            .env("PI_FAMULUS_TEST_AGENT_BUDGET_MARKER", marker)
+            .env("PI_FAMULUS_TEST_AGENT_BUDGET_RELEASE_MARKER", release_marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pi-famulus daemon with budget pause"),
+    ))
+}
+
+fn spawn_daemon_with_writer_queue_marker(home: &Path, marker: &Path) -> ReapedChild {
+    ReapedChild(Some(
+        Command::new(BIN)
+            .arg("daemon")
+            .env("PI_FAMULUS_HOME", home)
+            .env("PI_FAMULUS_TEST_WRITER_QUEUE_FULL_MARKER", marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pi-famulus daemon with writer queue marker"),
+    ))
 }
 
 fn wait_for_socket(home: &Path, timeout: Duration) {
@@ -125,10 +185,12 @@ fn connect(home: &Path, timeout: Duration) -> Conn {
 }
 
 /// RAII guard: kill the daemon and wipe PI_FAMULUS_HOME when the test ends.
-/// (If the test already killed/reaped the child, the extra kill is a no-op.)
+/// Field order is the cleanup order: `ReapedChild` reaps first, then
+/// `TestHome` removes the directory. A child this test already waited is
+/// not killed again.
 struct Daemon {
-    child: Child,
-    home: PathBuf,
+    child: ReapedChild,
+    home: TestHome,
 }
 
 impl Daemon {
@@ -141,14 +203,6 @@ impl Daemon {
 
     fn connect(&self) -> Conn {
         connect(&self.home, CONNECT_TIMEOUT)
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = fs::remove_dir_all(&self.home);
     }
 }
 
@@ -1445,9 +1499,8 @@ fn p16_queued_grant_survives_writer_backpressure_and_session_activity() {
     let home = test_home("p16-grant-retry");
     fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
     let marker = home.join("p16-writer-queue-full");
-    let child = spawn_daemon_with_writer_queue_marker(&home, &marker);
+    let _daemon = spawn_daemon_with_writer_queue_marker(&home, &marker);
     wait_for_socket(&home, CONNECT_TIMEOUT);
-    let _daemon = Daemon { child, home: home.clone() };
     let mut holder = connect(&home, CONNECT_TIMEOUT);
     let mut waiter = connect(&home, CONNECT_TIMEOUT);
     hello_ext_protocol(&mut holder, "session-p16-holder", 5);

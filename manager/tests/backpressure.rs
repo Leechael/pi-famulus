@@ -7,10 +7,6 @@
 //! binary; the original workload, latency and memory bounds are unchanged.
 //! Producer success and exact output size also guard the workload itself.
 
-// Daemons and task children spawned here are reaped by the harness
-// (`Home::drop` kills them), not by `wait()` at each call site.
-#![allow(clippy::zombie_processes)]
-
 mod common;
 
 use common::*;

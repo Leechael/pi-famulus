@@ -1,7 +1,3 @@
-// Daemons and task children spawned here are reaped by the harness
-// (`Home::drop` kills them), not by `wait()` at each call site.
-#![allow(clippy::zombie_processes)]
-
 #![cfg(unix)]
 //! Tests written to kill cargo-mutants survivors (see manager/TESTING.md,
 //! "Mutation score"). Each asserts a customer-visible behaviour that the
