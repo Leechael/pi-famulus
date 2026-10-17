@@ -199,7 +199,7 @@ describe("review fixes", () => {
     const out = renderConversation([{ role: "assistant", text: 'tool write {"path":"e.txt","content":""}' }], 80, plainTheme, { expanded: false }).join("\n");
     expect(out).toContain("+0 lines");
     const blank = renderConversation([{ role: "assistant", text: 'tool write {"path":"e.txt","content":"\\n"}' }], 80, plainTheme, { expanded: false }).join("\n");
-    expect(blank).toContain("+1 line");
+    expect(blank).toMatch(/\+1 line(?!s)/);
   });
 
   it("notes a line the preview cap cut part-way through", () => {
