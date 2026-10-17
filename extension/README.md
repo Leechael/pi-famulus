@@ -1,9 +1,9 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/Leechael/pi-famulus/main/assets/logo.png" alt="pi-famulus" width="120" />
   <h1>pi-famulus</h1>
-  <p><b>Let your agent delegate, and keep working.</b></p>
+  <p><b>Keep your main agent focused. Hand off the rest.</b></p>
   <p>English · <a href="https://github.com/Leechael/pi-famulus/blob/main/README_CN.md">中文</a></p>
-  <p>Subagents and long-running bash for <a href="https://pi.dev">pi</a> and agents built on it. Results wake the agent when work finishes, so it never has to poll. One daemon owns every shell it starts.</p>
+  <p>Subagents and long-running bash for <a href="https://pi.dev">pi</a> and agents built on it. Results wake the agent when work finishes, so the conversation keeps going. One Rust daemon runs the shells and monitors it starts.</p>
   <p>
     <a href="https://github.com/Leechael/pi-famulus/blob/main/docs/tools.md">Tools</a> ·
     <a href="https://github.com/Leechael/pi-famulus/blob/main/docs/cli.md">CLI</a> ·
@@ -22,6 +22,8 @@
 
 ## Why
 
+pi-famulus is less about subagents than about the main agent: keep its context clean, keep it on the goal, and keep talking to it while work runs. Plan with the main agent, hand the coding to a subagent on a cheaper model, and let tests and logs run in the background until they need attention.
+
 A famulus is the assistant who runs a scholar's errands, as Wagner does for Faust. pi's core leaves subagents, background bash and monitoring to extensions on purpose ([design, section 1](https://github.com/Leechael/pi-famulus/blob/main/docs/design.md#1-background-and-goals)). pi-famulus adds them. It is for people who run pi, or an agent built on pi, on real projects and want to hand off slow or parallel work, such as a test suite, a build, a dev server or a code review, without stalling the conversation.
 
 Three things go wrong when an agent has to wait:
@@ -33,6 +35,10 @@ Three things go wrong when an agent has to wait:
 One machine-wide daemon (`pi-famulus`, written in Rust) starts every shell command and monitor, including the ones subagents run, and is their parent. If the daemon crashes or is killed, the process groups it started are stopped, except commands that moved into a new session with `setsid`. Subagents themselves run inside pi.
 
 pi-famulus is a pi extension, so it works wherever pi loads extensions: the pi TUI, RPC mode, and agents you build with the pi SDK. Outside the TUI there is no `/tasks` list and no fleet line, but results still wake the agent. Print mode (`pi -p`) exits when the first run ends, so results that arrive later are not seen.
+
+### Not a pane manager
+
+If you use Herdr or tmux panes, keep them. Panes are for watching and taking over an agent. pi-famulus is for the main agent: it is woken when a subagent overruns its budget, asks for a decision or finishes, so it never has to watch a pane to know work is done. A subagent that stalls is retried on its own, and the parent hears the outcome.
 
 ## Quick Start
 
@@ -63,10 +69,11 @@ Run the full test suite and tell me what fails.
 - **Wake on completion**: A finished command, a monitor event or a subagent result is injected into the conversation. The agent continues from it without polling.
 - **Subagents**: A call takes up to 10 subagents, which run 4 at a time by default, or a `chain` that runs in order. If the wait passes 45 seconds, the call returns and the run continues in the background. Each subagent reports back when it finishes.
 - **Clean finish**: A subagent's `bash` runs in the foreground until the command exits or times out, and subagents cannot start subagents or monitors. So a finished subagent leaves nothing it started through pi-famulus running, unless a command detached itself with `setsid` or left a process running with `&`.
-- **One daemon for every process**: The daemon is the parent of every shell and monitor task across your pi sessions. If it crashes or is killed with `kill -9`, each task's process group is stopped. Commands that move into a new session with `setsid` escape this.
+- **Hears about trouble early**: With the default settings, a subagent with no activity for 5 minutes is resumed once on the same session, and marked failed if it stalls again. The watchdog pauses while a tool runs or a `contact_supervisor` question waits for an answer. Past its 30-minute soft budget (`timeout_ms`) the child keeps running, and the parent gets an overrun wake every 10 minutes to extend, steer or interrupt it; the wake is held while the child waits for an answer. These values are set in the `subagent` section of the [configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md).
+- **One daemon for every shell and monitor**: The daemon is the parent of every shell and monitor task across your pi sessions. If it crashes or is killed with `kill -9`, each task's process group is stopped. Commands that move into a new session with `setsid` escape this.
 - **Shared capacity**: By default, at most 8 subagents run at once across all pi sessions on the machine (`pi-famulus config set max-agents <n>` changes it). The rest wait in a queue. Subagents labelled `work_kind: "test-suite"` or `"test"` are capped at 2 at a time; without a label, a subagent counts as `other`.
 - **Parent and subagent talk**: A subagent asks its parent a question with `contact_supervisor` and waits for the answer. You can answer it yourself with `/reply`. `agent_message` sends messages between parent and subagents.
-- **Inspectable**: `pi-famulus top`, `ls`, `show`, `agent` and `events` show what ran, why it ended, and why a notification did or did not arrive.
+- **Inspectable**: In a terminal, `pi-famulus top` is a live dashboard of sessions, subagents, shells and monitors. Open a subagent to read its conversation or a task to read its output, and stop a running shell or monitor from there. `ls`, `show`, `agent` and `events` show what ran, why it ended, and why a notification did or did not arrive.
 - **Tested against real models**: Tool descriptions are graded on real-model runs. The latest matrix (2026-10-08; 12 xAI and OpenAI configurations, 10 scenarios, k=10) recorded 1198 passes and 2 failures, with 6 invalid or errored episodes excluded ([eval/RESULTS.md](https://github.com/Leechael/pi-famulus/blob/main/eval/RESULTS.md)). It predates a later wording change to the `subagent` and wake prompts ([PR #62](https://github.com/Leechael/pi-famulus/pull/62)), which has not been through the full matrix yet.
 
 ## Usage Guide
@@ -135,7 +142,7 @@ pi-famulus starts and stops processes for you. This section states what it guara
 - **Which binary and versions am I running?** Type `/famulus`. It shows the `pi-famulus` binary path and its version, the running manager's version and pid, and the extension version.
 - **Why does my pi bash command hang on long builds?** With pi-famulus, `bash` stops waiting after 20 seconds and moves the command to the background, so the turn continues. To change the limit, set `foregroundBudgetMs` in `~/.pi/agent/pi-famulus/config.json` ([configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)).
 - **How do I see or stop running work?** Type `/tasks` in the pi TUI and press `ctrl+x` on an item. From a terminal, `pi-famulus ls` lists what is running.
-- **Does it work on Windows?** Yes, on x64 and arm64. The in-place upgrade, where the daemon re-executes itself, works only on Linux and macOS. On Windows, replace the binary and restart the daemon manually.
+- **Does it work on Windows?** Yes, on x64 and arm64. The in-place upgrade, where the daemon re-executes itself, works only on Linux and macOS. On Windows, replace the binary and restart the daemon manually. Unless `PI_FAMULUS_SHELL` names another shell, `bash` commands run in Git Bash when Git for Windows is installed, else in a `bash.exe` on `PATH` other than WSL's, else in `cmd.exe` ([configuration](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)). Git Bash's runtime can crash or hang when several copies start at the same moment ([git-for-windows/git#6368](https://github.com/git-for-windows/git/issues/6368)). With a posix shell (anything but `cmd.exe`), pi-famulus staggers shell start-ups to avoid it. A likely start-up crash ends as `shell-start-failed`. A task with no output and no process besides the shell after 20 seconds is stopped as `shell-start-hung`, so a silent command that runs only shell builtins for that long is stopped too. In both cases the agent is told to check for side effects before it retries.
 - **What if a notification does not arrive?** Run `pi-famulus events --id <id>` to see whether the wake was emitted, delivered and injected. Run `pi-famulus doctor` to check daemon health.
 
 ## Docs

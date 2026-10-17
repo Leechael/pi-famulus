@@ -16,7 +16,7 @@
  *   the next one. See design.md §4.6 "Child lifecycle".
  * - `hardTimeoutMs` (opt-in, default off) is the abort ceiling per turn:
  *   abort -> result {status:"interrupted", error:"timeout"};
- * - a stall watchdog aborts the child after `stallMs` (default 10min) without
+ * - a stall watchdog aborts the child after `stallMs` (default 5min) without
  *   any session event. A stall is treated as transient (a silently dropped
  *   provider stream): the child is aborted and auto-resumed on the SAME
  *   session with a continuation prompt, up to `stallRetries` times
@@ -79,7 +79,7 @@ export interface AdmissionTicket {
 
 export interface InProcessRunnerOptions {
   createSession: CreateSessionFn;
-  /** Stall watchdog timeout (ms). Default 10 minutes. */
+  /** Stall watchdog timeout (ms). Default 5 minutes. */
   stallMs?: number;
   /** Auto-resume attempts after a stall. Default 1; 0 settles stalled at once. */
   stallRetries?: number;
