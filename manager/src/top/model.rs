@@ -394,7 +394,10 @@ pub struct VisibleRow {
 #[derive(Debug, Clone)]
 pub struct EventRow {
     pub ts: u64,
+    /// Display form: the session's short prefix, or `-`.
     pub session: String,
+    /// The full session ID, for `--session` filtering.
+    pub session_id: Option<String>,
     pub src: String,
     pub ty: String,
     pub id: String,
@@ -872,10 +875,9 @@ impl TopState {
         if !self.session_allowed(&node.session_id) {
             return false;
         }
-        if !self.cwd_allowed(node.cwd.as_deref()) && node.kind == NodeKind::Session {
-            // A session with no cwd still passes when it has in-scope children;
-            // cwd is enforced on leaves/agents below.
-        } else if !self.cwd_allowed(node.cwd.as_deref()) && matches!(node.kind, NodeKind::Task | NodeKind::Agent | NodeKind::Main) {
+        // A session outside the cwd (or with none) is still drawn when one of
+        // its children is in scope; the tree walk checks that separately.
+        if !self.cwd_allowed(node.cwd.as_deref()) {
             return false;
         }
         match self.scope {
@@ -1078,7 +1080,7 @@ impl TopState {
         self.events
             .iter()
             .rev()
-            .filter(|e| self.session_allowed(if e.session == "-" { "" } else { &e.session }) || e.session == "-")
+            .filter(|e| e.session_id.as_deref().is_none_or(|s| self.session_allowed(s)))
             .filter(|e| self.events_id.as_ref().is_none_or(|id| e.keys.iter().any(|k| k == id) || e.id == *id))
             .filter(|e| {
                 q.is_empty()
@@ -1244,6 +1246,10 @@ impl TopState {
     }
 
     pub fn jump_events_for_selected(&mut self) {
+        // An Events row's id is synthetic and names no event key.
+        if self.tab == Tab::Events {
+            return;
+        }
         if let Some(id) = self.selected.clone() {
             let key = self.nodes.get(&id).map(|n| match n.kind {
                 NodeKind::Session => n.session_id.clone(),
@@ -1660,10 +1666,11 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
             n.metrics.running,
             n.metrics.started_at,
             n.metrics.wall_ms,
+            n.metrics.active_at,
         )
     });
     let mut m = Metrics::default();
-    if let Some((tin, tout, toks, rate, cr, cw, llm, tool, queue, running, started, wall)) = own_tokens {
+    if let Some((tin, tout, toks, rate, cr, cw, llm, tool, queue, running, started, wall, active)) = own_tokens {
         if kind == NodeKind::Agent {
             m.tokens_in = tin;
             m.tokens_out = tout;
@@ -1678,7 +1685,9 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
         }
         m.running = running;
         m.started_at = started;
-        m.active_at = started;
+        // A node's own activity (a session's last_seen, an agent's end)
+        // counts too, not only its start.
+        m.active_at = active.max(started);
     }
     for c in &children {
         let Some(cn) = nodes.get(c) else { continue };
@@ -1817,6 +1826,7 @@ fn event_row(e: &EventLine, prefixes: &HashMap<String, String>) -> EventRow {
             .as_ref()
             .map(|s| prefixes.get(s).cloned().unwrap_or_else(|| s.clone()))
             .unwrap_or_else(|| "-".into()),
+        session_id: e.session.clone(),
         src: e.src.clone(),
         ty: e.ty.clone(),
         id: e.id.clone().unwrap_or_else(|| "-".into()),

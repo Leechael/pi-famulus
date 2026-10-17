@@ -123,6 +123,11 @@ fn wrap_paragraph(para: &str, max: usize, out: &mut Vec<String>) {
                 line = rest;
                 w = display_width(&line);
                 brk = None;
+                // The carried word plus this character can still overflow.
+                if w + cw > max && !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                    w = 0;
+                }
             } else {
                 out.push(std::mem::take(&mut line));
                 w = 0;
@@ -364,6 +369,8 @@ mod tests {
         assert_eq!(display_width(&pad("中", 4)), 4);
         assert_eq!(wrap_width("hello world", 8), vec!["hello", "world"]);
         assert_eq!(wrap_width("中文字符", 5), vec!["中文", "字符"]);
+        // A word carried past a space break still fits the width.
+        assert_eq!(wrap_width(" 中文", 3), vec!["", "中", "文"]);
         assert_eq!(wrap_width("abc\n\ndef", 10), vec!["abc", "", "def"]);
         assert_eq!(scrub_tty("\x1b[32mok\x1b[0m"), "ok");
         assert_eq!(scrub_tty("Rebasing (1/2)\rRebasing (2/2)\nDone"), "Rebasing (2/2)\nDone");

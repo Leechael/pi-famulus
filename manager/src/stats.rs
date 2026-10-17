@@ -328,9 +328,23 @@ pub fn render(groups: &[Group], by: By) -> Vec<String> {
         .collect()
 }
 
-pub async fn cmd_top(home: &Path, json: bool) -> Result<(), String> {
-    let snap = inspect::snapshot(home, Live::IfRunning).await?;
+pub async fn cmd_top(home: &Path, json: bool, session: Option<&str>, cwd: Option<&str>) -> Result<(), String> {
+    let mut snap = inspect::snapshot(home, Live::IfRunning).await?;
     inspect::warn_if_older_daemon(&snap);
+    // The same --session / --cwd scope as the live view: tasks by their own
+    // cwd, agents by their session's.
+    let dir = cwd.map(inspect::normalize_dir);
+    let session_ok = |sid: &str| session.is_none_or(|p| sid.starts_with(p));
+    snap.tasks
+        .retain(|t| session_ok(&t.session_id) && dir.as_ref().is_none_or(|d| inspect::under_dir(&t.cwd, d)));
+    let session_cwd: HashMap<String, Option<String>> =
+        snap.sessions.iter().map(|(id, s)| (id.clone(), s.cwd.clone())).collect();
+    snap.agents.retain(|a| {
+        session_ok(&a.session_id)
+            && dir.as_ref().is_none_or(|d| {
+                session_cwd.get(&a.session_id).and_then(|c| c.as_deref()).is_some_and(|c| inspect::under_dir(c, d))
+            })
+    });
     let tasks: Vec<&TaskRecord> = snap.tasks.iter().collect();
     let names: HashMap<String, String> = snap.agents.iter().map(|a| (a.child_id.clone(), a.name.clone())).collect();
     let prefixes = inspect::session_prefixes(snap.sessions.keys().map(|s| s.as_str()).chain(tasks.iter().map(|t| t.session_id.as_str())));

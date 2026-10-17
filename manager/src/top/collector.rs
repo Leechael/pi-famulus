@@ -527,7 +527,11 @@ fn tail_file(path: &Path) -> Vec<String> {
         Ok((bytes, _)) => {
             let text = String::from_utf8_lossy(&bytes);
             // `lines` strips one `\r` of a CRLF; pty output can carry a second.
-            let lines: Vec<String> = text.lines().map(|s| s.trim_end_matches('\r').to_string()).collect();
+            let mut lines: Vec<String> = text.lines().map(|s| s.trim_end_matches('\r').to_string()).collect();
+            // A tail that starts mid-file starts mid-line: drop the fragment.
+            if off > 0 && lines.len() > 1 {
+                lines.remove(0);
+            }
             if lines.is_empty() {
                 vec!["(empty)".into()]
             } else {

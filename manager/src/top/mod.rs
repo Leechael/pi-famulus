@@ -463,6 +463,8 @@ fn handle_search(d: &mut Detail, key: KeyEvent) {
         KeyCode::Esc => {
             d.log.query.clear();
             d.log.editing = false;
+            d.log.matches.clear();
+            d.log.current = 0;
         }
         KeyCode::Enter => d.log.editing = false,
         KeyCode::Tab => d.log.filter = !d.log.filter,
@@ -603,17 +605,26 @@ fn request_stop(state: &mut TopState) {
     }
 }
 
+/// The stop runs on the UI loop, so a daemon that never answers must not
+/// freeze keys and drawing: give up after a few seconds.
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn stop_task(home: &Path, task_id: &str) -> Result<(), String> {
-    let mut conn = client::connect_existing(home, &HelloMode::Cli)
+    let stop = async {
+        let mut conn = client::connect_existing(home, &HelloMode::Cli)
+            .await
+            .map_err(|_| "pi-famulus is not running".to_string())?;
+        let _: UnitOk = conn
+            .roundtrip(RequestKind::Stop {
+                task_id: task_id.to_string(),
+                reason: Some("tui".into()),
+            })
+            .await?;
+        Ok(())
+    };
+    tokio::time::timeout(STOP_TIMEOUT, stop)
         .await
-        .map_err(|_| "pi-famulus is not running".to_string())?;
-    let _: UnitOk = conn
-        .roundtrip(RequestKind::Stop {
-            task_id: task_id.to_string(),
-            reason: Some("tui".into()),
-        })
-        .await?;
-    Ok(())
+        .unwrap_or_else(|_| Err(format!("stop {task_id}: pi-famulus did not answer")))
 }
 
 struct TerminalGuard;
@@ -621,7 +632,11 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // No guard exists yet to undo raw mode, so undo it here on failure.
+        if let Err(e) = execute!(stdout(), EnterAlternateScreen, EnableMouseCapture) {
+            let _ = restore();
+            return Err(e);
+        }
         let prev = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let _ = restore();

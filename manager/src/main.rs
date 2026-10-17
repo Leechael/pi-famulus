@@ -182,7 +182,7 @@ async fn async_main() {
             cwd,
         } => {
             if !top::wants_interactive(json, once) {
-                run_client(stats::cmd_top(&home, json)).await
+                run_client(stats::cmd_top(&home, json, session.as_deref(), cwd.as_deref())).await
             } else {
                 match crate::fmt::parse_duration(&interval) {
                     Ok(ms) if ms > 0 => run_client(top::run(&home, ms, session, cwd)).await,

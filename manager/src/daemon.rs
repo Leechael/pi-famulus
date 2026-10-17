@@ -1701,6 +1701,17 @@ pub struct StartSpec {
     pub label: Option<String>,
 }
 
+/// A client label is display text: one line, no control characters, and no
+/// longer than a clipped command, so it cannot break a row or bloat records.
+fn clean_label(raw: &str) -> Option<String> {
+    let line: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then(|| crate::events::clip_chars(&line, crate::events::COMMAND_CHARS))
+}
+
 fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk, ProtoError> {
     let StartSpec {
         kind,
@@ -1712,6 +1723,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         key,
         label,
     } = spec;
+    let label = label.as_deref().and_then(clean_label);
     let (session_id, home) = {
         let st = state.lock().unwrap();
         if st.shutdown {
@@ -3901,6 +3913,14 @@ fn admit_agent(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn client_labels_are_one_clipped_line() {
+        assert_eq!(clean_label("watch\n\x1b[31mbuild\t "), Some("watch [31mbuild".into()));
+        assert_eq!(clean_label(" \n "), None);
+        let long = clean_label(&"x".repeat(500)).unwrap();
+        assert_eq!(long.chars().count(), crate::events::COMMAND_CHARS);
+    }
 
     fn running_record_for_cpu_test() -> TaskRecord {
         serde_json::from_value(json!({
