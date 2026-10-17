@@ -33,6 +33,13 @@ pub struct Conn {
     wr: WriteHalf<Stream>,
 }
 
+impl Conn {
+    /// The live `top` view keeps reading events while it writes commands.
+    pub(crate) fn into_halves(self) -> (ReadHalf<Stream>, WriteHalf<Stream>) {
+        (self.rd, self.wr)
+    }
+}
+
 // Framing violations are permanent protocol failures, not disconnections.
 const PROTOCOL_FRAMING_PREFIX: &str = "protocol framing: ";
 
@@ -1018,66 +1025,6 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     } else {
         outln!("{} problem(s) found", r.failures);
         1
-    }
-}
-
-/// Live transcript of a hosted subagent, with a line of input.
-pub async fn cmd_attach(home: &Path, target: &str) -> Result<(), String> {
-    let mut conn = connect_existing(home, &HelloMode::Cli).await?;
-    let _: UnitOk = conn
-        .roundtrip(RequestKind::AgentWatch { child_id: target.to_string() })
-        .await?;
-    println!("attached to {target}. Each line is sent to the subagent. Ctrl-D closes.");
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let lock = stdin.lock();
-        for line in std::io::BufRead::lines(lock) {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    let mut waiting: Option<String> = None;
-    loop {
-        tokio::select! {
-            line = rx.recv(), if waiting.is_none() => {
-                let Some(line) = line else { return Ok(()) };
-                if line.is_empty() { continue; }
-                let id = new_request_id();
-                let req = Request {
-                    v: Some(PROTO_VERSION),
-                    id: id.clone(),
-                    kind: RequestKind::AgentInput {
-                        child_id: target.to_string(),
-                        op: "prompt_steer".into(),
-                        text: line,
-                        source: "user".into(),
-                        since: None,
-                    },
-                };
-                write_frame(&mut conn.wr, &encode(&req)).await.map_err(|e| format!("send: {e}"))?;
-                waiting = Some(id);
-            }
-            frame = read_frame(&mut conn.rd) => {
-                let bytes = frame.map_err(|e| format!("recv: {e}"))?.ok_or_else(|| "manager closed the connection".to_string())?;
-                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("bad JSON: {e}"))?;
-                if value.get("id").and_then(|id| id.as_str()) == waiting.as_deref() {
-                    if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
-                        println!("send failed: {}", value["error"]);
-                    }
-                    waiting = None;
-                    continue;
-                }
-                match value.get("event").and_then(|event| event.as_str()) {
-                    Some("agent_rpc") => println!("{}", value["record"]),
-                    Some("agent_state") => println!("[{} {} {}]", value["activity"].as_str().unwrap_or("?"), value["residency"].as_str().unwrap_or("?"), value["driver"].as_str().unwrap_or("parent")),
-                    Some("agent_ui") => println!("dialog: {}", value["request"]),
-                    _ => {}
-                }
-            }
-        }
     }
 }
 

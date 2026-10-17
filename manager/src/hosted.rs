@@ -972,6 +972,7 @@ fn rpc_line(id: &str, op: &str, text: &str, since: Option<&str>) -> String {
         "prompt_steer" => json!({"id": id, "type": "prompt", "message": text, "streamingBehavior": "steer"}),
         "prompt_follow" => json!({"id": id, "type": "prompt", "message": text, "streamingBehavior": "followUp"}),
         "abort" => json!({"id": id, "type": "abort"}),
+        "clear_queue" => json!({"id": id, "type": "clear_queue"}),
         "get_state" => json!({"id": id, "type": "get_state"}),
         "get_last_assistant_text" => json!({"id": id, "type": "get_last_assistant_text"}),
         "get_entries" => {

@@ -653,6 +653,45 @@ pub struct TopState {
     pub cpu_hist: Vec<f64>,
     /// Recent running-task counts, oldest first, one per snapshot.
     pub run_hist: Vec<f64>,
+    /// Open `top` already inside this agent's live conversation (`pi-famulus attach`).
+    pub focus: Option<String>,
+    /// Input line for the open agent detail. Absent for task details.
+    pub composer: Option<AgentComposer>,
+    /// Commands the UI loop should hand to the live watch (`op`, `text`).
+    pub pending_live: Vec<(String, String)>,
+}
+
+/// What the user is typing to a hosted subagent, plus the header facts.
+#[derive(Debug, Clone)]
+pub struct AgentComposer {
+    pub child_id: String,
+    pub input: String,
+    pub activity: String,
+    pub residency: String,
+    pub model: String,
+    pub cache: String,
+    pub context: String,
+    pub esc_armed: bool,
+    /// Live events are updating the transcript, so disk snapshots must not replace it.
+    pub connected: bool,
+    pub draft: bool,
+}
+
+impl AgentComposer {
+    pub fn new(child_id: String) -> Self {
+        Self {
+            child_id,
+            input: String::new(),
+            activity: "…".into(),
+            residency: "…".into(),
+            model: String::new(),
+            cache: String::new(),
+            context: String::new(),
+            esc_armed: false,
+            connected: false,
+            draft: false,
+        }
+    }
 }
 
 /// Samples kept for the header graphs (two minutes at the default 1s).
@@ -703,6 +742,9 @@ impl TopState {
             mouse: MouseHit::default(),
             cpu_hist: Vec::new(),
             run_hist: Vec::new(),
+            focus: None,
+            composer: None,
+            pending_live: Vec::new(),
         }
     }
 

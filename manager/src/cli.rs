@@ -285,8 +285,7 @@ pub(crate) enum Sub {
         #[usage(double_dash = "automatic")]
         command: String,
     },
-    /// Talk to a hosted subagent. Prints its event stream and sends each
-    /// typed line as a prompt (steered while it is running).
+    /// Open `top` on one hosted subagent, with a live transcript and an input line.
     #[usage(display_order = 145, help_heading = "Acting on tasks")]
     Attach {
         /// Child id or pi session id.

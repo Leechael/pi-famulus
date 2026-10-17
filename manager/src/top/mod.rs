@@ -5,13 +5,15 @@
 //! screen) is guaranteed on return, error, and panic.
 
 pub mod collector;
+pub mod live;
 pub mod model;
 pub mod ui;
 
 use crate::client::{self, HelloMode};
 use crate::proto::{RequestKind, UnitOk};
 use crate::top::collector::{open_detail, CollectView, Collector, Tick};
-use crate::top::model::{Detail, DetailBody, NodeKind, Tab, TabHit, TopState};
+use crate::top::live::{LiveCmd, LiveMsg};
+use crate::top::model::{AgentComposer, Chat, Detail, DetailBody, NodeKind, Tab, TabHit, TopState};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -39,8 +41,15 @@ pub fn wants_interactive(json: bool, once: bool) -> bool {
     !json && !once && crate::sys::stdio_interactive()
 }
 
-pub async fn run(home: &Path, interval_ms: u64, session: Option<String>, cwd: Option<String>) -> Result<(), String> {
+pub async fn run(
+    home: &Path,
+    interval_ms: u64,
+    session: Option<String>,
+    cwd: Option<String>,
+    focus: Option<String>,
+) -> Result<(), String> {
     let mut state = TopState::new(interval_ms, session, cwd);
+    state.focus = focus;
     state.message = Some("loading…".into());
 
     let _guard = TerminalGuard::enter().map_err(|e| e.to_string())?;
@@ -62,6 +71,8 @@ pub async fn run(home: &Path, interval_ms: u64, session: Option<String>, cwd: Op
         }
     });
 
+    let (live_tx, mut live_rx) = mpsc::unbounded_channel::<LiveMsg>();
+    let mut live_slot: Option<(String, mpsc::UnboundedSender<LiveCmd>)> = None;
     let (tick_tx, mut tick_rx) = mpsc::channel::<Result<Tick, String>>(1);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CollectorCmd>();
     let home_buf = home.to_path_buf();
@@ -110,6 +121,7 @@ pub async fn run(home: &Path, interval_ms: u64, session: Option<String>, cwd: Op
                     break;
                 }
             }
+            Some(msg) = live_rx.recv() => apply_live(&mut state, msg),
             _ = tokio::time::sleep(Duration::from_millis(80)), if anim => {}
         }
         while let Ok(ev) = ev_rx.try_recv() {
@@ -120,6 +132,18 @@ pub async fn run(home: &Path, interval_ms: u64, session: Option<String>, cwd: Op
         while let Ok(res) = tick_rx.try_recv() {
             apply_latest(&mut state, &mut tick_rx, res);
         }
+        while let Ok(msg) = live_rx.try_recv() {
+            apply_live(&mut state, msg);
+        }
+        sync_live(&mut state, home, &mut live_slot, &live_tx);
+        for (op, text) in std::mem::take(&mut state.pending_live) {
+            if let Some((_, tx)) = &live_slot {
+                let _ = tx.send(LiveCmd::Send { op, text });
+            }
+        }
+    }
+    if let Some((_, tx)) = live_slot {
+        let _ = tx.send(LiveCmd::Stop);
     }
     Ok(())
 }
@@ -197,8 +221,202 @@ fn apply_tick(state: &mut TopState, tick: Tick) {
         }
     }
     state.preview_body = tick.preview_body;
-    if let (Some(d), Some(body)) = (state.detail.as_mut(), tick.detail_body) {
-        d.body = body;
+    let body = tick.detail_body;
+    let live = state.composer.as_ref().map(|c| c.connected).unwrap_or(false);
+    if !live {
+        if let Some(body) = body {
+            if let Some(d) = state.detail.as_mut() {
+                d.body = body;
+            }
+        }
+    }
+    let focus = state.focus.is_some() && state.detail.is_none();
+    if focus {
+        open_focused(state);
+    }
+}
+
+fn open_focused(state: &mut TopState) {
+    let Some(id) = state.focus.clone() else { return };
+    state.focus = None;
+    if state.nodes.contains_key(&id) {
+        state.selected = Some(id.clone());
+    }
+    if let Some(d) = open_detail(state) {
+        if d.id == id {
+            state.detail = Some(d);
+            return;
+        }
+    }
+    state.detail = Some(Detail {
+        id: id.clone(),
+        tab: 0,
+        follow: true,
+        hold: false,
+        scroll: 0,
+        title: id,
+        tabs: Vec::new(),
+        body: DetailBody::Conversation(Chat {
+            turns: Vec::new(),
+            agent: String::new(),
+            stats: Vec::new(),
+            note: None,
+            running: false,
+        }),
+        wrap_len: 0,
+        view_h: 0,
+        tools_expanded: false,
+        open: std::collections::HashSet::new(),
+        hits: Vec::new(),
+        log: crate::top::model::LogView::default(),
+        fold_count: 0,
+    });
+}
+
+fn sync_live(
+    state: &mut TopState,
+    home: &Path,
+    slot: &mut Option<(String, mpsc::UnboundedSender<LiveCmd>)>,
+    live_tx: &mpsc::UnboundedSender<LiveMsg>,
+) {
+    let want = state.detail.as_ref().filter(|d| d.tabs.is_empty()).map(|d| d.id.clone());
+    match (want, slot.as_ref().map(|(id, _)| id.clone())) {
+        (Some(id), Some(cur)) if cur == id => {}
+        (Some(id), _) => {
+            if let Some((_, tx)) = slot.take() {
+                let _ = tx.send(LiveCmd::Stop);
+            }
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let tx = live_tx.clone();
+            let home = home.to_path_buf();
+            let watch_id = id.clone();
+            tokio::spawn(async move { live::run(home, watch_id, tx, cmd_rx).await });
+            *slot = Some((id.clone(), cmd_tx));
+            if state.composer.as_ref().map(|c| c.child_id.as_str()) != Some(id.as_str()) {
+                state.composer = Some(AgentComposer::new(id));
+            }
+        }
+        (None, Some(_)) => {
+            if let Some((_, tx)) = slot.take() {
+                let _ = tx.send(LiveCmd::Stop);
+            }
+            state.composer = None;
+        }
+        (None, None) => {}
+    }
+}
+
+fn apply_live(state: &mut TopState, msg: LiveMsg) {
+    let Some(composer) = state.composer.as_mut() else { return };
+    let Some(detail) = state.detail.as_mut() else { return };
+    if detail.id != composer.child_id {
+        return;
+    }
+    match msg {
+        LiveMsg::Error(text) => state.message = Some(text),
+        LiveMsg::Restored(text) => {
+            if !text.is_empty() {
+                composer.input = text;
+            }
+            composer.esc_armed = false;
+            state.message = Some("aborted; queued text is back in the input".into());
+        }
+        LiveMsg::Turns(turns) => {
+            composer.connected = true;
+            composer.draft = false;
+            conversation(detail).turns = turns;
+            detail.follow = true;
+        }
+        LiveMsg::Delta(delta) => {
+            composer.connected = true;
+            let chat = conversation(detail);
+            if composer.draft {
+                if let Some(last) = chat.turns.last_mut() {
+                    last.text.push_str(&delta);
+                }
+            } else {
+                composer.draft = true;
+                chat.turns.push(crate::inspect::TranscriptTurn {
+                    role: "assistant".into(),
+                    tool: None,
+                    args: None,
+                    text: delta,
+                    ts: None,
+                    error: false,
+                });
+            }
+            chat.running = true;
+        }
+        LiveMsg::Assistant(text) => {
+            composer.connected = true;
+            let chat = conversation(detail);
+            if composer.draft {
+                if let Some(last) = chat.turns.last_mut() {
+                    last.text = text;
+                }
+                composer.draft = false;
+            } else {
+                chat.turns.push(crate::inspect::TranscriptTurn {
+                    role: "assistant".into(),
+                    tool: None,
+                    args: None,
+                    text,
+                    ts: None,
+                    error: false,
+                });
+            }
+        }
+        LiveMsg::User(text) => {
+            composer.connected = true;
+            composer.draft = false;
+            conversation(detail).turns.push(crate::inspect::TranscriptTurn {
+                role: "user".into(),
+                tool: None,
+                args: None,
+                text,
+                ts: None,
+                error: false,
+            });
+        }
+        LiveMsg::State { activity, residency, cache } => {
+            composer.connected = true;
+            if !activity.is_empty() {
+                composer.activity = activity;
+            }
+            if !residency.is_empty() {
+                composer.residency = residency;
+            }
+            if !cache.is_empty() {
+                composer.cache = cache;
+            }
+            if let DetailBody::Conversation(chat) = &mut detail.body {
+                chat.running = composer.activity == "running";
+            }
+        }
+        LiveMsg::Meta { model, context } => {
+            if !model.is_empty() {
+                composer.model = model;
+            }
+            if !context.is_empty() {
+                composer.context = context;
+            }
+        }
+    }
+}
+
+fn conversation(detail: &mut Detail) -> &mut Chat {
+    if !matches!(detail.body, DetailBody::Conversation(_)) {
+        detail.body = DetailBody::Conversation(Chat {
+            turns: Vec::new(),
+            agent: String::new(),
+            stats: Vec::new(),
+            note: None,
+            running: false,
+        });
+    }
+    match &mut detail.body {
+        DetailBody::Conversation(chat) => chat,
+        _ => unreachable!(),
     }
 }
 
@@ -484,6 +702,13 @@ fn handle_search(d: &mut Detail, key: KeyEvent) {
 }
 
 fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
+    let live = {
+        let Some(d) = state.detail.as_ref() else { return false };
+        state.composer.as_ref().is_some_and(|c| c.child_id == d.id) && d.tabs.is_empty()
+    };
+    if live {
+        return handle_live_keys(state, key);
+    }
     let Some(d) = state.detail.as_mut() else {
         return false;
     };
@@ -524,6 +749,77 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
         KeyCode::End | KeyCode::Char('G') => {
             d.follow = true;
             d.hold = false;
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Agent detail: letters go to the input line. Arrows still scroll.
+/// Enter sends (steered while the child is running). Alt-Enter queues a
+/// follow-up. Esc twice clears the queue, aborts, and puts that text back.
+fn handle_live_keys(state: &mut TopState, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            if let Some(d) = state.detail.as_mut() { detail_scroll_up(d, 1); }
+            return false;
+        }
+        KeyCode::Down => {
+            if let Some(d) = state.detail.as_mut() { detail_scroll_down(d, 1); }
+            return false;
+        }
+        KeyCode::PageUp => {
+            if let Some(d) = state.detail.as_mut() { detail_scroll_up(d, 16); }
+            return false;
+        }
+        KeyCode::PageDown => {
+            if let Some(d) = state.detail.as_mut() { detail_scroll_down(d, 16); }
+            return false;
+        }
+        KeyCode::Char('q')
+            if state.composer.as_ref().is_some_and(|c| c.input.is_empty())
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            state.detail = None;
+            return false;
+        }
+        _ => {}
+    }
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let Some(composer) = state.composer.as_mut() else { return false };
+    match key.code {
+        KeyCode::Esc => {
+            if composer.esc_armed {
+                composer.esc_armed = false;
+                state.pending_live.push(("abort".into(), String::new()));
+                state.message = Some("aborting…".into());
+            } else {
+                composer.esc_armed = true;
+                state.message = Some("esc again aborts this turn".into());
+            }
+        }
+        KeyCode::Enter if alt => {
+            composer.esc_armed = false;
+            let text = std::mem::take(&mut composer.input);
+            if !text.is_empty() {
+                state.pending_live.push(("prompt_follow".into(), text));
+            }
+        }
+        KeyCode::Enter => {
+            composer.esc_armed = false;
+            let text = std::mem::take(&mut composer.input);
+            if !text.is_empty() {
+                let op = if composer.activity == "running" { "prompt_steer" } else { "prompt" };
+                state.pending_live.push((op.into(), text));
+            }
+        }
+        KeyCode::Backspace => {
+            composer.esc_armed = false;
+            composer.input.pop();
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            composer.esc_armed = false;
+            composer.input.push(c);
         }
         _ => {}
     }
@@ -605,7 +901,7 @@ fn request_stop(state: &mut TopState) {
     }
     match state.selected_node() {
         Some(n) if n.kind == NodeKind::Agent => {
-            state.message = Some("agents run inside pi; stop from /tasks or ask the agent".into());
+            state.message = Some("Enter opens this subagent; esc twice there aborts its turn".into());
         }
         Some(n) if n.kind == NodeKind::Task => {
             state.message = Some(format!("{} is not running", n.id));
@@ -695,6 +991,55 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn agent_detail() -> Detail {
+        Detail {
+            id: "ch_1".into(),
+            tab: 0,
+            follow: true,
+            hold: false,
+            scroll: 0,
+            title: "ch_1".into(),
+            tabs: Vec::new(),
+            body: DetailBody::Conversation(crate::top::model::Chat {
+                turns: Vec::new(),
+                agent: "worker".into(),
+                stats: Vec::new(),
+                note: None,
+                running: false,
+            }),
+            wrap_len: 0,
+            view_h: 0,
+            tools_expanded: false,
+            open: HashSet::new(),
+            hits: Vec::new(),
+            log: LogView::default(),
+            fold_count: 0,
+        }
+    }
+
+    #[test]
+    fn live_agent_detail_types_sends_and_aborts_on_a_second_esc() {
+        let mut state = TopState::new(1_000, None, None);
+        state.detail = Some(agent_detail());
+        state.composer = Some(crate::top::model::AgentComposer::new("ch_1".into()));
+        handle_detail(&mut state, key(KeyCode::Char('h')));
+        handle_detail(&mut state, key(KeyCode::Char('i')));
+        handle_detail(&mut state, key(KeyCode::Enter));
+        assert_eq!(state.pending_live, vec![("prompt".into(), "hi".into())]);
+        state.composer.as_mut().unwrap().activity = "running".into();
+        state.composer.as_mut().unwrap().input = "more".into();
+        handle_detail(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(state.pending_live[1], ("prompt_follow".into(), "more".into()));
+        handle_detail(&mut state, key(KeyCode::Esc));
+        assert!(state.composer.as_ref().unwrap().esc_armed);
+        handle_detail(&mut state, key(KeyCode::Esc));
+        assert_eq!(state.pending_live[2].0, "abort");
+        assert!(state.detail.is_some(), "abort stays on the conversation");
+        state.composer.as_mut().unwrap().input.clear();
+        handle_detail(&mut state, key(KeyCode::Char('q')));
+        assert!(state.detail.is_none());
     }
 
     #[test]
