@@ -71,7 +71,7 @@ pi install npm:pi-famulus
 - **一个守护进程管所有 shell 和 monitor**：守护进程是你所有 pi 会话里每个 shell 和 monitor 任务的父进程。它崩溃或被 `kill -9` 杀掉时，每个任务的进程组都会被停止。用 `setsid` 进入新会话的命令不受这个约束。
 - **共享并发上限**：默认情况下，整台机器上所有 pi 会话加起来最多同时运行 8 个子代理（用 `pi-famulus config set max-agents <n>` 修改），其余的排队等待。标为 `work_kind: "test-suite"` 或 `"test"` 的子代理同时最多 2 个；没有标注的子代理算作 `other`。
 - **父子对话**：子代理用 `contact_supervisor` 向父代理提问并等待回答，你也可以用 `/reply` 自己回答。`agent_message` 在父代理和子代理之间传消息。
-- **可查**：`pi-famulus top`、`ls`、`show`、`agent`、`events` 能看到跑了什么、为什么结束、通知为什么到了或没到。
+- **可查**：在终端里，`pi-famulus top` 是会话、子代理、shell 和 monitor 的实时面板。打开子代理能看它的对话，打开任务能看它的输出，也能在面板里停掉正在跑的 shell 或 monitor。`ls`、`show`、`agent`、`events` 能看到跑了什么、为什么结束、通知为什么到了或没到。
 - **用真实模型测过**：工具描述按真实模型的运行结果打分。最近一轮矩阵（2026-10-08；12 种 xAI 和 OpenAI 配置，10 个场景，k=10）记录了 1198 次通过、2 次失败，另有 6 个无效或出错的 episode 不计入（[eval/RESULTS.md](https://github.com/Leechael/pi-famulus/blob/main/eval/RESULTS.md)）。这轮矩阵早于之后对 `subagent` 和唤醒提示词的一次措辞修改（[PR #62](https://github.com/Leechael/pi-famulus/pull/62)），那次修改还没跑过完整矩阵。
 
 ## Usage Guide
