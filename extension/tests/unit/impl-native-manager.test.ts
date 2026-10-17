@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -301,5 +302,85 @@ describe("native lookup for every published platform", () => {
       .toBe(join("/xdg-cache", "pi-famulus", "native", pkg.version, "darwin-x64"));
     expect(nativeCacheDir({ platform: "linux", arch: "x64", version: pkg.version, env: {}, home: "/home/u" }))
       .toBe(join("/home/u", ".cache", "pi-famulus", "native", pkg.version, "linux-x64"));
+  });
+});
+
+describe.skipIf(!hostNativeName)("native cache install failures", () => {
+  let root = "";
+  afterEach(() => {
+    if (root) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    root = "";
+  });
+
+  function fromFile() {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "native-fail-")));
+    const from = join(root, "src", "native-manager.js");
+    mkdirSync(dirname(from), { recursive: true });
+    writeFileSync(from, "");
+    return from;
+  }
+
+  it("returns null instead of throwing when the cache directory cannot be created", () => {
+    const from = fromFile();
+    const blocker = join(root, "not-a-directory");
+    writeFileSync(blocker, "x");
+    expect(ensureNativeManagerInstalled({
+      from, stopAt: root, cacheDir: join(blocker, "cache"), env: {},
+      spawn() { throw new Error("spawned"); },
+    })).toBeNull();
+  });
+
+  it("does not install when the caller disables the cache", () => {
+    const from = fromFile();
+    expect(ensureNativeManagerInstalled({
+      from, stopAt: root, cacheDir: false, env: {},
+      spawn() { throw new Error("spawned"); },
+    })).toBeNull();
+  });
+
+  it("keeps a binary that landed even when npm reports failure", () => {
+    const from = fromFile();
+    const cache = join(root, "cache");
+    const binary = join(cache, "node_modules", hostNativeName!, "bin", hostExe);
+    const found = ensureNativeManagerInstalled({
+      from, stopAt: root, cacheDir: cache, env: {},
+      spawn() {
+        mkdirSync(dirname(binary), { recursive: true });
+        writeFileSync(join(cache, "node_modules", hostNativeName!, "package.json"), JSON.stringify({
+          name: hostNativeName, version: pkg.version,
+          exports: { "./package.json": "./package.json", "./bin/pi-famulus": `./bin/${hostExe}` },
+        }));
+        writeFileSync(binary, "#!/bin/sh\nexit 0\n");
+        chmodSync(binary, 0o755);
+        return { status: 1 };
+      },
+    });
+    expect(found).toBe(binary);
+  });
+
+  it("replaces an install lock left by a dead process", () => {
+    const from = fromFile();
+    const cache = join(root, "cache");
+    mkdirSync(cache, { recursive: true });
+    const exited = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+    writeFileSync(`${cache}.install.lock`, String(exited.pid));
+    let spawned = false;
+    const found = ensureNativeManagerInstalled({
+      from, stopAt: root, cacheDir: cache, env: {},
+      spawn() {
+        spawned = true;
+        const binary = join(cache, "node_modules", hostNativeName!, "bin", hostExe);
+        mkdirSync(dirname(binary), { recursive: true });
+        writeFileSync(join(cache, "node_modules", hostNativeName!, "package.json"), JSON.stringify({
+          name: hostNativeName, version: pkg.version,
+          exports: { "./package.json": "./package.json", "./bin/pi-famulus": `./bin/${hostExe}` },
+        }));
+        writeFileSync(binary, "#!/bin/sh\nexit 0\n");
+        chmodSync(binary, 0o755);
+        return { status: 0 };
+      },
+    });
+    expect(spawned).toBe(true);
+    expect(found).toBe(join(cache, "node_modules", hostNativeName!, "bin", hostExe));
   });
 });

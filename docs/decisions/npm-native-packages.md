@@ -55,7 +55,7 @@ Published is terminal for this release set. Installing or rolling back a client 
 
 Consumers: npm uses package metadata; the extension and CLI share a native resolver; source tests use local development lock records; CI prepares/installs real tarballs; publishing validates those same artifacts. Historical eval harnesses and installed runtime records do not migrate through this flow.
 
-Missing/invalid/omitted native dependencies permit explicit/manual discovery for the extension. When none of those candidates exist, the extension and npm CLI install the exact platform package into a versioned user cache with npm (still the registry, not the runtime home) and use that binary. `PI_FAMULUS_NO_NATIVE_FETCH=1` leaves the omission visible and the session degraded. The npm CLI exits with an actionable error when that install cannot run. Unexpected infrastructure errors are not silently swallowed. Repeating package preparation uses a new inode, protecting macOS code-signing semantics.
+Missing/invalid/omitted native dependencies permit explicit/manual discovery for the extension. When none of those candidates exist, the extension and npm CLI install the exact platform package into a versioned user cache with npm (still the registry, not the runtime home) and use that binary. `PI_FAMULUS_NO_NATIVE_FETCH=1` and pi's `PI_OFFLINE=1` leave the omission visible and the session degraded. The npm CLI exits with an actionable error when that install cannot run. Unexpected infrastructure errors are not silently swallowed. Repeating package preparation uses a new inode, protecting macOS code-signing semantics.
 
 ## Consequences
 

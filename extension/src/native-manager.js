@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -172,11 +172,71 @@ export function describeNativeLookup(options) {
   return found.path ? `npm ${name} ${found.path}` : `npm ${name} (${found.detail})`;
 }
 
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** A lock left by a dead process, or held far longer than one npm install, can be replaced. */
+function installLockIsStale(lockPath) {
+  try {
+    const age = Date.now() - statSync(lockPath).mtimeMs;
+    const pid = Number(readFileSync(lockPath, "utf8").trim());
+    if (Number.isInteger(pid) && pid > 0) return !pidAlive(pid) || age > 150_000;
+    return age > 5_000;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * One npm install per cache directory. Another startup either waits until that
+ * install publishes a binary or takes over a stale lock. Returns the open lock,
+ * or null when waiting itself produced a usable binary.
+ */
+function acquireInstallLock(dir, lookup) {
+  mkdirSync(dir, { recursive: true });
+  const lockPath = `${dir}.install.lock`;
+  const deadline = Date.now() + 130_000;
+  while (Date.now() <= deadline) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try { writeSync(fd, String(process.pid)); } catch { /* the fd is still the lock */ }
+      return { fd, lockPath };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const ready = resolveNativeManagerPath(lookup);
+      if (ready) return null;
+      if (installLockIsStale(lockPath)) {
+        rmSync(lockPath, { force: true });
+        continue;
+      }
+      sleepMs(200);
+    }
+  }
+  return null;
+}
+
+function releaseInstallLock(lock) {
+  if (!lock) return;
+  try { closeSync(lock.fd); } catch { /* already closed */ }
+  rmSync(lock.lockPath, { force: true });
+}
+
 /**
  * Install the exact platform package into the versioned cache when the
  * optional dependency is missing. No-ops when a usable binary is already
  * resolvable. `PI_FAMULUS_NO_NATIVE_FETCH=1`, `PI_OFFLINE=1`, and Vitest skip
- * the install.
+ * the install. Directory, manifest, and npm failures return null so startup
+ * degrades instead of throwing.
  */
 export function ensureNativeManagerInstalled({
   platform = process.platform,
@@ -189,30 +249,43 @@ export function ensureNativeManagerInstalled({
   stopAt,
 } = {}) {
   const lookup = { platform, arch, cacheDir, from, stopAt };
-  const existing = resolveNativeManagerPath(lookup);
-  if (existing) return existing;
-  if (!nativePackageName(platform, arch)) return null;
-  if (env.PI_FAMULUS_NO_NATIVE_FETCH === "1" || env.PI_OFFLINE === "1" || env.VITEST) return null;
-  const dir = cacheDir ?? nativeCacheDir({ platform, arch, env });
-  mkdirSync(dir, { recursive: true });
-  const manifest = join(dir, "package.json");
   try {
-    readFileSync(manifest);
-  } catch {
-    writeFileSync(manifest, `${JSON.stringify({ private: true, name: "pi-famulus-native-cache", version: "0.0.0" })}\n`);
-  }
-  const command = npmCommand ?? (platform === "win32" ? "npm.cmd" : "npm");
-  const name = nativePackageName(platform, arch);
-  let result;
-  try {
-    result = spawn(command, [
-      "install", `${name}@${packageVersion}`,
-      "--prefix", dir,
-      "--ignore-scripts", "--no-fund", "--no-audit", "--loglevel=error",
-    ], { timeout: 120_000, windowsHide: true, encoding: "utf8" });
+    const existing = resolveNativeManagerPath(lookup);
+    if (existing) return existing;
+    if (!nativePackageName(platform, arch)) return null;
+    if (env.PI_FAMULUS_NO_NATIVE_FETCH === "1" || env.PI_OFFLINE === "1" || env.VITEST) return null;
+    if (cacheDir === false) return null;
+    const dir = cacheDir ?? nativeCacheDir({ platform, arch, env });
+    const lockedLookup = { ...lookup, cacheDir: dir };
+    const lock = acquireInstallLock(dir, lockedLookup);
+    if (!lock) return resolveNativeManagerPath(lockedLookup);
+    try {
+      const manifest = join(dir, "package.json");
+      try {
+        readFileSync(manifest);
+      } catch {
+        writeFileSync(manifest, `${JSON.stringify({ private: true, name: "pi-famulus-native-cache", version: "0.0.0" })}\n`);
+      }
+      const command = npmCommand ?? (platform === "win32" ? "npm.cmd" : "npm");
+      const name = nativePackageName(platform, arch);
+      let result;
+      try {
+        result = spawn(command, [
+          "install", `${name}@${packageVersion}`,
+          "--prefix", dir,
+          "--ignore-scripts", "--no-fund", "--no-audit", "--loglevel=error",
+        ], { timeout: 120_000, windowsHide: true, encoding: "utf8" });
+      } catch {
+        return resolveNativeManagerPath(lockedLookup);
+      }
+      const found = resolveNativeManagerPath(lockedLookup);
+      if (found) return found;
+      if (!result || result.error || result.status !== 0) return null;
+      return null;
+    } finally {
+      releaseInstallLock(lock);
+    }
   } catch {
     return null;
   }
-  if (!result || result.error || result.status !== 0) return null;
-  return resolveNativeManagerPath({ ...lookup, cacheDir: dir });
 }
