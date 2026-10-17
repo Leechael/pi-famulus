@@ -1,9 +1,9 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/Leechael/pi-famulus/main/assets/logo.png" alt="pi-famulus" width="120" />
   <h1>pi-famulus</h1>
-  <p><b>Let your agent delegate, and keep working.</b></p>
+  <p><b>Keep your main agent focused. Hand off the rest.</b></p>
   <p>English · <a href="https://github.com/Leechael/pi-famulus/blob/main/README_CN.md">中文</a></p>
-  <p>Subagents and long-running bash for <a href="https://pi.dev">pi</a> and agents built on it. Results wake the agent when work finishes, so it never has to poll. One daemon owns every shell it starts.</p>
+  <p>Subagents and long-running bash for <a href="https://pi.dev">pi</a> and agents built on it. Results wake the agent when work finishes, so the conversation keeps going. One Rust daemon runs the shells and monitors it starts.</p>
   <p>
     <a href="https://github.com/Leechael/pi-famulus/blob/main/docs/tools.md">Tools</a> ·
     <a href="https://github.com/Leechael/pi-famulus/blob/main/docs/cli.md">CLI</a> ·
