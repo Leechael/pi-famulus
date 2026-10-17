@@ -48,6 +48,8 @@ export interface FamulusSubagentConfig {
   maxConcurrentChildren?: number;
   /** Max child sessions spawned per hour. */
   spawnBudgetPerHour?: number;
+  /** pi command for hosted subagents: a path, or a JSON argv array. */
+  piCommand?: string;
 }
 
 /** Subagent settings with every field resolved (design doc §4.6 defaults). */
@@ -64,6 +66,7 @@ export interface ResolvedSubagentConfig {
   concurrency: number;
   maxConcurrentChildren: number;
   spawnBudgetPerHour: number;
+  piCommand: string | null;
 }
 
 /**
@@ -88,6 +91,7 @@ export const DEFAULT_SUBAGENT_CONFIG: ResolvedSubagentConfig = {
   concurrency: 4,
   maxConcurrentChildren: 8,
   spawnBudgetPerHour: 32,
+  piCommand: null,
 };
 
 /** Merge defaults <- top-level subagentBudgetMs <- subagent section. */
@@ -123,6 +127,9 @@ export function resolveSubagentConfig(config: FamulusConfig): ResolvedSubagentCo
   }
   if (typeof section.spawnBudgetPerHour === "number" && section.spawnBudgetPerHour >= 1) {
     resolved.spawnBudgetPerHour = Math.floor(section.spawnBudgetPerHour);
+  }
+  if (typeof section.piCommand === "string" && section.piCommand.trim()) {
+    resolved.piCommand = section.piCommand.trim();
   }
   return resolved;
 }
@@ -251,6 +258,9 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
     }
     if (typeof section.spawnBudgetPerHour === "number" && section.spawnBudgetPerHour >= 1) {
       subagent.spawnBudgetPerHour = section.spawnBudgetPerHour;
+    }
+    if (typeof section.piCommand === "string" && section.piCommand.trim()) {
+      subagent.piCommand = section.piCommand.trim();
     }
     config.subagent = subagent;
   }

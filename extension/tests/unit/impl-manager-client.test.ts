@@ -232,7 +232,7 @@ describe("ManagerClient (integration, fake manager)", () => {
       session_id: "sess-1",
       pi_pid: process.pid,
       extension_version: packageVersion,
-      protocol: 5,
+      protocol: 6,
     });
   });
 
@@ -245,7 +245,7 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(await client.connect()).toBe(true);
     expect(client.managerInfo()).toEqual({ version: "0.1.0", pid: 4321 });
   });
-  it("negotiates the minimum of its v5 maximum and the daemon's reported maximum", async () => {
+  it("negotiates the minimum of its v6 maximum and the daemon's reported maximum", async () => {
     fake.setProtocol(3);
     expect(await client.connect()).toBe(true);
     expect(client.protocolLevel()).toBe(3);
@@ -253,7 +253,7 @@ describe("ManagerClient (integration, fake manager)", () => {
     fake.setProtocol(9);
     client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null });
     expect(await client.connect()).toBe(true);
-    expect(client.protocolLevel()).toBe(5);
+    expect(client.protocolLevel()).toBe(6);
   });
 
   it("waits out a shutting-down hello without deleting manager files", async () => {

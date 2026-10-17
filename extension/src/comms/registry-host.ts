@@ -69,5 +69,11 @@ export function createRegistryCommsHost(deps: RegistryHostDeps): CommsHost {
         details: wake.details,
       });
     },
+
+    async resumeChild(childId: string, message: string) {
+      const registry = deps.getRegistry();
+      if (!registry) throw new Error("subagent system is not initialized");
+      await registry.resumeChild(childId, message);
+    },
   };
 }

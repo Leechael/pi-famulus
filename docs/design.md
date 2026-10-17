@@ -19,7 +19,7 @@ pi (`@earendil-works/pi-coding-agent`) deliberately leaves subagents, background
 | Orchestration expression | Tool-parameter style: parallel `tasks[]` + sequential interpolation in `chain[]` (lain style) |
 | Package positioning | An entirely new standalone package. Not compatible with pi-subagents; cross-session/cross-machine communication belongs to agent-intercom (a separate system), not this package |
 | Synchronous strategy | Smart budget mode: wait synchronously by default, automatically switch to asynchronous execution when the foreground budget expires (grok style) |
-| Child-agent process model | v1 uses in-process `createAgentSession` throughout; the execution layer exposes a `ChildRunner` seam for a future detached backend |
+| Child-agent process model | Each subagent is a `pi --mode rpc` process owned by the daemon, with a normal pi session file. The runner seam stays in the extension (budgets, stalls, wakes). See `docs/plans/2026-10-17-rpc-hosted-subagents.md` |
 | Process management | Standalone Rust binary `pi-famulus`, machine-wide singleton, conventional paths, isolation through session_id namespaces |
 | Manager lifecycle | **Lives and dies with pi processes**: zero active connections → kill remaining tasks → exit. Started under a lock when needed. Never resurrects itself; only clients have spawn authority |
 | Manager language | Rust (tokio + usage-rs + serde_json + interprocess + fd-lock) |
@@ -43,7 +43,7 @@ pi instance C (session c) ──┘                                ├─ proces
     ├─ bash override ────► manager client ──────────────────┤─ event push (task_started/exited/output)
     ├─ monitor tool ────► start + watch output stream        └─ lifecycle: zero connections → cleanup and exit
     ├─ task_list/output/stop
-    ├─ subagent tool ───► ChildRunner seam (v1: InProcessRunner)
+    ├─ subagent tool ───► ChildRunner seam (hosted pi --mode rpc, via the daemon)
     ├─ comms ──► in-process mailbox (contact_supervisor / agent_message)
     └─ NotifyCenter ──► sole injection outlet (triggerTurn/steer/passive)
 ```
@@ -659,7 +659,7 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 ## 6. Non-goals (explicitly excluded in v1)
 
 - Cross-session / cross-machine communication (belongs to agent-intercom)
-- Detached subagent runner (ChildRunner seam reserved)
+- A second pi process opening a hosted session file at the same time (pi does not lock session files; attach goes through the daemon)
 - Worktree isolation, workflow-script sandbox, a watchdog for a detached runner (the in-process stall watchdog of §4.6 exists), missions
 - Compatibility with pi-subagents / pi-intercom
 - In-place `exec` upgrade on Windows (Unix-only; Windows replaces the binary and restarts). Windows itself is supported: named-pipe IPC and a Job Object lifeline (`KILL_ON_JOB_CLOSE`, manager/src/sys/windows.rs:6)

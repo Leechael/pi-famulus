@@ -157,6 +157,10 @@ interface ResolvedModel {
  * falls back to the parent model with a warning (user-authored files must not
  * hard-fail across machines).
  */
+export function resolveChildModel(deps: PiRuntimeDeps, req: ChildRunRequest): ResolvedModel {
+  return resolveModel(deps, req);
+}
+
 function resolveModel(deps: PiRuntimeDeps, req: ChildRunRequest): ResolvedModel {
   const candidates = modelCandidates(deps);
   const findModel = (provider: string, id: string): Model | undefined =>

@@ -366,7 +366,7 @@ describe("InProcessRunner", () => {
     expect(released).toBe(2);
   });
 
-  it("keeps the machine permit across an interrupted resumable turn", async () => {
+  it("releases the machine permit when an interrupted turn can still be resumed", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
     const releases: boolean[] = [];
@@ -376,11 +376,11 @@ describe("InProcessRunner", () => {
     });
     const handle = await runner.start(makeReq());
     await handle.interrupt();
-    expect(releases).toEqual([false]);
+    expect(releases).toEqual([true]);
     factory.sessions[0].autoComplete = "resumed";
     await handle.resume("continue");
     expect((await handle.result).status).toBe("completed");
-    expect(releases).toEqual([false, true]);
+    expect(releases).toEqual([true, true]);
   });
 
   it("keeps the permit when admission resolves after a resumable interruption", async () => {
@@ -405,9 +405,9 @@ describe("InProcessRunner", () => {
     await handle.interrupt();
     resolveAdmission((terminal = true) => { releases.push(terminal); });
     await tick();
-    expect(releases).toEqual([false, false, false]);
+    expect(releases).toEqual([true, true]);
     handle.dispose();
-    expect(releases).toEqual([false, false, false, true]);
+    expect(releases).toEqual([true, true]);
   });
 
   it("releases an interrupted child's retained machine permit on disposal", async () => {
@@ -420,9 +420,9 @@ describe("InProcessRunner", () => {
     });
     const handle = await runner.start(makeReq());
     await handle.interrupt();
-    expect(releases).toEqual([false]);
+    expect(releases).toEqual([true]);
     handle.dispose();
-    expect(releases).toEqual([false, true]);
+    expect(releases).toEqual([true]);
   });
 
   it("attributes cancelled admission wait to queue time, not duration", async () => {

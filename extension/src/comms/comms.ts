@@ -147,16 +147,18 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         child.status === "failed" ||
         child.status === "interrupted"
       ) {
-        // Lifecycle (resume) belongs to the subagent tool. Resuming here never
-        // wired a completion wake, so the parent hung.
-        throw new Error(
-          fill("tools.agent_message.error.finished-child", {
-            childId: toChildId,
-            name: child.name,
-            status: child.status,
-            runId: child.runId,
-          }),
-        );
+        const resume = (host as CommsHost & { resumeChild?: (childId: string, message: string) => Promise<void> }).resumeChild;
+        if (!resume) {
+          throw new Error(
+            fill("tools.agent_message.error.finished-child", {
+              childId: toChildId,
+              name: child.name,
+              status: child.status,
+              runId: child.runId,
+            }),
+          );
+        }
+        await resume(child.handle.childId, message);
       } else {
         throw new Error(
           `Child ${toChildId} (${child.name}) is ${child.status}; ` +

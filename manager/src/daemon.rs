@@ -68,8 +68,17 @@ pub type Shared = Arc<Mutex<DaemonState>>;
 // State
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConnRole {
+    Parent,
+    Cli,
+    Child,
+}
+
 pub struct ConnHandle {
     pub kind: ClientKind,
+    pub role: ConnRole,
+    pub child_id: Option<String>,
     pub session_id: Option<String>,
     pub tx: OutTx,
     /// Fired to make the connection's read loop exit (session rebind).
@@ -165,6 +174,9 @@ pub struct DaemonState {
     pub agent_admission: Arc<Mutex<()>>,
     /// Cached global budget; per-kind settings remain part of CapacityConfig.
     pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
+    /// Hosted `pi --mode rpc` subagents.
+    pub hosted: crate::hosted::Hosted,
+    agent_notices: Option<mpsc::UnboundedReceiver<crate::hosted::Notice>>,
 }
 
 /// Bound on remembered start keys.
@@ -178,6 +190,8 @@ const PENDING_AGENT_REQUEST_IDS_MAX: usize = 8;
 
 impl DaemonState {
     fn new(home: PathBuf, registry: Registry, foreground: bool) -> DaemonState {
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let hosted_home = home.clone();
         DaemonState {
             home,
             started_at_ms: now_ms(),
@@ -207,6 +221,8 @@ impl DaemonState {
             cancelled_acquires: HashSet::new(),
             agent_admission: Arc::new(Mutex::new(())),
             agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
+            hosted: crate::hosted::Hosted::new(hosted_home, notice_tx),
+            agent_notices: Some(notice_rx),
         }
     }
 }
@@ -317,6 +333,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
             std::process::id()
         );
     }
+    start_agent_loops(&state);
     serve(state, listener, daemon_lock).await
 }
 
@@ -450,6 +467,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         send_agent_grants(&s2, wake);
         maybe_arm_idle_timer(&s2);
     });
+    start_agent_loops(&state);
     serve(state, listener, lock).await
 }
 
@@ -877,7 +895,19 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             cwd,
             extension_version,
             protocol,
-        } => (
+            role,
+            session_file,
+            child_id,
+            token,
+            pi_version: _,
+        } => {
+            let role = match role.as_deref() {
+                Some("child") => ConnRole::Child,
+                Some("cli") => ConnRole::Cli,
+                _ if client_kind == ClientKind::Cli => ConnRole::Cli,
+                _ => ConnRole::Parent,
+            };
+            (
             client_kind,
             session_id,
             pi_pid,
@@ -885,8 +915,13 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                 cwd,
                 extension_version,
                 protocol,
+                role,
+                child_id,
+                token,
+                session_file,
             },
-        ),
+            )
+        }
         _ => {
             let _ = tx
                 .send(encode_error(
@@ -898,7 +933,7 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             return;
         }
     };
-    if client_kind == ClientKind::Extension {
+    if client_kind == ClientKind::Extension && info.role != ConnRole::Child {
         let ok = matches!(&session_id, Some(s) if valid_session_id(s)) && pi_pid.is_some();
         if !ok {
             let _ = tx
@@ -911,7 +946,26 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             return;
         }
     }
+    let mut session_id = session_id;
+    if info.role == ConnRole::Child {
+        let child_id = info.child_id.clone().unwrap_or_default();
+        let token = info.token.clone().unwrap_or_default();
+        let auth = {
+            let st = state.lock().unwrap();
+            st.hosted.auth_child(&child_id, &token)
+        };
+        match auth {
+            Ok(parent) => session_id = Some(parent),
+            Err(e) => {
+                let _ = tx.send(encode_error(&hello.id, &e.code, &e.message)).await;
+                return;
+            }
+        }
+    }
 
+    let notice_role = info.role;
+    let notice_file = info.session_file.clone();
+    let notice_session = session_id.clone();
     let conn_id = match register_conn(
         &state,
         &tx,
@@ -929,7 +983,20 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             return;
         }
     };
-    let started_at = state.lock().unwrap().started_at_ms;
+    let (started_at, hosted_notice) = {
+        let st = state.lock().unwrap();
+        let notice = if notice_role != ConnRole::Child {
+            st.hosted.lookup(notice_session.as_deref(), notice_file.as_deref())
+        } else {
+            None
+        };
+        if notice_role == ConnRole::Parent {
+            if let Some(file) = notice_file.as_deref() {
+                st.hosted.claim_owner(notice_session.as_deref().unwrap_or(""), Some(file));
+            }
+        }
+        (st.started_at_ms, notice)
+    };
     let _ = tx
         .send(encode_ok(
             &hello.id,
@@ -938,6 +1005,7 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                 pid: std::process::id(),
                 started_at,
                 protocol: PROTOCOL,
+                hosted: hosted_notice,
             },
         ))
         .await;
@@ -1016,6 +1084,10 @@ pub struct HelloInfo {
     pub cwd: Option<String>,
     pub extension_version: Option<String>,
     pub protocol: Option<u32>,
+    pub role: ConnRole,
+    pub child_id: Option<String>,
+    pub token: Option<String>,
+    pub session_file: Option<String>,
 }
 
 /// Register a hello'd connection. Same-session rebind: the new connection
@@ -1042,7 +1114,7 @@ fn register_conn(
     }
     let conn_id = st.next_conn_id;
     st.next_conn_id += 1;
-    if kind == ClientKind::Extension {
+    if kind == ClientKind::Extension && info.role != ConnRole::Child {
         let sid = session_id.clone().unwrap_or_default();
         let old = st.sessions.get(&sid).and_then(|s| s.conn_id);
         if let Some(old_id) = old {
@@ -1083,10 +1155,17 @@ fn register_conn(
             },
         );
     }
+    if info.role == ConnRole::Child {
+        if let Some(child_id) = info.child_id.clone() {
+            st.hosted.set_child_conn(&child_id, Some(conn_id));
+        }
+    }
     st.conns.insert(
         conn_id,
         ConnHandle {
             kind,
+            role: info.role,
+            child_id: info.child_id.clone(),
             session_id,
             tx: tx.clone(),
             die: die.clone(),
@@ -1099,6 +1178,15 @@ fn register_conn(
 
 fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     if let Some(h) = st.conns.remove(&conn_id) {
+        st.hosted.drop_conn(conn_id);
+        if h.role != ConnRole::Child {
+            if let Some(sid) = h.session_id.clone() {
+                let owns = st.sessions.get(&sid).and_then(|s| s.conn_id) == Some(conn_id);
+                if owns && why == "closed" {
+                    st.hosted.on_parent_closed(&sid);
+                }
+            }
+        }
         if let Some(sid) = &h.session_id {
             let home = st.home.clone();
             if let Some(s) = st.sessions.get_mut(sid) {
@@ -1388,14 +1476,54 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
     );
 }
 
-/// §3.2: arm the 5s idle timer when the last active connection went away.
+fn start_agent_loops(state: &Shared) {
+    let rx = state.lock().unwrap().agent_notices.take();
+    if let Some(mut rx) = rx {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while let Some(notice) = rx.recv().await {
+                let st = state.lock().unwrap();
+                if let Some(session) = st.sessions.get(&notice.parent_session) {
+                    if let Some(conn_id) = session.conn_id {
+                        if let Some(conn) = st.conns.get(&conn_id) {
+                            let _ = conn.tx.try_send(encode_event(&notice.event));
+                        }
+                    }
+                }
+                if let Some(conn_id) = st.hosted.child_of_conn(&notice.child_id) {
+                    if let Some(conn) = st.conns.get(&conn_id) {
+                        let _ = conn.tx.try_send(encode_event(&notice.event));
+                    }
+                }
+                let watchers = st.hosted.watcher_ids(&notice.child_id);
+                for conn_id in watchers {
+                    if let Some(conn) = st.conns.get(&conn_id) {
+                        let _ = conn.tx.try_send(encode_event(&notice.event));
+                    }
+                }
+            }
+        });
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let clock = state.lock().unwrap().clock.clone();
+            clock.sleep("agent-retention", Duration::from_millis(250)).await;
+            if state.lock().unwrap().shutdown {
+                break;
+            }
+            state.lock().unwrap().hosted.tick();
+        }
+    });
+}
+
+/// §3.2: arm the 5s idle timer when the last parent/cli connection went away
+/// and no hosted subagent is still warm.
 pub fn maybe_arm_idle_timer(state: &Shared) {
     let mut st = state.lock().unwrap();
-    if st.shutdown
-        || st.upgrading
-        || st.hold_idle
-        || !st.conns.is_empty()
-        || st.idle_timer.is_some()
+    let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
+    let warm = st.hosted.warm_count() > 0;
+    if st.shutdown || st.upgrading || st.hold_idle || session_conn || warm || st.idle_timer.is_some()
     {
         return;
     }
@@ -1405,7 +1533,9 @@ pub fn maybe_arm_idle_timer(state: &Shared) {
         clock.sleep("idle", IDLE_SHUTDOWN).await;
         let fired = {
             let mut st = state2.lock().unwrap();
-            if st.conns.is_empty() && !st.shutdown {
+            let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
+            let warm = st.hosted.warm_count() > 0;
+            if !session_conn && !warm && !st.shutdown {
                 st.shutdown = true;
                 Some((st.home.clone(), st.shutdown_notify.clone()))
             } else {
@@ -1556,6 +1686,66 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         RequestKind::ReleaseAgent { child_id } => {
             respond(&tx, &id, handle_release_agent(&state, conn_id, &child_id)).await;
         }
+        RequestKind::AgentSpawn { child_id, run_id, name, argv, cwd, env } => {
+            match parent_session(&state, conn_id) {
+                Ok(parent) => {
+                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
+                    respond(&tx, &id, hosted.spawn(&parent, &child_id, &run_id, &name, argv, cwd, env).await).await
+                }
+                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+            }
+        }
+        RequestKind::AgentInput { child_id, op, text, source, since } => {
+            let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
+            let source = if source.is_empty() { "parent".into() } else { source };
+            respond(&tx, &id, hosted.rpc(&child_id, &op, &text, &source, since.as_deref()).await).await
+        }
+        RequestKind::AgentWatch { child_id } => {
+            let result = { let st = state.lock().unwrap(); st.hosted.watch(&child_id, conn_id).map(|()| UnitOk {}) };
+            respond(&tx, &id, result).await
+        }
+        RequestKind::AgentUnwatch { child_id } => {
+            { let st = state.lock().unwrap(); st.hosted.unwatch(&child_id, conn_id); }
+            respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
+        }
+        RequestKind::AgentComms { request_id, reason, message } => {
+            let (child_id, hosted) = {
+                let st = state.lock().unwrap();
+                (st.conns.get(&conn_id).and_then(|c| c.child_id.clone()).unwrap_or_default(), st.hosted.clone())
+            };
+            match hosted.comms(&child_id, &request_id, &reason, &message).await {
+                Ok(reply) => respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "reply": reply }))).await,
+                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+            }
+        }
+        RequestKind::AgentCommsReply { request_id, child_id, message } => {
+            let result = { let st = state.lock().unwrap(); st.hosted.comms_reply(&request_id, &child_id, &message).map(|()| UnitOk {}) };
+            respond(&tx, &id, result).await
+        }
+        RequestKind::AgentUiResponse { child_id, rpc_id, value, cancelled } => {
+            let result = { let st = state.lock().unwrap(); st.hosted.ui_response(&child_id, &rpc_id, &value, cancelled).map(|()| UnitOk {}) };
+            respond(&tx, &id, result).await
+        }
+        RequestKind::HostedLookup { session_id, session_file } => {
+            let notice = { let st = state.lock().unwrap(); st.hosted.lookup(session_id.as_deref(), session_file.as_deref()) };
+            respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "hosted": notice }))).await
+        }
+        RequestKind::AgentCache { expires_at, tier, lifetime_ms: _ } => {
+            {
+                let st = state.lock().unwrap();
+                let child_id = st.conns.get(&conn_id).and_then(|c| c.child_id.clone()).unwrap_or_default();
+                st.hosted.cache(&child_id, expires_at, tier);
+            }
+            respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
+        }
+        RequestKind::AgentPark { child_id } => {
+            let result = { let st = state.lock().unwrap(); st.hosted.park(&child_id, "interrupt").map(|()| UnitOk {}) };
+            respond(&tx, &id, result).await
+        }
+        RequestKind::AgentTakeover { child_id } => {
+            let result = { let st = state.lock().unwrap(); st.hosted.takeover(&child_id).map(|()| UnitOk {}) };
+            respond(&tx, &id, result).await
+        }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
         #[cfg(feature = "test-clock")]
@@ -1607,6 +1797,15 @@ fn handle_clock(
         RequestKind::ClockAdvance { ms } => m.advance(*ms),
         _ => m.status(),
     })
+}
+
+fn parent_session(state: &Shared, conn_id: u64) -> Result<String, ProtoError> {
+    let st = state.lock().unwrap();
+    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    if conn.role == ConnRole::Child {
+        return Err(ProtoError::new(E_FORBIDDEN, "a hosted child cannot spawn subagents"));
+    }
+    conn.session_id.clone().ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "agent_spawn requires an extension session"))
 }
 
 async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoError>) {
@@ -4022,6 +4221,8 @@ mod tests {
             1,
             ConnHandle {
                 kind: ClientKind::Extension,
+                role: ConnRole::Parent,
+                child_id: None,
                 session_id: Some("sess-utf8".into()),
                 tx,
                 die: Arc::new(Notify::new()),
@@ -4151,7 +4352,7 @@ mod tests {
                 &state, tx, &Arc::new(Notify::new()),
                 &Arc::new(Mutex::new(HashMap::new())), &writer.abort_handle(),
                 ClientKind::Extension, Some(session.into()), Some(std::process::id()),
-                HelloInfo { cwd: None, extension_version: None, protocol: Some(5) },
+                HelloInfo { cwd: None, extension_version: None, protocol: Some(5), role: ConnRole::Parent, child_id: None, token: None, session_file: None },
             ).unwrap());
         }
         let request = |id: &str, kind: &str, child: &str| {

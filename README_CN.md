@@ -132,7 +132,7 @@ pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及
 ## FAQ
 
 - **pi-famulus 和 `pi-subagents`、`pi-background-tasks` 有什么区别？** 它们是替代关系，选一个用。想要现成的角色、保存的工作流、`/council`，或在独立进程里跑的后台子代理，选 [`pi-subagents`](https://github.com/nicobailon/pi-subagents)。想要带输出文件的具名后台 shell 任务、只读的委派 agent，或它的 Fusion 工作流，选 [`pi-background-tasks`](https://github.com/ismailsaleekh/pi-background-tasks)。想要一个守护进程管理你所有 pi 会话里的 shell 和 monitor 进程、子代理共享并发上限、以及一个能查历史运行的 CLI，选 pi-famulus。
-- **能像 tmux pane 那样 attach 到子代理上吗？** 不能。子代理运行在 agent 的进程内部，没法 attach，也没法接管它的会话。可以通过父代理给它改方向、恢复或中断它，用 `/reply` 回答它的问题，用 `pi-famulus agent <id> -f`、`show <id>` 和 `top` 查看它做了什么。
+- **能像 tmux pane 那样 attach 到子代理上吗？** 可以。每个子代理是一个带 pi session id 的 `pi --mode rpc` 进程。pi TUI 里用 `/attach <id>`，终端里用 `pi-famulus attach <id>`，都是跟那个进程说话。它还在托管时，另开一个 `pi --session` 打开同一会话会被拒绝：可以选择接管，或者 attach。
 - **能在 pi TUI 以外使用吗？** 能。pi 能加载扩展的地方它都能加载，包括 RPC 模式（`pi --mode rpc`）和用 pi SDK 开发的 agent。print 模式（`pi -p`）也能加载，但第一轮运行结束就退出，之后的结果收不到。在 SDK 开发的 agent 里，通过 `DefaultResourceLoader` 加载它（比如用 `additionalExtensionPaths`），再调用 `session.bindExtensions()`。真实模型评测就是在 RPC 模式下驱动 pi 的。
 - **子代理能再启动子代理吗？** 不能，嵌套只有一层。
 - **pi 退出后后台任务会怎样？** 最后一个 pi 会话关闭 5 秒后，守护进程停止仍在运行的任务并退出。之后可以用 `pi-famulus show <id>` 查看记录。

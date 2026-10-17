@@ -13,6 +13,7 @@ mod events;
 mod fmt;
 mod gc;
 mod handover;
+mod hosted;
 mod inspect;
 mod ipc;
 mod lifecycle;
@@ -21,6 +22,7 @@ mod winpath;
 mod pager;
 mod proto;
 mod registry;
+mod rpc_child;
 mod runner;
 mod shellstart;
 mod stats;
@@ -43,6 +45,9 @@ fn main() {
         Some("__run") => {
             let command = args.next().unwrap_or_default();
             std::process::exit(runner::main(std::ffi::OsStr::new(&command)));
+        }
+        Some("__rpc") => {
+            std::process::exit(rpc_child::main(args.collect()));
         }
         // An in-place upgrade asks the new binary this before exec'ing it.
         Some(handover::CHECK_ARG) => {
@@ -225,6 +230,7 @@ async fn async_main() {
         Sub::KillSession { session_id } => {
             run_client(client::cmd_kill_session(&home, &session_id)).await
         }
+        Sub::Attach { target } => run_client(client::cmd_attach(&home, &target)).await,
         Sub::Doctor => client::cmd_doctor(&home).await,
         Sub::Shutdown => run_client(client::cmd_shutdown(&home)).await,
         Sub::Upgrade => run_client(client::cmd_upgrade(&home)).await,

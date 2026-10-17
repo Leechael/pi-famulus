@@ -164,7 +164,7 @@ export function renderIndex({ prompts, segments }: ReturnType<typeof parsePrompt
   ].join("\n");
 }
 
-if (import.meta.main) {
+if (import.meta.main || process.argv[1]?.includes("build-prompts")) {
   const parsed = parsePrompts();
   const files: Array<[string, string]> = [
     [OUT_TS, renderModule(parsed)],

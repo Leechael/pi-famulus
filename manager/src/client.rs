@@ -183,6 +183,11 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
             cwd: None,
             extension_version: None,
             protocol: Some(PROTOCOL),
+            role: Some("cli".into()),
+            session_file: None,
+            child_id: None,
+            token: None,
+            pi_version: None,
         },
         HelloMode::Extension { session_id } => RequestKind::Hello {
             client_kind: ClientKind::Extension,
@@ -191,6 +196,11 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
             extension_version: Some(format!("pi-famulus-cli/{}", crate::VERSION)),
             protocol: Some(PROTOCOL),
+            role: Some("parent".into()),
+            session_file: None,
+            child_id: None,
+            token: None,
+            pi_version: None,
         },
     };
     let _: HelloOk = conn.roundtrip(hello).await?;
@@ -960,10 +970,13 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     if let Some(st) = &status {
         for s in st.sessions.iter().filter(|s| s.connected) {
             match s.protocol {
-                Some(p) if p == st.protocol => r.ok("protocol", format!("session {} speaks {p}", s.session_id)),
+                Some(p) if p <= st.protocol => r.ok(
+                    "protocol",
+                    format!("session {} speaks {p} (manager {})", s.session_id, st.protocol),
+                ),
                 Some(p) => r.fail(
                     "protocol",
-                    format!("session {} speaks {p}, manager speaks {}; update the extension or the manager", s.session_id, st.protocol),
+                    format!("session {} speaks {p}, newer than this manager ({}); update the manager", s.session_id, st.protocol),
                 ),
                 None => r.fail(
                     "protocol",
@@ -1005,6 +1018,66 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     } else {
         outln!("{} problem(s) found", r.failures);
         1
+    }
+}
+
+/// Live transcript of a hosted subagent, with a line of input.
+pub async fn cmd_attach(home: &Path, target: &str) -> Result<(), String> {
+    let mut conn = connect_existing(home, &HelloMode::Cli).await?;
+    let _: UnitOk = conn
+        .roundtrip(RequestKind::AgentWatch { child_id: target.to_string() })
+        .await?;
+    println!("attached to {target}. Each line is sent to the subagent. Ctrl-D closes.");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let lock = stdin.lock();
+        for line in std::io::BufRead::lines(lock) {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut waiting: Option<String> = None;
+    loop {
+        tokio::select! {
+            line = rx.recv(), if waiting.is_none() => {
+                let Some(line) = line else { return Ok(()) };
+                if line.is_empty() { continue; }
+                let id = new_request_id();
+                let req = Request {
+                    v: Some(PROTO_VERSION),
+                    id: id.clone(),
+                    kind: RequestKind::AgentInput {
+                        child_id: target.to_string(),
+                        op: "prompt_steer".into(),
+                        text: line,
+                        source: "user".into(),
+                        since: None,
+                    },
+                };
+                write_frame(&mut conn.wr, &encode(&req)).await.map_err(|e| format!("send: {e}"))?;
+                waiting = Some(id);
+            }
+            frame = read_frame(&mut conn.rd) => {
+                let bytes = frame.map_err(|e| format!("recv: {e}"))?.ok_or_else(|| "manager closed the connection".to_string())?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("bad JSON: {e}"))?;
+                if value.get("id").and_then(|id| id.as_str()) == waiting.as_deref() {
+                    if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+                        println!("send failed: {}", value["error"]);
+                    }
+                    waiting = None;
+                    continue;
+                }
+                match value.get("event").and_then(|event| event.as_str()) {
+                    Some("agent_rpc") => println!("{}", value["record"]),
+                    Some("agent_state") => println!("[{} {} {}]", value["activity"].as_str().unwrap_or("?"), value["residency"].as_str().unwrap_or("?"), value["driver"].as_str().unwrap_or("parent")),
+                    Some("agent_ui") => println!("dialog: {}", value["request"]),
+                    _ => {}
+                }
+            }
+        }
     }
 }
 

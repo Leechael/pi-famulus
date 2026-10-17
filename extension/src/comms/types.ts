@@ -43,6 +43,8 @@ export interface CommsHost {
   listChildren(): { childId: string; runId: string; name: string; status: ChildStatus }[];
   sameRun(childIdA: string, childIdB: string): boolean;
   notifySupervisor(wake: { content: string; details: FamulusWake }): void;
+  /** Continue an idle child. Absent on test hosts that still reject send-to-finished. */
+  resumeChild?(childId: string, message: string): Promise<void>;
 }
 
 export interface MailboxEntry {

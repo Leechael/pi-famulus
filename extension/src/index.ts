@@ -21,7 +21,7 @@ import { createAgentLoader, type AgentLoader } from "./agents/loader";
 import { createBashOverride } from "./bash-override";
 import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
-import { createAgentMessageTool, createContactSupervisorTool } from "./comms/tools";
+import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
 import type { TaskExitInfo } from "./format";
@@ -30,7 +30,6 @@ import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monit
 import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
 import { NotifyCenter } from "./notify";
 import { onWakeMessageEnd, registryStatusLookup } from "./wake-delivery";
-import { createChildBashTool } from "./subagent/child-bash";
 import { ChildShellTracker, createOverrunNotifier } from "./subagent/overrun";
 import {
   agentEndReason,
@@ -43,7 +42,11 @@ import {
 import { TranscriptWriter } from "./subagent/transcript";
 import { FleetWidget } from "./subagent/fleet-widget";
 import { WorkIndex, type WorkItem } from "./work-index";
-import { createPiSessionFn, isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
+import { fileURLToPath } from "node:url";
+import { isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
+import { createHostedSessionFn } from "./subagent/hosted-session";
+import { isHostedChildProcess, registerChildMode } from "./child-mode";
+import { registerAttachCommand } from "./tui/attach-command";
 import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
@@ -76,6 +79,10 @@ interface FamulusRuntime {
 }
 
 export default function (pi: ExtensionAPI): void {
+  if (isHostedChildProcess()) {
+    registerChildMode(pi);
+    return;
+  }
   if (isFamulusChildSession(pi)) return;
   // A /reload parked the previous instance's runtime: adopt it so its shells,
   // monitors and subagents keep running (see reload-handoff.ts). Another
@@ -392,6 +399,10 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     clock,
     syncWithManager: deps.syncWithManager,
   });
+  registerAttachCommand(pi, {
+    getClient: () => client,
+    getRegistry: () => subagentRegistry,
+  });
   registerFamulusCommand(pi, {
     extensionVersion: EXTENSION_VERSION,
     managerPath,
@@ -523,11 +534,43 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       sessionId: startCtx.sessionManager.getSessionId(),
       managerPath,
       cwd: startCtx.cwd,
+      sessionFile: startCtx.sessionManager.getSessionFile?.(),
       clock,
       log: () => {}, // keep quiet; degradation is surfaced via tools
     });
 
     client.onEvent((event) => {
+      const hosted = event as ManagerEvent & {
+        child_id?: string;
+        reason?: string;
+        request_id?: string;
+        message?: string;
+        name?: string;
+        residency?: string;
+        driver?: string;
+        last_text?: string;
+      };
+      if (hosted.event === "agent_comms" && hosted.child_id && hosted.request_id) {
+        const reason = hosted.reason === "need_decision" ? "need_decision" : "progress_update";
+        void comms.contactSupervisor(hosted.child_id, reason, hosted.message ?? "").then((reply) => {
+          if (reason === "need_decision") void client?.agentCommsReply(hosted.request_id!, hosted.child_id!, reply).catch(() => {});
+        }).catch(() => {});
+        return;
+      }
+      if (hosted.event === "agent_detach" && hosted.child_id) {
+        notifyCenter?.notify({
+          customType: "pi-famulus-wake",
+          content: `System wake — not a new user message.\n\nThe user talked to ${hosted.name ?? hosted.child_id} directly.\n${hosted.last_text ?? ""}`,
+          details: { kind: "supervisor-update", from: hosted.child_id, name: hosted.name ?? hosted.child_id, message: hosted.last_text ?? "" },
+        });
+        return;
+      }
+      if (hosted.event === "agent_state" && hosted.child_id) {
+        const handle = subagentRegistry?.handle(hosted.child_id) as { pauseStall?: () => void; resumeStall?: () => void } | undefined;
+        if (hosted.driver === "user") handle?.pauseStall?.();
+        else handle?.resumeStall?.();
+        return;
+      }
       if (event.event === "task_started" && event.task_id) {
         const prior = taskMeta.get(event.task_id);
         taskMeta.set(event.task_id, {
@@ -612,7 +655,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     }
     // The foreground shell each child is blocked on, for its overrun wake.
     const childShells = new ChildShellTracker();
-    const createSession = createPiSessionFn({
+    const createSession = createHostedSessionFn({
       getModelRegistry: () => ctx?.modelRegistry ?? null,
       getModelRuntime: () => {
         const registry = ctx?.modelRegistry as { runtime?: unknown } | null | undefined;
@@ -623,29 +666,10 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       getScopedModels: () => ctx?.scopedModels ?? [],
       getCwd: () => ctx?.cwd ?? process.cwd(),
       getProjectTrusted: () => ctx?.isProjectTrusted() ?? false,
-      customTools: (req) => {
-        const tools: Array<ToolDefinition<any, any, any>> = [
-          // M4: every child can reach the supervisor and its siblings.
-          createContactSupervisorTool(comms, req.childId),
-          createAgentMessageTool(comms, { kind: "child", childId: req.childId, runId: req.runId }, commsHost, clock),
-        ];
-        // The no-background bash variant replaces the built-in bash inside
-        // child sessions (custom tools override builtins by name).
-        tools.push(
-          createChildBashTool({
-            getClient: () => client,
-            home,
-            sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
-            sessionEnv: () => (ctx ? sessionEnv(ctx) : {}),
-            trackTask,
-            childId: req.childId,
-            runId: req.runId,
-            clock,
-            shells: childShells,
-          }),
-        );
-        return tools;
-      },
+      getClient: () => client,
+      getHome: () => home,
+      extensionEntry: fileURLToPath(import.meta.url),
+      piCommand: subagentConfig.piCommand,
     });
     // The registry outlives startCtx across a /reload, which leaves startCtx
     // stale; its closures keep plain values instead.
@@ -869,6 +893,24 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     ctx = null;
   };
   const runtime: FamulusRuntime = { attach: (host) => binding.attach(host) };
+
+  pi.on("session_before_switch", async (event, switchCtx) => {
+    const file = event.targetSessionFile;
+    if (!file || !client?.isAvailable() || client.protocolLevel() < 6) return;
+    const found = await client.hostedLookup({ sessionFile: file }).catch(() => null);
+    if (!found || found.residency !== "warm" || typeof found.child_id !== "string") return;
+    if (!switchCtx.hasUI) return { cancel: true };
+    const choice = await switchCtx.ui.select("This session is hosted by pi-famulus", [
+      "Attach to the hosted process",
+      "Take over",
+      "Cancel",
+    ]);
+    if (choice === "Take over") {
+      await client.agentTakeover(found.child_id).catch(() => {});
+      return;
+    }
+    return { cancel: true };
+  });
 
   pi.on("session_shutdown", async (event) => {
     if (event.reason === "reload" && ctx) {

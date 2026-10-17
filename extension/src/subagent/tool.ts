@@ -547,7 +547,18 @@ export function createSubagentTool(
       };
     }
 
-    const record = requireRun(registry, params.run_id);
+    const record = params.run_id
+      ? requireRun(registry, params.run_id)
+      : params.child_id
+        ? registry.list().find((run) => run.children.some((c) => c.childId === params.child_id || c.name === params.child_id))
+        : undefined;
+    if (!record) {
+      if (params.child_id && !params.run_id) {
+        throw new Error(`unknown child "${params.child_id}" (no run in this session holds it)`);
+      }
+      requireRun(registry, params.run_id);
+      throw new Error("run_id is required for this action");
+    }
 
     if (action === "get") {
       return {
@@ -585,10 +596,17 @@ export function createSubagentTool(
         const known = record.children.map((c) => `${c.name} (${c.childId})`).join(", ");
         throw new Error(`no child "${params.child_id}" in run ${record.runId} (children: ${known})`);
       }
+      const idle = record.children.filter((c) => {
+        if (params.child_id && c.childId !== params.child_id && c.name !== params.child_id) return false;
+        return c.status === "completed" || c.status === "failed" || c.status === "interrupted";
+      });
       for (const child of targets) {
         await registry.handle(child.childId)?.interrupt();
       }
-      const scope = params.child_id ? `subagent ${params.child_id}` : `${targets.length} subagent(s)`;
+      for (const child of idle) {
+        await registry.handle(child.childId)?.interrupt();
+      }
+      const scope = params.child_id ? `subagent ${params.child_id}` : `${targets.length + idle.length} subagent(s)`;
       return {
         content: [{ type: "text", text: `Interrupted ${scope} in run ${record.runId}.` }],
         details: { run_id: record.runId, interrupted: targets.map((c) => c.childId) },
@@ -597,6 +615,16 @@ export function createSubagentTool(
 
     if (action === "steer") {
       if (!params.message) throw new Error("message is required for steer");
+      const named = params.child_id
+        ? record.children.find((c) => c.childId === params.child_id || c.name === params.child_id)
+        : record.children.length === 1 ? record.children[0] : undefined;
+      if (named && named.status !== "running" && named.status !== "pending") {
+        const { queuedBehind } = await registry.resumeChild(named.childId, params.message);
+        return {
+          content: [{ type: "text", text: `Started a new turn on idle subagent ${named.name} (${named.childId}) in run ${record.runId}.${queuedBehind === null ? "" : ` Queued behind ${queuedBehind}.`}` }],
+          details: { run_id: record.runId, child_id: named.childId, queued_behind: queuedBehind },
+        };
+      }
       const handle = resolveSingleActiveChild(registry, record, params.child_id, "steer");
       await handle.steer(params.message);
       return {

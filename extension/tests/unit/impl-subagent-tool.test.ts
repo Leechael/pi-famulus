@@ -474,9 +474,8 @@ describe("subagent tool — management actions", () => {
     const started = await exec({ tasks: [{ prompt: "a" }] });
     const runId = (started.details as { run_id: string }).run_id;
     await expect(exec({ action: "steer", run_id: runId })).rejects.toThrow(/message is required/);
-    await expect(exec({ action: "steer", run_id: runId, message: "x" })).rejects.toThrow(
-      /cannot steer/,
-    );
+    const continued = await exec({ action: "steer", run_id: runId, message: "x" });
+    expect(continued.content[0].type === "text" && continued.content[0].text).toContain("new turn");
   });
 
   it("resume re-prompts a finished child and notifies on completion", async () => {

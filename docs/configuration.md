@@ -10,7 +10,9 @@ pi-famulus reads `~/.pi/agent/pi-famulus/config.json`. The directory can be move
                 "hardTimeoutMs": 0, "stallMs": 300000,
                 "stallRetries": 1, "stallRetryDelayMs": 5000,
                 "decisionTimeoutMs": 600000,
-                "concurrency": 4, "maxConcurrentChildren": 8, "spawnBudgetPerHour": 32 }
+                "concurrency": 4, "maxConcurrentChildren": 8, "spawnBudgetPerHour": 32,
+                "piCommand": null, "idleMinMs": 120000, "idleGraceMs": 15000, "idleMaxMs": 3600000 },
+  "maxWarmAgents": 4
 }
 ```
 
@@ -34,6 +36,11 @@ The `subagent` timeouts are staggered so they do not fire together:
 | `timeoutMs` | 1800000 (30 min) | Soft budget per child turn (launch or `resume`). Reaching it does not stop the child: the parent gets a `subagent-overrun` wake with the child's last activity and, if it is waiting on a foreground shell, that shell, and decides (`extend`, steer, `interrupt`). Stall retries do not restart it. |
 | `overrunRepeatMs` | 600000 (10 min) | Repeat of the `subagent-overrun` wake while the child stays past its budget. `extend` re-arms the deadline at now + `timeout_ms` (default: the child's spawn budget); steering once the deadline has passed postpones the next reminder; reminders are held while the child waits on a `need_decision` reply. |
 | `hardTimeoutMs` | 0 (off) | Opt-in ceiling per child turn that aborts the child (and its running shell) and settles it `interrupted (timeout)`. `extend` does not move it. |
+| `piCommand` | null | How to start `pi` for a hosted subagent: a path, a shell-quoted command, or a JSON argv array. Also `PI_FAMULUS_PI`. When unset, the extension uses the running pi. |
+| `idleMinMs` | 120000 | Shortest time a warm idle subagent stays up. The daemon reads this. |
+| `idleGraceMs` | 15000 | Extra time after the estimated prompt-cache expiry before the process is parked. |
+| `idleMaxMs` | 3600000 | Longest a warm idle subagent stays up, even if cache warming keeps moving the expiry. |
+| `maxWarmAgents` | 4 | Machine-wide cap on warm (process alive) subagents. Past it, the least recently used idle one is parked. Top-level key, read by the daemon. |
 
 
 All keys above except `foregroundBudgetMs` and `managerPath` belong in the `subagent` object.

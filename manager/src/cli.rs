@@ -285,6 +285,13 @@ pub(crate) enum Sub {
         #[usage(double_dash = "automatic")]
         command: String,
     },
+    /// Talk to a hosted subagent. Prints its event stream and sends each
+    /// typed line as a prompt (steered while it is running).
+    #[usage(display_order = 145, help_heading = "Acting on tasks")]
+    Attach {
+        /// Child id or pi session id.
+        target: String,
+    },
     /// Health checks; fixes stale socket/pid files. Exit 1 on any failure.
     ///
     /// Covers daemon, socket, config, protocol, stale records, orphan pids, disk use.
