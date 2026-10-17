@@ -89,6 +89,9 @@ pub struct TaskEntry {
     /// Output bytes the fanout has pushed to watchers, as a cursor (an
     /// incomplete trailing UTF-8 sequence it holds back is not counted).
     pub delivered_cursor: u64,
+    /// Bounded monitor metadata only; intentionally not persisted/handovered.
+    /// New binaries fall back to raw bytes until an inherited partial line ends.
+    pub monitor: Option<crate::monitor::MonitorState>,
     /// Sessions that watched this task when an in-place upgrade closed
     /// their connections, with the cursor they had received up to. Resumed
     /// (and the gap sent) when the session reconnects.
@@ -139,6 +142,8 @@ impl TaskEntry {
     /// An entry with no runner, pipes or timers attached.
     pub fn bare(record: TaskRecord, output: Arc<Mutex<OutputState>>) -> Self {
         let (status_tx, _) = watch::channel(record.status);
+        let monitor =
+            (record.kind == TaskKind::Monitor).then(|| crate::monitor::MonitorState::new(0));
         TaskEntry {
             record,
             child: None,
@@ -159,6 +164,7 @@ impl TaskEntry {
             exit_watch: None,
             status_partial: Vec::new(),
             delivered_cursor: 0,
+            monitor,
             watch_sessions: Vec::new(),
             group_lingering: false,
             job_generation: 0,

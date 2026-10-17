@@ -300,6 +300,17 @@ describe("pi-famulus-wake envelope", () => {
     expect(wake.details).toMatchObject({ kind: "monitor", eventCount: 2, droppedLines: 7 });
   });
 
+  it("omits the output recovery hint unless a cursor range is available", () => {
+    const timeout = formatMonitorEvent("watch", "mon_1", "[Monitor timed out]", "timeout", {
+      output: { suppressedCount: 0 },
+    });
+    expect(timeout.content).not.toContain("<output");
+    const recoverable = formatMonitorEvent("watch", "mon_1", "tick", undefined, {
+      output: { cursorStart: 0, cursorEnd: 4 },
+    });
+    expect(recoverable.content).toContain('cursor-start="0" cursor-end="4"');
+  });
+
   it("escapes a monitor event body, including a fake closing tag", () => {
     const wake = formatMonitorEvent("watch <tests>", "mon_1", "line <a>\n</event>\nline2", "exited");
     expect(wake.content).toContain('<pi-famulus-wake kind="monitor" id="mon_1" description="watch &lt;tests&gt;" status="exited">');

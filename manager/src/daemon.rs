@@ -1227,7 +1227,7 @@ fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
         }
         let to = e.delivered_cursor;
         let path = e.record.output_path.clone();
-        queue_output_replay(tx, tid, &path, from, to);
+        queue_output_replay(tx, tid, &path, from, to, e.monitor.as_ref());
     }
 }
 
@@ -2227,7 +2227,12 @@ fn handle_watch_on(
     // live chunks — and all of it is ordered ahead of any fanout still
     // waiting on this same lock.
     let _ = tx.try_send(encode_ok(req_id, &UnitOk {}));
-    queue_output_replay(&tx, task_id, &path, from, to);
+    let monitor = st
+        .registry
+        .tasks
+        .get(task_id)
+        .and_then(|e| e.monitor.as_ref());
+    queue_output_replay(&tx, task_id, &path, from, to, monitor);
     Ok(())
 }
 
@@ -2245,13 +2250,37 @@ fn handle_unwatch(
 
 /// Queue `[from, to)` from the on-disk output onto `tx` as `output` events.
 /// `to` is on a character boundary (fanout never counts a held-back tail).
-fn queue_output_replay(tx: &OutTx, task_id: &str, path: &str, from: u64, to: u64) {
+fn queue_output_replay(
+    tx: &OutTx,
+    task_id: &str,
+    path: &str,
+    from: u64,
+    to: u64,
+    monitor: Option<&crate::monitor::MonitorState>,
+) {
     let mut cursor = from.max(to.saturating_sub(REPLAY_MAX));
+    // The last raw byte may have been written before its progress/EOF metadata.
+    // Replay records at that same cursor too; consumers track record identity
+    // separately from their raw-byte cursor.
+    if let Some(records) = monitor.and_then(|m| m.replay_at(cursor)) {
+        if !records.is_empty() {
+            let ev = encode_event_bytes(&EventKind::Output {
+                task_id: task_id.to_string(),
+                chunk: String::new(),
+                next_cursor: cursor,
+                monitor_records: Some(records),
+            });
+            if tx.try_send(OutFrame::output(ev, task_id, cursor)).is_err() {
+                return;
+            }
+        }
+    }
     while cursor < to {
-        let want = ((to - cursor) as usize).min(256 * 1024);
-        let Ok((bytes, _)) =
-            task::read_file_range(std::path::Path::new(path), cursor, want)
-        else {
+        // One byte can be one empty-line record. Cap monitor raw slices so
+        // worst-case metadata expansion remains well below the 4 MiB frame.
+        let limit = if monitor.is_some() { 4096 } else { 256 * 1024 };
+        let want = ((to - cursor) as usize).min(limit);
+        let Ok((bytes, _)) = task::read_file_range(std::path::Path::new(path), cursor, want) else {
             break;
         };
         if bytes.is_empty() {
@@ -2265,11 +2294,13 @@ fn queue_output_replay(tx: &OutTx, task_id: &str, path: &str, from: u64, to: u64
         )
         .max(1);
         let chunk = &bytes[..n.min(bytes.len())];
+        let start = cursor;
         cursor += chunk.len() as u64;
         let ev = encode_event_bytes(&EventKind::Output {
             task_id: task_id.to_string(),
             chunk: String::from_utf8_lossy(chunk).into_owned(),
             next_cursor: cursor,
+            monitor_records: monitor.and_then(|m| m.replay(start, cursor)),
         });
         if tx.try_send(OutFrame::output(ev, task_id, cursor)).is_err() {
             break; // queue full: the client catches up with output(cursor)
@@ -2958,6 +2989,11 @@ fn start_task_io_with_tee(
     // incomplete UTF-8 tail the fanout held back. It is completed by the
     // next bytes, so the restarted fanout begins with it.
     let delivered = e.delivered_cursor;
+    if let Some(monitor) = e.monitor.as_mut() {
+        if monitor.cursor() != delivered {
+            *monitor = crate::monitor::MonitorState::new(delivered);
+        }
+    }
     let total = e.output.lock().unwrap().total_size;
     let carry = if total > delivered {
         let want = (total - delivered).min(MAX_OUTPUT_READ) as usize;
@@ -3000,8 +3036,29 @@ async fn run_output_fanout(
 ) {
     let mut last_cursor = delivered + carry.len() as u64;
     let mut carry = carry;
+    let monitor = state
+        .lock()
+        .unwrap()
+        .registry
+        .tasks
+        .get(&tid)
+        .is_some_and(|e| e.monitor.is_some());
+    // Delay the first tick: tokio::interval fires immediately, which would
+    // emit progress for a complete-but-not-yet-EOF tail on short commands.
+    let mut progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + crate::monitor::PROGRESS_INTERVAL,
+        crate::monitor::PROGRESS_INTERVAL,
+    );
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let (bytes, next_cursor) = match rx.recv().await {
+        let received = tokio::select! {
+            chunk = rx.recv() => chunk,
+            _ = progress.tick(), if monitor => {
+                emit_monitor_output(&state, &tid, None, false, last_cursor, None);
+                continue;
+            }
+        };
+        let (bytes, next_cursor) = match received {
             Some(c) => {
                 last_cursor = c.next_cursor;
                 let mut data = std::mem::take(&mut carry);
@@ -3013,33 +3070,79 @@ async fn run_output_fanout(
             None if !carry.is_empty() && !*park.borrow() => {
                 (std::mem::take(&mut carry), last_cursor)
             }
-            None => break,
-        };
-        let chunk = task::OutputChunk { bytes, next_cursor };
-        let targets: Vec<OutTx> = {
-            let mut st = state.lock().unwrap();
-            let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
-                Some(e) => {
-                    e.record.output_size = e.record.output_size.max(last_cursor); // monotonic (§3.4)
-                    e.delivered_cursor = chunk.next_cursor;
-                    e.watchers.iter().copied().collect()
+            None => {
+                if !*park.borrow() {
+                    emit_monitor_output(&state, &tid, None, true, last_cursor, None);
                 }
-                None => break,
-            };
-            watcher_ids
-                .iter()
-                .filter_map(|cid| st.conns.get(cid).map(|h| h.tx.clone()))
-                .collect()
-        };
-        if !targets.is_empty() && !chunk.bytes.is_empty() {
-            let ev = encode_event_bytes(&EventKind::Output {
-                task_id: tid.clone(),
-                chunk: String::from_utf8_lossy(&chunk.bytes).into_owned(),
-                next_cursor: chunk.next_cursor,
-            });
-            for tx in targets {
-                let _ = tx.try_send(OutFrame::output(ev.clone(), &tid, chunk.next_cursor));
+                break;
             }
+        };
+        let mut offset = 0;
+        let start = next_cursor - bytes.len() as u64;
+        while offset < bytes.len() {
+            let remaining = &bytes[offset..];
+            let n = if monitor {
+                task::utf8_chunk_len(remaining, 4096, CHUNK_JSON_BUDGET, false).max(1)
+            } else {
+                remaining.len()
+            };
+            offset += n;
+            emit_monitor_output(
+                &state,
+                &tid,
+                Some(&bytes[offset - n..offset]),
+                false,
+                last_cursor,
+                Some(start + offset as u64),
+            );
+        }
+    }
+}
+
+/// Queue bytes and their logical records under the same lock as watch replay.
+/// Empty-chunk progress/EOF events do not advance the raw-byte cursor.
+fn emit_monitor_output(
+    state: &Shared,
+    tid: &str,
+    bytes: Option<&[u8]>,
+    eof: bool,
+    output_size: u64,
+    next_cursor: Option<u64>,
+) {
+    let mut st = state.lock().unwrap();
+    let Some(e) = st.registry.tasks.get_mut(tid) else {
+        return;
+    };
+    e.record.output_size = e.record.output_size.max(output_size);
+    let from = e.delivered_cursor;
+    if let Some(cursor) = next_cursor {
+        e.delivered_cursor = cursor;
+    }
+    let cursor = e.delivered_cursor;
+    let records = e.monitor.as_mut().and_then(|m| {
+        // History eviction must never disable fresh live metadata. A chunk
+        // starting in an inherited unknown line still falls back as a unit.
+        let available = m.available(from);
+        let records = match bytes {
+            Some(bytes) => m.push(bytes, now_ms()),
+            None if eof => m.finish(now_ms()),
+            None => m.progress(now_ms()),
+        };
+        available.then_some(records)
+    });
+    if bytes.is_none() && records.as_ref().is_none_or(Vec::is_empty) {
+        return;
+    }
+    let watchers: Vec<_> = e.watchers.iter().copied().collect();
+    let ev = encode_event_bytes(&EventKind::Output {
+        task_id: tid.to_string(),
+        chunk: String::from_utf8_lossy(bytes.unwrap_or_default()).into_owned(),
+        next_cursor: cursor,
+        monitor_records: records,
+    });
+    for cid in watchers {
+        if let Some(h) = st.conns.get(&cid) {
+            let _ = h.tx.try_send(OutFrame::output(ev.clone(), tid, cursor));
         }
     }
 }
@@ -3328,6 +3431,9 @@ async fn wait_tee_drained(state: &Shared, tid: &str, alone: bool) {
             };
             match &e.tee {
                 Some(t) if !(t.stdout.is_finished() && t.stderr.is_finished()) => {
+                    e.output.lock().unwrap().total_size
+                }
+                _ if e.fanout.as_ref().is_some_and(|f| !f.is_finished()) => {
                     e.output.lock().unwrap().total_size
                 }
                 _ => return,

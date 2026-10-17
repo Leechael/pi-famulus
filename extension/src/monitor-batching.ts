@@ -13,19 +13,71 @@ export interface LineBatcherOptions {
   flushMs?: number; // batching window, default 200
   maxLineChars?: number; // per-line cap, default 500
   maxBatchChars?: number; // per-batch cap, default 3000
-  onFlush: (text: string) => void;
+  onFlush: (text: string, info: { truncated: boolean; omittedChars: number }) => void;
   clock?: Clock;
+}
+
+function sourceOfSlice(text: string, source: number, start: number, end: number): number {
+  if (text.length === 0 || end <= start) return 0;
+  return Math.round(source * ((end - start) / text.length));
+}
+
+/** Fixed-memory head/tail preview. Counts omitted source units, not generated ellipses. */
+export class BoundedPreview {
+  private head = "";
+  private tail = "";
+  private sourceHead = 0;
+  private sourceTail = 0;
+  total = 0;
+  private sourceTotal = 0;
+  constructor(readonly limit: number) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("preview limit must be positive");
+  }
+  append(text: string, sourceChars = text.length): void {
+    const headLimit = Math.ceil((this.limit - 1) / 2);
+    if (this.total + text.length <= this.limit) {
+      this.head += text;
+      this.sourceHead += sourceChars;
+    } else {
+      const old = this.head;
+      const oldSourceHead = this.sourceHead;
+      if (this.total <= this.limit) {
+        const combined = old + text;
+        const combinedSource = oldSourceHead + sourceChars;
+        this.head = combined.slice(0, headLimit);
+        this.sourceHead = sourceOfSlice(combined, combinedSource, 0, this.head.length);
+      }
+      const tailLimit = this.limit - 1 - headLimit;
+      if (tailLimit > 0) {
+        const from = (this.tail || old).concat(text);
+        const fromSource = (this.tail ? this.sourceTail : oldSourceHead) + sourceChars;
+        this.tail = from.slice(-tailLimit);
+        this.sourceTail = sourceOfSlice(from, fromSource, from.length - this.tail.length, from.length);
+      } else {
+        this.tail = "";
+        this.sourceTail = 0;
+      }
+    }
+    this.total += text.length;
+    this.sourceTotal += sourceChars;
+  }
+  get omittedChars(): number {
+    if (this.total <= this.limit) return 0;
+    return Math.max(0, this.sourceTotal - this.sourceHead - this.sourceTail);
+  }
+  get text(): string { return this.total > this.limit ? `${this.head}…${this.tail}` : this.head; }
 }
 
 export class LineBatcher {
   private readonly flushMs: number;
   private readonly maxLineChars: number;
   private readonly maxBatchChars: number;
-  private readonly onFlush: (text: string) => void;
+  private readonly onFlush: LineBatcherOptions["onFlush"];
   private readonly clock: Clock;
-
-  private partial = ""; // trailing bytes not yet terminated by \n
-  private lines: string[] = []; // complete lines awaiting emission
+  private partial: BoundedPreview;
+  private lines: BoundedPreview;
+  private lineCount = 0;
+  private omittedLineChars = 0;
   private timer: ClockTimer | null = null;
   private disposed = false;
 
@@ -35,49 +87,52 @@ export class LineBatcher {
     this.maxBatchChars = opts.maxBatchChars ?? 3000;
     this.onFlush = opts.onFlush;
     this.clock = opts.clock ?? realClock;
+    this.partial = new BoundedPreview(this.maxLineChars);
+    this.lines = new BoundedPreview(this.maxBatchChars);
   }
 
-  /** Feed a raw output chunk (may contain no/newlines or multiple lines). */
+  /** Bound retained data during ingestion, not just after the timer fires. */
   push(chunk: string): void {
     if (this.disposed || chunk.length === 0) return;
-    const combined = this.partial + chunk;
-    const parts = combined.split("\n");
-    this.partial = parts.pop() ?? "";
-    for (const line of parts) {
-      this.lines.push(this.capLine(line));
+    const parts = chunk.split("\n");
+    for (let i = 0; i < parts.length; i++) {
+      this.partial.append(parts[i]);
+      if (i < parts.length - 1) this.finishLine();
     }
-    if (this.lines.length > 0 || this.partial.length > 0) this.schedule();
+    this.schedule();
   }
 
-  /**
-   * Immediately emit the current buffer when non-empty, including any
-   * unterminated trailing line. Used when a monitored process exits.
-   */
   flush(): void {
     if (this.disposed) return;
     this.clearTimer();
     this.emit();
   }
 
-  /** Clear the pending timer and drop buffered content. */
   dispose(): void {
     this.disposed = true;
     this.clearTimer();
-    this.lines = [];
-    this.partial = "";
+    this.reset();
   }
 
-  private capLine(line: string): string {
-    if (line.length <= this.maxLineChars) return line;
-    return line.slice(0, this.maxLineChars);
+  private finishLine(): void {
+    if (this.lineCount++ > 0) this.lines.append("\n", 1);
+    const displayed = this.partial.text;
+    this.lines.append(displayed, this.partial.total - this.partial.omittedChars);
+    this.omittedLineChars += this.partial.omittedChars;
+    this.partial = new BoundedPreview(this.maxLineChars);
+  }
+
+  private reset(): void {
+    this.partial = new BoundedPreview(this.maxLineChars);
+    this.lines = new BoundedPreview(this.maxBatchChars);
+    this.lineCount = 0;
+    this.omittedLineChars = 0;
   }
 
   private schedule(): void {
     if (this.timer !== null) return;
     this.timer = this.clock.setTimeout(() => {
       this.timer = null;
-      // Window end drains everything, including an unterminated trailing
-      // line (no data loss); a fresh window starts on the next push.
       this.emit();
     }, this.flushMs);
     this.clock.unref?.(this.timer);
@@ -91,18 +146,11 @@ export class LineBatcher {
   }
 
   private emit(): void {
-    const lines = this.lines;
-    const partial = this.partial.length > 0 ? this.capLine(this.partial) : "";
-    if (lines.length === 0 && partial.length === 0) return;
-    this.lines = [];
-    this.partial = "";
-
-    let text = partial.length > 0 ? [...lines, partial].join("\n") : lines.join("\n");
-    if (text.length > this.maxBatchChars) {
-      // Keep the tail: for monitoring, the most recent lines matter most.
-      text = `…${text.slice(-(this.maxBatchChars - 1))}`;
-    }
-    if (text.length > 0) this.onFlush(text);
+    if (this.partial.total > 0) this.finishLine();
+    const text = this.lines.text;
+    const omittedChars = this.omittedLineChars + this.lines.omittedChars;
+    this.reset();
+    if (text.length > 0) this.onFlush(text, { truncated: omittedChars > 0, omittedChars });
   }
 }
 

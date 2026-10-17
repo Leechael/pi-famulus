@@ -2,7 +2,7 @@
 
 # description
 
-Read output of a background task. Without a cursor, returns the tail of the output plus the current file pointer; pass the returned next_cursor as cursor for incremental reads. Not a way to wait: a running task wakes you when it finishes, so reply with no tool call instead of calling this again.
+Read original output of a background task, including a monitor's truncated or deduplicated output. Without a cursor, returns the tail plus the current file pointer; pass next_cursor as cursor to page forward. Use small max_bytes ranges for details. Reading a different range is allowed; while a task is running, recently read ranges may be rejected if the output size is unchanged. This is not a way to wait: when no further details are needed, end your turn with no tool call and resume on the next notification.
 
 # snippet
 
@@ -18,10 +18,10 @@ Byte offset to read from (for incremental reads). Omit to read the tail of the o
 
 # param: max_bytes
 
-Maximum bytes to return (default 65536)
+Maximum bytes to return (default 65536, capped at 1048576); use a smaller range to avoid flooding context. Zero selects the default.
 # hint: still-running
 
-The task is still running. Reply to the user now with no tool call; a <pi-famulus-wake> arrives when it finishes.
+The task is still running. Read another byte range only if details are needed; otherwise end your turn with no tool call. Do not repeatedly check for progress; a <pi-famulus-wake> arrives when it finishes.
 
 # error: no-new-output
 

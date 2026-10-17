@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import { realClock, type Clock } from "./clock";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient, TaskRecord } from "./manager-client";
+import { fnv1a64 } from "./config";
 import { fill, PROMPTS } from "./prompts.generated";
 import {
   formatAgentCommand,
@@ -196,19 +197,32 @@ export interface TaskOutputDetails {
 }
 
 const DEFAULT_OUTPUT_BYTES = 65536;
+// manager/src/daemon.rs MAX_OUTPUT_READ: clamp before selecting a tail window.
+const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 export function createTaskOutputTool(
   deps: TaskToolsDeps,
 ): ToolDefinition<typeof taskOutputParameters, TaskOutputDetails> {
-  // total_size at the last read of each running task. A repeat read that finds
-  // the same size is polling: the prompt forbids it, but models still loop.
-  const lastRunningSize = new Map<string, number>();
-  const guardPoll = (id: string, running: boolean, size: number) => {
-    if (running && lastRunningSize.get(id) === size) {
+  // Reading another page is retrieval, not polling. Remember actual returned
+  // ranges so tail/explicit reads (or different limits hitting EOF) agree.
+  // Bound both task and range histories for long-lived extension sessions.
+  const runningReads = new Map<string, { size: number; ranges: Set<string> }>();
+  const guardPoll = (id: string, running: boolean, size: number, start: number, end: number, identity = "") => {
+    if (!running) {
+      runningReads.delete(id);
+      return;
+    }
+    const previous = runningReads.get(id);
+    const entry = previous?.size === size ? previous : { size, ranges: new Set<string>() };
+    const range = `${start === end ? "empty" : `${start}:${end}`}:${identity}`;
+    if (entry.ranges.has(range)) {
       throw new Error(fill("tools.task_output.error.no-new-output", { taskId: id, hint: END_TURN_HINT }));
     }
-    if (running) lastRunningSize.set(id, size);
-    else lastRunningSize.delete(id);
+    entry.ranges.add(range);
+    if (entry.ranges.size > 256) entry.ranges.delete(entry.ranges.values().next().value!);
+    runningReads.delete(id);
+    runningReads.set(id, entry);
+    if (runningReads.size > 128) runningReads.delete(runningReads.keys().next().value!);
   };
   return {
     name: "task_output",
@@ -217,11 +231,19 @@ export function createTaskOutputTool(
     promptSnippet: PROMPTS["tools.task_output.snippet"],
     parameters: taskOutputParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      for (const field of ["cursor", "max_bytes"] as const) {
+        const value = params[field];
+        if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+          throw new TypeError(`${field} must be a nonnegative safe integer`);
+        }
+      }
       const agentText = agentTextFor(deps, params.task_id);
       if (agentText !== undefined) {
         const status = deps.getIndex?.()?.get(params.task_id)?.status ?? "unknown";
         const running = status === "pending" || status === "running";
-        guardPoll(params.task_id, running, agentText.length);
+        // Length alone hides a same-length conversation rewrite. Hash the
+        // snapshot so a changed child transcript is a new range.
+        guardPoll(params.task_id, running, agentText.length, 0, agentText.length, fnv1a64(agentText));
         const body = (agentText || "(no output yet)") + (running ? `\n\n${END_TURN_HINT}` : "");
         return {
           content: [{ type: "text", text: body }],
@@ -236,10 +258,7 @@ export function createTaskOutputTool(
         };
       }
       const client = await requireClient(deps);
-      const maxBytes =
-        params.max_bytes !== undefined && params.max_bytes > 0
-          ? Math.floor(params.max_bytes)
-          : DEFAULT_OUTPUT_BYTES;
+      const maxBytes = Math.min(params.max_bytes || DEFAULT_OUTPUT_BYTES, MAX_OUTPUT_BYTES);
 
       let cursor = params.cursor;
       if (cursor === undefined) {
@@ -250,7 +269,7 @@ export function createTaskOutputTool(
 
       const res = await client.output(params.task_id, cursor, maxBytes);
       const running = res.status === "running";
-      guardPoll(params.task_id, running, res.total_size);
+      guardPoll(params.task_id, running, res.total_size, cursor, res.next_cursor);
       const details: TaskOutputDetails = {
         task_id: params.task_id,
         status: res.status,

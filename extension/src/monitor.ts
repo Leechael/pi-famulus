@@ -13,7 +13,9 @@ import { formatMonitorEvent } from "./format";
 import { MONITOR_IDLE_INSTRUCTION } from "./behavior-guidelines";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
-import type { ManagerClient, ManagerEvent, TaskRecord } from "./manager-client";
+import type { ManagerClient, ManagerEvent, MonitorOutputRecord, TaskRecord } from "./manager-client";
+import { DEFAULT_DEDUP_WINDOW_MS, MonitorOutputBuffer, mergeOutputInfo, type FingerprintMode } from "./monitor-output";
+import type { MonitorOutputInfo } from "./wake";
 import { LineBatcher, RateLimiter, SaturationWindow } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
 import { fill, fillList, PROMPTS } from "./prompts.generated";
@@ -75,6 +77,10 @@ interface MonitorEntry {
   description: string;
   startedAt: number;
   batcher: LineBatcher;
+  output: MonitorOutputBuffer;
+  legacyOutput: MonitorOutputInfo;
+  recordCursor: number;
+  lastRecordKind?: "line" | "progress";
   limiter: RateLimiter;
   saturation: SaturationWindow;
   droppedLinesPending: number;
@@ -82,10 +88,12 @@ interface MonitorEntry {
   stopped: boolean;
   cursor: number;
   recovering: boolean;
-  queuedOutput: { chunk: string; cursor?: number }[];
+  queuedOutput: { chunk: string; cursor?: number; records?: MonitorOutputRecord[] }[];
   lastEventAt?: number;
   /** The model asked to stop it (task_stop): what is left is not news. */
   stopRequested?: boolean;
+  /** Prevents autoStop from re-entering while it drains the 200ms batcher. */
+  stopping?: boolean;
 }
 
 export class MonitorRegistry {
@@ -93,7 +101,7 @@ export class MonitorRegistry {
   private readonly clock: Clock;
   private readonly entries = new Map<string, MonitorEntry>();
   private readonly changeListeners = new Set<() => void>();
-  private readonly early = new Map<string, { chunks: { chunk: string; cursor?: number }[]; chars: number; exit?: ManagerEvent }>();
+  private readonly early = new Map<string, { chunks: { chunk: string; cursor?: number; records?: MonitorOutputRecord[] }[]; chars: number; exit?: ManagerEvent }>();
 
   constructor(deps: MonitorDeps) {
     this.deps = deps;
@@ -130,7 +138,7 @@ export class MonitorRegistry {
 
   /** Start a monitor process and subscribe to its output stream. */
   async start(
-    params: { command: string; description: string; timeout_ms?: number; persistent?: boolean },
+    params: { command: string; description: string; timeout_ms?: number; persistent?: boolean; dedup_window_ms?: number; fingerprint_mode?: FingerprintMode },
     ctx: ExtensionContext,
   ): Promise<{ taskId: string; timeoutMs: number | null }> {
     const client = this.deps.getClient();
@@ -138,6 +146,12 @@ export class MonitorRegistry {
       throw new Error("pi-famulus is not available in this session; monitor is disabled");
     }
 
+    if (params.dedup_window_ms !== undefined && (!Number.isSafeInteger(params.dedup_window_ms) || params.dedup_window_ms < 0 || params.dedup_window_ms > 3_600_000)) {
+      throw new RangeError("dedup_window_ms must be an integer between 0 and 3600000");
+    }
+    if (params.fingerprint_mode !== undefined && params.fingerprint_mode !== "exact" && params.fingerprint_mode !== "ignore-timestamps") {
+      throw new RangeError("fingerprint_mode must be exact or ignore-timestamps");
+    }
     const persistent = params.persistent === true;
     let timeoutMs: number | null = null;
     if (!persistent) {
@@ -161,6 +175,9 @@ export class MonitorRegistry {
       description: params.description,
       startedAt: this.clock.now(),
       batcher: null as unknown as LineBatcher, // assigned below (self-reference in callback)
+      output: null as unknown as MonitorOutputBuffer,
+      legacyOutput: {},
+      recordCursor: -1,
       limiter: new RateLimiter({ clock: this.clock }),
       saturation: new SaturationWindow({
         windowMs: SATURATION_WINDOW_MS,
@@ -175,8 +192,19 @@ export class MonitorRegistry {
       queuedOutput: [],
     };
     entry.batcher = new LineBatcher({
-      onFlush: (text) => this.onBatch(entry, text),
+      onFlush: (text, info) => {
+        const output = mergeOutputInfo(entry.legacyOutput, info);
+        entry.legacyOutput = {};
+        this.onBatch(entry, text, output);
+      },
       clock: this.clock,
+    });
+    entry.output = new MonitorOutputBuffer({
+      clock: this.clock,
+      windowMs: params.dedup_window_ms ?? DEFAULT_DEDUP_WINDOW_MS,
+      mode: params.fingerprint_mode ?? "exact",
+      onFlush: ({ text, output }) => this.onBatch(entry, text, output, entry.output.onDelivered),
+      onSuppressed: () => this.deps.logEvent?.("monitor.dedupe", { id: entry.taskId }),
     });
     if (timeoutMs !== null) {
       entry.timeoutTimer = this.clock.setTimeout(() => {
@@ -189,7 +217,7 @@ export class MonitorRegistry {
     // Replay what arrived before we knew the id: lines first, then the exit.
     const early = this.early.get(task_id);
     this.early.delete(task_id);
-    for (const output of early?.chunks ?? []) this.acceptOutput(entry, output.chunk, output.cursor);
+    for (const output of early?.chunks ?? []) this.acceptOutput(entry, output.chunk, output.cursor, output.records);
     if (early?.exit) this.handleExit(task_id, early.exit);
     // Older managers only stream after an explicit watch; newer ones already do.
     else await client.watch(task_id).catch(() => {});
@@ -197,32 +225,60 @@ export class MonitorRegistry {
   }
 
   /** Handle a watched output event from the manager. */
-  handleOutput(taskId: string, chunk: string, nextCursor?: number): void {
+  handleOutput(taskId: string, chunk: string, nextCursor?: number, records?: MonitorOutputRecord[]): void {
     const entry = this.entries.get(taskId);
     if (entry) {
-      if (entry.recovering) entry.queuedOutput.push({ chunk, cursor: nextCursor });
-      else this.acceptOutput(entry, chunk, nextCursor);
+      if (entry.recovering) entry.queuedOutput.push({ chunk, cursor: nextCursor, records });
+      else this.acceptOutput(entry, chunk, nextCursor, records);
       return;
     }
     const early = this.earlyFor(taskId);
-    if (early.chars + chunk.length > EARLY_MAX_CHARS) return;
-    early.chunks.push({ chunk, cursor: nextCursor });
-    early.chars += chunk.length;
+    const cost = chunk.length + (records?.reduce((n, r) => n + r.preview.length + 256, 0) ?? 0);
+    if (early.chars + cost > EARLY_MAX_CHARS) {
+      // Metadata expansion (e.g. hundreds of empty lines) must not discard
+      // startup bytes which fit the budget. Convert the buffered prefix too:
+      // it may contain raw fragments held for a later completed-line record.
+      const rawCost = early.chunks.reduce((n, output) => n + output.chunk.length, 0) + chunk.length;
+      if (rawCost > EARLY_MAX_CHARS) return;
+      for (const output of early.chunks) output.records = undefined;
+      early.chunks.push({ chunk, cursor: nextCursor });
+      early.chars = rawCost;
+    } else {
+      early.chunks.push({ chunk, cursor: nextCursor, records });
+      early.chars += cost;
+    }
   }
 
-  private acceptOutput(entry: MonitorEntry, chunk: string, nextCursor?: number): void {
+  private acceptOutput(entry: MonitorEntry, chunk: string, nextCursor?: number, records?: MonitorOutputRecord[]): void {
     let deliver = Buffer.from(chunk, "utf8");
+    const previousCursor = entry.cursor;
     if (typeof nextCursor === "number") {
-      if (nextCursor <= entry.cursor) return;
-      const startCursor = nextCursor - deliver.byteLength;
-      if (startCursor < entry.cursor) {
-        deliver = deliver.subarray(entry.cursor - startCursor);
+      if (nextCursor <= entry.cursor) deliver = Buffer.alloc(0);
+      else {
+        const startCursor = nextCursor - deliver.byteLength;
+        if (startCursor < entry.cursor) deliver = deliver.subarray(entry.cursor - startCursor);
+        entry.cursor = nextCursor;
       }
-      entry.cursor = nextCursor;
-    } else {
-      entry.cursor += deliver.byteLength;
+    } else entry.cursor += deliver.byteLength;
+    if (records !== undefined) {
+      // Empty metadata arrays deliberately hold raw fragments for Rust framing.
+      entry.batcher.flush();
+      for (const record of records) {
+        if (!validRecord(record, entry.cursor)) continue;
+        if (record.cursor_end < entry.recordCursor || (record.cursor_end === entry.recordCursor && !(entry.lastRecordKind === "progress" && record.kind === "line"))) continue;
+        entry.recordCursor = record.cursor_end;
+        entry.lastRecordKind = record.kind;
+        entry.output.push(record);
+      }
+    } else if (deliver.byteLength > 0) {
+      // Legacy manager or unavailable replay metadata: fail open, never hash in JS.
+      entry.output.flush();
+      entry.legacyOutput = mergeOutputInfo(entry.legacyOutput, {
+        firstObservedAt: this.clock.now(), lastObservedAt: this.clock.now(),
+        cursorStart: Math.max(previousCursor, entry.cursor - deliver.byteLength), cursorEnd: entry.cursor,
+      });
+      entry.batcher.push(deliver.toString("utf8"));
     }
-    if (deliver.byteLength > 0) entry.batcher.push(deliver.toString("utf8"));
   }
 
   /**
@@ -252,10 +308,12 @@ export class MonitorRegistry {
     }
     // Drain remaining buffered lines before closing out.
     entry.batcher.flush();
+    entry.output.flush();
     const alreadyStopped = entry.stopped;
     this.cleanup(entry);
     this.deps.onExited?.(taskId, event);
-    if (alreadyStopped) return true; // timeout/saturation notice already sent
+    if (alreadyStopped) return true; // timeout/saturation owns the pending summary
+    const summary = entry.output.takeSummary();
     const exitCode = event.exit_code ?? null;
     // A clean exit soon after an event is the command finishing on it
     // (grep -m1), unless someone stopped it (TUI stop: end_reason "tui").
@@ -274,7 +332,7 @@ export class MonitorRegistry {
         entry.taskId,
         `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). No further events will be delivered.${entry.droppedLinesPending > 0 ? ` ${entry.droppedLinesPending} output lines were dropped.` : ""}`,
         "exited",
-        { droppedLines: entry.droppedLinesPending },
+        { droppedLines: entry.droppedLinesPending, ...(summary.suppressedCount ? { output: summary } : {}) },
       ),
       { passive: causedByEvent || entry.stopRequested === true, quietEvents: entry.stopRequested === true },
     );
@@ -300,7 +358,7 @@ export class MonitorRegistry {
     return closed;
   }
 
-  private earlyFor(taskId: string): { chunks: { chunk: string; cursor?: number }[]; chars: number; exit?: ManagerEvent } {
+  private earlyFor(taskId: string): { chunks: { chunk: string; cursor?: number; records?: MonitorOutputRecord[] }[]; chars: number; exit?: ManagerEvent } {
     let early = this.early.get(taskId);
     if (!early) {
       early = { chunks: [], chars: 0 };
@@ -321,7 +379,7 @@ export class MonitorRegistry {
       await client.watch(entry.taskId).catch(() => {});
       entry.recovering = false;
       const queued = entry.queuedOutput.splice(0).sort((a, b) => (a.cursor ?? 0) - (b.cursor ?? 0));
-      for (const output of queued) this.acceptOutput(entry, output.chunk, output.cursor);
+      for (const output of queued) this.acceptOutput(entry, output.chunk, output.cursor, output.records);
     }
   }
 
@@ -333,8 +391,10 @@ export class MonitorRegistry {
     this.early.clear();
   }
 
-  private onBatch(entry: MonitorEntry, text: string): void {
-    if (entry.stopped) return;
+  private onBatch(entry: MonitorEntry, text: string, output?: MonitorOutputInfo, onDelivered?: () => void): boolean {
+    if (entry.stopped) return false;
+    const center = this.deps.getNotifyCenter();
+    if (!center) return false;
     const now = this.clock.now();
     const accepted = entry.limiter.tryConsume();
     entry.saturation.record(!accepted, now);
@@ -342,23 +402,30 @@ export class MonitorRegistry {
       const droppedLines = text.split("\n").length;
       this.deps.logEvent?.("monitor.drop", { id: entry.taskId, lines: droppedLines });
       entry.droppedLinesPending += droppedLines;
-      // Already stopping at the model's request: no rate-limit stop or wake.
-      if (entry.saturation.isSaturated(now) && !entry.stopRequested) void this.autoStop(entry);
-      return;
+      // Already stopping at the model's request, or draining for autoStop:
+      // no nested rate-limit stop or wake.
+      if (entry.saturation.isSaturated(now) && !entry.stopRequested && !entry.stopping) void this.autoStop(entry);
+      return false;
     }
     const droppedLines = entry.droppedLinesPending;
     entry.droppedLinesPending = 0;
     entry.lastEventAt = now;
     // Lines still buffered when the model stopped it: recorded, coalesced
     // with that monitor's other pending output, and never a wake.
-    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines, {
+    center.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines, {
       quiet: entry.stopRequested === true,
+      output,
+      onDelivered,
     });
+    return true;
   }
 
   /** Timeout reached: stop the process and notify (§4.4). */
   private async timeout(entry: MonitorEntry): Promise<void> {
     if (entry.stopped) return;
+    entry.batcher.flush();
+    entry.output.flush();
+    if (entry.stopped) return; // A flush may already have tripped overload protection.
     entry.stopped = true;
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "timeout" });
     const client = this.deps.getClient();
@@ -370,7 +437,7 @@ export class MonitorRegistry {
         "[Monitor timed out — re-arm if needed.]",
 
         "timeout",
-        { droppedLines: entry.droppedLinesPending },
+        { droppedLines: entry.droppedLinesPending, output: entry.output.takeSummary() },
       ),
     );
     this.deps.toast?.(`Monitor "${entry.description}" timed out — re-arm if needed.`, "warning");
@@ -380,6 +447,10 @@ export class MonitorRegistry {
 
   /** Rate limiter saturated for too long: stop and notify (§4.4). */
   private async autoStop(entry: MonitorEntry): Promise<void> {
+    if (entry.stopped || entry.stopping) return;
+    entry.stopping = true;
+    entry.batcher.flush();
+    entry.output.flush();
     if (entry.stopped) return;
     entry.stopped = true;
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "rate-limit" });
@@ -392,7 +463,7 @@ export class MonitorRegistry {
         "[Monitor stopped: at least half of output batches were dropped in the last 30s.]",
 
         "stopped",
-        { droppedLines: entry.droppedLinesPending },
+        { droppedLines: entry.droppedLinesPending, output: entry.output.takeSummary() },
       ),
     );
     this.deps.toast?.(
@@ -406,6 +477,7 @@ export class MonitorRegistry {
   private cleanup(entry: MonitorEntry): void {
     entry.stopped = true;
     entry.batcher.dispose();
+    entry.output.dispose();
     entry.limiter.dispose();
     if (entry.timeoutTimer !== null) {
       this.clock.clearTimeout(entry.timeoutTimer);
@@ -414,6 +486,14 @@ export class MonitorRegistry {
     this.entries.delete(entry.taskId);
     this.emitChange();
   }
+}
+
+function validRecord(record: MonitorOutputRecord, cursor: number): boolean {
+  return record?.version === 1 && (record.kind === "line" || record.kind === "progress") &&
+    typeof record.preview === "string" && record.preview.length <= 2000 &&
+    Number.isSafeInteger(record.cursor_start) && record.cursor_start >= 0 &&
+    Number.isSafeInteger(record.cursor_end) && record.cursor_end >= record.cursor_start && record.cursor_end <= cursor &&
+    Number.isFinite(record.observed_at) && record.observed_at >= 0;
 }
 
 /** A task_exited-shaped event rebuilt from a manager record (reconcile). */
@@ -451,6 +531,8 @@ const monitorParameters = Type.Object({
     }),
   ),
   persistent: Type.Optional(Type.Boolean({ description: PROMPTS["tools.monitor.param.persistent"] })),
+  dedup_window_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 3_600_000, description: PROMPTS["tools.monitor.param.dedup_window_ms"] })),
+  fingerprint_mode: Type.Optional(Type.Union([Type.Literal("exact"), Type.Literal("ignore-timestamps")], { description: PROMPTS["tools.monitor.param.fingerprint_mode"] })),
 });
 
 export function createMonitorTool(

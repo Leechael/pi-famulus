@@ -91,6 +91,19 @@ export interface TaskRecord {
   end_reason?: string;
 }
 
+/** Rust-framed logical output. Fingerprints cover full content, not the preview. */
+export interface MonitorOutputRecord {
+  version: 1;
+  kind: "line" | "progress";
+  observed_at: number;
+  cursor_start: number;
+  cursor_end: number;
+  preview: string;
+  truncated: boolean;
+  fingerprint?: string;
+  timestamp_fingerprint?: string;
+}
+
 /** Server-pushed event (§3.3). Fields beyond `event` depend on the event kind. */
 export interface ManagerEvent {
   event: "task_started" | "output" | "task_exited" | "session_rebound" | string;
@@ -100,6 +113,8 @@ export interface ManagerEvent {
   pid?: number;
   chunk?: string;
   next_cursor?: number;
+  /** Absent on legacy managers/replay fallback; [] means Rust framing is active. */
+  monitor_records?: MonitorOutputRecord[];
   exit_code?: number | null;
   signal?: string | null;
   duration_ms?: number;

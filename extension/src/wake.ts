@@ -94,6 +94,17 @@ export interface WakeTiming {
   ageMs?: number;
 }
 
+/** Original-output coordinates and observation times; independent of wake delivery time. */
+export interface MonitorOutputInfo {
+  firstObservedAt?: number;
+  lastObservedAt?: number;
+  cursorStart?: number;
+  cursorEnd?: number;
+  truncated?: boolean;
+  suppressedCount?: number;
+  omittedChars?: number;
+}
+
 export type FamulusWake = FamulusWakeBody & WakeTiming;
 
 type FamulusWakeBody =
@@ -106,6 +117,7 @@ type FamulusWakeBody =
       event: string;
       eventCount?: number;
       droppedLines?: number;
+      output?: MonitorOutputInfo;
     }
   | {
       kind: "subagent-handover";
@@ -316,7 +328,21 @@ function renderMonitor(details: Extract<FamulusWake, { kind: "monitor" }>): stri
   if (details.droppedLines !== undefined && details.droppedLines > 0) {
     attrs.push(`dropped-lines="${details.droppedLines}"`);
   }
-  return [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <event>${escapeXml(details.event)}</event>`, "</pi-famulus-wake>"].join("\n");
+  const output = details.output;
+  const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <event>${escapeXml(details.event)}</event>`];
+  if (output?.cursorStart !== undefined) {
+    const fields: string[] = [];
+    if (output.firstObservedAt !== undefined) fields.push(`first-observed-at="${wakeTimestamp(output.firstObservedAt)}"`);
+    if (output.lastObservedAt !== undefined) fields.push(`last-observed-at="${wakeTimestamp(output.lastObservedAt)}"`);
+    fields.push(`cursor-start="${output.cursorStart}"`);
+    if (output.cursorEnd !== undefined) fields.push(`cursor-end="${output.cursorEnd}"`);
+    if (output.truncated) fields.push('truncated="true"');
+    if (output.suppressedCount) fields.push(`duplicates-suppressed="${output.suppressedCount}"`);
+    if (output.omittedChars) fields.push(`omitted-chars="${output.omittedChars}"`);
+    parts.push(`  <output ${fields.join(" ")}>${escapeXml(PROMPTS["wakes.monitor.output-hint"])}</output>`);
+  }
+  parts.push("</pi-famulus-wake>");
+  return parts.join("\n");
 }
 
 function renderHandover(details: Extract<FamulusWake, { kind: "subagent-handover" }>): string {

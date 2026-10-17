@@ -28,11 +28,11 @@ describe("NotifyCenter monitor batching", () => {
     expect(first).toMatchObject({
       kind: "monitor",
       id: "mon_1",
-      event: "2 events · last: tick 2",
+      event: "2 events\ntick 1\ntick 2",
       eventCount: 2,
       droppedLines: 3,
     });
-    expect(first.kind === "monitor" ? first.event : "").toBe("2 events · last: tick 2");
+    expect(first.kind === "monitor" ? first.event : "").toBe("2 events\ntick 1\ntick 2");
     expect(sent[0].message.customType).toBe("pi-famulus-wake");
     expect(sent[0].message.content).toContain('<pi-famulus-wake kind="monitor"');
     expect(sent[0].message.content).toContain("</pi-famulus-wake>");
@@ -40,6 +40,160 @@ describe("NotifyCenter monitor batching", () => {
     expect(sent[1].message.details).toMatchObject({ kind: "monitor", id: "mon_2", event: "ready" });
     expect(events).toContainEqual({ type: "wake.emit", fields: { kind: "monitor", ids: ["mon_1"], batch: true } });
     expect(events).toContainEqual({ type: "wake.deliver", fields: { kind: "monitor", mode: "trigger" } });
+    center.dispose();
+  });
+
+  it("does not split a surrogate pair at a preview boundary", () => {
+    let idle = false;
+    const sent: { details?: unknown }[] = [];
+    const center = new NotifyCenter({
+      sendMessage: (message) => sent.push(message),
+      isIdle: () => idle,
+      clock: new ManualClock(),
+    });
+    const emoji = "😀";
+    center.notifyMonitorEvent("noisy", "mon_1", `${"h".repeat(1449)}${emoji}${"t".repeat(2000)}`);
+    idle = true;
+    center.settled();
+    const wake = sent[0].details as Extract<FamulusWake, { kind: "monitor" }>;
+    const lone = [...wake.event].filter((ch) => {
+      const code = ch.charCodeAt(0);
+      return ch.length === 1 && code >= 0xd800 && code <= 0xdfff;
+    });
+    expect(lone).toEqual([]);
+    center.dispose();
+  });
+
+  it("bounds a long busy preview with its original head, latest tail, and an exact omission count", () => {
+    let idle = false;
+    const sent: { details?: unknown }[] = [];
+    const center = new NotifyCenter({
+      sendMessage: (message) => sent.push(message),
+      isIdle: () => idle,
+      clock: new ManualClock(),
+    });
+    const chunks = ["START\n" + "a".repeat(6_000), "b".repeat(6_000), "LATEST\nEND"];
+    for (const chunk of chunks) center.notifyMonitorEvent("noisy", "mon_1", chunk, 0, { output: { omittedChars: 5, truncated: false } });
+    expect(sent).toHaveLength(0);
+    idle = true;
+    center.settled();
+    const wake = sent[0].details as Extract<FamulusWake, { kind: "monitor" }>;
+    expect(wake.eventCount).toBe(3);
+    expect(wake.event.length).toBeLessThanOrEqual(3_000);
+    expect(wake.event).toMatch(/^3 events\nSTART\n/);
+    expect(wake.event).toMatch(/LATEST\nEND$/);
+    const marker = /\n\[\.\.\. (\d+) characters omitted \.\.\.\]\n/.exec(wake.event);
+    expect(marker).not.toBeNull();
+    const omitted = Number(marker![1]);
+    expect(omitted).toBe(chunks.join("\n").length - (wake.event.length - "3 events\n".length - marker![0].length));
+    expect(wake).toMatchObject({ output: { truncated: true, omittedChars: omitted + 15 } });
+    center.dispose();
+  });
+
+  it("merges pending observation times, byte envelopes, suppression, and upstream omissions", () => {
+    let idle = false;
+    const sent: { details?: unknown }[] = [];
+    const center = new NotifyCenter({
+      sendMessage: (message) => sent.push(message),
+      isIdle: () => idle,
+      clock: new ManualClock(),
+    });
+    center.notifyMonitorEvent("ticker", "mon_1", "first", 2, {
+      output: { firstObservedAt: 20, lastObservedAt: 30, cursorStart: 100, cursorEnd: 140, suppressedCount: 2, omittedChars: 5, truncated: true },
+    });
+    center.notifyMonitorEvent("ticker", "mon_1", "second", 3, {
+      output: { firstObservedAt: 10, lastObservedAt: 25, cursorStart: 50, cursorEnd: 120, suppressedCount: 3, omittedChars: 7, truncated: false },
+    });
+    center.notifyMonitorEvent("ticker", "mon_1", "third", 0, {
+      output: { firstObservedAt: undefined, lastObservedAt: 40, cursorStart: undefined, cursorEnd: 200 },
+    });
+    idle = true;
+    center.settled();
+    expect(sent[0].details).toMatchObject({
+      event: "3 events\nfirst\nsecond\nthird",
+      droppedLines: 5,
+      output: { firstObservedAt: 10, lastObservedAt: 40, cursorStart: 50, cursorEnd: 200, suppressedCount: 5, omittedChars: 12, truncated: true },
+    });
+    center.dispose();
+  });
+
+  it("calls one stable monitor acknowledgement after delivery, never on busy enqueue", () => {
+    let idle = false;
+    const sent: { details?: unknown }[] = [];
+    const acknowledgedAt: number[] = [];
+    const onDelivered = () => acknowledgedAt.push(sent.length);
+    const center = new NotifyCenter({
+      sendMessage: (message) => sent.push(message),
+      isIdle: () => idle,
+      clock: new ManualClock(),
+    });
+    center.notifyMonitorEvent("ticker", "mon_1", "first", 0, { onDelivered });
+    center.notifyMonitorEvent("ticker", "mon_1", "second", 0, { onDelivered });
+    expect(acknowledgedAt).toEqual([]);
+    idle = true;
+    center.settled();
+    center.flushMonitorEvents();
+    expect(acknowledgedAt).toEqual([1]);
+    center.notifyMonitorEvent("ticker", "mon_1", "idle", 0, {
+      onDelivered,
+      output: { firstObservedAt: 10, cursorStart: 0, cursorEnd: 4 },
+    });
+    expect(acknowledgedAt).toEqual([1, 2]);
+    expect(sent[1].details).toMatchObject({ output: { firstObservedAt: 10, cursorStart: 0, cursorEnd: 4 } });
+    center.dispose();
+  });
+
+  it("rejects changing a pending monitor's callback without losing its original batch", () => {
+    let idle = false;
+    const sent: { details?: unknown }[] = [];
+    let acknowledged = 0;
+    const center = new NotifyCenter({
+      sendMessage: (message) => sent.push(message),
+      isIdle: () => idle,
+      clock: new ManualClock(),
+    });
+    const onDelivered = () => { acknowledged++; };
+    center.notifyMonitorEvent("ticker", "mon_1", "original", 2, { onDelivered, output: { cursorEnd: 8 } });
+    expect(() => center.notifyMonitorEvent("changed", "mon_1", "rejected", 9, {
+      quiet: true, onDelivered: () => { throw new Error("must not be retained"); }, output: { cursorEnd: 100 },
+    })).toThrow(/stable.*onDelivered/i);
+    expect(sent).toHaveLength(0);
+    idle = true;
+    center.settled();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].details).toMatchObject({ description: "ticker", event: "original", eventCount: 1, droppedLines: 2, output: { cursorEnd: 8 } });
+    expect(acknowledged).toBe(1);
+    center.dispose();
+  });
+
+  it("acknowledges quiet output only when its held passive wake is actually appended", () => {
+    let idle = false;
+    const clock = new ManualClock(1_000);
+    const sent: { message: { details?: unknown }; options: unknown }[] = [];
+    const acknowledgedAt: number[] = [];
+    const onDelivered = () => acknowledgedAt.push(sent.length);
+    const center = new NotifyCenter({
+      sendMessage: (message, options) => sent.push({ message, options }),
+      isIdle: () => idle,
+      clock,
+    });
+    center.notifyMonitorEvent("watcher", "mon_1", "before stop", 0, { onDelivered });
+    center.notifyMonitorEvent("watcher", "mon_1", "last line", 0, { quiet: true, onDelivered });
+    const exit = formatMonitorEvent("watcher", "mon_1", "Monitor stopped.", "stopped");
+    center.notify(exit, { passive: true, quietEvents: true });
+    expect(sent).toHaveLength(0);
+    expect(acknowledgedAt).toEqual([]);
+    clock.advanceBy(5_000);
+    idle = true;
+    center.settled();
+    expect(sent.map((entry) => entry.message.details)).toMatchObject([
+      { event: "2 events\nbefore stop\nlast line", asOf: 1_000 },
+      { status: "stopped", asOf: 1_000 },
+    ]);
+    expect(sent.map((entry) => entry.options)).toEqual([{ triggerTurn: false }, { triggerTurn: false }]);
+    expect(acknowledgedAt).toEqual([1]);
+    center.settled();
+    expect(acknowledgedAt).toEqual([1]);
     center.dispose();
   });
 

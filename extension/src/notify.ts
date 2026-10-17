@@ -14,9 +14,11 @@
  *   ever delivered once.
  */
 import { formatMonitorEvent, formatTaskNotification, type TaskExitInfo } from "./format";
-import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, wakeIds, type WakeItem } from "./wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, wakeIds, type MonitorOutputInfo, type WakeItem } from "./wake";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
+
+type MonitorDeliveryAck = (visiblePreview?: string) => void;
 
 export interface NotifyMessage {
   customType: string;
@@ -42,6 +44,64 @@ export interface NotifyCenterDeps {
 }
 
 
+// Reserve 100 of the 3000 preview characters for the event-count prefix and
+// omission marker. No raw pending text grows with the number/size of events.
+const MONITOR_PREVIEW_CHARS = 2900;
+const MONITOR_PREVIEW_HALF = MONITOR_PREVIEW_CHARS / 2;
+interface MonitorPreview {
+  head: string;
+  tail: string;
+  omittedChars: number;
+}
+
+function clipUtf16Start(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const out = text.slice(0, max);
+  const last = out.charCodeAt(out.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? out.slice(0, -1) : out;
+}
+
+function clipUtf16End(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const out = text.slice(-max);
+  const first = out.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? out.slice(1) : out;
+}
+
+function appendMonitorPreview(previous: MonitorPreview | undefined, event: string): MonitorPreview {
+  const total = previous
+    ? previous.head.length + previous.tail.length + previous.omittedChars + 1 + event.length
+    : event.length;
+  if (total <= MONITOR_PREVIEW_CHARS) {
+    return { head: previous ? `${previous.head}\n${event}` : event, tail: "", omittedChars: 0 };
+  }
+  const head = previous
+    ? clipUtf16Start(`${previous.head}\n${clipUtf16Start(event, MONITOR_PREVIEW_HALF)}`, MONITOR_PREVIEW_HALF)
+    : clipUtf16Start(event, MONITOR_PREVIEW_HALF);
+  const tail = event.length >= MONITOR_PREVIEW_HALF
+    ? clipUtf16End(event, MONITOR_PREVIEW_HALF)
+    : clipUtf16End(`${previous?.tail || previous?.head || ""}\n${event}`, MONITOR_PREVIEW_HALF);
+  return { head, tail, omittedChars: total - head.length - tail.length };
+}
+
+function mergeMonitorOutput(previous: MonitorOutputInfo | undefined, next: MonitorOutputInfo | undefined): MonitorOutputInfo | undefined {
+  if (!previous && !next) return undefined;
+  const output = { ...previous };
+  for (const key of ["firstObservedAt", "cursorStart"] as const) {
+    const value = next?.[key];
+    if (value !== undefined) output[key] = Math.min(previous?.[key] ?? value, value);
+  }
+  for (const key of ["lastObservedAt", "cursorEnd"] as const) {
+    const value = next?.[key];
+    if (value !== undefined) output[key] = Math.max(previous?.[key] ?? value, value);
+  }
+  for (const key of ["suppressedCount", "omittedChars"] as const) {
+    if (previous?.[key] !== undefined || next?.[key] !== undefined) output[key] = (previous?.[key] ?? 0) + (next?.[key] ?? 0);
+  }
+  if (previous?.truncated !== undefined || next?.truncated !== undefined) output.truncated = !!previous?.truncated || !!next?.truncated;
+  return output;
+}
+
 export class NotifyCenter {
   private readonly deps: NotifyCenterDeps;
   private readonly batchMs: number;
@@ -49,14 +109,14 @@ export class NotifyCenter {
   private pendingExits: TaskExitInfo[] = [];
   private readonly pendingMonitors = new Map<
     string,
-    { description: string; eventCount: number; lastEvent: string; droppedLines: number; quiet: boolean }
+    { description: string; eventCount: number; preview: MonitorPreview; droppedLines: number; quiet: boolean; output?: MonitorOutputInfo; onDelivered?: MonitorDeliveryAck }
   >();
   private readonly seen = new Set<string>();
   private timer: ClockTimer | null = null;
   private disposed = false;
   /** A wake started or steered a run that has not settled yet. */
   private runPending = false;
-  private held: NotifyMessage[] = [];
+  private held: { message: NotifyMessage; onDelivered?: MonitorDeliveryAck; sourcePreview?: string }[] = [];
 
   constructor(deps: NotifyCenterDeps) {
     this.deps = deps;
@@ -94,11 +154,15 @@ export class NotifyCenter {
     if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id, opts.quietEvents);
     if (!opts.passive) {
       this.deliver(message);
-    } else if (this.runPending || !this.deps.isIdle()) {
-      this.held.push(message);
     } else {
-      this.deliver(message, true);
+      this.deliverPassive(message);
     }
+  }
+
+  private deliverPassive(message: NotifyMessage, onDelivered?: MonitorDeliveryAck, sourcePreview?: string): void {
+    message = stampWakeAsOf(message, this.clock.now());
+    if (this.runPending || !this.deps.isIdle()) this.held.push({ message, onDelivered, sourcePreview });
+    else this.deliver(message, true, onDelivered, sourcePreview);
   }
 
   /**
@@ -111,7 +175,7 @@ export class NotifyCenter {
     this.runPending = false;
     this.flushMonitorEvents();
     if (this.runPending) return;
-    for (const message of this.held.splice(0)) this.deliver(message, true);
+    for (const { message, onDelivered, sourcePreview } of this.held.splice(0)) this.deliver(message, true, onDelivered, sourcePreview);
   }
 
   /**
@@ -119,21 +183,30 @@ export class NotifyCenter {
    * monitor. `quiet`: output of a monitor the model stopped; it is only
    * coalesced, and its summary is delivered without a turn (with the exit
    * notice, or at settle), pending events of that monitor included.
+   * `onDelivered` receives surviving source lines after sendMessage returns, not
+   * enqueue; generated headings/omission markers are never acknowledgement
+   * evidence. Callers must reuse one stable callback per monitor: retaining one
+   * callback bounds pending acknowledgements without silently dropping any.
    */
-  notifyMonitorEvent(description: string, taskId: string, event: string, droppedLines = 0, opts: { quiet?: boolean } = {}): void {
+  notifyMonitorEvent(description: string, taskId: string, event: string, droppedLines = 0, opts: { quiet?: boolean; onDelivered?: MonitorDeliveryAck; output?: MonitorOutputInfo } = {}): void {
     if (this.disposed) return;
     const pending = this.pendingMonitors.get(taskId);
+    if (pending?.onDelivered && opts.onDelivered && pending.onDelivered !== opts.onDelivered) {
+      throw new Error(`Monitor ${taskId} requires a stable onDelivered callback while pending`);
+    }
     if (this.deps.isIdle() && !pending && !opts.quiet) {
-      const wake = formatMonitorEvent(description, taskId, event, undefined, { droppedLines });
-      this.deliver({ customType: wake.customType, content: wake.content, details: wake.details });
+      const wake = formatMonitorEvent(description, taskId, event, undefined, { droppedLines, output: opts.output });
+      this.deliver({ customType: wake.customType, content: wake.content, details: wake.details }, false, opts.onDelivered);
       return;
     }
     this.pendingMonitors.set(taskId, {
       description,
       eventCount: (pending?.eventCount ?? 0) + 1,
-      lastEvent: event,
+      preview: appendMonitorPreview(pending?.preview, event),
       droppedLines: (pending?.droppedLines ?? 0) + droppedLines,
       quiet: (pending?.quiet ?? false) || opts.quiet === true,
+      output: mergeMonitorOutput(pending?.output, opts.output),
+      onDelivered: pending?.onDelivered ?? opts.onDelivered,
     });
     if (this.deps.isIdle() && !opts.quiet) this.flushMonitorEvents();
   }
@@ -149,16 +222,25 @@ export class NotifyCenter {
     const item = this.pendingMonitors.get(taskId);
     if (!item) return;
     this.pendingMonitors.delete(taskId);
-    const summary = item.eventCount > 1
-      ? `${item.eventCount} events · last: ${item.lastEvent}`
-      : item.lastEvent;
+    const { head, tail, omittedChars } = item.preview;
+    const preview = omittedChars > 0 ? `${head}\n[... ${omittedChars} characters omitted ...]\n${tail}` : head;
+    const summary = item.eventCount > 1 ? `${item.eventCount} events\n${preview}` : preview;
     const wake = formatMonitorEvent(item.description, taskId, summary, undefined, {
       eventCount: item.eventCount,
       droppedLines: item.droppedLines,
+      output: mergeMonitorOutput(item.output, omittedChars > 0 ? { truncated: true, omittedChars } : undefined),
     });
     const message = { customType: wake.customType, content: wake.content, details: wake.details };
-    if (quiet || item.quiet) this.notify(message, { passive: true });
-    else this.deliver(message);
+    // Exclude generated text and boundary fragments: a clipped middle source
+    // line named e.g. "30 events" was not seen just because our heading says it.
+    const sourcePreview = omittedChars > 0
+      ? [
+        head.slice(0, Math.max(0, head.lastIndexOf("\n"))),
+        tail.includes("\n") ? tail.slice(tail.indexOf("\n") + 1) : "",
+      ].filter(Boolean).join("\n")
+      : head;
+    if (quiet || item.quiet) this.deliverPassive(message, item.onDelivered, sourcePreview);
+    else this.deliver(message, false, item.onDelivered, sourcePreview);
   }
 
   /** Flush any pending task exit notifications now. */
@@ -204,7 +286,7 @@ export class NotifyCenter {
     });
   }
 
-  private deliver(message: NotifyMessage, passive = false): void {
+  private deliver(message: NotifyMessage, passive = false, onDelivered?: MonitorDeliveryAck, sourcePreview?: string): void {
     // Wakes built here (task batches, monitor events) are stamped now.
     message = stampWakeAsOf(message, this.clock.now());
     const msg = { ...message, display: true };
@@ -227,5 +309,6 @@ export class NotifyCenter {
     } else {
       this.deps.sendMessage(msg, { deliverAs: "steer" });
     }
+    onDelivered?.(sourcePreview ?? (details?.kind === "monitor" ? (message.details as { event?: string }).event : undefined));
   }
 }

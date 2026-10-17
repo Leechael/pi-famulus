@@ -26,16 +26,25 @@ subagent({ action: "list|get|status|interrupt|resume|steer|extend|models", run_i
 
 ### monitor
 ```
-monitor({ command, description, timeout_ms?, persistent? })   // timeout_ms default 300000, min 1000, max 3600000
+monitor({ command, description, timeout_ms?, persistent?, dedup_window_ms?, fingerprint_mode? })
 ```
-Each output line becomes an event (200ms batching, 500 chars/line and 3000 chars/batch caps; a burst of 10 events, then one every 2s; batches over the limit are dropped). Exit and timeout produce notifications. Sustained saturation (at least 10 batches in a 30s window, half or more dropped) stops the monitor and notifies.
+`timeout_ms` defaults to 300000 (min 1000, max 3600000); `persistent:true` disables the timeout. Exit and timeout produce notifications. Output is a bounded preview, not a complete log:
 
-After starting/re-arming a monitor or handling its event, finish any remaining work, then end the turn with a reply and no tool call. Simply wait for the next notification—do not poll, sleep, or call `wait_for` to yield. A UI extension's `wait_for` is for observed UI conditions, not monitor notifications.
+- Rust frames complete lines and supplies full-content BLAKE3 fingerprints, observation times and original byte ranges. Preview truncation does not affect identity. Unfinished lines produce incremental, non-deduplicated progress after 250ms; EOF finalizes the line. See [the metadata protocol](../manager/MONITOR_OUTPUT.md).
+- `dedup_window_ms` defaults to **60000**, accepts 0–3600000, and 0 disables content deduplication. The same fingerprint in the same monitor emits once per window, starting on notification delivery. Repeats do not extend the window. Pending repeats are counted without waking the model. Expiration itself sends nothing; another occurrence may emit again.
+- `fingerprint_mode` defaults to **`exact`**. Explicit **`ignore-timestamps`** ignores only supported bare ISO timestamps at line edges; numbers, paths, resource identities and interior timestamps remain significant. Original logs are unchanged.
+- An identity omitted from the actual delivered preview does not acquire a suppression window: it may be shown on a later repeat. Capacity/history overflow also fails open rather than inventing equivalence.
+- Lines have 500-character head/tail previews; 200ms batches retain at most 3000 UTF-16 units. Busy-agent output preserves bounded head/tail content rather than only the last batch. Omission flags/counts and original byte range envelopes allow on-demand retrieval; ranges can contain interleaved events. Rust preview limits count Unicode scalars.
+- Observation timestamps are distinct from wake `as-of`/`age-ms`. Repetition summaries accompany later admitted output or terminal notices, not separate repeat-only wakes. `monitor.dedupe` is separate from overload `monitor.drop`.
+- The existing overload budget remains: a burst of 10 batches, then one every 2s. Sustained saturation (at least 10 batches in a 30s window, half or more dropped) stops the monitor and notifies. Deduplicated repeats do not consume this budget.
+- Older managers and replay outside the bounded metadata history fall back to raw previews without content deduplication. Raw output remains available while the task log is retained; neither previews nor recovery pointers promise permanent storage.
+
+After starting/re-arming a monitor or handling its event, finish immediate work, then end the turn with no tool call. An unchanged/intermediate event does not require a user-visible reply. Do not repeat waiting status, poll, sleep, or call `wait_for` to yield. A UI extension's `wait_for` is for observed UI conditions, not monitor notifications.
 
 Parent background-task guidelines are re-applied to every model request when pi rebuilds its base prompt, including wake-triggered tool continuations. This repairs instruction visibility; it does not guarantee that every model follows them. The opt-in [monitor/UI compatibility evals](../eval/README.md) measure that behavior without operating a real UI.
 
 ### task_list / task_output / task_stop
-Manage shell/monitor tasks held by the manager.
+Manage shell/monitor tasks held by the manager. `task_output({task_id, cursor?, max_bytes?})` reads original bytes, bypassing monitor fingerprints, deduplication and preview truncation. Omit `cursor` for the last 65536 bytes; use `cursor:0` for the beginning, or the returned `next_cursor` to continue. `max_bytes` is capped at 1 MiB; prefer small ranges (for example 8192) to avoid refilling context. Reading different pages of unchanged running output is allowed; repeated equivalent ranges without growth are rejected as polling. Once a log has been removed by retention/cleanup, reads fail rather than reconstructing historical output by rerunning a command.
 
 ### agent_message (parent↔child comms)
 ```
