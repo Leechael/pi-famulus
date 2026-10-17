@@ -23,9 +23,9 @@ use tokio::sync::mpsc;
 
 pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
 
-/// Best-effort live CPU for requested process groups, read from one Linux
-/// `/proc` scan. Values are cumulative user/system milliseconds for currently
-/// visible members; reaped descendants are intentionally not inferred.
+/// Best-effort live CPU for requested process groups. Values are cumulative
+/// user/system milliseconds for currently visible members (Linux `/proc`,
+/// Darwin `proc_pidinfo`); reaped descendants are intentionally not inferred.
 pub fn live_group_cpu_ms_many(pgids: &[u32]) -> HashMap<u32, Option<(u64, u64)>> {
     let mut readings: HashMap<u32, Option<(u64, u64)>> =
         pgids.iter().copied().map(|pgid| (pgid, None)).collect();

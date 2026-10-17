@@ -88,6 +88,134 @@ pub fn truncate_width_left(s: &str, max: usize) -> String {
     out
 }
 
+/// Wrap `s` to `max` display columns. Existing newlines stay paragraph
+/// breaks. Prefers a space; otherwise hard-breaks (CJK, long tokens).
+pub fn wrap_width(s: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut out = Vec::new();
+    for para in s.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        wrap_paragraph(para, max, &mut out);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn wrap_paragraph(para: &str, max: usize, out: &mut Vec<String>) {
+    let mut line = String::new();
+    let mut w = 0;
+    let mut brk: Option<usize> = None;
+    for c in para.chars() {
+        let cw = char_width(c);
+        if cw == 0 {
+            line.push(c);
+            continue;
+        }
+        if w + cw > max && !line.is_empty() {
+            if let Some(bi) = brk {
+                let rest = line[bi..].to_string();
+                out.push(line[..bi].trim_end().to_string());
+                line = rest;
+                w = display_width(&line);
+                brk = None;
+                // The carried word plus this character can still overflow.
+                if w + cw > max && !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                    w = 0;
+                }
+            } else {
+                out.push(std::mem::take(&mut line));
+                w = 0;
+            }
+            // Drop the space only when it would lead the new line; after a
+            // word carried down from the break it separates two words.
+            if c == ' ' && line.is_empty() {
+                continue;
+            }
+        }
+        if c == ' ' {
+            line.push(c);
+            w += cw;
+            brk = Some(line.len());
+            continue;
+        }
+        line.push(c);
+        w += cw;
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+}
+
+/// Strip CSI/OSC, expand tabs, and collapse CR progress so TUI wrap matches
+/// what the terminal will actually paint.
+pub fn scrub_tty(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut line = String::new();
+    let mut col = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if x.is_ascii_alphabetic() || x == '~' {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if x == '\u{7}' {
+                            break;
+                        }
+                        if x == '\u{1b}' {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    let _ = chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if c == '\r' {
+            if chars.peek() != Some(&'\n') {
+                line.clear();
+                col = 0;
+            }
+            continue;
+        }
+        if c == '\n' {
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+            col = 0;
+            continue;
+        }
+        if c == '\t' {
+            let n = 8 - (col % 8);
+            line.extend(std::iter::repeat_n(' ', n));
+            col += n;
+            continue;
+        }
+        line.push(c);
+        col += char_width(c);
+    }
+    out.push_str(&line);
+    out
+}
+
 /// Pad `s` with spaces to `w` display columns (left-aligned).
 pub fn pad(s: &str, w: usize) -> String {
     let dw = display_width(s);
@@ -214,6 +342,15 @@ pub fn first_line(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrap_keeps_the_space_after_a_carried_word() {
+        let s = "arrived after your continue; hold STARTING normal prek/source edits under hooks until we coordinate";
+        for w in 12..=100 {
+            let joined = wrap_width(s, w).join(" ");
+            assert_eq!(joined, s, "width {w}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -230,6 +367,14 @@ mod tests {
         assert_eq!(truncate_width_left("/a/b/c", 4), "…b/c");
         assert_eq!(pad("中", 4), "中  ");
         assert_eq!(display_width(&pad("中", 4)), 4);
+        assert_eq!(wrap_width("hello world", 8), vec!["hello", "world"]);
+        assert_eq!(wrap_width("中文字符", 5), vec!["中文", "字符"]);
+        // A word carried past a space break still fits the width.
+        assert_eq!(wrap_width(" 中文", 3), vec!["", "中", "文"]);
+        assert_eq!(wrap_width("abc\n\ndef", 10), vec!["abc", "", "def"]);
+        assert_eq!(scrub_tty("\x1b[32mok\x1b[0m"), "ok");
+        assert_eq!(scrub_tty("Rebasing (1/2)\rRebasing (2/2)\nDone"), "Rebasing (2/2)\nDone");
+        assert_eq!(scrub_tty("a\tb"), "a       b");
     }
 
     #[test]

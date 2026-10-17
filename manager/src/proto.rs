@@ -237,6 +237,9 @@ pub struct TaskRecord {
     /// The most recent sampling attempt failed; cumulative CPU may be stale.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live_cpu_stale: bool,
+    /// Human-readable name from the client (monitor `description`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +298,9 @@ pub enum RequestKind {
         /// task the first one started instead of starting it again.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
+        /// Human-readable name (monitor `description`). Older clients omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// Record that the extension moved a task to the background.
     MarkBackground {
@@ -831,8 +837,10 @@ mod tests {
                 timeout_ms,
                 origin,
                 key,
+                label,
             } => {
                 assert_eq!(key, None, "key is optional (older clients)");
+                assert_eq!(label, None, "label is optional (older clients)");
                 assert_eq!(kind, TaskKind::Shell);
                 assert_eq!(command, "ls -la");
                 assert_eq!(cwd.as_deref(), Some("/tmp"));

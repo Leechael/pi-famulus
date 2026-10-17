@@ -273,9 +273,94 @@ pub fn group_cpu_ticks_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u
     Ok(totals)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Cumulative user/system CPU in milliseconds for each requested process
+/// group, summed across live members (`proc_listpgrppids` + `PROC_PIDTASKINFO`).
+/// Unreadable or racing processes are skipped; a missing group entry means no
+/// member was readable. Callers treat the unit as ticks at 1000 Hz so
+/// [`clock_ticks_per_second`] converts them back to milliseconds unchanged.
+#[cfg(target_os = "macos")]
+pub fn group_cpu_ticks_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64)>> {
+    let mut totals = HashMap::new();
+    for &pgid in pgids {
+        let Ok(members) = group_members(pgid) else {
+            continue;
+        };
+        let mut user = 0u64;
+        let mut system = 0u64;
+        let mut any = false;
+        for pid in members {
+            let Some((u, s)) = pid_cpu_ms(pid) else {
+                continue;
+            };
+            user = user.saturating_add(u);
+            system = system.saturating_add(s);
+            any = true;
+        }
+        if any {
+            totals.insert(pgid, (user, system));
+        }
+    }
+    Ok(totals)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn group_cpu_ticks_by_pgid(_pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64)>> {
     Ok(HashMap::new())
+}
+
+/// Mach absolute time → milliseconds for one Darwin pid (`pti_total_user` /
+/// `pti_total_system`). `None` if the process is gone or `proc_pidinfo` did
+/// not fill a complete `proc_taskinfo`.
+#[cfg(target_os = "macos")]
+fn pid_cpu_ms(pid: u32) -> Option<(u64, u64)> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: the kernel writes at most `size` bytes into `info`.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    // SAFETY: `proc_pidinfo` filled the whole struct.
+    let info = unsafe { info.assume_init() };
+    let (numer, denom) = mach_timebase();
+    let to_ms = |ticks: u64| ticks.saturating_mul(numer) / denom / 1_000_000;
+    Some((to_ms(info.pti_total_user), to_ms(info.pti_total_system)))
+}
+
+/// Cached `mach_timebase_info` (numer, denom). Falls back to 1/1 if the
+/// kernel refuses the call, which leaves Mach ticks unscaled.
+///
+/// Declared locally: libc's `mach_timebase_info` is deprecated in favour of
+/// the `mach2` crate, which we do not take as a dependency for one call.
+#[cfg(target_os = "macos")]
+fn mach_timebase() -> (u64, u64) {
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::kern_return_t;
+    }
+    static TB: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *TB.get_or_init(|| {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 1 };
+        // SAFETY: writes only into the stack `info` we own.
+        let kr = unsafe { mach_timebase_info(&mut info) };
+        if kr == 0 && info.denom != 0 {
+            (info.numer as u64, info.denom as u64)
+        } else {
+            (1, 1)
+        }
+    })
 }
 
 /// Linux clock ticks per second, kept behind the sys module's unsafe boundary.
@@ -285,7 +370,14 @@ pub fn clock_ticks_per_second() -> Option<u64> {
     (ticks > 0).then_some(ticks as u64)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Darwin samples are already milliseconds; 1000 Hz makes
+/// `ticks * 1000 / hz` a no-op in [`crate::task::live_group_cpu_ms_many`].
+#[cfg(target_os = "macos")]
+pub fn clock_ticks_per_second() -> Option<u64> {
+    Some(1_000)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn clock_ticks_per_second() -> Option<u64> {
     None
 }
@@ -461,6 +553,23 @@ pub fn localtime(secs: i64) -> super::LocalTime {
     }
 }
 
+/// Whether stdin (fd 0) is a terminal.
+pub fn stdin_is_tty() -> bool {
+    // SAFETY: isatty on a valid fd number has no side effects.
+    unsafe { libc::isatty(0) == 1 }
+}
+
+/// Whether stdout (fd 1) is a terminal.
+pub fn stdout_is_tty() -> bool {
+    // SAFETY: isatty on a valid fd number has no side effects.
+    unsafe { libc::isatty(1) == 1 }
+}
+
+/// Interactive TUI requires both stdin and stdout to be terminals.
+pub fn stdio_interactive() -> bool {
+    stdin_is_tty() && stdout_is_tty()
+}
+
 /// Columns of the terminal on stdout, or None when stdout is not a tty.
 ///
 /// # Safety boundary
@@ -567,5 +676,36 @@ mod tests {
         signal_group(pid, SIGKILL).unwrap();
         child.wait().unwrap();
         assert!(group_members(pid).unwrap().is_empty());
+    }
+
+    /// A busy child in its own group accumulates user+system ticks that grow
+    /// between two samples. Guards both the Linux `/proc` walk and Darwin
+    /// `proc_pidinfo` path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn group_cpu_ticks_grow_for_a_busy_child() {
+        assert!(clock_ticks_per_second().is_some());
+        let mut child = std::process::Command::new("/bin/sh");
+        child.args(["-c", "while :; do :; done"]);
+        apply_new_session_std(&mut child);
+        let mut child = child.spawn().unwrap();
+        let pgid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while group_members(pgid).unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "busy child never joined its group");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let first = group_cpu_ticks_by_pgid(&[pgid]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let second = group_cpu_ticks_by_pgid(&[pgid]).unwrap();
+        signal_group(pgid, SIGKILL).unwrap();
+        let _ = child.wait();
+        let (u1, s1) = first.get(&pgid).copied().unwrap_or((0, 0));
+        let (u2, s2) = second.get(&pgid).copied().expect("second sample should see the group");
+        assert!(
+            u2.saturating_add(s2) > u1.saturating_add(s1),
+            "cpu ticks should grow: {first:?} -> {second:?}"
+        );
+        assert!(group_cpu_ticks_by_pgid(&[]).unwrap().is_empty());
     }
 }

@@ -1,16 +1,17 @@
 /**
- * Passive fleet summary below the editor — counts only, no keyboard hooks.
+ * Passive fleet line below the editor — live work only, no keyboard hooks.
  *
- * Format: `2 workers · 1 subagent · 1 monitor`
- *   workers   = backgrounded shell tasks (not sync-waited)
- *   subagents = in-process subagent children
- *   monitors  = active monitors
+ * Format: `● 2 shells · 1 monitor · scout 12s   /tasks`
+ *   shells   = backgrounded shell tasks (not sync-waited)
+ *   monitors = active monitors
+ *   then each running subagent by name with its age
  *
  * Driven by WorkIndex changes. Does not poll the manager.
  */
 import { realClock, type Clock, type ClockTimer } from "../clock";
 import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
 import { truncateToWidth } from "../tui/pi-tui-load";
+import { statusGlyph } from "../tui/tool-component";
 
 export const FLEET_WIDGET_KEY = "pi-famulus-fleet";
 
@@ -207,10 +208,9 @@ export class FleetWidget {
       parts.push(`${name} ${theme.fg("dim", formatAge(item.startedAt, item.endedAt, now))}`);
     }
     if (parts.length === 0) return [];
-    const line = `  ${theme.fg("accent", "●")} ${parts.join(theme.fg("dim", " · "))}   ${theme.fg("dim", "/tasks")}`;
+    const live = statusGlyph("running");
+    const line = `  ${theme.fg(live.color, live.glyph)} ${parts.join(theme.fg("dim", " · "))}   ${theme.fg("dim", "/tasks")}`;
     return [truncateToWidth(line, Math.max(1, width), "…")];
   }
 }
 
-/** @deprecated Use FleetWidget — kept as alias for older imports. */
-export { FleetWidget as FleetStatus };

@@ -57,7 +57,7 @@ The extension prioritizes executable config `managerPath`, executable `PI_FAMULU
 
 Priority: `--home` > `PI_FAMULUS_HOME` > default.
 
-**Pager.** On Unix, when stdout is a terminal, `sessions`, `ls`, `show`, `stats`, `top`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PI_FAMULUS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text. Windows does not page these commands yet.
+**Pager.** On Unix, when stdout is a terminal, `sessions`, `ls`, `show`, `stats`, `top --once` / `top --json`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PI_FAMULUS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text. Windows does not page these commands yet.
 
 Layout under home:
 
@@ -81,7 +81,7 @@ pi-famulus status [--json]
 pi-famulus sessions [--json]
 pi-famulus ls [-a] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
 pi-famulus show <id> [--json]
-pi-famulus top [--json]
+pi-famulus top [--once] [--interval DUR] [--session PREFIX] [--cwd DIR] [--json]
 pi-famulus stats [--by agent|kind|agent,kind] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # --by defaults to agent
 pi-famulus agent <ch_id> [--full] [-f]
 pi-famulus events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
@@ -109,7 +109,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show` and `stats` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `upgrade`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show`, `stats` and `top` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `upgrade`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
@@ -173,7 +173,7 @@ ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -     -     
 
 By default only running work, anywhere (a live process is never hidden, even in a gone session). `-a`/`--all` adds the finished work of connected sessions; a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Running rows come first, then finished ones, each newest first. `TIME` is a task's start and an agent's **last transcript message** (a long-running agent that just spoke sorts as recent; its start is in `show`). Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (TIME within). `--json` prints the rows in the same order as an array of objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `active_at` (= TIME), `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, `running`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known, and a task's `work_kind`).
 
-- `CPU` is a finished task's user + system CPU time. For a running task it is the latest best-effort cumulative process-group sample; `CORES` is lifetime average when finished and the sample's lifetime average while running. `NOW` is CPU used during the most recent ~5 s sample interval as percent of one core (a process group using several cores can exceed 100%). `SAMPLE` is the last successful sample time; `NOW=stale` means the latest sampling attempt failed, so no live percentage is reported. Live sampling reads visible Linux `/proc` group members, is response-only (not persisted), and can miss descendants that exited between samples; it is unavailable on platforms without `/proc`. Finished measurements cover the command and every descendant waited for by its parent (pytest's xdist workers, a compiler under make), measured when the command exits. `-` means no sample/report yet, for agents, or when usage was not measured: a hard timeout (`--timeout-ms`) or stop past its 2s grace SIGKILLs the runner with the group. Never counted: processes that escaped the wait chain (`setsid`, `cmd &` never waited for, a worker orphaned because its parent died first). On macOS, a process that reaps children and then `exec`s loses their CPU (`make; exec foo` shows only `foo`). `--json` carries `cpu_user_ms`, `cpu_sys_ms`, `max_rss_kb` and (running tasks only) `live_cpu_user_ms`, `live_cpu_sys_ms`, `live_cpu_percent`, `live_cpu_sampled_at`, and `live_cpu_stale`.
+- `CPU` is a finished task's user + system CPU time. For a running task it is the latest best-effort cumulative process-group sample; `CORES` is lifetime average when finished and the sample's lifetime average while running. `NOW` is CPU used during the most recent ~2 s sample interval as percent of one core (a process group using several cores can exceed 100%). `SAMPLE` is the last successful sample time; `NOW=stale` means the latest sampling attempt failed, so no live percentage is reported. Live sampling reads visible Linux `/proc` group members or Darwin `proc_pidinfo` totals, is response-only (not persisted), and can miss descendants that exited between samples; it is unavailable on Windows. Finished measurements cover the command and every descendant waited for by its parent (pytest's xdist workers, a compiler under make), measured when the command exits. `-` means no sample/report yet, for agents, or when usage was not measured: a hard timeout (`--timeout-ms`) or stop past its 2s grace SIGKILLs the runner with the group. Never counted: processes that escaped the wait chain (`setsid`, `cmd &` never waited for, a worker orphaned because its parent died first). On macOS, a process that reaps children and then `exec`s loses their CPU (`make; exec foo` shows only `foo`). `--json` carries `cpu_user_ms`, `cpu_sys_ms`, `max_rss_kb` and (running tasks only) `live_cpu_user_ms`, `live_cpu_sys_ms`, `live_cpu_percent`, `live_cpu_sampled_at`, and `live_cpu_stale`.
 - `EXIT` is the exit code, a signal name (`SIGTERM`, `SIGKILL`, …), or `-`.
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.
 - `TITLE` is the command's first line (agents: `name (agent) model`), truncated by **display width** so CJK and emoji keep the table aligned: to the terminal width on a tty, to 60 columns otherwise.
@@ -194,10 +194,10 @@ Everything about one id, any kind:
 
 ### `top`
 
-A plain-text snapshot of retained task CPU grouped by agent and work kind, together with child token totals and wall attribution:
+On a terminal, an interactive dashboard of connected sessions, agents, tasks, live CPU, and tokens. `--once` or a pipe prints the same plain-text snapshot as before; `--json` prints `TopReport` and exits.
 
 ```text
-$ pi-famulus top
+$ pi-famulus top --once
 pi-famulus top — CPU totals are per-agent task CPU, including monitors; NOW is the latest sampled CPU rate (100% = one core).
 AGENTS
   worker (ch_1234) | CPU 12s total, 85.0% now (sample 14:04:23) | 2 task(s) | tokens 8200 in / 460 out (cache read 6100 / write 280), 24.0 output tok/s | wall LLM 19s / tool 3s / queue 500ms / unclassified 20ms
@@ -205,7 +205,50 @@ WORK KINDS
   test-suite | 1 task(s) | CPU 10s total, 85.0% now (sample 14:04:23)
 ```
 
-`CPU total` combines final runner CPU from ended tasks (including monitors) with daemon live process-group estimates for running tasks; shell tasks attributed to a child use `origin.child_id`, while monitor tasks without a child id appear under `main <session>`. It is not a measurement of remote model compute or agent runtime overhead. `NOW` is the recent sampling interval, which refreshes about every 5s; percentages can exceed 100% when multiple cores are used. A `NOW` value of `unavailable` (JSON `cpu_now_stale: true`) distinguishes a failed sample from no sample yet; `sample` is the most recent successful timestamp (`cpu_sampled_at` in JSON). Agents with usage but no shell tasks still appear. `tokens_input` is exactly provider `usage.input`; cache-read (`tokens_cache_read`) and cache-write (`tokens_cache_write`) counts are separate and not included in input. `output tok/s` is cumulative provider output tokens divided by observed assistant-message LLM milliseconds × 1000, not total elapsed time; it is unavailable when either value is missing. Wall split classifies observed LLM message, tool execution, and admission queue intervals; unclassified time is approximate and is not assigned to a phase. `--json` returns `agents[]` and `work_kinds[]` with millisecond totals, separate cache counters, and optional CPU rates plus freshness fields. This command takes a snapshot; it does not refresh continuously and never starts the daemon.
+```bash
+pi-famulus top [--once] [--interval 1s] [--session PREFIX] [--cwd DIR] [--json]
+```
+
+**Views and scope.** The default view is scoped to **active work only**: running agents and tasks, plus the ancestors needed to reach them. Finished rows stay hidden; `a` cycles Active → Connected (connected sessions, including idle ones) → All Retained.
+
+- Session rows lead with the working-directory name. Session-owned monitors hang directly under the session (the synthetic `main` bucket is omitted in Active); subagent work shows `Session → Run → Agent → Task`. Live branches expand to the running leaf.
+- Other views: `2` agents leaderboard, `3` flat task table, `4` merged events.
+- Work-kind slot and CPU pressure stay in the header and, in Active scope, count only running work.
+- Monitors show their stored `description`, or a short guess from the command (incident folder, ssh host and what it tails). Subagent rows show token I/O on the node and in the TOK I/O column.
+
+**Keys and mouse.** `?` lists every key by screen.
+
+- `s` cycles the sort: CPU / NOW% / WALL / TASKS / TOKENS / TIME. `/` filters by id, name, command, cwd, kind, or status.
+- `v` toggles a bottom preview; `Enter` opens a full-screen detail. Detail titles are `<id> · <label>`.
+- `x` stops a selected running `sh_`/`mon_` task (`stopped:tui`) after confirmation, and never starts the daemon to do it.
+- `+`/`-` steps the refresh interval across 500ms, 1s, 2s, 5s (default `--interval 1s`). `p` or `Space` pauses and resumes refreshing.
+- `q` quits; `Ctrl+C` quits from anywhere. Status messages clear on the next key.
+- Mouse: click a row to select it (click again to fold or open, double-click for detail), click tabs, Scope, or Sort, and use the wheel to move.
+
+**Task detail.** The info panel (status, kind, wall, CPU, exit, command, cwd, pid, start, output path) stays pinned on top, and `output` and `stderr` are tabs (`1`/`2` or click). Blank lines are hidden; `b` shows them.
+
+- `/` searches as you type: matches are highlighted and `n`/`N` step through them, or `&` (Tab while typing) shows only matching lines.
+- Search is case-insensitive unless the query has an uppercase letter; `a|b` matches either.
+- `Esc` clears the search, then closes.
+
+**Agent conversation.** For an agent, the detail is the transcript as a thread (the newest 2 MiB when it is larger), not a 64 KiB tail or a clipped one-liner dump.
+
+- Messages from the parent sit on an accent rail under a `┃ main → <agent>` header; each stretch of the child's own output opens with `● <agent>`.
+- Assistant prose is plain text with light markdown (headings, bullets, quotes, fenced and `inline` code, **bold**). Text the agent writes beside a tool call stays visible; only real reasoning folds as `∴ Thinking`.
+- Each tool call or thinking block is one line (`▸ ✓ bash  rg loader`, `▸ ∴ Thinking`) that unfolds in place under a thin rule; click its chevron, or press `o` to unfold all. Consecutive tool and thinking rows stack without gaps.
+- Follow-tail is the default: scroll up to read history, scroll to the end to stick again. `f` turns following off or on, and `g`/`G` jump to the top or the end. A scroll thumb shows progress and the title shows `● following` or the scroll position.
+- A status line shows a `working` spinner while the child is live, plus tokens / tok/s / llm / tool / queue / shells.
+
+**Look.** The screen is laid out like btop: rounded boxes with colored borders, titles and hotkey digits cut into the border (`¹pi-famulus`, `²work kinds`, `¹tree ²agents ³tasks ⁴events`), key hints and the `n/total` position in the main box's bottom border, green→yellow→red gradient meters, and braille history graphs of CPU and running tasks.
+
+- The header shows `● live 1s · HH:MM:SS`, the time of the last snapshot, so every refresh is visible. Running tasks and agents spin while they run; redraws stop when nothing visible runs or the view is paused.
+- Columns that are blank on every visible row are hidden, and the selected row is marked `▌` and highlighted.
+- Key hints drop the least important first on narrow terminals, so `? help`, `q quit` (or `esc close` in a detail), and the position always show.
+- Status glyphs match the pi extension: running ● green, pending ○, completed ✓, failed ✗ red, stopped / timeout ■ amber.
+
+`--session` and `--cwd` restrict every form of `top` (the TUI, `--once`, `--json`, and piped output) the same way they do `ls`. Layout clips every row to the terminal width (no wrapping): compact under 100 columns, standard 100–139, wide at 140+. Short terminals (`rows < 20`) use a two-line header and disable the preview split.
+
+`CPU total` combines final runner CPU from ended tasks (including monitors) with daemon live process-group estimates for running tasks; shell tasks attributed to a child use `origin.child_id`, while monitor tasks without a child id appear under `main <session>`. It is not a measurement of remote model compute or agent runtime overhead. `NOW` is the recent sampling interval, which refreshes about every 2s; percentages can exceed 100% when multiple cores are used. A `NOW` value of `unavailable` (JSON `cpu_now_stale: true`) distinguishes a failed sample from no sample yet; `sample` is the most recent successful timestamp (`cpu_sampled_at` in JSON). Agents with usage but no shell tasks still appear. `tokens_input` is exactly provider `usage.input`; cache-read (`tokens_cache_read`) and cache-write (`tokens_cache_write`) counts are separate and not included in input. Header token totals skip agents that omit a field, so one legacy record does not blank the sum. `output tok/s` is cumulative provider output tokens divided by observed assistant-message LLM milliseconds × 1000, not total elapsed time; it is unavailable when either value is missing. Wall split classifies observed LLM message, tool execution, and admission queue intervals; unclassified time is approximate and is not assigned to a phase. `--json` returns `agents[]` and `work_kinds[]` with millisecond totals, separate cache counters, and optional CPU rates plus freshness fields. Never starts the daemon.
 
 ### `stats`
 
@@ -222,7 +265,7 @@ TOTAL                                    46  1h13m  3h45m    3.0           1    
 
 - **AGENT** is the subagent in the task's `origin.child_id`, named from its agent record (`name (ch_…)`; the bare id when the record is gone). Tasks a session's main agent ran itself (including monitors without a child id) are `main <session>`.
 - **KIND** is the task's `work_kind` (see `ls`): `test-suite`, `test`, `build`, `lint/type`, `git`, `read/search`, `other`, or `monitor`. Not the shell/monitor `KIND` of `ls`. `npm test -- --run` is still a whole suite (`--run` selects one-shot mode, not tests); a path or test-name filter makes it `test`.
-- **WALL** sums the tasks' durations (a running task's so far). **CPU** sums user + system CPU for tasks with a final measurement or a live process-group estimate, and **CORES** divides it by the wall time of those same tasks. **UNMEASURED** counts tasks without an available final/live measurement (e.g. SIGKILLed with their runner by `--timeout-ms` or after a stop's grace, or recorded by an older manager); `-` means no task in the row was measured. Live CPU is best-effort and sampled about every 5s; see `ls` for what CPU covers.
+- **WALL** sums the tasks' durations (a running task's so far). **CPU** sums user + system CPU for tasks with a final measurement or a live process-group estimate, and **CORES** divides it by the wall time of those same tasks. **UNMEASURED** counts tasks without an available final/live measurement (e.g. SIGKILLed with their runner by `--timeout-ms` or after a stop's grace, or recorded by an older manager); `-` means no task in the row was measured. Live CPU is best-effort and sampled about every 2s; see `ls` for what CPU covers.
 - **KILLED** / **KILLED-WALL**: tasks that ended `killed` and the wall time they ran before that.
 
 Every retained task record counts, including finished work of gone sessions (`ls` leaves those out); rows are sorted by CPU, then wall time, with a `TOTAL` row last. Filters as in `ls`: `--session PREFIX`, `--cwd DIR`, `--since DUR` (tasks running at some point within it). Per-project command overrides are **not supported**; commands use the built-in classifier, so opaque scripts can land in `other`. `npm test -- --run` is classified as a whole suite (`--run` chooses one-shot mode, not test selection). `--json` prints the groups with raw milliseconds (`wall_ms`, `cpu_user_ms`, `cpu_sys_ms`, `cpu_ms`, `measured`, `measured_wall_ms`, optional `cpu_now_percent`, `cpu_now_stale`, `cpu_sampled_at`, `killed`, `killed_wall_ms`, and `avg_cores` when measured wall time is nonzero). Never starts the daemon.

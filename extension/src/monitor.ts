@@ -21,6 +21,7 @@ import { LineBatcher, RateLimiter, SaturationWindow } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
 import { fill, fillList, PROMPTS } from "./prompts.generated";
 import { statusGlyph, toolComponent } from "./tui/tool-component";
+import type { WorkIndex } from "./work-index";
 
 
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -168,8 +169,10 @@ export class MonitorRegistry {
       run_in_background: true,
       timeout_ms: null, // timeout is enforced extension-side to control the notice
       origin: { via: "monitor" },
+      label: params.description,
     });
     this.deps.trackTask(task_id, { kind: "monitor", command: params.command, cwd: ctx.cwd });
+    this.deps.logEvent?.("monitor.start", { id: task_id, description: params.description });
 
     const entry: MonitorEntry = {
       taskId: task_id,
@@ -538,6 +541,7 @@ const monitorParameters = Type.Object({
 
 export function createMonitorTool(
   registry: MonitorRegistry,
+  getIndex?: () => WorkIndex | null,
 ): ToolDefinition<typeof monitorParameters, { task_id: string; timeout_ms: number | null }> {
   return {
     name: "monitor",
@@ -572,9 +576,27 @@ export function createMonitorTool(
         .map((c) => c.text)
         .join("\n");
       const firstLine = text.split("\n")[0];
-      const failed = context.isError || /\b(failed|killed|orphaned|error)\b/i.test(text);
-      const { color, glyph } = statusGlyph(failed ? "failed" : "completed", failed);
-      const line = `${theme.fg(color as "error", glyph)} ${firstLine}${expanded ? "" : theme.fg("dim", "  · manage via /tasks")}`;
+      // Live status from the work index (a started monitor is running, not
+      // done); the tool's own error flag when the start itself failed.
+      const taskId = (result.details as { task_id?: string } | undefined)?.task_id;
+      const index = getIndex?.() ?? null;
+      const item = taskId ? index?.get(taskId) : undefined;
+      const state = context.state as { unsubscribe?: () => void } | undefined;
+      if (index && taskId && state && !state.unsubscribe && (item?.status === "running" || item?.status === "pending")) {
+        state.unsubscribe = index.onChange(() => {
+          const now = index.get(taskId)?.status;
+          if (now !== "running" && now !== "pending") {
+            state.unsubscribe?.();
+            state.unsubscribe = () => {};
+          }
+          context.invalidate?.();
+        });
+      }
+      // Live monitors are indexed before this renders, so a missing row is a
+      // finished one that was pruned or predates a reload.
+      const status = context.isError ? "failed" : item?.status ?? (taskId && !index ? "running" : "completed");
+      const { color, glyph } = statusGlyph(status, context.isError);
+      const line = `${theme.fg(color as "error", glyph)} ${firstLine}${expanded ? "" : theme.fg("dim", " · /tasks")}`;
       return toolComponent([line]) as never;
     },
   };

@@ -35,11 +35,11 @@ describe("bash transcript row", () => {
       details: { backgrounded: true, task_id: "sh_1", fullOutputPath: "/x" },
     };
     const first = render(tool, result, context);
-    expect(first).toEqual(["⏵ sh_1 running in background · /tasks"]);
+    expect(first).toEqual(["● sh_1 running in background · /tasks"]);
 
     index.patch("sh_1", { status: "failed", exitCode: 1, endedAt: 3_000 });
     expect(invalidations).toBeGreaterThan(0);
-    expect(render(tool, result, context)).toEqual(["✗ sh_1 failed · exit 1 · 3.0s · /tasks"]);
+    expect(render(tool, result, context)).toEqual(["✗ sh_1 failed · exit 1 · 3s · /tasks"]);
 
     const after = invalidations;
     index.upsert({ id: "sh_2", kind: "shell", status: "running", title: "x", startedAt: 0, countsAsWorker: true });

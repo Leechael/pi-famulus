@@ -26,6 +26,7 @@ import { taskOutputPath, type FamulusConfig } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 import { backgroundRowText, formatBackgroundNotice, truncateTail } from "./format";
 import { toolComponent } from "./tui/tool-component";
+import { scrubTty } from "./tui/conversation-view";
 import type { WorkIndex } from "./work-index";
 import type { ManagerClient } from "./manager-client";
 import { fill, PROMPTS } from "./prompts.generated";
@@ -316,24 +317,26 @@ export function createBashOverride(
         const index = deps.getIndex?.() ?? null;
         const state = context.state as { unsubscribe?: () => void };
         const item = index?.get(taskId);
-        if (index && !state.unsubscribe && isActiveStatus(item?.status)) {
-          // Redraw this row when the task finishes, then stop listening.
+        if (index && !state.unsubscribe && (!item || isActiveStatus(item.status))) {
+          // Redraw this row as the task appears or finishes; stop once it has.
           state.unsubscribe = index.onChange(() => {
-            if (!isActiveStatus(index.get(taskId)?.status)) {
+            const now = index.get(taskId);
+            if (now && !isActiveStatus(now.status)) {
               state.unsubscribe?.();
               state.unsubscribe = () => {};
             }
             context.invalidate();
           });
         }
-        const row = backgroundRowText(taskId, item, (deps.clock ?? realClock).now());
+        const row = backgroundRowText(taskId, item, (deps.clock ?? realClock).now(), index !== null);
         return toolComponent([`${theme.fg(row.color as never, row.glyph)} ${theme.fg("muted", row.text)}`]) as never;
       }
       const text = result.content
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const lines = text.split("\n");
+      // Progress \r, tabs, and cursor sequences would scramble the row.
+      const lines = scrubTty(text).split("\n");
       const shown = expanded ? lines : lines.slice(0, PREVIEW_LINES);
       const out = shown.map((l) => theme.fg("toolOutput", l));
       if (shown.length < lines.length) {

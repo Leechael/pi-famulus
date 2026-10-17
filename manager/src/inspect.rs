@@ -87,6 +87,26 @@ pub fn agent_output_tokens_per_second(tokens_output: Option<u64>, llm_ms: Option
     }
 }
 
+/// Output tokens and LLM milliseconds from agents that have both, for a
+/// pooled rate. An agent with tokens but no LLM time (an older record, or one
+/// written before any assistant message finished) would otherwise add tokens
+/// without their time and inflate the rate.
+pub fn rate_pair(tokens_output: Option<u64>, llm_ms: Option<u64>) -> Option<(u64, u64)> {
+    match (tokens_output, llm_ms) {
+        (Some(tokens), Some(ms)) if ms > 0 => Some((tokens, ms)),
+        _ => None,
+    }
+}
+
+/// Pooled output tok/s over [`rate_pair`]s: total tokens / total LLM time.
+pub fn pooled_output_tokens_per_second(pairs: impl IntoIterator<Item = Option<(u64, u64)>>) -> Option<f64> {
+    let (tokens, ms) = pairs
+        .into_iter()
+        .flatten()
+        .fold((0u64, 0u64), |(t, m), (pt, pm)| (t.saturating_add(pt), m.saturating_add(pm)));
+    agent_output_tokens_per_second(Some(tokens), Some(ms))
+}
+
 fn token_count_label(value: Option<u64>) -> String {
     value.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into())
 }
@@ -443,6 +463,108 @@ pub struct Row {
     pub running: bool,
 }
 
+/// Monitor `description` when the client sent one; otherwise a short guess
+/// from the command (incident folder, ssh host + what it tails, …).
+pub fn task_title(t: &TaskRecord) -> String {
+    if let Some(label) = t.label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return label.to_string();
+    }
+    guess_command_title(&t.command)
+}
+
+pub fn guess_command_title(command: &str) -> String {
+    let line = fmt::first_line(command).trim();
+    if line.is_empty() {
+        return String::new();
+    }
+    if let Some(slug) = incident_folder_title(line) {
+        return slug;
+    }
+    if let Some(ssh) = ssh_watch_title(line) {
+        return ssh;
+    }
+    if let Some(tick) = heartbeat_title(line) {
+        return tick;
+    }
+    compact_command_head(line)
+}
+
+fn incident_folder_title(cmd: &str) -> Option<String> {
+    for part in cmd.split('/') {
+        let part = part.trim();
+        let b = part.as_bytes();
+        if b.len() > 11 && b[4] == b'-' && b[7] == b'-' && b[10] == b'-'
+            && b[..4].iter().all(|c| c.is_ascii_digit())
+            && b[5..7].iter().all(|c| c.is_ascii_digit())
+            && b[8..10].iter().all(|c| c.is_ascii_digit())
+        {
+            let slug = &part[11..];
+            if !slug.is_empty() && slug.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                return Some(slug.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn ssh_watch_title(cmd: &str) -> Option<String> {
+    if !cmd.split_whitespace().any(|w| w == "ssh") {
+        return None;
+    }
+    let host = cmd
+        .split_whitespace()
+        .find(|w| w.contains('@'))
+        .map(|w| w.rsplit('@').next().unwrap_or(w))?;
+    let remote = cmd.split('\'').nth(1).or_else(|| cmd.split('"').nth(1)).unwrap_or("");
+    let hint = remote_watch_hint(remote);
+    Some(match hint {
+        Some(h) => format!("{h} @{host}"),
+        None => format!("ssh @{host}"),
+    })
+}
+
+fn remote_watch_hint(remote: &str) -> Option<String> {
+    if let Some(path) = remote.split_whitespace().rev().find(|w| w.contains('/')) {
+        let name = std::path::Path::new(path).file_name()?.to_string_lossy();
+        if !name.is_empty() {
+            return Some(name.into_owned());
+        }
+    }
+    remote
+        .split_whitespace()
+        .find(|w| !w.starts_with('-') && *w != "sudo")
+        .map(|s| s.to_string())
+}
+
+fn heartbeat_title(cmd: &str) -> Option<String> {
+    if !cmd.contains("while true") || !cmd.contains("sleep") {
+        return None;
+    }
+    let after = cmd.split("sleep").nth(1)?;
+    let n: u64 = after.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok()?;
+    if n >= 60 && n.is_multiple_of(60) {
+        Some(format!("tick every {}m", n / 60))
+    } else {
+        Some(format!("tick every {n}s"))
+    }
+}
+
+fn compact_command_head(line: &str) -> String {
+    let mut toks = line.split_whitespace().peekable();
+    while toks.peek().is_some_and(|t| t.contains('=') && !t.starts_with('-')) {
+        toks.next();
+    }
+    let rest: Vec<&str> = toks.take(4).collect();
+    let s = rest.join(" ");
+    if s.chars().count() > 48 {
+        fmt::truncate_width(&s, 48)
+    } else if s.is_empty() {
+        fmt::first_line(line).to_string()
+    } else {
+        s
+    }
+}
+
 /// What a task's command does (`crate::workkind`). A monitor's wall time
 /// is watching, not work, so monitors are their own kind.
 pub fn work_kind(t: &TaskRecord) -> &'static str {
@@ -474,7 +596,7 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         exit_code: t.exit_code,
         signal: t.signal.clone(),
         end_reason: t.end_reason.clone(),
-        title: fmt::first_line(&t.command).to_string(),
+        title: task_title(t),
         work_kind: Some(work_kind(t).to_string()),
         cpu_user_ms: t.cpu_user_ms,
         cpu_sys_ms: t.cpu_sys_ms,
@@ -1088,6 +1210,60 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
 // agent transcript
 // ---------------------------------------------------------------------------
 
+/// One conversation turn from a child transcript jsonl line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub role: String,
+    pub tool: Option<String>,
+    pub args: Option<String>,
+    pub text: String,
+    pub ts: Option<u64>,
+    pub error: bool,
+}
+
+/// Parse one transcript line. `None` hides it (system/preamble unless `full`).
+/// Transcript lines: {role, text, tool?, args?, isError?, ts?}.
+pub fn parse_transcript_line(line: &str, full: bool, prompt_head: Option<&str>, first_user: &mut bool) -> Option<TranscriptTurn> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("?").to_string();
+    let mut text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let ts = v.get("ts").and_then(|t| t.as_u64());
+    let error = v
+        .get("isError")
+        .or_else(|| v.get("is_error"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    if !full && (role == "system" || v.get("preamble").and_then(|p| p.as_bool()) == Some(true)) {
+        return None;
+    }
+    let tool = v.get("tool").and_then(|t| t.as_str()).map(|s| s.to_string());
+    let args = match v.get("args") {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(other) if !other.is_null() => Some(other.to_string()),
+        _ => None,
+    };
+    if role == "user" && *first_user {
+        *first_user = false;
+        if !full {
+            if let Some(p) = prompt_head {
+                if text != p && text.contains(p) {
+                    text = p.to_string();
+                }
+            }
+        }
+    } else if role == "user" {
+        *first_user = false;
+    }
+    Some(TranscriptTurn {
+        role,
+        tool,
+        args,
+        text,
+        ts,
+        error,
+    })
+}
+
 /// Render one transcript line. `None` hides it (system/preamble lines unless
 /// `full`). Transcript lines: {role, text, tool?, args?, isError?, ts?}.
 pub fn render_transcript_line(line: &str, full: bool, prompt_head: Option<&str>, first_user: &mut bool) -> Option<String> {
@@ -1205,7 +1381,6 @@ pub struct EventsOpts {
     pub json: bool,
 }
 
-/// Read every events file; returns (events, malformed line count).
 /// Every event line so far, time-ordered, plus the malformed-line count and,
 /// per file, the offset just past the last complete line read. `-f`
 /// continues from exactly those offsets, so a line written while history is
@@ -1444,7 +1619,7 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let tokens_cache_read = sum_agent_field(&agents, |a| a.tokens_cache_read);
     let tokens_cache_write = sum_agent_field(&agents, |a| a.tokens_cache_write);
     let llm_ms = sum_agent_field(&agents, |a| a.llm_ms);
-    let tokens_per_second = agent_output_tokens_per_second(tokens_output, llm_ms);
+    let tokens_per_second = pooled_output_tokens_per_second(agents.iter().map(|a| rate_pair(a.tokens_output, a.llm_ms)));
     if json_out {
         let mut v = serde_json::to_value(&st).unwrap();
         v["agent_counts"] = json!({"running": a_running, "terminal": a_done});
@@ -1501,8 +1676,10 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         a_running,
         a_done
     );
+    // The caption's time is the time the rate was pooled over, not every agent's.
+    let rate_ms: u64 = agents.iter().filter_map(|a| rate_pair(a.tokens_output, a.llm_ms)).fold(0u64, |sum, (_, ms)| sum.saturating_add(ms));
     let rate = tokens_per_second
-        .zip(llm_ms)
+        .map(|v| (v, rate_ms))
         .map(|(v, ms)| format!(" ({v:.1} output tok/s over {ms} ms of LLM time)"))
         .unwrap_or_default();
     outln!(
@@ -1621,6 +1798,27 @@ mod tests {
     }
 
     #[test]
+    fn guess_command_title_prefers_incident_ssh_and_tick() {
+        assert_eq!(
+            guess_command_title("bash /Users/me/storage/2026-09-27-stripe-risk-block-cooldown/watch.sh"),
+            "stripe-risk-block-cooldown"
+        );
+        assert_eq!(
+            guess_command_title("ssh -o BatchMode=yes phala@phala-cloud-01 'sudo tail -n +1 -F /var/log/nginx/teehouse-api-access.log'"),
+            "teehouse-api-access.log @phala-cloud-01"
+        );
+        assert_eq!(
+            guess_command_title("ssh phala@phala-cloud-01 'sudo journalctl -fu teehouse'"),
+            "journalctl @phala-cloud-01"
+        );
+        assert_eq!(
+            guess_command_title("while true; do sleep 120; echo TICK; done"),
+            "tick every 2m"
+        );
+        assert_eq!(guess_command_title("pytest -n 4"), "pytest -n 4");
+    }
+
+    #[test]
     fn prefixes_are_unique_and_at_least_8() {
         let ids = ["0199aaaa-1111-7000", "0199aaaa-2222-7000", "abc", "zzzzzzzzzzzz"];
         let p = session_prefixes(ids.iter().copied());
@@ -1676,5 +1874,23 @@ mod tests {
         let t = r#"{"role":"tool","tool":"bash","args":"ls","isError":true,"text":"boom"}"#;
         assert_eq!(render_transcript_line(t, false, head, &mut first).unwrap(), "tool bash(ls) ✗ → boom");
         assert_eq!(render_transcript_line("not json", false, head, &mut first), None);
+    }
+
+    #[test]
+    fn conversation_layout_is_turns_not_one_liners() {
+        let mut first = true;
+        let head = Some("inspect the loader");
+        let u = r#"{"role":"user","text":"You are a worker...\n\ninspect the loader","ts":1}"#;
+        let a = r#"{"role":"assistant","text":"I will inspect it."}"#;
+        let t = r#"{"role":"tool","tool":"read","text":"file body"}"#;
+        let turns = [
+            parse_transcript_line(u, false, head, &mut first).unwrap(),
+            parse_transcript_line(a, false, head, &mut first).unwrap(),
+            parse_transcript_line(t, false, head, &mut first).unwrap(),
+        ];
+        assert_eq!(turns[0].text, "inspect the loader");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[2].tool.as_deref(), Some("read"));
+        assert_eq!(turns[2].text, "file body");
     }
 }

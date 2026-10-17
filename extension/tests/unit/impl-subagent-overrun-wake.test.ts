@@ -140,12 +140,12 @@ describe("subagent-overrun wake", () => {
     const render = (expanded: boolean) =>
       (map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(wake, { expanded, outputPad: 0 }, theme).render(160) as string[]).join("\n");
     const pill = render(false);
-    expect(pill).toContain("overrun worker-1 31m0s / 30m0s budget · still running · shell 12m0s (output growing)");
+    expect(pill).toContain("overrun worker-1 31m00s / 30m00s budget · still running · shell 12m00s (output growing)");
     expect(pill).not.toContain("✗");
     const expanded = render(true);
-    expect(expanded).toContain("Shell sh_1 · 12m0s");
+    expect(expanded).toContain("Shell sh_1 · 12m00s");
     expect(expanded).toContain("$ cd /repo && npm test -- --runInBand");
-    expect(expanded).toContain("Next reminder in 10m0s unless you extend, steer, or interrupt it.");
+    expect(expanded).toContain("Next reminder in 10m00s unless you extend, steer, or interrupt it.");
     const batched = formatSubagentOverrunBatch([
       info(),
       info({ runId: "run_b", childId: "ch_b", name: "worker-2", lastActivity: { agoMs: 2 * MIN, text: "Inspecting logs." }, hardCeilingMs: 15 * MIN }),
@@ -155,8 +155,8 @@ describe("subagent-overrun wake", () => {
     expect(batchedRender(false)).toContain("+1 more overdue");
     expect(batchedRender(true)).toContain("Also overdue (1)");
     expect(batchedRender(true)).toContain("worker-2 (ch_b) · run run_b");
-    expect(batchedRender(true)).toContain("Last activity (2m0s ago): Inspecting logs.");
-    expect(batchedRender(true)).toContain("Hard ceiling stops it in 15m0s.");
+    expect(batchedRender(true)).toContain("Last activity (2m00s ago): Inspecting logs.");
+    expect(batchedRender(true)).toContain("Hard ceiling stops it in 15m00s.");
     expect(expanded).not.toContain("<pi-famulus-wake");
   });
 });
@@ -196,15 +196,15 @@ describe("subagent-overrun wake under an opt-in hard ceiling (review P2, PR #34)
       info({ elapsedMs: 60_000, budgetMs: 60_000, nextReminderMs: 10 * MIN, hardCeilingMs: 30_000 }),
     );
     const text = expandedWakeText(wake.details, wake.content);
-    expect(text).toContain("Hard ceiling stops it in 30.0s (extend does not move it).");
+    expect(text).toContain("Hard ceiling stops it in 30s (extend does not move it).");
     expect(text).not.toContain("Next reminder");
   });
 
   it("expanded TUI names the next reminder when it comes before the ceiling", () => {
     const wake = formatSubagentOverrun(info({ nextReminderMs: 10 * MIN, hardCeilingMs: 25 * MIN }));
     const text = expandedWakeText(wake.details, wake.content);
-    expect(text).toContain("Hard ceiling stops it in 25m0s (extend does not move it).");
-    expect(text).toContain("Next reminder in 10m0s unless you extend, steer, or interrupt it.");
+    expect(text).toContain("Hard ceiling stops it in 25m00s (extend does not move it).");
+    expect(text).toContain("Next reminder in 10m00s unless you extend, steer, or interrupt it.");
   });
 });
 

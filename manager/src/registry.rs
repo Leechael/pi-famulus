@@ -397,6 +397,7 @@ mod tests {
             live_cpu_percent: None,
             live_cpu_sampled_at: None,
             live_cpu_stale: false,
+            label: None,
         }
     }
 
@@ -423,8 +424,10 @@ mod tests {
         rec.live_cpu_percent = Some(12.5);
         rec.live_cpu_sampled_at = Some(1726000000500);
         rec.live_cpu_stale = true;
+        rec.label = Some("watch build".into());
         persist_record(&home, &rec).unwrap();
         let persisted = load_all_records(&home);
+        assert_eq!(persisted[0].label.as_deref(), Some("watch build"));
         assert_eq!(persisted[0].live_cpu_user_ms, None);
         assert_eq!(persisted[0].live_cpu_sys_ms, None);
         assert_eq!(persisted[0].live_cpu_percent, None);

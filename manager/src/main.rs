@@ -26,6 +26,7 @@ mod shellstart;
 mod stats;
 mod sys;
 mod task;
+mod top;
 mod workkind;
 
 use cli::{Cli, Sub};
@@ -173,7 +174,29 @@ async fn async_main() {
             };
             run_client(stats::cmd_stats(&home, opts)).await
         }
-        Sub::Top { json } => run_client(stats::cmd_top(&home, json)).await,
+        Sub::Top {
+            json,
+            once,
+            interval,
+            session,
+            cwd,
+        } => {
+            if !top::wants_interactive(json, once) {
+                run_client(stats::cmd_top(&home, json, session.as_deref(), cwd.as_deref())).await
+            } else {
+                match crate::fmt::parse_duration(&interval) {
+                    Ok(ms) if ms > 0 => run_client(top::run(&home, ms, session, cwd)).await,
+                    Ok(_) => {
+                        eprintln!("pi-famulus: interval must be greater than 0");
+                        1
+                    }
+                    Err(e) => {
+                        eprintln!("pi-famulus: {e}");
+                        1
+                    }
+                }
+            }
+        },
         Sub::Agent { id, full, follow } => {
             run_client(inspect::cmd_agent(&home, &id, full, follow)).await
         }

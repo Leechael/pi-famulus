@@ -1,7 +1,11 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
-import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
+import { turnsFromMessages } from "../../src/subagent/conversation";
+import { plainTheme, renderConversation } from "../../src/tui/conversation-view";
+
+const formatConversation = (turns: Parameters<typeof renderConversation>[0]) =>
+  renderConversation(turns, 100, plainTheme, { expanded: true, agent: "scout" }).join("\n");
 import { stderrPathFor } from "../../src/tui/task-output-paths";
 import { filterTaskItems, formatWorkRows, groupTaskRows, moveSelection, stopChoice, taskDetailHeader, taskDetailInfo, resolveTaskOutputPath } from "../../src/tui/tasks-command";
 import { visibleDetailTabs, wrapLines } from "../../src/tui/scroll-detail-view";
@@ -80,11 +84,10 @@ describe("tasks view", () => {
     expect(formatWorkRows([failed], failed.id, 1000, 100)[0]).toContain("529 overloaded_error");
   });
 
-  it("keeps detail tabs in keyboard shortcut order", () => {
-    expect(visibleDetailTabs({ output: () => "", stderr: () => "", info: () => "" }))
-      .toEqual(["output", "stderr", "info"]);
-    expect(visibleDetailTabs({ conversation: () => "", result: () => "", info: () => "" }))
+  it("keeps subagent detail tabs in keyboard shortcut order", () => {
+    expect(visibleDetailTabs({ info: () => "", conversation: () => "", result: () => "" }))
       .toEqual(["conversation", "result", "info"]);
+    expect(visibleDetailTabs({ info: () => "", conversation: () => "" })).toEqual(["conversation", "info"]);
   });
 
   it("uses the manager task output path for a live monitor before exit", () => {
@@ -167,10 +170,30 @@ describe("tasks view", () => {
         { role: "toolResult", toolName: "read", content: [{ type: "text", text: "file body" }], isError: false },
       ]),
     );
-    expect(text).toContain("── user ──");
+    expect(text).toContain("┃ main → scout");
     expect(text).toContain("look at src");
-    expect(text).toContain("tool read");
+    expect(text).toContain("✓ read");
     expect(stderrPathFor("/tmp/tasks/sh_ab.output")).toBe("/tmp/tasks/sh_ab.stderr");
+  });
+
+  it("emits thinking as its own turn so the TUI can collapse it", () => {
+    const turns = turnsFromMessages([
+      { role: "user", content: "look at src" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "I should read the file first" },
+          { type: "text", text: "reading" },
+          { type: "toolCall", name: "read", arguments: { path: "src" } },
+        ],
+      },
+    ]);
+    expect(turns).toEqual([
+      { role: "user", text: "look at src" },
+      { role: "thinking", text: "I should read the file first" },
+      { role: "assistant", text: "reading" },
+      { role: "assistant", text: 'tool read {"path":"src"}' },
+    ]);
   });
 
   it("wraps ANSI and CJK by visible width", () => {
@@ -184,26 +207,28 @@ describe("tasks view", () => {
 // Manual testing (2026-09-24): a monitor view opened while it ran said
 // "running · 57m46s" long after it exited, and a command with no output
 // (`true`) showed a bare "(empty)".
-describe("task detail tabs follow the live item", () => {
-  it("re-reads status from the index and explains empty output", async () => {
+describe("task detail follows the live item", () => {
+  it("re-reads status for the pinned panel and explains empty output", async () => {
     const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const { taskDetailTabs } = await import("../../src/tui/tasks-command");
+    const { infoCard, streamBody } = await import("../../src/tui/task-detail-view");
+    const plain = { fg: (_c: string, t: string) => t, bold: (t: string) => t, italic: (t: string) => t };
     const dir = mkdtempSync(join(tmpdir(), "pi-famulus-tabs-"));
     const out = join(dir, "mon_1.output");
+    const err = join(dir, "mon_1.stderr");
     writeFileSync(out, "");
-    writeFileSync(join(dir, "mon_1.stderr"), "");
+    writeFileSync(err, "");
     let item = { id: "mon_1", kind: "monitor" as const, status: "running" as const, title: "noop watcher", command: "true", startedAt: 0, countsAsWorker: false, outputPath: out } as never as import("../../src/work-index").WorkItem;
-    const tabs = taskDetailTabs(() => item, { outputPath: out, stderrPath: join(dir, "mon_1.stderr") }, () => 1_000);
-    expect(tabs.output()).toContain("running");
-    expect(tabs.output()).toContain("(no output yet)");
+    expect(infoCard(item, 1_000, plain, 100).join("\n")).toContain("running");
+    expect(streamBody(item, out, "output")).toBe("(no output yet)");
     item = { ...item, status: "completed", exitCode: 0, endedAt: 5, endReason: "exited" } as typeof item;
-    expect(tabs.output()).toContain("exit 0");
-    expect(tabs.output()).not.toContain("running");
-    expect(tabs.output()).toMatch(/no output; the command printed nothing/);
-    expect(tabs.stderr()).toContain("(nothing on stderr)");
-    expect(tabs.info()).toContain("noop watcher");
+    const card = infoCard(item, 1_000, plain, 100).join("\n");
+    expect(card).toContain("exit 0");
+    expect(card).not.toContain("running");
+    expect(streamBody(item, out, "output")).toMatch(/no output; the command printed nothing/);
+    expect(streamBody(item, err, "stderr")).toBe("(nothing on stderr)");
+    expect(card).toContain("$ true");
     rmSync(dir, { recursive: true, force: true });
   });
 });

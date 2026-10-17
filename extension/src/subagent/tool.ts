@@ -21,6 +21,7 @@ import { realClock, type Clock, type ClockTimer } from "../clock";
 
 import type { NotifyCenter } from "../notify";
 import { statusGlyph, toolComponent } from "../tui/tool-component";
+import { scrubTty } from "../tui/conversation-view";
 import type { WorkIndex } from "../work-index";
 import { fill, PROMPTS } from "../prompts.generated";
 import { runChain, runTasks, validateChainSteps } from "./pool";
@@ -706,7 +707,7 @@ export function createSubagentTool(
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const all = text.split("\n");
+      const all = scrubTty(text).split("\n");
       const shown = expanded ? all : all.slice(0, 10);
       const out = shown.map((l) => theme.fg("toolOutput", l));
       if (shown.length < all.length) out.push(theme.fg("muted", `... (${all.length - shown.length} more lines, ctrl+o to expand)`));

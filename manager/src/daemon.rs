@@ -32,7 +32,7 @@ const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
 /// only: normally the runner guards its group and its exit says "empty").
 const GROUP_POLL: Duration = Duration::from_millis(500);
 /// Best-effort live process-group CPU refresh interval.
-const LIVE_CPU_POLL: Duration = Duration::from_secs(5);
+const LIVE_CPU_POLL: Duration = Duration::from_secs(2);
 
 type OutTx = mpsc::Sender<OutFrame>;
 
@@ -1444,6 +1444,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             timeout_ms,
             origin,
             key,
+            label,
             ..
         } => {
             let spec = StartSpec {
@@ -1454,6 +1455,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
                 timeout_ms,
                 origin,
                 key,
+                label,
             };
             respond(&tx, &id, handle_start(&state, conn_id, spec)).await
         }
@@ -1696,6 +1698,20 @@ pub struct StartSpec {
     pub timeout_ms: Option<u64>,
     pub origin: Option<Origin>,
     pub key: Option<String>,
+    pub label: Option<String>,
+}
+
+/// A client label is display text: one line, no control or bidi formatting
+/// characters, and no longer than a clipped command, so it cannot break,
+/// reorder, or spoof a row, or bloat records.
+fn clean_label(raw: &str) -> Option<String> {
+    let bidi = |c: char| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let line: String = raw
+        .chars()
+        .map(|c| if c.is_control() || bidi(c) { ' ' } else { c })
+        .collect();
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then(|| crate::events::clip_chars(&line, crate::events::COMMAND_CHARS))
 }
 
 fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk, ProtoError> {
@@ -1707,7 +1723,9 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         timeout_ms,
         origin,
         key,
+        label,
     } = spec;
+    let label = label.as_deref().and_then(clean_label);
     let (session_id, home) = {
         let st = state.lock().unwrap();
         if st.shutdown {
@@ -1799,6 +1817,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         live_cpu_percent: None,
         live_cpu_sampled_at: None,
         live_cpu_stale: false,
+        label: label.clone(),
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -1821,6 +1840,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
                 "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
                 "origin": origin,
                 "pid": pid,
+                "label": label,
             }),
         );
         let mut entry = TaskEntry::new_running(record, parts, output, timeout_ms);
@@ -3895,6 +3915,15 @@ fn admit_agent(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn client_labels_are_one_clipped_line() {
+        assert_eq!(clean_label("watch\n\x1b[31mbuild\t "), Some("watch [31mbuild".into()));
+        assert_eq!(clean_label(" \n "), None);
+        assert_eq!(clean_label("tail \u{202E}gol.exe"), Some("tail gol.exe".into()));
+        let long = clean_label(&"x".repeat(500)).unwrap();
+        assert_eq!(long.chars().count(), crate::events::COMMAND_CHARS);
+    }
 
     fn running_record_for_cpu_test() -> TaskRecord {
         serde_json::from_value(json!({

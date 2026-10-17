@@ -3,7 +3,8 @@ import { statusGlyph } from "../../src/tui/tool-component";
 
 describe("TUI work status glyphs", () => {
   it("distinguishes active states from terminal success", () => {
-    expect(statusGlyph("running")).toEqual({ color: "accent", glyph: "●" });
+    expect(statusGlyph("running")).toEqual({ color: "success", glyph: "●" });
+    expect(statusGlyph("stopped")).toEqual({ color: "warning", glyph: "■" });
     expect(statusGlyph("pending")).toEqual({ color: "dim", glyph: "○" });
     expect(statusGlyph("completed")).toEqual({ color: "success", glyph: "✓" });
   });

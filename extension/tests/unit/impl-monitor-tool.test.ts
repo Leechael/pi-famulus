@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createMonitorTool, MonitorRegistry } from "../../src/monitor";
+import { WorkIndex } from "../../src/work-index";
 
 describe("monitor tool result rendering", () => {
   it("renders failed tool results as failures and avoids key-hint glyphs", () => {
@@ -23,7 +24,7 @@ describe("monitor tool result rendering", () => {
     const text = result.render(120).join("\n");
     expect(text).toContain("✗");
     expect(text).not.toContain("✓");
-    expect(text).toContain("manage via /tasks");
+    expect(text).toContain("· /tasks");
     expect(text).not.toContain("↓");
   });
 });
@@ -100,5 +101,28 @@ describe("monitor start result", () => {
       { isError: false },
     ) as { render(width: number): string[] };
     expect(row.render(200).join("\n")).not.toContain("Events arrive");
+  });
+});
+
+describe("monitor transcript row status", () => {
+  const registry = () => new MonitorRegistry({ getClient: () => null, sessionEnv: () => ({}), getNotifyCenter: () => null, trackTask: () => {} });
+  const theme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t };
+  const render = (getIndex: () => WorkIndex | null) =>
+    ((createMonitorTool(registry(), getIndex).renderResult as Function)(
+      { content: [{ type: "text", text: "Monitor started · task mon_1 · timeout 60s" }], details: { task_id: "mon_1", timeout_ms: 60_000 } },
+      { expanded: false, isPartial: false },
+      theme,
+      { isError: false, state: {} },
+    ) as { render(width: number): string[] }).render(200).join("\n");
+
+  it("shows a monitor the index no longer holds as finished, not running", () => {
+    expect(render(() => new WorkIndex())).toContain("✓");
+    expect(render(() => new WorkIndex())).not.toContain("●");
+  });
+
+  it("shows an indexed live monitor as running", () => {
+    const index = new WorkIndex();
+    index.upsert({ id: "mon_1", kind: "monitor", status: "running", title: "ready", startedAt: 0, countsAsWorker: false });
+    expect(render(() => index)).toContain("●");
   });
 });

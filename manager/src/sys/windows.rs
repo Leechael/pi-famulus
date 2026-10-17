@@ -16,8 +16,8 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, SYSTEMTIME, WAIT_OBJECT_0, DUPLICATE_SAME_ACCESS,
 };
 use windows_sys::Win32::System::Console::{
-    GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE,
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
@@ -550,6 +550,25 @@ pub fn localtime(secs: i64) -> LocalTime {
     }
 }
 
+pub fn stdin_is_tty() -> bool {
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode = 0u32;
+        GetConsoleMode(h, &mut mode) != 0
+    }
+}
+
+pub fn stdout_is_tty() -> bool {
+    stdout_tty_columns().is_some()
+}
+
+pub fn stdio_interactive() -> bool {
+    stdin_is_tty() && stdout_is_tty()
+}
+
 pub fn stdout_tty_columns() -> Option<usize> {
     unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -587,7 +606,7 @@ pub fn max_rss_bytes() -> u64 {
     0
 }
 
-/// Live CPU sampling is Linux `/proc` only; Windows callers treat this as unavailable.
+/// Live CPU sampling is Unix-only (Linux `/proc`, Darwin `proc_pidinfo`).
 pub fn clock_ticks_per_second() -> Option<u64> {
     None
 }

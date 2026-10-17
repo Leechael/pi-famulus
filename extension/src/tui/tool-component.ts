@@ -1,6 +1,6 @@
 import { fitLines } from "./pi-tui-load";
 
-export function renderToolLines(lines: string[], width: number): string[] {
+function renderToolLines(lines: string[], width: number): string[] {
   const limit = Math.max(1, width);
   const out: string[] = [];
   for (const line of lines) out.push(...fitLines(line, limit));
@@ -16,11 +16,15 @@ export function toolComponent(lines: string[]): { render(width: number): string[
   };
 }
 
+/**
+ * The one status mapping, shared with `pi-famulus top`: running ● green,
+ * pending ○ dim, done ✓ green, failed ✗ red, stopped / timeout ■ amber.
+ */
 export function statusGlyph(status: string | undefined, isError = false): { color: string; glyph: string } {
   if (isError || status === "failed" || status === "killed" || status === "orphaned" || status === "interrupted") {
     return { color: "error", glyph: "✗" };
   }
-  if (status === "running") return { color: "accent", glyph: "●" };
+  if (status === "running") return { color: "success", glyph: "●" };
   if (status === "pending") return { color: "dim", glyph: "○" };
   if (status === "partial" || status === "timeout" || status === "stopped") {
     return { color: "warning", glyph: "■" };

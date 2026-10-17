@@ -753,6 +753,13 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
     assert_eq!((suite["tasks"].as_u64(), suite["cpu_ms"].as_u64()), (Some(1), Some(1_500)));
     assert!(report["cpu_note"].as_str().unwrap().contains("100% equals one core"));
 
+    // The snapshot honours the live view's scope flags.
+    let other: Value = serde_json::from_str(&cli_ok(&home, &["top", "--json", "--session", "sess-other"]).stdout).unwrap();
+    assert!(other["agents"].as_array().unwrap().is_empty(), "{other:#}");
+    assert!(other["work_kinds"].as_array().unwrap().is_empty(), "{other:#}");
+    let scoped: Value = serde_json::from_str(&cli_ok(&home, &["top", "--json", "--session", "sess-t"]).stdout).unwrap();
+    assert_eq!(scoped["agents"].as_array().unwrap().len(), report["agents"].as_array().unwrap().len());
+
     let text = cli_ok(&home, &["top"]).stdout;
     assert!(text.contains("AGENTS") && text.contains("WORK KINDS") && text.contains("10.0 output tok/s") && text.contains("test-suite"), "{text}");
     assert!(text.contains("wall LLM 1s / tool unavailable / queue unavailable / unclassified unavailable"), "{text}");
@@ -761,8 +768,8 @@ fn c12_top_reports_agent_cpu_kind_cpu_and_tokens() {
 
 /// Real-daemon smoke test: a busy process group becomes visible as cumulative
 /// and recent CPU in the plain-text `top` command.
-// Live process-group sampling reads /proc; it is Linux-only by design.
-#[cfg(target_os = "linux")]
+// Live process-group sampling is Linux `/proc` and Darwin `proc_pidinfo`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn c13_top_reports_live_process_group_cpu() {
     let home = Home::new_real("c13");

@@ -141,16 +141,18 @@ describe("formatBackgroundNotice", () => {
   });
 
   it("draws the transcript row from live task state, not from the model text", () => {
-    expect(backgroundRowText("sh_1", undefined, 0)).toMatchObject({ glyph: "⏵", text: "sh_1 running in background · /tasks" });
-    expect(backgroundRowText("sh_1", { status: "running", startedAt: 0 }, 5_000).glyph).toBe("⏵");
+    expect(backgroundRowText("sh_1", undefined, 0)).toMatchObject({ glyph: "●", text: "sh_1 running in background · /tasks" });
+    // Missing from a live index: pruned or not yet re-listed — claim neither state.
+    expect(backgroundRowText("sh_1", undefined, 0, true)).toEqual({ glyph: "·", color: "dim", text: "sh_1 · status in /tasks" });
+    expect(backgroundRowText("sh_1", { status: "running", startedAt: 0 }, 5_000).glyph).toBe("●");
     expect(backgroundRowText("sh_1", { status: "completed", exitCode: 0, startedAt: 0, endedAt: 14_000 }, 20_000)).toEqual({
       glyph: "✓",
       color: "success",
-      text: "sh_1 finished · exit 0 · 14.0s",
+      text: "sh_1 finished · exit 0 · 14s",
     });
     expect(backgroundRowText("sh_1", { status: "failed", exitCode: 3, startedAt: 0, endedAt: 12_000 }, 20_000)).toMatchObject({
       glyph: "✗",
-      text: "sh_1 failed · exit 3 · 12.0s · /tasks",
+      text: "sh_1 failed · exit 3 · 12s · /tasks",
     });
   });
 });

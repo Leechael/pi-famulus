@@ -39,7 +39,8 @@ impl Sub {
     /// Listings and dumps a person reads; not a follow, not an action.
     pub(crate) fn pages(&self) -> bool {
         match self {
-            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } | Sub::Top { .. } => true,
+            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } => true,
+            Sub::Top { json, once, .. } => !crate::top::wants_interactive(*json, *once),
             Sub::Agent { follow, .. } | Sub::Events { follow, .. } | Sub::Log { follow, .. } => {
                 !follow
             }
@@ -106,14 +107,28 @@ pub(crate) enum Sub {
         #[usage(long)]
         json: bool,
     },
-    /// Cumulative and live task CPU (including monitors) by agent and work kind, with tokens.
+    /// Interactive live view of sessions, agents, tasks, and CPU (like top).
     ///
-    /// A plain-text snapshot; 100% NOW equals one CPU core.
+    /// On a TTY this opens a refreshable dashboard. `--once` or a pipe prints
+    /// the plain-text snapshot instead. 100% NOW equals one CPU core. Never
+    /// starts the daemon.
     #[usage(display_order = 43, help_heading = "Inspection")]
     Top {
         /// Machine-readable JSON on stdout.
         #[usage(long)]
         json: bool,
+        /// Print one snapshot and exit (also the mode when stdout is not a TTY).
+        #[usage(long)]
+        once: bool,
+        /// Refresh interval (500ms, 1s, 2s, 5s). Default 1s. Ignored with --once/--json.
+        #[usage(long, default = "1s")]
+        interval: String,
+        /// Only sessions whose id starts with this prefix.
+        #[usage(long)]
+        session: Option<String>,
+        /// Only work whose cwd is this directory or below it.
+        #[usage(long)]
+        cwd: Option<String>,
     },
     /// Retained tasks' wall time and CPU, grouped by agent and/or work kind.
     ///
@@ -362,5 +377,45 @@ mod tests {
         assert_eq!(session, "cli");
         assert_eq!(kind, "shell");
         assert_eq!(command, "-nasty command");
+    }
+
+    #[test]
+    fn top_accepts_once_interval_and_scope_flags() {
+        let cli = Cli::parse_from(
+            &[
+                OsStr::new("top"),
+                OsStr::new("--once"),
+                OsStr::new("--interval"),
+                OsStr::new("2s"),
+                OsStr::new("--session"),
+                OsStr::new("abc"),
+                OsStr::new("--cwd"),
+                OsStr::new("/tmp"),
+            ],
+        )
+        .expect("valid top invocation");
+        let Sub::Top {
+            json,
+            once,
+            interval,
+            session,
+            cwd,
+        } = cli.cmd
+        else {
+            panic!("top should be selected");
+        };
+        assert!(!json);
+        assert!(once);
+        assert_eq!(interval, "2s");
+        assert_eq!(session.as_deref(), Some("abc"));
+        assert_eq!(cwd.as_deref(), Some("/tmp"));
+        assert!(Sub::Top {
+            json: false,
+            once: true,
+            interval: "1s".into(),
+            session: None,
+            cwd: None,
+        }
+        .pages());
     }
 }

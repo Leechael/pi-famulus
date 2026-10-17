@@ -4,16 +4,18 @@
  * Type to filter, ↑↓ selects, Enter opens, Ctrl+X asks before stopping, Tab
  * switches between active/recent and the manager's complete task history.
  */
-import { DynamicBorder, keyHint, rawKeyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realClock, type Clock } from "../clock";
 import type { ManagerClient, TaskRecord } from "../manager-client";
 import { taskOutputPath } from "../config";
-import { formatConversation } from "../subagent/conversation";
 import type { SubagentRegistry } from "../subagent/registry";
 import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
-import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
+import { fitKeys, keyHints, notifyPlainFallback, showScrollDetail, spread, type PaneRenderer, type PaneTheme } from "./scroll-detail-view";
+import { plainTheme, renderConversation } from "./conversation-view";
+import { formatDuration } from "../format";
+import { showTaskDetail } from "./task-detail-view";
 import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
-import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
+import { fitLines, loadPiTui, truncateToWidth, visibleWidth } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
 
 
@@ -150,20 +152,6 @@ export function formatWorkRows(
   });
 }
 
-function selectorHint(theme: { fg(color: string, text: string): string }): string {
-  try {
-    return [
-      keyHint("tui.select.up", ""),
-      keyHint("tui.select.down", ""),
-      keyHint("tui.select.confirm", "view"),
-      rawKeyHint("ctrl+x", "stop"),
-      keyHint("tui.select.cancel", "close"),
-    ].join("  ");
-  } catch {
-    return theme.fg("dim", "↑↓ select · Enter view · Ctrl+X stop · Esc close · type to filter");
-  }
-}
-
 export interface TaskListChoice {
   action: "close" | "view" | "stop" | "already-finished";
   id?: string;
@@ -286,7 +274,6 @@ async function showTaskList(
         tui.requestRender();
         scheduleAgeTick();
       });
-      const border = new DynamicBorder((text) => theme.fg("border", text));
       const pageSize = () => Math.max(1, (tui.terminal?.rows ?? 24) - 8);
       const matches = (data: string, id: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel") => {
         try { return kb.matches(data, id); } catch { return false; }
@@ -336,6 +323,8 @@ async function showTaskList(
       };
       return {
         render(width: number) {
+          const t = theme as unknown as PaneTheme;
+          const dim = (text: string) => t.fg("dim", text);
           const items = visibleItems();
           if (!items.some((item) => item.id === selectedId)) selectedId = items[0]?.id;
           const rows = groupTaskRows(items);
@@ -346,33 +335,54 @@ async function showTaskList(
           const window = rows.slice(start, start + height);
           const inner = Math.max(1, width);
           const active = items.filter(isLive).length;
-          const scopeLabel = scope === "all" ? "All" : "Active + recent";
-          const titleText = `Tasks ${selectedTask + (items.length ? 1 : 0)}/${items.length} · ${active} active · ${scopeLabel}`;
-          const title = truncateToWidth(theme.fg("accent", titleText), inner, "…");
-          const filterLine = truncateToWidth(theme.fg("dim", `Filter: ${filter || "(type to filter)"} · Tab scope`), inner, "…");
-          const hintLine = hint ? truncateToWidth(theme.fg(hint.startsWith("Already") ? "dim" : "warning", hint), inner, "…") : "";
-          const confirmLine = confirmId
-            ? truncateToWidth(theme.fg("error", `Stop ${confirmId}? Enter confirm · Esc cancel`), inner, "…")
-            : "";
+          const scopeLabel = scope === "all" ? "all history" : "active + recent";
+          const rule = t.fg("borderMuted", "─".repeat(inner));
+          const counts = `${active > 0 ? t.fg("success", `${active} active`) : dim("0 active")}${dim(` · ${items.length} shown · ${scopeLabel}`)}`;
+          const title = spread(`${t.fg("accent", "◆")} ${t.bold("Tasks")}`, counts, inner);
+          // A long filter keeps its end (what is being typed) in view.
+          const shownFilter = visibleWidth(filter) > inner - 4 ? `…${filter.slice(-(inner - 5))}` : filter;
+          const prompt = truncateToWidth(
+            filter ? `${t.fg("accent", "›")} ${shownFilter}${t.fg("accent", "▏")}` : `${t.fg("accent", "›")} ${dim("type to filter")}`,
+            inner,
+            "",
+          );
+          const notice = confirmId
+            ? `  ${t.bold(t.fg("error", `■ stop ${confirmId}?`))}  ${keyHints(t, [["y ⏎", "confirm"], ["n esc", "cancel"]])}`
+            : hint
+              ? `  ${t.fg(hint.startsWith("Already") || hint.startsWith("Stop requested") ? "dim" : "warning", hint)}`
+              : "";
+          const kindWidth = width >= 60 ? 8 : 0;
           const body = window.map((row) => {
-            if (row.type === "run") return truncateToWidth(theme.fg("muted", `Run ${row.runId} · ${row.count} child${row.count === 1 ? "" : "ren"}`), inner, "…");
-            const selected = row.item.id === selectedId;
-            const marker = selected ? "▸" : " ";
-            const { color, glyph } = statusGlyph(row.item.status);
-            const age = formatAge(row.item.startedAt, row.item.endedAt, clock.now());
-            const terminal = row.item.exitCode !== undefined && row.item.exitCode !== null
-              ? ` exit=${row.item.exitCode}`
-              : row.item.signal ? ` ${row.item.signal}` : row.item.endReason ? ` ${row.item.endReason}` : "";
-            const kind = width >= 60 ? `${row.item.kind.padEnd(7)} ` : "";
-            const title = row.item.error ? `${row.item.title} · ${row.item.error}` : row.item.title;
-            const prefix = row.indent ? "  " : "";
-            const text = `${prefix}${marker} ${theme.fg(color as never, glyph)} ${kind}${row.item.status.padEnd(10)} ${age.padEnd(6)}${terminal} ${title}`;
-            return fitLines(truncateToWidth(text, inner, "…"), inner);
-          }).flat();
-          const page = theme.fg("dim", `(${items.length ? selectedTask + 1 : 0}/${items.length}) PgUp/PgDn Home/End · Ctrl+X stop · Enter view`);
-          return [...border.render(inner), title, filterLine, ...(confirmLine ? [confirmLine] : []), ...(hintLine ? [hintLine] : []), ...body, page, ...border.render(inner)];
+            if (row.type === "run") {
+              return truncateToWidth(`  ${dim("▾")} ${t.fg("muted", row.runId)} ${dim(`· ${row.count} child${row.count === 1 ? "" : "ren"}`)}`, inner, "…");
+            }
+            const item = row.item;
+            const selected = item.id === selectedId;
+            const { color, glyph } = statusGlyph(item.status);
+            const age = formatAge(item.startedAt, item.endedAt, clock.now());
+            const terminal = item.exitCode !== undefined && item.exitCode !== null
+              ? `exit=${item.exitCode}`
+              : item.signal ?? item.endReason ?? "";
+            const name = item.error ? `${item.title} ${t.fg("error", `· ${item.error}`)}` : item.title;
+            const lead = (selected ? t.fg("accent", "▌") : " ") + (row.indent ? "   " : " ");
+            const kind = kindWidth ? t.fg("muted", item.kind.padEnd(kindWidth)) : "";
+            // Same rule as top: a finished row keeps a quiet status word.
+            const status = t.fg(isLive(item) || color !== "success" ? color : "dim", item.status.padEnd(10));
+            const left = `${lead}${t.fg(color, glyph)} ${kind}${status}${selected ? t.bold(name) : name}`;
+            const right = dim(`${terminal ? `${terminal}  ` : ""}${age}`);
+            return spread(left, right, inner);
+          });
+          if (body.length === 0) body.push(`  ${dim(filter ? "No task matches the filter." : "No background tasks.")}`);
+          const place = items.length ? `${selectedTask + 1}${dim(`/${items.length}`)}` : "";
+          const keys = fitKeys(
+            t,
+            "",
+            [["↑↓", "select", 2], ["⏎", "open", 1], ["ctrl+x", "stop", 3], ["tab", "scope", 4], ["esc", filter ? "clear" : "close", 0]],
+            inner - 2 - visibleWidth(place) - 2,
+          );
+          return [rule, title, prompt, ...(notice ? [truncateToWidth(notice, inner, "…")] : []), "", ...body, "", spread(`  ${keys}`, place, inner), rule];
         },
-        invalidate() { border.invalidate(); },
+        invalidate() {},
         handleInput(data: string) {
           const items = visibleItems();
           const current = items[selectedIndex(items, selectedId)];
@@ -383,7 +393,8 @@ async function showTaskList(
             return;
           }
           if (confirmId) {
-            if (matchesKey(data, "tui.select.confirm") || data === "\r" || data === "\n") { void requestStop(); return; }
+            if (matchesKey(data, "tui.select.confirm") || data === "\r" || data === "\n" || data === "y" || data === "Y") { void requestStop(); return; }
+            if (data === "n" || data === "N") { confirmId = undefined; hint = "Stop cancelled."; tui.requestRender(); return; }
             return;
           }
           if (matches(data, "tui.select.up")) { choose(moveSelection(items, selectedId, -1) ?? selectedId); return; }
@@ -445,7 +456,40 @@ export function taskDetailHeader(item: WorkItem, now: number): string {
   const outcome = item.exitCode !== undefined && item.exitCode !== null
     ? `exit ${item.exitCode}`
     : item.signal ?? item.endReason ?? item.status;
-  return `${item.id} · ${item.kind} · ${outcome} · ${formatAge(item.startedAt, item.endedAt, now)} · ${item.cwd ?? "cwd unavailable"}\n$ ${item.command ?? item.title}`;
+  const head = `${item.id} · ${item.kind} · ${outcome} · ${formatAge(item.startedAt, item.endedAt, now)}`;
+  // Agents have no cwd or command line of their own.
+  if (item.kind === "agent") return head;
+  return `${head} · ${item.cwd ?? "cwd unavailable"}\n$ ${item.command ?? item.title}`;
+}
+
+const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/** `12.4k`, `1.3M`: same as top's compact numbers. */
+export function compactNum(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.floor(n / 1000)}k`;
+  if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** `⠋ working   12.4k in · 1.8k out · 24.0 tok/s · llm 1m02s · tool 31s`, as in top's agent footer. */
+export function agentStatusLine(
+  handle: { tokenUsage(): { input: number; output: number }; wallUsage(): { llmMs: number; toolMs: number } } | undefined,
+  live: boolean,
+  now: number,
+  theme: { fg(color: string, text: string): string; italic(text: string): string },
+): string {
+  const dim = (s: string) => theme.fg("dim", s);
+  const parts: string[] = [];
+  if (handle) {
+    const tokens = handle.tokenUsage();
+    const wall = handle.wallUsage();
+    parts.push(`${compactNum(tokens.input)}${dim(" in")}`, `${compactNum(tokens.output)}${dim(" out")}`);
+    if (wall.llmMs > 0) parts.push(`${((tokens.output * 1000) / wall.llmMs).toFixed(1)}${dim(" tok/s")}`);
+    parts.push(`${formatDuration(wall.llmMs)}${dim(" llm")}`, `${formatDuration(wall.toolMs)}${dim(" tool")}`);
+  }
+  const spin = live ? `${theme.fg("accent", SPIN[Math.floor(now / 80) % SPIN.length])} ${theme.italic(theme.fg("accent", "working"))}   ` : "";
+  return spin + parts.join(dim(" · "));
 }
 
 export function resolveTaskOutputPath(item: WorkItem, home: string | undefined, sessionId: string | undefined): string {
@@ -467,75 +511,64 @@ export function taskDetailInfo(item: WorkItem, now: number): string {
   return lines.join("\n");
 }
 
-function isLiveStatus(status: string): boolean {
-  return status === "running" || status === "pending";
-}
-
-/**
- * Tab bodies for a shell or monitor. `getItem` is read on every poll so the
- * header follows the task (a view opened while it ran must not keep saying
- * "running"), and an empty file says why it is empty.
- */
-export function taskDetailTabs(
-  getItem: () => WorkItem,
-  paths: { outputPath: string; stderrPath: string },
-  now: () => number,
-): { output: () => string; stderr: () => string; info: () => string } {
-  const body = (path: string, emptyLive: string, emptyDone: string) => {
-    const text = readTaskFileTailCached(path);
-    if (text !== "(empty)") return text;
-    return isLiveStatus(getItem().status) ? emptyLive : emptyDone;
-  };
-  return {
-    output: () => `${taskDetailHeader(getItem(), now())}\n\n${body(paths.outputPath, "(no output yet)", "(no output; the command printed nothing)")}`,
-    stderr: () => `${taskDetailHeader(getItem(), now())}\n\n${body(paths.stderrPath, "(nothing on stderr yet)", "(nothing on stderr)")}`,
-    info: () => taskDetailInfo({ ...getItem(), ...paths }, now()),
-  };
-}
-
 async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksCommandDeps): Promise<void> {
   if (!ctx.hasUI) return;
   const clock = deps.clock ?? realClock;
   if (item.kind === "agent") {
     const handle = () => deps.getRegistry()?.handle(item.id);
     const conversation = () => handle()?.conversation() ?? [];
-    const conversationText = () => {
+    const name = item.name ?? item.title;
+    const turnsOrPrompt = () => {
       const turns = conversation();
-      return turns.length > 0 ? formatConversation(turns) : item.prompt ? `Task prompt:\n${item.prompt}` : "(no conversation yet)";
+      return turns.length > 0 ? turns : item.prompt ? [{ role: "user", text: item.prompt }] : [];
     };
+    const thread: PaneRenderer = {
+      render(width, theme, state) {
+        return renderConversation(turnsOrPrompt(), width, theme, { ...state, agent: name });
+      },
+    };
+    const current = () => deps.getIndex()?.get(item.id) ?? item;
+    const live = () => ["running", "pending"].includes(current().status);
     const resultText = () => {
       const latest = [...conversation()].reverse().find((turn) => turn.role === "assistant")?.text;
       return latest ?? item.text ?? "(no result yet)";
     };
-    const infoText = () => taskDetailInfo(deps.getIndex()?.get(item.id) ?? item, clock.now());
+    const infoText = () => taskDetailInfo(current(), clock.now());
     try {
       await showScrollDetail(ctx.ui, {
-        title: `subagent ${item.title}`,
+        title: `${item.id} · ${name}`,
         tabs: {
-          conversation: conversationText,
+          conversation: thread,
           result: resultText,
           info: infoText,
         },
+        live,
+        status: (theme) => agentStatusLine(handle(), live(), clock.now(), theme),
         pollMs: 500,
         clock: deps.clock,
       });
     } catch {
-      notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, `${infoText()}\n\n${conversationText()}`);
+      const plain = renderConversation(turnsOrPrompt(), 100, plainTheme, { expanded: true, agent: name }).join("\n");
+      notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, `${infoText()}\n\n${plain}`);
     }
     return;
   }
   const outputPath = resolveTaskOutputPath(item, deps.home, deps.sessionId?.());
   const stderrPath = item.stderrPath || stderrPathFor(outputPath);
-  const tabs = taskDetailTabs(() => deps.getIndex()?.get(item.id) ?? item, { outputPath, stderrPath }, () => clock.now());
-  const infoText = tabs.info;
+  const getItem = () => deps.getIndex()?.get(item.id) ?? item;
   try {
-    await showScrollDetail(ctx.ui, {
-      title: `${item.kind} ${item.title}`,
-      tabs,
+    await showTaskDetail(ctx.ui, {
+      title: `${item.id} · ${item.title}`,
+      getItem,
+      paths: { outputPath, stderrPath },
       pollMs: 500,
       clock: deps.clock,
     });
   } catch {
-    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, `${infoText()}\n\n${readTaskFileTailCached(outputPath)}`);
+    notifyPlainFallback(
+      ctx.ui.notify.bind(ctx.ui),
+      item.title,
+      `${taskDetailInfo({ ...getItem(), outputPath, stderrPath }, clock.now())}\n\n${readTaskFileTailCached(outputPath)}`,
+    );
   }
 }
