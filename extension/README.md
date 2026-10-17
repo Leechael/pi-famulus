@@ -36,6 +36,10 @@ One machine-wide daemon (`pi-famulus`, written in Rust) starts every shell comma
 
 pi-famulus is a pi extension, so it works wherever pi loads extensions: the pi TUI, RPC mode, and agents you build with the pi SDK. Outside the TUI there is no `/tasks` list and no fleet line, but results still wake the agent. Print mode (`pi -p`) exits when the first run ends, so results that arrive later are not seen.
 
+### Not a pane manager
+
+If you use Herdr or tmux panes, keep them. Panes are for watching and taking over an agent. pi-famulus is for the main agent: it is woken when a subagent overruns its budget, asks for a decision or finishes, so it never has to watch a pane to know work is done. A subagent that stalls is retried on its own, and the parent hears the outcome.
+
 ## Quick Start
 
 > **Before you install**: pi-famulus registers the tools `bash` (replacing the built-in), `subagent`, `monitor`, `agent_message`, `task_list`, `task_output` and `task_stop`, and the commands `/tasks`, `/famulus` and `/reply`. In pi 1.0.0, when two extensions register the same tool name, the extension loaded first keeps it, and the other one's tool is hidden.
