@@ -31,6 +31,9 @@ mod task;
 mod top;
 mod workkind;
 
+#[cfg(test)]
+mod fs_permissions;
+
 use cli::{Cli, Sub};
 
 /// Package version plus the commit it was built from ("0.1.0+066598ae00"):
