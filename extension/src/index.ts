@@ -113,7 +113,8 @@ export function readPreview(outputPath: string | undefined, maxChars: number): s
   return tail.text.length <= maxChars ? tail.text : tail.text.slice(-maxChars);
 }
 
-function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
+/** Map a manager exit event to the background-wake status. Exported for tests. */
+export function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
   // The manager died without shutting down; its runner took the task down.
   if (event.end_reason === "manager-crash") return "orphaned";
   if (event.signal) return "killed";
