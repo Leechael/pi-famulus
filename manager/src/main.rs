@@ -22,6 +22,7 @@ mod pager;
 mod proto;
 mod registry;
 mod runner;
+mod shellstart;
 mod stats;
 mod sys;
 mod task;

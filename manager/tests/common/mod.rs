@@ -1539,7 +1539,12 @@ pub fn pids_in(text: &str) -> Vec<u32> {
 
 /// Poll a task's output until it contains at least `n` integers (pids).
 pub fn wait_for_pids(c: &mut Conn, task_id: &str, n: usize) -> Vec<u32> {
-    poll_until(Duration::from_secs(5), || {
+    wait_for_pids_for(c, task_id, n, Duration::from_secs(5))
+}
+
+/// Like `wait_for_pids`, with an explicit deadline.
+pub fn wait_for_pids_for(c: &mut Conn, task_id: &str, n: usize, timeout: Duration) -> Vec<u32> {
+    poll_until(timeout, || {
         let r = c.request_ok(json!({"type":"output","task_id":task_id,"cursor":0,"max_bytes":65536}));
         let p = pids_in(r["chunk"].as_str().unwrap_or(""));
         if p.len() >= n {

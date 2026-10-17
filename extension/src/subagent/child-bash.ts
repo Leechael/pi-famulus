@@ -32,6 +32,7 @@ import {
   bareSleepError,
   collectOutput,
   formatFinishedOutput,
+  exitedStatus,
   killedStatus,
   timedOutStatus,
   SHELL_MAX_BYTES,
@@ -172,7 +173,7 @@ export function createChildBashTool(
         const { text, details } = formatFinishedOutput(collected, outputPath);
         const exitCode = waitResult.exit_code ?? null;
         if (exitCode !== 0 && exitCode !== null) {
-          throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
+          throw new Error(appendStatus(text, await exitedStatus(client, start.task_id, exitCode)));
         }
         // No exit code: killed (timeout, stop, crash), unless the manager
         // finished it as completed with its runner status unobservable.

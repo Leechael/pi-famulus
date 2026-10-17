@@ -302,6 +302,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       status: toExitStatus(event),
       exitCode: event.exit_code ?? null,
       ...(typeof event.signal === "string" && event.signal ? { signal: event.signal } : {}),
+      ...(event.end_reason ? { endReason: event.end_reason } : {}),
       durationMs: event.duration_ms ?? 0,
       outputPath: event.output_path ?? "",
       preview: readPreview(event.output_path, 4000),

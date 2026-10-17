@@ -495,10 +495,17 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("child stdin pipe missing"))?;
-    tokio::spawn(async move {
+    let release = async move {
         let _ = stdin.write_all(gate.as_bytes()).await;
         let _ = stdin.shutdown().await;
-    });
+    };
+    if crate::sys::task_shell().kind == crate::sys::ShellKind::Posix {
+        // Concurrent Git Bash cold starts race in the MSYS runtime (see
+        // `shellstart`): start posix shells one at a time.
+        tokio::spawn(crate::shellstart::serialize::start(pid, release));
+    } else {
+        tokio::spawn(release);
+    }
     let status = tokio::fs::File::from_std(std::fs::File::from(status_read));
     let stdout = child
         .stdout

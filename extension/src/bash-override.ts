@@ -35,6 +35,7 @@ import {
   collectOutput,
   formatFinishedOutput,
   killedBy,
+  exitedStatus,
   killedStatus,
   timedOutStatus,
   SHELL_MAX_BYTES,
@@ -446,7 +447,7 @@ export function createBashOverride(
         // Mirror the built-in bash tool: non-zero exits resolve to an isError
         // result carrying structuredContent instead of rejecting.
         return {
-          content: [{ type: "text", text: appendStatus(text, `Command exited with code ${exitCode}`) }],
+          content: [{ type: "text", text: appendStatus(text, await exitedStatus(client, start.task_id, exitCode)) }],
           details,
           structuredContent,
           isError: true,

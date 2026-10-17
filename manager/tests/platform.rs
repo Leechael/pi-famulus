@@ -55,6 +55,7 @@ fn main() {
         ("q1_quoted_arguments_reach_the_program", q1_quoted_arguments_reach_the_program),
         ("q2_commands_run_in_a_posix_shell", q2_commands_run_in_a_posix_shell),
         ("x1_concurrent_starts_and_stops_finish_promptly", x1_concurrent_starts_and_stops_finish_promptly),
+        ("x2_concurrent_shell_starts_all_run", x2_concurrent_shell_starts_all_run),
         ("d1_concurrent_clients_spawn_one_daemon", d1_concurrent_clients_spawn_one_daemon),
         ("d3_concurrent_daemons_leave_one_survivor", d3_concurrent_daemons_leave_one_survivor),
         ("d5_last_client_crash_idles_out_and_kills_tasks", d5_last_client_crash_idles_out_and_kills_tasks),
@@ -278,14 +279,24 @@ fn t3_timeout_ms_hard_kill() {
     let home = Home::new("w-t3");
     let _d = home.start_daemon();
     let mut c = ext(&home, "sess-a");
-    let mut slow = start_req(&kit(&["tree", "60000"]));
-    slow["timeout_ms"] = json!(500);
+    let mut slow = start_req(&kit(&["tree", "120000"]));
+    // timeout_ms starts when the runner is spawned, before its gate opens.
+    // On Windows, shell starts take turns (`Local\pi-famulus-shell-start`),
+    // and the concurrent 24-shell test can queue many 500ms builtin starts
+    // ahead of this one. The ceiling has to outlast that queue; the pid
+    // wait and the terminal wait have to outlast the ceiling.
+    let (timeout_ms, pid_wait, kill_wait) = if cfg!(windows) {
+        (45_000_u64, Duration::from_secs(40), S(70))
+    } else {
+        (3_000, Duration::from_secs(5), S(8))
+    };
+    slow["timeout_ms"] = json!(timeout_ms);
     let (slow, _) = c.start_with(slow);
-    let pids = wait_for_pids(&mut c, &slow, 2);
+    let pids = wait_for_pids_for(&mut c, &slow, 2, pid_wait);
     let mut fast = start_req(&kit(&["echo", "ok"]));
     fast["timeout_ms"] = json!(10_000);
     let (fast, _) = c.start_with(fast);
-    let t = c.wait_terminal(&slow, S(8)).expect("timeout must kill");
+    let t = c.wait_terminal(&slow, kill_wait).expect("timeout must kill");
     assert_eq!((t["status"].as_str(), t["end_reason"].as_str()), (Some("killed"), Some("timeout")), "{t}");
     assert!(poll_true(S(5), || pids.iter().all(|p| !pid_running(*p))), "timeout left {pids:?} running");
     let f = c.wait_terminal(&fast, S(8)).unwrap();
@@ -668,6 +679,63 @@ fn x1_concurrent_starts_and_stops_finish_promptly() {
         } else {
             assert!(pids.iter().all(|p| pid_running(*p)), "{id}: a bystander task died: {pids:?}");
         }
+    }
+}
+
+/// Many shell tasks started at once all run their command. On Windows this
+/// is the Git Bash start-up race (git-for-windows/git#6368): unserialized,
+/// concurrent MSYS cold starts crash (0xC0000005, `add_item ... failed`) or
+/// hang with no output, as on PR #75's win32-arm64 run. Deliberately no
+/// long-lived MSYS process is kept around here: it would hide the race this
+/// test exists to catch.
+fn x2_concurrent_shell_starts_all_run() {
+    let home = Home::new("w-x2");
+    let _d = home.start_daemon();
+    let scope = test_scope();
+    let argv = kit(&["argv", "ran"]);
+    let ended: Vec<(String, Value, String, usize)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..4)
+            .map(|t| {
+                let (home, argv) = (&home, &argv);
+                s.spawn(move || {
+                    enter_test_scope(scope);
+                    let mut c = ext(home, &format!("sess-x2-{t}"));
+                    // Builtins only, and one that runs a program.
+                    let ids: Vec<(String, usize)> = (0..6)
+                        .map(|i| {
+                            let n = t * 6 + i;
+                            let cmd = if i % 2 == 0 {
+                                format!("echo start_{n}; echo done_$(({n} + 1))")
+                            } else {
+                                format!("echo start_{n}; {argv}")
+                            };
+                            (c.start(&cmd).0, n)
+                        })
+                        .collect();
+                    ids.into_iter()
+                        .map(|(id, n)| {
+                            let rec = c.wait_terminal(&id, S(60)).unwrap_or_else(|| panic!("{id} did not finish"));
+                            let out = lf(&output_of(&mut c, &id));
+                            (id, rec, out, n)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(ended.len(), 24);
+    for (id, rec, out, n) in &ended {
+        let want = if n % 6 % 2 == 0 {
+            format!("start_{n}\ndone_{}\n", n + 1)
+        } else {
+            format!("start_{n}\nran\n")
+        };
+        assert_eq!(
+            (rec["exit_code"].as_i64(), rec["end_reason"].as_str(), out.as_str()),
+            (Some(0), Some("exited"), want.as_str()),
+            "{id}: {rec}"
+        );
     }
 }
 
