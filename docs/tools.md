@@ -86,6 +86,6 @@ Requires pi 1.0.0 or newer. CI checks 1.0.0, 1.0.4, and the latest published ver
 | `/famulus` | Show the `pi-famulus` binary path (and its `--version`), the running manager's version and pid, and the extension version |
 | Transcript rows | A backgrounded bash call is one row that updates when the command finishes |
 | Notification pills | One line per wake, with the same status glyphs as `/tasks` and `top` (● running, ✓ done, ✗ failed, ■ stopped or timed out), plus › monitor event, ! overrun, ? decision request, ↑ supervisor update. Ctrl+O expands labelled fields; the XML envelope is model-facing only |
-| Status glyphs | Shared by `top`, `/tasks`, tool rows, pills, and the fleet line: running ● green, pending ○ dim, completed ✓ green, failed / killed / interrupted ✗ red, stopped / timeout / partial ■ amber |
+| Status glyphs | Shared by `top`, `/tasks`, tool rows, pills, and the fleet line: running ● green, pending ○ dim, completed ✓ green, failed / killed / orphaned / interrupted ✗ red, stopped / timeout / partial ■ amber |
 
 Print mode (`pi -p`) skips widgets; notifications still inject as before.
