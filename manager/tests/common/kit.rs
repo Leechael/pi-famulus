@@ -91,6 +91,8 @@ fn run_tests(tests: &[(&'static str, TestFn)], args: &[String]) -> i32 {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, selected.len().max(1));
     println!("\nrunning {} tests", selected.len());
+    // Hold the MSYS runtime's shared state for the whole run (see MsysKeeper).
+    let _msys = MsysKeeper::start();
     let next = AtomicUsize::new(0);
     let failed = Mutex::new(Vec::new());
     let started = Instant::now();
@@ -206,4 +208,97 @@ pub fn taskkit(args: &[String]) -> i32 {
     }
     let _ = out.flush();
     0
+}
+
+/// Keeps one MSYS process (Git Bash) alive while the tests run.
+///
+/// Every MSYS process maps a per-user shared memory section at startup; the
+/// first one to map it builds the mount table. When many `bash.exe` cold
+/// starts race to build it (the tests start shell tasks from every test
+/// thread), a loser can spin for ~15s and die with
+/// `fatal error - add_item ("\??\C:\Program Files\Git", "/", ...) failed,
+/// errno 1`, or crash with STATUS_ACCESS_VIOLATION; while new starts keep
+/// coming the section stays poisoned and every later bash hangs the same way
+/// (git-for-windows/git#6368). One long-lived MSYS process that has finished
+/// starting owns the section, so later starts only open it and never rebuild
+/// it.
+///
+/// It exits by itself when its stdin closes: force-killing MSYS processes is
+/// itself one of the ways to poison that state.
+struct MsysKeeper {
+    #[cfg(windows)]
+    child: Option<std::process::Child>,
+}
+
+impl MsysKeeper {
+    #[cfg(not(windows))]
+    fn start() -> Self {
+        MsysKeeper {}
+    }
+
+    #[cfg(windows)]
+    fn start() -> Self {
+        use std::io::{BufRead, BufReader};
+        // Same resolution the daemon uses for task shells.
+        let shell = pi_famulus_task_shell();
+        let Some(bash) = shell else { return MsysKeeper { child: None } };
+        let child = Command::new(&bash)
+            .args(["-c", "echo ready; read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { return MsysKeeper { child: None } };
+        // "ready" means the runtime finished initializing its shared state.
+        let mut line = String::new();
+        if let Some(out) = child.stdout.take() {
+            let _ = BufReader::new(out).read_line(&mut line);
+        }
+        if line.trim() != "ready" {
+            eprintln!("warning: MSYS keeper did not start ({bash:?}); shell tasks may race");
+        }
+        MsysKeeper { child: Some(child) }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MsysKeeper {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            drop(child.stdin.take()); // EOF ends `read`; bash exits on its own.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// The POSIX shell the daemon runs tasks in on Windows, mirroring
+/// `sys::windows::resolve_task_shell`; None when tasks would use `cmd.exe`.
+#[cfg(windows)]
+fn pi_famulus_task_shell() -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    if let Some(s) = std::env::var_os("PI_FAMULUS_SHELL").filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(s);
+        let cmd = p.file_stem().map(|s| s.to_string_lossy().eq_ignore_ascii_case("cmd")).unwrap_or(false);
+        return if cmd { None } else { Some(p) };
+    }
+    for root in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(dir) = std::env::var_os(root) {
+            let bash = Path::new(&dir).join("Git").join("bin").join("bash.exe");
+            if bash.is_file() {
+                return Some(bash);
+            }
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join("bash.exe")).find(|b| {
+        let lower = b.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+        let wsl = lower.ends_with("\\system32\\bash.exe") || lower.ends_with("\\sysnative\\bash.exe");
+        !wsl && b.is_file()
+    })
 }

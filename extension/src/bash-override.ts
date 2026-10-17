@@ -13,10 +13,7 @@
  * ({ truncation?, fullOutputPath? }); extension fields are added alongside.
  */
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { BoundedOutput } from "./bounded-output";
 import { Type, type Static } from "typebox";
 import {
   getShellConfig,
@@ -177,7 +174,13 @@ async function executeLocal(
   }
   const viaStdin = shell.commandTransport === "stdin";
 
-  const output = await new Promise<{ text: string; exitCode: number | null; signal: string | null; timedOut: boolean; aborted: boolean }>(
+  const collector = new BoundedOutput({
+    maxBytes: MAX_BYTES,
+    maxLines: MAX_LINES,
+    // structuredOutput() keeps up to this much tail.
+    tailBytes: STRUCTURED_OUTPUT_MAX_BYTES,
+  });
+  const output = await new Promise<{ exitCode: number | null; signal: string | null; timedOut: boolean; aborted: boolean }>(
     (resolve, reject) => {
       const child = spawn(shell.shell, viaStdin ? shell.args : [...shell.args, params.command], {
         cwd: ctx.cwd,
@@ -190,7 +193,6 @@ async function executeLocal(
         child.stdin?.on("error", () => {});
         child.stdin?.end(params.command);
       }
-      const chunks: Buffer[] = [];
       let settled = false;
       let timedOut = false;
       let aborted = false;
@@ -200,7 +202,7 @@ async function executeLocal(
         settled = true;
         if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
-        resolve({ text: Buffer.concat(chunks).toString("utf8"), exitCode, signal: killSignal, timedOut, aborted });
+        resolve({ exitCode, signal: killSignal, timedOut, aborted });
       };
       const kill = () => {
         try {
@@ -222,8 +224,7 @@ async function executeLocal(
           : null;
       if (timer !== null) clock.unref?.(timer);
       signal?.addEventListener("abort", onAbort, { once: true });
-      child.stdout?.on("data", (d: Buffer) => chunks.push(d));
-      child.stderr?.on("data", (d: Buffer) => chunks.push(d));
+      collector.attach(child.stdout, child.stderr);
       child.on("error", (err) => {
         if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
@@ -236,21 +237,22 @@ async function executeLocal(
     },
   );
 
-  const t = truncateTail(output.text, MAX_LINES, MAX_BYTES);
+  const collected = await collector.finish();
+  const t = truncateTail(collected.text, MAX_LINES, MAX_BYTES);
+  const totalLines = collected.totalLines;
   let text = t.text || "(no output)";
   let details: FamulusBashDetails | undefined;
-  if (t.truncated) {
-    const fullOutputPath = join(tmpdir(), `pi-famulus-bash-${randomUUID()}.log`);
-    writeFileSync(fullOutputPath, output.text, "utf8");
+  if (t.truncated || collected.headDropped) {
+    const fullOutputPath = collected.fullOutputPath;
     const outputLines = t.text.length === 0 ? 0 : t.text.split("\n").length;
-    const startLine = t.totalLines - outputLines + 1;
+    const startLine = totalLines - outputLines + 1;
     details = {
       truncation: {
         content: t.text,
         truncated: true,
-        truncatedBy: t.totalLines > MAX_LINES ? "lines" : "bytes",
-        totalLines: t.totalLines,
-        totalBytes: t.totalBytes,
+        truncatedBy: totalLines > MAX_LINES ? "lines" : "bytes",
+        totalLines,
+        totalBytes: collected.totalBytes,
         outputLines,
         outputBytes: Buffer.byteLength(t.text, "utf8"),
         lastLinePartial: false,
@@ -260,7 +262,9 @@ async function executeLocal(
       },
       fullOutputPath,
     };
-    text += `\n\n[Showing lines ${startLine}-${t.totalLines} of ${t.totalLines}. Full output: ${fullOutputPath}]`;
+    text += fullOutputPath
+      ? `\n\n[Showing lines ${startLine}-${totalLines} of ${totalLines}. Full output: ${fullOutputPath}]`
+      : `\n\n[Showing lines ${startLine}-${totalLines} of ${totalLines}. Full output unavailable]`;
   }
 
   if (output.aborted) throw new Error(appendStatus(text, "Command aborted"));
@@ -268,10 +272,10 @@ async function executeLocal(
     throw new Error(appendStatus(text, timedOutStatus(params.timeout)));
   }
   if (output.exitCode === null) throw new Error(appendStatus(text, killedBy(output.signal)));
-  const { output: structuredText, truncated: structuredTruncated } = structuredOutput(output.text);
+  const { output: structuredText, truncated: structuredTruncated } = structuredOutput(collected.text);
   const structuredContent: BashToolOutput = {
     output: structuredText,
-    truncated: structuredTruncated,
+    truncated: structuredTruncated || collected.headDropped,
     ...(details?.fullOutputPath ? { full_output_path: details.fullOutputPath } : {}),
     exit_code: output.exitCode,
     wall_time_seconds: wallSeconds(startedAtMs, clock.now()),
