@@ -42,19 +42,29 @@ export interface Query {
   fold: boolean;
 }
 
+/** Lower-case that keeps every index in place (`İ` would grow under toLowerCase). */
+function foldCase(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const lower = ch.toLowerCase();
+    out += lower.length === ch.length ? lower : ch;
+  }
+  return out;
+}
+
 export function parseQuery(query: string): Query | null {
   const fold = !/[A-Z]/.test(query);
   const terms = query
     .split("|")
     .map((term) => term.trim())
     .filter((term) => term.length > 0)
-    .map((term) => (fold ? term.toLowerCase() : term));
+    .map((term) => (fold ? foldCase(term) : term));
   return terms.length > 0 ? { terms, fold } : null;
 }
 
 /** Merged [start, end) ranges of every match, left to right. */
 export function matchRanges(line: string, query: Query): Array<[number, number]> {
-  const hay = query.fold ? line.toLowerCase() : line;
+  const hay = query.fold ? foldCase(line) : line;
   const found: Array<[number, number]> = [];
   for (const term of query.terms) {
     let from = 0;
@@ -106,9 +116,17 @@ export interface LogLayout {
   total: number;
 }
 
-/** Placeholder bodies such as "(no output yet)". */
+/** Bodies that stand in for output; real output such as `(done)` is searched. */
+const PLACEHOLDERS = new Set([
+  "(no output path)",
+  "(no output yet)",
+  "(no output; the command printed nothing)",
+  "(nothing on stderr yet)",
+  "(nothing on stderr)",
+]);
+
 function isPlaceholder(text: string): boolean {
-  return /^\([^\n]*\)$/.test(text.trim());
+  return PLACEHOLDERS.has(text.trim());
 }
 
 export function layoutLog(text: string, width: number, view: LogView, theme: TaskTheme, currentRow = -1): LogLayout {
@@ -145,7 +163,10 @@ function clockOf(ms: number): string {
 
 function tilde(path: string): string {
   const home = process.env.HOME;
-  return home && path.startsWith(home) ? `~${path.slice(home.length)}` : path;
+  if (!home || !path.startsWith(home)) return path;
+  const rest = path.slice(home.length);
+  // `/home/alice2` is not under `/home/alice`.
+  return rest === "" || rest[0] === "/" || rest[0] === "\\" ? `~${rest}` : path;
 }
 
 /** Pinned panel: state and outcome, the command, and where it runs. */
@@ -213,6 +234,8 @@ export async function showTaskDetail(ui: ExtensionUIContext, options: TaskDetail
       let stream: TaskStream = "output";
       const view: LogView = { query: "", editing: false, filter: false, showBlank: false };
       let follow = true;
+      // `f` at the end must not re-follow on the next render; scrolling clears it.
+      let held = false;
       let scroll = 0;
       let current = 0;
       let matches: number[] = [];
@@ -260,10 +283,10 @@ export async function showTaskDetail(ui: ExtensionUIContext, options: TaskDetail
         }
         seek = false;
         current = Math.min(current, Math.max(0, matches.length - 1));
-        if (follow || scroll >= max) {
+        if (follow || (!held && scroll >= max)) {
           scroll = max;
           follow = true;
-        }
+        } else scroll = Math.min(scroll, max);
         const dim = (s: string) => theme.fg("dim", s);
         const live = item.status === "running" || item.status === "pending";
         const pill = positionPill(theme, follow, live, laid.lines.length, height, scroll);
@@ -326,6 +349,7 @@ export async function showTaskDetail(ui: ExtensionUIContext, options: TaskDetail
           const move = (next: number) => {
             scroll = Math.max(0, next);
             follow = false;
+            held = false;
             tui.requestRender();
           };
           if (matchesKey(data, "escape")) {
@@ -349,7 +373,10 @@ export async function showTaskDetail(ui: ExtensionUIContext, options: TaskDetail
           else if (data === "n") jump(true);
           else if (data === "N") jump(false);
           else if (data === "b") view.showBlank = !view.showBlank;
-          else if (data === "f" || data === "F") follow = !follow;
+          else if (data === "f" || data === "F") {
+            follow = !follow;
+            held = !follow;
+          }
           else if (matchesKey(data, "up") || data === "k") return move(scroll - 1);
           else if (matchesKey(data, "down") || data === "j") return move(scroll + 1);
           else if (matchesKey(data, "pageUp")) return move(scroll - Math.max(1, lastHeight - 1));
@@ -363,6 +390,7 @@ export async function showTaskDetail(ui: ExtensionUIContext, options: TaskDetail
           if (event.type === "wheel" && event.wheelDelta) {
             scroll = Math.max(0, scroll + event.wheelDelta);
             follow = false;
+            held = false;
             return { handled: true };
           }
           if (event.type === "click" && event.y === tabY && event.x !== undefined) {

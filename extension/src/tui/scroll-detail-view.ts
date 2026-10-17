@@ -175,6 +175,8 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
       const tabKeys = () => visibleDetailTabs(options.tabs);
       let tab: AgentDetailTab = tabKeys()[0] ?? "conversation";
       let follow = true;
+      // `f` at the end must not re-follow on the next render; scrolling clears it.
+      let held = false;
       let expanded = false;
       let scroll = 0;
       let timer: ClockTimer | null = null;
@@ -210,10 +212,10 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
           lastHeight = height;
           const lines = paneLines(pane(), Math.max(1, width - 1), theme, expanded);
           const max = Math.max(0, lines.length - height);
-          if (follow || scroll >= max) {
+          if (follow || (!held && scroll >= max)) {
             scroll = max;
             follow = true;
-          }
+          } else scroll = Math.min(scroll, max);
           const head = spread(
             `${theme.fg("accent", "◆")} ${theme.bold(options.title)}`,
             positionPill(theme, follow, live(), lines.length, height, scroll),
@@ -238,6 +240,7 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
           const move = (next: number) => {
             scroll = Math.max(0, next);
             follow = false;
+            held = false;
             tui.requestRender();
           };
           if (matchesKey(data, "escape") || data === "q") {
@@ -249,7 +252,10 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
           if (keys.length > 0 && (matchesKey(data, "tab") || data === "\t")) setTab(keys[(keys.indexOf(tab) + 1) % keys.length]);
           else if (shortcut >= 0 && shortcut < keys.length) setTab(keys[shortcut]);
           else if ((data === "o" || data === "O") && foldable()) expanded = !expanded;
-          else if (data === "f" || data === "F") follow = !follow;
+          else if (data === "f" || data === "F") {
+            follow = !follow;
+            held = !follow;
+          }
           else if (matchesKey(data, "up") || data === "k") return move(scroll - 1);
           else if (matchesKey(data, "down") || data === "j") return move(scroll + 1);
           else if (matchesKey(data, "pageUp")) return move(scroll - Math.max(1, lastHeight - 1));
@@ -263,6 +269,7 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
           if (event.type === "wheel" && event.wheelDelta) {
             scroll = Math.max(0, scroll + event.wheelDelta);
             follow = false;
+            held = false;
             return { handled: true };
           }
           if (event.type === "click" && event.y === 1 && event.x !== undefined) {

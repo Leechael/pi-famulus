@@ -592,7 +592,9 @@ export function createMonitorTool(
           context.invalidate?.();
         });
       }
-      const status = context.isError ? "failed" : item?.status ?? (taskId ? "running" : "completed");
+      // Live monitors are indexed before this renders, so a missing row is a
+      // finished one that was pruned or predates a reload.
+      const status = context.isError ? "failed" : item?.status ?? (taskId && !index ? "running" : "completed");
       const { color, glyph } = statusGlyph(status, context.isError);
       const line = `${theme.fg(color as "error", glyph)} ${firstLine}${expanded ? "" : theme.fg("dim", " · /tasks")}`;
       return toolComponent([line]) as never;

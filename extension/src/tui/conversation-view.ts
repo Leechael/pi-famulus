@@ -104,7 +104,8 @@ export function callPreview(name: string, args: string | undefined, theme: ChatT
   if (name === "write") {
     const content = jsonStrings(args, "content")[0];
     if (!content) return undefined;
-    const lines = content.value.replace(/\n$/, "").split("\n");
+    const text = content.value.replace(/\n$/, "");
+    const lines = text === "" ? [] : text.split("\n");
     const digits = String(lines.length).length;
     const count = content.closed ? `+${lines.length} line${lines.length === 1 ? "" : "s"}` : `+${lines.length}+ lines`;
     return {
@@ -304,7 +305,7 @@ export function renderConversation(
     const glyph = pending
       ? theme.fg("accent", "● ")
       : result.error ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
-    const summary = call.summary ? theme.fg("muted", `  ${call.summary}`) : "";
+    const summary = call.summary ? theme.fg("muted", `  ${scrubTty(call.summary)}`) : "";
     // The stat sits on the right so a long path truncates, not the stat.
     const tail = [preview?.stat, pending ? theme.fg("dim", "running") : ""].filter(Boolean).join("  ");
     out.push(padBetween(MARGIN + chevron(options.expanded, foldable) + glyph + theme.bold(call.name) + summary, tail, w));
@@ -316,15 +317,17 @@ export function renderConversation(
       let shown = 0;
       let rows = 0;
       for (const row of preview.rows) {
-        if (rows >= PREVIEW_ROWS) break;
         const gutterColor = /^\s*\d+ $/.test(row.gutter) ? "dim" : row.color;
-        fitLines(scrubTty(row.text), inner).forEach((seg, j) => {
-          if (rows >= PREVIEW_ROWS) return;
+        const segs = fitLines(scrubTty(row.text), inner);
+        const room = PREVIEW_ROWS - rows;
+        segs.slice(0, room).forEach((seg, j) => {
           // Headers (no gutter) sit flush; gutters align under each other.
           const g = row.gutter === "" ? "" : j === 0 ? row.gutter.padStart(gw) : " ".repeat(gw);
           out.push(MARGIN + rule + theme.fg(gutterColor, g) + theme.fg(row.color, seg));
-          rows++;
         });
+        rows += Math.min(room, segs.length);
+        // A line the cap cut part-way through counts as not shown.
+        if (segs.length > room) break;
         shown++;
       }
       const more = preview.rows.length - shown;
@@ -342,7 +345,7 @@ export function renderConversation(
       begin("user");
       const rail = theme.fg("accent", "┃ ");
       out.push(rail + theme.bold(theme.fg("accent", "main")) + theme.fg("dim", ` → ${agent}`));
-      for (const line of fitLines(turn.text.trim() || " ", w - 2)) out.push(rail + line);
+      for (const line of fitLines(scrubTty(turn.text).trim() || " ", w - 2)) out.push(rail + line);
       continue;
     }
     if (turn.role === "thinking") {
@@ -360,25 +363,33 @@ export function renderConversation(
     }
     if (turn.role === "assistant error") {
       begin("text");
-      fitLines(turn.text.trim(), w - MARGIN.length - 2).forEach((line, j) => {
+      fitLines(scrubTty(turn.text).trim(), w - MARGIN.length - 2).forEach((line, j) => {
         out.push(MARGIN + (j === 0 ? theme.fg("error", "✗ ") : "  ") + theme.fg("error", line));
       });
       continue;
     }
     const call = parseToolCall(turn.text);
     if (call) {
-      const next = turns[i + 1];
-      const paired = next ? toolResult(next) : undefined;
-      if (next && paired && paired.name === call.name) {
-        toolRow(call, { text: next.text, error: paired.error });
-        i++;
-      } else {
-        toolRow(call, undefined);
+      // Parallel calls arrive as a run of calls, then a run of results in
+      // call order: pair them by name, first unused result first.
+      const calls = [call];
+      let j = i + 1;
+      for (let c: ToolCall | undefined; j < turns.length && !toolResult(turns[j]) && (c = parseToolCall(turns[j].text)); j++) calls.push(c);
+      const results: Array<{ name: string; error: boolean; text: string; used: boolean }> = [];
+      for (let r; j < turns.length && (r = toolResult(turns[j])); j++) results.push({ ...r, text: turns[j].text, used: false });
+      for (const c of calls) {
+        const hit = results.find((r) => !r.used && r.name === c.name);
+        if (hit) hit.used = true;
+        toolRow(c, hit && { text: hit.text, error: hit.error });
       }
+      // A result with no matching call (its call scrolled out of the snapshot).
+      for (const r of results) if (!r.used) toolRow({ name: r.name, summary: "" }, r);
+      i = j - 1;
       continue;
     }
     begin("text");
-    out.push(...markdown(turn.text.trim(), w, theme));
+    // Child transcript text is untrusted: no escape sequence reaches the terminal.
+    out.push(...markdown(scrubTty(turn.text).trim(), w, theme));
   }
   return out.map((line) => (visibleWidth(line) > w ? truncateToWidth(line, w, "…") : line));
 }

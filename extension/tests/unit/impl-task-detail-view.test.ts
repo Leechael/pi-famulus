@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { infoCard, layoutLog, matchRanges, parseQuery, type LogView, type TaskTheme } from "../../src/tui/task-detail-view";
-import { fitKeys, spread, tabRow } from "../../src/tui/scroll-detail-view";
+import { fitKeys, showScrollDetail, spread, tabRow } from "../../src/tui/scroll-detail-view";
 import { visibleWidth } from "../../src/tui/pi-tui-load";
 import type { WorkItem } from "../../src/work-index";
 
@@ -55,6 +55,17 @@ describe("task output search", () => {
   it("shows placeholder bodies dimmed and unsearched", () => {
     expect(layoutLog("(no output yet)", 80, view({ query: "out", filter: true }), tagged).lines).toEqual([" <dim>(no output yet)</dim>"]);
   });
+
+  it("searches real output that happens to be parenthesised", () => {
+    expect(layoutLog("(done)", 80, view({ query: "zzz", filter: true }), plain).lines).toEqual([" (no line matches)"]);
+    expect(layoutLog("(\x1b[31mdone\x1b[0m)", 80, view(), plain).lines).toEqual([" (done)"]);
+  });
+
+  it("keeps highlight ranges on the matched text when folding changes length", () => {
+    const line = "İstanbul error";
+    const [[start, end]] = matchRanges(line, parseQuery("error")!);
+    expect(line.slice(start, end)).toBe("error");
+  });
 });
 
 describe("task detail chrome", () => {
@@ -82,6 +93,17 @@ describe("task detail chrome", () => {
     for (const line of infoCard(item, 10_000, plain, 40)) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
   });
 
+  it("shortens only paths under HOME to ~", () => {
+    const home = process.env.HOME;
+    process.env.HOME = "/home/alice";
+    try {
+      expect(infoCard({ ...item, cwd: "/home/alice/proj" }, 10_000, plain, 120)[2]).toContain("cwd ~/proj");
+      expect(infoCard({ ...item, cwd: "/home/alice2/proj" }, 10_000, plain, 120)[2]).toContain("cwd /home/alice2/proj");
+    } finally {
+      process.env.HOME = home;
+    }
+  });
+
   it("cuts stream tabs into a rule and reports their click ranges", () => {
     const row = tabRow(["output", "stderr"], "stderr", "3 lines", plain, 60);
     expect(row.line.startsWith("─┐¹output┌┐²stderr┌")).toBe(true);
@@ -107,5 +129,26 @@ describe("shared detail chrome", () => {
     expect(narrow).toContain("esc close");
     expect(narrow).toContain("/ search");
     expect(narrow).not.toContain("show blank");
+  });
+});
+
+describe("follow toggle", () => {
+  it("stays unfollowed after `f` at the end, and new output does not pull it back", async () => {
+    let lines = Array.from({ length: 40 }, (_, i) => `line ${i}`);
+    let component: { render(w: number): string[]; handleInput(d: string): void } | undefined;
+    const ui = {
+      custom: (factory: Function) =>
+        new Promise<void>((resolve) => {
+          component = factory({ requestRender() {}, terminal: { rows: 20 } }, plain, {}, resolve);
+        }),
+    };
+    void showScrollDetail(ui as never, { title: "t", tabs: { result: () => lines.join("\n") }, live: () => true, pollMs: 0 });
+    expect(component!.render(60)[0]).toContain("following");
+    component!.handleInput("f");
+    const head = component!.render(60)[0];
+    expect(head).not.toContain("following");
+    lines = [...lines, ...Array.from({ length: 10 }, (_, i) => `more ${i}`)];
+    expect(component!.render(60)[0]).not.toContain("following");
+    expect(component!.render(60).join("\n")).not.toContain("more 9");
   });
 });

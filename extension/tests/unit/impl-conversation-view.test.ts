@@ -166,3 +166,44 @@ describe("write and edit calls", () => {
     expect(lines.join("\n")).toContain("Successfully replaced");
   });
 });
+
+describe("review fixes", () => {
+  it("pairs parallel calls with their own results, in order", () => {
+    const turns = turnsFromMessages([
+      { role: "assistant", content: [
+        { type: "toolCall", name: "read", arguments: { path: "a.ts" } },
+        { type: "toolCall", name: "bash", arguments: { command: "ls" } },
+        { type: "toolCall", name: "read", arguments: { path: "b.ts" } },
+      ] },
+      { role: "toolResult", toolName: "read", content: [{ type: "text", text: "AAA" }] },
+      { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "LS" }] },
+      { role: "toolResult", toolName: "read", content: [{ type: "text", text: "BBB" }] },
+    ] as never);
+    const out = renderConversation(turns, 80, plainTheme, { expanded: true }).map((l) => l.trim());
+    expect(out.join("\n")).not.toContain("running");
+    expect(out.indexOf("│ AAA")).toBe(out.findIndex((l) => l.includes("read  a.ts")) + 1);
+    expect(out.indexOf("│ LS")).toBe(out.findIndex((l) => l.includes("bash  ls")) + 1);
+    expect(out.indexOf("│ BBB")).toBe(out.findIndex((l) => l.includes("read  b.ts")) + 1);
+  });
+
+  it("keeps escape sequences in child prose away from the terminal", () => {
+    const out = renderConversation(
+      [{ role: "user", text: "hi \x1b]0;pwn\x07there" }, { role: "assistant", text: "ok \x1b[2Jdone" }],
+      80, plainTheme, { expanded: false },
+    ).join("\n");
+    expect(out).not.toContain("\x1b");
+    expect(out).toContain("ok done");
+  });
+
+  it("counts an empty write as zero lines", () => {
+    const out = renderConversation([{ role: "assistant", text: 'tool write {"path":"e.txt","content":""}' }], 80, plainTheme, { expanded: false }).join("\n");
+    expect(out).toContain("+0 lines");
+  });
+
+  it("notes a line the preview cap cut part-way through", () => {
+    const content = [...Array.from({ length: 59 }, (_, i) => `l${i}`), "x".repeat(200)].join("\n");
+    const text = `tool write ${JSON.stringify({ path: "w.txt", content })}`;
+    const out = renderConversation([{ role: "assistant", text }], 40, plainTheme, { expanded: true }).join("\n");
+    expect(out).toContain("… 1 more line");
+  });
+});
