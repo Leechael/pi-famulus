@@ -297,19 +297,35 @@ pub fn lock_named_mutex(name: &str, timeout_ms: u32) -> Option<NamedMutexGuard> 
 /// File name of `pid`'s executable (`bash.exe`), or None when it cannot be
 /// queried (gone, or access denied).
 pub fn image_name(pid: u32) -> Option<String> {
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() || h == INVALID_HANDLE_VALUE {
             return None;
         }
-        let mut buf = [0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        // A path longer than the first buffer must be retried. Failing the
+        // query makes start-up classification treat the process as already
+        // past the shell (`None` is "not the shell").
+        let mut cap = 1024usize;
+        let path = loop {
+            let mut buf = vec![0u16; cap];
+            let mut len = cap as u32;
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+            if ok != 0 {
+                break String::from_utf16_lossy(&buf[..len as usize]);
+            }
+            if windows_sys::Win32::Foundation::GetLastError() != ERROR_INSUFFICIENT_BUFFER {
+                CloseHandle(h);
+                return None;
+            }
+            let need = (len as usize).max(cap.saturating_mul(2)).saturating_add(1);
+            if need <= cap || need > 32_768 {
+                CloseHandle(h);
+                return None;
+            }
+            cap = need;
+        };
         CloseHandle(h);
-        if ok == 0 {
-            return None;
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
         Some(path.rsplit(['\\', '/']).next().unwrap_or("").to_string())
     }
 }

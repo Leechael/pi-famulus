@@ -7,8 +7,9 @@
 //! `fatal error - add_item ("\??\C:\Program Files\Git", "/", ...) failed, errno 1`
 //! or STATUS_ACCESS_VIOLATION (0xC0000005), and while new starts keep coming
 //! the section stays poisoned: later bash processes hang at start-up with no
-//! output (git-for-windows/git#6368, msys2/msys2-runtime#333). The user's
-//! command never ran in either case.
+//! output (git-for-windows/git#6368, msys2/msys2-runtime#333). A nested
+//! shell can print the same fatal text after the command has already had
+//! side effects, and a silent builtin-only command looks like the hang.
 //!
 //! This module holds the platform-independent classification; the daemon
 //! applies it on Windows only (`finalize_exit`, the start-up watchdog).
@@ -43,7 +44,8 @@ pub fn mentions_msys_startup_failure(output: &[u8]) -> bool {
     contains(output, b"add_item (") || contains(output, b"msys-2.0.dll")
 }
 
-/// Did the shell itself fail to start (so the command never ran)?
+/// Likely shell start-up crash: crash status, MSYS fatal text, and at most
+/// `MAX_STARTUP_FAILURE_OUTPUT` bytes. Not proof the command never ran.
 /// `output` is the task's merged output (or its tail), `output_size` its
 /// full size.
 pub fn is_startup_crash(exit_code: Option<i32>, output_size: u64, output: &[u8]) -> bool {
@@ -102,7 +104,9 @@ pub enum HangVerdict {
     Wait,
     /// Start-up is over (output, a real process, or the job is gone).
     Done,
-    /// No output and only the shell for `START_HANG_AFTER_MS`: kill it.
+    /// No output and only the shell for `START_HANG_AFTER_MS`. A silent
+    /// builtin-only command has no child process either, so this also kills
+    /// one that runs that long. Job membership cannot tell them apart.
     Hung,
 }
 
@@ -143,7 +147,10 @@ pub mod serialize {
     use super::{start_phase, StartPhase};
     use std::time::{Duration, Instant};
 
-    /// Per logon session, shared by every pi-famulus daemon of the user.
+    /// Per Windows logon session (`Local\`), shared by every pi-famulus
+    /// daemon in that session. Not across sessions of the same user: creating
+    /// a `Global\` mutex needs SeCreateGlobalPrivilege, which an interactive
+    /// process does not have.
     const START_LOCK: &str = "Local\\pi-famulus-shell-start";
     const START_LOCK_WAIT_MAX_MS: u32 = 30_000;
     /// Longest one start holds back the next.
@@ -171,10 +178,11 @@ pub mod serialize {
     ///
     /// The turn is a named mutex, not an in-process lock: the MSYS shared
     /// section is per user, so shells started by another pi-famulus daemon
-    /// (another `PI_FAMULUS_HOME`, a test suite running daemons in
-    /// parallel) race with ours just the same. Mutex ownership is per
-    /// thread, so one OS thread takes it, waits for this start to finish,
-    /// and releases it.
+    /// in this logon session (another `PI_FAMULUS_HOME`, a test suite
+    /// running daemons in parallel) race with ours just the same. The mutex
+    /// is `Local\` (this session only); see `START_LOCK`. Mutex ownership is
+    /// per thread, so one OS thread takes it, waits for this start to
+    /// finish, and releases it.
     pub async fn start(runner_pid: u32, release: impl std::future::Future<Output = ()>) {
         let (taken_tx, taken_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();

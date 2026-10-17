@@ -2,8 +2,9 @@
  * Windows Git Bash start-up race (git-for-windows/git#6368): the manager ends
  * a task whose shell crashed while starting as shell-start-failed, and one
  * whose shell hung while starting as shell-start-hung. Every place the model
- * hears about the task must say the command did not run, so it retries
- * instead of debugging "exit code -1073741819" (PR #75 CI, win32-arm64).
+ * hears about the task must say Git Bash may have failed to start, and that
+ * the command may have partially run, instead of "exit code -1073741819"
+ * (PR #75 CI, win32-arm64).
  */
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
@@ -34,7 +35,9 @@ function client(record: Partial<TaskRecord>, exitCode: number | null): ManagerCl
 describe("status lines", () => {
   it("a start-up crash on Windows says the shell failed to start", async () => {
     const text = await exitedStatus(client({ end_reason: "shell-start-failed" }, CRASH), "sh_1", CRASH, "win32");
-    expect(text).toMatch(/Git Bash failed to start \(Windows runtime race, not your command\).*Retry/);
+    expect(text).toMatch(/Windows runtime startup failure/);
+    expect(text).toMatch(/may have partially run/);
+    expect(text).toMatch(/Check for side effects before retrying/);
     expect(text).toContain(`exit code ${CRASH}`);
   });
 
@@ -47,7 +50,9 @@ describe("status lines", () => {
 
   it("a hung start-up kill says the shell hung, not 'killed'", async () => {
     const text = await killedStatus(client({ end_reason: "shell-start-hung" }, null), "sh_1", undefined);
-    expect(text).toMatch(/Git Bash hung while starting \(Windows runtime race, not your command\).*Retry/);
+    expect(text).toMatch(/only the shell process for 20s/);
+    expect(text).toMatch(/silent builtin-only command/);
+    expect(text).toMatch(/Check for side effects before retrying/);
   });
 });
 
@@ -64,7 +69,7 @@ describe("bash tools", () => {
       trackTask: vi.fn(),
       markNotifyOnExit: vi.fn(),
     });
-    await expect(tool.execute("tc", { command: "make" }, undefined, undefined, ctx)).rejects.toThrow(/Git Bash hung while starting/);
+    await expect(tool.execute("tc", { command: "make" }, undefined, undefined, ctx)).rejects.toThrow(/only the shell process for 20s/);
   });
 
   // A subagent's bash must fail too, so the subagent moves on and its slots
@@ -79,12 +84,12 @@ describe("bash tools", () => {
       childId: "ch_1",
       runId: "run_1",
     });
-    await expect(tool.execute("tc", { command: "make" }, undefined, undefined, ctx)).rejects.toThrow(/Git Bash hung while starting/);
+    await expect(tool.execute("tc", { command: "make" }, undefined, undefined, ctx)).rejects.toThrow(/only the shell process for 20s/);
   });
 });
 
 describe("wakes", () => {
-  it("a background task's exit wake says the command did not run", () => {
+  it("a background task's exit wake says the command may have partially run", () => {
     const info: TaskExitInfo = {
       taskId: "sh_1",
       kind: "shell",
@@ -97,7 +102,9 @@ describe("wakes", () => {
       endReason: "shell-start-failed",
     };
     const xml = formatTaskNotification([info]).content;
-    expect(xml).toMatch(/did not run\. Git Bash failed to start \(Windows runtime race, not your command\)/);
+    expect(xml).toMatch(/Windows runtime startup failure/);
+    expect(xml).toMatch(/may have partially run/);
+    expect(xml).not.toMatch(/did not run/);
   });
 
   it("a monitor's exit notice says Git Bash failed to start", async () => {
@@ -127,6 +134,6 @@ describe("wakes", () => {
       end_reason: "shell-start-failed",
     });
     center.settled();
-    expect(sent.map((m) => m.content).join("\n")).toMatch(/Git Bash failed to start \(Windows runtime race, not your command\)/);
+    expect(sent.map((m) => m.content).join("\n")).toMatch(/Windows runtime startup failure[\s\S]*may have partially run/);
   });
 });

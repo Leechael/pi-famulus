@@ -494,7 +494,6 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
     let mut stdin = child
         .stdin
         .take()
-<<<<<<< HEAD
         .ok_or_else(|| io::Error::other("child stdin pipe missing"))?;
     let release = async move {
         let _ = stdin.write_all(gate.as_bytes()).await;

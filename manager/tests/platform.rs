@@ -279,18 +279,24 @@ fn t3_timeout_ms_hard_kill() {
     let home = Home::new("w-t3");
     let _d = home.start_daemon();
     let mut c = ext(&home, "sess-a");
-    let mut slow = start_req(&kit(&["tree", "60000"]));
-    // Long enough for the tree to print its pids first: on Windows, shell
-    // starts wait their turn (Git Bash start-up race, see
-    // src/shellstart.rs), and with the suite's other daemons starting
-    // shells too, that wait counts against timeout_ms.
-    slow["timeout_ms"] = json!(3_000);
+    let mut slow = start_req(&kit(&["tree", "120000"]));
+    // timeout_ms starts when the runner is spawned, before its gate opens.
+    // On Windows, shell starts take turns (`Local\pi-famulus-shell-start`),
+    // and the concurrent 24-shell test can queue many 500ms builtin starts
+    // ahead of this one. The ceiling has to outlast that queue; the pid
+    // wait and the terminal wait have to outlast the ceiling.
+    let (timeout_ms, pid_wait, kill_wait) = if cfg!(windows) {
+        (45_000_u64, Duration::from_secs(40), S(70))
+    } else {
+        (3_000, Duration::from_secs(5), S(8))
+    };
+    slow["timeout_ms"] = json!(timeout_ms);
     let (slow, _) = c.start_with(slow);
-    let pids = wait_for_pids(&mut c, &slow, 2);
+    let pids = wait_for_pids_for(&mut c, &slow, 2, pid_wait);
     let mut fast = start_req(&kit(&["echo", "ok"]));
     fast["timeout_ms"] = json!(10_000);
     let (fast, _) = c.start_with(fast);
-    let t = c.wait_terminal(&slow, S(8)).expect("timeout must kill");
+    let t = c.wait_terminal(&slow, kill_wait).expect("timeout must kill");
     assert_eq!((t["status"].as_str(), t["end_reason"].as_str()), (Some("killed"), Some("timeout")), "{t}");
     assert!(poll_true(S(5), || pids.iter().all(|p| !pid_running(*p))), "timeout left {pids:?} running");
     let f = c.wait_terminal(&fast, S(8)).unwrap();

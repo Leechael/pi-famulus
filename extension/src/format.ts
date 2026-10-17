@@ -97,7 +97,7 @@ function displayCommand(command: string): string {
 
 function statusPhrase(info: TaskExitInfo): string {
   const startFailure = shellStartStatus(info.endReason);
-  if (startFailure) return `did not run. ${startFailure}`;
+  if (startFailure) return startFailure;
   const code = info.exitCode === null ? null : `exit code ${info.exitCode}`;
   switch (info.status) {
     case "completed":

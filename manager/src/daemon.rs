@@ -3262,9 +3262,11 @@ async fn read_status_line(
 ///
 /// The watch resumes from the entry (`exit_phase`, runner, status pipe,
 /// partial status line) and, when parked, puts all of it back there.
-/// Kill a task whose Git Bash never got past start-up (MSYS runtime race,
+/// Kill a task that still looks like Git Bash start-up (MSYS runtime race,
 /// see `shellstart`): no output and nothing but the shell in its job for
-/// `START_HANG_AFTER_MS`. Ends with the task's start-up; a daemon upgrade
+/// `START_HANG_AFTER_MS`. A silent builtin-only command is the same shape,
+/// so the watch can kill one; the job has no signal that the shell has
+/// begun the command. Ends with the task's start-up; a daemon upgrade
 /// drops it (the next daemon does not re-arm it).
 #[cfg(windows)]
 async fn watch_shell_start(state: Shared, tid: String, pid: u32) {
@@ -3550,9 +3552,9 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
                 .clone()
                 .unwrap_or_else(|| end_reason::EXITED.to_string()),
         );
-        // Git Bash crashed while starting (MSYS runtime race, see
-        // `shellstart`): the command never ran, so say so instead of
-        // reporting an ordinary failure.
+        // Likely Git Bash start-up crash (MSYS runtime race, see
+        // `shellstart`): crash status, MSYS marker, and a short tail.
+        // A nested shell can look the same after side effects.
         #[cfg(windows)]
         if entry.kill_reason.is_none() && crate::sys::task_shell().kind == crate::sys::ShellKind::Posix {
             let out = entry.output.lock().unwrap();
