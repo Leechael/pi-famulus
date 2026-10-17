@@ -41,15 +41,18 @@ mod unix {
     }
 
     fn temp_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        // macOS sun_path is 104 bytes. std::env::temp_dir() there is
+        // /var/folders/..., and manager.sock then exceeds SUN_LEN.
+        // Integration homes stay under the limit by using a short name;
+        // this probe's name does not, so the base itself is /tmp.
+        PathBuf::from("/tmp").join(format!(
             "pi-famulus-mode-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
-        dir
+        ))
     }
 
     fn record(home: &Path) -> TaskRecord {
