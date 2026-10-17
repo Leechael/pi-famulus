@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ManagerClient, ManagerEvent } from "../manager-client";
-import { resolvePiArgv } from "../pi-command";
+import { parentResourceArgs, resolvePiArgv } from "../pi-command";
 import { resolveChildModel, type PiRuntimeDeps } from "./pi-runtime";
 import type {
   ChildRunRequest,
@@ -51,16 +51,21 @@ export function createHostedSessionFn(deps: HostedSessionDeps): CreateSessionFn 
     mkdirSync(promptPath, { recursive: true });
     const promptFile = join(promptPath, `${req.childId}.md`);
     writeFileSync(promptFile, req.agent.systemPrompt);
+    const inherited = parentResourceArgs();
+    const extensionPaths = inherited.filter((_, i) => inherited[i - 1] === "-e");
+    const alreadyLoadsUs = extensionPaths.some((path) => path === deps.extensionEntry);
+    const trustInherited = inherited.some((arg) => arg === "-a" || arg === "--approve" || arg === "-na" || arg === "--no-approve");
     const argv = [
       ...pi.argv,
       "--mode", "rpc",
       "--session-id", req.childId,
       "--name", `${req.agent.name}: ${req.name}`,
+      ...inherited,
+      ...(alreadyLoadsUs ? [] : ["-e", deps.extensionEntry]),
       ...(model.model ? ["--model", `${model.model.provider}/${model.model.id}`] : []),
       "--thinking", String(thinking),
       "--append-system-prompt", promptFile,
-      deps.getProjectTrusted?.() ? "-a" : "-na",
-      "-e", deps.extensionEntry,
+      ...(trustInherited ? [] : [deps.getProjectTrusted?.() ? "-a" : "-na"]),
       ...(req.agent.tools ? ["--tools", req.agent.tools.join(",")] : []),
     ];
     const env = { ...process.env } as Record<string, string>;

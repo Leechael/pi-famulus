@@ -5,7 +5,7 @@
 //! retention timer, and it moves JSONL between the extension and the child.
 
 use crate::proto::{self, now_ms, EventKind, ProtoError, E_BAD_REQUEST, E_FORBIDDEN, E_NOT_FOUND};
-use crate::task::{self, lifeline};
+use crate::task;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -946,7 +946,7 @@ async fn spawn_rpc(argv: &[String], cwd: &str, env: &HashMap<String, String>) ->
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     {
-        let life = lifeline()?;
+        let life = task::lifeline()?;
         let (status_read, status_write) = crate::sys::pipe_cloexec()?;
         let status_write = crate::sys::dup_cloexec_high(&status_write)?;
         crate::sys::apply_runner_setup_tokio(&mut cmd, life.read.as_raw_fd(), status_write.as_raw_fd());
@@ -956,9 +956,8 @@ async fn spawn_rpc(argv: &[String], cwd: &str, env: &HashMap<String, String>) ->
     let mut child = cmd.spawn()?;
     let pid = child.id().unwrap_or(0);
     #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        let _ = crate::sys::assign_job(pid, child.as_raw_handle());
+    if let Some(handle) = child.raw_handle() {
+        let _ = crate::sys::assign_job(pid, handle);
     }
     let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("stdout"))?;

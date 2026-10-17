@@ -8,6 +8,7 @@
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]

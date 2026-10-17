@@ -39,6 +39,42 @@ export function resolvePiArgv(configured?: string | null): PiCommand {
   };
 }
 
+const PARENT_FLAGS = new Set([
+  "-ne",
+  "--no-extensions",
+  "-ns",
+  "--no-skills",
+  "-np",
+  "--no-prompt-templates",
+  "-nc",
+  "--no-context-files",
+  "--offline",
+  "--no-mcp",
+]);
+
+/**
+ * Flags from the pi process that is spawning the subagent. The child is a new
+ * process, so it only sees providers and tools that its own command line loads.
+ * Eval and SDK hosts pass those as `-e` on argv (`-ne` plus an explicit faux
+ * provider extension); forwarding them is what lets the child use the same model.
+ */
+export function parentResourceArgs(argv: readonly string[] = process.argv.slice(2)): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-e" || arg === "--extension") {
+      const value = argv[i + 1];
+      if (value && !value.startsWith("-")) {
+        out.push("-e", value);
+        i++;
+      }
+      continue;
+    }
+    if (PARENT_FLAGS.has(arg)) out.push(arg);
+  }
+  return out;
+}
+
 function splitCommand(raw: string): string[] {
   const parts: string[] = [];
   let current = "";
