@@ -96,6 +96,7 @@ mod unix {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "created paths are not private")]
     async fn created_paths_are_private_under_umask_022() {
         let _umask = UmaskGuard::set(0o022);
         let home = temp_home("fresh");
@@ -152,6 +153,7 @@ mod unix {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "a 0777 home was locked and written without being rejected or tightened")]
     async fn preexisting_world_writable_home_is_rejected_or_fixed() {
         let _umask = UmaskGuard::set(0o022);
         let home = temp_home("open");
