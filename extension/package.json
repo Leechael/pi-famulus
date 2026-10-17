@@ -1,7 +1,7 @@
 {
   "name": "pi-famulus",
   "version": "0.1.7",
-  "description": "Done means done: subagents and long-running background bash for Pi. One daemon owns every shell it starts and wakes the agent when work finishes. No polling.",
+  "description": "Keep your main agent's context clean: subagents on cheaper models, long bash in the background, and monitors that wake the agent. One Rust daemon runs the shells.",
   "keywords": [
     "pi-package",
     "pi",
