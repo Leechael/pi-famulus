@@ -72,6 +72,7 @@ impl Clock {
     /// Continue the manual clock's virtual time after an in-place upgrade
     /// (the new image starts a fresh clock). No-op on the real clock.
     #[allow(unused_variables)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn resume_at(&self, now_ms: u64) {
         #[cfg(feature = "test-clock")]
         if let Some(m) = &self.manual {
@@ -170,6 +171,7 @@ mod manual {
             self.state.lock().unwrap().now_ms
         }
 
+        #[cfg_attr(windows, allow(dead_code))]
         pub fn set_now_ms(&self, ms: u64) {
             self.state.lock().unwrap().now_ms = ms;
         }

@@ -197,7 +197,9 @@ pub fn group(
     prefixes: &HashMap<String, String>,
     now: u64,
 ) -> Vec<Group> {
-    let mut groups: BTreeMap<(Option<String>, Option<String>, Option<String>), Group> = BTreeMap::new();
+    // (session, child, work kind); `None` where the grouping ignores it.
+    type Key = (Option<String>, Option<String>, Option<String>);
+    let mut groups: BTreeMap<Key, Group> = BTreeMap::new();
     for t in tasks {
         let child = t.origin.as_ref().and_then(|o| o.child_id.clone());
         let (agent, child_id, session_id) = if by == By::Kind {
@@ -229,7 +231,7 @@ pub fn group(
         g.add(t, now);
     }
     let mut out: Vec<Group> = groups.into_values().collect();
-    out.sort_by(|a, b| (b.cpu_ms(), b.wall_ms).cmp(&(a.cpu_ms(), a.wall_ms)));
+    out.sort_by_key(|g| std::cmp::Reverse((g.cpu_ms(), g.wall_ms)));
     out
 }
 
@@ -469,9 +471,9 @@ pub async fn cmd_stats(home: &Path, o: StatsOpts) -> Result<(), String> {
     let tasks: Vec<&TaskRecord> = snap
         .tasks
         .iter()
-        .filter(|t| o.session.as_ref().map_or(true, |p| t.session_id.starts_with(p.as_str())))
-        .filter(|t| dir.as_ref().map_or(true, |d| inspect::under_dir(&t.cwd, d)))
-        .filter(|t| since.map_or(true, |s| t.ended_at.unwrap_or(snap.now) >= s))
+        .filter(|t| o.session.as_ref().is_none_or(|p| t.session_id.starts_with(p.as_str())))
+        .filter(|t| dir.as_ref().is_none_or(|d| inspect::under_dir(&t.cwd, d)))
+        .filter(|t| since.is_none_or(|s| t.ended_at.unwrap_or(snap.now) >= s))
         .collect();
     let names: HashMap<String, String> = snap.agents.iter().map(|a| (a.child_id.clone(), a.name.clone())).collect();
     let prefixes = inspect::session_prefixes(snap.sessions.keys().map(|s| s.as_str()).chain(tasks.iter().map(|t| t.session_id.as_str())));

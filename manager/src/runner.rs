@@ -59,6 +59,7 @@ use std::time::Duration;
 
 /// Grace between the group SIGTERM and SIGKILL when the lifeline breaks
 /// (the same 2 s as the daemon's stop/shutdown, §3.2).
+#[cfg_attr(windows, allow(dead_code))]
 const LIFELINE_GRACE: Duration = Duration::from_secs(2);
 /// How often a guardian looks for remaining group members. Every group
 /// enumeration walks the whole process table (on Linux, all of /proc), so
@@ -246,6 +247,7 @@ fn report_usage(what: &str, alone: bool, usage: Option<Usage>) {
     let _ = sys::write_raw(RUNNER_STATUS_FD, status_line(what, alone, usage).as_bytes());
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn status_line(what: &str, alone: bool, usage: Option<Usage>) -> String {
     let mut line = format!("{what} {}", if alone { "alone" } else { "linger" });
     if let Some(u) = usage {

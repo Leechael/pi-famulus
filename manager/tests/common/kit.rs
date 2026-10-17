@@ -182,24 +182,34 @@ pub fn taskkit(args: &[String]) -> i32 {
                 std::thread::sleep(Duration::from_millis(15));
             }
         }
-        "tree" | "leave" => {
-            let ms = num(0).to_string();
-            let leave = verb == "leave";
-            let mut cmd = Command::new(std::env::current_exe().unwrap());
-            cmd.args(["taskkit", "sleep", &ms]).stdin(Stdio::null());
-            if leave {
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-            }
-            let child = cmd.spawn().expect("spawn child");
-            if leave {
-                let _ = writeln!(out, "{}", child.id());
-                let _ = out.flush();
-                std::mem::forget(child);
-                return 0;
-            }
+        "tree" => {
+            let ms = num(0);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["taskkit", "sleep", &ms.to_string()])
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn child");
             let _ = writeln!(out, "{} {}", std::process::id(), child.id());
             let _ = out.flush();
-            std::thread::sleep(Duration::from_millis(num(0)));
+            std::thread::sleep(Duration::from_millis(ms));
+            let _ = child.wait();
+        }
+        "leave" => {
+            // The child is the leftover the caller asserts on. It has to
+            // outlive this task program, so it is detached on purpose.
+            let ms = num(0).to_string();
+            #[allow(clippy::zombie_processes)]
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["taskkit", "sleep", &ms])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn child");
+            let _ = writeln!(out, "{}", child.id());
+            let _ = out.flush();
+            std::mem::forget(child);
+            return 0;
         }
         other => {
             eprintln!("taskkit: unknown verb {other:?}");

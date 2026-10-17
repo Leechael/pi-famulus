@@ -32,6 +32,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
@@ -117,6 +118,83 @@ pub struct Home {
     pub extra_pids: Vec<u32>,
     /// Daemons of this home run on the manual clock (see `advance`).
     pub manual: bool,
+    /// Direct daemon children. `Home::drop` signals task pids first; only
+    /// then does this reaper `wait`, so a dead child's pid stays reserved
+    /// for that cleanup. See [`DaemonChild`].
+    reaper: Arc<Reaper>,
+}
+
+/// `wait`s daemon `Child` handles after [`Home::drop`] has signalled them.
+///
+/// The last `Arc` drops either as `Home` itself drops (the usual order:
+/// the [`DaemonChild`] guard moved its handle here already) or when a
+/// guard outlives the home. `try_wait` distinguishes "still our live
+/// child" from "the test already reaped it", so a second `kill` cannot
+/// hit a pid the kernel has reused.
+struct Reaper {
+    children: Mutex<Vec<Child>>,
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        let children = std::mem::take(self.children.get_mut().unwrap_or_else(|p| p.into_inner()));
+        for mut child in children {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(_) => {
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+}
+
+/// A daemon this test spawned.
+///
+/// Drop does not `wait` yet. It hands the `Child` to the home's reaper so
+/// [`Home::drop`] can still signal recorded task pids while Unix is holding
+/// those pids (a dead child keeps its pid until its parent waits). The
+/// reaper then `wait`s, including when an assertion fails. Wrapping the
+/// handle also keeps `clippy::zombie_processes` on the real `Child` uses
+/// instead of a crate-wide allow.
+pub struct DaemonChild {
+    child: Option<Child>,
+    reaper: Arc<Reaper>,
+}
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            self.reaper.children.lock().unwrap_or_else(|p| p.into_inner()).push(child);
+        }
+    }
+}
+
+impl std::ops::Deref for DaemonChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        self.child.as_ref().expect("daemon child used after drop")
+    }
+}
+
+impl std::ops::DerefMut for DaemonChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("daemon child used after drop")
+    }
+}
+
+impl DaemonChild {
+    /// `Child::wait_with_output`, then forget the handle so Drop does not
+    /// reap it again. Safe after `wait_child`: `wait` returns the status it
+    /// already collected and still reads the pipes.
+    pub fn collect_output(&mut self) -> std::process::Output {
+        let child = self.child.take().expect("daemon child used after drop");
+        child.wait_with_output().expect("collect daemon output")
+    }
 }
 
 /// True when the suite runs with `--features test-clock`: daemons started
@@ -140,6 +218,7 @@ impl Home {
             path,
             extra_pids: Vec::new(),
             manual: MANUAL_CLOCK,
+            reaper: Arc::new(Reaper { children: Mutex::new(Vec::new()) }),
         }
     }
     /// A home whose daemons always use real time (timing canaries).
@@ -294,7 +373,7 @@ impl Home {
             .unwrap_or_else(|_| Stdio::null())
     }
     /// Spawn `pi-famulus --home H daemon` as a direct child of the test.
-    pub fn spawn_daemon(&self) -> Child {
+    pub fn spawn_daemon(&self) -> DaemonChild {
         let child = Command::new(BIN)
             .arg("--home")
             .arg(&self.path)
@@ -306,9 +385,15 @@ impl Home {
             .stderr(self.daemon_stderr())
             .spawn()
             .expect("spawn daemon");
+        self.adopt(child)
+    }
+    /// Own a daemon `Child` this home did not spawn itself (a `pre_exec`
+    /// hook, an extra environment the helpers do not take). Reaped with the
+    /// daemons from [`Self::spawn_daemon`].
+    pub fn adopt(&self, child: Child) -> DaemonChild {
         // Bind later Drop/kill_pid probes to this process handle (Windows PID reuse).
         track(child.id());
-        child
+        DaemonChild { child: Some(child), reaper: Arc::clone(&self.reaper) }
     }
     /// A private copy of the binary under this home, so a test can replace
     /// it (in-place upgrade) without touching the one other tests use.
@@ -321,7 +406,7 @@ impl Home {
     }
     /// Start a daemon from `bin` with extra environment; waits until it
     /// accepts connections.
-    pub fn start_daemon_from(&self, bin: &Path, env: &[(&str, &str)]) -> Child {
+    pub fn start_daemon_from(&self, bin: &Path, env: &[(&str, &str)]) -> DaemonChild {
         let mut cmd = Command::new(bin);
         cmd.arg("--home")
             .arg(&self.path)
@@ -334,8 +419,7 @@ impl Home {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().expect("spawn daemon");
-        track(child.id());
+        let child = self.adopt(cmd.spawn().expect("spawn daemon"));
         // The first run of a freshly copied binary is slow on macOS (code
         // signature assessment), hence the longer wait.
         assert!(
@@ -345,7 +429,7 @@ impl Home {
         child
     }
     /// Spawn a daemon and wait until it accepts connections.
-    pub fn start_daemon(&self) -> Child {
+    pub fn start_daemon(&self) -> DaemonChild {
         let child = self.spawn_daemon();
         assert!(
             // The daemon binds, then writes manager.pid: ready means both.
@@ -390,7 +474,7 @@ impl Drop for Home {
         #[cfg(windows)]
         {
             let pidfile = self.pidfile_pid();
-            let tracked_ok = pidfile.is_some_and(|pid| win::kill_if_tracked(pid));
+            let tracked_ok = pidfile.is_some_and(win::kill_if_tracked);
             if !tracked_ok {
                 for pid in daemon_pids_for(&self.path) {
                     kill_pid(pid, SIGKILL);
@@ -619,7 +703,8 @@ pub fn clock_request(home: &Path, req: Value) -> Value {
 #[cfg(unix)]
 /// kill(pid, 0); EPERM counts as alive. Zombies count as alive too, so callers
 /// that own the child must reap it (test-owned daemons are reaped via
-/// `wait_child`; task processes are children of the daemon, not of the test).
+/// `wait_child` or [`Home`]'s reaper; task processes are children of the
+/// daemon, not of the test).
 pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -699,7 +784,7 @@ pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
             let words: Vec<&str> = cmd.split_whitespace().collect();
             if cmd.contains("pi-famulus")
                 && words.iter().any(|w| *w == home_s)
-                && words.iter().any(|w| *w == "daemon")
+                && words.contains(&"daemon")
             {
                 let pid: u32 = pid.parse().ok()?;
                 if pid_running(pid) {

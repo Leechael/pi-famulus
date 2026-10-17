@@ -48,6 +48,7 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 ///
 /// `Err(assigned)` means `in_list < assigned`: the caller must retry with at
 /// least `assigned` id slots. Zero ids are dropped.
+#[cfg(any(windows, test))]
 fn parse_basic_process_id_list(buf: &[u8]) -> Result<Vec<u32>, usize> {
     if buf.len() < 8 {
         return Err(0);

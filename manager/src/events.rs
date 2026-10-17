@@ -91,7 +91,7 @@ fn shrink_longest_string(v: &mut Value, by: usize) -> bool {
     fn longest<'a>(v: &'a mut Value, top: bool, best: &mut Option<&'a mut String>) {
         match v {
             Value::String(s) => {
-                if best.as_ref().map_or(true, |b| s.len() > b.len()) {
+                if best.as_ref().is_none_or(|b| s.len() > b.len()) {
                     *best = Some(s);
                 }
             }

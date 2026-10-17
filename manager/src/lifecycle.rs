@@ -7,7 +7,7 @@ use crate::registry::{self, Registry, TaskEntry};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, unix))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -332,6 +332,7 @@ pub struct SpawnLockGuard {
 pub fn try_acquire_spawn_lock(home: &Path) -> io::Result<Option<SpawnLockGuard>> {
     let f = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(lock_path(home))?;
     let lock: &'static mut fd_lock::RwLock<std::fs::File> =

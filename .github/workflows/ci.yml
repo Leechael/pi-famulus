@@ -37,6 +37,33 @@ jobs:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
 
+  # Lint gate: clippy warnings fail the build. Each OS compiles its own cfg
+  # branches (Unix handover, macOS proc_pidinfo, Windows job objects), so a
+  # Linux-only run would miss most of the platform code.
+  clippy:
+    name: clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: manager
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: manager
+          key: clippy
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --release -- -D warnings
+
   # Matrix and pins live in .github/pi-compat.json, shared with upstream-drift.yml.
   pi-matrix:
     runs-on: ubuntu-24.04
