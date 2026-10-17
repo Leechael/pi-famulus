@@ -539,6 +539,127 @@ describe("ManagerClient (integration, fake manager)", () => {
   });
 });
 
+/** §3.3 length prefix. Same cap as FrameDecoder in manager-client.ts. */
+const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+
+function frame(message: Record<string, unknown>): Buffer {
+  return encodeFrame(message);
+}
+
+async function writeAll(socket: net.Socket, data: Buffer): Promise<void> {
+  const ok = socket.write(data);
+  if (ok) return;
+  await new Promise<void>((resolve) => socket.once("drain", resolve));
+}
+
+function connectedSocket(fake: FakeManager): net.Socket {
+  const socket = [...fake.sockets][0];
+  if (!socket) throw new Error("fake manager has no connected socket");
+  return socket;
+}
+
+function collectEvents(client: ManagerClient, count: number, timeoutMs = 5000): Promise<ManagerEvent[]> {
+  const got: ManagerEvent[] = [];
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      off();
+      reject(new Error(`timed out waiting for ${count} events, got ${got.length}`));
+    }, timeoutMs);
+    const off = client.onEvent((event) => {
+      got.push(event);
+      if (got.length >= count) {
+        clearTimeout(timer);
+        off();
+        resolve(got);
+      }
+    });
+  });
+}
+
+describe("length-prefixed frame decoding", () => {
+  let home: string;
+  let fake: FakeManager;
+  let client: ManagerClient;
+
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-frames-"));
+    fake = await startFakeManager(home);
+    client = new ManagerClient({ home, sessionId: "sess-frames", managerPath: null });
+    expect(await client.connect()).toBe(true);
+  });
+
+  afterEach(async () => {
+    await client.close();
+    await fake.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("decodes several frames delivered in one chunk", async () => {
+    const pending = collectEvents(client, 2);
+    const socket = connectedSocket(fake);
+    await writeAll(socket, Buffer.concat([
+      frame({ v: 1, type: "event", event: "output", task_id: "one", chunk: "a", next_cursor: 1 }),
+      frame({ v: 1, type: "event", event: "output", task_id: "two", chunk: "b", next_cursor: 1 }),
+    ]));
+    const events = await pending;
+    expect(events.map((event) => event.task_id)).toEqual(["one", "two"]);
+  });
+
+  it("decodes one frame split across many chunks", async () => {
+    const pending = collectEvents(client, 1);
+    const socket = connectedSocket(fake);
+    const bytes = frame({ v: 1, type: "event", event: "output", task_id: "split", chunk: "xyz", next_cursor: 3 });
+    for (const byte of bytes) {
+      await writeAll(socket, Buffer.from([byte]));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const events = await pending;
+    expect(events[0]).toMatchObject({ event: "output", task_id: "split", chunk: "xyz" });
+  });
+
+  it("accepts a frame of exactly 4 MiB", async () => {
+    const prefix = '{"v":1,"type":"event","event":"output","task_id":"cap","chunk":"';
+    const suffix = '","next_cursor":1}';
+    const fill = MAX_FRAME_BYTES - Buffer.byteLength(prefix) - Buffer.byteLength(suffix);
+    expect(fill).toBeGreaterThan(0);
+    const payload = Buffer.concat([Buffer.from(prefix), Buffer.alloc(fill, 0x61), Buffer.from(suffix)]);
+    expect(payload.length).toBe(MAX_FRAME_BYTES);
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(payload.length, 0);
+    const pending = collectEvents(client, 1, 15000);
+    await writeAll(connectedSocket(fake), Buffer.concat([header, payload]));
+    const events = await pending;
+    expect(events[0]).toMatchObject({ event: "output", task_id: "cap" });
+    expect(events[0]?.chunk?.length).toBe(fill);
+  }, 15000);
+
+  it("closes the connection on a frame one byte over the cap and does not parse what follows", async () => {
+    const seen: ManagerEvent[] = [];
+    client.onEvent((event) => seen.push(event));
+    const socket = connectedSocket(fake);
+    const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(MAX_FRAME_BYTES + 1, 0);
+    const decoy = frame({
+      v: 1,
+      type: "event",
+      event: "task_exited",
+      task_id: "should-not-parse",
+      exit_code: 0,
+    });
+    await writeAll(socket, Buffer.concat([header, Buffer.alloc(8, 0), decoy]));
+    await Promise.race([
+      closed,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("oversized frame did not close the socket")), 1000);
+      }),
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(seen.filter((event) => event.task_id === "should-not-parse")).toEqual([]);
+    expect(socket.destroyed).toBe(true);
+  });
+});
+
 describe("tryAcquireSpawnLockFile", () => {
   let dir: string;
   let lockPath: string;
