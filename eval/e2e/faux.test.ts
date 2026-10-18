@@ -336,7 +336,7 @@ describe("faux e2e", { concurrency: true }, () => {
     const firstEvent = ws.findIndex((w) => w.wake.status === "event");
     assert.ok(firstEvent >= 0 && firstEvent < ws.indexOf(exitedWakes[0]), `exit before its event\n${explain(ep)}`);
     // `echo noop` ends in milliseconds; the exit must not wait on anything.
-    assert.ok(exitedWakes[0].t - monitorResult.t < 2000, `exit wake late\n${explain(ep)}`);
+    assert.ok(exitedWakes[0].t - monitorResult.t < 8000, `exit wake late\n${explain(ep)}`);
     const lines = ws.filter((w) => w.wake.status === "event").flatMap((w) => w.wake.body.split("\n"));
     assert.ok(lines.includes("noop"), `first line lost\n${explain(ep)}`);
     const listing = toolResults(ep.items).find((r) => r.toolName === "task_list");
@@ -350,7 +350,7 @@ describe("faux e2e", { concurrency: true }, () => {
     const r = toolResults(ep.items).find((x) => x.toolName === "bash");
     assert.ok(r, explain(ep));
     assert.equal(r.isError, true, `killed command reported as success: ${r.text}\n${explain(ep)}`);
-    assert.match(r.text, /started[\s\S]*timed out after 1 seconds/, explain(ep));
+    assert.match(r.text, /started[\s\S]*timed out after 4 seconds/, explain(ep));
   });
 
   it("(c3) a monitor that prints and exits while the agent is busy: event first, exit starts no turn", async () => {

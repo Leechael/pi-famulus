@@ -439,7 +439,7 @@ exports[`model-visible prompt surface > tool declarations 1`] = `
               "type": "string",
             },
           ],
-          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).",
+          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to an idle child starts a new turn.",
         },
         "message": {
           "description": "Message text.",
@@ -495,7 +495,7 @@ exports[`model-visible prompt surface > tool declarations 1`] = `
               "type": "string",
             },
           ],
-          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).",
+          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to an idle child starts a new turn.",
         },
         "message": {
           "description": "Message text.",

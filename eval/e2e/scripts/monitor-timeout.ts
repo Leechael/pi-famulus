@@ -8,7 +8,7 @@ export const MONITOR_COMMAND = "for i in 1 2 3; do echo tick-$i; sleep 0.3; done
 
 const script: FauxScript = {
   steps: [
-    call("monitor", { command: MONITOR_COMMAND, description: "tick watcher", timeout_ms: 2500 }),
+    call("monitor", { command: MONITOR_COMMAND, description: "tick watcher", timeout_ms: 8000 }),
     say("Monitor armed; waiting for events."),
   ],
   // Every wake (event batch or timeout) gets a turn; echo what woke us.

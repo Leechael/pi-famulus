@@ -65,7 +65,7 @@ function parent(ctx: FauxCallContext) {
     return call("agent_message", { action: "reply", to: request, message: "RED" });
   }
   if (texts.some((t) => t.includes('kind="subagent-done"')) && !called(ctx, (n, a) => n === "agent_message" && a.action === "send")) {
-    // Finished child: now an error that points at subagent resume.
+    // Finished child: send starts a new turn instead of erroring.
     return call("agent_message", { action: "send", to: "one", message: "one more thing" });
   }
   return say("ok");

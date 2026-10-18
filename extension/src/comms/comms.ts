@@ -56,7 +56,7 @@ export interface CommsWithOrigin extends Comms {
     message: string,
     delivery: "steer" | "queue",
     from?: string,
-  ): Promise<void>;
+  ): Promise<"running" | "resumed">;
   /** Cancel pending decision waiters and timers (session shutdown). */
   dispose(): void;
 }
@@ -129,7 +129,7 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
       options.logEvent?.("decision.reply", { child_id: toChildId });
     },
 
-    async send(toChildId, message, delivery, from = "supervisor") {
+    async send(toChildId, message, delivery, from = "supervisor"): Promise<"running" | "resumed"> {
       const child = host.getChild(toChildId);
       if (!child) {
         const known =
@@ -142,6 +142,8 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         } else {
           await child.handle.followUp(message);
         }
+        mailbox.append(child.runId, { from, to: toChildId, kind: "send", message });
+        return "running";
       } else if (
         child.status === "completed" ||
         child.status === "failed" ||
@@ -159,14 +161,14 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
           );
         }
         await resume(child.handle.childId, message);
-        host.onResumeAccepted?.(child.handle.childId);
+        mailbox.append(child.runId, { from, to: toChildId, kind: "send", message });
+        return "resumed";
       } else {
         throw new Error(
           `Child ${toChildId} (${child.name}) is ${child.status}; ` +
             "messages can only be delivered to running or finished children.",
         );
       }
-      mailbox.append(child.runId, { from, to: toChildId, kind: "send", message });
     },
 
     async broadcast(runId, message, fromChildId) {

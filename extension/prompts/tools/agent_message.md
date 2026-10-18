@@ -22,7 +22,7 @@ Message text.
 
 # param: delivery
 
-"steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).
+"steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to an idle child starts a new turn.
 # error: finished-child
 
-Child {{childId}} ({{name}}) has finished ({{status}}). <!--seg:result.agent-message-use-resume-->agent_message does not resume children. Use subagent({ action: "resume", run_id: "{{runId}}", child_id: "{{childId}}", message: "..." }).<!--/seg-->
+Child {{childId}} ({{name}}) has finished ({{status}}), and this host cannot start another turn. Use subagent({ action: "resume", run_id: "{{runId}}", child_id: "{{childId}}", message: "..." }).

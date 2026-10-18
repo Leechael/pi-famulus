@@ -65,7 +65,7 @@ export interface Comms {
     message: string,
   ): Promise<string>; // need_decision → reply text; progress_update → immediate "ok"
   reply(toChildId: string, message: string): void; // no pending waiter → throw
-  send(toChildId: string, message: string, delivery: "steer" | "queue"): Promise<void>;
+  send(toChildId: string, message: string, delivery: "steer" | "queue"): Promise<"running" | "resumed">;
   broadcast(runId: string, message: string, fromChildId?: string): Promise<string[]>; // delivered childIds
   pendingRequests(): { childId: string; name: string; message: string; sinceMs: number }[];
   log(runId: string, limit?: number): MailboxEntry[]; // default 20, ring 200/run

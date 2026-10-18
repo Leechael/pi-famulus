@@ -1483,20 +1483,19 @@ fn start_agent_loops(state: &Shared) {
         tokio::spawn(async move {
             while let Some(notice) = rx.recv().await {
                 let st = state.lock().unwrap();
+                let mut targets = Vec::new();
                 if let Some(session) = st.sessions.get(&notice.parent_session) {
                     if let Some(conn_id) = session.conn_id {
-                        if let Some(conn) = st.conns.get(&conn_id) {
-                            let _ = conn.tx.try_send(encode_event(&notice.event));
-                        }
+                        targets.push(conn_id);
                     }
                 }
                 if let Some(conn_id) = st.hosted.child_of_conn(&notice.child_id) {
-                    if let Some(conn) = st.conns.get(&conn_id) {
-                        let _ = conn.tx.try_send(encode_event(&notice.event));
-                    }
+                    targets.push(conn_id);
                 }
-                let watchers = st.hosted.watcher_ids(&notice.child_id);
-                for conn_id in watchers {
+                targets.extend(st.hosted.watcher_ids(&notice.child_id));
+                targets.sort_unstable();
+                targets.dedup();
+                for conn_id in targets {
                     if let Some(conn) = st.conns.get(&conn_id) {
                         let _ = conn.tx.try_send(encode_event(&notice.event));
                     }
@@ -1696,17 +1695,29 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             }
         }
         RequestKind::AgentInput { child_id, op, text, source, since } => {
-            let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
-            let source = if source.is_empty() { "parent".into() } else { source };
-            respond(&tx, &id, hosted.rpc(&child_id, &op, &text, &source, since.as_deref()).await).await
+            match authorize_agent(&state, conn_id, &child_id) {
+                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+                Ok(()) => {
+                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
+                    let source = if source.is_empty() { "parent".into() } else { source };
+                    respond(&tx, &id, hosted.rpc(&child_id, &op, &text, &source, since.as_deref()).await).await
+                }
+            }
         }
         RequestKind::AgentWatch { child_id } => {
-            let result = { let st = state.lock().unwrap(); st.hosted.watch(&child_id, conn_id).map(|()| UnitOk {}) };
+            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.watch(&child_id, conn_id).map(|()| UnitOk {})
+            });
             respond(&tx, &id, result).await
         }
         RequestKind::AgentUnwatch { child_id } => {
-            { let st = state.lock().unwrap(); st.hosted.unwatch(&child_id, conn_id); }
-            respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
+            let result = authorize_agent(&state, conn_id, &child_id).map(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.unwatch(&child_id, conn_id);
+                UnitOk {}
+            });
+            respond(&tx, &id, result).await
         }
         RequestKind::AgentComms { request_id, reason, message } => {
             let (child_id, hosted) = {
@@ -1719,11 +1730,17 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             }
         }
         RequestKind::AgentCommsReply { request_id, child_id, message } => {
-            let result = { let st = state.lock().unwrap(); st.hosted.comms_reply(&request_id, &child_id, &message).map(|()| UnitOk {}) };
+            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.comms_reply(&request_id, &child_id, &message).map(|()| UnitOk {})
+            });
             respond(&tx, &id, result).await
         }
         RequestKind::AgentUiResponse { child_id, rpc_id, value, cancelled } => {
-            let result = { let st = state.lock().unwrap(); st.hosted.ui_response(&child_id, &rpc_id, &value, cancelled).map(|()| UnitOk {}) };
+            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.ui_response(&child_id, &rpc_id, &value, cancelled).map(|()| UnitOk {})
+            });
             respond(&tx, &id, result).await
         }
         RequestKind::HostedLookup { session_id, session_file } => {
@@ -1739,11 +1756,17 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
         }
         RequestKind::AgentPark { child_id } => {
-            let result = { let st = state.lock().unwrap(); st.hosted.park(&child_id, "interrupt").map(|()| UnitOk {}) };
+            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.park(&child_id, "interrupt").map(|()| UnitOk {})
+            });
             respond(&tx, &id, result).await
         }
         RequestKind::AgentTakeover { child_id } => {
-            let result = { let st = state.lock().unwrap(); st.hosted.takeover(&child_id).map(|()| UnitOk {}) };
+            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.takeover(&child_id).map(|()| UnitOk {})
+            });
             respond(&tx, &id, result).await
         }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
@@ -1797,6 +1820,19 @@ fn handle_clock(
         RequestKind::ClockAdvance { ms } => m.advance(*ms),
         _ => m.status(),
     })
+}
+
+fn authorize_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<(), ProtoError> {
+    let st = state.lock().unwrap();
+    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    let role = match conn.role {
+        ConnRole::Cli => "cli",
+        ConnRole::Child => "child",
+        ConnRole::Parent => "parent",
+    };
+    let session = conn.session_id.clone();
+    let caller = conn.child_id.clone();
+    st.hosted.authorize(role, session.as_deref(), caller.as_deref(), child_id)
 }
 
 fn parent_session(state: &Shared, conn_id: u64) -> Result<String, ProtoError> {

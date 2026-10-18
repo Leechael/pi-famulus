@@ -138,6 +138,40 @@ impl Hosted {
         self.inner.lock().unwrap().agents.get(child_id).and_then(|a| a.child_conn)
     }
 
+    /// Parent extensions may touch only their own children. A hosted child may
+    /// touch itself and siblings in the same run. The CLI (top, attach) may
+    /// touch any child.
+    pub fn authorize(
+        &self,
+        role: &str,
+        session_id: Option<&str>,
+        caller_child: Option<&str>,
+        target: &str,
+    ) -> Result<(), ProtoError> {
+        let g = self.inner.lock().unwrap();
+        let agent = g.agents.get(target).ok_or_else(|| ProtoError::new(E_NOT_FOUND, "unknown child"))?;
+        match role {
+            "cli" => Ok(()),
+            "child" => {
+                let me = caller_child.unwrap_or("");
+                if me == target {
+                    return Ok(());
+                }
+                match g.agents.get(me) {
+                    Some(mine) if mine.parent_session == agent.parent_session && mine.run_id == agent.run_id => Ok(()),
+                    _ => Err(ProtoError::new(E_FORBIDDEN, "a hosted child cannot address that agent")),
+                }
+            }
+            _ => {
+                if session_id == Some(agent.parent_session.as_str()) {
+                    Ok(())
+                } else {
+                    Err(ProtoError::new(E_FORBIDDEN, "that subagent belongs to another session"))
+                }
+            }
+        }
+    }
+
     pub fn lookup(&self, session_id: Option<&str>, session_file: Option<&str>) -> Option<crate::proto::HostedNotice> {
         let g = self.inner.lock().unwrap();
         let id = session_id.and_then(|s| g.agents.contains_key(s).then(|| s.to_string())).or_else(|| {

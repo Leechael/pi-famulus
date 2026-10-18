@@ -6,6 +6,7 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { CHILD_BEHAVIOR_GUIDELINES } from "./behavior-guidelines";
 import { createChildBashTool } from "./subagent/child-bash";
 import { ChildShellTracker } from "./subagent/overrun";
 import { createContactSupervisorTool, createAgentMessageTool } from "./comms/tools";
@@ -44,13 +45,16 @@ export function registerChildMode(pi: ExtensionAPI): void {
     notifySupervisor: () => {},
   });
 
-  pi.registerTool(createContactSupervisorTool({
-    ...comms,
-    contactSupervisor: async (_from: string, reason: "need_decision" | "progress_update", message: string) => {
-      if (!client) throw new Error("pi-famulus daemon is not connected");
-      return client.agentComms(randomUUID(), reason, message);
-    },
-  } as never, childId));
+  pi.registerTool({
+    ...createContactSupervisorTool({
+      ...comms,
+      contactSupervisor: async (_from: string, reason: "need_decision" | "progress_update", message: string) => {
+        if (!client) throw new Error("pi-famulus daemon is not connected");
+        return client.agentComms(randomUUID(), reason, message);
+      },
+    } as never, childId),
+    promptGuidelines: [CHILD_BEHAVIOR_GUIDELINES],
+  });
 
   pi.registerTool(createAgentMessageTool(comms, { kind: "child", childId, runId }, {
     getChild: (id) => ({

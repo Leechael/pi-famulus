@@ -271,14 +271,6 @@
       ]
     },
     {
-      "id": "result.agent-message-use-resume",
-      "kind": "regex",
-      "surface": "tool error: agent_message send to a finished child (comms/comms.ts)",
-      "affects": [
-        "resume-finished"
-      ]
-    },
-    {
       "id": "wake.lead-in",
       "kind": "text",
       "surface": "wake: FAMULUS_WAKE_LEAD_IN, shared by every <pi-famulus-wake> kind (wake.ts)",
