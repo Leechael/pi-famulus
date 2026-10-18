@@ -110,6 +110,8 @@ pub struct PendingAgent {
     queued_behind: u64,
     /// A sibling-started turn: drop the permit when the child settles.
     release_on_settle: bool,
+    /// Hosted child that asked for this permit. None means the parent session.
+    requester_child: Option<String>,
 }
 
 #[derive(Clone)]
@@ -126,6 +128,8 @@ pub struct AgentPermit {
 pub(crate) struct UndeliveredGrant {
     child_id: String,
     queued_behind: Option<u64>,
+    /// None: the parent session's connection. Some: that hosted child only.
+    requester_child: Option<String>,
 }
 
 struct AgentGrant {
@@ -2934,6 +2938,11 @@ async fn handle_acquire_agent(
                                         )
                                     } else {
                                         let queued_behind = st.pending_agents.len() as u64;
+                                        let requester_child = if release_on_settle {
+                                            st.conns.get(&conn_id).and_then(|c| c.child_id.clone())
+                                        } else {
+                                            None
+                                        };
                                         st.pending_agents.push_back(PendingAgent {
                                             session_id: sid,
                                             child_id: child_id.into(),
@@ -2942,6 +2951,7 @@ async fn handle_acquire_agent(
                                             tx: tx.clone(),
                                             queued_behind,
                                             release_on_settle,
+                                            requester_child,
                                         });
                                         (None, wake)
                                     }
@@ -3127,17 +3137,18 @@ fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) ->
         let Some(conn) = st.conns.get(&conn_id) else {
             return HashSet::new();
         };
-        let owners: Vec<String> = if conn.role == ConnRole::Child {
-            conn.child_id.as_deref().and_then(|id| st.hosted.parent_of(id)).into_iter().collect()
-        } else {
-            conn.session_id.clone().into_iter().collect()
-        };
-        if owners.is_empty() {
-            return HashSet::new();
-        }
+        let is_child = conn.role == ConnRole::Child;
+        let session_id = conn.session_id.clone();
+        let caller = conn.child_id.clone();
         st.undelivered_agent_grants
             .iter()
-            .filter(|((owner, _), _)| owners.iter().any(|sid| sid == owner))
+            .filter(|((owner, _), grant)| {
+                if is_child {
+                    grant.requester_child.is_some() && grant.requester_child == caller
+                } else {
+                    session_id.as_ref() == Some(owner) && grant.requester_child.is_none()
+                }
+            })
             .map(|((owner, request_id), grant)| {
                 (owner.clone(), request_id.clone(), grant.child_id.clone(), grant.queued_behind)
             })
@@ -4223,6 +4234,7 @@ fn wake_pending_with_capacity(
                 UndeliveredGrant {
                     child_id: pending.child_id.clone(),
                     queued_behind: Some(pending.queued_behind),
+                    requester_child: pending.requester_child.clone(),
                 },
             );
             wake.push(AgentGrant {
