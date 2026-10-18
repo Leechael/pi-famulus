@@ -14,6 +14,12 @@ const echoFromWake = (re: RegExp): FauxStep => (ctx) => {
 
 const lastTaskId = (text: string) => /task_id: (sh_[0-9a-f]{8})/.exec(text)?.[1] ?? "sh_unknown";
 
+/** A real settle, not the wake markup quoted in a tool's instructions. */
+function childTurnSettled(text: string): boolean {
+  if (/kind="subagent-(done|handover)"[^>]*\brun-id=/.test(text)) return true;
+  return /Run run_[0-9a-f]{8} \[[^\]]+\] /.test(text) && !/continues in the background/.test(text);
+}
+
 /**
  * resume-finished: parent and faux child share one provider, so the script is
  * a pure function of the call context (who is asking, and what came last).
@@ -43,14 +49,14 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
     if (mode !== "resume" && !already("agent_message", "send")) {
       return call("agent_message", { action: "send", to: "worker-1", message: "append the word done to fruit.txt" });
     }
-    if (mode !== "send-only" && !already("subagent", "resume")) {
-      // The spawn can still be running when the foreground budget returns.
-      // A finish inside the budget is the synchronous tool result (`Run run_…`),
-      // not a wake. Resume is rejected until that turn has settled.
-      const settled = ctx.messages.some((m) => {
-        const text = textOf(m);
-        return /kind="subagent-(done|handover)"/.test(text) || /Run run_[0-9a-f]{8} \[[^\]]+\] /.test(text);
-      });
+    const resumed = ctx.messages.some(
+      (m) => m.role === "toolResult" && m.toolName === "subagent" && textOf(m).includes("Resumed subagent"),
+    );
+    if (mode !== "send-only" && !resumed) {
+      // The backgrounded tool text quotes kind="subagent-handover" as
+      // instructions. Only a wake that names a run, or a synchronous
+      // `Run run_…` result, means the spawn has settled.
+      const settled = ctx.messages.some((m) => childTurnSettled(textOf(m)));
       if (!settled) return say("ok");
       // Send to an idle child starts its own turn. Resume only after that
       // turn has finished; a resume while it is still pending is rejected.
@@ -59,7 +65,7 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
           (m) => m.role === "assistant" && JSON.stringify(m.content).includes('"action":"send"'),
         );
         const later = sendAt >= 0 ? ctx.messages.slice(sendAt + 1) : [];
-        const finished = later.some((m) => /kind="subagent-(done|handover)"/.test(textOf(m)));
+        const finished = later.some((m) => childTurnSettled(textOf(m)));
         if (!finished) return say("ok");
       }
       return call("subagent", {
