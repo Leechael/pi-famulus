@@ -62,7 +62,7 @@ async fn session(
         .await?;
     let (mut rd, mut wr) = conn.into_halves();
     let (frame_tx, mut frames) = mpsc::unbounded_channel();
-    let reader = tokio::spawn(async move {
+    let _reader = AbortOnDrop(tokio::spawn(async move {
         loop {
             match read_frame(&mut rd).await {
                 Ok(Some(bytes)) => {
@@ -80,7 +80,7 @@ async fn session(
                 }
             }
         }
-    });
+    }));
     let mut bootstrap = vec!["get_session_stats", "get_state", "get_entries"];
     let mut waiting: Option<(String, String)> = None;
     let mut abort_after_clear = false;
@@ -98,10 +98,7 @@ async fn session(
             }
             if let Some(cmd) = queued.pop_front() {
                 match cmd {
-                    LiveCmd::Stop => {
-                        reader.abort();
-                        return Ok(());
-                    }
+                    LiveCmd::Stop => return Ok(()),
                     LiveCmd::Send { op, text } if op == "abort" => {
                         abort_after_clear = true;
                         waiting = Some(send_input(&mut wr, child_id, "clear_queue", "").await?);
@@ -117,10 +114,7 @@ async fn session(
         tokio::select! {
             cmd = cmds.recv() => {
                 match cmd {
-                    None | Some(LiveCmd::Stop) => {
-                        reader.abort();
-                        return Ok(());
-                    }
+                    None | Some(LiveCmd::Stop) => return Ok(()),
                     Some(cmd) if waiting.is_some() => queued.push_back(cmd),
                     Some(LiveCmd::Send { op, text }) if op == "abort" => {
                         waiting = Some(send_input(&mut wr, child_id, "clear_queue", "").await?);
@@ -306,6 +300,14 @@ fn message_text(message: &Value) -> Option<String> {
 
 fn texts(value: &Value) -> Vec<String> {
     value.as_array().map(|items| items.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default()
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn cache_label(expires_at: Option<u64>) -> String {

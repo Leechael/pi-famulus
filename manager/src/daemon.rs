@@ -902,11 +902,10 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             pi_version: _,
         } => {
             if let Some(asked) = role.as_deref() {
-                let allowed = match (asked, client_kind) {
-                    ("cli", ClientKind::Cli) => true,
-                    ("child" | "parent", ClientKind::Extension) => true,
-                    _ => false,
-                };
+                let allowed = matches!(
+                    (asked, client_kind),
+                    ("cli", ClientKind::Cli) | ("child" | "parent", ClientKind::Extension)
+                );
                 if !allowed {
                     let _ = tx
                         .send(encode_error(

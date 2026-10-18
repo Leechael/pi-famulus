@@ -782,7 +782,6 @@ export function createSubagentTool(
   };
 }
 
-/** Resume result clause for a turn waiting for an admission slot ("" when it started at once). */
 function resolveRunByChild(registry: SubagentRegistry, childIdOrName: string) {
   const runs = registry.list();
   const byId = runs.filter((run) => run.children.some((c) => c.childId === childIdOrName));
@@ -795,6 +794,7 @@ function resolveRunByChild(registry: SubagentRegistry, childIdOrName: string) {
   return byName[0];
 }
 
+/** Resume result clause for a turn waiting for an admission slot ("" when it started at once). */
 function queuedText(queuedBehind: number | null): string {
   if (queuedBehind === null) return "";
   const ahead = queuedBehind === 0 ? "" : ` and ${queuedBehind} subagent(s) are waiting ahead of it`;

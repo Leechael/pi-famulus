@@ -263,6 +263,10 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
       subagent.piCommand = JSON.stringify(section.piCommand);
     } else if (typeof section.piCommand === "string" && section.piCommand.trim()) {
       subagent.piCommand = section.piCommand.trim();
+    } else if ("piCommand" in section) {
+      // Present but not a usable command. An empty argv makes spawn fail
+      // instead of quietly using whichever pi is running this session.
+      subagent.piCommand = "[]";
     }
     config.subagent = subagent;
   }
