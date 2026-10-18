@@ -56,7 +56,7 @@ export interface CommsWithOrigin extends Comms {
     message: string,
     delivery: "steer" | "queue",
     from?: string,
-  ): Promise<"running" | "resumed">;
+  ): Promise<"running" | "resumed" | "queued">;
   /** Cancel pending decision waiters and timers (session shutdown). */
   dispose(): void;
 }
@@ -129,7 +129,7 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
       options.logEvent?.("decision.reply", { child_id: toChildId });
     },
 
-    async send(toChildId, message, delivery, from = "supervisor"): Promise<"running" | "resumed"> {
+    async send(toChildId, message, delivery, from = "supervisor"): Promise<"running" | "resumed" | "queued"> {
       const child = host.getChild(toChildId);
       if (!child) {
         const known =
@@ -149,7 +149,7 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         child.status === "failed" ||
         child.status === "interrupted"
       ) {
-        const resume = (host as CommsHost & { resumeChild?: (childId: string, message: string) => Promise<void> }).resumeChild;
+        const resume = host.resumeChild;
         if (!resume) {
           throw new Error(
             fill("tools.agent_message.error.finished-child", {
@@ -160,9 +160,9 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
             }),
           );
         }
-        await resume(child.handle.childId, message);
+        const { queuedBehind } = await resume(child.handle.childId, message);
         mailbox.append(child.runId, { from, to: toChildId, kind: "send", message });
-        return "resumed";
+        return queuedBehind === null ? "resumed" : "queued";
       } else {
         throw new Error(
           `Child ${toChildId} (${child.name}) is ${child.status}; ` +

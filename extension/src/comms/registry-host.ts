@@ -75,8 +75,9 @@ export function createRegistryCommsHost(deps: RegistryHostDeps): CommsHost {
     async resumeChild(childId: string, message: string) {
       const registry = deps.getRegistry();
       if (!registry) throw new Error("subagent system is not initialized");
-      await registry.resumeChild(childId, message);
+      const accepted = await registry.resumeChild(childId, message);
       deps.onResumeAccepted?.(childId);
+      return accepted;
     },
   };
 }

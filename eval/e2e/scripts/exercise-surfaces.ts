@@ -5,7 +5,7 @@
  *   system prompt sections + <rules> + tool declarations, backgrounded-bash
  *   result, sleep-block error, task wake (+ <still-running>), monitor wake,
  *   subagent backgrounded result, subagent-handover / subagent-done /
- *   supervisor-request wakes, and the agent_message "finished child" error.
+ *   supervisor-request wakes, and agent_message send starting a turn on a finished child.
  *
  * Parent and children share the faux provider, so every decision is a pure
  * function of the call context (not a step index).

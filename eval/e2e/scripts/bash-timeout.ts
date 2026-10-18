@@ -1,5 +1,5 @@
 /**
- * The model gives bash a 1s timeout on a 5s command. Eval batch 4: the manager
+ * The model gives bash a 4s timeout on an 8s command. Eval batch 4: the manager
  * path returned the partial output as a success, so the model believed the
  * command was still running.
  */

@@ -139,14 +139,16 @@ impl Hosted {
     }
 
     /// Parent extensions may touch only their own children. A hosted child may
-    /// touch itself and siblings in the same run. The CLI (top, attach) may
-    /// touch any child.
+    /// touch itself, and siblings in the same run only when `sibling_input` is
+    /// set (send/watch). Park, takeover and UI replies stay with the owner.
+    /// The CLI (top, attach) may touch any child.
     pub fn authorize(
         &self,
         role: &str,
         session_id: Option<&str>,
         caller_child: Option<&str>,
         target: &str,
+        sibling_input: bool,
     ) -> Result<(), ProtoError> {
         let g = self.inner.lock().unwrap();
         let agent = g.agents.get(target).ok_or_else(|| ProtoError::new(E_NOT_FOUND, "unknown child"))?;
@@ -156,6 +158,9 @@ impl Hosted {
                 let me = caller_child.unwrap_or("");
                 if me == target {
                     return Ok(());
+                }
+                if !sibling_input {
+                    return Err(ProtoError::new(E_FORBIDDEN, "a hosted child cannot address that agent"));
                 }
                 match g.agents.get(me) {
                     Some(mine) if mine.parent_session == agent.parent_session && mine.run_id == agent.run_id => Ok(()),

@@ -901,6 +901,23 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             token,
             pi_version: _,
         } => {
+            if let Some(asked) = role.as_deref() {
+                let allowed = match (asked, client_kind) {
+                    ("cli", ClientKind::Cli) => true,
+                    ("child" | "parent", ClientKind::Extension) => true,
+                    _ => false,
+                };
+                if !allowed {
+                    let _ = tx
+                        .send(encode_error(
+                            &hello.id,
+                            E_BAD_REQUEST,
+                            "hello role does not match the client kind",
+                        ))
+                        .await;
+                    return;
+                }
+            }
             let role = match role.as_deref() {
                 Some("child") => ConnRole::Child,
                 Some("cli") => ConnRole::Cli,
@@ -1695,7 +1712,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             }
         }
         RequestKind::AgentInput { child_id, op, text, source, since } => {
-            match authorize_agent(&state, conn_id, &child_id) {
+            match authorize_agent(&state, conn_id, &child_id, true) {
                 Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
                 Ok(()) => {
                     let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
@@ -1705,19 +1722,15 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             }
         }
         RequestKind::AgentWatch { child_id } => {
-            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+            let result = authorize_agent(&state, conn_id, &child_id, true).and_then(|()| {
                 let st = state.lock().unwrap();
                 st.hosted.watch(&child_id, conn_id).map(|()| UnitOk {})
             });
             respond(&tx, &id, result).await
         }
         RequestKind::AgentUnwatch { child_id } => {
-            let result = authorize_agent(&state, conn_id, &child_id).map(|()| {
-                let st = state.lock().unwrap();
-                st.hosted.unwatch(&child_id, conn_id);
-                UnitOk {}
-            });
-            respond(&tx, &id, result).await
+            { let st = state.lock().unwrap(); st.hosted.unwatch(&child_id, conn_id); }
+            respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
         }
         RequestKind::AgentComms { request_id, reason, message } => {
             let (child_id, hosted) = {
@@ -1730,14 +1743,14 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             }
         }
         RequestKind::AgentCommsReply { request_id, child_id, message } => {
-            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
                 let st = state.lock().unwrap();
                 st.hosted.comms_reply(&request_id, &child_id, &message).map(|()| UnitOk {})
             });
             respond(&tx, &id, result).await
         }
         RequestKind::AgentUiResponse { child_id, rpc_id, value, cancelled } => {
-            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
                 let st = state.lock().unwrap();
                 st.hosted.ui_response(&child_id, &rpc_id, &value, cancelled).map(|()| UnitOk {})
             });
@@ -1756,14 +1769,14 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
         }
         RequestKind::AgentPark { child_id } => {
-            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
                 let st = state.lock().unwrap();
                 st.hosted.park(&child_id, "interrupt").map(|()| UnitOk {})
             });
             respond(&tx, &id, result).await
         }
         RequestKind::AgentTakeover { child_id } => {
-            let result = authorize_agent(&state, conn_id, &child_id).and_then(|()| {
+            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
                 let st = state.lock().unwrap();
                 st.hosted.takeover(&child_id).map(|()| UnitOk {})
             });
@@ -1822,7 +1835,7 @@ fn handle_clock(
     })
 }
 
-fn authorize_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<(), ProtoError> {
+fn authorize_agent(state: &Shared, conn_id: u64, child_id: &str, sibling_input: bool) -> Result<(), ProtoError> {
     let st = state.lock().unwrap();
     let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
     let role = match conn.role {
@@ -1832,7 +1845,7 @@ fn authorize_agent(state: &Shared, conn_id: u64, child_id: &str) -> Result<(), P
     };
     let session = conn.session_id.clone();
     let caller = conn.child_id.clone();
-    st.hosted.authorize(role, session.as_deref(), caller.as_deref(), child_id)
+    st.hosted.authorize(role, session.as_deref(), caller.as_deref(), child_id, sibling_input)
 }
 
 fn parent_session(state: &Shared, conn_id: u64) -> Result<String, ProtoError> {

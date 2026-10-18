@@ -295,7 +295,7 @@ export function createAgentMessageTool(
 
       // send
       const delivery = params.delivery ?? "steer";
-      let delivered: "running" | "resumed";
+      let delivered: "running" | "resumed" | "queued";
       try {
         delivered = await comms.send(target.childId, message, delivery, from);
       } catch (err) {
@@ -305,11 +305,13 @@ export function createAgentMessageTool(
         });
       }
       const how =
-        delivered === "resumed"
-          ? "started a new turn on the idle child"
-          : delivery === "steer"
-            ? "steered into the running child"
-            : "queued for the running child";
+        delivered === "queued"
+          ? "accepted a new turn on the idle child; it is waiting for a machine slot"
+          : delivered === "resumed"
+            ? "started a new turn on the idle child"
+            : delivery === "steer"
+              ? "steered into the running child"
+              : "queued for the running child";
       return okResult("send", `Message to ${target.childId} (${target.name}) ${how}.`, {
         to: target.childId,
         delivery,
