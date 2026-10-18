@@ -383,7 +383,7 @@ describe("InProcessRunner", () => {
     expect(releases).toEqual([true, true]);
   });
 
-  it("keeps the permit when admission resolves after a resumable interruption", async () => {
+  it("releases a permit admitted after a resumable interruption", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
     const releases: boolean[] = [];
@@ -410,7 +410,7 @@ describe("InProcessRunner", () => {
     expect(releases).toEqual([true, true]);
   });
 
-  it("releases an interrupted child's retained machine permit on disposal", async () => {
+  it("does not release again when dispose follows an interrupt that already released", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
     const releases: boolean[] = [];

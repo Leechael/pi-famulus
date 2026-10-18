@@ -8,6 +8,7 @@ use crate::client::{self, HelloMode};
 use crate::inspect::TranscriptTurn;
 use crate::proto::{self, read_frame, write_frame, Request, RequestKind, PROTO_VERSION};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -36,11 +37,13 @@ pub enum LiveMsg {
     /// Text pulled out of the steer / follow-up queues by Esc Esc.
     Restored(String),
     Error(String),
+    /// The watch connection ended. The composer must stop trusting the live transcript.
+    Disconnected(String),
 }
 
 pub async fn run(home: PathBuf, child_id: String, tx: mpsc::UnboundedSender<LiveMsg>, mut cmds: mpsc::UnboundedReceiver<LiveCmd>) {
     if let Err(e) = session(home, &child_id, &tx, &mut cmds).await {
-        let _ = tx.send(LiveMsg::Error(e));
+        let _ = tx.send(LiveMsg::Disconnected(e));
     }
 }
 
@@ -58,9 +61,30 @@ async fn session(
         .roundtrip(RequestKind::AgentWatch { child_id: child_id.to_string() })
         .await?;
     let (mut rd, mut wr) = conn.into_halves();
+    let (frame_tx, mut frames) = mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        loop {
+            match read_frame(&mut rd).await {
+                Ok(Some(bytes)) => {
+                    if frame_tx.send(Ok(bytes)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = frame_tx.send(Err("manager closed the connection".to_string()));
+                    break;
+                }
+                Err(e) => {
+                    let _ = frame_tx.send(Err(format!("recv: {e}")));
+                    break;
+                }
+            }
+        }
+    });
     let mut bootstrap = vec!["get_session_stats", "get_state", "get_entries"];
     let mut waiting: Option<(String, String)> = None;
     let mut abort_after_clear = false;
+    let mut queued: VecDeque<LiveCmd> = VecDeque::new();
     loop {
         if waiting.is_none() {
             if abort_after_clear {
@@ -72,29 +96,44 @@ async fn session(
                 waiting = Some(send_input(&mut wr, child_id, op, "").await?);
                 continue;
             }
+            if let Some(cmd) = queued.pop_front() {
+                match cmd {
+                    LiveCmd::Stop => {
+                        reader.abort();
+                        return Ok(());
+                    }
+                    LiveCmd::Send { op, text } if op == "abort" => {
+                        abort_after_clear = true;
+                        waiting = Some(send_input(&mut wr, child_id, "clear_queue", "").await?);
+                        let _ = text;
+                    }
+                    LiveCmd::Send { op, text } => {
+                        waiting = Some(send_input(&mut wr, child_id, &op, &text).await?);
+                    }
+                }
+                continue;
+            }
         }
         tokio::select! {
             cmd = cmds.recv() => {
                 match cmd {
                     None | Some(LiveCmd::Stop) => {
-                        let _ = (rd, wr);
+                        reader.abort();
                         return Ok(());
                     }
-                    Some(LiveCmd::Send { op, text }) if waiting.is_some() => {
-                        let _ = tx.send(LiveMsg::Error("still waiting for the previous command".into()));
-                        let _ = (op, text);
-                    }
-                    Some(LiveCmd::Send { op, text: _ }) if op == "abort" => {
+                    Some(cmd) if waiting.is_some() => queued.push_back(cmd),
+                    Some(LiveCmd::Send { op, text }) if op == "abort" => {
                         waiting = Some(send_input(&mut wr, child_id, "clear_queue", "").await?);
                         abort_after_clear = true;
+                        let _ = text;
                     }
                     Some(LiveCmd::Send { op, text }) => {
                         waiting = Some(send_input(&mut wr, child_id, &op, &text).await?);
                     }
                 }
             }
-            frame = read_frame(&mut rd) => {
-                let bytes = frame.map_err(|e| format!("recv: {e}"))?.ok_or_else(|| "manager closed the connection".to_string())?;
+            frame = frames.recv() => {
+                let bytes = frame.ok_or_else(|| "manager closed the connection".to_string())??;
                 let value: Value = serde_json::from_slice(&bytes).map_err(|e| format!("bad JSON: {e}"))?;
                 if let Some((id, op)) = waiting.clone() {
                     if value.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) {
@@ -200,8 +239,12 @@ fn apply_record(tx: &mpsc::UnboundedSender<LiveMsg>, record: &Value) {
             let _ = tx.send(LiveMsg::State { activity: "idle".into(), residency: String::new(), cache: String::new() });
         }
         "message_update" => {
-            let delta = record
-                .get("assistantMessageEvent")
+            let event = record.get("assistantMessageEvent");
+            let event_type = event.and_then(|e| e.get("type")).and_then(|t| t.as_str());
+            if matches!(event_type, Some(kind) if kind != "text_delta") {
+                return;
+            }
+            let delta = event
                 .and_then(|e| e.get("delta"))
                 .and_then(|d| d.as_str())
                 .or_else(|| record.get("delta").and_then(|d| d.as_str()));

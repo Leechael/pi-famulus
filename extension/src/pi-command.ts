@@ -13,7 +13,7 @@ export function resolvePiArgv(configured?: string | null, argv: readonly string[
     if (raw.startsWith("[")) {
       try {
         const parsed = JSON.parse(raw) as unknown;
-        if (Array.isArray(parsed) && parsed.every((part) => typeof part === "string" && part.length > 0)) {
+        if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((part) => typeof part === "string" && part.length > 0)) {
           return { argv: parsed as string[] };
         }
       } catch {

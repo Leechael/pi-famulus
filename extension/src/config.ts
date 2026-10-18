@@ -259,7 +259,9 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
     if (typeof section.spawnBudgetPerHour === "number" && section.spawnBudgetPerHour >= 1) {
       subagent.spawnBudgetPerHour = section.spawnBudgetPerHour;
     }
-    if (typeof section.piCommand === "string" && section.piCommand.trim()) {
+    if (Array.isArray(section.piCommand) && section.piCommand.length > 0 && section.piCommand.every((part) => typeof part === "string" && part.length > 0)) {
+      subagent.piCommand = JSON.stringify(section.piCommand);
+    } else if (typeof section.piCommand === "string" && section.piCommand.trim()) {
       subagent.piCommand = section.piCommand.trim();
     }
     config.subagent = subagent;

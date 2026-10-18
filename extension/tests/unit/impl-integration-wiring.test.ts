@@ -109,7 +109,7 @@ describe("comms tools over the real registry", () => {
       details: { ok: boolean };
     };
     expect(r2.details.ok).toBe(true);
-    expect(factory.sessions[0].prompts.at(-1)).toContain("now docs");
+    expect(factory.sessions[0].prompts).toEqual(["do alpha", "now docs"]);
   });
 
   it("need_decision blocks the child until the parent replies via the tool", async () => {

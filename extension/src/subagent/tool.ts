@@ -566,7 +566,7 @@ export function createSubagentTool(
     const record = params.run_id
       ? requireRun(registry, params.run_id)
       : params.child_id
-        ? registry.list().find((run) => run.children.some((c) => c.childId === params.child_id || c.name === params.child_id))
+        ? resolveRunByChild(registry, params.child_id)
         : undefined;
     if (!record) {
       if (params.child_id && !params.run_id) {
@@ -622,10 +622,11 @@ export function createSubagentTool(
       for (const child of idle) {
         await registry.handle(child.childId)?.interrupt();
       }
-      const scope = params.child_id ? `subagent ${params.child_id}` : `${targets.length + idle.length} subagent(s)`;
+      const interrupted = [...targets, ...idle].map((c) => c.childId);
+      const scope = params.child_id ? `subagent ${params.child_id}` : `${interrupted.length} subagent(s)`;
       return {
         content: [{ type: "text", text: `Interrupted ${scope} in run ${record.runId}.` }],
-        details: { run_id: record.runId, interrupted: targets.map((c) => c.childId) },
+        details: { run_id: record.runId, interrupted },
       };
     }
 
@@ -638,7 +639,15 @@ export function createSubagentTool(
         const { queuedBehind } = await registry.resumeChild(named.childId, params.message);
         armResumeWake(named.childId);
         return {
-          content: [{ type: "text", text: `Started a new turn on idle subagent ${named.name} (${named.childId}) in run ${record.runId}.${queuedBehind === null ? "" : ` Queued behind ${queuedBehind}.`}` }],
+          content: [{
+            type: "text",
+            text: fill("tools.subagent.result.resumed", {
+              name: named.name,
+              childId: named.childId,
+              runId: record.runId,
+              queued: queuedText(queuedBehind),
+            }),
+          }],
           details: { run_id: record.runId, child_id: named.childId, queued_behind: queuedBehind },
         };
       }
@@ -774,6 +783,18 @@ export function createSubagentTool(
 }
 
 /** Resume result clause for a turn waiting for an admission slot ("" when it started at once). */
+function resolveRunByChild(registry: SubagentRegistry, childIdOrName: string) {
+  const runs = registry.list();
+  const byId = runs.filter((run) => run.children.some((c) => c.childId === childIdOrName));
+  if (byId.length === 1) return byId[0];
+  const byName = runs.filter((run) => run.children.some((c) => c.name === childIdOrName));
+  if (byName.length > 1) {
+    const ids = byName.map((run) => run.runId).join(", ");
+    throw new Error(`child name "${childIdOrName}" is in more than one run (${ids}); pass run_id`);
+  }
+  return byName[0];
+}
+
 function queuedText(queuedBehind: number | null): string {
   if (queuedBehind === null) return "";
   const ahead = queuedBehind === 0 ? "" : ` and ${queuedBehind} subagent(s) are waiting ahead of it`;

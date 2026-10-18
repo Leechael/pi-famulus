@@ -80,10 +80,17 @@ export function createHostedSessionFn(deps: HostedSessionDeps): CreateSessionFn 
       cwd,
       env,
     });
-    await client.agentInput(req.childId, "set_steering_mode", "all", "parent").catch(() => {});
+    let warning = model.warning;
+    try {
+      await client.agentInput(req.childId, "set_steering_mode", "all", "parent");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const note = `Steering mode was not set (${message}); queued input may wait until the current turn ends.`;
+      warning = warning ? `${warning} ${note}` : note;
+    }
     await client.agentWatch(req.childId);
     const session = new HostedRpcSession(client, req.childId, {
-      warning: model.warning,
+      warning,
       resolvedModel: model.model ? `${model.model.provider}/${model.model.id}` : undefined,
       effectiveThinkingLevel: typeof thinking === "string" ? thinking : undefined,
       sessionFile: typeof spawned.session_file === "string" ? spawned.session_file : undefined,

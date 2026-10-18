@@ -18,8 +18,9 @@
  * pi loads the extension's TypeScript directly, so the prompts are compiled
  * into a module rather than read at runtime.
  */
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ROOT = join(import.meta.dirname, "..");
 const PROMPTS_DIR = join(ROOT, "prompts");
@@ -164,7 +165,8 @@ export function renderIndex({ prompts, segments }: ReturnType<typeof parsePrompt
   ].join("\n");
 }
 
-if (import.meta.main || process.argv[1]?.includes("build-prompts")) {
+const invokedDirectly = process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+if (import.meta.main || invokedDirectly) {
   const parsed = parsePrompts();
   const files: Array<[string, string]> = [
     [OUT_TS, renderModule(parsed)],

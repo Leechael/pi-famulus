@@ -314,6 +314,10 @@ fn apply_live(state: &mut TopState, msg: LiveMsg) {
     }
     match msg {
         LiveMsg::Error(text) => state.message = Some(text),
+        LiveMsg::Disconnected(text) => {
+            composer.connected = false;
+            state.message = Some(text);
+        }
         LiveMsg::Restored(text) => {
             if !text.is_empty() {
                 composer.input = text;

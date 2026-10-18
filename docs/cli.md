@@ -83,6 +83,7 @@ pi-famulus sessions [--json]
 pi-famulus ls [-a] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
 pi-famulus show <id> [--json]
 pi-famulus top [--once] [--interval DUR] [--session PREFIX] [--cwd DIR] [--json]
+pi-famulus attach <child-id>   # needs a terminal; opens top on that hosted subagent
 pi-famulus stats [--by agent|kind|agent,kind] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # --by defaults to agent
 pi-famulus agent <ch_id> [--full] [-f]
 pi-famulus events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
@@ -110,7 +111,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show`, `stats` and `top` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `upgrade`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show`, `stats` and `top` (read the disk instead), `attach` (needs a terminal and a running daemon; it does not start one), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `upgrade`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 

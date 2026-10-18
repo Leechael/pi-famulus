@@ -2,7 +2,7 @@
 
 # description
 
-Message your subagents. "send" steers or queues a running child, and starts a new turn on an idle one. <!--seg:tooldesc.agent-message-no-resume-->An idle child (warm or parked) continues with send or subagent resume; its prompt cache stays warm only for the time a wake or list reports. <!--/seg-->"reply" answers a child's pending decision request; "broadcast" steers every running child of a run (to = run_id); "list" shows children, pending decision requests, and recent traffic.
+Message your subagents. "send" steers or queues a running child, and starts a new turn on an idle one. <!--seg:tooldesc.agent-message-no-resume-->An idle child (warm or parked) continues with send or subagent resume; its prompt cache stays warm only for the time a wake reports. <!--/seg-->"reply" answers a child's pending decision request; "broadcast" steers every running child of a run (to = run_id); "list" shows children, pending decision requests, and recent traffic.
 
 # snippet
 

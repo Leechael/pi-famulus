@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -25,7 +25,7 @@ describe("parentResourceArgs", () => {
 
 describe("resolvePiArgv", () => {
   it("uses the pi launcher that is running this process, including a .bin symlink", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-argv-"));
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-argv-")));
     const cli = join(dir, "pi-coding-agent", "dist", "cli.js");
     mkdirSync(join(dir, "pi-coding-agent", "dist"), { recursive: true });
     writeFileSync(cli, "// pi\n");

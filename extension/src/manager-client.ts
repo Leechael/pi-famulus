@@ -978,7 +978,7 @@ export class ManagerClient {
     waitForAdmission = false,
   ): Promise<Record<string, unknown>> {
     const type = String(msg.type);
-    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent", "agent_spawn", "agent_input", "agent_watch", "agent_park", "hosted_lookup"].includes(type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent", "agent_spawn", "agent_watch", "agent_park", "hosted_lookup"].includes(type);
     const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
