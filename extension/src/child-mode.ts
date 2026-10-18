@@ -11,6 +11,7 @@ import { createChildBashTool } from "./subagent/child-bash";
 import { ChildShellTracker } from "./subagent/overrun";
 import { createContactSupervisorTool, createAgentMessageTool } from "./comms/tools";
 import { createComms } from "./comms/comms";
+import type { ChildHandle, ChildStatus, CommsHost } from "./comms/types";
 import { getFamulusHome, loadConfig, resolveManagerPath } from "./config";
 import { ManagerClient } from "./manager-client";
 import { realClock } from "./clock";
@@ -38,12 +39,61 @@ export function registerChildMode(pi: ExtensionAPI): void {
   const allow = process.env.PI_FAMULUS_CHILD_TOOLS?.split(",").filter(Boolean);
   const bashAllowed = !allow || allow.includes("bash");
 
-  const comms = createComms({
-    getChild: () => undefined,
-    listChildren: () => [],
+  interface Peer {
+    childId: string;
+    name: string;
+    runId: string;
+    activity: string;
+  }
+  const peers: Peer[] = [];
+
+  const peerStatus = (peer: Peer): ChildStatus => {
+    if (peer.activity === "running" || peer.activity === "starting") return "running";
+    if (peer.activity === "failed") return "failed";
+    return "completed";
+  };
+
+  const handleFor = (peer: Peer): ChildHandle => ({
+    childId: peer.childId,
+    result: Promise.resolve({ status: "completed", text: "", durationMs: 0 }),
+    steer: async (message: string) => { await client?.agentInput(peer.childId, "prompt_steer", message, childId); },
+    followUp: async (message: string) => { await client?.agentInput(peer.childId, "prompt_follow", message, childId); },
+    resume: async (message: string) => { await client?.agentInput(peer.childId, "prompt", message, childId); },
+    interrupt: async () => { await client?.agentInput(peer.childId, "abort", "", childId); },
+    status: () => peerStatus(peer),
+    lastEventAt: () => Date.now(),
+  });
+
+  const host: CommsHost = {
+    getChild(id) {
+      const peer = peers.find((item) => item.childId === id);
+      if (!peer) return undefined;
+      return { handle: handleFor(peer), runId: peer.runId, name: peer.name, status: peerStatus(peer) };
+    },
+    listChildren() {
+      return peers.map((peer) => ({ childId: peer.childId, runId: peer.runId, name: peer.name, status: peerStatus(peer) }));
+    },
     sameRun: () => true,
     notifySupervisor: () => {},
-  });
+    resumeChild: async (id, message) => {
+      if (!client) throw new Error("pi-famulus daemon is not connected");
+      await client.agentInput(id, "prompt", message, childId);
+      return { queuedBehind: null };
+    },
+  };
+
+  const refreshPeers = async () => {
+    if (!client?.isAvailable()) return;
+    const listed = await client.agentPeers().catch(() => []);
+    peers.splice(0, peers.length, ...listed.map((peer) => ({
+      childId: peer.childId,
+      name: peer.name,
+      runId: peer.runId,
+      activity: peer.activity,
+    })));
+  };
+
+  const comms = createComms(host);
 
   pi.registerTool({
     ...createContactSupervisorTool({
@@ -56,33 +106,31 @@ export function registerChildMode(pi: ExtensionAPI): void {
     promptGuidelines: [CHILD_BEHAVIOR_GUIDELINES],
   });
 
-  pi.registerTool(createAgentMessageTool(comms, { kind: "child", childId, runId }, {
-    getChild: (id) => ({
-      handle: {
-        childId: id,
-        result: Promise.resolve({ status: "completed", text: "", durationMs: 0 }),
-        steer: async (message: string) => { await client?.agentInput(id, "prompt_steer", message, childId); },
-        followUp: async (message: string) => { await client?.agentInput(id, "prompt_follow", message, childId); },
-        resume: async (message: string) => { await client?.agentInput(id, "prompt", message, childId); },
-        interrupt: async () => {},
-        status: () => "running" as const,
-        lastEventAt: () => Date.now(),
-      },
-      runId,
-      name: id,
-      status: "running" as const,
-    }),
-    listChildren: () => [],
-    sameRun: () => true,
-    notifySupervisor: () => {},
-  }, realClock));
+  const messageTool = createAgentMessageTool(comms, { kind: "child", childId, runId }, host, realClock);
+  pi.registerTool({
+    ...messageTool,
+    execute: async (toolCallId, params, signal, onUpdate, toolCtx) => {
+      await refreshPeers();
+      return messageTool.execute(toolCallId, params, signal, onUpdate, toolCtx);
+    },
+  });
 
   if (bashAllowed) {
     pi.registerTool(createChildBashTool({
       getClient: () => client,
       home,
       sessionId: () => ctx?.sessionManager.getSessionId() ?? childId,
-      sessionEnv: () => ({ ...process.env }) as Record<string, string>,
+      sessionEnv: (): Record<string, string> => {
+        const current = ctx;
+        if (!current) return {};
+        return {
+          PI_SESSION_ID: current.sessionManager.getSessionId(),
+          PI_SESSION_FILE: current.sessionManager.getSessionFile?.() ?? "",
+          PI_PROVIDER: current.model?.provider ?? "",
+          PI_MODEL: current.model?.id ?? "",
+          PI_REASONING_LEVEL: current.thinkingLevel ?? "",
+        };
+      },
       trackTask: () => {},
       childId,
       runId,

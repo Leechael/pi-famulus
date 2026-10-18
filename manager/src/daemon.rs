@@ -899,12 +899,13 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             session_file,
             child_id,
             token,
-            pi_version: _,
+            pi_version,
         } => {
-            if let Some(asked) = role.as_deref() {
+            if let Some(asked) = role {
                 let allowed = matches!(
                     (asked, client_kind),
-                    ("cli", ClientKind::Cli) | ("child" | "parent", ClientKind::Extension)
+                    (HelloRole::Cli, ClientKind::Cli)
+                        | (HelloRole::Child | HelloRole::Parent, ClientKind::Extension)
                 );
                 if !allowed {
                     let _ = tx
@@ -917,9 +918,9 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                     return;
                 }
             }
-            let role = match role.as_deref() {
-                Some("child") => ConnRole::Child,
-                Some("cli") => ConnRole::Cli,
+            let role = match role {
+                Some(HelloRole::Child) => ConnRole::Child,
+                Some(HelloRole::Cli) => ConnRole::Cli,
                 _ if client_kind == ClientKind::Cli => ConnRole::Cli,
                 _ => ConnRole::Parent,
             };
@@ -935,6 +936,7 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                 child_id,
                 token,
                 session_file,
+                pi_version,
             },
             )
         }
@@ -1104,6 +1106,7 @@ pub struct HelloInfo {
     pub child_id: Option<String>,
     pub token: Option<String>,
     pub session_file: Option<String>,
+    pub pi_version: Option<String>,
 }
 
 /// Register a hello'd connection. Same-session rebind: the new connection
@@ -1174,6 +1177,9 @@ fn register_conn(
     if info.role == ConnRole::Child {
         if let Some(child_id) = info.child_id.clone() {
             st.hosted.set_child_conn(&child_id, Some(conn_id));
+            if let Some(version) = info.pi_version.as_deref() {
+                st.hosted.set_pi_version(&child_id, version);
+            }
         }
     }
     st.conns.insert(
@@ -1759,11 +1765,11 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             let notice = { let st = state.lock().unwrap(); st.hosted.lookup(session_id.as_deref(), session_file.as_deref()) };
             respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "hosted": notice }))).await
         }
-        RequestKind::AgentCache { expires_at, tier, lifetime_ms: _ } => {
+        RequestKind::AgentCache { expires_at, tier, lifetime_ms } => {
             {
                 let st = state.lock().unwrap();
                 let child_id = st.conns.get(&conn_id).and_then(|c| c.child_id.clone()).unwrap_or_default();
-                st.hosted.cache(&child_id, expires_at, tier);
+                st.hosted.cache(&child_id, expires_at, tier, lifetime_ms);
             }
             respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
         }
@@ -1775,11 +1781,29 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             respond(&tx, &id, result).await
         }
         RequestKind::AgentTakeover { child_id } => {
-            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
+            match authorize_agent(&state, conn_id, &child_id, false) {
+                Err(e) => respond(&tx, &id, Err::<UnitOk, _>(e)).await,
+                Ok(()) => {
+                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
+                    respond(&tx, &id, hosted.takeover(&child_id).await.map(|()| UnitOk {})).await
+                }
+            }
+        }
+        RequestKind::AgentPeers => {
+            let (child_id, hosted, is_child) = {
                 let st = state.lock().unwrap();
-                st.hosted.takeover(&child_id).map(|()| UnitOk {})
-            });
-            respond(&tx, &id, result).await
+                let conn = st.conns.get(&conn_id);
+                (
+                    conn.and_then(|c| c.child_id.clone()).unwrap_or_default(),
+                    st.hosted.clone(),
+                    conn.is_some_and(|c| c.role == ConnRole::Child),
+                )
+            };
+            if !is_child {
+                respond(&tx, &id, Err::<serde_json::Value, _>(ProtoError::new(E_FORBIDDEN, "agent_peers is for a hosted child"))).await;
+            } else {
+                respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "peers": hosted.peers(&child_id) }))).await;
+            }
         }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
@@ -4401,7 +4425,7 @@ mod tests {
                 &state, tx, &Arc::new(Notify::new()),
                 &Arc::new(Mutex::new(HashMap::new())), &writer.abort_handle(),
                 ClientKind::Extension, Some(session.into()), Some(std::process::id()),
-                HelloInfo { cwd: None, extension_version: None, protocol: Some(5), role: ConnRole::Parent, child_id: None, token: None, session_file: None },
+                HelloInfo { cwd: None, extension_version: None, protocol: Some(5), role: ConnRole::Parent, child_id: None, token: None, session_file: None, pi_version: None },
             ).unwrap());
         }
         let request = |id: &str, kind: &str, child: &str| {

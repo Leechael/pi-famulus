@@ -137,8 +137,17 @@ pub async fn run(
         }
         sync_live(&mut state, home, &mut live_slot, &live_tx);
         for (op, text) in std::mem::take(&mut state.pending_live) {
-            if let Some((_, tx)) = &live_slot {
-                let _ = tx.send(LiveCmd::Send { op, text });
+            let sent = live_slot.as_ref().is_some_and(|(_, tx)| tx.send(LiveCmd::Send { op, text: text.clone() }).is_ok());
+            if !sent {
+                if let Some(composer) = state.composer.as_mut() {
+                    if composer.input.is_empty() {
+                        composer.input = text;
+                    } else {
+                        composer.input.push('\n');
+                        composer.input.push_str(&text);
+                    }
+                }
+                state.message = Some("the live session is gone; the message was put back".into());
             }
         }
     }

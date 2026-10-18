@@ -1051,19 +1051,24 @@ fn draw_detail(
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" · ");
-        let prompt = format!("› {}▏  {facts}", c.input);
+        let width = chunks[1].width as usize;
+        let suffix = if facts.is_empty() { String::new() } else { format!("  {facts}") };
+        let budget = width.saturating_sub(2 + suffix.chars().count() + 1);
+        let shown = tail_columns(&c.input, budget);
+        let prompt = format!("› {shown}▏{suffix}");
         frame.render_widget(Paragraph::new(Line::from(sp(fg(ACCENT), prompt))), chunks[1]);
     }
 
-    let mut keys: Vec<Key> = if live.is_some() {
-        vec![("q", "close", 0), ("enter", "send", 1), ("alt-enter", "later", 2), ("esc esc", "abort", 3)]
+    let keys: Vec<Key> = if live.is_some() {
+        vec![("q", "close", 0), ("enter", "send", 1), ("alt-enter", "later", 2), ("esc esc", "abort", 3), ("↑↓", "scroll", 4)]
     } else {
-        vec![("esc", "close", 0), ("o", if d.tools_expanded { "fold all" } else { "unfold all" }, 1)]
+        let mut keys = vec![("esc", "close", 0), ("o", if d.tools_expanded { "fold all" } else { "unfold all" }, 1)];
+        if running {
+            keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 2));
+        }
+        keys.extend([("↑↓", "scroll", 3), ("g G", "top / end", 4)]);
+        keys
     };
-    if running {
-        keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 2));
-    }
-    keys.extend([("↑↓", "scroll", 3), ("g G", "top / end", 4)]);
     let pill = pos_pill(d.follow, running, painted.len(), height, d.scroll);
     frame.render_widget(detail_block(&d.title, pill, Vec::new(), &keys, area.width), area);
 }
@@ -1074,6 +1079,24 @@ const SPIN_MS: u128 = 80;
 const MARGIN: usize = 2;
 /// Unfolded tool output / thinking hangs off a rule at this column.
 const HANG: usize = MARGIN + 2;
+
+/// Keep the end of `text` inside `width` columns. Code points above Latin-1 count as two.
+fn tail_columns(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = 0usize;
+    let mut start = text.len();
+    for (idx, ch) in text.char_indices().rev() {
+        let w = if (ch as u32) > 0xFF { 2 } else { 1 };
+        if used + w > width {
+            break;
+        }
+        used += w;
+        start = idx;
+    }
+    text[start..].to_string()
+}
 
 fn spin_index(ms: u128) -> usize {
     (ms as usize / SPIN_MS as usize) % SPIN.len()

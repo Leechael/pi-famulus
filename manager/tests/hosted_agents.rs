@@ -69,7 +69,8 @@ fn hosted_prompt_is_relayed_and_lookup_sees_the_session() {
     conn.hello_ext("sess-host");
     let spawned = spawn_fake(&home, &mut conn, "ch_aabbccdd");
     assert_eq!(spawned["residency"], "warm", "{spawned}");
-    assert_eq!(spawned["activity"], "starting", "{spawned}");
+    // get_state said the child is not streaming, so it is idle rather than stuck in starting.
+    assert_eq!(spawned["activity"], "idle", "{spawned}");
     let prompted = conn.request_ok(json!({
         "type": "agent_input",
         "child_id": "ch_aabbccdd",

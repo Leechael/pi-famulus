@@ -534,6 +534,29 @@ export class ManagerClient {
     await this.request({ type: "agent_watch", child_id: childId });
   }
 
+  async agentUnwatch(childId: string): Promise<void> {
+    this.requireHostedProtocol();
+    await this.request({ type: "agent_unwatch", child_id: childId });
+  }
+
+  async agentPeers(): Promise<Array<{ childId: string; name: string; runId: string; activity: string; residency: string }>> {
+    this.requireHostedProtocol();
+    const res = await this.request({ type: "agent_peers" });
+    const peers = Array.isArray(res.peers) ? res.peers : [];
+    return peers.flatMap((peer) => {
+      if (!peer || typeof peer !== "object") return [];
+      const row = peer as Record<string, unknown>;
+      if (typeof row.child_id !== "string") return [];
+      return [{
+        childId: row.child_id,
+        name: typeof row.name === "string" ? row.name : row.child_id,
+        runId: typeof row.run_id === "string" ? row.run_id : "",
+        activity: typeof row.activity === "string" ? row.activity : "idle",
+        residency: typeof row.residency === "string" ? row.residency : "",
+      }];
+    });
+  }
+
   async agentPark(childId: string): Promise<void> {
     this.requireHostedProtocol();
     await this.request({ type: "agent_park", child_id: childId });
@@ -978,7 +1001,7 @@ export class ManagerClient {
     waitForAdmission = false,
   ): Promise<Record<string, unknown>> {
     const type = String(msg.type);
-    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent", "agent_spawn", "agent_watch", "agent_park", "hosted_lookup"].includes(type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent", "agent_spawn", "agent_watch", "agent_unwatch", "agent_park", "agent_peers", "hosted_lookup"].includes(type);
     const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {

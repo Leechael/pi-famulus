@@ -99,10 +99,10 @@ export interface InProcessRunnerOptions {
   /** Shared time source and scheduler. */
   clock?: Clock;
   /**
-   * Per-generation admission hook. Awaited before each (re)start; the
-   * releaser gets terminal=false for a resumable interruption so its local
-   * slot can be returned while the child-owned machine permit is retained.
-   * Rejecting cancels the generation as {status:"interrupted", error}.
+   * Per-generation admission hook. Awaited before each (re)start. The
+   * releaser is called with terminal=true when the turn settles, including
+   * an interrupted turn: the machine permit is released and the next turn
+   * acquires again. Rejecting cancels the generation as {status:"interrupted", error}.
    */
   acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<(terminal?: boolean) => void>;
   /**
@@ -767,8 +767,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.status_ = result.status;
     // Every settled turn releases its machine permit, including an
     // interrupted one. The next turn (resume, send, user input) acquires again.
-    this.terminalSettle = true;
-    this.release(this.terminalSettle);
+    this.release(true);
     this.notifyActivity();
     this.resolveResult(result);
   }

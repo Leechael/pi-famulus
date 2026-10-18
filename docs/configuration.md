@@ -43,7 +43,7 @@ The `subagent` timeouts are staggered so they do not fire together:
 | `maxWarmAgents` | 4 | Machine-wide cap on warm (process alive) subagents. Past it, the least recently used idle one is parked. Top-level key, read by the daemon. |
 
 
-All keys above except `foregroundBudgetMs` and `managerPath` belong in the `subagent` object.
+All keys above except `foregroundBudgetMs`, `managerPath`, and `maxWarmAgents` belong in the `subagent` object. `maxWarmAgents` is top-level; the daemon reads it from there.
 
 ## Daemon keys
 
@@ -81,6 +81,6 @@ On Windows the file name in steps 4 and 5, and inside the native package, is `pi
 
 ## Degraded startup
 
-If the manager is missing or cannot start, the extension warns in the TUI. Bash then runs locally, so auto-backgrounding and manager-backed output and history are unavailable. `task_*` and `monitor` report that they are disabled. In-process subagents still run, but their `bash` tool fails until the manager is available. Fix the installation, or point to a binary with `PI_FAMULUS_MANAGER_PATH` or `managerPath`. If optional dependencies were omitted at install time, reinstall with them enabled. `pi update --extensions` runs npm install; an `omit=optional` npm setting removes the platform package during that update. The next session installs that exact package into the cache in step 3, in the background, including when the installed copy is the wrong version or not executable. Set `PI_FAMULUS_NO_NATIVE_FETCH=1` or run pi with `PI_OFFLINE=1` to keep the missing package as a degraded start.
+If the manager is missing or cannot start, the extension warns in the TUI. Bash then runs locally, so auto-backgrounding and manager-backed output and history are unavailable. `task_*` and `monitor` report that they are disabled. Subagent calls fail with that startup diagnosis; there is no in-process fallback. Fix the installation, or point to a binary with `PI_FAMULUS_MANAGER_PATH` or `managerPath`. If optional dependencies were omitted at install time, reinstall with them enabled. `pi update --extensions` runs npm install; an `omit=optional` npm setting removes the platform package during that update. The next session installs that exact package into the cache in step 3, in the background, including when the installed copy is the wrong version or not executable. Set `PI_FAMULUS_NO_NATIVE_FETCH=1` or run pi with `PI_OFFLINE=1` to keep the missing package as a degraded start.
 
 If the extension is loaded outside pi and pi's bundled `pi-tui` cannot be resolved, a one-time console warning says the interactive `/tasks` views use a reduced text fallback. Load the extension through pi for the full UI.

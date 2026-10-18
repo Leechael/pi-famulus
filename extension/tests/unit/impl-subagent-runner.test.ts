@@ -383,30 +383,23 @@ describe("InProcessRunner", () => {
     expect(releases).toEqual([true, true]);
   });
 
-  it("releases a permit admitted after a resumable interruption", async () => {
+  it("dispose releases a permit still held after a resumable interruption", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
     const releases: boolean[] = [];
-    let resolveAdmission!: (release: (terminal?: boolean) => void) => void;
-    let acquired = 0;
     const runner = new InProcessRunner({
       createSession: factory.fn,
-      acquire: async () => {
-        acquired++;
-        if (acquired === 1) return (terminal = true) => { releases.push(terminal); };
-        return new Promise((resolve) => { resolveAdmission = resolve; });
-      },
+      acquire: async () => (terminal = true) => { releases.push(terminal); },
     });
     const handle = await runner.start(makeReq());
     await handle.interrupt();
-    await handle.resume("continue");
+    expect(releases).toEqual([true]);
+    const resumed = handle.resume("continue");
     await tick();
-    expect(acquired).toBe(2);
-    await handle.interrupt();
-    resolveAdmission((terminal = true) => { releases.push(terminal); });
-    await tick();
-    expect(releases).toEqual([true, true]);
+    expect(releases).toEqual([true]);
     handle.dispose();
+    await resumed.catch(() => {});
+    await tick();
     expect(releases).toEqual([true, true]);
   });
 

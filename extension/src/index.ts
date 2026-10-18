@@ -47,7 +47,7 @@ import { fileURLToPath } from "node:url";
 import { isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
 import { createHostedSessionFn } from "./subagent/hosted-session";
 import { isHostedChildProcess, registerChildMode } from "./child-mode";
-import { registerAttachCommand } from "./tui/attach-command";
+import { openAttachView, registerAttachCommand } from "./tui/attach-command";
 import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
@@ -58,6 +58,48 @@ import { registerFamulusMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
 import { stderrPathFor } from "./tui/task-output-paths";
 import { shellWakeTitle } from "./wake";
+
+async function promptIfHostedSession(
+  c: ManagerClient,
+  live: () => ExtensionContext | null,
+  query: { sessionFile?: string | null; sessionId?: string },
+  where: "start" | "switch",
+): Promise<"takeover" | "stay" | "none"> {
+  if (!c.isAvailable() || c.protocolLevel() < 6) return "none";
+  const found = await c.hostedLookup({
+    ...(query.sessionId ? { sessionId: query.sessionId } : {}),
+    ...(query.sessionFile ? { sessionFile: query.sessionFile } : {}),
+  }).catch(() => null);
+  if (!found || found.residency !== "warm" || typeof found.child_id !== "string") return "none";
+  const uiCtx = live();
+  if (!uiCtx) return "none";
+  if (where === "start" && query.sessionId && uiCtx.sessionManager.getSessionId() !== query.sessionId) return "none";
+  if (!uiCtx.hasUI) {
+    uiCtx.ui.notify(
+      "This session file belongs to a warm hosted subagent. Use /attach from the parent, or open it in the TUI to take over.",
+      "warning",
+    );
+    return "stay";
+  }
+  const choice = await uiCtx.ui.select("This session is hosted by pi-famulus", [
+    "Attach to the hosted process",
+    "Take over",
+    "Cancel",
+  ]);
+  if (choice === "Take over") {
+    try {
+      await c.agentTakeover(found.child_id);
+      return "takeover";
+    } catch (err) {
+      uiCtx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+      return "stay";
+    }
+  }
+  if (choice === "Attach to the hosted process") {
+    await openAttachView(uiCtx, c, found.child_id);
+  }
+  return "stay";
+}
 
 /** Read only the tail of a task output file for the notification preview (≤ maxChars). */
 export function readPreview(outputPath: string | undefined, maxChars: number): string {
@@ -897,6 +939,9 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         if (ok === null || client !== c || !c) return;
         if (ok) {
           if (c.protocolLevel() >= 4) void reconcileAgentLeases(c).catch(() => {});
+          const file = startCtx.sessionManager.getSessionFile?.();
+          const sid = startCtx.sessionManager.getSessionId();
+          void promptIfHostedSession(c, () => ctx, { sessionFile: file, sessionId: sid }, "start").catch(() => {});
           return;
         }
         // A /reload may have replaced startCtx by now; report to the live one.
@@ -943,19 +988,9 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
 
   pi.on("session_before_switch", async (event, switchCtx) => {
     const file = event.targetSessionFile;
-    if (!file || !client?.isAvailable() || client.protocolLevel() < 6) return;
-    const found = await client.hostedLookup({ sessionFile: file }).catch(() => null);
-    if (!found || found.residency !== "warm" || typeof found.child_id !== "string") return;
-    if (!switchCtx.hasUI) return { cancel: true };
-    const choice = await switchCtx.ui.select("This session is hosted by pi-famulus", [
-      "Attach to the hosted process",
-      "Take over",
-      "Cancel",
-    ]);
-    if (choice === "Take over") {
-      await client.agentTakeover(found.child_id).catch(() => {});
-      return;
-    }
+    if (!file || !client?.isAvailable()) return;
+    const outcome = await promptIfHostedSession(client, () => switchCtx, { sessionFile: file }, "switch");
+    if (outcome === "none" || outcome === "takeover") return;
     return { cancel: true };
   });
 

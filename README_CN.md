@@ -30,7 +30,7 @@ agent 需要等待时，会出三种问题：
 - **后台命令结束时没人知道。** 装了 pi-famulus 后，命令一退出，结果就注入对话，模型收到后直接接着做，不用轮询。
 - **子代理报告完成时，它启动的活还在跑。** 装了 pi-famulus 后，子代理的 `bash` 不能转到后台，子代理也不能再启动子代理或 monitor。所以它报告完成时，它通过 pi-famulus 启动的东西都已经停了。例外是用 `setsid` 脱离出去的命令，以及用 `&` 留在后台的进程。
 
-整台机器只有一个守护进程（`pi-famulus`，用 Rust 编写）。它启动每一条 shell 命令和每一个 monitor，包括子代理运行的那些，并作为它们的父进程。守护进程崩溃或被杀掉时，它启动的进程组都会被停止；用 `setsid` 进入新会话的命令除外。子代理本身运行在 pi 内部。
+整台机器只有一个守护进程（`pi-famulus`，用 Rust 编写）。它启动每一条 shell 命令和每一个 monitor，包括子代理运行的那些，并作为它们的父进程。守护进程崩溃或被杀掉时，它启动的进程组都会被停止；用 `setsid` 进入新会话的命令除外。每个子代理本身是守护进程托管的 `pi --mode rpc` 进程，而不是跑在父会话里面。
 
 pi-famulus 是一个 pi 扩展，pi 能加载扩展的地方它都能用：pi TUI、RPC 模式，以及用 pi SDK 开发的 agent。离开 TUI 就没有 `/tasks` 列表和 fleet 行，但结果照样会唤醒 agent。print 模式（`pi -p`）在第一轮运行结束时就退出，之后才到的结果收不到。
 
@@ -123,7 +123,7 @@ pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及
 
 - 在 Unix 上，守护进程把每个 shell 和 monitor 任务作为一个进程组启动，并作为它的父进程。守护进程结束时（`shutdown`、`kill -9`、panic），每个进程组先收到 SIGTERM，2 秒后收到 SIGKILL。Windows 上的任务跑在 Job Object 里，被停止或守护进程退出时作为一个整体终止。
 - 把子进程移到新会话（`setsid`）的命令会离开进程组，不受上面的约束。用 `&` 留在后台的进程会一直运行，直到它自己退出或被守护进程停止。
-- 最后一个 pi 会话关闭后，运行中的任务不会保留。最后一个会话断开 5 秒后，守护进程停止剩下的任务并退出。记录、输出和 transcript 在磁盘上保留 24 小时。
+- shell 和 monitor 不会在最后一个 pi 会话关闭后继续跑。最后一个会话断开、并且没有仍处于 warm 的托管子代理时，5 秒后守护进程停止剩下的任务并退出。仍 warm 的子代理会把守护进程留着，直到它自己的保留时间到了再停。记录、输出和 transcript 在磁盘上保留 24 小时。
 - 子代理的 30 分钟回合预算用完时还在运行，不会被杀掉，除非你设置了 `hardTimeoutMs`。父代理会收到通知，再决定延长、改方向还是中断。
 - 子代理 5 分钟没有动静时，会在同一个会话上恢复一次，transcript 保留。工具运行期间，或 `contact_supervisor` 的问题等待回答期间，计时暂停。如果它再次停滞，就被标记为失败。
 - `monitor` 每 200 ms 把输出合成一批。同一 monitor 的完整重复行默认在 60 秒内去重，默认精确匹配，忽略时间戳需要显式开启。通知是有长度上限的预览，原始输出可通过 `task_output` 读取。去重不计为过载丢弃。通过去重的批次允许一次连发 10 个事件，之后每 2 秒一个，超出的批次会被丢弃。在一个至少有 10 批的 30 秒窗口里，如果至少一半的批次被丢弃，monitor 会停止并通知你。
@@ -132,10 +132,10 @@ pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及
 ## FAQ
 
 - **pi-famulus 和 `pi-subagents`、`pi-background-tasks` 有什么区别？** 它们是替代关系，选一个用。想要现成的角色、保存的工作流、`/council`，或在独立进程里跑的后台子代理，选 [`pi-subagents`](https://github.com/nicobailon/pi-subagents)。想要带输出文件的具名后台 shell 任务、只读的委派 agent，或它的 Fusion 工作流，选 [`pi-background-tasks`](https://github.com/ismailsaleekh/pi-background-tasks)。想要一个守护进程管理你所有 pi 会话里的 shell 和 monitor 进程、子代理共享并发上限、以及一个能查历史运行的 CLI，选 pi-famulus。
-- **能像 tmux pane 那样 attach 到子代理上吗？** 可以。每个子代理是一个带 pi session id 的 `pi --mode rpc` 进程。pi TUI 里用 `/attach <id>`，终端里用 `pi-famulus attach <id>`，都是跟那个进程说话。它还在托管时，另开一个 `pi --session` 打开同一会话会被拒绝：可以选择接管，或者 attach。
+- **能像 tmux pane 那样 attach 到子代理上吗？** 可以。每个子代理是一个带 pi session id 的 `pi --mode rpc` 进程。pi TUI 里用 `/attach <id>`，终端里用 `pi-famulus attach <child id>`，都是跟那个进程说话。进程还活着时，在 pi TUI 里再打开同一会话会让你选择 attach、接管或取消。没有界面时这次打开会被拒绝。已经停掉（parked）的子代理可以直接打开。
 - **能在 pi TUI 以外使用吗？** 能。pi 能加载扩展的地方它都能加载，包括 RPC 模式（`pi --mode rpc`）和用 pi SDK 开发的 agent。print 模式（`pi -p`）也能加载，但第一轮运行结束就退出，之后的结果收不到。在 SDK 开发的 agent 里，通过 `DefaultResourceLoader` 加载它（比如用 `additionalExtensionPaths`），再调用 `session.bindExtensions()`。真实模型评测就是在 RPC 模式下驱动 pi 的。
 - **子代理能再启动子代理吗？** 不能，嵌套只有一层。
-- **pi 退出后后台任务会怎样？** 最后一个 pi 会话关闭 5 秒后，守护进程停止仍在运行的任务并退出。之后可以用 `pi-famulus show <id>` 查看记录。
+- **pi 退出后后台任务会怎样？** 最后一个 pi 会话关闭、并且没有仍处于 warm 的托管子代理时，5 秒后守护进程停止仍在运行的任务并退出。之后可以用 `pi-famulus show <id>` 查看记录。
 - **`/reload` 会中断正在运行的任务吗？** 不会。shell、monitor 和子代理继续运行，结果照常送达。如果这次 reload 加载的是另一个版本的 pi-famulus，旧版本的任务会先被停止。
 - **怎么知道用的是哪个二进制、哪个版本？** 输入 `/famulus`，它显示 `pi-famulus` 二进制路径及其版本、正在运行的 manager 的版本和 pid，以及扩展的版本。
 - **为什么 pi 的 bash 命令在长时间构建时卡住？** 装了 pi-famulus 后，`bash` 等 20 秒就不再等，把命令转到后台，这一回合继续。要改这个时限，在 `~/.pi/agent/pi-famulus/config.json` 里设置 `foregroundBudgetMs`（[配置说明](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)）。

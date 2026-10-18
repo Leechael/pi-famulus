@@ -70,11 +70,76 @@ pub fn main(argv: Vec<String>) -> i32 {
             }
         }
     });
+    let leader = child.id();
     let status = child.wait();
     let _ = copy.join();
+    #[cfg(unix)]
+    if lifeline_broken() {
+        reap_orphans(leader);
+    }
     match status {
-        Ok(s) => s.code().unwrap_or(1),
+        Ok(s) => command_exit(s),
         Err(_) => 1,
+    }
+}
+
+fn command_exit(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        1
+    }
+}
+
+#[cfg(unix)]
+fn lifeline_broken() -> bool {
+    let mut fds = [libc::pollfd {
+        fd: RUNNER_LIFELINE_FD,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    }];
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+    rc > 0 && (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
+/// The daemon is already gone and pi has exited. Kill whatever ignored SIGTERM
+/// before this process returns and abandons the group.
+#[cfg(unix)]
+fn reap_orphans(leader: u32) {
+    if leader == 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match crate::sys::group_members(leader) {
+            Ok(pids) => {
+                let others: Vec<u32> = pids.into_iter().filter(|p| *p != leader).collect();
+                if others.is_empty() {
+                    return;
+                }
+                for pid in others {
+                    let _ = crate::sys::kill_pid(pid, crate::sys::SIGKILL);
+                }
+            }
+            Err(_) => {
+                let _ = crate::sys::signal_group(leader, crate::sys::SIGKILL);
+                if !crate::sys::group_alive(leader) {
+                    return;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

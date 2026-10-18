@@ -56,7 +56,9 @@ struct Agent {
     session_file: Option<String>,
     pi_session_id: Option<String>,
     cache_expires_at: Option<u64>,
+    cache_lifetime_ms: Option<u64>,
     cache_tier: Option<String>,
+    pi_version: Option<String>,
     idle_since: Option<u64>,
     last_user_ms: Option<u64>,
     user_spoke: bool,
@@ -88,12 +90,18 @@ struct DiskAgent {
     token: String,
     argv: Vec<String>,
     cwd: String,
+    #[serde(default)]
+    env: HashMap<String, String>,
     residency: String,
     activity: String,
     driver: String,
     session_file: Option<String>,
     pi_session_id: Option<String>,
     cache_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_lifetime_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_version: Option<String>,
     last_text: String,
 }
 
@@ -179,10 +187,43 @@ impl Hosted {
 
     pub fn lookup(&self, session_id: Option<&str>, session_file: Option<&str>) -> Option<crate::proto::HostedNotice> {
         let g = self.inner.lock().unwrap();
-        let id = session_id.and_then(|s| g.agents.contains_key(s).then(|| s.to_string())).or_else(|| {
-            session_file.and_then(|f| g.by_file.get(f).cloned())
-        })?;
+        let id = resolve_id(&g, session_id, session_file)?;
         g.agents.get(&id).map(|a| a.notice())
+    }
+
+    /// Same-run siblings, including the caller. A hosted child uses this to address peers.
+    pub fn peers(&self, child_id: &str) -> Vec<Value> {
+        let g = self.inner.lock().unwrap();
+        let Some(me) = g.agents.get(child_id) else { return Vec::new() };
+        let parent = me.parent_session.clone();
+        let run = me.run_id.clone();
+        g.agents
+            .values()
+            .filter(|a| a.parent_session == parent && a.run_id == run)
+            .map(|a| json!({
+                "child_id": a.child_id,
+                "name": a.name,
+                "run_id": a.run_id,
+                "activity": a.activity,
+                "residency": a.residency,
+            }))
+            .collect()
+    }
+
+    pub fn set_pi_version(&self, child_id: &str, version: &str) {
+        if version.is_empty() {
+            return;
+        }
+        let home = {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(agent) = g.agents.get_mut(child_id) {
+                agent.pi_version = Some(version.to_string());
+            }
+            g.home.clone()
+        };
+        if let Some(agent) = self.inner.lock().unwrap().agents.get(child_id) {
+            agent.persist(&home);
+        }
     }
 
     /// Interactive pi opened a parked session file: the daemon will not respawn it.
@@ -218,6 +259,12 @@ impl Hosted {
         {
             let g = self.inner.lock().unwrap();
             if let Some(agent) = g.agents.get(child_id) {
+                if agent.parent_session_claimed_externally() {
+                    return Err(ProtoError::new(
+                        E_FORBIDDEN,
+                        format!("{child_id} is open in pi session {}; ask the user or wait", agent.parent_session),
+                    ));
+                }
                 if agent.residency == "warm" {
                     if agent.parent_session != parent_session {
                         return Err(ProtoError::new(
@@ -267,7 +314,17 @@ impl Hosted {
             }
         }
         self.pump(child_id.to_string(), generation, proc.stdout, proc.stderr, proc.stdin, stdin_rx, proc.child);
-        let state = self.rpc_ready(child_id, "get_state", "", "daemon", None).await?;
+        let state = match self.rpc_ready(child_id, "get_state", "", "daemon", None).await {
+            Ok(v) => v,
+            Err(e) => {
+                let pid = self.inner.lock().unwrap().agents.get(child_id).map(|a| a.pid).unwrap_or(0);
+                self.mark_failed(child_id, &e.message);
+                if pid != 0 {
+                    let _ = task::signal_group(pid, task::SIGKILL);
+                }
+                return Err(e);
+            }
+        };
         if let Some(file) = state.get("sessionFile").and_then(|v| v.as_str()) {
             let mut g = self.inner.lock().unwrap();
             let home = g.home.clone();
@@ -284,6 +341,20 @@ impl Hosted {
         if let Some(id) = state.get("sessionId").and_then(|v| v.as_str()) {
             if let Some(agent) = self.inner.lock().unwrap().agents.get_mut(child_id) {
                 agent.pi_session_id = Some(id.to_string());
+            }
+        }
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(agent) = g.agents.get_mut(child_id) {
+                if agent.activity == "starting" {
+                    let streaming = state.get("isStreaming").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if streaming {
+                        agent.activity = "running".into();
+                    } else {
+                        agent.activity = "idle".into();
+                        agent.idle_since = Some(now_ms());
+                    }
+                }
             }
         }
         self.emit_state(child_id);
@@ -432,12 +503,13 @@ impl Hosted {
         Err(ProtoError::new(E_NOT_FOUND, "no pending decision with that request_id"))
     }
 
-    pub fn cache(&self, child_id: &str, expires_at: Option<u64>, tier: Option<String>) {
+    pub fn cache(&self, child_id: &str, expires_at: Option<u64>, tier: Option<String>, lifetime_ms: Option<u64>) {
         let home = {
             let mut g = self.inner.lock().unwrap();
             if let Some(agent) = g.agents.get_mut(child_id) {
                 agent.cache_expires_at = expires_at;
                 agent.cache_tier = tier;
+                agent.cache_lifetime_ms = lifetime_ms;
             }
             g.home.clone()
         };
@@ -474,8 +546,18 @@ impl Hosted {
         self.park_inner(child_id, reason)
     }
 
-    pub fn takeover(&self, child_id: &str) -> Result<(), ProtoError> {
-        self.park_inner(child_id, "takeover")
+    /// Abort the hosted process and wait until it has left the session file.
+    pub async fn takeover(&self, child_id: &str) -> Result<(), ProtoError> {
+        let pid = {
+            let g = self.inner.lock().unwrap();
+            g.agents.get(child_id).ok_or_else(|| ProtoError::new(E_NOT_FOUND, "unknown child"))?.pid
+        };
+        if pid != 0 {
+            self.rpc_nowait(child_id, "abort");
+        }
+        self.park_inner(child_id, "takeover")?;
+        wait_pid_gone(pid).await;
+        Ok(())
     }
 
     pub fn on_parent_closed(&self, parent_session: &str) {
@@ -685,6 +767,7 @@ impl Hosted {
         let mut parent = None;
         let mut forward = false;
         let mut ui_cancel: Option<String> = None;
+        let mut capped = Vec::new();
         {
             let mut g = self.inner.lock().unwrap();
             let Some(agent) = g.agents.get_mut(child_id) else { return };
@@ -709,7 +792,7 @@ impl Hosted {
                             agent.activity = "idle".into();
                         }
                         agent.idle_since = Some(now_ms());
-                        self_cap_warm(&mut g);
+                        capped = over_cap_ids(&g);
                     }
                     "message_end" => {
                         if let Some(text) = assistant_text(&value) {
@@ -735,6 +818,9 @@ impl Hosted {
             let _ = self.ui_response(child_id, &rpc_id, &json!({"cancelled": true}), true);
             let home = self.inner.lock().unwrap().home.clone();
             crate::events::emit(&home, parent.as_deref(), "agent.ui_cancelled", Some(child_id), json!({ "rpc_id": rpc_id }));
+        }
+        for id in capped {
+            let _ = self.park_inner(&id, "warm-cap");
         }
         if forward {
             let event = if value.get("type").and_then(|t| t.as_str()) == Some("extension_ui_request") {
@@ -817,9 +903,12 @@ impl Hosted {
             );
             agent.residency = "parked".into();
             agent.activity = "idle".into();
+            agent.env = disk.env;
             agent.session_file = disk.session_file.clone();
             agent.pi_session_id = disk.pi_session_id;
             agent.cache_expires_at = disk.cache_expires_at;
+            agent.cache_lifetime_ms = disk.cache_lifetime_ms;
+            agent.pi_version = disk.pi_version;
             agent.last_text = disk.last_text;
             agent.driver = "parent".into();
             let mut g = self.inner.lock().unwrap();
@@ -831,22 +920,45 @@ impl Hosted {
     }
 }
 
-fn self_cap_warm(g: &mut Inner) {
+fn over_cap_ids(g: &Inner) -> Vec<String> {
     let limits = limits_of(&g.home);
     let mut idle: Vec<(String, u64)> = g.agents.values()
         .filter(|a| a.residency == "warm" && a.activity != "running" && a.activity != "starting")
         .map(|a| (a.child_id.clone(), a.idle_since.unwrap_or(0)))
         .collect();
     if idle.len() <= limits.max_warm {
-        return;
+        return Vec::new();
     }
     idle.sort_by_key(|(_, t)| *t);
     let extra = idle.len() - limits.max_warm;
-    for (id, _) in idle.into_iter().take(extra) {
-        if let Some(agent) = g.agents.get_mut(&id) {
-            agent.park_scheduled = true;
-            agent.stdin.take();
-            agent.residency = "parked".into();
+    idle.into_iter().take(extra).map(|(id, _)| id).collect()
+}
+
+fn resolve_id(g: &Inner, session_id: Option<&str>, session_file: Option<&str>) -> Option<String> {
+    if let Some(s) = session_id {
+        if g.agents.contains_key(s) {
+            return Some(s.to_string());
+        }
+        if let Some(id) = g.agents.values().find(|a| a.pi_session_id.as_deref() == Some(s)).map(|a| a.child_id.clone()) {
+            return Some(id);
+        }
+    }
+    session_file.and_then(|f| g.by_file.get(f).cloned())
+}
+
+async fn wait_pid_gone(pid: u32) {
+    if pid == 0 || !task::pid_alive(pid) {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while task::pid_alive(pid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if task::pid_alive(pid) {
+        let _ = task::signal_group(pid, task::SIGKILL);
+        let hard = tokio::time::Instant::now() + Duration::from_secs(2);
+        while task::pid_alive(pid) && tokio::time::Instant::now() < hard {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -869,7 +981,9 @@ impl Agent {
             session_file: None,
             pi_session_id: None,
             cache_expires_at: None,
+            cache_lifetime_ms: None,
             cache_tier: None,
+            pi_version: None,
             idle_since: None,
             last_user_ms: None,
             user_spoke: false,
@@ -898,6 +1012,8 @@ impl Agent {
             parent_session: Some(self.parent_session.clone()),
             session_file: self.session_file.clone(),
             cache_expires_at: self.cache_expires_at,
+            cache_lifetime_ms: self.cache_lifetime_ms,
+            pi_version: self.pi_version.clone(),
         }
     }
 
@@ -911,6 +1027,8 @@ impl Agent {
             "session_file": self.session_file,
             "session_id": self.pi_session_id,
             "cache_expires_at": self.cache_expires_at,
+            "cache_lifetime_ms": self.cache_lifetime_ms,
+            "pi_version": self.pi_version,
             "run_id": self.run_id,
             "name": self.name,
         })
@@ -926,6 +1044,8 @@ impl Agent {
             session_file: self.session_file.clone(),
             cache_expires_at: self.cache_expires_at,
             session_id: self.pi_session_id.clone(),
+            cache_lifetime_ms: self.cache_lifetime_ms,
+            pi_version: self.pi_version.clone(),
         }
     }
 
@@ -940,12 +1060,15 @@ impl Agent {
             token: self.token.clone(),
             argv: self.argv.clone(),
             cwd: self.cwd.clone(),
+            env: self.env.clone(),
             residency: self.residency.clone(),
             activity: self.activity.clone(),
             driver: self.driver.clone(),
             session_file: self.session_file.clone(),
             pi_session_id: self.pi_session_id.clone(),
             cache_expires_at: self.cache_expires_at,
+            cache_lifetime_ms: self.cache_lifetime_ms,
+            pi_version: self.pi_version.clone(),
             last_text: self.last_text.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&disk) {

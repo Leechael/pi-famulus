@@ -260,6 +260,15 @@ pub struct Request {
     pub kind: RequestKind,
 }
 
+/// Hello `role`. Unknown strings fail deserialization (`E_BAD_REQUEST`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelloRole {
+    Parent,
+    Cli,
+    Child,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestKind {
@@ -281,8 +290,9 @@ pub enum RequestKind {
         protocol: Option<u32>,
         /// `parent` (a pi session), `cli`, or `child` (pi-famulus inside a
         /// hosted subagent). Absent: extension → parent, cli → cli.
+        /// Any other string is rejected at parse time.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        role: Option<String>,
+        role: Option<HelloRole>,
         /// Pi session file this connection has open, when it knows it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_file: Option<String>,
@@ -438,6 +448,8 @@ pub enum RequestKind {
     },
     /// Close a warm idle subagent now (keep the session file).
     AgentPark { child_id: String },
+    /// Siblings in the calling child's run. Hosted children only.
+    AgentPeers,
     /// Stop a warm subagent so an interactive pi can own its session file.
     AgentTakeover { child_id: String },
     Shutdown,
@@ -526,6 +538,10 @@ pub struct HostedNotice {
     pub session_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_lifetime_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -743,6 +759,10 @@ pub enum EventKind {
         cache_expires_at: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_lifetime_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_version: Option<String>,
     },
     /// A hosted child is asking its parent (or an attached UI).
     /// The wire name stays `agent_comms`: the parent extension matches that,
@@ -973,6 +993,12 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn hello_unknown_role_fails_to_parse() {
+        let raw = br#"{"type":"hello","client_kind":"extension","session_id":"s","pi_pid":1,"role":"chld"}"#;
+        assert!(serde_json::from_slice::<Request>(raw).is_err());
     }
 
     #[test]

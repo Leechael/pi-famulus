@@ -21,7 +21,7 @@ pi (`@earendil-works/pi-coding-agent`) deliberately leaves subagents, background
 | Synchronous strategy | Smart budget mode: wait synchronously by default, automatically switch to asynchronous execution when the foreground budget expires (grok style) |
 | Child-agent process model | Each subagent is a `pi --mode rpc` process owned by the daemon, with a normal pi session file. The runner seam stays in the extension (budgets, stalls, wakes). See `docs/plans/2026-10-17-rpc-hosted-subagents.md` |
 | Process management | Standalone Rust binary `pi-famulus`, machine-wide singleton, conventional paths, isolation through session_id namespaces |
-| Manager lifecycle | **Lives and dies with pi processes**: zero active connections → kill remaining tasks → exit. Started under a lock when needed. Never resurrects itself; only clients have spawn authority |
+| Manager lifecycle | **Lives while a pi session is connected or a hosted subagent is warm**: zero session connections and no warm child → kill remaining tasks → exit. Started under a lock when needed. Never resurrects itself; only clients have spawn authority |
 | Manager language | Rust (tokio + usage-rs + serde_json + interprocess + fd-lock) |
 
 ### Research sources (findings incorporated; no implementation dependency)
@@ -37,18 +37,19 @@ pi (`@earendil-works/pi-coding-agent`) deliberately leaves subagents, background
 ```
 pi instance A (session a) ──┐
 pi instance B (session b) ──┼── conventional-path socket ──► pi-famulus (Rust, machine-wide singleton)
-pi instance C (session c) ──┘                                ├─ process engine: spawn/wait/stop/output
+pi instance C (session c) ──┘                                                                                            ├─ process engine: spawn/wait/stop/output
+                                                            ├─ hosted agents: residency, retention, RPC relay
                                                             ├─ session_id namespaces
     pi extension (TS, in-process)                           ├─ dual output writes (bounded memory + full disk log)
     ├─ bash override ────► manager client ──────────────────┤─ event push (task_started/exited/output)
-    ├─ monitor tool ────► start + watch output stream        └─ lifecycle: zero connections → cleanup and exit
+    ├─ monitor tool ────► start + watch output stream        └─ lifecycle: no sessions and no warm child → exit
     ├─ task_list/output/stop
     ├─ subagent tool ───► ChildRunner seam (hosted pi --mode rpc, via the daemon)
-    ├─ comms ──► in-process mailbox (contact_supervisor / agent_message)
+    ├─ comms ──► daemon relay for child messages; mailbox stays in the extension
     └─ NotifyCenter ──► sole injection outlet (triggerTurn/steer/passive)
 ```
 
-**Strict layering rule**: the manager handles only processes and output pipes, with no LLM/session semantics; all semantics (budgets, rate limiting, truncation, injection, communication) live in the extension.
+**Layering**: the manager owns processes, output pipes, and hosted-subagent residency (RPC framing, warm/parked, retention). Conversation content, budgets, rate limiting, truncation, injection, and the comms mailbox stay in the extension. The daemon moves JSONL between the extension and the child; it does not interpret the conversation.
 
 ## 3. pi-famulus (Rust)
 
@@ -104,7 +105,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 
 - Each extension connection registers `{session_id, pi_pid}` at `hello`; that connection is the session's control channel
 - Connection closes (process death necessarily causes this with Unix sockets, including kill -9) → mark that session disconnected
-- **Zero active connections for 5s → graceful shutdown**:
+- **Zero session connections and no warm hosted subagent for 5s → graceful shutdown** (a warm child keeps the daemon up after its parent disconnects; child connections do not count as sessions):
   1. Send SIGTERM to all running tasks (process groups); include tasks whose leader exited but whose group still contains members (background children)
   2. 2s grace → send SIGKILL to **process groups** that may still have members (even with a dead leader, SIGTERM-ignoring descendants are killed)
   3. Persist task state as `killed` (`end_reason: "manager-shutdown"`)
@@ -150,6 +151,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 - Omitting `env` from `start` → the child inherits the manager's own environment (the extension always explicitly passes the complete env)
 - `stop` response = signal sent (SIGTERM→2s→SIGKILL flow started); the state change is determined by `task_exited`; killed tasks' `task_exited` carries `exit_code:null, signal:"SIGTERM"|"SIGKILL"`
 - CLI output is human-readable tables (not a contract); successful `shutdown` exits 0
+- Protocol 6 adds hosted-subagent requests (`agent_spawn`, `agent_input`, `agent_watch` / `agent_unwatch`, `agent_peers`, `agent_park`, `agent_takeover`, `agent_comms`, `hosted_lookup`, `agent_cache`). `hello.role` is `parent`, `cli`, or `child`; any other string is `E_BAD_REQUEST`. `agent_cache.lifetime_ms` and `hello.pi_version` are stored on the hosted agent and included in `agent_state` (and therefore in `pi-famulus top`).
 
 #### Message definitions
 
@@ -493,11 +495,11 @@ Attributes use kebab-case, values are XML-escaped. All child-element text is esc
 
 ### 4.6 subagent tool (M3)
 
-Modules: `src/subagent/` (types.ts / runner.ts / registry.ts / pool.ts / tool.ts / child-bash.ts / pi-runtime.ts / fleet-widget.ts)
+Modules: `src/subagent/` (types.ts / runner.ts / registry.ts / pool.ts / tool.ts / child-bash.ts / hosted-session.ts / fleet-widget.ts) and `src/child-mode.ts`.
 
-**Strict pi-runtime isolation rule**: `createAgentSession` may be **dynamically imported** only in `pi-runtime.ts` (`await import("@earendil-works/pi-coding-agent")`); all other modules have zero runtime pi dependencies (`import type` is allowed). The runner creates child sessions through an injected `CreateSessionFn` factory, faked in tests. If dynamic import fails, the subagent tool returns explicit error text without affecting other tools.
+Each subagent is a daemon-owned `pi --mode rpc` process (`pi-famulus __rpc`), not an in-process `createAgentSession`. The extension runner (`InProcessRunner` over `createHostedSessionFn`) still owns budgets, stalls, wakes, and the permit. The daemon tracks residency from `agent_start`, `agent_settled`, and process exit, plus the retention timer, and relays JSONL. The production session factory is `createHostedSessionFn`. Tests inject a fake `CreateSessionFn`. If the daemon or pi is missing, that subagent call fails; bash, monitor, and `task_*` keep working. There is no in-process fallback.
 
-**Child-session construction** (pi SDK verified): `createAgentSession({ cwd, model?, thinkingLevel?, tools?: explicit allowlist, customTools: [contact_supervisor, etc.], sessionManager: SessionManager.inMemory() })`; model resolution uses `ctx.modelRegistry.find(provider, id)` / `getAvailable()`; default model = parent session's current model (`ctx.model`). Child-session objects remain in the registry until session_shutdown (a `/reload` hands the registry to the reloaded extension, §4.1), so "resume" = another `prompt()` on the same object (v1 does not reconstruct across processes).
+**Child-session construction**: the daemon spawns pi with the parent's resource flags and a file-backed session (pi's default session directory). Model resolution uses `ctx.modelRegistry.find(provider, id)` / `getAvailable()`; default model = parent session's current model (`ctx.model`). A parked child respawns on the next prompt, steer, or follow-up, reusing the session file. The spawn environment (provider credentials included) is stored with the agent record so a daemon restart can respawn it. "Resume" is another `prompt` on that process. Takeover aborts the process and waits until it exits before interactive pi opens the file.
 
 **Tool schema** (typebox, field-name contract):
 
@@ -599,8 +601,8 @@ Modules: `src/comms/` (mailbox.ts / tools.ts / routing.ts). **Depend only on the
   - `progress_update`: send and return immediately (notify parent through NotifyCenter's `<pi-famulus-wake kind="supervisor-update">`, nonblocking)
   - `need_decision`: block child tool execute until the parent replies; **independent per-child waiter** (no global lock—pi-intercom lesson); 10min timeout returns `"Supervisor did not respond within 10 minutes; decide yourself and continue."`; parent receives `<pi-famulus-wake kind="supervisor-request">` (see §4.5) and answers with `agent_message reply`
 - `agent_message` (parent session; child variant carries `from`): `{ action: "send"|"reply"|"broadcast"|"list", to?: string(child_id|name), message?: string, delivery?: "steer"|"queue"(default steer) }`
-  - Send to running child: steer → `session.steer(message)`; queue → `session.followUp(message)`
-  - Send to ended child: return an error; it does not resume the child. Continue with `subagent({ action: "resume", run_id, child_id, message })`, which notifies again on completion
+  - Send to running child: steer → `prompt` with `streamingBehavior: "steer"`; queue → `prompt` with `followUp`
+  - Send to an idle or finished child starts a new turn (`prompt`) instead of failing. The tool text says whether that turn started or is waiting for a machine slot. `subagent({ action: "resume" })` is the same path and still notifies on completion
   - Reply: resolve the child's pending need_decision waiter; no pending request → error listing waiting children
   - Broadcast: steer all active children in the same run
   - List: all children in this session + status + pending requests
@@ -660,7 +662,7 @@ Manual after M1: run long commands with `pi -e ./extension`, verify automatic ba
 
 - Cross-session / cross-machine communication (belongs to agent-intercom)
 - A second pi process opening a hosted session file at the same time (pi does not lock session files; attach goes through the daemon)
-- Worktree isolation, workflow-script sandbox, a watchdog for a detached runner (the in-process stall watchdog of §4.6 exists), missions
+- Worktree isolation, workflow-script sandbox, a watchdog for a detached runner (the extension stall watchdog of §4.6 still runs against the hosted session), missions
 - Compatibility with pi-subagents / pi-intercom
 - In-place `exec` upgrade on Windows (Unix-only; Windows replaces the binary and restarts). Windows itself is supported: named-pipe IPC and a Job Object lifeline (`KILL_ON_JOB_CLOSE`, manager/src/sys/windows.rs:6)
 

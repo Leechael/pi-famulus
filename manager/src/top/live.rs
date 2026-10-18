@@ -208,7 +208,13 @@ fn apply_response(tx: &mpsc::UnboundedSender<LiveMsg>, op: &str, value: &Value) 
 fn apply_event(tx: &mpsc::UnboundedSender<LiveMsg>, value: &Value) {
     match value.get("event").and_then(|v| v.as_str()) {
         Some("agent_state") => {
-            let cache = cache_label(value.get("cache_expires_at").and_then(|v| v.as_u64()));
+            let mut cache = cache_label(value.get("cache_expires_at").and_then(|v| v.as_u64()));
+            if let Some(ms) = value.get("cache_lifetime_ms").and_then(|v| v.as_u64()) {
+                cache = format!("{cache} · {}s", ms / 1000);
+            }
+            if let Some(version) = value.get("pi_version").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                cache = format!("{cache} · pi {version}");
+            }
             let _ = tx.send(LiveMsg::State {
                 activity: value.get("activity").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 residency: value.get("residency").and_then(|v| v.as_str()).unwrap_or("").to_string(),
