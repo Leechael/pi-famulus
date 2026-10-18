@@ -44,6 +44,10 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
       return call("agent_message", { action: "send", to: "worker-1", message: "append the word done to fruit.txt" });
     }
     if (mode !== "send-only" && !already("subagent", "resume")) {
+      // The spawn can still be running when the foreground budget returns.
+      // Resume is rejected until that turn settles.
+      const settled = ctx.messages.some((m) => /kind="subagent-(done|handover)"/.test(textOf(m)));
+      if (!settled) return say("ok");
       // Send to an idle child starts its own turn. Resume only after that
       // turn has finished; a resume while it is still pending is rejected.
       if (mode === "send-then-resume") {

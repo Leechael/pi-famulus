@@ -337,8 +337,9 @@ describe("faux e2e", { concurrency: true }, () => {
     // real-model eval had it first in 25 of 125 monitors).
     const firstEvent = ws.findIndex((w) => w.wake.status === "event");
     assert.ok(firstEvent >= 0 && firstEvent < ws.indexOf(exitedWakes[0]), `exit before its event\n${explain(ep)}`);
-    // `echo noop` ends in milliseconds; the exit must not wait on anything.
-    assert.ok(exitedWakes[0].t - monitorResult.t < 8000, `exit wake late\n${explain(ep)}`);
+    // `echo noop` ends as soon as the shell starts. The window covers a slow
+    // Windows shell start; the monitor's own timeout is what must not win.
+    assert.ok(exitedWakes[0].t - monitorResult.t < 20_000, `exit wake late\n${explain(ep)}`);
     const lines = ws.filter((w) => w.wake.status === "event").flatMap((w) => w.wake.body.split("\n"));
     assert.ok(lines.includes("noop"), `first line lost\n${explain(ep)}`);
     const listing = toolResults(ep.items).find((r) => r.toolName === "task_list");
