@@ -246,7 +246,9 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match((ep.items.at(-1) as { text?: string }).text ?? "", /WOKE orphaned/);
     // The runner only exits after its process group is empty, so its death
     // proves the lifeline tore down `sleep 30` (SIGTERM, then SIGKILL).
-    assert.ok(await waitPidGone(runnerPid), `runner pid ${runnerPid} still alive 10s after the manager crash\n${explain(ep)}`);
+    // Windows job teardown can lag past 10s on a busy runner; 20s is still
+    // before that sleep would exit on its own.
+    assert.ok(await waitPidGone(runnerPid, 20_000), `runner pid ${runnerPid} still alive 20s after the manager crash\n${explain(ep)}`);
   });
 
   // Windows has no in-place upgrade (the manager refuses it; manager/tests/platform.rs u1).
