@@ -34,8 +34,8 @@ const allWakesSeen = (items: Item[]) => {
     WAKE_KINDS.every((k) => kinds.has(k)) &&
     wakes(items).some((w) => w.wake.status === "timeout") &&
     wakes(items).some((w) => w.wake.stillRunning.length > 0) &&
-    // the agent_message "finished child" error (sent after subagent-done)
-    toolResults(items).some((r) => r.toolName === "agent_message" && /does not resume children/.test(r.text))
+    // send to a finished child starts a new turn (sent after subagent-done)
+    toolResults(items).some((r) => r.toolName === "agent_message" && /new turn/.test(r.text))
   );
 };
 

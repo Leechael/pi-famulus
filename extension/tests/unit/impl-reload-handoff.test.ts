@@ -111,7 +111,7 @@ describe("extension across /reload", () => {
     expect(managers[0].shutdownSession).not.toHaveBeenCalled();
     expect(managers[0].close).not.toHaveBeenCalled();
     expect(after.tools).toEqual(expect.arrayContaining(["bash", "subagent", "monitor", "task_list"]));
-    expect([...after.commands.keys()].sort()).toEqual(["famulus", "reply", "tasks"]);
+    expect([...after.commands.keys()].sort()).toEqual(["attach", "famulus", "reply", "tasks"]);
 
     await after.emit("session_shutdown", { reason: "quit" });
     expect(managers[0].shutdownSession).toHaveBeenCalledTimes(1);

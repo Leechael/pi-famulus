@@ -16,6 +16,8 @@ export interface RegistryHostDeps {
   getNotifyCenter: () => {
     notify(msg: { customType: string; content: string; details?: unknown }): void;
   } | null;
+  /** The subagent tool registers this so a send-to-idle turn wakes the parent. */
+  onResumeAccepted?: (childId: string) => void;
 }
 
 
@@ -68,6 +70,14 @@ export function createRegistryCommsHost(deps: RegistryHostDeps): CommsHost {
         content: wake.content,
         details: wake.details,
       });
+    },
+
+    async resumeChild(childId: string, message: string) {
+      const registry = deps.getRegistry();
+      if (!registry) throw new Error("subagent system is not initialized");
+      const accepted = await registry.resumeChild(childId, message);
+      deps.onResumeAccepted?.(childId);
+      return accepted;
     },
   };
 }

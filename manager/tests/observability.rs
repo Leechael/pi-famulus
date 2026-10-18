@@ -226,11 +226,11 @@ fn p3_hello_protocol_and_status() {
     let t0 = now_ms();
     let mut a = home.connect();
     let hello = hello_v2(&mut a, "sess-p3", "/tmp/p3");
-    assert_eq!(hello["protocol"], 5, "hello reports maximum supported protocol");
+    assert_eq!(hello["protocol"], 6, "hello reports maximum supported protocol");
     let mut cli = home.connect();
     cli.hello_cli();
     let st = cli.request_ok(json!({"type":"status"}));
-    assert_eq!(st["protocol"], 5, "{st}");
+    assert_eq!(st["protocol"], 6, "{st}");
     let s = &st["sessions"][0];
     assert_eq!((s["protocol"].as_u64(), s["extension_version"].as_str()), (Some(2), Some("0.9.0-test")), "{st}");
     let since = s["connected_at"].as_u64().unwrap();
@@ -367,7 +367,7 @@ fn e1_manager_writes_session_and_task_events() {
         .collect();
     let dt: Vec<&str> = daemon.iter().map(|e| e["type"].as_str().unwrap()).collect();
     assert_eq!(dt, ["daemon.start", "daemon.shutdown"]);
-    assert_eq!(daemon[0]["protocol"], 5);
+    assert_eq!(daemon[0]["protocol"], 6);
 }
 
 /// Oversized fields are truncated so every line stays below 4 KiB.
@@ -1195,7 +1195,7 @@ fn c6_status_counts_uptime_and_not_running() {
     // "unknown", and would drift from the built-from commit on any tree
     // whose HEAD moved since the daemon binary was built.
     let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
-    assert!(s.contains(&format!("version:  {version} (protocol 5)")), "{s}");
+    assert!(s.contains(&format!("version:  {version} (protocol 6)")), "{s}");
     let bin = std::fs::canonicalize(BIN).unwrap();
     // Fresh /tmp targets can be reported as /tmp or /private/tmp on macOS.
     let reported_bin = s.lines().find_map(|line| line.strip_prefix("binary:   ")).expect("binary path");
@@ -1206,7 +1206,7 @@ fn c6_status_counts_uptime_and_not_running() {
     assert!(s.contains("agent tokens: 47 input / 9 output (cache read 24 / write 6) (1.5 output tok/s over 6000 ms of LLM time)"), "{s}");
     let out = cli_ok(&home, &["status", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(v["protocol"], 5);
+    assert_eq!(v["protocol"], 6);
     assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
     assert_eq!(v["agent_tokens"], json!({"input":47,"output":9,"tokens_cache_read":24,"tokens_cache_write":6,"llm_ms":6000,"output_tokens_per_second":1.5}));
     let shown = cli_ok(&home, &["show", "ch_0000c601"]).stdout;
@@ -1228,7 +1228,7 @@ fn c6_cli_hello_identifies_the_new_product() {
         .expect("CLI start registered its extension-style session");
     let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
     assert_eq!(session["extension_version"], format!("pi-famulus-cli/{version}"));
-    assert_eq!(session["protocol"], 5);
+    assert_eq!(session["protocol"], 6);
 }
 
 // ===========================================================================

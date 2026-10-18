@@ -46,6 +46,9 @@ pub struct Snapshot {
     /// Preserve protocol-5 kind and cancel ownership across newer handovers.
     #[serde(default)]
     pub agent_permit_details: Vec<(String, String, String, String)>,
+    /// Sibling permits released on settle. (session, child, release_on_settle, turn_started).
+    #[serde(default)]
+    pub agent_permit_flags: Vec<(String, String, bool, bool)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -435,6 +438,14 @@ fn snapshot(
                     permit.work_kind.clone(),
                     permit.request_id.clone(),
                 )
+            })
+            .collect(),
+        agent_permit_flags: st
+            .agent_permits
+            .iter()
+            .filter(|(_, permit)| permit.release_on_settle || permit.turn_started)
+            .map(|((session_id, child_id), permit)| {
+                (session_id.clone(), child_id.clone(), permit.release_on_settle, permit.turn_started)
             })
             .collect(),
     })

@@ -21,7 +21,7 @@ const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
 const EXTENSION_VERSION = "0.1.9";
 export { EXTENSION_VERSION };
 // 5: speaks per-kind agent admission and queued acquire.
-const PROTOCOL = 5;
+const PROTOCOL = 6;
 const HELLO_TIMEOUT_MS = 5000;
 const RECONNECT_HELLO_TIMEOUT_MS = 25_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -124,6 +124,8 @@ export interface ManagerEvent {
   output_size?: number;
   end_reason?: string;
   ts?: number;
+  /** Set on task_started when the daemon recorded who asked for the task. */
+  origin?: { via: string; child_id?: string; run_id?: string };
 }
 
 export class ManagerError extends Error {
@@ -142,6 +144,12 @@ export interface ManagerClientOptions {
   piPid?: number;
   /** Session working directory, sent on hello (optional; older managers ignore it). */
   cwd?: string;
+  /** `parent` for a pi session, `child` for pi-famulus inside a hosted subagent. */
+  role?: "parent" | "child";
+  childId?: string;
+  token?: string;
+  /** Pi session file this process has open. */
+  sessionFile?: string;
   log?: (message: string) => void;
   clock?: Clock;
 }
@@ -288,6 +296,10 @@ export class ManagerClient {
   private managerPath: string | null;
   private readonly piPid: number;
   private readonly cwd: string | undefined;
+  private readonly role: "parent" | "child";
+  private readonly childId: string | undefined;
+  private readonly token: string | undefined;
+  private readonly sessionFile: string | undefined;
   private readonly log: (message: string) => void;
   private readonly clock: Clock;
 
@@ -315,6 +327,10 @@ export class ManagerClient {
     this.managerPath = options.managerPath;
     this.piPid = options.piPid ?? process.pid;
     this.cwd = options.cwd;
+    this.role = options.role ?? "parent";
+    this.childId = options.childId;
+    this.token = options.token;
+    this.sessionFile = options.sessionFile;
     this.log = options.log ?? (() => {});
     this.clock = options.clock ?? realClock;
   }
@@ -458,18 +474,138 @@ export class ManagerClient {
     childId: string,
     workKind = "other",
     signal?: AbortSignal,
-  ): Promise<{ granted: boolean; rejection?: string }> {
+  ): Promise<{ granted: boolean; rejection?: string; queuedBehind?: number }> {
     if (signal?.aborted) throw new Error("subagent admission cancelled");
     const message: Record<string, unknown> = { type: "acquire_agent", child_id: childId };
     if (this.protocolLevel_ >= 5) message.work_kind = workKind;
     // Protocol 4 has no cancel frame. Keep its immediate acquire correlated so
     // admission can release a grant that arrives after the generation aborts.
     const res = await this.request(message, DEFAULT_REQUEST_TIMEOUT_MS, this.protocolLevel_ >= 5 ? signal : undefined, true);
-    return { granted: res.granted === true, ...(typeof res.rejection === "string" ? { rejection: res.rejection } : {}) };
+    return {
+      granted: res.granted === true,
+      ...(typeof res.rejection === "string" ? { rejection: res.rejection } : {}),
+      ...(typeof res.queued_behind === "number" ? { queuedBehind: res.queued_behind } : {}),
+    };
   }
 
   async releaseAgent(childId: string): Promise<void> {
     await this.request({ type: "release_agent", child_id: childId });
+  }
+
+  requireHostedProtocol(): void {
+    if (this.protocolLevel_ < 6) {
+      throw new Error(
+        "this pi-famulus daemon does not host subagents (protocol " +
+          `${this.protocolLevel_}; need 6). Restart pi so it starts the current daemon.`,
+      );
+    }
+  }
+
+  async agentSpawn(input: {
+    childId: string;
+    runId: string;
+    name: string;
+    argv: string[];
+    cwd: string;
+    env: Record<string, string>;
+  }): Promise<Record<string, unknown>> {
+    this.requireHostedProtocol();
+    return this.request({
+      type: "agent_spawn",
+      child_id: input.childId,
+      run_id: input.runId,
+      name: input.name,
+      argv: input.argv,
+      cwd: input.cwd,
+      env: input.env,
+    }, 20_000);
+  }
+
+  async agentInput(childId: string, op: string, text: string, source = "parent", since?: string): Promise<Record<string, unknown>> {
+    this.requireHostedProtocol();
+    return this.request({
+      type: "agent_input",
+      child_id: childId,
+      op,
+      text,
+      source,
+      ...(since ? { since } : {}),
+    }, 20_000);
+  }
+
+  async agentWatch(childId: string): Promise<void> {
+    this.requireHostedProtocol();
+    await this.request({ type: "agent_watch", child_id: childId });
+  }
+
+  async agentUnwatch(childId: string): Promise<void> {
+    this.requireHostedProtocol();
+    await this.request({ type: "agent_unwatch", child_id: childId });
+  }
+
+  async agentPeers(): Promise<Array<{ childId: string; name: string; runId: string; activity: string; residency: string }>> {
+    this.requireHostedProtocol();
+    const res = await this.request({ type: "agent_peers" });
+    const peers = Array.isArray(res.peers) ? res.peers : [];
+    return peers.flatMap((peer) => {
+      if (!peer || typeof peer !== "object") return [];
+      const row = peer as Record<string, unknown>;
+      if (typeof row.child_id !== "string") return [];
+      return [{
+        childId: row.child_id,
+        name: typeof row.name === "string" ? row.name : row.child_id,
+        runId: typeof row.run_id === "string" ? row.run_id : "",
+        activity: typeof row.activity === "string" ? row.activity : "idle",
+        residency: typeof row.residency === "string" ? row.residency : "",
+      }];
+    });
+  }
+
+  async agentPark(childId: string): Promise<void> {
+    this.requireHostedProtocol();
+    await this.request({ type: "agent_park", child_id: childId });
+  }
+
+  async agentTakeover(childId: string): Promise<void> {
+    this.requireHostedProtocol();
+    await this.request({ type: "agent_takeover", child_id: childId });
+  }
+
+  async hostedLookup(query: { sessionId?: string; sessionFile?: string }): Promise<Record<string, unknown> | null> {
+    if (this.protocolLevel_ < 6) return null;
+    const res = await this.request({
+      type: "hosted_lookup",
+      ...(query.sessionId ? { session_id: query.sessionId } : {}),
+      ...(query.sessionFile ? { session_file: query.sessionFile } : {}),
+    });
+    const hosted = res.hosted;
+    return hosted && typeof hosted === "object" ? hosted as Record<string, unknown> : null;
+  }
+
+  async agentComms(requestId: string, reason: string, message: string): Promise<string> {
+    this.requireHostedProtocol();
+    const res = await this.request({ type: "agent_comms", request_id: requestId, reason, message }, 11 * 60 * 1000);
+    return typeof res.reply === "string" ? res.reply : "";
+  }
+
+  async agentCommsReply(requestId: string, childId: string, message: string): Promise<void> {
+    this.requireHostedProtocol();
+    await this.request({ type: "agent_comms_reply", request_id: requestId, child_id: childId, message });
+  }
+
+  async agentUiResponse(childId: string, rpcId: string, value: Record<string, unknown>, cancelled: boolean): Promise<void> {
+    this.requireHostedProtocol();
+    await this.request({ type: "agent_ui_response", child_id: childId, rpc_id: rpcId, value, cancelled });
+  }
+
+  async agentCache(expiresAt: number | null, tier: string | null, lifetimeMs: number | null): Promise<void> {
+    if (this.protocolLevel_ < 6) return;
+    await this.request({
+      type: "agent_cache",
+      ...(expiresAt !== null ? { expires_at: expiresAt } : {}),
+      ...(tier ? { tier } : {}),
+      ...(lifetimeMs !== null ? { lifetime_ms: lifetimeMs } : {}),
+    });
   }
 
   /** Daemon status, including optional in-place upgrade metadata. */
@@ -774,6 +910,10 @@ export class ManagerClient {
           ...(this.cwd ? { cwd: this.cwd } : {}),
           extension_version: EXTENSION_VERSION,
           protocol: PROTOCOL,
+          role: this.role,
+          ...(this.sessionFile ? { session_file: this.sessionFile } : {}),
+          ...(this.childId ? { child_id: this.childId } : {}),
+          ...(this.token ? { token: this.token } : {}),
         }),
       );
     });
@@ -865,7 +1005,7 @@ export class ManagerClient {
     waitForAdmission = false,
   ): Promise<Record<string, unknown>> {
     const type = String(msg.type);
-    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent"].includes(type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent", "agent_spawn", "agent_watch", "agent_park", "agent_peers", "hosted_lookup"].includes(type);
     const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {

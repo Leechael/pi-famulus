@@ -69,18 +69,29 @@ fn monitor_live_records_include_eof_tail_before_exit_and_preserve_raw_reads() {
         .cloned()
         .collect();
     assert_eq!(replay, records);
-    late.events.clear();
-    late.request_ok(json!({"type":"watch","task_id":tid}));
-    late.wait_event(Duration::from_secs(1), |v| {
-        v["event"] == "output"
-            && v["chunk"] == ""
-            && v["next_cursor"] == 21
-            && v["monitor_records"].as_array().is_some_and(|rs| {
-                rs.iter()
-                    .any(|r| r["kind"] == "line" && r["preview"] == "trailing")
-            })
-    })
-    .expect("EOF metadata is replayable even when raw cursor is caught up");
+    // A loaded runner can handle this repeat watch before the writer task
+    // has recorded the first replay's flush: the raw bytes are then
+    // delivered again, which is legitimate (clients dedupe by next_cursor).
+    // Retry until the daemon has recorded the cursor and answers with the
+    // trailing line's metadata alone.
+    let mut answer = None;
+    for _ in 0..5 {
+        late.events.clear();
+        late.request_ok(json!({"type":"watch","task_id":tid}));
+        answer = late.wait_event(Duration::from_secs(5), |v| {
+            v["event"] == "output"
+                && v["next_cursor"] == 21
+                && v["monitor_records"].as_array().is_some_and(|rs| {
+                    rs.iter()
+                        .any(|r| r["kind"] == "line" && r["preview"] == "trailing")
+                })
+        });
+        if answer.as_ref().is_some_and(|v| v["chunk"] == "") {
+            break;
+        }
+    }
+    let answer = answer.expect("EOF metadata is replayable even when raw cursor is caught up");
+    assert_eq!(answer["chunk"], "", "a recorded cursor must answer with metadata alone");
 }
 
 #[test]

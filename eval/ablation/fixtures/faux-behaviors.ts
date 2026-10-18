@@ -14,6 +14,12 @@ const echoFromWake = (re: RegExp): FauxStep => (ctx) => {
 
 const lastTaskId = (text: string) => /task_id: (sh_[0-9a-f]{8})/.exec(text)?.[1] ?? "sh_unknown";
 
+/** A real settle, not the wake markup quoted in a tool's instructions. */
+function childTurnSettled(text: string): boolean {
+  if (/kind="subagent-(done|handover)"[^>]*\brun-id=/.test(text)) return true;
+  return /Run run_[0-9a-f]{8} \[[^\]]+\] /.test(text) && !/continues in the background/.test(text);
+}
+
 /**
  * resume-finished: parent and faux child share one provider, so the script is
  * a pure function of the call context (who is asking, and what came last).
@@ -26,7 +32,11 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
     if (!first.startsWith("Use the subagent tool")) {
       // Child session.
       if (last?.role === "toolResult") return say("apple");
-      if (/append/i.test(lastText)) return call("bash", { command: "echo done >> fruit.txt" });
+      // Resume is the turn that finishes the file. A send to an idle child
+      // also starts a turn; that turn must not satisfy the scenario goal or
+      // the episode ends before the scripted resume.
+      if (/new line/i.test(lastText)) return call("bash", { command: "echo done >> fruit.txt" });
+      if (/append/i.test(lastText)) return call("bash", { command: "echo more >> fruit.txt" });
       return call("write", { path: "fruit.txt", content: "apple\n" });
     }
     // Parent session.
@@ -39,8 +49,31 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
     if (mode !== "resume" && !already("agent_message", "send")) {
       return call("agent_message", { action: "send", to: "worker-1", message: "append the word done to fruit.txt" });
     }
-    if (mode !== "send-only" && !already("subagent", "resume")) {
-      return call("subagent", { action: "resume", run_id: runId, message: "append the word done to fruit.txt on a new line" });
+    const resumed = ctx.messages.some(
+      (m) => m.role === "toolResult" && m.toolName === "subagent" && textOf(m).includes("Resumed subagent"),
+    );
+    if (mode !== "send-only" && !resumed) {
+      // The backgrounded tool text quotes kind="subagent-handover" as
+      // instructions. Only a wake that names a run, or a synchronous
+      // `Run run_…` result, means the spawn has settled.
+      const settled = ctx.messages.some((m) => childTurnSettled(textOf(m)));
+      if (!settled) return say("ok");
+      // Send to an idle child starts its own turn. Resume only after that
+      // turn has finished; a resume while it is still pending is rejected.
+      if (mode === "send-then-resume") {
+        const sendAt = ctx.messages.findIndex(
+          (m) => m.role === "assistant" && JSON.stringify(m.content).includes('"action":"send"'),
+        );
+        const later = sendAt >= 0 ? ctx.messages.slice(sendAt + 1) : [];
+        const finished = later.some((m) => childTurnSettled(textOf(m)));
+        if (!finished) return say("ok");
+      }
+      return call("subagent", {
+        action: "resume",
+        run_id: runId,
+        child_id: "worker-1",
+        message: "append the word done to fruit.txt on a new line",
+      });
     }
     return say("Done.");
   };

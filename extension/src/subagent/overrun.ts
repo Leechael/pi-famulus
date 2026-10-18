@@ -38,6 +38,17 @@ export class ChildShellTracker {
     this.sizes.delete(taskId);
   }
 
+  /** A hosted child's shell is observed from the parent session's task_exited. */
+  endByTask(taskId: string): void {
+    for (const [childId, shell] of this.shells) {
+      if (shell.taskId === taskId) {
+        this.shells.delete(childId);
+        this.sizes.delete(taskId);
+        return;
+      }
+    }
+  }
+
   current(childId: string): ChildShell | undefined {
     return this.shells.get(childId);
   }

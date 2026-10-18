@@ -56,7 +56,7 @@ export interface CommsWithOrigin extends Comms {
     message: string,
     delivery: "steer" | "queue",
     from?: string,
-  ): Promise<void>;
+  ): Promise<"running" | "resumed" | "queued">;
   /** Cancel pending decision waiters and timers (session shutdown). */
   dispose(): void;
 }
@@ -129,7 +129,7 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
       options.logEvent?.("decision.reply", { child_id: toChildId });
     },
 
-    async send(toChildId, message, delivery, from = "supervisor") {
+    async send(toChildId, message, delivery, from = "supervisor"): Promise<"running" | "resumed" | "queued"> {
       const child = host.getChild(toChildId);
       if (!child) {
         const known =
@@ -142,28 +142,33 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         } else {
           await child.handle.followUp(message);
         }
+        mailbox.append(child.runId, { from, to: toChildId, kind: "send", message });
+        return "running";
       } else if (
         child.status === "completed" ||
         child.status === "failed" ||
         child.status === "interrupted"
       ) {
-        // Lifecycle (resume) belongs to the subagent tool. Resuming here never
-        // wired a completion wake, so the parent hung.
-        throw new Error(
-          fill("tools.agent_message.error.finished-child", {
-            childId: toChildId,
-            name: child.name,
-            status: child.status,
-            runId: child.runId,
-          }),
-        );
+        const resume = host.resumeChild;
+        if (!resume) {
+          throw new Error(
+            fill("tools.agent_message.error.finished-child", {
+              childId: toChildId,
+              name: child.name,
+              status: child.status,
+              runId: child.runId,
+            }),
+          );
+        }
+        const { queuedBehind } = await resume(child.handle.childId, message);
+        mailbox.append(child.runId, { from, to: toChildId, kind: "send", message });
+        return queuedBehind === null ? "resumed" : "queued";
       } else {
         throw new Error(
           `Child ${toChildId} (${child.name}) is ${child.status}; ` +
             "messages can only be delivered to running or finished children.",
         );
       }
-      mailbox.append(child.runId, { from, to: toChildId, kind: "send", message });
     },
 
     async broadcast(runId, message, fromChildId) {

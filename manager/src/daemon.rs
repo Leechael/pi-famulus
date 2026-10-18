@@ -68,8 +68,17 @@ pub type Shared = Arc<Mutex<DaemonState>>;
 // State
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConnRole {
+    Parent,
+    Cli,
+    Child,
+}
+
 pub struct ConnHandle {
     pub kind: ClientKind,
+    pub role: ConnRole,
+    pub child_id: Option<String>,
     pub session_id: Option<String>,
     pub tx: OutTx,
     /// Fired to make the connection's read loop exit (session rebind).
@@ -97,6 +106,12 @@ pub struct PendingAgent {
     /// One waiter per (session, child); aliases let a resent request id share it.
     request_ids: Vec<String>,
     tx: OutTx,
+    /// Waiters already queued when this one joined.
+    queued_behind: u64,
+    /// A sibling-started turn: drop the permit when the child settles.
+    release_on_settle: bool,
+    /// Hosted child that asked for this permit. None means the parent session.
+    requester_child: Option<String>,
 }
 
 #[derive(Clone)]
@@ -104,6 +119,17 @@ pub struct AgentPermit {
     pub(crate) work_kind: String,
     /// Only this request id owns cancellation authority for the held permit.
     pub(crate) request_id: String,
+    /// Set when a hosted sibling acquired the permit. Released on settle.
+    pub(crate) release_on_settle: bool,
+    /// The sibling prompt has been seen running, so a later idle is its settle.
+    pub(crate) turn_started: bool,
+}
+
+pub(crate) struct UndeliveredGrant {
+    child_id: String,
+    queued_behind: Option<u64>,
+    /// None: the parent session's connection. Some: that hosted child only.
+    requester_child: Option<String>,
 }
 
 struct AgentGrant {
@@ -111,6 +137,7 @@ struct AgentGrant {
     child_id: String,
     request_id: String,
     tx: OutTx,
+    queued_behind: Option<u64>,
 }
 
 pub struct DaemonState {
@@ -157,7 +184,7 @@ pub struct DaemonState {
     /// FIFO requests waiting for a per-kind slot, one entry per child.
     pub pending_agents: std::collections::VecDeque<PendingAgent>,
     /// Queued grants that hit a full/closed output channel; retried on session activity.
-    pub undelivered_agent_grants: HashMap<(String, String), String>,
+    pub undelivered_agent_grants: HashMap<(String, String), UndeliveredGrant>,
     /// One-shot cancellation tombstones for cancel/acquire dispatch races.
     pub cancelled_acquires: HashSet<(String, String, String)>,
     /// Serializes budget reads with admission commits without holding `state`
@@ -165,6 +192,9 @@ pub struct DaemonState {
     pub agent_admission: Arc<Mutex<()>>,
     /// Cached global budget; per-kind settings remain part of CapacityConfig.
     pub agent_budget: Arc<Mutex<crate::capacity::MaxAgentsCache>>,
+    /// Hosted `pi --mode rpc` subagents.
+    pub hosted: crate::hosted::Hosted,
+    agent_notices: Option<mpsc::UnboundedReceiver<crate::hosted::Notice>>,
 }
 
 /// Bound on remembered start keys.
@@ -178,6 +208,8 @@ const PENDING_AGENT_REQUEST_IDS_MAX: usize = 8;
 
 impl DaemonState {
     fn new(home: PathBuf, registry: Registry, foreground: bool) -> DaemonState {
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let hosted_home = home.clone();
         DaemonState {
             home,
             started_at_ms: now_ms(),
@@ -207,6 +239,8 @@ impl DaemonState {
             cancelled_acquires: HashSet::new(),
             agent_admission: Arc::new(Mutex::new(())),
             agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
+            hosted: crate::hosted::Hosted::new(hosted_home, notice_tx),
+            agent_notices: Some(notice_rx),
         }
     }
 }
@@ -317,6 +351,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
             std::process::id()
         );
     }
+    start_agent_loops(&state);
     serve(state, listener, daemon_lock).await
 }
 
@@ -389,6 +424,8 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
                     AgentPermit {
                         work_kind: String::new(),
                         request_id: String::new(),
+                        release_on_settle: false,
+                        turn_started: false,
                     },
                 )
             }));
@@ -401,10 +438,18 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
                         AgentPermit {
                             work_kind,
                             request_id,
+                            release_on_settle: false,
+                            turn_started: false,
                         },
                     )
                 },
             ));
+    }
+    for (session_id, child_id, release_on_settle, turn_started) in snap.agent_permit_flags {
+        if let Some(permit) = st.agent_permits.get_mut(&(session_id, child_id)) {
+            permit.release_on_settle = release_on_settle;
+            permit.turn_started = turn_started;
+        }
     }
     let clock = st.clock.clone();
     clock.resume_at(snap.clock_now_ms);
@@ -450,6 +495,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         send_agent_grants(&s2, wake);
         maybe_arm_idle_timer(&s2);
     });
+    start_agent_loops(&state);
     serve(state, listener, lock).await
 }
 
@@ -470,8 +516,8 @@ fn reap_disconnected_agent_permits(st: &mut DaemonState) {
     st.cancelled_acquires
         .retain(|(sid, _, _)| connected.contains(sid));
     let active_permits: HashSet<(String, String)> = st.agent_permits.keys().cloned().collect();
-    st.undelivered_agent_grants.retain(|(sid, _), child_id| {
-        connected.contains(sid) && active_permits.contains(&(sid.clone(), child_id.clone()))
+    st.undelivered_agent_grants.retain(|(sid, _), grant| {
+        connected.contains(sid) && active_permits.contains(&(sid.clone(), grant.child_id.clone()))
     });
 }
 
@@ -877,7 +923,36 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             cwd,
             extension_version,
             protocol,
-        } => (
+            role,
+            session_file,
+            child_id,
+            token,
+            pi_version,
+        } => {
+            if let Some(asked) = role {
+                let allowed = matches!(
+                    (asked, client_kind),
+                    (HelloRole::Cli, ClientKind::Cli)
+                        | (HelloRole::Child | HelloRole::Parent, ClientKind::Extension)
+                );
+                if !allowed {
+                    let _ = tx
+                        .send(encode_error(
+                            &hello.id,
+                            E_BAD_REQUEST,
+                            "hello role does not match the client kind",
+                        ))
+                        .await;
+                    return;
+                }
+            }
+            let role = match role {
+                Some(HelloRole::Child) => ConnRole::Child,
+                Some(HelloRole::Cli) => ConnRole::Cli,
+                _ if client_kind == ClientKind::Cli => ConnRole::Cli,
+                _ => ConnRole::Parent,
+            };
+            (
             client_kind,
             session_id,
             pi_pid,
@@ -885,8 +960,14 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                 cwd,
                 extension_version,
                 protocol,
+                role,
+                child_id,
+                token,
+                session_file,
+                pi_version,
             },
-        ),
+            )
+        }
         _ => {
             let _ = tx
                 .send(encode_error(
@@ -898,7 +979,7 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             return;
         }
     };
-    if client_kind == ClientKind::Extension {
+    if client_kind == ClientKind::Extension && info.role != ConnRole::Child {
         let ok = matches!(&session_id, Some(s) if valid_session_id(s)) && pi_pid.is_some();
         if !ok {
             let _ = tx
@@ -911,7 +992,26 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             return;
         }
     }
+    let mut session_id = session_id;
+    if info.role == ConnRole::Child {
+        let child_id = info.child_id.clone().unwrap_or_default();
+        let token = info.token.clone().unwrap_or_default();
+        let auth = {
+            let st = state.lock().unwrap();
+            st.hosted.auth_child(&child_id, &token)
+        };
+        match auth {
+            Ok(parent) => session_id = Some(parent),
+            Err(e) => {
+                let _ = tx.send(encode_error(&hello.id, &e.code, &e.message)).await;
+                return;
+            }
+        }
+    }
 
+    let notice_role = info.role;
+    let notice_file = info.session_file.clone();
+    let notice_session = session_id.clone();
     let conn_id = match register_conn(
         &state,
         &tx,
@@ -929,7 +1029,20 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
             return;
         }
     };
-    let started_at = state.lock().unwrap().started_at_ms;
+    let (started_at, hosted_notice) = {
+        let st = state.lock().unwrap();
+        let notice = if notice_role != ConnRole::Child {
+            st.hosted.lookup(notice_session.as_deref(), notice_file.as_deref())
+        } else {
+            None
+        };
+        if notice_role == ConnRole::Parent {
+            if let Some(file) = notice_file.as_deref() {
+                st.hosted.claim_owner(notice_session.as_deref().unwrap_or(""), Some(file));
+            }
+        }
+        (st.started_at_ms, notice)
+    };
     let _ = tx
         .send(encode_ok(
             &hello.id,
@@ -938,6 +1051,7 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                 pid: std::process::id(),
                 started_at,
                 protocol: PROTOCOL,
+                hosted: hosted_notice,
             },
         ))
         .await;
@@ -1016,6 +1130,11 @@ pub struct HelloInfo {
     pub cwd: Option<String>,
     pub extension_version: Option<String>,
     pub protocol: Option<u32>,
+    pub role: ConnRole,
+    pub child_id: Option<String>,
+    pub token: Option<String>,
+    pub session_file: Option<String>,
+    pub pi_version: Option<String>,
 }
 
 /// Register a hello'd connection. Same-session rebind: the new connection
@@ -1042,7 +1161,7 @@ fn register_conn(
     }
     let conn_id = st.next_conn_id;
     st.next_conn_id += 1;
-    if kind == ClientKind::Extension {
+    if kind == ClientKind::Extension && info.role != ConnRole::Child {
         let sid = session_id.clone().unwrap_or_default();
         let old = st.sessions.get(&sid).and_then(|s| s.conn_id);
         if let Some(old_id) = old {
@@ -1083,10 +1202,20 @@ fn register_conn(
             },
         );
     }
+    if info.role == ConnRole::Child {
+        if let Some(child_id) = info.child_id.clone() {
+            st.hosted.set_child_conn(&child_id, Some(conn_id));
+            if let Some(version) = info.pi_version.as_deref() {
+                st.hosted.set_pi_version(&child_id, version);
+            }
+        }
+    }
     st.conns.insert(
         conn_id,
         ConnHandle {
             kind,
+            role: info.role,
+            child_id: info.child_id.clone(),
             session_id,
             tx: tx.clone(),
             die: die.clone(),
@@ -1099,6 +1228,15 @@ fn register_conn(
 
 fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     if let Some(h) = st.conns.remove(&conn_id) {
+        st.hosted.drop_conn(conn_id);
+        if h.role != ConnRole::Child {
+            if let Some(sid) = h.session_id.clone() {
+                let owns = st.sessions.get(&sid).and_then(|s| s.conn_id) == Some(conn_id);
+                if owns && why == "closed" {
+                    st.hosted.on_parent_closed(&sid);
+                }
+            }
+        }
         if let Some(sid) = &h.session_id {
             let home = st.home.clone();
             if let Some(s) = st.sessions.get_mut(sid) {
@@ -1388,14 +1526,85 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
     );
 }
 
-/// §3.2: arm the 5s idle timer when the last active connection went away.
+fn release_settled_sibling_permit(st: &mut DaemonState, notice: &crate::hosted::Notice) -> Vec<AgentGrant> {
+    let activity = match &notice.event {
+        EventKind::AgentState { activity, .. } => activity.as_str(),
+        _ => return Vec::new(),
+    };
+    let key = (notice.parent_session.clone(), notice.child_id.clone());
+    if activity == "running" {
+        if let Some(permit) = st.agent_permits.get_mut(&key) {
+            if permit.release_on_settle {
+                permit.turn_started = true;
+            }
+        }
+        return Vec::new();
+    }
+    if activity != "idle" && activity != "failed" {
+        return Vec::new();
+    }
+    // A parked respawn emits idle before the sibling prompt starts a turn.
+    let release = st.agent_permits.get(&key).is_some_and(|permit| permit.release_on_settle && permit.turn_started);
+    if !release {
+        return Vec::new();
+    }
+    st.agent_permits.remove(&key);
+    st.undelivered_agent_grants.retain(|(owner, _), grant| owner != &notice.parent_session || grant.child_id != notice.child_id);
+    wake_pending(st)
+}
+
+fn start_agent_loops(state: &Shared) {
+    let rx = state.lock().unwrap().agent_notices.take();
+    if let Some(mut rx) = rx {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while let Some(notice) = rx.recv().await {
+                let wake = {
+                let mut st = state.lock().unwrap();
+                let wake = release_settled_sibling_permit(&mut st, &notice);
+                let mut targets = Vec::new();
+                if let Some(session) = st.sessions.get(&notice.parent_session) {
+                    if let Some(conn_id) = session.conn_id {
+                        targets.push(conn_id);
+                    }
+                }
+                if let Some(conn_id) = st.hosted.child_of_conn(&notice.child_id) {
+                    targets.push(conn_id);
+                }
+                targets.extend(st.hosted.watcher_ids(&notice.child_id));
+                targets.sort_unstable();
+                targets.dedup();
+                for conn_id in targets {
+                    if let Some(conn) = st.conns.get(&conn_id) {
+                        let _ = conn.tx.try_send(encode_event(&notice.event));
+                    }
+                }
+                wake
+                };
+                send_agent_grants(&state, wake);
+            }
+        });
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let clock = state.lock().unwrap().clock.clone();
+            clock.sleep("agent-retention", Duration::from_millis(250)).await;
+            if state.lock().unwrap().shutdown {
+                break;
+            }
+            state.lock().unwrap().hosted.tick();
+        }
+    });
+}
+
+/// §3.2: arm the 5s idle timer when the last parent/cli connection went away
+/// and no hosted subagent is still warm.
 pub fn maybe_arm_idle_timer(state: &Shared) {
     let mut st = state.lock().unwrap();
-    if st.shutdown
-        || st.upgrading
-        || st.hold_idle
-        || !st.conns.is_empty()
-        || st.idle_timer.is_some()
+    let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
+    let warm = st.hosted.warm_count() > 0;
+    if st.shutdown || st.upgrading || st.hold_idle || session_conn || warm || st.idle_timer.is_some()
     {
         return;
     }
@@ -1405,7 +1614,9 @@ pub fn maybe_arm_idle_timer(state: &Shared) {
         clock.sleep("idle", IDLE_SHUTDOWN).await;
         let fired = {
             let mut st = state2.lock().unwrap();
-            if st.conns.is_empty() && !st.shutdown {
+            let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
+            let warm = st.hosted.warm_count() > 0;
+            if !session_conn && !warm && !st.shutdown {
                 st.shutdown = true;
                 Some((st.home.clone(), st.shutdown_notify.clone()))
             } else {
@@ -1556,6 +1767,104 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         RequestKind::ReleaseAgent { child_id } => {
             respond(&tx, &id, handle_release_agent(&state, conn_id, &child_id)).await;
         }
+        RequestKind::AgentSpawn { child_id, run_id, name, argv, cwd, env } => {
+            match parent_session(&state, conn_id) {
+                Ok(parent) => {
+                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
+                    respond(&tx, &id, hosted.spawn(&parent, &child_id, &run_id, &name, argv, cwd, env).await).await
+                }
+                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+            }
+        }
+        RequestKind::AgentInput { child_id, op, text, source, since } => {
+            match authorize_agent(&state, conn_id, &child_id, true) {
+                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+                Ok(()) => {
+                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
+                    let source = if source.is_empty() { "parent".into() } else { source };
+                    respond(&tx, &id, hosted.rpc(&child_id, &op, &text, &source, since.as_deref()).await).await
+                }
+            }
+        }
+        RequestKind::AgentWatch { child_id } => {
+            let result = authorize_agent(&state, conn_id, &child_id, true).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.watch(&child_id, conn_id).map(|()| UnitOk {})
+            });
+            respond(&tx, &id, result).await
+        }
+        RequestKind::AgentUnwatch { child_id } => {
+            { let st = state.lock().unwrap(); st.hosted.unwatch(&child_id, conn_id); }
+            respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
+        }
+        RequestKind::AgentComms { request_id, reason, message } => {
+            let (child_id, hosted) = {
+                let st = state.lock().unwrap();
+                (st.conns.get(&conn_id).and_then(|c| c.child_id.clone()).unwrap_or_default(), st.hosted.clone())
+            };
+            match hosted.comms(&child_id, &request_id, &reason, &message).await {
+                Ok(reply) => respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "reply": reply }))).await,
+                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+            }
+        }
+        RequestKind::AgentCommsReply { request_id, child_id, message } => {
+            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.comms_reply(&request_id, &child_id, &message).map(|()| UnitOk {})
+            });
+            respond(&tx, &id, result).await
+        }
+        RequestKind::AgentUiResponse { child_id, rpc_id, value, cancelled } => {
+            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.ui_response(&child_id, &rpc_id, &value, cancelled).map(|()| UnitOk {})
+            });
+            respond(&tx, &id, result).await
+        }
+        RequestKind::HostedLookup { session_id, session_file } => {
+            let notice = { let st = state.lock().unwrap(); st.hosted.lookup(session_id.as_deref(), session_file.as_deref()) };
+            respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "hosted": notice }))).await
+        }
+        RequestKind::AgentCache { expires_at, tier, lifetime_ms } => {
+            {
+                let st = state.lock().unwrap();
+                let child_id = st.conns.get(&conn_id).and_then(|c| c.child_id.clone()).unwrap_or_default();
+                st.hosted.cache(&child_id, expires_at, tier, lifetime_ms);
+            }
+            respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
+        }
+        RequestKind::AgentPark { child_id } => {
+            let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
+                let st = state.lock().unwrap();
+                st.hosted.park(&child_id, "interrupt").map(|()| UnitOk {})
+            });
+            respond(&tx, &id, result).await
+        }
+        RequestKind::AgentTakeover { child_id } => {
+            match authorize_agent(&state, conn_id, &child_id, false) {
+                Err(e) => respond(&tx, &id, Err::<UnitOk, _>(e)).await,
+                Ok(()) => {
+                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
+                    respond(&tx, &id, hosted.takeover(&child_id).await.map(|()| UnitOk {})).await
+                }
+            }
+        }
+        RequestKind::AgentPeers => {
+            let (child_id, hosted, is_child) = {
+                let st = state.lock().unwrap();
+                let conn = st.conns.get(&conn_id);
+                (
+                    conn.and_then(|c| c.child_id.clone()).unwrap_or_default(),
+                    st.hosted.clone(),
+                    conn.is_some_and(|c| c.role == ConnRole::Child),
+                )
+            };
+            if !is_child {
+                respond(&tx, &id, Err::<serde_json::Value, _>(ProtoError::new(E_FORBIDDEN, "agent_peers is for a hosted child"))).await;
+            } else {
+                respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "peers": hosted.peers(&child_id) }))).await;
+            }
+        }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
         #[cfg(feature = "test-clock")]
@@ -1607,6 +1916,28 @@ fn handle_clock(
         RequestKind::ClockAdvance { ms } => m.advance(*ms),
         _ => m.status(),
     })
+}
+
+fn authorize_agent(state: &Shared, conn_id: u64, child_id: &str, sibling_input: bool) -> Result<(), ProtoError> {
+    let st = state.lock().unwrap();
+    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    let role = match conn.role {
+        ConnRole::Cli => "cli",
+        ConnRole::Child => "child",
+        ConnRole::Parent => "parent",
+    };
+    let session = conn.session_id.clone();
+    let caller = conn.child_id.clone();
+    st.hosted.authorize(role, session.as_deref(), caller.as_deref(), child_id, sibling_input)
+}
+
+fn parent_session(state: &Shared, conn_id: u64) -> Result<String, ProtoError> {
+    let st = state.lock().unwrap();
+    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    if conn.role == ConnRole::Child {
+        return Err(ProtoError::new(E_FORBIDDEN, "a hosted child cannot spawn subagents"));
+    }
+    conn.session_id.clone().ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "agent_spawn requires an extension session"))
 }
 
 async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoError>) {
@@ -1838,7 +2169,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
             serde_json::json!({
                 "kind": kind,
                 "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
-                "origin": origin,
+                "origin": origin.clone(),
                 "pid": pid,
                 "label": label,
             }),
@@ -1877,6 +2208,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
             command,
             pid,
             ts: now,
+            origin: origin.clone(),
         },
     );
     Ok(StartOk { task_id, pid })
@@ -2392,6 +2724,23 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
     })
 }
 
+/// Parent acquires use the connection's session. A hosted child acquires for a
+/// same-run sibling under that sibling's parent session, so the turn shares
+/// the machine permit with the parent.
+fn admission_owner(st: &DaemonState, conn_id: u64, child_id: &str) -> Result<(String, u32, bool), ProtoError> {
+    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    let from_child = conn.role == ConnRole::Child;
+    let sid = if from_child {
+        let caller = conn.child_id.clone().unwrap_or_default();
+        st.hosted.authorize("child", None, Some(&caller), child_id, true)?;
+        st.hosted.parent_of(child_id).ok_or_else(|| ProtoError::new(E_NOT_FOUND, "unknown child"))?
+    } else {
+        conn.session_id.clone().ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?
+    };
+    let protocol = st.sessions.get(&sid).and_then(|s| s.protocol).unwrap_or(if from_child { 6 } else { 0 });
+    Ok((sid, protocol, from_child))
+}
+
 async fn handle_acquire_agent(
     state: &Shared,
     conn_id: u64,
@@ -2403,29 +2752,16 @@ async fn handle_acquire_agent(
 ) {
     let session = {
         let st = state.lock().unwrap();
-        st.conns.get(&conn_id).and_then(|c| {
-            c.session_id.as_ref().map(|sid| {
-                (
-                    sid.clone(),
-                    st.sessions.get(sid).and_then(|s| s.protocol).unwrap_or(0),
-                    st.home.clone(),
-                    st.agent_budget.clone(),
-                    st.agent_admission.clone(),
-                )
-            })
+        admission_owner(&st, conn_id, child_id).map(|(sid, protocol, from_child)| {
+            (sid, protocol, st.home.clone(), st.agent_budget.clone(), st.agent_admission.clone(), from_child)
         })
     };
-    let Some((sid, client_protocol, home, budget_cache, admission_lock)) = session else {
-        respond::<AgentAdmissionOk>(
-            tx,
-            request_id,
-            Err(ProtoError::new(
-                E_SESSION_REQUIRED,
-                "extension session required",
-            )),
-        )
-        .await;
-        return;
+    let (sid, client_protocol, home, budget_cache, admission_lock, release_on_settle) = match session {
+        Ok(parts) => parts,
+        Err(error) => {
+            respond::<AgentAdmissionOk>(tx, request_id, Err(error)).await;
+            return;
+        }
     };
     // The #46 global budget cache remains authoritative for the machine-wide
     // cap. Serialize its refresh and this state commit so an older read cannot
@@ -2438,11 +2774,14 @@ async fn handle_acquire_agent(
     let capacity = crate::capacity::load(&home);
     let (result, wake) = {
         let mut st = state.lock().unwrap();
-        if st
-            .conns
-            .get(&conn_id)
-            .and_then(|conn| conn.session_id.as_deref())
-            != Some(sid.as_str())
+        let still_here = st.conns.get(&conn_id).is_some_and(|conn| {
+            if conn.role == ConnRole::Child {
+                true
+            } else {
+                conn.session_id.as_deref() == Some(sid.as_str())
+            }
+        });
+        if !still_here
         {
             (
                 Some(Err(ProtoError::new(
@@ -2464,7 +2803,7 @@ async fn handle_acquire_agent(
                 let grant_still_undelivered = st
                     .undelivered_agent_grants
                     .get(&(sid.clone(), request_id.to_string()))
-                    .is_some_and(|owner| owner == child_id);
+                    .is_some_and(|grant| grant.child_id == child_id);
                 if st.agent_permits.contains_key(&key)
                     && (grant_still_undelivered || re_served_grants.contains(request_id))
                 {
@@ -2477,6 +2816,7 @@ async fn handle_acquire_agent(
                         Some(Ok(AgentAdmissionOk {
                             granted: true,
                             rejection: None,
+                            queued_behind: None,
                         })),
                         wake,
                     )
@@ -2491,6 +2831,7 @@ async fn handle_acquire_agent(
                                 Some(Ok(AgentAdmissionOk {
                                     granted: false,
                                     rejection: Some("capacity_queue_full".into()),
+                                    queued_behind: None,
                                 })),
                                 wake,
                             )
@@ -2514,6 +2855,7 @@ async fn handle_acquire_agent(
                             Some(Ok(AgentAdmissionOk {
                                 granted: false,
                                 rejection: Some("global_capacity".into()),
+                                queued_behind: None,
                             })),
                             wake,
                         ),
@@ -2523,12 +2865,15 @@ async fn handle_acquire_agent(
                                 AgentPermit {
                                     work_kind: String::new(),
                                     request_id: request_id.to_string(),
+                                    release_on_settle,
+                                    turn_started: false,
                                 },
                             );
                             (
                                 Some(Ok(AgentAdmissionOk {
                                     granted: true,
                                     rejection: None,
+                                    queued_behind: None,
                                 })),
                                 wake,
                             )
@@ -2561,12 +2906,15 @@ async fn handle_acquire_agent(
                                         AgentPermit {
                                             work_kind: kind.to_string(),
                                             request_id: request_id.to_string(),
+                                            release_on_settle,
+                                            turn_started: false,
                                         },
                                     );
                                     (
                                         Some(Ok(AgentAdmissionOk {
-                                            granted: true,
-                                            rejection: None,
+                                        granted: true,
+                                        rejection: None,
+                                        queued_behind: None,
                                         })),
                                         wake,
                                     )
@@ -2582,18 +2930,28 @@ async fn handle_acquire_agent(
                                     {
                                         (
                                             Some(Ok(AgentAdmissionOk {
-                                                granted: false,
-                                                rejection: Some("capacity_queue_full".into()),
+                                            granted: false,
+                                            rejection: Some("capacity_queue_full".into()),
+                                            queued_behind: None,
                                             })),
                                             wake,
                                         )
                                     } else {
+                                        let queued_behind = st.pending_agents.len() as u64;
+                                        let requester_child = if release_on_settle {
+                                            st.conns.get(&conn_id).and_then(|c| c.child_id.clone())
+                                        } else {
+                                            None
+                                        };
                                         st.pending_agents.push_back(PendingAgent {
                                             session_id: sid,
                                             child_id: child_id.into(),
                                             work_kind: kind.into(),
                                             request_ids: vec![request_id.into()],
                                             tx: tx.clone(),
+                                            queued_behind,
+                                            release_on_settle,
+                                            requester_child,
                                         });
                                         (None, wake)
                                     }
@@ -2674,7 +3032,7 @@ fn handle_cancel_acquire(
     {
         st.agent_permits.remove(&permit_key);
         st.undelivered_agent_grants
-            .retain(|(owner, _), child| owner != &sid || child != child_id);
+            .retain(|(owner, _), grant| owner != &sid || grant.child_id != child_id);
     } else if !st.agent_permits.contains_key(&permit_key) {
         // One-shot tombstone closes cancel-before-acquire dispatch races. Once
         // consumed, a retry with this id is evaluated as a new acquire.
@@ -2712,7 +3070,7 @@ fn clear_delivered_grant(state: &Shared, session_id: &str, request_id: &str, chi
     if st
         .undelivered_agent_grants
         .get(&key)
-        .is_some_and(|child| child == child_id)
+        .is_some_and(|grant| grant.child_id == child_id)
     {
         st.undelivered_agent_grants.remove(&key);
     }
@@ -2725,6 +3083,7 @@ fn send_agent_grants_locked(st: &mut DaemonState, wake: Vec<AgentGrant>) {
             &AgentAdmissionOk {
                 granted: true,
                 rejection: None,
+                queued_behind: grant.queued_behind,
             },
         );
         if grant.tx.try_send(frame).is_ok() {
@@ -2732,7 +3091,7 @@ fn send_agent_grants_locked(st: &mut DaemonState, wake: Vec<AgentGrant>) {
             if st
                 .undelivered_agent_grants
                 .get(&key)
-                .is_some_and(|child| child == &grant.child_id)
+                .is_some_and(|held| held.child_id == grant.child_id)
             {
                 st.undelivered_agent_grants.remove(&key);
             }
@@ -2750,6 +3109,7 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
             &AgentAdmissionOk {
                 granted: true,
                 rejection: None,
+                queued_behind: grant.queued_behind,
             },
         );
         if grant.tx.try_send(frame).is_ok() {
@@ -2763,7 +3123,7 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
             if st
                 .undelivered_agent_grants
                 .get(&key)
-                .is_some_and(|child| child == &child_id)
+                .is_some_and(|grant| grant.child_id == child_id)
             {
                 st.undelivered_agent_grants.remove(&key);
             }
@@ -2774,29 +3134,35 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
 fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) -> HashSet<String> {
     let pending = {
         let st = state.lock().unwrap();
-        let Some(sid) = st
-            .conns
-            .get(&conn_id)
-            .and_then(|conn| conn.session_id.as_ref())
-        else {
+        let Some(conn) = st.conns.get(&conn_id) else {
             return HashSet::new();
         };
+        let is_child = conn.role == ConnRole::Child;
+        let session_id = conn.session_id.clone();
+        let caller = conn.child_id.clone();
         st.undelivered_agent_grants
             .iter()
-            .filter(|((owner, _), _)| owner == sid)
-            .map(|((owner, request_id), child_id)| {
-                (owner.clone(), request_id.clone(), child_id.clone())
+            .filter(|((owner, _), grant)| {
+                if is_child {
+                    grant.requester_child.is_some() && grant.requester_child == caller
+                } else {
+                    session_id.as_ref() == Some(owner) && grant.requester_child.is_none()
+                }
+            })
+            .map(|((owner, request_id), grant)| {
+                (owner.clone(), request_id.clone(), grant.child_id.clone(), grant.queued_behind)
             })
             .collect::<Vec<_>>()
     };
     let mut re_served = HashSet::new();
-    for (sid, request_id, child_id) in pending {
+    for (sid, request_id, child_id, queued_behind) in pending {
         if tx
             .try_send(encode_ok(
                 &request_id,
                 &AgentAdmissionOk {
                     granted: true,
                     rejection: None,
+                    queued_behind,
                 },
             ))
             .is_ok()
@@ -2815,15 +3181,11 @@ fn handle_release_agent(
 ) -> Result<UnitOk, ProtoError> {
     let wake = {
         let mut st = state.lock().unwrap();
-        let sid = st
-            .conns
-            .get(&conn_id)
-            .and_then(|c| c.session_id.clone())
-            .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+        let sid = admission_owner(&st, conn_id, child_id)?.0;
         st.agent_permits
             .remove(&(sid.clone(), child_id.to_string()));
         st.undelivered_agent_grants
-            .retain(|(owner, _), child| owner != &sid || child != child_id);
+            .retain(|(owner, _), grant| owner != &sid || grant.child_id != child_id);
         wake_pending(&mut st)
     };
     send_agent_grants(state, wake);
@@ -3862,18 +4224,25 @@ fn wake_pending_with_capacity(
             AgentPermit {
                 work_kind: pending.work_kind,
                 request_id: owner_request_id,
+                release_on_settle: pending.release_on_settle,
+                turn_started: false,
             },
         );
         for request_id in pending.request_ids {
             st.undelivered_agent_grants.insert(
                 (pending.session_id.clone(), request_id.clone()),
-                pending.child_id.clone(),
+                UndeliveredGrant {
+                    child_id: pending.child_id.clone(),
+                    queued_behind: Some(pending.queued_behind),
+                    requester_child: pending.requester_child.clone(),
+                },
             );
             wake.push(AgentGrant {
                 session_id: pending.session_id.clone(),
                 child_id: pending.child_id.clone(),
                 request_id,
                 tx: pending.tx.clone(),
+                queued_behind: Some(pending.queued_behind),
             });
         }
     }
@@ -3890,12 +4259,14 @@ fn admit_agent(
         return AgentAdmissionOk {
             granted: true,
             rejection: None,
+            queued_behind: None,
         };
     }
     if permits.len() >= budget {
         return AgentAdmissionOk {
             granted: false,
             rejection: Some("global_capacity".into()),
+            queued_behind: None,
         };
     }
     permits.insert(
@@ -3903,11 +4274,14 @@ fn admit_agent(
         AgentPermit {
             work_kind: "unknown".into(),
             request_id: format!("request-{}", key.1),
+            release_on_settle: false,
+            turn_started: false,
         },
     );
     AgentAdmissionOk {
         granted: true,
         rejection: None,
+        queued_behind: None,
     }
 }
 
@@ -4022,6 +4396,8 @@ mod tests {
             1,
             ConnHandle {
                 kind: ClientKind::Extension,
+                role: ConnRole::Parent,
+                child_id: None,
                 session_id: Some("sess-utf8".into()),
                 tx,
                 die: Arc::new(Notify::new()),
@@ -4151,7 +4527,7 @@ mod tests {
                 &state, tx, &Arc::new(Notify::new()),
                 &Arc::new(Mutex::new(HashMap::new())), &writer.abort_handle(),
                 ClientKind::Extension, Some(session.into()), Some(std::process::id()),
-                HelloInfo { cwd: None, extension_version: None, protocol: Some(5) },
+                HelloInfo { cwd: None, extension_version: None, protocol: Some(5), role: ConnRole::Parent, child_id: None, token: None, session_file: None, pi_version: None },
             ).unwrap());
         }
         let request = |id: &str, kind: &str, child: &str| {
@@ -4182,7 +4558,7 @@ mod tests {
         assert_eq!(released["ok"], true);
         assert_eq!(waiter_tx.capacity(), 0, "release must hit the full writer");
         assert_eq!(state.lock().unwrap().undelivered_agent_grants
-            .get(&("p16-waiter".into(), "p16-wait".into())).map(String::as_str), Some("ch_wait"));
+            .get(&("p16-waiter".into(), "p16-wait".into())).map(|grant| grant.child_id.as_str()), Some("ch_wait"));
         for id in ["p16-status-0", "p16-status-1"] {
             let frame: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
             assert_eq!(frame["id"], id, "full writer must not lose queued responses");

@@ -387,7 +387,9 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
         // A losing spawn can still be finishing its bounded lifetime-lock
         // retry after every CLI has connected to the winner. Wait for those
         // non-serving contenders to exit before asserting the process count.
-        assert!(poll_true(S(15), || {
+        // Same scheduling slack as d3: a loaded darwin-x64 runner can still
+        // be retrying after 15s.
+        assert!(poll_true(S(45), || {
             live = daemon_pids_for(&home.path);
             live.len() <= 1
         }), "round {round}: daemon contenders did not settle\n{}", d2_diagnostics(&home, old));
@@ -418,12 +420,13 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             .expect("owner hello did not identify the daemon") as u32;
 
         // Five contenders must each finish the production lock-retry cap;
-        // the marker proves actual WouldBlock attempts, while 15s is only a
-        // safety deadline for scheduling (not a claim-time contract).
+        // the marker proves actual WouldBlock attempts. The wait is only a
+        // scheduling deadline, not a claim-time contract: a loaded darwin-x64
+        // runner has missed 500 attempts inside 15s while still making progress.
         let expected_blocked_attempts = 5 * DAEMON_LOCK_RETRY_ATTEMPTS;
         let mut running = Vec::new();
         assert!(
-            poll_true(S(15), || {
+            poll_true(S(45), || {
                 running = kids
                     .iter_mut()
                     .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))

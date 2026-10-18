@@ -246,7 +246,9 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match((ep.items.at(-1) as { text?: string }).text ?? "", /WOKE orphaned/);
     // The runner only exits after its process group is empty, so its death
     // proves the lifeline tore down `sleep 30` (SIGTERM, then SIGKILL).
-    assert.ok(await waitPidGone(runnerPid), `runner pid ${runnerPid} still alive 10s after the manager crash\n${explain(ep)}`);
+    // Windows job teardown can lag past 10s on a busy runner; 20s is still
+    // before that sleep would exit on its own.
+    assert.ok(await waitPidGone(runnerPid, 20_000), `runner pid ${runnerPid} still alive 20s after the manager crash\n${explain(ep)}`);
   });
 
   // Windows has no in-place upgrade (the manager refuses it; manager/tests/platform.rs u1).
@@ -335,8 +337,9 @@ describe("faux e2e", { concurrency: true }, () => {
     // real-model eval had it first in 25 of 125 monitors).
     const firstEvent = ws.findIndex((w) => w.wake.status === "event");
     assert.ok(firstEvent >= 0 && firstEvent < ws.indexOf(exitedWakes[0]), `exit before its event\n${explain(ep)}`);
-    // `echo noop` ends in milliseconds; the exit must not wait on anything.
-    assert.ok(exitedWakes[0].t - monitorResult.t < 2000, `exit wake late\n${explain(ep)}`);
+    // `echo noop` ends as soon as the shell starts. The window covers a slow
+    // Windows shell start; the monitor's own timeout is what must not win.
+    assert.ok(exitedWakes[0].t - monitorResult.t < 20_000, `exit wake late\n${explain(ep)}`);
     const lines = ws.filter((w) => w.wake.status === "event").flatMap((w) => w.wake.body.split("\n"));
     assert.ok(lines.includes("noop"), `first line lost\n${explain(ep)}`);
     const listing = toolResults(ep.items).find((r) => r.toolName === "task_list");
@@ -350,7 +353,7 @@ describe("faux e2e", { concurrency: true }, () => {
     const r = toolResults(ep.items).find((x) => x.toolName === "bash");
     assert.ok(r, explain(ep));
     assert.equal(r.isError, true, `killed command reported as success: ${r.text}\n${explain(ep)}`);
-    assert.match(r.text, /started[\s\S]*timed out after 1 seconds/, explain(ep));
+    assert.match(r.text, /started[\s\S]*timed out after 4 seconds/, explain(ep));
   });
 
   it("(c3) a monitor that prints and exits while the agent is busy: event first, exit starts no turn", async () => {

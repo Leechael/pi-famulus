@@ -99,10 +99,10 @@ export interface InProcessRunnerOptions {
   /** Shared time source and scheduler. */
   clock?: Clock;
   /**
-   * Per-generation admission hook. Awaited before each (re)start; the
-   * releaser gets terminal=false for a resumable interruption so its local
-   * slot can be returned while the child-owned machine permit is retained.
-   * Rejecting cancels the generation as {status:"interrupted", error}.
+   * Per-generation admission hook. Awaited before each (re)start. The
+   * releaser is called with terminal=true when the turn settles, including
+   * an interrupted turn: the machine permit is released and the next turn
+   * acquires again. Rejecting cancels the generation as {status:"interrupted", error}.
    */
   acquire?: (req: ChildRunRequest, ticket: AdmissionTicket) => Promise<(terminal?: boolean) => void>;
   /**
@@ -462,8 +462,17 @@ class InProcessChildHandle implements DisposableChildHandle {
     await this.beginGeneration(message, false, false, gen);
   }
 
+  hosting(): { residency?: string; driver?: string; cacheExpiresAt?: number; sessionFile?: string; sessionId?: string } | undefined {
+    const session = this.session as { hosting?: () => { residency?: string; driver?: string; cacheExpiresAt?: number; sessionFile?: string; sessionId?: string } } | null;
+    return session?.hosting?.();
+  }
+
   async interrupt(): Promise<void> {
-    if (this.status_ !== "running" && this.status_ !== "pending") return;
+    if (this.status_ !== "running" && this.status_ !== "pending") {
+      const session = this.session as { park?: () => Promise<void> } | null;
+      if (session?.park) await session.park();
+      return;
+    }
     this.settle(this.generation, {
       status: "interrupted",
       // A pending turn has produced nothing yet; the last assistant text
@@ -563,8 +572,8 @@ class InProcessChildHandle implements DisposableChildHandle {
           signal: admissionAbort.signal,
         });
         if (this.disposed || this.isSettled(gen)) {
-          // A queued interruption is resumable; only disposal is terminal.
-          release(this.disposed);
+          // The turn is over (interrupted or disposed). The next turn acquires again.
+          release(true);
           return;
         }
         this.releaseSlot = release;
@@ -756,8 +765,9 @@ class InProcessChildHandle implements DisposableChildHandle {
       result.warning = this.session.warning;
     }
     this.status_ = result.status;
-    this.terminalSettle = result.status !== "interrupted" || result.error === "disposed";
-    this.release(this.terminalSettle);
+    // Every settled turn releases its machine permit, including an
+    // interrupted one. The next turn (resume, send, user input) acquires again.
+    this.release(true);
     this.notifyActivity();
     this.resolveResult(result);
   }

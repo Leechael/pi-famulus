@@ -12,7 +12,7 @@ use crate::fmt;
 use crate::inspect::TranscriptTurn;
 use crate::top::model::{
     self, agent_cols, compact_num, cpu_cell, header_height, height_class, now_cell, task_cols, tok_io_cell, tree_cols,
-    wall_cell, width_class, Chat, Col, DetailBody, FoldHit, HeightClass, HitRect, Node, NodeKind, Tab, TabHit,
+    wall_cell, width_class, AgentComposer, Chat, Col, DetailBody, FoldHit, HeightClass, HitRect, Node, NodeKind, Tab, TabHit,
     TopState, VisibleRow, WidthClass,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
@@ -196,8 +196,9 @@ pub fn draw(frame: &mut Frame, state: &mut TopState) {
     if state.help {
         draw_help(frame, area);
     }
+    let composer = state.composer.clone();
     if let Some(d) = state.detail.as_mut() {
-        draw_detail(frame, area, d, &mut state.mouse);
+        draw_detail(frame, area, d, composer.as_ref(), &mut state.mouse);
     } else {
         state.mouse.detail = HitRect::default();
         state.mouse.chat = HitRect::default();
@@ -967,7 +968,13 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 
 // ── detail overlay ─────────────────────────────────────────────────────────
 
-fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
+fn draw_detail(
+    frame: &mut Frame,
+    area: Rect,
+    d: &mut model::Detail,
+    composer: Option<&AgentComposer>,
+    mouse: &mut model::MouseHit,
+) {
     // Tasks always use the task view, also before their first body arrives.
     if !d.tabs.is_empty() || matches!(d.body, DetailBody::Log { .. }) {
         draw_task_detail(frame, area, d, mouse);
@@ -979,9 +986,14 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
         DetailBody::Conversation(c) => Some((c.stats.clone(), c.running, c.note.clone())),
         _ => None,
     };
+    let live = composer.filter(|c| c.child_id == d.id);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints(if live.is_some() {
+            vec![Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]
+        } else {
+            vec![Constraint::Min(1), Constraint::Length(1)]
+        })
         .split(inner);
     let body = chunks[0];
     let text_w = body.width.saturating_sub(2).max(1);
@@ -1031,13 +1043,32 @@ fn draw_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut
             left.push(unit(&format!(" {l}")));
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(fit_spans(left, chunks[1].width as usize))), chunks[1]);
-
-    let mut keys: Vec<Key> = vec![("esc", "close", 0), ("o", if d.tools_expanded { "fold all" } else { "unfold all" }, 1)];
-    if running {
-        keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 2));
+    let status_row = if live.is_some() { chunks[2] } else { chunks[1] };
+    frame.render_widget(Paragraph::new(Line::from(fit_spans(left, status_row.width as usize))), status_row);
+    if let Some(c) = live {
+        let facts = [c.activity.as_str(), c.residency.as_str(), c.model.as_str(), c.cache.as_str(), c.context.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let width = chunks[1].width as usize;
+        let suffix = if facts.is_empty() { String::new() } else { format!("  {facts}") };
+        let budget = width.saturating_sub(2 + suffix.chars().count() + 1);
+        let shown = tail_columns(&c.input, budget);
+        let prompt = format!("› {shown}▏{suffix}");
+        frame.render_widget(Paragraph::new(Line::from(sp(fg(ACCENT), prompt))), chunks[1]);
     }
-    keys.extend([("↑↓", "scroll", 3), ("g G", "top / end", 4)]);
+
+    let keys: Vec<Key> = if live.is_some() {
+        vec![("q", "close", 0), ("enter", "send", 1), ("alt-enter", "later", 2), ("esc esc", "abort", 3), ("↑↓", "scroll", 4)]
+    } else {
+        let mut keys = vec![("esc", "close", 0), ("o", if d.tools_expanded { "fold all" } else { "unfold all" }, 1)];
+        if running {
+            keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 2));
+        }
+        keys.extend([("↑↓", "scroll", 3), ("g G", "top / end", 4)]);
+        keys
+    };
     let pill = pos_pill(d.follow, running, painted.len(), height, d.scroll);
     frame.render_widget(detail_block(&d.title, pill, Vec::new(), &keys, area.width), area);
 }
@@ -1048,6 +1079,24 @@ const SPIN_MS: u128 = 80;
 const MARGIN: usize = 2;
 /// Unfolded tool output / thinking hangs off a rule at this column.
 const HANG: usize = MARGIN + 2;
+
+/// Keep the end of `text` inside `width` columns. Code points above Latin-1 count as two.
+fn tail_columns(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = 0usize;
+    let mut start = text.len();
+    for (idx, ch) in text.char_indices().rev() {
+        let w = if (ch as u32) > 0xFF { 2 } else { 1 };
+        if used + w > width {
+            break;
+        }
+        used += w;
+        start = idx;
+    }
+    text[start..].to_string()
+}
 
 fn spin_index(ms: u128) -> usize {
     (ms as usize / SPIN_MS as usize) % SPIN.len()

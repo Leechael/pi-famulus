@@ -8,7 +8,7 @@ import { call, type FauxScript, say, textOf } from "../faux-dsl.ts";
 
 let listed = false;
 const script: FauxScript = {
-  steps: [call("monitor", { command: "echo noop", description: "quick watcher", timeout_ms: 4000 })],
+  steps: [call("monitor", { command: "echo noop", description: "quick watcher", timeout_ms: 15000 })],
   // The exit can land while the turn that started the monitor is still
   // running (steered into it) or after it (a wake of its own), so look at
   // everything the model has seen, not only the latest input.

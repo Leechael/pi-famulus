@@ -18,8 +18,9 @@ pub const PROTO_VERSION: u32 = 1;
 /// (origin, mark_background, stop.reason, end_reason, events.jsonl); 3 =
 /// in-place upgrade (`upgrade`, status `generation`/`last_upgrade`, start
 /// keys, resend on reconnect); 4 = machine-wide agent admission; 5 = per-kind
-/// agent budgets and queued acquire.
-pub const PROTOCOL: u32 = 5;
+/// agent budgets and queued acquire; 6 = hosted subagents (`pi --mode rpc`
+/// processes: spawn, input, watch, comms, cache, hosting lookup).
+pub const PROTOCOL: u32 = 6;
 /// The first protocol level whose manager understands `upgrade`.
 pub const PROTOCOL_UPGRADE: u32 = 3;
 /// §3.3: max frame 4 MiB.
@@ -259,6 +260,15 @@ pub struct Request {
     pub kind: RequestKind,
 }
 
+/// Hello `role`. Unknown strings fail deserialization (`E_BAD_REQUEST`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelloRole {
+    Parent,
+    Cli,
+    Child,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestKind {
@@ -278,6 +288,23 @@ pub enum RequestKind {
         /// Protocol level the client speaks; see [`PROTOCOL`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         protocol: Option<u32>,
+        /// `parent` (a pi session), `cli`, or `child` (pi-famulus inside a
+        /// hosted subagent). Absent: extension → parent, cli → cli.
+        /// Any other string is rejected at parse time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<HelloRole>,
+        /// Pi session file this connection has open, when it knows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_file: Option<String>,
+        /// Hosted subagent id. Required with `role: "child"` and `token`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_id: Option<String>,
+        /// Per-agent token the daemon put in the child environment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        /// Pi version the child process reports.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_version: Option<String>,
     },
     /// §3.3 start — env is the child's *complete* environment.
     Start {
@@ -359,6 +386,72 @@ pub enum RequestKind {
     ReleaseAgent {
         child_id: String,
     },
+    /// Start (or reattach) a hosted `pi --mode rpc` subagent.
+    AgentSpawn {
+        child_id: String,
+        run_id: String,
+        name: String,
+        argv: Vec<String>,
+        cwd: String,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    /// Write one RPC command to a hosted subagent. Respawns a parked one.
+    AgentInput {
+        child_id: String,
+        /// `prompt` | `prompt_steer` | `prompt_follow` | `abort` | `get_state` | `get_entries` | `get_last_assistant_text`.
+        op: String,
+        #[serde(default)]
+        text: String,
+        /// `parent` | `user` | a sibling child id.
+        #[serde(default)]
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+    },
+    AgentWatch { child_id: String },
+    AgentUnwatch { child_id: String },
+    /// Child → parent. `need_decision` stays open until reply or 10 minutes.
+    AgentComms {
+        request_id: String,
+        reason: String,
+        message: String,
+    },
+    AgentCommsReply {
+        request_id: String,
+        child_id: String,
+        message: String,
+    },
+    /// Answer an `extension_ui_request` from a hosted pi.
+    AgentUiResponse {
+        child_id: String,
+        rpc_id: String,
+        #[serde(default)]
+        value: serde_json::Value,
+        #[serde(default)]
+        cancelled: bool,
+    },
+    HostedLookup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_file: Option<String>,
+    },
+    /// Child reports its prompt-cache estimate.
+    AgentCache {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lifetime_ms: Option<u64>,
+    },
+    /// Close a warm idle subagent now (keep the session file).
+    AgentPark { child_id: String },
+    /// Siblings in the calling child's run. Hosted children only.
+    AgentPeers,
+    /// Stop a warm subagent so an interactive pi can own its session file.
+    AgentTakeover { child_id: String },
     Shutdown,
     /// CLI only: replace this daemon in place with the binary now at its
     /// executable path (exec, same pid; see `handover.rs`). Answered before
@@ -427,6 +520,28 @@ pub struct HelloOk {
     /// Maximum protocol level supported by this daemon.
     #[serde(default)]
     pub protocol: u32,
+    /// Set when the connecting session is a hosted subagent's pi session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<HostedNotice>,
+}
+
+/// A pi session the daemon is hosting (or has parked).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostedNotice {
+    pub child_id: String,
+    pub residency: String,
+    pub activity: String,
+    pub driver: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_lifetime_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,6 +621,9 @@ pub struct AgentAdmissionOk {
     /// Extensible reason code, e.g. `global_capacity`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection: Option<String>,
+    /// How many waiters were ahead when this grant had to queue. Absent when a slot was free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_behind: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +713,10 @@ pub enum EventKind {
         command: String,
         pid: u32,
         ts: u64,
+        /// Present when the starter named an origin. A hosted child's foreground
+        /// bash is how the parent session learns which shell that child is blocked on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
     },
     /// Only pushed after `watch`.
     Output {
@@ -622,6 +744,51 @@ pub enum EventKind {
     },
     /// Pushed to the old connection when a session is rebound (§3.3 hello).
     SessionRebound {},
+    /// One JSONL record from a hosted subagent, or a daemon notice about it.
+    AgentRpc {
+        child_id: String,
+        record: serde_json::Value,
+    },
+    /// Residency / activity / cache changed.
+    AgentState {
+        child_id: String,
+        residency: String,
+        activity: String,
+        driver: String,
+        pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_expires_at: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_lifetime_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_version: Option<String>,
+    },
+    /// A hosted child is asking its parent (or an attached UI).
+    /// The wire name stays `agent_comms`: the parent extension matches that,
+    /// not the Rust variant name.
+    #[serde(rename = "agent_comms")]
+    AgentCommsEvent {
+        child_id: String,
+        request_id: String,
+        reason: String,
+        message: String,
+        name: String,
+    },
+    /// The user stopped talking to a subagent. `last_text` is the last assistant reply.
+    AgentDetach {
+        child_id: String,
+        name: String,
+        last_text: String,
+    },
+    /// Dialog or notify from a hosted pi extension.
+    AgentUi {
+        child_id: String,
+        request: serde_json::Value,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +938,11 @@ mod tests {
                 cwd: None,
                 extension_version: None,
                 protocol: None,
+                role: None,
+                session_file: None,
+                child_id: None,
+                token: None,
+                pi_version: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();
@@ -792,6 +964,11 @@ mod tests {
                 cwd: None,
                 extension_version: None,
                 protocol: None,
+                role: None,
+                session_file: None,
+                child_id: None,
+                token: None,
+                pi_version: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();
@@ -819,6 +996,12 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn hello_unknown_role_fails_to_parse() {
+        let raw = br#"{"type":"hello","client_kind":"extension","session_id":"s","pi_pid":1,"role":"chld"}"#;
+        assert!(serde_json::from_slice::<Request>(raw).is_err());
     }
 
     #[test]
@@ -937,6 +1120,18 @@ mod tests {
             v,
             serde_json::json!({"v": 1, "type": "event", "event": "session_rebound"})
         );
+
+        let ev = Event::new(EventKind::AgentCommsEvent {
+            child_id: "ch_a1b2c3d4".into(),
+            request_id: "req".into(),
+            reason: "need_decision".into(),
+            message: "which?".into(),
+            name: "worker".into(),
+        });
+        let v: serde_json::Value = serde_json::from_slice(&encode(&ev)).unwrap();
+        assert_eq!(v["event"], serde_json::json!("agent_comms"));
+        assert_eq!(v["child_id"], serde_json::json!("ch_a1b2c3d4"));
+        assert_eq!(v["request_id"], serde_json::json!("req"));
     }
 
     #[test]

@@ -135,6 +135,8 @@ export interface ChildHandle {
   tokenUsage(): ChildTokenUsage;
   /** Cumulative observed LLM, tool, admission-queue and approximate wall time. */
   wallUsage(): ChildWallUsage;
+  /** Hosted-process view, when this child runs as `pi --mode rpc`. */
+  hosting?(): { residency?: string; driver?: string; cacheExpiresAt?: number; sessionFile?: string; sessionId?: string } | undefined;
 }
 
 /**

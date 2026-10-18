@@ -33,6 +33,13 @@ pub struct Conn {
     wr: WriteHalf<Stream>,
 }
 
+impl Conn {
+    /// The live `top` view keeps reading events while it writes commands.
+    pub(crate) fn into_halves(self) -> (ReadHalf<Stream>, WriteHalf<Stream>) {
+        (self.rd, self.wr)
+    }
+}
+
 // Framing violations are permanent protocol failures, not disconnections.
 const PROTOCOL_FRAMING_PREFIX: &str = "protocol framing: ";
 
@@ -183,6 +190,11 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
             cwd: None,
             extension_version: None,
             protocol: Some(PROTOCOL),
+            role: Some(HelloRole::Cli),
+            session_file: None,
+            child_id: None,
+            token: None,
+            pi_version: None,
         },
         HelloMode::Extension { session_id } => RequestKind::Hello {
             client_kind: ClientKind::Extension,
@@ -191,6 +203,11 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
             extension_version: Some(format!("pi-famulus-cli/{}", crate::VERSION)),
             protocol: Some(PROTOCOL),
+            role: Some(HelloRole::Parent),
+            session_file: None,
+            child_id: None,
+            token: None,
+            pi_version: None,
         },
     };
     let _: HelloOk = conn.roundtrip(hello).await?;
@@ -960,10 +977,13 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     if let Some(st) = &status {
         for s in st.sessions.iter().filter(|s| s.connected) {
             match s.protocol {
-                Some(p) if p == st.protocol => r.ok("protocol", format!("session {} speaks {p}", s.session_id)),
+                Some(p) if p <= st.protocol => r.ok(
+                    "protocol",
+                    format!("session {} speaks {p} (manager {})", s.session_id, st.protocol),
+                ),
                 Some(p) => r.fail(
                     "protocol",
-                    format!("session {} speaks {p}, manager speaks {}; update the extension or the manager", s.session_id, st.protocol),
+                    format!("session {} speaks {p}, newer than this manager ({}); update the manager", s.session_id, st.protocol),
                 ),
                 None => r.fail(
                     "protocol",

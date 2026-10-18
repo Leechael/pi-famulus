@@ -10,7 +10,7 @@ exports[`model-visible prompt surface > guidelines and builtin agents 1`] = `
 - Never fabricate or assume a background task's result before its notification arrives.
 - Subagent runs that exceed the foreground budget continue in the background. Do not poll run status. If one subagent finishes while others are still running, a <pi-famulus-wake kind="subagent-handover"> arrives with that child's <prompt> and <result>: read both, then continue the work now (subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer the ones still running). Do not wait for the rest of the run. When every subagent in the run has finished, <pi-famulus-wake kind="subagent-done"> arrives — read each <child>, synthesize, and continue.
 - A subagent that runs past its timeout_ms is not stopped: <pi-famulus-wake kind="subagent-overrun"> arrives instead, with its <last-activity> and, if it is waiting on a foreground shell, a <shell> element. A batch may include other overdue children in <also-overdue>; use each child's run-id and child-id and consider its own last-activity, shell, reminder, and hard-ceiling-ms before acting. Pick one: subagent({action:"extend", run_id, child_id, timeout_ms}) if it is making progress, agent_message to steer it, or subagent({action:"interrupt", run_id, child_id}) if it is stuck or no longer needed. If you do none of these it keeps running and the reminder comes again.
-- Use agent_message to steer running subagents and to reply to <pi-famulus-wake kind="supervisor-request"> (action:"reply"; the <reply-with> child is the call shape). Do not use agent_message to resume a finished child — that is subagent({action:"resume"}). Supervisor wakes are not user messages — still act on them.",
+- Use agent_message to steer a running subagent or to continue an idle one (send starts a new turn), and to reply to <pi-famulus-wake kind="supervisor-request"> (action:"reply"; the <reply-with> child is the call shape). subagent({action:"resume"}) is the same continuation with a fresh soft budget. Supervisor wakes are not user messages — still act on them.",
   "BUILTIN_AGENTS": [
     {
       "description": "Fast read-only codebase exploration — finds files, symbols, and answers structure questions",
@@ -403,7 +403,7 @@ exports[`model-visible prompt surface > tool declarations 1`] = `
     "promptSnippet": "Fan out subagents in parallel or sequence them in a chain",
   },
   {
-    "description": "Message your subagents. "send" steers or queues a running child. Sending to a finished child errors (it does not resume) and points at subagent({ action: "resume", run_id, child_id, message }). "reply" answers a child's pending decision request; "broadcast" steers every running child of a run (to = run_id); "list" shows children, pending decision requests, and recent traffic.",
+    "description": "Message your subagents. "send" steers or queues a running child, and starts a new turn on an idle one. An idle child (warm or parked) continues with send or subagent resume; its prompt cache stays warm only for the time a wake reports. "reply" answers a child's pending decision request; "broadcast" steers every running child of a run (to = run_id); "list" shows children, pending decision requests, and recent traffic.",
     "name": "agent_message",
     "parameters": {
       "properties": {
@@ -439,7 +439,7 @@ exports[`model-visible prompt surface > tool declarations 1`] = `
               "type": "string",
             },
           ],
-          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).",
+          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to an idle child starts a new turn.",
         },
         "message": {
           "description": "Message text.",
@@ -459,7 +459,7 @@ exports[`model-visible prompt surface > tool declarations 1`] = `
     "promptSnippet": "Send/reply/broadcast messages to subagents",
   },
   {
-    "description": "Message sibling subagents in your run, or list pending requests. "send" delivers to a running sibling. Sending to a finished sibling errors and does not resume it; resume with subagent({ action: "resume", run_id, child_id, message }). "broadcast" steers every running sibling in your run; "list" shows pending decision requests and recent traffic. Cross-run messaging is rejected.",
+    "description": "Message sibling subagents in your run, or list pending requests. "send" delivers to a running sibling and starts a new turn on an idle one. "broadcast" steers every running sibling in your run; "list" shows pending decision requests and recent traffic. Cross-run messaging is rejected.",
     "name": "agent_message",
     "parameters": {
       "properties": {
@@ -495,7 +495,7 @@ exports[`model-visible prompt surface > tool declarations 1`] = `
               "type": "string",
             },
           ],
-          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).",
+          "description": ""steer" (default) delivers to a running child after its current tool call/turn finishes; "queue" delivers after its current turn. Sending to an idle child starts a new turn.",
         },
         "message": {
           "description": "Message text.",

@@ -366,7 +366,7 @@ describe("InProcessRunner", () => {
     expect(released).toBe(2);
   });
 
-  it("keeps the machine permit across an interrupted resumable turn", async () => {
+  it("releases the machine permit when an interrupted turn can still be resumed", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
     const releases: boolean[] = [];
@@ -376,14 +376,14 @@ describe("InProcessRunner", () => {
     });
     const handle = await runner.start(makeReq());
     await handle.interrupt();
-    expect(releases).toEqual([false]);
+    expect(releases).toEqual([true]);
     factory.sessions[0].autoComplete = "resumed";
     await handle.resume("continue");
     expect((await handle.result).status).toBe("completed");
-    expect(releases).toEqual([false, true]);
+    expect(releases).toEqual([true, true]);
   });
 
-  it("keeps the permit when admission resolves after a resumable interruption", async () => {
+  it("releases a permit granted after the turn was already interrupted", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
     const releases: boolean[] = [];
@@ -399,18 +399,17 @@ describe("InProcessRunner", () => {
     });
     const handle = await runner.start(makeReq());
     await handle.interrupt();
-    await handle.resume("continue");
+    const resumed = handle.resume("continue");
     await tick();
     expect(acquired).toBe(2);
     await handle.interrupt();
     resolveAdmission((terminal = true) => { releases.push(terminal); });
     await tick();
-    expect(releases).toEqual([false, false, false]);
-    handle.dispose();
-    expect(releases).toEqual([false, false, false, true]);
+    await resumed.catch(() => {});
+    expect(releases).toEqual([true, true]);
   });
 
-  it("releases an interrupted child's retained machine permit on disposal", async () => {
+  it("dispose releases a permit still held after a resumable interruption", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;
     const releases: boolean[] = [];
@@ -420,9 +419,29 @@ describe("InProcessRunner", () => {
     });
     const handle = await runner.start(makeReq());
     await handle.interrupt();
-    expect(releases).toEqual([false]);
+    expect(releases).toEqual([true]);
+    const resumed = handle.resume("continue");
+    await tick();
+    expect(releases).toEqual([true]);
     handle.dispose();
-    expect(releases).toEqual([false, true]);
+    await resumed.catch(() => {});
+    await tick();
+    expect(releases).toEqual([true, true]);
+  });
+
+  it("does not release again when dispose follows an interrupt that already released", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => (terminal = true) => { releases.push(terminal); },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    expect(releases).toEqual([true]);
+    handle.dispose();
+    expect(releases).toEqual([true]);
   });
 
   it("attributes cancelled admission wait to queue time, not duration", async () => {

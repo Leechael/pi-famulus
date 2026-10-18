@@ -1,8 +1,9 @@
 /**
  * comms types (design doc appendix B, M4).
  *
- * `ChildStatus` / `ChildResult` / `ChildHandle` are structural re-declarations
- * of the appendix B contract. They are intentionally NOT imported from
+ * `ChildStatus` / `ChildResult` / `ChildHandle` follow the appendix B shapes.
+ * `send` returns `"running" | "resumed" | "queued"`; appendix B originally said `Promise<void>`.
+ * These shapes are intentionally NOT imported from
  * `../subagent/types` (M3 is developed in parallel and may not exist yet);
  * any value satisfying these shapes is accepted.
  */
@@ -43,6 +44,10 @@ export interface CommsHost {
   listChildren(): { childId: string; runId: string; name: string; status: ChildStatus }[];
   sameRun(childIdA: string, childIdB: string): boolean;
   notifySupervisor(wake: { content: string; details: FamulusWake }): void;
+  /** Continue an idle child. Absent on test hosts that still reject send-to-finished. `queuedBehind` is null when a slot was free. */
+  resumeChild?(childId: string, message: string): Promise<{ queuedBehind: number | null }>;
+  /** Fired after resumeChild accepts a turn, so the parent can be woken when it settles. */
+  onResumeAccepted?(childId: string): void;
 }
 
 export interface MailboxEntry {
@@ -61,7 +66,8 @@ export interface Comms {
     message: string,
   ): Promise<string>; // need_decision → reply text; progress_update → immediate "ok"
   reply(toChildId: string, message: string): void; // no pending waiter → throw
-  send(toChildId: string, message: string, delivery: "steer" | "queue"): Promise<void>;
+  // "running" steered or queued into a live child; "resumed" an idle child started a turn; "queued" the turn is waiting for a machine slot.
+  send(toChildId: string, message: string, delivery: "steer" | "queue"): Promise<"running" | "resumed" | "queued">;
   broadcast(runId: string, message: string, fromChildId?: string): Promise<string[]>; // delivered childIds
   pendingRequests(): { childId: string; name: string; message: string; sinceMs: number }[];
   log(runId: string, limit?: number): MailboxEntry[]; // default 20, ring 200/run

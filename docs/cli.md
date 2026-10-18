@@ -15,6 +15,7 @@ From the CLI alone you can answer: what is each session doing and where (cwd), w
 | What is running / just finished? | `pi-famulus ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits drops its finished rows from `ls` at once, and drops out of `sessions` too once nothing of it is still running; either way its running work stays listed until it ends, and its agent records, transcripts and events stay reachable for `goneSessionRetention` (default 24h); a finished task's own record can expire sooner under `finishedTaskRetention` |
 | Why did this end? What did it print? | `pi-famulus show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
 | What did this subagent do? | `pi-famulus agent <ch_id> [-f] [--full]` (live transcript) |
+| Talk to a hosted subagent | `pi-famulus attach <child-id>` opens `top` on that agent: the transcript is live, Enter sends, Alt-Enter queues a follow-up, Esc twice aborts |
 | Which subagent spent how much CPU on which kind of task? | `pi-famulus stats [--by agent\|kind\|agent,kind] [--since 2h]` (tasks, wall, CPU, average cores, unmeasured, killed); `ls` shows CPU and CORES per finished task |
 | Why didn't a notification arrive? | `pi-famulus events [-f] [--id X]` (task lifecycle + wake emit/deliver/inject/dedupe/drop; `wake.inject lag_ms` = how long a wake waited before the model saw it) |
 | Follow output | `pi-famulus tail <id>`, `pi-famulus log -f <id> [--stderr]` |
@@ -82,6 +83,7 @@ pi-famulus sessions [--json]
 pi-famulus ls [-a] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
 pi-famulus show <id> [--json]
 pi-famulus top [--once] [--interval DUR] [--session PREFIX] [--cwd DIR] [--json]
+pi-famulus attach <child-id>   # needs a terminal; opens top on that hosted subagent
 pi-famulus stats [--by agent|kind|agent,kind] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # --by defaults to agent
 pi-famulus agent <ch_id> [--full] [-f]
 pi-famulus events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
@@ -109,7 +111,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show`, `stats` and `top` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `upgrade`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions`, `show`, `stats` and `top` (read the disk instead), `attach` (needs a terminal and a running daemon; it does not start one), `agent`, `events`, `log`, `tail`, `completion`, `config`, `doctor`, `upgrade`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 

@@ -5,7 +5,7 @@
  *   system prompt sections + <rules> + tool declarations, backgrounded-bash
  *   result, sleep-block error, task wake (+ <still-running>), monitor wake,
  *   subagent backgrounded result, subagent-handover / subagent-done /
- *   supervisor-request wakes, and the agent_message "finished child" error.
+ *   supervisor-request wakes, and agent_message send starting a turn on a finished child.
  *
  * Parent and children share the faux provider, so every decision is a pure
  * function of the call context (not a step index).
@@ -65,7 +65,7 @@ function parent(ctx: FauxCallContext) {
     return call("agent_message", { action: "reply", to: request, message: "RED" });
   }
   if (texts.some((t) => t.includes('kind="subagent-done"')) && !called(ctx, (n, a) => n === "agent_message" && a.action === "send")) {
-    // Finished child: now an error that points at subagent resume.
+    // Finished child: send starts a new turn instead of erroring.
     return call("agent_message", { action: "send", to: "one", message: "one more thing" });
   }
   return say("ok");

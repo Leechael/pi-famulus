@@ -50,6 +50,34 @@ const execTool = (tool: { execute: (...a: never[]) => Promise<unknown> }, params
   tool.execute("tc" as never, params as never, undefined as never, undefined as never, {} as never);
 
 describe("registry-host adapter over a real registry", () => {
+  it("send to a finished child says it is waiting when every slot is busy", async () => {
+    const registry = new SubagentRegistry({ maxConcurrentChildren: 1, spawnBudgetPerHour: 32 });
+    const factory = new SessionFactory();
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: (req, ticket) => registry.admitChild(req.childId, ticket),
+    });
+    registry.setRunner(runner);
+    const host = createRegistryCommsHost({
+      getRegistry: () => registry,
+      getNotifyCenter: () => ({ notify: () => {} }),
+    });
+    const comms = createComms(host);
+    const tool = createAgentMessageTool(comms, { kind: "parent" }, host);
+    const run = registry.createRun("tasks");
+    await registry.startChild(addReq(registry, run.runId, "alpha"));
+    await tick();
+    factory.autoComplete = null;
+    await registry.startChild(addReq(registry, run.runId, "beta"));
+    await tick();
+    const res = (await execTool(tool, { action: "send", to: "alpha", message: "again" })) as {
+      content: { type: string; text?: string }[];
+      details: { ok: boolean };
+    };
+    expect(res.details.ok).toBe(true);
+    expect(res.content[0].text).toContain("waiting for a machine slot");
+  });
+
   it("maps children by id and name; sameRun reflects lineage", async () => {
     const { registry, factory, host } = makeStack();
     factory.autoComplete = null;
@@ -89,7 +117,7 @@ describe("registry-host adapter over a real registry", () => {
 });
 
 describe("comms tools over the real registry", () => {
-  it("parent send steers a running child; send to a terminal child does not resume it", async () => {
+  it("parent send steers a running child and starts a turn on an idle one", async () => {
     const { registry, factory, comms, host } = makeStack();
     factory.autoComplete = null;
     const run = registry.createRun("tasks");
@@ -108,8 +136,8 @@ describe("comms tools over the real registry", () => {
     const r2 = (await execTool(tool, { action: "send", to: "alpha", message: "now docs" })) as {
       details: { ok: boolean };
     };
-    expect(r2.details.ok).toBe(false);
-    expect(factory.sessions[0].prompts).toEqual(["do alpha"]);
+    expect(r2.details.ok).toBe(true);
+    expect(factory.sessions[0].prompts).toEqual(["do alpha", "now docs"]);
   });
 
   it("need_decision blocks the child until the parent replies via the tool", async () => {

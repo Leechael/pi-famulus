@@ -140,6 +140,8 @@ export interface SubagentToolDeps {
   /** Agent definition resolver (M5 wires the real loader; default: worker). */
   resolveAgent?: (name: string | undefined) => AgentDefinition;
   /** Selectable models for action:"models" (§4.6); absent → action errors. */
+  /** Receives the watcher for turns started by agent_message send. */
+  registerResumeWatch?: (watch: (childId: string) => void) => void;
   listModels?: () => {
     provider: string;
     id: string;
@@ -346,6 +348,20 @@ export function createSubagentTool(
     return true;
   };
 
+  const armResumeWake = (childId: string): void => {
+    const registry = deps.getRegistry();
+    if (!registry) return;
+    const record = registry.list().find((run) => run.children.some((c) => c.childId === childId));
+    if (!record) return;
+    const handedOver = new Set<string>();
+    void registry.getResult(childId)?.then(() => {
+      if (!notifyChildHandover(registry, record.runId, childId, handedOver)) {
+        notifyRunCompleted(registry, record.runId);
+      }
+    });
+  };
+  deps.registerResumeWatch?.(armResumeWake);
+
   const startRun = async (
     params: SubagentParams,
     signal: AbortSignal | undefined,
@@ -547,7 +563,18 @@ export function createSubagentTool(
       };
     }
 
-    const record = requireRun(registry, params.run_id);
+    const record = params.run_id
+      ? requireRun(registry, params.run_id)
+      : params.child_id
+        ? resolveRunByChild(registry, params.child_id)
+        : undefined;
+    if (!record) {
+      if (params.child_id && !params.run_id) {
+        throw new Error(`unknown child "${params.child_id}" (no run in this session holds it)`);
+      }
+      requireRun(registry, params.run_id);
+      throw new Error("run_id is required for this action");
+    }
 
     if (action === "get") {
       return {
@@ -585,18 +612,45 @@ export function createSubagentTool(
         const known = record.children.map((c) => `${c.name} (${c.childId})`).join(", ");
         throw new Error(`no child "${params.child_id}" in run ${record.runId} (children: ${known})`);
       }
+      const idle = record.children.filter((c) => {
+        if (params.child_id && c.childId !== params.child_id && c.name !== params.child_id) return false;
+        return c.status === "completed" || c.status === "failed" || c.status === "interrupted";
+      });
       for (const child of targets) {
         await registry.handle(child.childId)?.interrupt();
       }
-      const scope = params.child_id ? `subagent ${params.child_id}` : `${targets.length} subagent(s)`;
+      for (const child of idle) {
+        await registry.handle(child.childId)?.interrupt();
+      }
+      const interrupted = [...targets, ...idle].map((c) => c.childId);
+      const scope = params.child_id ? `subagent ${params.child_id}` : `${interrupted.length} subagent(s)`;
       return {
         content: [{ type: "text", text: `Interrupted ${scope} in run ${record.runId}.` }],
-        details: { run_id: record.runId, interrupted: targets.map((c) => c.childId) },
+        details: { run_id: record.runId, interrupted },
       };
     }
 
     if (action === "steer") {
       if (!params.message) throw new Error("message is required for steer");
+      const named = params.child_id
+        ? record.children.find((c) => c.childId === params.child_id || c.name === params.child_id)
+        : record.children.length === 1 ? record.children[0] : undefined;
+      if (named && named.status !== "running" && named.status !== "pending") {
+        const { queuedBehind } = await registry.resumeChild(named.childId, params.message);
+        armResumeWake(named.childId);
+        return {
+          content: [{
+            type: "text",
+            text: fill("tools.subagent.result.resumed", {
+              name: named.name,
+              childId: named.childId,
+              runId: record.runId,
+              queued: queuedText(queuedBehind),
+            }),
+          }],
+          details: { run_id: record.runId, child_id: named.childId, queued_behind: queuedBehind },
+        };
+      }
       const handle = resolveSingleActiveChild(registry, record, params.child_id, "steer");
       await handle.steer(params.message);
       return {
@@ -645,12 +699,7 @@ export function createSubagentTool(
     );
     // Resume is asynchronous. If siblings are still running, hand this child
     // back as soon as it finishes; otherwise the run-complete wake covers it.
-    const handedOver = new Set<string>();
-    void registry.getResult(child.childId)?.then(() => {
-      if (!notifyChildHandover(registry, record.runId, child.childId, handedOver)) {
-        notifyRunCompleted(registry, record.runId);
-      }
-    });
+    armResumeWake(child.childId);
     return {
       content: [
         {
@@ -731,6 +780,18 @@ export function createSubagentTool(
       return startRun(params, signal);
     },
   };
+}
+
+function resolveRunByChild(registry: SubagentRegistry, childIdOrName: string) {
+  const runs = registry.list();
+  const byId = runs.filter((run) => run.children.some((c) => c.childId === childIdOrName));
+  if (byId.length === 1) return byId[0];
+  const byName = runs.filter((run) => run.children.some((c) => c.name === childIdOrName));
+  if (byName.length > 1) {
+    const ids = byName.map((run) => run.runId).join(", ");
+    throw new Error(`child name "${childIdOrName}" is in more than one run (${ids}); pass run_id`);
+  }
+  return byName[0];
 }
 
 /** Resume result clause for a turn waiting for an admission slot ("" when it started at once). */
