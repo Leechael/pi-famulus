@@ -77,9 +77,22 @@ export function registerChildMode(pi: ExtensionAPI): void {
     notifySupervisor: () => {},
     resumeChild: async (id, message) => {
       if (!client) throw new Error("pi-famulus daemon is not connected");
+      client.requireHostedProtocol();
+      // A live signal disables the 30s acquire timer, so a queued permit can wait.
+      const admissionSignal = new AbortController().signal;
       let queuedBehind: number | null = null;
       for (;;) {
-        const admission = await client.acquireAgent(id, "other");
+        let admission: { granted: boolean; queuedBehind?: number };
+        try {
+          admission = await client.acquireAgent(id, "other", admissionSignal);
+        } catch (err) {
+          const messageText = err instanceof Error ? err.message : String(err);
+          if (messageText.includes("timed out")) {
+            queuedBehind = queuedBehind ?? 0;
+            continue;
+          }
+          throw err;
+        }
         if (admission.granted) {
           if (admission.queuedBehind != null) queuedBehind = admission.queuedBehind;
           break;

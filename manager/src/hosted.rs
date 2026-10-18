@@ -191,11 +191,12 @@ impl Hosted {
         g.agents.get(&id).map(|a| a.notice())
     }
 
-    /// Same-run siblings, including the caller. A hosted child uses this to address peers.
+    /// Parent session that owns this hosted child.
     pub fn parent_of(&self, child_id: &str) -> Option<String> {
         self.inner.lock().unwrap().agents.get(child_id).map(|a| a.parent_session.clone())
     }
 
+    /// Same-run siblings, including the caller. A hosted child uses this to address peers.
     pub fn peers(&self, child_id: &str) -> Vec<Value> {
         let g = self.inner.lock().unwrap();
         let Some(me) = g.agents.get(child_id) else { return Vec::new() };

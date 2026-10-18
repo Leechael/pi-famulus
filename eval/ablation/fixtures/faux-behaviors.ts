@@ -45,8 +45,12 @@ function resumeBehavior(mode: "resume" | "send-then-resume" | "send-only"): Faux
     }
     if (mode !== "send-only" && !already("subagent", "resume")) {
       // The spawn can still be running when the foreground budget returns.
-      // Resume is rejected until that turn settles.
-      const settled = ctx.messages.some((m) => /kind="subagent-(done|handover)"/.test(textOf(m)));
+      // A finish inside the budget is the synchronous tool result (`Run run_…`),
+      // not a wake. Resume is rejected until that turn has settled.
+      const settled = ctx.messages.some((m) => {
+        const text = textOf(m);
+        return /kind="subagent-(done|handover)"/.test(text) || /Run run_[0-9a-f]{8} \[[^\]]+\] /.test(text);
+      });
       if (!settled) return say("ok");
       // Send to an idle child starts its own turn. Resume only after that
       // turn has finished; a resume while it is still pending is rejected.

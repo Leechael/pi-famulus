@@ -119,6 +119,13 @@ pub struct AgentPermit {
     pub(crate) request_id: String,
     /// Set when a hosted sibling acquired the permit. Released on settle.
     pub(crate) release_on_settle: bool,
+    /// The sibling prompt has been seen running, so a later idle is its settle.
+    pub(crate) turn_started: bool,
+}
+
+pub(crate) struct UndeliveredGrant {
+    child_id: String,
+    queued_behind: Option<u64>,
 }
 
 struct AgentGrant {
@@ -173,7 +180,7 @@ pub struct DaemonState {
     /// FIFO requests waiting for a per-kind slot, one entry per child.
     pub pending_agents: std::collections::VecDeque<PendingAgent>,
     /// Queued grants that hit a full/closed output channel; retried on session activity.
-    pub undelivered_agent_grants: HashMap<(String, String), String>,
+    pub undelivered_agent_grants: HashMap<(String, String), UndeliveredGrant>,
     /// One-shot cancellation tombstones for cancel/acquire dispatch races.
     pub cancelled_acquires: HashSet<(String, String, String)>,
     /// Serializes budget reads with admission commits without holding `state`
@@ -414,6 +421,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
                         work_kind: String::new(),
                         request_id: String::new(),
                         release_on_settle: false,
+                        turn_started: false,
                     },
                 )
             }));
@@ -427,10 +435,17 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
                             work_kind,
                             request_id,
                             release_on_settle: false,
+                            turn_started: false,
                         },
                     )
                 },
             ));
+    }
+    for (session_id, child_id, release_on_settle, turn_started) in snap.agent_permit_flags {
+        if let Some(permit) = st.agent_permits.get_mut(&(session_id, child_id)) {
+            permit.release_on_settle = release_on_settle;
+            permit.turn_started = turn_started;
+        }
     }
     let clock = st.clock.clone();
     clock.resume_at(snap.clock_now_ms);
@@ -497,8 +512,8 @@ fn reap_disconnected_agent_permits(st: &mut DaemonState) {
     st.cancelled_acquires
         .retain(|(sid, _, _)| connected.contains(sid));
     let active_permits: HashSet<(String, String)> = st.agent_permits.keys().cloned().collect();
-    st.undelivered_agent_grants.retain(|(sid, _), child_id| {
-        connected.contains(sid) && active_permits.contains(&(sid.clone(), child_id.clone()))
+    st.undelivered_agent_grants.retain(|(sid, _), grant| {
+        connected.contains(sid) && active_permits.contains(&(sid.clone(), grant.child_id.clone()))
     });
 }
 
@@ -1508,20 +1523,29 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
 }
 
 fn release_settled_sibling_permit(st: &mut DaemonState, notice: &crate::hosted::Notice) -> Vec<AgentGrant> {
-    let settled = match &notice.event {
-        EventKind::AgentState { activity, .. } => activity == "idle" || activity == "failed",
-        _ => false,
+    let activity = match &notice.event {
+        EventKind::AgentState { activity, .. } => activity.as_str(),
+        _ => return Vec::new(),
     };
-    if !settled {
+    let key = (notice.parent_session.clone(), notice.child_id.clone());
+    if activity == "running" {
+        if let Some(permit) = st.agent_permits.get_mut(&key) {
+            if permit.release_on_settle {
+                permit.turn_started = true;
+            }
+        }
         return Vec::new();
     }
-    let key = (notice.parent_session.clone(), notice.child_id.clone());
-    let release = st.agent_permits.get(&key).is_some_and(|permit| permit.release_on_settle);
+    if activity != "idle" && activity != "failed" {
+        return Vec::new();
+    }
+    // A parked respawn emits idle before the sibling prompt starts a turn.
+    let release = st.agent_permits.get(&key).is_some_and(|permit| permit.release_on_settle && permit.turn_started);
     if !release {
         return Vec::new();
     }
     st.agent_permits.remove(&key);
-    st.undelivered_agent_grants.retain(|(owner, _), child| owner != &notice.parent_session || child != &notice.child_id);
+    st.undelivered_agent_grants.retain(|(owner, _), grant| owner != &notice.parent_session || grant.child_id != notice.child_id);
     wake_pending(st)
 }
 
@@ -2775,7 +2799,7 @@ async fn handle_acquire_agent(
                 let grant_still_undelivered = st
                     .undelivered_agent_grants
                     .get(&(sid.clone(), request_id.to_string()))
-                    .is_some_and(|owner| owner == child_id);
+                    .is_some_and(|grant| grant.child_id == child_id);
                 if st.agent_permits.contains_key(&key)
                     && (grant_still_undelivered || re_served_grants.contains(request_id))
                 {
@@ -2838,6 +2862,7 @@ async fn handle_acquire_agent(
                                     work_kind: String::new(),
                                     request_id: request_id.to_string(),
                                     release_on_settle,
+                                    turn_started: false,
                                 },
                             );
                             (
@@ -2878,6 +2903,7 @@ async fn handle_acquire_agent(
                                             work_kind: kind.to_string(),
                                             request_id: request_id.to_string(),
                                             release_on_settle,
+                                            turn_started: false,
                                         },
                                     );
                                     (
@@ -2996,7 +3022,7 @@ fn handle_cancel_acquire(
     {
         st.agent_permits.remove(&permit_key);
         st.undelivered_agent_grants
-            .retain(|(owner, _), child| owner != &sid || child != child_id);
+            .retain(|(owner, _), grant| owner != &sid || grant.child_id != child_id);
     } else if !st.agent_permits.contains_key(&permit_key) {
         // One-shot tombstone closes cancel-before-acquire dispatch races. Once
         // consumed, a retry with this id is evaluated as a new acquire.
@@ -3034,7 +3060,7 @@ fn clear_delivered_grant(state: &Shared, session_id: &str, request_id: &str, chi
     if st
         .undelivered_agent_grants
         .get(&key)
-        .is_some_and(|child| child == child_id)
+        .is_some_and(|grant| grant.child_id == child_id)
     {
         st.undelivered_agent_grants.remove(&key);
     }
@@ -3055,7 +3081,7 @@ fn send_agent_grants_locked(st: &mut DaemonState, wake: Vec<AgentGrant>) {
             if st
                 .undelivered_agent_grants
                 .get(&key)
-                .is_some_and(|child| child == &grant.child_id)
+                .is_some_and(|held| held.child_id == grant.child_id)
             {
                 st.undelivered_agent_grants.remove(&key);
             }
@@ -3087,7 +3113,7 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
             if st
                 .undelivered_agent_grants
                 .get(&key)
-                .is_some_and(|child| child == &child_id)
+                .is_some_and(|grant| grant.child_id == child_id)
             {
                 st.undelivered_agent_grants.remove(&key);
             }
@@ -3098,30 +3124,34 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
 fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) -> HashSet<String> {
     let pending = {
         let st = state.lock().unwrap();
-        let Some(sid) = st
-            .conns
-            .get(&conn_id)
-            .and_then(|conn| conn.session_id.as_ref())
-        else {
+        let Some(conn) = st.conns.get(&conn_id) else {
             return HashSet::new();
         };
+        let owners: Vec<String> = if conn.role == ConnRole::Child {
+            conn.child_id.as_deref().and_then(|id| st.hosted.parent_of(id)).into_iter().collect()
+        } else {
+            conn.session_id.clone().into_iter().collect()
+        };
+        if owners.is_empty() {
+            return HashSet::new();
+        }
         st.undelivered_agent_grants
             .iter()
-            .filter(|((owner, _), _)| owner == sid)
-            .map(|((owner, request_id), child_id)| {
-                (owner.clone(), request_id.clone(), child_id.clone())
+            .filter(|((owner, _), _)| owners.iter().any(|sid| sid == owner))
+            .map(|((owner, request_id), grant)| {
+                (owner.clone(), request_id.clone(), grant.child_id.clone(), grant.queued_behind)
             })
             .collect::<Vec<_>>()
     };
     let mut re_served = HashSet::new();
-    for (sid, request_id, child_id) in pending {
+    for (sid, request_id, child_id, queued_behind) in pending {
         if tx
             .try_send(encode_ok(
                 &request_id,
                 &AgentAdmissionOk {
                     granted: true,
                     rejection: None,
-                    queued_behind: None,
+                    queued_behind,
                 },
             ))
             .is_ok()
@@ -3144,7 +3174,7 @@ fn handle_release_agent(
         st.agent_permits
             .remove(&(sid.clone(), child_id.to_string()));
         st.undelivered_agent_grants
-            .retain(|(owner, _), child| owner != &sid || child != child_id);
+            .retain(|(owner, _), grant| owner != &sid || grant.child_id != child_id);
         wake_pending(&mut st)
     };
     send_agent_grants(state, wake);
@@ -4184,12 +4214,16 @@ fn wake_pending_with_capacity(
                 work_kind: pending.work_kind,
                 request_id: owner_request_id,
                 release_on_settle: pending.release_on_settle,
+                turn_started: false,
             },
         );
         for request_id in pending.request_ids {
             st.undelivered_agent_grants.insert(
                 (pending.session_id.clone(), request_id.clone()),
-                pending.child_id.clone(),
+                UndeliveredGrant {
+                    child_id: pending.child_id.clone(),
+                    queued_behind: Some(pending.queued_behind),
+                },
             );
             wake.push(AgentGrant {
                 session_id: pending.session_id.clone(),
@@ -4229,6 +4263,7 @@ fn admit_agent(
             work_kind: "unknown".into(),
             request_id: format!("request-{}", key.1),
             release_on_settle: false,
+            turn_started: false,
         },
     );
     AgentAdmissionOk {
@@ -4511,7 +4546,7 @@ mod tests {
         assert_eq!(released["ok"], true);
         assert_eq!(waiter_tx.capacity(), 0, "release must hit the full writer");
         assert_eq!(state.lock().unwrap().undelivered_agent_grants
-            .get(&("p16-waiter".into(), "p16-wait".into())).map(String::as_str), Some("ch_wait"));
+            .get(&("p16-waiter".into(), "p16-wait".into())).map(|grant| grant.child_id.as_str()), Some("ch_wait"));
         for id in ["p16-status-0", "p16-status-1"] {
             let frame: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
             assert_eq!(frame["id"], id, "full writer must not lose queued responses");
