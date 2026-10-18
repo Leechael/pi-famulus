@@ -418,12 +418,13 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             .expect("owner hello did not identify the daemon") as u32;
 
         // Five contenders must each finish the production lock-retry cap;
-        // the marker proves actual WouldBlock attempts, while 15s is only a
-        // safety deadline for scheduling (not a claim-time contract).
+        // the marker proves actual WouldBlock attempts. The wait is only a
+        // scheduling deadline, not a claim-time contract: a loaded darwin-x64
+        // runner has missed 500 attempts inside 15s while still making progress.
         let expected_blocked_attempts = 5 * DAEMON_LOCK_RETRY_ATTEMPTS;
         let mut running = Vec::new();
         assert!(
-            poll_true(S(15), || {
+            poll_true(S(45), || {
                 running = kids
                     .iter_mut()
                     .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
