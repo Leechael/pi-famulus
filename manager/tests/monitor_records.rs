@@ -90,7 +90,8 @@ fn monitor_live_records_include_eof_tail_before_exit_and_preserve_raw_reads() {
             break;
         }
     }
-    answer.expect("EOF metadata is replayable even when raw cursor is caught up");
+    let answer = answer.expect("EOF metadata is replayable even when raw cursor is caught up");
+    assert_eq!(answer["chunk"], "", "a recorded cursor must answer with metadata alone");
 }
 
 #[test]
