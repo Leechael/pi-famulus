@@ -387,7 +387,9 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
         // A losing spawn can still be finishing its bounded lifetime-lock
         // retry after every CLI has connected to the winner. Wait for those
         // non-serving contenders to exit before asserting the process count.
-        assert!(poll_true(S(15), || {
+        // Same scheduling slack as d3: a loaded darwin-x64 runner can still
+        // be retrying after 15s.
+        assert!(poll_true(S(45), || {
             live = daemon_pids_for(&home.path);
             live.len() <= 1
         }), "round {round}: daemon contenders did not settle\n{}", d2_diagnostics(&home, old));
