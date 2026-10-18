@@ -474,14 +474,18 @@ export class ManagerClient {
     childId: string,
     workKind = "other",
     signal?: AbortSignal,
-  ): Promise<{ granted: boolean; rejection?: string }> {
+  ): Promise<{ granted: boolean; rejection?: string; queuedBehind?: number }> {
     if (signal?.aborted) throw new Error("subagent admission cancelled");
     const message: Record<string, unknown> = { type: "acquire_agent", child_id: childId };
     if (this.protocolLevel_ >= 5) message.work_kind = workKind;
     // Protocol 4 has no cancel frame. Keep its immediate acquire correlated so
     // admission can release a grant that arrives after the generation aborts.
     const res = await this.request(message, DEFAULT_REQUEST_TIMEOUT_MS, this.protocolLevel_ >= 5 ? signal : undefined, true);
-    return { granted: res.granted === true, ...(typeof res.rejection === "string" ? { rejection: res.rejection } : {}) };
+    return {
+      granted: res.granted === true,
+      ...(typeof res.rejection === "string" ? { rejection: res.rejection } : {}),
+      ...(typeof res.queued_behind === "number" ? { queuedBehind: res.queued_behind } : {}),
+    };
   }
 
   async releaseAgent(childId: string): Promise<void> {
@@ -1001,7 +1005,7 @@ export class ManagerClient {
     waitForAdmission = false,
   ): Promise<Record<string, unknown>> {
     const type = String(msg.type);
-    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent", "agent_spawn", "agent_watch", "agent_unwatch", "agent_park", "agent_peers", "hosted_lookup"].includes(type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start", "acquire_agent", "cancel_acquire_agent", "release_agent", "agent_spawn", "agent_watch", "agent_park", "agent_peers", "hosted_lookup"].includes(type);
     const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {

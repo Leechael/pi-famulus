@@ -77,14 +77,30 @@ export function registerChildMode(pi: ExtensionAPI): void {
     notifySupervisor: () => {},
     resumeChild: async (id, message) => {
       if (!client) throw new Error("pi-famulus daemon is not connected");
-      await client.agentInput(id, "prompt", message, childId);
-      return { queuedBehind: null };
+      let queuedBehind: number | null = null;
+      for (;;) {
+        const admission = await client.acquireAgent(id, "other");
+        if (admission.granted) {
+          if (admission.queuedBehind != null) queuedBehind = admission.queuedBehind;
+          break;
+        }
+        queuedBehind = queuedBehind ?? 0;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      try {
+        await client.agentInput(id, "prompt", message, childId);
+      } catch (err) {
+        await client.releaseAgent(id).catch(() => {});
+        throw err;
+      }
+      return { queuedBehind };
     },
   };
 
   const refreshPeers = async () => {
     if (!client?.isAvailable()) return;
-    const listed = await client.agentPeers().catch(() => []);
+    const listed = await client.agentPeers().catch(() => null);
+    if (!listed) return;
     peers.splice(0, peers.length, ...listed.map((peer) => ({
       childId: peer.childId,
       name: peer.name,

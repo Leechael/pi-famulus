@@ -37,7 +37,7 @@ pi (`@earendil-works/pi-coding-agent`) deliberately leaves subagents, background
 ```
 pi instance A (session a) ──┐
 pi instance B (session b) ──┼── conventional-path socket ──► pi-famulus (Rust, machine-wide singleton)
-pi instance C (session c) ──┘                                                                                            ├─ process engine: spawn/wait/stop/output
+pi instance C (session c) ──┘                                ├─ process engine: spawn/wait/stop/output
                                                             ├─ hosted agents: residency, retention, RPC relay
                                                             ├─ session_id namespaces
     pi extension (TS, in-process)                           ├─ dual output writes (bounded memory + full disk log)
@@ -151,7 +151,7 @@ Ownership of `manager.pid` and the socket: daemon identity = the exclusive flock
 - Omitting `env` from `start` → the child inherits the manager's own environment (the extension always explicitly passes the complete env)
 - `stop` response = signal sent (SIGTERM→2s→SIGKILL flow started); the state change is determined by `task_exited`; killed tasks' `task_exited` carries `exit_code:null, signal:"SIGTERM"|"SIGKILL"`
 - CLI output is human-readable tables (not a contract); successful `shutdown` exits 0
-- Protocol 6 adds hosted-subagent requests (`agent_spawn`, `agent_input`, `agent_watch` / `agent_unwatch`, `agent_peers`, `agent_park`, `agent_takeover`, `agent_comms`, `hosted_lookup`, `agent_cache`). `hello.role` is `parent`, `cli`, or `child`; any other string is `E_BAD_REQUEST`. `agent_cache.lifetime_ms` and `hello.pi_version` are stored on the hosted agent and included in `agent_state` (and therefore in `pi-famulus top`).
+- Protocol 6 adds hosted-subagent requests (`agent_spawn`, `agent_input`, `agent_watch` / `agent_unwatch`, `agent_peers`, `agent_park`, `agent_takeover`, `agent_comms`, `agent_comms_reply`, `agent_ui_response`, `hosted_lookup`, `agent_cache`). `hello.role` is `parent`, `cli`, or `child`; any other string is `E_BAD_REQUEST`. `agent_cache.lifetime_ms` and `hello.pi_version` are stored on the hosted agent and included in `agent_state` (and therefore in `pi-famulus top`).
 
 #### Message definitions
 

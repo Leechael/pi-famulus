@@ -192,6 +192,10 @@ impl Hosted {
     }
 
     /// Same-run siblings, including the caller. A hosted child uses this to address peers.
+    pub fn parent_of(&self, child_id: &str) -> Option<String> {
+        self.inner.lock().unwrap().agents.get(child_id).map(|a| a.parent_session.clone())
+    }
+
     pub fn peers(&self, child_id: &str) -> Vec<Value> {
         let g = self.inner.lock().unwrap();
         let Some(me) = g.agents.get(child_id) else { return Vec::new() };
@@ -1072,7 +1076,15 @@ impl Agent {
             last_text: self.last_text.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&disk) {
-            let _ = std::fs::write(dir.join(format!("{}.json", self.child_id)), bytes);
+            let path = dir.join(format!("{}.json", self.child_id));
+            if std::fs::write(&path, bytes).is_ok() {
+                // The record holds provider credentials. Only the owner should read it.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
         }
     }
 }

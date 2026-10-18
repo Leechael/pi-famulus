@@ -41,12 +41,15 @@ export function registerAttachCommand(pi: ExtensionAPI, deps: AttachCommandDeps)
 
 interface EntryMessage {
   role?: string;
-  content?: { text?: string }[];
+  content?: string | { text?: string }[];
   message?: EntryMessage;
 }
 
 function textOf(message: EntryMessage | undefined): string {
-  return (message?.content ?? []).map((part) => part.text ?? "").join("");
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => (typeof part === "string" ? part : part?.text ?? "")).join("");
 }
 
 function linesFromEntries(entries: unknown): string[] {
@@ -113,8 +116,8 @@ export async function openAttachView(ctx: ExtensionContext, client: ManagerClien
       return {
         render(width: number) {
           const limit = Math.max(1, width);
-          const shown = lines.slice(-Math.max(4, (tui.terminal?.rows ?? 24) - 6));
-          const body = shown.flatMap((line) => fitLines(line, limit));
+          const rows = Math.max(4, (tui.terminal?.rows ?? 24) - 6);
+          const body = lines.flatMap((line) => fitLines(line, limit)).slice(-rows);
           return [
             `◆ ${childId}  ${status}`,
             ...body,

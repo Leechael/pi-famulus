@@ -621,6 +621,9 @@ pub struct AgentAdmissionOk {
     /// Extensible reason code, e.g. `global_capacity`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection: Option<String>,
+    /// How many waiters were ahead when this grant had to queue. Absent when a slot was free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_behind: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -210,7 +210,7 @@ fn apply_event(tx: &mpsc::UnboundedSender<LiveMsg>, value: &Value) {
         Some("agent_state") => {
             let mut cache = cache_label(value.get("cache_expires_at").and_then(|v| v.as_u64()));
             if let Some(ms) = value.get("cache_lifetime_ms").and_then(|v| v.as_u64()) {
-                cache = format!("{cache} · {}s", ms / 1000);
+                cache = format!("{cache} · {}s lifetime", ms / 1000);
             }
             if let Some(version) = value.get("pi_version").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 cache = format!("{cache} · pi {version}");

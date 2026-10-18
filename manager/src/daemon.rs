@@ -106,6 +106,10 @@ pub struct PendingAgent {
     /// One waiter per (session, child); aliases let a resent request id share it.
     request_ids: Vec<String>,
     tx: OutTx,
+    /// Waiters already queued when this one joined.
+    queued_behind: u64,
+    /// A sibling-started turn: drop the permit when the child settles.
+    release_on_settle: bool,
 }
 
 #[derive(Clone)]
@@ -113,6 +117,8 @@ pub struct AgentPermit {
     pub(crate) work_kind: String,
     /// Only this request id owns cancellation authority for the held permit.
     pub(crate) request_id: String,
+    /// Set when a hosted sibling acquired the permit. Released on settle.
+    pub(crate) release_on_settle: bool,
 }
 
 struct AgentGrant {
@@ -120,6 +126,7 @@ struct AgentGrant {
     child_id: String,
     request_id: String,
     tx: OutTx,
+    queued_behind: Option<u64>,
 }
 
 pub struct DaemonState {
@@ -406,6 +413,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
                     AgentPermit {
                         work_kind: String::new(),
                         request_id: String::new(),
+                        release_on_settle: false,
                     },
                 )
             }));
@@ -418,6 +426,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
                         AgentPermit {
                             work_kind,
                             request_id,
+                            release_on_settle: false,
                         },
                     )
                 },
@@ -1498,13 +1507,33 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
     );
 }
 
+fn release_settled_sibling_permit(st: &mut DaemonState, notice: &crate::hosted::Notice) -> Vec<AgentGrant> {
+    let settled = match &notice.event {
+        EventKind::AgentState { activity, .. } => activity == "idle" || activity == "failed",
+        _ => false,
+    };
+    if !settled {
+        return Vec::new();
+    }
+    let key = (notice.parent_session.clone(), notice.child_id.clone());
+    let release = st.agent_permits.get(&key).is_some_and(|permit| permit.release_on_settle);
+    if !release {
+        return Vec::new();
+    }
+    st.agent_permits.remove(&key);
+    st.undelivered_agent_grants.retain(|(owner, _), child| owner != &notice.parent_session || child != &notice.child_id);
+    wake_pending(st)
+}
+
 fn start_agent_loops(state: &Shared) {
     let rx = state.lock().unwrap().agent_notices.take();
     if let Some(mut rx) = rx {
         let state = state.clone();
         tokio::spawn(async move {
             while let Some(notice) = rx.recv().await {
-                let st = state.lock().unwrap();
+                let wake = {
+                let mut st = state.lock().unwrap();
+                let wake = release_settled_sibling_permit(&mut st, &notice);
                 let mut targets = Vec::new();
                 if let Some(session) = st.sessions.get(&notice.parent_session) {
                     if let Some(conn_id) = session.conn_id {
@@ -1522,6 +1551,9 @@ fn start_agent_loops(state: &Shared) {
                         let _ = conn.tx.try_send(encode_event(&notice.event));
                     }
                 }
+                wake
+                };
+                send_agent_grants(&state, wake);
             }
         });
     }
@@ -2664,6 +2696,23 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
     })
 }
 
+/// Parent acquires use the connection's session. A hosted child acquires for a
+/// same-run sibling under that sibling's parent session, so the turn shares
+/// the machine permit with the parent.
+fn admission_owner(st: &DaemonState, conn_id: u64, child_id: &str) -> Result<(String, u32, bool), ProtoError> {
+    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    let from_child = conn.role == ConnRole::Child;
+    let sid = if from_child {
+        let caller = conn.child_id.clone().unwrap_or_default();
+        st.hosted.authorize("child", None, Some(&caller), child_id, true)?;
+        st.hosted.parent_of(child_id).ok_or_else(|| ProtoError::new(E_NOT_FOUND, "unknown child"))?
+    } else {
+        conn.session_id.clone().ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?
+    };
+    let protocol = st.sessions.get(&sid).and_then(|s| s.protocol).unwrap_or(if from_child { 6 } else { 0 });
+    Ok((sid, protocol, from_child))
+}
+
 async fn handle_acquire_agent(
     state: &Shared,
     conn_id: u64,
@@ -2675,29 +2724,16 @@ async fn handle_acquire_agent(
 ) {
     let session = {
         let st = state.lock().unwrap();
-        st.conns.get(&conn_id).and_then(|c| {
-            c.session_id.as_ref().map(|sid| {
-                (
-                    sid.clone(),
-                    st.sessions.get(sid).and_then(|s| s.protocol).unwrap_or(0),
-                    st.home.clone(),
-                    st.agent_budget.clone(),
-                    st.agent_admission.clone(),
-                )
-            })
+        admission_owner(&st, conn_id, child_id).map(|(sid, protocol, from_child)| {
+            (sid, protocol, st.home.clone(), st.agent_budget.clone(), st.agent_admission.clone(), from_child)
         })
     };
-    let Some((sid, client_protocol, home, budget_cache, admission_lock)) = session else {
-        respond::<AgentAdmissionOk>(
-            tx,
-            request_id,
-            Err(ProtoError::new(
-                E_SESSION_REQUIRED,
-                "extension session required",
-            )),
-        )
-        .await;
-        return;
+    let (sid, client_protocol, home, budget_cache, admission_lock, release_on_settle) = match session {
+        Ok(parts) => parts,
+        Err(error) => {
+            respond::<AgentAdmissionOk>(tx, request_id, Err(error)).await;
+            return;
+        }
     };
     // The #46 global budget cache remains authoritative for the machine-wide
     // cap. Serialize its refresh and this state commit so an older read cannot
@@ -2710,11 +2746,14 @@ async fn handle_acquire_agent(
     let capacity = crate::capacity::load(&home);
     let (result, wake) = {
         let mut st = state.lock().unwrap();
-        if st
-            .conns
-            .get(&conn_id)
-            .and_then(|conn| conn.session_id.as_deref())
-            != Some(sid.as_str())
+        let still_here = st.conns.get(&conn_id).is_some_and(|conn| {
+            if conn.role == ConnRole::Child {
+                true
+            } else {
+                conn.session_id.as_deref() == Some(sid.as_str())
+            }
+        });
+        if !still_here
         {
             (
                 Some(Err(ProtoError::new(
@@ -2749,6 +2788,7 @@ async fn handle_acquire_agent(
                         Some(Ok(AgentAdmissionOk {
                             granted: true,
                             rejection: None,
+                            queued_behind: None,
                         })),
                         wake,
                     )
@@ -2763,6 +2803,7 @@ async fn handle_acquire_agent(
                                 Some(Ok(AgentAdmissionOk {
                                     granted: false,
                                     rejection: Some("capacity_queue_full".into()),
+                                    queued_behind: None,
                                 })),
                                 wake,
                             )
@@ -2786,6 +2827,7 @@ async fn handle_acquire_agent(
                             Some(Ok(AgentAdmissionOk {
                                 granted: false,
                                 rejection: Some("global_capacity".into()),
+                                queued_behind: None,
                             })),
                             wake,
                         ),
@@ -2795,12 +2837,14 @@ async fn handle_acquire_agent(
                                 AgentPermit {
                                     work_kind: String::new(),
                                     request_id: request_id.to_string(),
+                                    release_on_settle,
                                 },
                             );
                             (
                                 Some(Ok(AgentAdmissionOk {
                                     granted: true,
                                     rejection: None,
+                                    queued_behind: None,
                                 })),
                                 wake,
                             )
@@ -2833,12 +2877,14 @@ async fn handle_acquire_agent(
                                         AgentPermit {
                                             work_kind: kind.to_string(),
                                             request_id: request_id.to_string(),
+                                            release_on_settle,
                                         },
                                     );
                                     (
                                         Some(Ok(AgentAdmissionOk {
-                                            granted: true,
-                                            rejection: None,
+                                        granted: true,
+                                        rejection: None,
+                                        queued_behind: None,
                                         })),
                                         wake,
                                     )
@@ -2854,18 +2900,22 @@ async fn handle_acquire_agent(
                                     {
                                         (
                                             Some(Ok(AgentAdmissionOk {
-                                                granted: false,
-                                                rejection: Some("capacity_queue_full".into()),
+                                            granted: false,
+                                            rejection: Some("capacity_queue_full".into()),
+                                            queued_behind: None,
                                             })),
                                             wake,
                                         )
                                     } else {
+                                        let queued_behind = st.pending_agents.len() as u64;
                                         st.pending_agents.push_back(PendingAgent {
                                             session_id: sid,
                                             child_id: child_id.into(),
                                             work_kind: kind.into(),
                                             request_ids: vec![request_id.into()],
                                             tx: tx.clone(),
+                                            queued_behind,
+                                            release_on_settle,
                                         });
                                         (None, wake)
                                     }
@@ -2997,6 +3047,7 @@ fn send_agent_grants_locked(st: &mut DaemonState, wake: Vec<AgentGrant>) {
             &AgentAdmissionOk {
                 granted: true,
                 rejection: None,
+                queued_behind: grant.queued_behind,
             },
         );
         if grant.tx.try_send(frame).is_ok() {
@@ -3022,6 +3073,7 @@ fn send_agent_grants(state: &Shared, wake: Vec<AgentGrant>) {
             &AgentAdmissionOk {
                 granted: true,
                 rejection: None,
+                queued_behind: grant.queued_behind,
             },
         );
         if grant.tx.try_send(frame).is_ok() {
@@ -3069,6 +3121,7 @@ fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) ->
                 &AgentAdmissionOk {
                     granted: true,
                     rejection: None,
+                    queued_behind: None,
                 },
             ))
             .is_ok()
@@ -3087,11 +3140,7 @@ fn handle_release_agent(
 ) -> Result<UnitOk, ProtoError> {
     let wake = {
         let mut st = state.lock().unwrap();
-        let sid = st
-            .conns
-            .get(&conn_id)
-            .and_then(|c| c.session_id.clone())
-            .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?;
+        let sid = admission_owner(&st, conn_id, child_id)?.0;
         st.agent_permits
             .remove(&(sid.clone(), child_id.to_string()));
         st.undelivered_agent_grants
@@ -4134,6 +4183,7 @@ fn wake_pending_with_capacity(
             AgentPermit {
                 work_kind: pending.work_kind,
                 request_id: owner_request_id,
+                release_on_settle: pending.release_on_settle,
             },
         );
         for request_id in pending.request_ids {
@@ -4146,6 +4196,7 @@ fn wake_pending_with_capacity(
                 child_id: pending.child_id.clone(),
                 request_id,
                 tx: pending.tx.clone(),
+                queued_behind: Some(pending.queued_behind),
             });
         }
     }
@@ -4162,12 +4213,14 @@ fn admit_agent(
         return AgentAdmissionOk {
             granted: true,
             rejection: None,
+            queued_behind: None,
         };
     }
     if permits.len() >= budget {
         return AgentAdmissionOk {
             granted: false,
             rejection: Some("global_capacity".into()),
+            queued_behind: None,
         };
     }
     permits.insert(
@@ -4175,11 +4228,13 @@ fn admit_agent(
         AgentPermit {
             work_kind: "unknown".into(),
             request_id: format!("request-{}", key.1),
+            release_on_settle: false,
         },
     );
     AgentAdmissionOk {
         granted: true,
         rejection: None,
+        queued_behind: None,
     }
 }
 

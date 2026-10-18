@@ -383,6 +383,32 @@ describe("InProcessRunner", () => {
     expect(releases).toEqual([true, true]);
   });
 
+  it("releases a permit granted after the turn was already interrupted", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const releases: boolean[] = [];
+    let resolveAdmission!: (release: (terminal?: boolean) => void) => void;
+    let acquired = 0;
+    const runner = new InProcessRunner({
+      createSession: factory.fn,
+      acquire: async () => {
+        acquired++;
+        if (acquired === 1) return (terminal = true) => { releases.push(terminal); };
+        return new Promise((resolve) => { resolveAdmission = resolve; });
+      },
+    });
+    const handle = await runner.start(makeReq());
+    await handle.interrupt();
+    const resumed = handle.resume("continue");
+    await tick();
+    expect(acquired).toBe(2);
+    await handle.interrupt();
+    resolveAdmission((terminal = true) => { releases.push(terminal); });
+    await tick();
+    await resumed.catch(() => {});
+    expect(releases).toEqual([true, true]);
+  });
+
   it("dispose releases a permit still held after a resumable interruption", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;

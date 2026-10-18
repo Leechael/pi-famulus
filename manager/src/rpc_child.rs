@@ -70,12 +70,12 @@ pub fn main(argv: Vec<String>) -> i32 {
             }
         }
     });
-    let leader = child.id();
     let status = child.wait();
     let _ = copy.join();
+    // pi inherits this process's group. The leader is the runner, not the pi pid.
     #[cfg(unix)]
     if lifeline_broken() {
-        reap_orphans(leader);
+        reap_orphans(crate::sys::getpid());
     }
     match status {
         Ok(s) => command_exit(s),

@@ -96,7 +96,11 @@ async function promptIfHostedSession(
     }
   }
   if (choice === "Attach to the hosted process") {
-    await openAttachView(uiCtx, c, found.child_id);
+    try {
+      await openAttachView(uiCtx, c, found.child_id);
+    } catch (err) {
+      uiCtx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+    }
   }
   return "stay";
 }
