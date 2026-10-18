@@ -65,6 +65,7 @@ The retention keys take a duration such as `"30m"` or `"0s"` and are read when t
 | `PI_FAMULUS_MANAGER_PATH` | Daemon executable to use; second in the lookup order. |
 | `PI_FAMULUS_PAGER` | Pager for CLI listings; see [CLI: global options](cli.md#global-options). |
 | `PI_FAMULUS_SHELL` | Windows only: the shell the daemon uses for `bash` commands. |
+| `PI_FAMULUS_NO_NATIVE_FETCH` | Set to `1` to skip installing a missing platform package into the user cache. The session stays degraded until a binary is found by the lookup below. |
 
 ## Manager binary discovery
 
@@ -72,14 +73,14 @@ The npm package installs the matching native manager through an exact-version op
 
 1. Executable `managerPath` from `config.json`.
 2. Executable `PI_FAMULUS_MANAGER_PATH`.
-3. The exact-version native npm package.
+3. The exact-version native npm package. When no usable exact-version package is found, the same version in the user cache (`$XDG_CACHE_HOME/pi-famulus/native/<version>/<platform>-<arch>` on Linux and macOS, or `~/.cache/pi-famulus/native/<version>/<platform>-<arch>` when `XDG_CACHE_HOME` is unset; `%LOCALAPPDATA%\pi-famulus\native\...` on Windows).
 4. Executable `~/.pi/agent/pi-famulus/bin/pi-famulus` (or the equivalent under `PI_FAMULUS_HOME`).
 5. Executable `pi-famulus` on `PATH`.
 
-On Windows the file name in steps 4 and 5, and inside the native package, is `pi-famulus.exe`. An arbitrary different-version native npm package is never substituted. Installing or updating the npm package does not move runtime state or copy a binary into the shared home. The `pi-famulus` CLI that npm installs (`npx pi-famulus --help`) always runs its own native package.
+On Windows the file name in steps 4 and 5, and inside the native package, is `pi-famulus.exe`. An arbitrary different-version native npm package is never substituted. Installing or updating the npm package does not move runtime state or copy a binary into the shared home. The `pi-famulus` CLI that npm installs (`npx pi-famulus --help`) runs this same native package.
 
 ## Degraded startup
 
-If the manager is missing or cannot start, the extension warns in the TUI. Bash then runs locally, so auto-backgrounding and manager-backed output and history are unavailable. `task_*` and `monitor` report that they are disabled. In-process subagents still run, but their `bash` tool fails until the manager is available. Fix the installation, or point to a binary with `PI_FAMULUS_MANAGER_PATH` or `managerPath`. If optional dependencies were omitted at install time, reinstall with them enabled.
+If the manager is missing or cannot start, the extension warns in the TUI. Bash then runs locally, so auto-backgrounding and manager-backed output and history are unavailable. `task_*` and `monitor` report that they are disabled. In-process subagents still run, but their `bash` tool fails until the manager is available. Fix the installation, or point to a binary with `PI_FAMULUS_MANAGER_PATH` or `managerPath`. If optional dependencies were omitted at install time, reinstall with them enabled. `pi update --extensions` runs npm install; an `omit=optional` npm setting removes the platform package during that update. The next session installs that exact package into the cache in step 3, in the background, including when the installed copy is the wrong version or not executable. Set `PI_FAMULUS_NO_NATIVE_FETCH=1` or run pi with `PI_OFFLINE=1` to keep the missing package as a degraded start.
 
 If the extension is loaded outside pi and pi's bundled `pi-tui` cannot be resolved, a one-time console warning says the interactive `/tasks` views use a reduced text fallback. Load the extension through pi for the full UI.

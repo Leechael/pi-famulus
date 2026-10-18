@@ -18,7 +18,7 @@ import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
-const EXTENSION_VERSION = "0.1.8";
+const EXTENSION_VERSION = "0.1.9";
 export { EXTENSION_VERSION };
 // 5: speaks per-kind agent admission and queued acquire.
 const PROTOCOL = 6;
@@ -293,7 +293,7 @@ function delay(clock: Clock, ms: number): Promise<void> {
 export class ManagerClient {
   private readonly home: string;
   private readonly sessionId: string;
-  private readonly managerPath: string | null;
+  private managerPath: string | null;
   private readonly piPid: number;
   private readonly cwd: string | undefined;
   private readonly role: "parent" | "child";
@@ -341,6 +341,11 @@ export class ManagerClient {
 
   isAvailable(): boolean {
     return this.state === "connected";
+  }
+
+  /** A binary found after construction. The first path wins. */
+  useManagerPath(path: string): void {
+    if (!this.managerPath) this.managerPath = path;
   }
 
   /** Maximum protocol level reported by the connected manager; 0 means unknown/legacy. */

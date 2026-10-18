@@ -24,6 +24,7 @@ import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
+import { ensureNativeManagerInstalled } from "./native-manager.js";
 import type { TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
@@ -106,7 +107,28 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   registerBehaviorGuidelines(pi);
   const home = getFamulusHome();
   const config = loadConfig(home);
-  const managerPath = resolveManagerPath(config, home);
+  // pi update reinstalls extensions with npm. omit=optional drops the platform
+  // package during that install. Fetch it in the background so a slow or
+  // unreachable registry cannot stall extension startup.
+  let managerPath = resolveManagerPath(config, home);
+  let famulusInfo: {
+    extensionVersion: string;
+    managerPath: string | null;
+    describeSearch: () => string;
+    getClient: () => ManagerClient | null;
+  } | null = null;
+  const nativeRestore: Promise<string | null> = managerPath
+    ? Promise.resolve(managerPath)
+    : Promise.resolve()
+        .then(() => ensureNativeManagerInstalled())
+        .then((path) => {
+          if (path) {
+            managerPath = path;
+            if (famulusInfo) famulusInfo.managerPath = path;
+          }
+          return path;
+        })
+        .catch(() => null);
   const clock = realClock;
 
   // Claude-style transcript pills for notifications (TUI only; no-ops elsewhere).
@@ -403,12 +425,13 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     getClient: () => client,
     getRegistry: () => subagentRegistry,
   });
-  registerFamulusCommand(pi, {
+  famulusInfo = {
     extensionVersion: EXTENSION_VERSION,
     managerPath,
     describeSearch: () => describeManagerSearch(config, home),
     getClient: () => client,
-  });
+  };
+  registerFamulusCommand(pi, famulusInfo);
   monitorRegistry.onChange(() => {
     for (const mon of monitorRegistry.listActive()) {
       const existing = workIndex.get(mon.taskId);
@@ -860,11 +883,18 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     startFleetWidget(startCtx);
 
     // Connect in the background: a cold manager spawn must not stall the
-    // first prompt. Tools call ensureAvailable() lazily before use.
+    // first prompt. The cache install, if one is running, finishes first so a
+    // missing optional package is not reported before it can be restored.
+    // Tools call ensureAvailable() lazily before use.
     const c = client;
-    void c
-      .connect()
+    void nativeRestore
+      .then((path) => {
+        if (client !== c || !c) return null;
+        if (path) c.useManagerPath(path);
+        return c.connect();
+      })
       .then((ok) => {
+        if (ok === null || client !== c || !c) return;
         if (ok) {
           if (c.protocolLevel() >= 4) void reconcileAgentLeases(c).catch(() => {});
           return;

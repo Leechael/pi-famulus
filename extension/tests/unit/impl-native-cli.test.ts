@@ -124,7 +124,10 @@ itPosix("forwards supervisor SIGTERM to a long-running native command without le
 });
 
 it("missing optional dependencies give an actionable error instead of trying another version", () => {
-  const result = spawnSync(process.execPath, [consumer(false), "--version"], { encoding: "utf8" });
+  const result = spawnSync(process.execPath, [consumer(false), "--version"], {
+    encoding: "utf8",
+    env: { ...process.env, PI_FAMULUS_NO_NATIVE_FETCH: "1" },
+  });
   expect(result.status).toBe(1);
   expect(result.stdout).toBe("");
   expect(result.stderr).toContain("optional dependencies enabled");

@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Keep your main agent's context clean: subagents on cheaper models, long bash in the background, and monitors that wake the agent. One Rust daemon runs the shells.",
   "keywords": [
     "pi-package",
@@ -54,12 +54,12 @@
     "pi-famulus": "./bin/pi-famulus.js"
   },
   "optionalDependencies": {
-    "pi-famulus-linux-x64": "0.1.8",
-    "pi-famulus-linux-arm64": "0.1.8",
-    "pi-famulus-darwin-x64": "0.1.8",
-    "pi-famulus-darwin-arm64": "0.1.8",
-    "pi-famulus-win-x64": "0.1.8",
-    "pi-famulus-win-arm64": "0.1.8"
+    "pi-famulus-linux-x64": "0.1.9",
+    "pi-famulus-linux-arm64": "0.1.9",
+    "pi-famulus-darwin-x64": "0.1.9",
+    "pi-famulus-darwin-arm64": "0.1.9",
+    "pi-famulus-win-x64": "0.1.9",
+    "pi-famulus-win-arm64": "0.1.9"
   },
   "pi": {
     "extensions": [

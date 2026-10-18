@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus-linux-x64",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Linux x64 native manager for pi-famulus (static musl)",
   "license": "MIT",
   "author": "Leechael Yim",
