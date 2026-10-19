@@ -277,6 +277,42 @@ export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: ()
   };
 }
 
+/**
+ * Load the extension on a fake pi and start a session. The calling test file
+ * must mock `../../src/manager-client` with FakeHostedManager.
+ */
+export async function startHostedExtension(opts: { sessionId: string; cwd: string; idle?: () => boolean; reason?: string }) {
+  const pi = fakeHostPi();
+  const ctx = fakeHostCtx(opts.sessionId, opts.cwd, { idle: opts.idle });
+  const { default: extension } = await import("../../src/index");
+  extension(pi.api);
+  await pi.emit("session_start", { reason: opts.reason ?? "startup" }, ctx);
+  const state = hostedFakeState();
+  const manager = state.instances[state.instances.length - 1];
+  const run = async (params: Record<string, unknown>) => pi.tool("subagent").execute("call", params, undefined, undefined, ctx);
+  /** Start one background child and wait until the daemon was asked to prompt it. */
+  const spawnChild = async (prompt = "work", name = "worker"): Promise<string> => {
+    const before = manager.spawns.length;
+    await run({ async: true, tasks: [{ prompt, name }] });
+    await until(() => manager.spawns.length > before && manager.inputs.some((input) => input.op === "prompt" && input.childId === manager.spawns[before]?.childId), "the hosted child to be prompted");
+    return manager.spawns[before].childId;
+  };
+  const shutdown = async () => {
+    try {
+      await pi.emit("session_shutdown", { reason: "quit" }, ctx);
+    } catch {
+      // best-effort cleanup
+    }
+  };
+  return { pi, ctx, manager, run, spawnChild, shutdown };
+}
+
+export function wakeDetails(sent: SentMessage[], kind: string): Array<Record<string, unknown>> {
+  return sent
+    .map((entry) => entry.message.details as Record<string, unknown> | undefined)
+    .filter((details): details is Record<string, unknown> => details?.kind === kind);
+}
+
 export function textOf(result: { content?: Array<{ type: string; text?: string }> }): string {
   return (result.content ?? []).map((part) => part.text ?? "").join("\n");
 }
