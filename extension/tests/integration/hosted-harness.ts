@@ -1,7 +1,7 @@
 /**
  * The parent extension against the real pi-famulus daemon, with real hosted
  * children: the daemon spawns `pi --mode rpc` from this checkout's pi
- * package. Children use the fake model in tests/fixtures/faux-child.ts
+ * package. Children use the fake model in tests/fixtures/faux-child.js
  * unless `childArgs` says otherwise.
  *
  * Opt-in, like the other real-daemon suites: PI_FAMULUS_INTEG=1 and a built
@@ -24,7 +24,7 @@ const PI_CLI = join(__dirname, "../../node_modules/@earendil-works/pi-coding-age
 export const HOSTED_INTEG =
   process.env.PI_FAMULUS_INTEG === "1" && existsSync(MANAGER_BIN) && existsSync(PI_CLI) && process.platform !== "win32";
 
-export const FAUX_CHILD = join(__dirname, "../fixtures/faux-child.ts");
+export const FAUX_CHILD = join(__dirname, "../fixtures/faux-child.js");
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 export type Tool = {
