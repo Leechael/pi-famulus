@@ -14,70 +14,20 @@ import {
   parkRuntime,
   takeParkedRuntime,
 } from "../../src/reload-handoff";
-
-const managers = vi.hoisted(() => [] as Array<{
-  shutdownSession: ReturnType<typeof vi.fn>;
-  close: ReturnType<typeof vi.fn>;
-  emit: (event: Record<string, unknown>) => void;
-}>);
-
-const sessionControl = vi.hoisted(() => ({
-  useFake: false,
-  sessions: [] as Array<{ complete(text?: string): void }>,
-}));
+import { hostedFakeState, resetHostedFakes, until } from "./hosted-fakes";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();
-  class FakeManagerClient {
-    shutdownSession = vi.fn(async () => []);
-    close = vi.fn(async () => {});
-    private readonly events: Array<(event: Record<string, unknown>) => void> = [];
-    constructor() {
-      managers.push(this);
-    }
-    onEvent(handler: (event: Record<string, unknown>) => void) {
-      this.events.push(handler);
-    }
-    onReconnect() {}
-    emit(event: Record<string, unknown>) {
-      for (const handler of this.events) handler(event);
-    }
-    async connect() { return true; }
-    async ensureAvailable() { return true; }
-    isAvailable() { return true; }
-    protocolLevel() { return 0; }
-    lastError() { return ""; }
-    async list() { return []; }
-    async start() { return { task_id: "sh_late", pid: 1 }; }
-    async markBackground() {}
-    async wait() { return { done: false, exit_code: null }; }
-    async output() {
-      return { chunk: "", next_cursor: 0, status: "running", exit_code: null, total_size: 0 };
-    }
-    async stop() {}
-  }
-  return { ...actual, ManagerClient: FakeManagerClient };
+  const { FakeHostedManager } = await import("./hosted-fakes");
+  return { ...actual, ManagerClient: FakeHostedManager };
 });
 
-vi.mock("../../src/subagent/pi-runtime", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../src/subagent/pi-runtime")>();
-  return {
-    ...actual,
-    createPiSessionFn: (deps: Parameters<typeof actual.createPiSessionFn>[0]) => {
-      if (!sessionControl.useFake) return actual.createPiSessionFn(deps);
-      return async () => {
-        const { FakeChildSession } = await import("./subagent-fakes");
-        const session = new FakeChildSession();
-        session.autoComplete = null;
-        sessionControl.sessions.push(session);
-        return session;
-      };
-    },
-  };
-});
+const managers = hostedFakeState().instances;
 
 const home = mkdtempSync(join(tmpdir(), "pi-famulus-reload-"));
 process.env.PI_FAMULUS_HOME = home;
+// The daemon is fake, so the hosted child is never started; any argv will do.
+process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -167,9 +117,7 @@ async function loadExtension(pi: ExtensionAPI): Promise<void> {
 
 describe("extension across /reload", () => {
   beforeEach(() => {
-    managers.length = 0;
-    sessionControl.useFake = false;
-    sessionControl.sessions.length = 0;
+    resetHostedFakes();
     takeParkedRuntime(); // nothing left over from another test
   });
 
@@ -189,14 +137,14 @@ describe("extension across /reload", () => {
     await after.emit("session_start", { reason: "reload" }, fakeCtx().ctx);
 
     expect(managers).toHaveLength(1);
-    expect(managers[0].shutdownSession).not.toHaveBeenCalled();
-    expect(managers[0].close).not.toHaveBeenCalled();
+    expect(managers[0].shutdownCalls).toBe(0);
+    expect(managers[0].closeCalls).toBe(0);
     expect(after.tools).toEqual(expect.arrayContaining(["bash", "subagent", "monitor", "task_list"]));
     expect([...after.commands.keys()].sort()).toEqual(["attach", "famulus", "reply", "tasks"]);
 
     await after.emit("session_shutdown", { reason: "quit" });
-    expect(managers[0].shutdownSession).toHaveBeenCalledTimes(1);
-    expect(managers[0].close).toHaveBeenCalledTimes(1);
+    expect(managers[0].shutdownCalls).toBe(1);
+    expect(managers[0].closeCalls).toBe(1);
   });
 
   it("still ends the session's tasks on quit", async () => {
@@ -204,7 +152,7 @@ describe("extension across /reload", () => {
     await loadExtension(pi.api);
     await pi.emit("session_start", { reason: "startup" }, fakeCtx().ctx);
     await pi.emit("session_shutdown", { reason: "quit" });
-    expect(managers[0].shutdownSession).toHaveBeenCalledTimes(1);
+    expect(managers[0].shutdownCalls).toBe(1);
     expect(takeParkedRuntime()).toBeNull();
   });
 
@@ -214,10 +162,10 @@ describe("extension across /reload", () => {
     await loadExtension(pi.api);
     await pi.emit("session_start", { reason: "startup" }, fakeCtx().ctx);
     await pi.emit("session_shutdown", { reason: "reload" });
-    expect(managers[0].shutdownSession).not.toHaveBeenCalled();
+    expect(managers[0].shutdownCalls).toBe(0);
 
     await vi.advanceTimersByTimeAsync(HANDOFF_EXPIRY_MS);
-    expect(managers[0].shutdownSession).toHaveBeenCalledTimes(1);
+    expect(managers[0].shutdownCalls).toBe(1);
   });
 
   it("tears down a runtime parked by another version before starting fresh", async () => {
@@ -277,14 +225,17 @@ async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 30; i++) await Promise.resolve();
 }
 
-async function waitForChildSession(): Promise<{ complete(text?: string): void }> {
-  const deadline = Date.now() + 2000;
-  while (Date.now() < deadline) {
-    const session = sessionControl.sessions[0];
-    if (session) return session;
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  throw new Error("background subagent session was not created");
+/**
+ * The hosted child has been spawned and prompted; returns its child id. Its
+ * session is the production HostedRpcSession, which settles when the daemon
+ * reports that the child's run settled.
+ */
+async function waitForHostedChild(): Promise<string> {
+  await until(
+    () => (managers[0]?.inputs ?? []).some((input) => input.op === "prompt"),
+    "the background subagent to be spawned and prompted",
+  );
+  return managers[0].spawns[0].childId;
 }
 
 function errorText(error: unknown): string {
@@ -300,8 +251,6 @@ async function lateWakesAfterShutdown(
   reason: (typeof SHUTDOWN_REASONS)[number],
   throwOnWidgetClear: boolean,
 ): Promise<void> {
-  sessionControl.useFake = true;
-  sessionControl.sessions.length = 0;
   const stale = { current: false };
   const pi = fakePi({ stale });
   const widget = { hasUI: throwOnWidgetClear, throwOnWidgetClear };
@@ -320,7 +269,7 @@ async function lateWakesAfterShutdown(
     undefined,
     host.ctx,
   );
-  const session = await waitForChildSession();
+  const childId = await waitForHostedChild();
   if (throwOnWidgetClear) expect(host.ui.mounted).toBe(true);
 
   const unhandled: unknown[] = [];
@@ -349,7 +298,7 @@ async function lateWakesAfterShutdown(
         output_path: "/tmp/sh_late.output",
         ts: 1,
       });
-      session.complete("child finished");
+      managers[0]?.finish(childId, { content: [{ type: "text", text: "child finished" }], stopReason: "stop" });
       await flushMicrotasks();
       try {
         await vi.advanceTimersByTimeAsync(250);
@@ -383,9 +332,7 @@ async function lateWakesAfterShutdown(
 
 describe.each(SHUTDOWN_REASONS)("session_shutdown reason %s while background work is in flight", (reason) => {
   beforeEach(() => {
-    managers.length = 0;
-    sessionControl.useFake = false;
-    sessionControl.sessions.length = 0;
+    resetHostedFakes();
     takeParkedRuntime();
   });
 
