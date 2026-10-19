@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus-darwin-arm64",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "macOS Apple Silicon arm64 native manager for pi-famulus",
   "license": "MIT",
   "author": "Leechael Yim",

@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus-win-x64",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Windows x64 native manager for pi-famulus (MSVC)",
   "license": "MIT",
   "author": "Leechael Yim",

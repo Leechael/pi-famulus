@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus-darwin-x64",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "macOS Intel x64 native manager for pi-famulus",
   "license": "MIT",
   "author": "Leechael Yim",
