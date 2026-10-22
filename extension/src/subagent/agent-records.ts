@@ -178,6 +178,31 @@ function parseRecord(raw: string): AgentChildRecord | null {
 }
 
 /** Load agent child records from disk (all sessions under home). */
+/** Hosted children the daemon still has warm. They outlive a gone parent session. */
+export function warmHostedChildIds(home: string): Set<string> {
+  const out = new Set<string>();
+  let files: string[];
+  try {
+    files = readdirSync(join(home, "agents")).filter((name) => name.endsWith(".json"));
+  } catch {
+    return out;
+  }
+  for (const file of files) {
+    try {
+      const value = JSON.parse(readFileSync(join(home, "agents", file), "utf8")) as {
+        residency?: string;
+        child_id?: string;
+      };
+      if (value.residency === "warm" && typeof value.child_id === "string") {
+        out.add(value.child_id);
+      }
+    } catch {
+      // skip bad hosted records
+    }
+  }
+  return out;
+}
+
 export function loadAgentChildRecords(
   home: string,
   opts: { sessionId?: string; includeTerminal?: boolean; connectedSessionIds?: ReadonlySet<string> } = {},
@@ -193,6 +218,7 @@ export function loadAgentChildRecords(
   } catch {
     return [];
   }
+  const warm = opts.connectedSessionIds === undefined ? new Set<string>() : warmHostedChildIds(home);
   const out: AgentChildRecord[] = [];
   for (const sid of sessionIds) {
     const dir = agentRecordsDir(home, sid);
@@ -209,7 +235,9 @@ export function loadAgentChildRecords(
         const disconnected =
           opts.connectedSessionIds !== undefined && !opts.connectedSessionIds.has(rec.session_id);
         const shown: AgentChildRecord =
-          disconnected && (rec.status === "pending" || rec.status === "running")
+          disconnected &&
+          (rec.status === "pending" || rec.status === "running") &&
+          !warm.has(rec.child_id)
             ? { ...rec, status: "interrupted" }
             : rec;
         const terminal =

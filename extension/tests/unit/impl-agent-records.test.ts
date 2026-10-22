@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -158,5 +158,34 @@ describe("agent child records", () => {
       connectedSessionIds: new Set(["live-session"]),
     });
     expect(loaded.map((r) => r.child_id)).not.toContain("ch_ghost001");
+  });
+
+  it("keeps a running record when the hosted child is still warm", () => {
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_warm001",
+      run_id: "run_warm001",
+      session_id: "gone-session",
+      name: "worker",
+      agent: "worker",
+      status: "running",
+      started_at: 1,
+    });
+    mkdirSync(join(home, "agents"), { recursive: true });
+    writeFileSync(
+      join(home, "agents", "ch_warm001.json"),
+      JSON.stringify({
+        child_id: "ch_warm001",
+        parent_session: "gone-session",
+        residency: "warm",
+        activity: "running",
+      }),
+    );
+    const loaded = loadAgentChildRecords(home, {
+      connectedSessionIds: new Set(["live-session"]),
+    });
+    expect(loaded[0]).toMatchObject({ child_id: "ch_warm001", status: "running" });
   });
 });
