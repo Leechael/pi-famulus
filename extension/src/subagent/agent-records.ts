@@ -181,6 +181,17 @@ function parseRecord(raw: string): AgentChildRecord | null {
 /** Hosted children the daemon still has warm. They outlive a gone parent session. */
 export function warmHostedChildIds(home: string): Set<string> {
   const out = new Set<string>();
+  try {
+    const { pid } = JSON.parse(readFileSync(join(home, "manager.pid"), "utf8")) as { pid?: unknown };
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return out;
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") return out;
+    }
+  } catch {
+    return out;
+  }
   let files: string[];
   try {
     files = readdirSync(join(home, "agents")).filter((name) => name.endsWith(".json"));

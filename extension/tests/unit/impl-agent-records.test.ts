@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -160,7 +161,12 @@ describe("agent child records", () => {
     expect(loaded.map((r) => r.child_id)).not.toContain("ch_ghost001");
   });
 
-  it("keeps a running record when the hosted child is still warm", () => {
+  it.each([
+    { residency: "warm", daemon: "alive", status: "running" },
+    { residency: "warm", daemon: "dead", status: "interrupted" },
+    { residency: "warm", daemon: "missing", status: "interrupted" },
+    { residency: "parked", daemon: "alive", status: "interrupted" },
+  ])("shows $residency residency with a $daemon daemon as $status", ({ residency, daemon, status }) => {
     home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
     writeAgentChildRecord(home, {
       v: 1,
@@ -173,19 +179,24 @@ describe("agent child records", () => {
       status: "running",
       started_at: 1,
     });
+    if (daemon !== "missing") {
+      const pid = daemon === "alive" ? process.pid : spawnSync(process.execPath, ["-e", ""]).pid;
+      expect(pid).toBeGreaterThan(0);
+      writeFileSync(join(home, "manager.pid"), JSON.stringify({ pid }));
+    }
     mkdirSync(join(home, "agents"), { recursive: true });
     writeFileSync(
       join(home, "agents", "ch_warm001.json"),
       JSON.stringify({
         child_id: "ch_warm001",
         parent_session: "gone-session",
-        residency: "warm",
+        residency,
         activity: "running",
       }),
     );
     const loaded = loadAgentChildRecords(home, {
-      connectedSessionIds: new Set(["live-session"]),
+      connectedSessionIds: new Set(["live-session"]), includeTerminal: true,
     });
-    expect(loaded[0]).toMatchObject({ child_id: "ch_warm001", status: "running" });
+    expect(loaded[0]).toMatchObject({ child_id: "ch_warm001", status });
   });
 });

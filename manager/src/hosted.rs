@@ -914,6 +914,7 @@ impl Hosted {
             agent.pi_version = disk.pi_version;
             agent.last_text = disk.last_text;
             agent.driver = "parent".into();
+            agent.persist(&home);
             let mut g = self.inner.lock().unwrap();
             if let Some(file) = agent.session_file.clone() {
                 g.by_file.insert(file, agent.child_id.clone());

@@ -171,6 +171,9 @@ pub fn agent_active_at(a: &AgentRecord, home: &Path) -> Option<u64> {
 /// session, so `ls` must not hide them as interrupted.
 fn warm_hosted_ids(home: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
+    if !crate::lifecycle::lock_held(home) {
+        return out;
+    }
     let Ok(files) = std::fs::read_dir(home.join("agents")) else {
         return out;
     };
@@ -1862,6 +1865,10 @@ mod tests {
             r#"{"child_id":"ch_live","parent_session":"sess-gone","run_id":"run_1","name":"worker","token":"t","argv":["pi"],"cwd":"/tmp","residency":"warm","activity":"running","driver":"parent","last_text":""}"#,
         )
         .unwrap();
+        let guard = match crate::lifecycle::claim_daemon(&dir).unwrap() {
+            crate::lifecycle::Claim::Acquired(guard) => guard,
+            _ => panic!("fresh home was locked"),
+        };
         let connected = HashSet::new();
         let recs = load_agent_records(&dir, &connected);
         let rec = recs.iter().find(|r| r.child_id == "ch_live").expect("record");
@@ -1885,6 +1892,10 @@ mod tests {
         )
         .unwrap();
         assert!(rows.iter().any(|r| r.id == "ch_live" && r.running), "{rows:?}");
+        drop(guard);
+        let offline = load_agent_records(&dir, &connected);
+        assert_eq!(offline[0].status, "interrupted");
+        assert!(offline[0].stale);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
