@@ -116,6 +116,20 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** 429 / rate-limit text is recorded separately from other model errors (I-58). */
+export function classifyModelFailure(message: string): {
+  endReason: "model-error" | "rate-limit";
+  retryAfter?: number;
+} {
+  const rateLimited = /\b429\b|rate[\s-]?limit|too many requests/i.test(message);
+  if (!rateLimited) return { endReason: "model-error" };
+  const retry = /retry[\s-]?after[:\s]+(\d+)/i.exec(message);
+  return {
+    endReason: "rate-limit",
+    ...(retry ? { retryAfter: Number(retry[1]) } : {}),
+  };
+}
+
 export class InProcessRunner implements ChildRunner {
   private readonly opts: InProcessRunnerOptions;
 
@@ -690,11 +704,14 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (!this.isCurrent(gen)) return;
     const failure = session?.getLastAssistantFailure?.();
     if (failure) {
+      const error = failure.errorMessage?.trim() || `Model stopped with ${failure.stopReason}`;
+      const classified = classifyModelFailure(error);
       this.settle(gen, {
         status: "failed",
         text: this.partialText(),
-        error: failure.errorMessage?.trim() || `Model stopped with ${failure.stopReason}`,
-        endReason: "model-error",
+        error,
+        endReason: classified.endReason,
+        ...(classified.retryAfter !== undefined ? { retryAfter: classified.retryAfter } : {}),
         durationMs: this.now() - this.startedAt,
       });
       return;

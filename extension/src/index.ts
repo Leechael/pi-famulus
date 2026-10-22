@@ -906,6 +906,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         };
         const endReason = agentEndReason(c.status, c.result);
         if (endReason) rec.end_reason = endReason;
+        if (c.result?.retryAfter !== undefined) rec.retry_after = c.result.retryAfter;
         const transcript = syncTranscript(c.childId);
         if (transcript) {
           rec.transcript = transcript;

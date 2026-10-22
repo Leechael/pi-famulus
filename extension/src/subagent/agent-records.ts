@@ -32,6 +32,8 @@ export interface AgentChildRecord {
   error?: string;
   /** Why the child ended (terminal statuses only). */
   end_reason?: AgentEndReason;
+  /** Seconds until a rate-limited provider may be retried, when known. */
+  retry_after?: number;
   /** Task prompt without the agent preamble, capped. */
   prompt_head?: string;
   /** Tail of the final result text, capped. */
@@ -58,6 +60,7 @@ export type AgentEndReason =
   | "completed"
   | "failed"
   | "model-error"
+  | "rate-limit"
   | "stalled"
   | "timeout"
   | "interrupted"
@@ -66,10 +69,11 @@ export type AgentEndReason =
 /** Map a terminal child status + result to the end_reason recorded on disk. */
 export function agentEndReason(
   status: AgentChildRecord["status"],
-  result: { error?: string; endReason?: "model-error" } | undefined,
+  result: { error?: string; endReason?: "model-error" | "rate-limit" } | undefined,
 ): AgentEndReason | undefined {
   if (status === "completed") return "completed";
   if (status === "failed") {
+    if (result?.endReason === "rate-limit") return "rate-limit";
     if (result?.endReason === "model-error") return "model-error";
     return result?.error === "stalled" ? "stalled" : "failed";
   }

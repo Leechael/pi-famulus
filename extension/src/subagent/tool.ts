@@ -228,6 +228,8 @@ function toNotificationInfo(record: RunRecord, now: number) {
       status: c.status,
       text: c.result?.text ?? "",
       error: c.result?.error,
+      ...(c.result?.endReason !== undefined ? { endReason: c.result.endReason } : {}),
+      ...(c.result?.retryAfter !== undefined ? { retryAfter: c.result.retryAfter } : {}),
       ...(c.result?.warning !== undefined ? { warning: c.result.warning } : {}),
       ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
     })),

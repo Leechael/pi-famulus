@@ -46,7 +46,9 @@ export interface ChildResult {
   /** Non-fatal caveat, e.g. agent-definition model fell back to parent model. */
   warning?: string;
   /** Set when the model itself stopped with an error (provider failure). */
-  endReason?: "model-error";
+  endReason?: "model-error" | "rate-limit";
+  /** Seconds until a rate-limited provider may be retried, when known. */
+  retryAfter?: number;
   /**
    * Total generations run (1 + resumes + stall retries). Omitted when 1.
    * Note: a user resume() also increments this; use `stalls` to count
