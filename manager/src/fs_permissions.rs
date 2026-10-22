@@ -13,7 +13,7 @@ mod unix {
     use crate::registry::{self, task_output_path};
     use crate::task::open_output_files;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     unsafe extern "C" {
@@ -104,9 +104,10 @@ mod unix {
         let _umask = UmaskGuard::set(0o022);
         let home = temp_home("fresh");
         let mut violations = Vec::new();
-        // daemon::run creates the home with create_dir_all and no mode of its own.
-        fs::create_dir_all(&home).unwrap();
-        expect_mode(&mut violations, &home, 0o700);
+        // Private fixture only: this component probe does not exercise
+        // daemon::run's home creation. Only product-created paths count below.
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        assert_eq!(mode_of(&home), 0o700, "the fixture home must be private");
 
         let guard = match lifecycle::claim_daemon(&home).unwrap() {
             Claim::Acquired(guard) => guard,
