@@ -619,7 +619,13 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     // still carry <shell>.
     const childShells = new ChildShellTracker();
     const parentSessionId = startCtx.sessionManager.getSessionId();
+    // Bind this session's notify centre and client. After /new /resume /fork
+    // the outer `notifyCenter` is replaced; late events on the old client
+    // must not follow that rebinding (I-15).
+    const sessionNotify = notifyCenter;
+    const sessionClient = client;
     client.onEvent((event) => {
+      if (client !== sessionClient) return;
       const hosted = event as ManagerEvent & {
         child_id?: string;
         reason?: string;
@@ -638,7 +644,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         return;
       }
       if (hosted.event === "agent_detach" && hosted.child_id) {
-        notifyCenter?.notify({
+        sessionNotify?.notify({
           customType: "pi-famulus-wake",
           content: `System wake — not a new user message.\n\nThe user talked to ${hosted.name ?? hosted.child_id} directly.\n${hosted.last_text ?? ""}`,
           details: { kind: "supervisor-update", from: hosted.child_id, name: hosted.name ?? hosted.child_id, message: hosted.last_text ?? "" },

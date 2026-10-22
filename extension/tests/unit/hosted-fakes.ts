@@ -176,6 +176,8 @@ export class FakeHostedManager {
 
   async close(): Promise<void> {
     this.closeCalls++;
+    this.handlers.length = 0;
+    this.reconnectHandlers.length = 0;
   }
 
   async hostedLookup(): Promise<null> {

@@ -5,9 +5,8 @@
  * replacement, and must not throw as an unhandledRejection.
  *
  * Distinct from the shutdown-only cases in impl-reload-handoff.test.ts,
- * which never start the next session. All three reasons fail today: the
- * old client's handlers still fire into the live notify centre and send
- * one wake after the next session has started.
+ * which never start the next session. The old client's handlers are
+ * dropped on teardown and must not follow a later notify-centre rebinding.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -197,7 +196,7 @@ describe.each(REPLACE_REASONS)("I-15 session replacement reason %s while backgro
     vi.useRealTimers();
   });
 
-  it.fails("does not deliver a late result after the next session starts", async () => {
+  it("does not deliver a late result after the next session starts", async () => {
     await lateWakesAfterReplacement(reason);
   });
 });
