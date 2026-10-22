@@ -79,6 +79,7 @@ describe("task_list scope", () => {
     const home = mkdtempSync(join(tmpdir(), "pi-famulus-scope-"));
     dirs.push(home);
     writeAgentChildRecord(home, record("sess-mine", "ch_hosted_live", "running"));
+    writeFileSync(join(home, "manager.pid"), JSON.stringify({ pid: process.pid }));
     mkdirSync(join(home, "agents"), { recursive: true });
     writeFileSync(
       join(home, "agents", "ch_hosted_live.json"),
