@@ -39,13 +39,15 @@ interface HostedFakeState {
   connectGate: Promise<void> | null;
   /** What list() returns. */
   tasks: Array<Record<string, unknown>>;
+  /** When false, tools degrade to the local bash fallback. */
+  available: boolean;
 }
 
 const KEY = Symbol.for("pi-famulus.test.hosted-fakes");
 
 export function hostedFakeState(): HostedFakeState {
   const scope = globalThis as typeof globalThis & { [KEY]?: HostedFakeState };
-  scope[KEY] ??= { instances: [], connectGate: null, tasks: [] };
+  scope[KEY] ??= { instances: [], connectGate: null, tasks: [], available: true };
   return scope[KEY];
 }
 
@@ -54,6 +56,7 @@ export function resetHostedFakes(): void {
   state.instances.length = 0;
   state.connectGate = null;
   state.tasks = [];
+  state.available = true;
 }
 
 export class FakeHostedManager {
@@ -87,12 +90,13 @@ export class FakeHostedManager {
   }
 
   async ensureAvailable(): Promise<boolean> {
+    if (hostedFakeState().available === false) return false;
     if (this.connected) return true;
     return this.connect();
   }
 
   isAvailable(): boolean {
-    return this.connected;
+    return this.connected && hostedFakeState().available !== false;
   }
 
   protocolLevel(): number {
