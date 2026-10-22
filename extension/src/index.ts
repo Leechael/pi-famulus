@@ -665,7 +665,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         if (!registry) return undefined;
         const rec = findAgentChildRecord(home, childId);
         if (!rec) return undefined;
-        if (registry.handle(rec.child_id) || registry.get(rec.run_id)) {
+        if (registry.handle(rec.child_id)) {
           return registry.get(rec.run_id);
         }
         const workKind = AGENT_WORK_KINDS.includes(rec.work_kind as AgentWorkKind)

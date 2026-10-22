@@ -26,6 +26,27 @@ const CHILD = "ch_left_warm";
 const RUN = "run_left_warm";
 
 describe("resume a hosted child by child_id after the parent dies", () => {
+  it("reattaches both siblings from the same persisted run", async () => {
+    const sessionId = "sess-resume-siblings";
+    const children = ["ch_sibling_a", "ch_sibling_b"];
+    for (const childId of children) {
+      writeAgentChildRecord(home, {
+        v: 1, kind: "agent", child_id: childId, run_id: "run_siblings", session_id: sessionId,
+        name: childId, agent: "worker", status: "running", started_at: Date.now() - 60_000,
+      });
+      hostedFakeState().lookups.set(childId, { child_id: childId, residency: "warm", activity: "idle", parent_session: sessionId });
+    }
+    const ext = await startHostedExtension({ sessionId, cwd: home });
+    try {
+      for (const childId of children) {
+        await ext.run({ action: "resume", child_id: childId, message: `continue ${childId}` });
+      }
+      expect(ext.manager.inputs.filter((input) => input.op === "prompt").map((input) => input.childId)).toEqual(children);
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
   it("reattaches the warm child and sends the resume message", async () => {
     writeAgentChildRecord(home, {
       v: 1,
