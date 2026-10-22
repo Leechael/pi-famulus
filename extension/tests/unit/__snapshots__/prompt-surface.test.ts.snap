@@ -340,7 +340,7 @@ exports[`model-visible prompt surface > tool declarations 1`] = `
                 "type": "string",
               },
               "prompt": {
-                "description": "Task prompt for this subagent",
+                "description": "Task prompt for this subagent. The child is a new process: it cannot see this conversation, so the prompt must be self-contained.",
                 "type": "string",
               },
               "work_kind": {
