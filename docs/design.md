@@ -459,6 +459,7 @@ notify({ customType, content, details }): void
 
 - 200ms batching window: merge multiple task_exited events into **one** `<pi-famulus-wake kind="task">`, containing multiple `<task>` elements
 - Deduplication: send the same event for the same task only once
+- Busy delivery queues a steer in the host. `triggerTurn:true` also queues while the host is streaming; it cannot interrupt or recover a hung stream. NotifyCenter does not infer a hang from elapsed busy time or resend queued wakes. Genuine hung-stream recovery belongs to the host.
 - All asynchronous injections share one `customType`: `pi-famulus-wake`. The former per-kind notification types are no longer emitted or registered. Their renderers were removed; older transcripts use pi's default custom-message rendering.
 - The lead-in is just one sentence, exported as `FAMULUS_WAKE_LEAD_IN`:
 

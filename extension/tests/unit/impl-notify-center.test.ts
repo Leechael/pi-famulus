@@ -1,3 +1,4 @@
+import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatMonitorEvent } from "../../src/format";
@@ -239,34 +240,32 @@ describe("NotifyCenter monitor batching", () => {
     center.dispose();
   });
 
-  it("sends a steered wake as a new turn after the parent stream hangs", () => {
-    let idle = false;
-    const sent: { message: { customType: string; content: string; details?: unknown }; options: unknown }[] = [];
+  it("queues one wake without inventing a hang during a long healthy host run", async () => {
+    const queued: { content: unknown; details?: unknown }[] = [];
+    // Exercise the installed host implementation, not a spy that assumes
+    // triggerTurn can interrupt streaming. Both options enqueue agent.steer.
+    const host = {
+      isStreaming: true,
+      agent: { steer: (message: typeof queued[number]) => queued.push(message) },
+    } as unknown as AgentSession;
     const clock = new ManualClock();
     const center = new NotifyCenter({
-      sendMessage: (message, options) => sent.push({ message, options }),
-      isIdle: () => idle,
+      sendMessage: (message, options) => { void AgentSession.prototype.sendCustomMessage.call(host, message, options); },
+      isIdle: () => !host.isStreaming,
       clock,
-      hangMs: 1_000,
     });
     center.notify({
       customType: "pi-famulus-wake",
       content: "child finished",
       details: { kind: "subagent-done", runId: "run_1" },
     });
-    expect(sent).toHaveLength(1);
-    expect(sent[0].options).toEqual({ deliverAs: "steer" });
-    clock.advanceBy(1_000);
-    expect(sent.map((entry) => (entry.message.details as { kind?: string }).kind)).toEqual([
-      "subagent-done",
-      "parent-hang",
-      "subagent-done",
+    expect(queued).toHaveLength(1);
+    // A healthy multi-tool run can remain busy well beyond 45 seconds.
+    clock.advanceBy(90_000);
+    expect(queued.map((message) => message.details)).toEqual([
+      expect.objectContaining({ kind: "subagent-done", runId: "run_1" }),
     ]);
-    expect(sent[1].options).toEqual({ triggerTurn: true });
-    expect(sent[2].options).toEqual({ triggerTurn: true });
-    expect(sent[1].message.content).toMatch(/produced no tokens/);
-    idle = true;
-    center.settled();
+    expect(queued[0].content).not.toMatch(/produced no tokens/);
     center.dispose();
   });
 
