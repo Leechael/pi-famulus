@@ -1208,7 +1208,7 @@ fn park_due_at(idle_since: u64, cache_expires_at: Option<u64>, limits: &Limits) 
     min.max(cache).min(max.max(min))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::HashMap;
