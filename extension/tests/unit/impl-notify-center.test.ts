@@ -239,6 +239,37 @@ describe("NotifyCenter monitor batching", () => {
     center.dispose();
   });
 
+  it("sends a steered wake as a new turn after the parent stream hangs", () => {
+    let idle = false;
+    const sent: { message: { customType: string; content: string; details?: unknown }; options: unknown }[] = [];
+    const clock = new ManualClock();
+    const center = new NotifyCenter({
+      sendMessage: (message, options) => sent.push({ message, options }),
+      isIdle: () => idle,
+      clock,
+      hangMs: 1_000,
+    });
+    center.notify({
+      customType: "pi-famulus-wake",
+      content: "child finished",
+      details: { kind: "subagent-done", runId: "run_1" },
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].options).toEqual({ deliverAs: "steer" });
+    clock.advanceBy(1_000);
+    expect(sent.map((entry) => (entry.message.details as { kind?: string }).kind)).toEqual([
+      "subagent-done",
+      "parent-hang",
+      "subagent-done",
+    ]);
+    expect(sent[1].options).toEqual({ triggerTurn: true });
+    expect(sent[2].options).toEqual({ triggerTurn: true });
+    expect(sent[1].message.content).toMatch(/produced no tokens/);
+    idle = true;
+    center.settled();
+    center.dispose();
+  });
+
   it("delivers immediately while idle and carries dropped-line metadata", () => {
     const sent: { message: { details?: unknown }; options: unknown }[] = [];
     const center = new NotifyCenter({

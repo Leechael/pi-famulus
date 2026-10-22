@@ -41,6 +41,11 @@ export interface NotifyCenterDeps {
   listStillRunning?: () => WakeItem[];
   clock?: Clock;
   logEvent?: (type: string, fields?: Record<string, unknown>) => void;
+  /**
+   * When a wake is steered because the parent is busy, wait this long and
+   * if it is still busy, send the wake as a new turn (I-57). Default 45s.
+   */
+  hangMs?: number;
 }
 
 
@@ -117,11 +122,15 @@ export class NotifyCenter {
   /** A wake started or steered a run that has not settled yet. */
   private runPending = false;
   private held: { message: NotifyMessage; onDelivered?: MonitorDeliveryAck; sourcePreview?: string }[] = [];
+  private readonly hangMs: number;
+  private hangTimer: ClockTimer | null = null;
+  private steered: NotifyMessage | null = null;
 
   constructor(deps: NotifyCenterDeps) {
     this.deps = deps;
     this.batchMs = deps.batchMs ?? 200;
     this.clock = deps.clock ?? realClock;
+    this.hangMs = deps.hangMs ?? 45_000;
   }
 
   /**
@@ -173,6 +182,7 @@ export class NotifyCenter {
   settled(): void {
     if (this.disposed) return;
     this.runPending = false;
+    this.clearHang();
     this.flushMonitorEvents();
     if (this.runPending) return;
     for (const { message, onDelivered, sourcePreview } of this.held.splice(0)) this.deliver(message, true, onDelivered, sourcePreview);
@@ -253,6 +263,7 @@ export class NotifyCenter {
   dispose(): void {
     this.disposed = true;
     this.clearTimer();
+    this.clearHang();
     this.pendingExits = [];
     this.pendingMonitors.clear();
     this.held = [];
@@ -305,10 +316,46 @@ export class NotifyCenter {
     if (mode === "passive") {
       this.deps.sendMessage(msg, { triggerTurn: false });
     } else if (mode === "trigger") {
+      this.clearHang();
       this.deps.sendMessage(msg, { triggerTurn: true });
     } else {
       this.deps.sendMessage(msg, { deliverAs: "steer" });
+      this.armHang(message);
     }
     onDelivered?.(sourcePreview ?? (details?.kind === "monitor" ? (message.details as { event?: string }).event : undefined));
+  }
+
+  private armHang(message: NotifyMessage): void {
+    this.steered = message;
+    if (this.hangTimer !== null) return;
+    if (!(this.hangMs > 0)) return;
+    this.hangTimer = this.clock.setTimeout(() => this.onHang(), this.hangMs);
+  }
+
+  private clearHang(): void {
+    if (this.hangTimer !== null) {
+      this.clock.clearTimeout(this.hangTimer);
+      this.hangTimer = null;
+    }
+    this.steered = null;
+  }
+
+  private onHang(): void {
+    this.hangTimer = null;
+    const steered = this.steered;
+    this.steered = null;
+    if (this.disposed || this.deps.isIdle() || !steered) return;
+    const hang: NotifyMessage = {
+      customType: FAMULUS_WAKE_CUSTOM_TYPE,
+      content:
+        "System wake — not a new user message.\n\n" +
+        "The parent model stream has produced no tokens. A queued wake follows as a new turn.",
+      details: { kind: "parent-hang" },
+    };
+    this.deps.logEvent?.("wake.deliver", { kind: "parent-hang", mode: "trigger" });
+    this.runPending = true;
+    this.deps.sendMessage({ ...stampWakeAsOf(hang, this.clock.now()), display: true }, { triggerTurn: true });
+    this.deps.logEvent?.("wake.deliver", { kind: (steered.details as { kind?: string } | undefined)?.kind ?? "unknown", mode: "trigger" });
+    this.deps.sendMessage({ ...stampWakeAsOf(steered, this.clock.now()), display: true }, { triggerTurn: true });
   }
 }
