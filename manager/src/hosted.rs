@@ -1120,15 +1120,18 @@ async fn spawn_rpc(argv: &[String], cwd: &str, env: &HashMap<String, String>) ->
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
     #[cfg(unix)]
-    {
+    let status_write = {
         let life = task::lifeline()?;
         let (status_read, status_write) = crate::sys::pipe_cloexec()?;
         let status_write = crate::sys::dup_cloexec_high(&status_write)?;
         crate::sys::apply_runner_setup_tokio(&mut cmd, life.read.as_raw_fd(), status_write.as_raw_fd());
         // Keep the read end alive so a write on the status pipe does not die with EPIPE.
         std::mem::forget(status_read);
-    }
+        status_write
+    };
     let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    drop(status_write); // the runner has its copy at fd 4; drop ours so the number is not reused as stdin
     let pid = child.id().unwrap_or(0);
     #[cfg(windows)]
     if let Some(handle) = child.raw_handle() {
@@ -1203,4 +1206,33 @@ fn park_due_at(idle_since: u64, cache_expires_at: Option<u64>, limits: &Limits) 
     let max = idle_since.saturating_add(limits.idle_max);
     let cache = cache_expires_at.map(|e| e.saturating_add(limits.grace)).unwrap_or(min);
     min.max(cache).min(max.max(min))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    /// I-64. Closing the daemon's stdin must produce EOF in the wrapper.
+    /// If `status_write` is dropped before spawn, that fd number is reused as
+    /// the stdin write end and `dup2` copies it onto fd 4, so closing stdin
+    /// never reaches the child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_stdin_ends_the_rpc_wrapper() {
+        let env: HashMap<String, String> = std::env::vars().collect();
+        let mut spawned = spawn_rpc(&["/bin/cat".into()], "/", &env)
+            .await
+            .expect("spawn /bin/cat via the rpc wrapper");
+        assert!(spawned.pid > 0);
+        drop(spawned.stdin);
+        drop(spawned.stdout);
+        drop(spawned.stderr);
+        let status = tokio::time::timeout(Duration::from_secs(3), spawned.child.wait())
+            .await
+            .expect("the rpc wrapper must exit after stdin is closed")
+            .expect("wait");
+        assert!(status.success(), "cat should exit 0 on stdin EOF, got {status}");
+    }
 }
