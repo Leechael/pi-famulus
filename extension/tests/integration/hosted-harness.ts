@@ -131,7 +131,9 @@ export async function startHostedHarness(opts: {
     isProjectTrusted: () => false,
   };
   const emit = async (name: string, event: Record<string, unknown>) => {
-    for (const handler of handlers.get(name) ?? []) await handler({ type: name, ...event }, ctx);
+    for (const handler of handlers.get(name) ?? []) {
+      await handler({ type: name, ...event }, ctx);
+    }
   };
   const { default: extension } = await import("../../src/index");
   extension(api as unknown as ExtensionAPI);
@@ -186,7 +188,9 @@ export async function startHostedHarness(opts: {
 
 export async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs: number, label: string): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
+  while (true) {
+    const ready = await predicate();
+    if (ready) return;
     if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 100));
   }

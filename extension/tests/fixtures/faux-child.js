@@ -31,7 +31,9 @@ export default function fauxChild(pi) {
     if (scenario === "bash-hang" && n === 0) {
       return fauxAssistantMessage([fauxToolCall("bash", { command: NEVER_EXITS })], { stopReason: "toolUse" });
     }
-    if (scenario === "hang") await new Promise(() => {});
+    if (scenario === "hang") {
+      await new Promise(() => {});
+    }
     return fauxAssistantMessage("done");
   };
   faux.setResponses([respond]);

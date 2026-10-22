@@ -74,7 +74,9 @@ describe("I-55 a tool allowlist keeps the supervisor tools", () => {
     const cwd = join(root, "w");
     const agentDir = join(root, "a");
     const home = join(root, "h");
-    for (const dir of [cwd, agentDir, home]) await mkdir(dir, { recursive: true });
+    for (const dir of [cwd, agentDir, home]) {
+      await mkdir(dir, { recursive: true });
+    }
 
     const { tools, env } = await hostedChildLaunch(home, ["read"]);
 

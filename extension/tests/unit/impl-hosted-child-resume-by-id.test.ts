@@ -50,9 +50,8 @@ describe("I-39 resume a hosted child by child_id after the parent dies", () => {
     try {
       let text: string;
       try {
-        text = textOf(
-          await ext.run({ action: "resume", child_id: CHILD, message: "continue the review" }),
-        );
+        const executed = await ext.run({ action: "resume", child_id: CHILD, message: "continue the review" });
+        text = textOf(executed);
       } catch (error) {
         text = `refused: ${error instanceof Error ? error.message : String(error)}`;
       }

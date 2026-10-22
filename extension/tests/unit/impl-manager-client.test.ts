@@ -585,7 +585,8 @@ describe("length-prefixed frame decoding", () => {
     home = mkdtempSync(join(tmpdir(), "pi-famulus-frames-"));
     fake = await startFakeManager(home);
     client = new ManagerClient({ home, sessionId: "sess-frames", managerPath: null });
-    expect(await client.connect()).toBe(true);
+    const connected = await client.connect();
+    expect(connected).toBe(true);
   });
 
   afterEach(async () => {

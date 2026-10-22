@@ -38,9 +38,8 @@ describe("I-52 daemon dies while a hosted child runs", () => {
       const record = JSON.parse(readFileSync(agentRecordPath(home, SESSION, childId), "utf8")) as { status: string };
       let resume: string;
       try {
-        resume = textOf(
-          await ext.run({ action: "resume", child_id: childId, message: "continue" }),
-        );
+        const executed = await ext.run({ action: "resume", child_id: childId, message: "continue" });
+        resume = textOf(executed);
       } catch (error) {
         resume = `refused: ${error instanceof Error ? error.message : String(error)}`;
       }

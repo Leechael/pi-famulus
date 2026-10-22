@@ -222,7 +222,9 @@ describe("PiBinding", () => {
 const SHUTDOWN_REASONS = ["new", "resume", "fork"] as const;
 
 async function flushMicrotasks(): Promise<void> {
-  for (let i = 0; i < 30; i++) await Promise.resolve();
+  for (let i = 0; i < 30; i++) {
+    await Promise.resolve();
+  }
 }
 
 /**

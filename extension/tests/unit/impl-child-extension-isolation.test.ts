@@ -64,21 +64,25 @@ describe("hosted child isolation: what the parent hands the daemon", () => {
         getHome: () => home,
         extensionEntry: "/ext/index.ts",
       });
-      sessions.push(...await Promise.all([
+      const created = await Promise.all([
         createSession(request("ch_iso_a", "prompt for a")),
         createSession(request("ch_iso_b", "prompt for b")),
-      ]));
+      ]);
+      sessions.push(...created);
     } finally {
       if (previous === undefined) delete process.env.PI_FAMULUS_PI;
       else process.env.PI_FAMULUS_PI = previous;
     }
     try {
-      const seen = await Promise.all(manager.spawns.map(async (spawn) => ({
-        childId: spawn.childId,
-        sessionId: flag(spawn.argv, "--session-id"),
-        prompt: await readFile(flag(spawn.argv, "--append-system-prompt")!, "utf8"),
-        envName: spawn.env.PI_FAMULUS_CHILD_NAME,
-      })));
+      const seen = await Promise.all(manager.spawns.map(async (spawn) => {
+        const prompt = await readFile(flag(spawn.argv, "--append-system-prompt")!, "utf8");
+        return {
+          childId: spawn.childId,
+          sessionId: flag(spawn.argv, "--session-id"),
+          prompt,
+          envName: spawn.env.PI_FAMULUS_CHILD_NAME,
+        };
+      }));
       expect(seen.sort((a, b) => a.childId.localeCompare(b.childId))).toEqual([
         { childId: "ch_iso_a", sessionId: "ch_iso_a", prompt: "prompt for a", envName: "ch_iso_a" },
         { childId: "ch_iso_b", sessionId: "ch_iso_b", prompt: "prompt for b", envName: "ch_iso_b" },

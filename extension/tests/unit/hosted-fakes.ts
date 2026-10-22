@@ -86,7 +86,9 @@ export class FakeHostedManager {
   connect(): Promise<boolean> {
     this.connecting ??= (async () => {
       const gate = hostedFakeState().connectGate;
-      if (gate) await gate;
+      if (gate) {
+        await gate;
+      }
       this.connected = true;
       return true;
     })();
@@ -272,7 +274,9 @@ export function fakeHostPi() {
     },
   };
   const emit = async (name: string, event: Record<string, unknown>, ctx: unknown = {}) => {
-    for (const handler of handlers.get(name) ?? []) await handler({ type: name, ...event }, ctx);
+    for (const handler of handlers.get(name) ?? []) {
+      await handler({ type: name, ...event }, ctx);
+    }
   };
   const tool = (name: string): ExecutableTool => {
     const found = tools.get(name);

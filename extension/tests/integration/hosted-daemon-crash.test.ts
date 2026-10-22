@@ -47,7 +47,8 @@ describe.skipIf(!HOSTED_INTEG)("I-52 daemon SIGKILL while a hosted child runs", 
 
     let resume: string;
     try {
-      resume = textOf(await subagent.execute("sub-2", { action: "resume", run_id: runId, message: "continue" }, undefined, undefined, h.ctx));
+      const executed = await subagent.execute("sub-2", { action: "resume", run_id: runId, message: "continue" }, undefined, undefined, h.ctx);
+      resume = textOf(executed);
     } catch (error) {
       resume = `refused: ${error instanceof Error ? error.message : String(error)}`;
     }

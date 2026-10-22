@@ -191,7 +191,8 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs: number, lab
   let last = "";
   while (Date.now() < deadline) {
     try {
-      if (await predicate()) return true;
+      const ready = await predicate();
+      if (ready) return true;
     } catch (error) {
       last = error instanceof Error ? error.message : String(error);
     }
