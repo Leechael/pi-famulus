@@ -842,6 +842,23 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         // One event per stall detection: an auto-resume follows unless the
         // retry budget (stallRetries) is already spent.
         logEvent("agent.stall", { child_id: childId, attempt });
+        notifyCenter?.notify({
+          customType: "pi-famulus-wake",
+          content:
+            `System wake — not a new user message.\n\n` +
+            `Subagent ${childId} stalled with no activity (attempt ${attempt}); retrying.`,
+          details: { kind: "subagent-stall", child_id: childId, attempt },
+        });
+      },
+      onToolLoop: (childId, toolName, args) => {
+        const argText = args && typeof args === "object" ? JSON.stringify(args) : String(args ?? "");
+        notifyCenter?.notify({
+          customType: "pi-famulus-wake",
+          content:
+            `System wake — not a new user message.\n\n` +
+            `Subagent ${childId} called ${toolName} three times in a row with the same arguments${argText ? `: ${argText}` : "."}`,
+          details: { kind: "subagent-loop", child_id: childId, tool: toolName, args },
+        });
       },
       // Soft deadline: the child keeps running; the parent decides.
       onOverrun: createOverrunNotifier({

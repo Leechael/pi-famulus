@@ -277,6 +277,9 @@ class HostedRpcSession implements ChildSessionAdapter {
       type,
       ...(record.message?.role ? { role: record.message.role } : {}),
       ...(record.toolCallId ? { toolCallId: record.toolCallId } : {}),
+      ...(record.toolName ? { toolName: record.toolName } : {}),
+      ...(record.args !== undefined ? { args: record.args } : {}),
+      ...(record.isError !== undefined ? { isError: record.isError } : {}),
     };
     for (const listener of this.listeners) listener(adapted);
   }

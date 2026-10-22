@@ -36,7 +36,7 @@ afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
 describe("I-31 a stuck or looping child is reported early", () => {
-  it.fails("tells the parent when the stall watchdog restarts a child", async () => {
+  it("tells the parent when the stall watchdog restarts a child", async () => {
     const ext = await startHostedExtension({ sessionId: "sess-stall", cwd: home });
     try {
       const childId = await ext.spawnChild();
@@ -58,7 +58,7 @@ describe("I-31 a stuck or looping child is reported early", () => {
     }
   });
 
-  it.fails("reports the same tool call repeated three times with the same arguments", async () => {
+  it("reports the same tool call repeated three times with the same arguments", async () => {
     const ext = await startHostedExtension({ sessionId: "sess-loop", cwd: home });
     try {
       const childId = await ext.spawnChild();

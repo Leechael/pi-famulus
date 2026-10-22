@@ -87,6 +87,8 @@ export interface InProcessRunnerOptions {
   stallRetryDelayMs?: number;
   /** Called on every stall detection (before any retry), with the 1-based attempt. */
   onStall?: (childId: string, attempt: number) => void;
+  /** Same tool name and arguments three times in a row (I-31). */
+  onToolLoop?: (childId: string, toolName: string, args: unknown) => void;
   /** Overrun reminder interval (ms). Default 10 minutes. */
   overrunRepeatMs?: number;
   /** Abort ceiling per user turn (ms). 0/absent = off: the soft deadline never aborts. */
@@ -152,6 +154,9 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly stallRetries: number;
   private readonly stallRetryDelayMs: number;
   private readonly onStall?: (childId: string, attempt: number) => void;
+  private readonly onToolLoop?: (childId: string, toolName: string, args: unknown) => void;
+  private lastToolKey: string | null = null;
+  private lastToolCount = 0;
   private readonly overrunRepeatMs: number;
   private readonly hardTimeoutMs: number;
   private readonly onOverrun?: (tick: OverrunTick) => void;
@@ -247,6 +252,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       ? Math.max(0, Math.floor(rawDelay))
       : DEFAULT_STALL_RETRY_DELAY_MS;
     this.onStall = opts.onStall;
+    this.onToolLoop = opts.onToolLoop;
     const rawRepeat = opts.overrunRepeatMs ?? DEFAULT_OVERRUN_REPEAT_MS;
     this.overrunRepeatMs =
       Number.isFinite(rawRepeat) && rawRepeat > 0
@@ -888,7 +894,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.toolStartedAt = null;
   }
 
-  private handleSessionEvent(event: { type: string; role?: string; toolCallId?: string; usage?: { input: number; output: number } }): void {
+  private handleSessionEvent(event: { type: string; role?: string; toolCallId?: string; toolName?: string; args?: unknown; usage?: { input: number; output: number } }): void {
     const now = this.now();
     const active = this.status_ === "running";
     let currentToolEvent = false;
@@ -932,6 +938,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       if (currentToolEvent) {
         this.toolDepth++;
         this.clearStall();
+        this.noteToolCall(event.toolName, event.args);
       }
       return;
     }
@@ -946,6 +953,22 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (!active) return;
     this.lastEvent = now;
     if (this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
+  }
+
+  private noteToolCall(toolName: string | undefined, args: unknown): void {
+    const name = toolName ?? "";
+    const key = `${name}\0${JSON.stringify(args ?? null)}`;
+    if (this.lastToolKey === key) this.lastToolCount += 1;
+    else {
+      this.lastToolKey = key;
+      this.lastToolCount = 1;
+    }
+    if (this.lastToolCount !== 3 || !name) return;
+    try {
+      this.onToolLoop?.(this.req.childId, name, args);
+    } catch {
+      // loop observers must not break the child
+    }
   }
 
   private release(terminal = true): void {
