@@ -167,11 +167,36 @@ pub fn agent_active_at(a: &AgentRecord, home: &Path) -> Option<u64> {
     last_message_ts(&a.transcript_path(home)).or(a.started_at)
 }
 
+/// Hosted children the daemon still has warm. They outlive a gone parent
+/// session, so `ls` must not hide them as interrupted (I-41).
+fn warm_hosted_ids(home: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(files) = std::fs::read_dir(home.join("agents")) else {
+        return out;
+    };
+    for file in files.flatten() {
+        let path = file.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        let residency = value.get("residency").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(child_id) = value.get("child_id").and_then(|v| v.as_str()) else { continue };
+        if residency == "warm" {
+            out.insert(child_id.to_string());
+        }
+    }
+    out
+}
+
 /// Every agent record under `home`. Records whose session is not in
 /// `connected` and that still claim to be running are shown as
-/// `interrupted` (stale = true): a gone session cannot host a live child.
+/// `interrupted` (stale = true), unless a warm hosted process still owns
+/// that child.
 pub fn load_agent_records(home: &Path, connected: &HashSet<String>) -> Vec<AgentRecord> {
     let mut out = Vec::new();
+    let warm = warm_hosted_ids(home);
     let Ok(sessions) = std::fs::read_dir(home.join("sessions")) else {
         return out;
     };
@@ -188,7 +213,10 @@ pub fn load_agent_records(home: &Path, connected: &HashSet<String>) -> Vec<Agent
             let Ok(mut rec) = serde_json::from_slice::<AgentRecord>(&bytes) else {
                 continue;
             };
-            if !agent_status_terminal(&rec.status) && !connected.contains(&rec.session_id) {
+            if !agent_status_terminal(&rec.status)
+                && !connected.contains(&rec.session_id)
+                && !warm.contains(&rec.child_id)
+            {
                 rec.status = "interrupted".into();
                 rec.stale = true;
             }
@@ -1816,6 +1844,48 @@ mod tests {
             "tick every 2m"
         );
         assert_eq!(guess_command_title("pytest -n 4"), "pytest -n 4");
+    }
+
+    #[test]
+    fn a_warm_hosted_child_stays_visible_when_the_parent_session_is_gone() {
+        let dir = std::env::temp_dir().join(format!("pi-famulus-i41-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sessions/sess-gone/agents")).unwrap();
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::write(
+            dir.join("sessions/sess-gone/agents/ch_live.json"),
+            r#"{"v":1,"kind":"agent","child_id":"ch_live","run_id":"run_1","session_id":"sess-gone","name":"worker","agent":"worker","status":"running","started_at":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agents/ch_live.json"),
+            r#"{"child_id":"ch_live","parent_session":"sess-gone","run_id":"run_1","name":"worker","token":"t","argv":["pi"],"cwd":"/tmp","residency":"warm","activity":"running","driver":"parent","last_text":""}"#,
+        )
+        .unwrap();
+        let connected = HashSet::new();
+        let recs = load_agent_records(&dir, &connected);
+        let rec = recs.iter().find(|r| r.child_id == "ch_live").expect("record");
+        assert_eq!(rec.status, "running");
+        assert!(!rec.stale);
+        let rows = filter_rows(
+            recs.iter()
+                .map(|a| agent_row(a, &BTreeMap::new(), 1, a.started_at))
+                .collect(),
+            &LsOpts {
+                all: true,
+                session: None,
+                cwd: None,
+                since: None,
+                json: false,
+            },
+            1,
+            &connected,
+            &recs,
+            &dir,
+        )
+        .unwrap();
+        assert!(rows.iter().any(|r| r.id == "ch_live" && r.running), "{rows:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
