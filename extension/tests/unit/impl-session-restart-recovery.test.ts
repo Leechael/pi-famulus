@@ -62,6 +62,42 @@ describe("the same session reopened after pi crashed", () => {
     }
   });
 
+  it("performs fresh same-session recovery after discarding the previous runtime's pending recovery", async () => {
+    const sessionId = "sess-fresh-recovery";
+    let connect!: () => void;
+    hostedFakeState().connectGate = new Promise<void>((resolve) => { connect = resolve; });
+    const ext = await startHostedExtension({ sessionId, cwd: home });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      let lists = 0;
+      ext.manager.list = async () => { lists++; await gate; return []; };
+      connect();
+      await until(() => lists >= 2, "old background sync and recovery lists");
+      await ext.pi.emit("session_shutdown", { reason: "new" }, ext.ctx);
+      hostedFakeState().connectGate = null;
+      hostedFakeState().tasks = [{
+        task_id: "sh_fresh_recovery", session_id: sessionId, kind: "shell", status: "killed", end_reason: "manager-shutdown",
+      }];
+      const nextCtx = fakeHostCtx(sessionId, home);
+      await ext.pi.emit("session_start", { reason: "resume" }, nextCtx);
+      release();
+      await settleAsync();
+      const recoveryWakes = () => ext.pi.sent.filter((sent) =>
+        (sent.message.details as { kind?: string })?.kind === "session-recovery" &&
+        (sent.message.content ?? "").includes("sh_fresh_recovery"));
+      expect(recoveryWakes()).toHaveLength(1);
+      // /reload retains this runtime and must not reset its recovery dedup.
+      await ext.pi.emit("session_shutdown", { reason: "reload" }, nextCtx);
+      await ext.pi.emit("session_start", { reason: "reload" }, nextCtx);
+      await settleAsync();
+      expect(recoveryWakes()).toHaveLength(1);
+    } finally {
+      connect(); release();
+      await ext.shutdown();
+    }
+  });
+
   it("discards a late task_list result even when a new runtime reopens the same session", async () => {
     const sessionId = "sess-sync-generation";
     const ext = await startHostedExtension({ sessionId, cwd: home });

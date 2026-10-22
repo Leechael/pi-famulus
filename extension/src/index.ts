@@ -1222,6 +1222,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     agentLoader = null;
     monitorRegistry?.disposeAll();
     notifyCenter?.dispose();
+    recoveredSessions.clear();
     cleanupSessionSpillFiles();
     const current = client;
     client = null;
