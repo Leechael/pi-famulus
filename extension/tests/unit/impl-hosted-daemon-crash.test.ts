@@ -25,6 +25,42 @@ afterEach(() => resetHostedFakes());
 const SESSION = "sess-daemon-crash";
 
 describe("daemon dies while a hosted child runs", () => {
+  it("regression: a resumed child waits for its interrupted generation's abort to drain", async () => {
+    const sessionId = "sess-interrupt-resume";
+    const ext = await startHostedExtension({ sessionId, cwd: home });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const childId = await ext.spawnChild();
+      ext.manager.rpc(childId, { type: "agent_start" });
+      let aborting = false;
+      const input = ext.manager.agentInput.bind(ext.manager);
+      ext.manager.agentInput = async (id, op, text, source) => {
+        if (op === "abort") { aborting = true; await gate; }
+        return input(id, op, text, source);
+      };
+      ext.manager.fireReconnect();
+      await until(() => aborting, "the old generation's blocked abort");
+      await ext.run({ action: "resume", child_id: childId, message: "continue after crash" });
+      await settleAsync();
+      const readRecord = () => JSON.parse(readFileSync(agentRecordPath(home, sessionId, childId), "utf8"));
+      expect(readRecord().status).toBe("pending");
+      expect(ext.manager.inputs.filter((call) => call.text === "continue after crash")).toEqual([]);
+      // Restart/abort warmup can report idle before the new prompt starts.
+      ext.manager.state(childId, "idle");
+      release();
+      await until(() => ext.manager.inputs.some((call) => call.text === "continue after crash"), "the resumed prompt");
+      expect(readRecord().status).toBe("running");
+      ext.manager.finish(childId, { content: [{ type: "text", text: "RESUMED SUCCESS" }], stopReason: "stop" });
+      await until(() => readRecord().status === "completed", "the resumed result");
+      expect(readRecord().result_tail).toBe("RESUMED SUCCESS");
+      expect(ext.pi.sent.filter((sent) => (sent.message.details as { kind?: string })?.kind === "subagent-done").at(-1)?.message.content).toContain("RESUMED SUCCESS");
+    } finally {
+      release();
+      await ext.shutdown();
+    }
+  });
+
   it("keeps a locally queued child pending across a same-daemon reconnect", async () => {
     writeFileSync(join(home, "config.json"), JSON.stringify({ subagent: { maxConcurrentChildren: 1 } }));
     const ext = await startHostedExtension({ sessionId: "sess-queued-reconnect", cwd: home });

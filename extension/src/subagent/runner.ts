@@ -528,11 +528,10 @@ class InProcessChildHandle implements DisposableChildHandle {
       text: this.status_ === "pending" ? "" : this.partialText(),
       durationMs: this.now() - this.startedAt,
     });
-    try {
-      await this.session?.abort();
-    } catch {
-      // abort is best-effort; the result is already settled
-    }
+    // Resume may be accepted as soon as the interrupted result is visible.
+    // Drain this abort just like a timeout/stall abort before prompting again.
+    this.abortPromise = this.session ? this.session.abort().catch(() => {}) : null;
+    await this.abortPromise;
   }
 
   dispose(): void | Promise<void> {
