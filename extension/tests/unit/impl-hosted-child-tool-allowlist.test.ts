@@ -68,7 +68,7 @@ async function hostedChildLaunch(home: string, tools: string[]): Promise<{ tools
 }
 
 describe("I-55 a tool allowlist keeps the supervisor tools", () => {
-  it.fails("a hosted child of a `tools: read` agent can still call contact_supervisor and agent_message", async () => {
+  it("a hosted child of a `tools: read` agent can still call contact_supervisor and agent_message", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-famulus-allowlist-"));
     tempDirs.push(root);
     const cwd = join(root, "w");

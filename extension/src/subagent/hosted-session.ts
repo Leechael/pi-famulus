@@ -66,10 +66,10 @@ export function createHostedSessionFn(deps: HostedSessionDeps): CreateSessionFn 
       "--thinking", String(thinking),
       "--append-system-prompt", promptFile,
       ...(trustInherited ? [] : [deps.getProjectTrusted?.() ? "-a" : "-na"]),
-      ...(req.agent.tools ? ["--tools", req.agent.tools.join(",")] : []),
+      ...(req.agent.tools ? ["--tools", hostedChildTools(req.agent.tools).join(",")] : []),
     ];
     const env = { ...process.env } as Record<string, string>;
-    if (req.agent.tools) env.PI_FAMULUS_CHILD_TOOLS = req.agent.tools.join(",");
+    if (req.agent.tools) env.PI_FAMULUS_CHILD_TOOLS = hostedChildTools(req.agent.tools).join(",");
     env.PI_FAMULUS_CHILD_RUN = req.runId;
     env.PI_FAMULUS_CHILD_NAME = req.name;
     const spawned = await client.agentSpawn({
@@ -291,6 +291,15 @@ class HostedRpcSession implements ChildSessionAdapter {
 
 function num(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+const SUPERVISOR_TOOLS = ["contact_supervisor", "agent_message"];
+
+/** Agent allowlists still keep the two supervisor tools (I-55). */
+export function hostedChildTools(tools: string[]): string[] {
+  const kept = new Set(tools);
+  for (const name of SUPERVISOR_TOOLS) kept.add(name);
+  return [...kept];
 }
 
 /** Request id for a child→parent decision. */
