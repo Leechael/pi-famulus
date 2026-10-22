@@ -260,6 +260,8 @@ class HostedRpcSession implements ChildSessionAdapter {
         if (record.message.errorMessage) {
           this.turns.push({ role: "assistant error", text: record.message.errorMessage });
         }
+      } else {
+        this.lastFailure = undefined;
       }
       const usage = record.message.usage;
       if (usage) {

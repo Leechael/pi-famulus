@@ -24,6 +24,43 @@ afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
 describe("a rate-limited hosted child is recorded distinctly", () => {
+  it.each(["automatic retry", "later resume"])("clears an old rate limit after a successful %s", async (recovery) => {
+    const ext = await startHostedExtension({ sessionId: `sess-${recovery}`, cwd: home });
+    try {
+      const childId = await ext.spawnChild();
+      ext.manager.rpc(childId, { type: "agent_start" });
+      ext.manager.rpc(childId, { type: "message_end", message: {
+        role: "assistant", content: [], stopReason: "error", errorMessage: "429 retry after 20s",
+      } });
+      if (recovery === "later resume") {
+        ext.manager.rpc(childId, { type: "agent_settled" });
+        await until(() => wakeDetails(ext.pi.sent, "subagent-done").length === 1, "the failed turn");
+        await ext.run({ action: "resume", child_id: childId, message: "try again" });
+        await until(() => ext.manager.inputs.some((input) => input.text === "try again"), "the resumed prompt");
+        ext.manager.rpc(childId, { type: "agent_start" });
+      } else {
+        ext.manager.rpc(childId, { type: "auto_retry_start" });
+      }
+      ext.manager.rpc(childId, { type: "message_end", message: {
+        role: "assistant", content: [{ type: "text", text: "SUCCESS" }], stopReason: "stop",
+      } });
+      if (recovery === "automatic retry") ext.manager.rpc(childId, { type: "auto_retry_end", success: true });
+      ext.manager.rpc(childId, { type: "agent_settled" });
+      const expectedWakes = recovery === "later resume" ? 2 : 1;
+      await until(() => wakeDetails(ext.pi.sent, "subagent-done").length === expectedWakes, "the successful turn");
+      const wake = wakeDetails(ext.pi.sent, "subagent-done").at(-1) as { children: Array<Record<string, unknown>> };
+      expect(wake.children[0]).toMatchObject({ status: "completed", result: "SUCCESS" });
+      expect(wake.children[0].error).toBeUndefined();
+      expect(wake.children[0].retryAfter).toBeUndefined();
+      const record = JSON.parse(readFileSync(agentRecordPath(home, `sess-${recovery}`, childId), "utf8"));
+      expect(record.status).toBe("completed");
+      expect(record.error).toBeUndefined();
+      expect(record.retry_after).toBeUndefined();
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
   it("records rate-limit and retry-after on the wake and the child record", async () => {
     const providerText = "429 Too Many Requests: rate limit exceeded, retry after 20s";
     const ext = await startHostedExtension({ sessionId: "sess-rate", cwd: home });
