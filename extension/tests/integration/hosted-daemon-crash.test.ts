@@ -23,7 +23,7 @@ describe.skipIf(!HOSTED_INTEG)("I-52 daemon SIGKILL while a hosted child runs", 
     harness = null;
   });
 
-  it.fails("marks the child interrupted, wakes the parent, and lets it resume", async () => {
+  it("marks the child interrupted, wakes the parent, and lets it resume", async () => {
     harness = await startHostedHarness({ scenario: "hang" });
     const h = harness;
     const subagent = h.tool("subagent");

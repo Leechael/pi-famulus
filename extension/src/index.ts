@@ -331,16 +331,16 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     }
   };
   /**
-   * The previous process died. Settle stale running agent records (the child
-   * is gone) and tell the model about that work and about commands the
-   * daemon already ended as manager-shutdown / manager-crash (I-19, I-40).
-   * A hosted child that is still warm is left for resume (I-39).
+   * A running disk record whose hosted process is gone: interrupt the live
+   * handle when this process still holds it (daemon crash, I-52), otherwise
+   * write the record. Warm children stay for resume (I-39).
    */
-  const recoverCrashedSession = async (sessionId: string): Promise<void> => {
-    if (!sessionId || recoveredSessions.has(sessionId)) return;
-    recoveredSessions.add(sessionId);
+  const settleDeadHostedChildren = async (
+    sessionId: string,
+    opts: { interruptLive?: boolean } = {},
+  ): Promise<AgentChildRecord[]> => {
     const stale = loadAgentChildRecords(home, { sessionId, includeTerminal: false });
-    const interrupted: AgentChildRecord[] = [];
+    const lost: AgentChildRecord[] = [];
     for (const rec of stale) {
       if (rec.status !== "running" && rec.status !== "pending") continue;
       let live = false;
@@ -350,15 +350,34 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         live = Boolean(found && (found.residency === "warm" || found.activity === "running" || found.activity === "starting"));
       }
       if (live) continue;
-      writeAgentChildRecord(home, {
-        ...rec,
-        status: "interrupted",
-        ended_at: rec.ended_at ?? clock.now(),
-        end_reason: "interrupted",
-        error: rec.error ?? "parent session ended",
-      });
-      interrupted.push(rec);
+      const handle = subagentRegistry?.handle(rec.child_id);
+      if (handle && (handle.status() === "running" || handle.status() === "pending")) {
+        if (!opts.interruptLive) continue;
+        await handle.interrupt().catch(() => {});
+      } else {
+        writeAgentChildRecord(home, {
+          ...rec,
+          status: "interrupted",
+          ended_at: rec.ended_at ?? clock.now(),
+          end_reason: "interrupted",
+          error: rec.error ?? "parent session ended",
+        });
+      }
+      lost.push(rec);
     }
+    return lost;
+  };
+  /**
+   * The previous process died. Settle stale running agent records (the child
+   * is gone) and tell the model about that work and about commands the
+   * daemon already ended as manager-shutdown / manager-crash (I-19, I-40).
+   * A hosted child that is still warm is left for resume (I-39).
+   */
+  const recoverCrashedSession = async (sessionId: string): Promise<void> => {
+    if (!sessionId || recoveredSessions.has(sessionId)) return;
+    recoveredSessions.add(sessionId);
+    const interrupted =
+      await settleDeadHostedChildren(sessionId);
     let killed: TaskRecord[] = [];
     if (client?.isAvailable()) {
       try {
@@ -890,6 +909,21 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         // The registry and its child ids survive socket reconnects in this
         // extension process; held ids include resumable interrupted children.
         await reconcileAgentLeases(manager);
+        const sid = ctx?.sessionManager.getSessionId() ?? "";
+        const lost =
+          await settleDeadHostedChildren(sid, { interruptLive: true });
+        if (lost.length > 0) {
+          sessionNotify?.notify({
+            customType: "pi-famulus-wake",
+            content: [
+              "System wake — not a new user message.",
+              "",
+              "The daemon restarted. Hosted children that were running are gone.",
+              ...lost.map((rec) => `Interrupted subagent ${rec.child_id} (${rec.name}).`),
+            ].join("\n"),
+            details: { kind: "session-recovery", children: lost.map((rec) => rec.child_id) },
+          });
+        }
       })().catch(() => {});
     });
 
