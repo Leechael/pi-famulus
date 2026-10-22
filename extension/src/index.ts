@@ -337,23 +337,28 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     sessionId: string,
     opts: { interruptLive?: boolean } = {},
   ): Promise<AgentChildRecord[]> => {
+    const manager = client;
+    const registry = subagentRegistry;
+    const center = notifyCenter;
     const stale = loadAgentChildRecords(home, { sessionId, includeTerminal: false });
     const lost: AgentChildRecord[] = [];
     for (const rec of stale) {
       if (rec.status !== "running" && rec.status !== "pending") continue;
-      const handle = subagentRegistry?.handle(rec.child_id);
+      const handle = registry?.handle(rec.child_id);
       // A local admission queue has no hosted process to look up yet.
       if (handle?.status() === "pending") continue;
       let live = false;
-      if (client?.isAvailable() && client.protocolLevel() >= 6) {
+      if (manager?.isAvailable() && manager.protocolLevel() >= 6) {
         const found =
-          await client.hostedLookup({ sessionId: rec.child_id }).catch(() => null);
+          await manager.hostedLookup({ sessionId: rec.child_id }).catch(() => null);
+        if (client !== manager || subagentRegistry !== registry || notifyCenter !== center) return [];
         live = Boolean(found && (found.residency === "warm" || found.activity === "running" || found.activity === "starting"));
       }
       if (live) continue;
       if (handle && (handle.status() === "running" || handle.status() === "pending")) {
         if (!opts.interruptLive) continue;
         await handle.interrupt().catch(() => {});
+        if (client !== manager || subagentRegistry !== registry || notifyCenter !== center) return [];
       } else {
         writeAgentChildRecord(home, {
           ...rec,
@@ -375,13 +380,17 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    */
   const recoverCrashedSession = async (sessionId: string): Promise<void> => {
     if (!sessionId || recoveredSessions.has(sessionId)) return;
+    const manager = client;
+    const center = notifyCenter;
     recoveredSessions.add(sessionId);
     const interrupted =
       await settleDeadHostedChildren(sessionId);
+    if (client !== manager || notifyCenter !== center) return;
     let killed: TaskRecord[] = [];
-    if (client?.isAvailable()) {
+    if (manager?.isAvailable()) {
       try {
-        const tasks = await client.list(true);
+        const tasks = await manager.list(true);
+        if (client !== manager || notifyCenter !== center) return;
         killed = tasks.filter((task) => {
           if (task.session_id && task.session_id !== sessionId) return false;
           if (task.kind !== "shell") return false;
@@ -406,7 +415,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     for (const task of killed) {
       lines.push(`Command ${task.task_id} ended while the session was gone (${task.end_reason ?? task.status}).`);
     }
-    notifyCenter?.notify({
+    center?.notify({
       customType: "pi-famulus-wake",
       content: lines.join("\n"),
       details: {
@@ -427,6 +436,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    */
   const syncWithManager = async (): Promise<void> => {
     const c = client;
+    const center = notifyCenter;
     let tasks: TaskRecord[];
     if (c && c.isAvailable()) {
       try {
@@ -441,6 +451,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       if (!disk) return;
       tasks = disk;
     }
+    if (client !== c || notifyCenter !== center) return;
     monitorRegistry?.reconcile(tasks);
     adoptParentShells(tasks);
     for (const task of workIndex.staleLive(tasks)) {
@@ -896,21 +907,25 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       }
     });
     client.onReconnect(() => {
+      if (client !== sessionClient) return;
       // A daemon restart may drop permits; a same-session rebind may retain
       // them. Keep each kind for idempotent re-registration and mark all local
       // leases pending until the daemon confirms them.
       for (const childId of globalAgentLeases.keys()) pendingAgentLeases.add(childId);
-      void monitorRegistry?.rewatchAll().then(() => syncWithManager());
+      void monitorRegistry?.rewatchAll().then(() => {
+        if (client === sessionClient) return syncWithManager();
+      });
       void (async () => {
-        const manager = client;
-        if (!manager || manager.protocolLevel() < 4) {
+        const manager = sessionClient;
+        if (manager.protocolLevel() < 4) {
           capacityNotice("daemon too old");
           return;
         }
         // The registry and its child ids survive socket reconnects in this
         // extension process; held ids include resumable interrupted children.
         await reconcileAgentLeases(manager);
-        const sid = ctx?.sessionManager.getSessionId() ?? "";
+        if (client !== manager) return;
+        const sid = parentSessionId;
         const lost =
           await settleDeadHostedChildren(sid, { interruptLive: true });
         if (lost.length > 0) {
@@ -1161,7 +1176,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     // first prompt. The cache install, if one is running, finishes first so a
     // missing optional package is not reported before it can be restored.
     // Tools call ensureAvailable() lazily before use.
-    const c = client;
+    if (client !== sessionClient) return;
+    const c = sessionClient;
     void nativeRestore
       .then((path) => {
         if (client !== c || !c) return null;

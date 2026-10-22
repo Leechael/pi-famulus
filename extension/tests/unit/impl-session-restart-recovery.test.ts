@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { agentRecordPath, writeAgentChildRecord } from "../../src/subagent/agent-records";
-import { hostedFakeState, resetHostedFakes, settleAsync, startHostedExtension, until } from "./hosted-fakes";
+import { fakeHostCtx, hostedFakeState, resetHostedFakes, settleAsync, startHostedExtension, textOf, until } from "./hosted-fakes";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();
@@ -33,6 +33,64 @@ afterEach(() => resetHostedFakes());
 const SESSION = "sess-restart";
 
 describe("the same session reopened after pi crashed", () => {
+  it("does not send an old background crash recovery into a replacement session", async () => {
+    let connect!: () => void;
+    hostedFakeState().connectGate = new Promise<void>((resolve) => { connect = resolve; });
+    const ext = await startHostedExtension({ sessionId: "sess-old", cwd: home });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      let lists = 0;
+      ext.manager.list = async () => {
+        lists++;
+        await gate;
+        return [{ task_id: "sh_old_recovery", session_id: "sess-old", kind: "shell", status: "killed", end_reason: "manager-shutdown" }];
+      };
+      connect();
+      await until(() => lists >= 2, "old background sync and recovery lists");
+      await ext.pi.emit("session_shutdown", { reason: "new" }, ext.ctx);
+      hostedFakeState().connectGate = null;
+      const nextCtx = fakeHostCtx("sess-new", home);
+      await ext.pi.emit("session_start", { reason: "new" }, nextCtx);
+      const before = ext.pi.sent.length;
+      release();
+      await settleAsync();
+      expect(ext.pi.sent.slice(before).some((sent) => (sent.message.content ?? "").includes("sh_old_recovery"))).toBe(false);
+    } finally {
+      connect(); release();
+      await ext.shutdown();
+    }
+  });
+
+  it("discards a late task_list result even when a new runtime reopens the same session", async () => {
+    const sessionId = "sess-sync-generation";
+    const ext = await startHostedExtension({ sessionId, cwd: home });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      await settleAsync();
+      let listed = false;
+      ext.manager.list = async () => {
+        listed = true;
+        await gate;
+        return [{ task_id: "sh_old_sync", session_id: sessionId, kind: "shell", command: "printf old", status: "completed", exit_code: 0, ended_at: Date.now(), started_at: Date.now() - 10 }];
+      };
+      const pending = ext.pi.tool("task_list").execute("old-list", {}, undefined, undefined, ext.ctx);
+      await until(() => listed, "the old task_list request");
+      await ext.pi.emit("session_shutdown", { reason: "new" }, ext.ctx);
+      await ext.pi.emit("session_start", { reason: "resume" }, fakeHostCtx(sessionId, home));
+      release();
+      await pending;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const nextList = await ext.pi.tool("task_list").execute("new-list", {}, undefined, undefined, fakeHostCtx(sessionId, home));
+      expect(textOf(nextList)).not.toContain("sh_old_sync");
+      expect(ext.pi.sent.some((sent) => (sent.message.content ?? "").includes("sh_old_sync"))).toBe(false);
+    } finally {
+      release();
+      await ext.shutdown();
+    }
+  });
+
   it("reports the interrupted subagent and command, and settles the stale record", async () => {
     const startedAt = Date.now() - 10 * 60_000;
     writeAgentChildRecord(home, {
