@@ -10,7 +10,7 @@
  *   PI_FAMULUS_INTEG=1 npx vitest run tests/integration/hosted-daemon-crash.test.ts
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { alive, HOSTED_INTEG, startHostedHarness, textOf, waitUntil, type HostedHarness } from "./hosted-harness";
+import { alive, HOSTED_INTEG, startHostedHarness, waitUntil, type HostedHarness } from "./hosted-harness";
 
 /** Generous: the extension respawns the daemon and reconnects within a few seconds. */
 const SETTLE_MS = 20_000;
@@ -43,23 +43,18 @@ describe.skipIf(!HOSTED_INTEG)("daemon SIGKILL while a hosted child runs", () =>
 
     const wakeNamesChild = () => h.sent.slice(sentBefore).some((sent) => (sent.message.content ?? "").includes(childId));
     const recordStatus = () => String(h.agentRecords().find((rec) => rec.child_id === childId)?.status);
-    await waitUntil(() => wakeNamesChild() && recordStatus() !== "running", SETTLE_MS, "a crash wake").catch(() => {});
-
-    let resume: string;
-    try {
-      const executed = await subagent.execute("sub-2", { action: "resume", run_id: runId, message: "continue" }, undefined, undefined, h.ctx);
-      resume = textOf(executed);
-    } catch (error) {
-      resume = `refused: ${error instanceof Error ? error.message : String(error)}`;
-    }
-    expect({
-      recordStatus: recordStatus(),
-      wakeNamesChild: wakeNamesChild(),
-      resumeRefused: resume.startsWith("refused"),
-    }).toEqual({
-      recordStatus: "interrupted",
-      wakeNamesChild: true,
-      resumeRefused: false,
+    await waitUntil(() => wakeNamesChild() && recordStatus() !== "running", SETTLE_MS, "a crash wake");
+    // Snapshot the crash outcome before resume correctly transitions to pending.
+    expect({ recordStatus: recordStatus(), wakeNamesChild: wakeNamesChild() }).toEqual({
+      recordStatus: "interrupted", wakeNamesChild: true,
     });
+
+    const callsBeforeResume = h.modelCalls();
+    await subagent.execute("sub-2", { action: "resume", run_id: runId, message: "continue" }, undefined, undefined, h.ctx);
+    await waitUntil(
+      () => h.modelCalls() > callsBeforeResume && recordStatus() === "running",
+      30_000,
+      "the resumed child to enter another model call",
+    );
   }, 90_000);
 });
