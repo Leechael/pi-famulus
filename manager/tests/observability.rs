@@ -370,6 +370,36 @@ fn e1_manager_writes_session_and_task_events() {
     assert_eq!(daemon[0]["protocol"], 6);
 }
 
+/// I-34. A gone parent is a crash when its pid is already dead, a shutdown
+/// when it called shutdown_session, and a closed socket otherwise.
+#[test]
+fn e_session_disconnect_names_crash_shutdown_and_closed() {
+    let home = Home::new("e-i34");
+    let _d = home.start_daemon();
+
+    let mut crash = home.connect();
+    crash.request_ok(json!({
+        "type":"hello","client_kind":"extension","session_id":"sess-crash",
+        "pi_pid":99_999_999u32,"cwd":"/tmp","protocol":2
+    }));
+    drop(crash);
+    let ev = wait_event(&home, "sess-crash", "session.disconnect", None);
+    assert_eq!(ev["reason"], "crash", "{ev}");
+
+    let mut clean = home.connect();
+    hello_v2(&mut clean, "sess-shutdown", "/tmp/shutdown");
+    clean.request_ok(json!({"type":"shutdown_session"}));
+    drop(clean);
+    let ev = wait_event(&home, "sess-shutdown", "session.disconnect", None);
+    assert_eq!(ev["reason"], "shutdown", "{ev}");
+
+    let mut live = home.connect();
+    hello_v2(&mut live, "sess-closed", "/tmp/closed");
+    drop(live);
+    let ev = wait_event(&home, "sess-closed", "session.disconnect", None);
+    assert_eq!(ev["reason"], "closed", "{ev}");
+}
+
 /// Oversized fields are truncated so every line stays below 4 KiB.
 #[test]
 fn e2_event_lines_stay_below_4k() {
