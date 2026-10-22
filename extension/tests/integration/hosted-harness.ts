@@ -18,7 +18,7 @@ export const MANAGER_BIN =
   process.env.PI_FAMULUS_MANAGER_PATH ??
   join(__dirname, "../../../manager/target/release", process.platform === "win32" ? "pi-famulus.exe" : "pi-famulus");
 
-const PI_CLI = join(__dirname, "../../node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+export const PI_CLI = join(__dirname, "../../node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
 
 /** Children run Unix shell fixtures (`tail -f /dev/null`); POSIX only. */
 export const HOSTED_INTEG =
@@ -71,18 +71,25 @@ function restoreEnv(): void {
   saved.clear();
 }
 
-export async function startHostedHarness(opts: {
-  scenario?: string;
-  childArgs?: string[];
-  env?: Record<string, string>;
-  sessionId?: string;
-}): Promise<HostedHarness> {
+export function createHostedDirs(): { root: string; home: string; cwd: string; agentDir: string } {
   // Short base: Unix socket paths are limited to ~104 bytes on macOS.
   const root = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pf-hosted-"));
   const home = join(root, "h");
   const cwd = join(root, "w");
   const agentDir = join(root, "a");
   for (const dir of [home, cwd, agentDir]) mkdirSync(dir, { recursive: true });
+  return { root, home, cwd, agentDir };
+}
+
+export async function startHostedHarness(opts: {
+  scenario?: string;
+  childArgs?: string[];
+  env?: Record<string, string>;
+  sessionId?: string;
+  /** Reuse a home the first parent already started the daemon in. */
+  existing?: { root: string; home: string; cwd: string; agentDir: string };
+}): Promise<HostedHarness> {
+  const { root, home, cwd, agentDir } = opts.existing ?? createHostedDirs();
   const sessionId = opts.sessionId ?? "hosted-sess";
   setEnv("PI_FAMULUS_HOME", home);
   setEnv("PI_FAMULUS_MANAGER_PATH", MANAGER_BIN);
