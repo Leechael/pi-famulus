@@ -14,63 +14,92 @@ import {
   parkRuntime,
   takeParkedRuntime,
 } from "../../src/reload-handoff";
-
-const managers = vi.hoisted(() => [] as Array<{ shutdownSession: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>);
+import { hostedFakeState, resetHostedFakes, until } from "./hosted-fakes";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();
-  class FakeManagerClient {
-    shutdownSession = vi.fn(async () => []);
-    close = vi.fn(async () => {});
-    constructor() {
-      managers.push(this);
-    }
-    onEvent() {}
-    onReconnect() {}
-    async connect() { return true; }
-    async ensureAvailable() { return true; }
-    isAvailable() { return true; }
-    protocolLevel() { return 0; }
-    lastError() { return ""; }
-    async list() { return []; }
-  }
-  return { ...actual, ManagerClient: FakeManagerClient };
+  const { FakeHostedManager } = await import("./hosted-fakes");
+  return { ...actual, ManagerClient: FakeHostedManager };
 });
+
+const managers = hostedFakeState().instances;
 
 const home = mkdtempSync(join(tmpdir(), "pi-famulus-reload-"));
 process.env.PI_FAMULUS_HOME = home;
+// The daemon is fake, so the hosted child is never started; any argv will do.
+process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
-function fakePi() {
+type ExecutableTool = {
+  name: string;
+  execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    onUpdate: undefined,
+    ctx: unknown,
+  ) => Promise<unknown>;
+};
+
+function fakePi(options?: { stale?: { current: boolean } }) {
   const handlers = new Map<string, Handler[]>();
   const tools: string[] = [];
+  const toolByName = new Map<string, ExecutableTool>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
   const sent: unknown[] = [];
   const api = {
     events: { emit: () => {}, on: () => () => {} },
     on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
-    registerTool: (tool: { name: string }) => tools.push(tool.name),
+    registerTool: (tool: ExecutableTool) => {
+      tools.push(tool.name);
+      toolByName.set(tool.name, tool);
+    },
     registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
       commands.set(name, command),
     registerMessageRenderer: () => {},
-    sendMessage: (msg: unknown) => sent.push(msg),
+    sendMessage: (msg: unknown) => {
+      if (options?.stale?.current) throw new Error("stale pi instance");
+      sent.push(msg);
+    },
   };
   const emit = async (name: string, event: Record<string, unknown>, ctx: unknown = {}) => {
     for (const handler of handlers.get(name) ?? []) await handler({ type: name, ...event }, ctx);
   };
-  return { api: api as unknown as ExtensionAPI, tools, commands, sent, emit };
+  return { api: api as unknown as ExtensionAPI, tools, toolByName, commands, sent, emit };
 }
 
-function fakeCtx(sessionId = "sess-1") {
+function fakeCtx(sessionId = "sess-1", options?: { hasUI?: boolean; throwOnWidgetClear?: boolean }) {
   const notices: string[] = [];
+  let widgetMounted = false;
+  const ui = {
+    notify: (msg: string) => notices.push(msg),
+    setWidget: (_key: string, content: unknown) => {
+      if (typeof content === "function") {
+        (content as (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }) => unknown)(
+          { requestRender() {} },
+          { fg: (_color, text) => text },
+        );
+        widgetMounted = true;
+        return;
+      }
+      if (content === undefined && widgetMounted && options?.throwOnWidgetClear) {
+        options.throwOnWidgetClear = false;
+        throw new Error("fleet widget dispose failed");
+      }
+    },
+    get mounted() {
+      return widgetMounted;
+    },
+  };
   return {
     notices,
+    ui,
     ctx: {
       cwd: tmpdir(),
-      hasUI: false,
-      ui: { notify: (msg: string) => notices.push(msg) },
+      hasUI: options?.hasUI === true,
+      ui,
       isIdle: () => true,
       sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined },
       modelRegistry: null,
@@ -88,7 +117,7 @@ async function loadExtension(pi: ExtensionAPI): Promise<void> {
 
 describe("extension across /reload", () => {
   beforeEach(() => {
-    managers.length = 0;
+    resetHostedFakes();
     takeParkedRuntime(); // nothing left over from another test
   });
 
@@ -108,14 +137,14 @@ describe("extension across /reload", () => {
     await after.emit("session_start", { reason: "reload" }, fakeCtx().ctx);
 
     expect(managers).toHaveLength(1);
-    expect(managers[0].shutdownSession).not.toHaveBeenCalled();
-    expect(managers[0].close).not.toHaveBeenCalled();
+    expect(managers[0].shutdownCalls).toBe(0);
+    expect(managers[0].closeCalls).toBe(0);
     expect(after.tools).toEqual(expect.arrayContaining(["bash", "subagent", "monitor", "task_list"]));
     expect([...after.commands.keys()].sort()).toEqual(["attach", "famulus", "reply", "tasks"]);
 
     await after.emit("session_shutdown", { reason: "quit" });
-    expect(managers[0].shutdownSession).toHaveBeenCalledTimes(1);
-    expect(managers[0].close).toHaveBeenCalledTimes(1);
+    expect(managers[0].shutdownCalls).toBe(1);
+    expect(managers[0].closeCalls).toBe(1);
   });
 
   it("still ends the session's tasks on quit", async () => {
@@ -123,7 +152,7 @@ describe("extension across /reload", () => {
     await loadExtension(pi.api);
     await pi.emit("session_start", { reason: "startup" }, fakeCtx().ctx);
     await pi.emit("session_shutdown", { reason: "quit" });
-    expect(managers[0].shutdownSession).toHaveBeenCalledTimes(1);
+    expect(managers[0].shutdownCalls).toBe(1);
     expect(takeParkedRuntime()).toBeNull();
   });
 
@@ -133,10 +162,10 @@ describe("extension across /reload", () => {
     await loadExtension(pi.api);
     await pi.emit("session_start", { reason: "startup" }, fakeCtx().ctx);
     await pi.emit("session_shutdown", { reason: "reload" });
-    expect(managers[0].shutdownSession).not.toHaveBeenCalled();
+    expect(managers[0].shutdownCalls).toBe(0);
 
     await vi.advanceTimersByTimeAsync(HANDOFF_EXPIRY_MS);
-    expect(managers[0].shutdownSession).toHaveBeenCalledTimes(1);
+    expect(managers[0].shutdownCalls).toBe(1);
   });
 
   it("tears down a runtime parked by another version before starting fresh", async () => {
@@ -187,5 +216,137 @@ describe("PiBinding", () => {
     binding.discardQueued();
     binding.ready();
     expect(next.sent).toEqual([]);
+  });
+});
+
+const SHUTDOWN_REASONS = ["new", "resume", "fork"] as const;
+
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 30; i++) {
+    await Promise.resolve();
+  }
+}
+
+/**
+ * The hosted child has been spawned and prompted; returns its child id. Its
+ * session is the production HostedRpcSession, which settles when the daemon
+ * reports that the child's run settled.
+ */
+async function waitForHostedChild(): Promise<string> {
+  await until(
+    () => (managers[0]?.inputs ?? []).some((input) => input.op === "prompt"),
+    "the background subagent to be spawned and prompted",
+  );
+  return managers[0].spawns[0].childId;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Start a background subagent and a background shell, shut the session down,
+ * then deliver both results late. sendMessage throws once the pi instance is
+ * stale, which is what a replaced session does.
+ */
+async function lateWakesAfterShutdown(
+  reason: (typeof SHUTDOWN_REASONS)[number],
+  throwOnWidgetClear: boolean,
+): Promise<void> {
+  const stale = { current: false };
+  const pi = fakePi({ stale });
+  const widget = { hasUI: throwOnWidgetClear, throwOnWidgetClear };
+  const host = fakeCtx("sess-switch", widget);
+  await loadExtension(pi.api);
+  await pi.emit("session_start", { reason: "startup" }, host.ctx);
+
+  const bash = pi.toolByName.get("bash");
+  const subagent = pi.toolByName.get("subagent");
+  if (!bash || !subagent) throw new Error("bash and subagent tools were not registered");
+  await bash.execute("bash-1", { command: "echo hi", run_in_background: true }, undefined, undefined, host.ctx);
+  await subagent.execute(
+    "sub-1",
+    { async: true, tasks: [{ prompt: "inspect", name: "alpha" }] },
+    undefined,
+    undefined,
+    host.ctx,
+  );
+  const childId = await waitForHostedChild();
+  if (throwOnWidgetClear) expect(host.ui.mounted).toBe(true);
+
+  const unhandled: unknown[] = [];
+  const onUnhandled = (rejection: unknown) => {
+    unhandled.push(rejection);
+  };
+  process.on("unhandledRejection", onUnhandled);
+  const problems: string[] = [];
+  try {
+    try {
+      await pi.emit("session_shutdown", { reason });
+    } catch (error) {
+      problems.push(`session_shutdown threw: ${errorText(error)}`);
+    }
+    stale.current = true;
+    const sentBefore = pi.sent.length;
+    // Only the batching clock is fake. setImmediate stays real so a rejected
+    // floating promise is observed as unhandledRejection on the next turn.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      managers[0]?.emit({
+        event: "task_exited",
+        task_id: "sh_late",
+        exit_code: 0,
+        duration_ms: 10,
+        output_path: "/tmp/sh_late.output",
+        ts: 1,
+      });
+      managers[0]?.finish(childId, { content: [{ type: "text", text: "child finished" }], stopReason: "stop" });
+      await flushMicrotasks();
+      try {
+        await vi.advanceTimersByTimeAsync(250);
+      } catch (error) {
+        problems.push(`late shell exit threw: ${errorText(error)}`);
+      }
+      await flushMicrotasks();
+    } finally {
+      vi.useRealTimers();
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    if (pi.sent.length !== sentBefore) {
+      problems.push(`sent ${pi.sent.length - sentBefore} message(s) to pi after shutdown`);
+    }
+    if (unhandled.length > 0) {
+      problems.push(`unhandledRejection: ${unhandled.map(errorText).join("; ")}`);
+    }
+    expect(problems).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    vi.useRealTimers();
+    stale.current = false;
+    try {
+      await pi.emit("session_shutdown", { reason: "quit" });
+    } catch {
+      // A second shutdown clears child timers after the one-shot widget throw.
+    }
+  }
+}
+
+describe.each(SHUTDOWN_REASONS)("session_shutdown reason %s while background work is in flight", (reason) => {
+  beforeEach(() => {
+    resetHostedFakes();
+    takeParkedRuntime();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("drops a late subagent result and a late shell exit", async () => {
+    await lateWakesAfterShutdown(reason, false);
+  });
+
+  it.fails("still drops them when teardown throws before the notification centre is disposed", async () => {
+    await lateWakesAfterShutdown(reason, true);
   });
 });

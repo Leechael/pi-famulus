@@ -46,7 +46,9 @@ export interface ChildResult {
   /** Non-fatal caveat, e.g. agent-definition model fell back to parent model. */
   warning?: string;
   /** Set when the model itself stopped with an error (provider failure). */
-  endReason?: "model-error";
+  endReason?: "model-error" | "rate-limit";
+  /** Seconds until a rate-limited provider may be retried, when known. */
+  retryAfter?: number;
   /**
    * Total generations run (1 + resumes + stall retries). Omitted when 1.
    * Note: a user resume() also increments this; use `stalls` to count
@@ -102,6 +104,9 @@ export interface ChildSessionEvent {
   role?: string;
   /** Pi's stable tool-call id, used to pair execution start/end events. */
   toolCallId?: string;
+  toolName?: string;
+  args?: unknown;
+  isError?: boolean;
   usage?: ChildTokenUsage;
 }
 
@@ -178,6 +183,8 @@ export type CreateSessionFn = (req: ChildRunRequest) => Promise<ChildSessionAdap
 
 export interface ChildRunner {
   start(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<ChildHandle>;
+  /** Reattach a child the daemon still hosts, without sending its first prompt. */
+  attach?(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<ChildHandle>;
 }
 
 /**

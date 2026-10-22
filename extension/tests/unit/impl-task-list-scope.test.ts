@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -73,6 +73,42 @@ describe("task_list scope", () => {
     expect(text).toMatch(/ch_mine_ghost \[agent\] interrupted/);
     expect(text).not.toContain("ch_other");
     expect(text).not.toMatch(/other session/i);
+  });
+
+  it("lists a warm hosted child as running after the parent process is gone", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-famulus-scope-"));
+    dirs.push(home);
+    writeAgentChildRecord(home, record("sess-mine", "ch_hosted_live", "running"));
+    writeFileSync(join(home, "manager.pid"), JSON.stringify({ pid: process.pid }));
+    mkdirSync(join(home, "agents"), { recursive: true });
+    writeFileSync(
+      join(home, "agents", "ch_hosted_live.json"),
+      JSON.stringify({
+        child_id: "ch_hosted_live",
+        parent_session: "sess-mine",
+        residency: "warm",
+        activity: "running",
+      }),
+    );
+    const client = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      list: async () => [],
+      sessions: async () => [],
+    } as unknown as ManagerClient;
+    const clock = new ManualClock(100);
+    const tool = createTaskListTool({
+      getClient: () => client,
+      getIndex: () => new WorkIndex({ clock }),
+      home,
+      sessionId: () => "sess-mine",
+      clock,
+    });
+    const res =
+      await tool.execute("t", { all: true }, undefined as never, undefined as never, {} as never);
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toMatch(/ch_hosted_live \[agent\] running/);
+    expect(text).not.toMatch(/ch_hosted_live \[agent\] interrupted/);
   });
 
   it("describes `all` as finished work, not other sessions", () => {

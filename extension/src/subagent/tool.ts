@@ -142,6 +142,8 @@ export interface SubagentToolDeps {
   /** Selectable models for action:"models" (§4.6); absent → action errors. */
   /** Receives the watcher for turns started by agent_message send. */
   registerResumeWatch?: (watch: (childId: string) => void) => void;
+  /** Rebuild a child this session no longer holds so resume can use child_id. */
+  recoverChild?: (childId: string) => Promise<RunRecord | undefined>;
   listModels?: () => {
     provider: string;
     id: string;
@@ -228,6 +230,8 @@ function toNotificationInfo(record: RunRecord, now: number) {
       status: c.status,
       text: c.result?.text ?? "",
       error: c.result?.error,
+      ...(c.result?.endReason !== undefined ? { endReason: c.result.endReason } : {}),
+      ...(c.result?.retryAfter !== undefined ? { retryAfter: c.result.retryAfter } : {}),
       ...(c.result?.warning !== undefined ? { warning: c.result.warning } : {}),
       ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
     })),
@@ -563,11 +567,16 @@ export function createSubagentTool(
       };
     }
 
-    const record = params.run_id
+    let record = params.run_id
       ? requireRun(registry, params.run_id)
       : params.child_id
         ? resolveRunByChild(registry, params.child_id)
         : undefined;
+    if (params.child_id && !params.run_id && action === "resume" && deps.recoverChild &&
+      (!record || !registry.findChild(record.runId, params.child_id))) {
+      record =
+        await deps.recoverChild(params.child_id);
+    }
     if (!record) {
       if (params.child_id && !params.run_id) {
         throw new Error(`unknown child "${params.child_id}" (no run in this session holds it)`);

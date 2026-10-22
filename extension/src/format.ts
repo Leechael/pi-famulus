@@ -228,6 +228,8 @@ export interface SubagentChildInfo {
   status: "pending" | "running" | "completed" | "failed" | "interrupted";
   text: string;
   error?: string;
+  endReason?: "model-error" | "rate-limit";
+  retryAfter?: number;
   /** Non-fatal caveat from the child run (e.g. an adapted model spec). */
   warning?: string;
   /** Task prompt that was sent to this child. */
@@ -287,6 +289,8 @@ export function formatSubagentNotification(info: SubagentNotificationInfo): Form
       prompt: capPrompt(child.prompt ?? ""),
       result: capTail(child.text),
       ...(child.error ? { error: child.error } : {}),
+      ...(child.endReason ? { endReason: child.endReason } : {}),
+      ...(child.retryAfter !== undefined ? { retryAfter: child.retryAfter } : {}),
       ...(child.warning ? { warning: child.warning } : {}),
     })),
   });

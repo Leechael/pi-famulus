@@ -19,6 +19,7 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import { resolveAgent as resolveAgentDef } from "./agents/definition";
 import { createAgentLoader, type AgentLoader } from "./agents/loader";
 import { createBashOverride } from "./bash-override";
+import { cleanupSessionSpillFiles } from "./bounded-output";
 import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool } from "./comms/tools";
@@ -35,6 +36,8 @@ import { ChildShellTracker, createOverrunNotifier } from "./subagent/overrun";
 import {
   agentEndReason,
   headOf,
+  loadAgentChildRecords,
+  findAgentChildRecord,
   tailOf,
   updateAgentChildMetrics,
   writeAgentChildRecord,
@@ -42,8 +45,9 @@ import {
 } from "./subagent/agent-records";
 import { TranscriptWriter } from "./subagent/transcript";
 import { FleetWidget } from "./subagent/fleet-widget";
-import { WorkIndex, type WorkItem } from "./work-index";
+import { printModeDropWarning, WORK_RETAIN_MS, WorkIndex, type WorkItem } from "./work-index";
 import { fileURLToPath } from "node:url";
+import { AGENT_WORK_KINDS, type AgentWorkKind } from "./subagent/types";
 import { isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
 import { createHostedSessionFn } from "./subagent/hosted-session";
 import { isHostedChildProcess, registerChildMode } from "./child-mode";
@@ -113,7 +117,8 @@ export function readPreview(outputPath: string | undefined, maxChars: number): s
   return tail.text.length <= maxChars ? tail.text : tail.text.slice(-maxChars);
 }
 
-function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
+/** Map a manager exit event to the background-wake status. Exported for tests. */
+export function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
   // The manager died without shutting down; its runner took the task down.
   if (event.end_reason === "manager-crash") return "orphaned";
   if (event.signal) return "killed";
@@ -219,6 +224,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
    */
   const notifyOnExit = new Set<string>();
+  /** Sessions that already received the crash-recovery notice. */
+  const recoveredSessions = new Set<string>();
   const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
   const workIndex = new WorkIndex({ clock });
   const patchExited = (taskId: string, event: ManagerEvent): void => {
@@ -289,6 +296,136 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     return out;
   };
   /**
+   * Parent-owned shells this process did not start (the previous pi died
+   * while the daemon stayed up). Running ones join the index and get an
+   * exit wake; recent finished ones are delivered the same way.
+   * manager-shutdown / manager-crash leftovers stay for the crash notice.
+   */
+  const adoptParentShells = (tasks: TaskRecord[]): void => {
+    const sid = ctx?.sessionManager.getSessionId() ?? "";
+    const now = clock.now();
+    for (const task of tasks) {
+      if (task.kind !== "shell") continue;
+      if (task.origin?.via === "child-bash") continue;
+      if (sid && task.session_id && task.session_id !== sid) continue;
+      if (workIndex.get(task.task_id) || taskMeta.has(task.task_id)) continue;
+      const startedAt = task.started_at ?? now;
+      taskMeta.set(task.task_id, {
+        kind: "shell",
+        command: task.command ?? "",
+        cwd: task.cwd,
+        startedAt,
+      });
+      if (task.status === "running") {
+        upsertBackgroundTask(task.task_id, startedAt);
+        markNotifyOnExit(task.task_id);
+        continue;
+      }
+      if (task.end_reason === "manager-shutdown" || task.end_reason === "manager-crash") continue;
+      if (task.ended_at != null && now - task.ended_at > WORK_RETAIN_MS) continue;
+      if (task.status !== "completed" && task.status !== "failed" && task.status !== "killed") continue;
+      upsertBackgroundTask(task.task_id, startedAt);
+      deliverExit(task.task_id, exitEventFromRecord(task));
+    }
+  };
+  /**
+   * A running disk record whose hosted process is gone: interrupt the live
+   * handle when this process still holds it (daemon crash), otherwise
+   * write the record. Warm children stay for resume.
+   */
+  const settleDeadHostedChildren = async (
+    sessionId: string,
+    opts: { interruptLive?: boolean } = {},
+  ): Promise<AgentChildRecord[]> => {
+    const manager = client;
+    const registry = subagentRegistry;
+    const center = notifyCenter;
+    const stale = loadAgentChildRecords(home, { sessionId, includeTerminal: false });
+    const lost: AgentChildRecord[] = [];
+    for (const rec of stale) {
+      if (rec.status !== "running" && rec.status !== "pending") continue;
+      const handle = registry?.handle(rec.child_id);
+      // A local admission queue has no hosted process to look up yet.
+      if (handle?.status() === "pending") continue;
+      let live = false;
+      if (manager?.isAvailable() && manager.protocolLevel() >= 6) {
+        const found =
+          await manager.hostedLookup({ sessionId: rec.child_id }).catch(() => null);
+        if (client !== manager || subagentRegistry !== registry || notifyCenter !== center) return [];
+        live = Boolean(found && (found.residency === "warm" || found.activity === "running" || found.activity === "starting"));
+      }
+      if (live) continue;
+      if (handle && (handle.status() === "running" || handle.status() === "pending")) {
+        if (!opts.interruptLive) continue;
+        await handle.interrupt().catch(() => {});
+        if (client !== manager || subagentRegistry !== registry || notifyCenter !== center) return [];
+      } else {
+        writeAgentChildRecord(home, {
+          ...rec,
+          status: "interrupted",
+          ended_at: rec.ended_at ?? clock.now(),
+          end_reason: "interrupted",
+          error: rec.error ?? "parent session ended",
+        });
+      }
+      lost.push(rec);
+    }
+    return lost;
+  };
+  /**
+   * The previous process died. Settle stale running agent records (the child
+   * is gone) and tell the model about that work and about commands the
+   * daemon already ended as manager-shutdown / manager-crash.
+   * A hosted child that is still warm is left for resume.
+   */
+  const recoverCrashedSession = async (sessionId: string): Promise<void> => {
+    if (!sessionId || recoveredSessions.has(sessionId)) return;
+    const manager = client;
+    const center = notifyCenter;
+    recoveredSessions.add(sessionId);
+    const interrupted =
+      await settleDeadHostedChildren(sessionId);
+    if (client !== manager || notifyCenter !== center) return;
+    let killed: TaskRecord[] = [];
+    if (manager?.isAvailable()) {
+      try {
+        const tasks = await manager.list(true);
+        if (client !== manager || notifyCenter !== center) return;
+        killed = tasks.filter((task) => {
+          if (task.session_id && task.session_id !== sessionId) return false;
+          if (task.kind !== "shell") return false;
+          return task.end_reason === "manager-shutdown" || task.end_reason === "manager-crash";
+        });
+      } catch {
+        killed = [];
+      }
+    }
+    if (interrupted.length === 0 && killed.length === 0) {
+      recoveredSessions.delete(sessionId);
+      return;
+    }
+    const lines = [
+      "System wake — not a new user message.",
+      "",
+      "This session was reopened after the previous process ended.",
+    ];
+    for (const rec of interrupted) {
+      lines.push(`Interrupted subagent ${rec.child_id} (${rec.name}).`);
+    }
+    for (const task of killed) {
+      lines.push(`Command ${task.task_id} ended while the session was gone (${task.end_reason ?? task.status}).`);
+    }
+    center?.notify({
+      customType: "pi-famulus-wake",
+      content: lines.join("\n"),
+      details: {
+        kind: "session-recovery",
+        children: interrupted.map((rec) => rec.child_id),
+        tasks: killed.map((task) => task.task_id),
+      },
+    });
+  };
+  /**
    * Settle everything the manager reports as ended that we still show live:
    * monitors in the registry and shell/monitor rows in the index. Runs when
    * the user or model looks (task_list, /tasks), after task_stop, after a
@@ -299,6 +436,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    */
   const syncWithManager = async (): Promise<void> => {
     const c = client;
+    const center = notifyCenter;
     let tasks: TaskRecord[];
     if (c && c.isAvailable()) {
       try {
@@ -313,7 +451,9 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       if (!disk) return;
       tasks = disk;
     }
+    if (client !== c || notifyCenter !== center) return;
     monitorRegistry?.reconcile(tasks);
+    adoptParentShells(tasks);
     for (const task of workIndex.staleLive(tasks)) {
       const event = exitEventFromRecord(task);
       // Route through the gate: if the real task_exited is processed after
@@ -533,6 +673,40 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         if (!loader) return resolveAgentDef([], name); // builtins-only fallback
         return resolveAgentDef(loader.reload().definitions, name);
       },
+      recoverChild: async (childId) => {
+        const registry = subagentRegistry;
+        if (!registry) return undefined;
+        const rec = findAgentChildRecord(home, childId);
+        if (!rec) return undefined;
+        if (registry.handle(rec.child_id)) {
+          return registry.get(rec.run_id);
+        }
+        const workKind = AGENT_WORK_KINDS.includes(rec.work_kind as AgentWorkKind)
+          ? rec.work_kind as AgentWorkKind
+          : undefined;
+        const loader = agentLoader;
+        const agent = resolveAgentDef(loader ? loader.reload().definitions : [], rec.agent);
+        registry.adoptExisting({
+          runId: rec.run_id,
+          childId: rec.child_id,
+          name: rec.name,
+          agent: rec.agent,
+          workKind,
+          startedAt: rec.started_at,
+          prompt: rec.prompt_head,
+        });
+        await registry.attachChild({
+          childId: rec.child_id,
+          runId: rec.run_id,
+          name: rec.name,
+          prompt: rec.prompt_head ?? "",
+          agent,
+          timeoutMs: subagentConfig.timeoutMs,
+          depth: 1,
+          ...(workKind ? { workKind } : {}),
+        });
+        return registry.get(rec.run_id);
+      },
       listModels: () => {
         const current = ctx?.model;
         return modelCandidates({
@@ -618,7 +792,13 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     // still carry <shell>.
     const childShells = new ChildShellTracker();
     const parentSessionId = startCtx.sessionManager.getSessionId();
+    // Bind this session's notify centre and client. After /new /resume /fork
+    // the outer `notifyCenter` is replaced; late events on the old client
+    // must not follow that rebinding.
+    const sessionNotify = notifyCenter;
+    const sessionClient = client;
     client.onEvent((event) => {
+      if (client !== sessionClient) return;
       const hosted = event as ManagerEvent & {
         child_id?: string;
         reason?: string;
@@ -628,6 +808,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         residency?: string;
         driver?: string;
         last_text?: string;
+        request?: { type?: string; id?: string; method?: string; title?: string; message?: string };
       };
       if (hosted.event === "agent_comms" && hosted.child_id && hosted.request_id) {
         const reason = hosted.reason === "need_decision" ? "need_decision" : "progress_update";
@@ -636,8 +817,31 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         }).catch(() => {});
         return;
       }
+      if (hosted.event === "agent_ui" && hosted.child_id) {
+        const request = hosted.request ?? {};
+        const method = request.method;
+        if (method !== "select" && method !== "confirm" && method !== "input" && method !== "editor") return;
+        const title = typeof request.title === "string" ? request.title : "";
+        const body = typeof request.message === "string" ? request.message : "";
+        sessionNotify?.notify({
+          customType: "pi-famulus-wake",
+          content:
+            `System wake — not a new user message.\n\n` +
+            `Subagent ${hosted.child_id} is waiting for a ${method}` +
+            (title ? `: ${title}` : ".") +
+            (body ? `\n${body}` : ""),
+          details: {
+            kind: "supervisor-request",
+            from: hosted.child_id,
+            method,
+            ...(title ? { title } : {}),
+            ...(body ? { message: body } : {}),
+          },
+        });
+        return;
+      }
       if (hosted.event === "agent_detach" && hosted.child_id) {
-        notifyCenter?.notify({
+        sessionNotify?.notify({
           customType: "pi-famulus-wake",
           content: `System wake — not a new user message.\n\nThe user talked to ${hosted.name ?? hosted.child_id} directly.\n${hosted.last_text ?? ""}`,
           details: { kind: "supervisor-update", from: hosted.child_id, name: hosted.name ?? hosted.child_id, message: hosted.last_text ?? "" },
@@ -703,20 +907,39 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       }
     });
     client.onReconnect(() => {
+      if (client !== sessionClient) return;
       // A daemon restart may drop permits; a same-session rebind may retain
       // them. Keep each kind for idempotent re-registration and mark all local
       // leases pending until the daemon confirms them.
       for (const childId of globalAgentLeases.keys()) pendingAgentLeases.add(childId);
-      void monitorRegistry?.rewatchAll().then(() => syncWithManager());
+      void monitorRegistry?.rewatchAll().then(() => {
+        if (client === sessionClient) return syncWithManager();
+      });
       void (async () => {
-        const manager = client;
-        if (!manager || manager.protocolLevel() < 4) {
+        const manager = sessionClient;
+        if (manager.protocolLevel() < 4) {
           capacityNotice("daemon too old");
           return;
         }
         // The registry and its child ids survive socket reconnects in this
         // extension process; held ids include resumable interrupted children.
         await reconcileAgentLeases(manager);
+        if (client !== manager) return;
+        const sid = parentSessionId;
+        const lost =
+          await settleDeadHostedChildren(sid, { interruptLive: true });
+        if (lost.length > 0) {
+          sessionNotify?.notify({
+            customType: "pi-famulus-wake",
+            content: [
+              "System wake — not a new user message.",
+              "",
+              "The daemon restarted. Hosted children that were running are gone.",
+              ...lost.map((rec) => `Interrupted subagent ${rec.child_id} (${rec.name}).`),
+            ].join("\n"),
+            details: { kind: "session-recovery", children: lost.map((rec) => rec.child_id) },
+          });
+        }
       })().catch(() => {});
     });
 
@@ -811,6 +1034,23 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         // One event per stall detection: an auto-resume follows unless the
         // retry budget (stallRetries) is already spent.
         logEvent("agent.stall", { child_id: childId, attempt });
+        notifyCenter?.notify({
+          customType: "pi-famulus-wake",
+          content:
+            `System wake — not a new user message.\n\n` +
+            `Subagent ${childId} stalled with no activity (attempt ${attempt}); retrying.`,
+          details: { kind: "subagent-stall", child_id: childId, attempt },
+        });
+      },
+      onToolLoop: (childId, toolName, args) => {
+        const argText = args && typeof args === "object" ? JSON.stringify(args) : String(args ?? "");
+        notifyCenter?.notify({
+          customType: "pi-famulus-wake",
+          content:
+            `System wake — not a new user message.\n\n` +
+            `Subagent ${childId} called ${toolName} three times in a row with the same arguments${argText ? `: ${argText}` : "."}`,
+          details: { kind: "subagent-loop", child_id: childId, tool: toolName, args },
+        });
       },
       // Soft deadline: the child keeps running; the parent decides.
       onOverrun: createOverrunNotifier({
@@ -898,6 +1138,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         };
         const endReason = agentEndReason(c.status, c.result);
         if (endReason) rec.end_reason = endReason;
+        if (c.result?.retryAfter !== undefined) rec.retry_after = c.result.retryAfter;
         const transcript = syncTranscript(c.childId);
         if (transcript) {
           rec.transcript = transcript;
@@ -927,12 +1168,16 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       }
     });
     startFleetWidget(startCtx);
+    if (client?.isAvailable()) {
+      await recoverCrashedSession(startCtx.sessionManager.getSessionId());
+    }
 
     // Connect in the background: a cold manager spawn must not stall the
     // first prompt. The cache install, if one is running, finishes first so a
     // missing optional package is not reported before it can be restored.
     // Tools call ensureAvailable() lazily before use.
-    const c = client;
+    if (client !== sessionClient) return;
+    const c = sessionClient;
     void nativeRestore
       .then((path) => {
         if (client !== c || !c) return null;
@@ -946,6 +1191,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
           const file = startCtx.sessionManager.getSessionFile?.();
           const sid = startCtx.sessionManager.getSessionId();
           void promptIfHostedSession(c, () => ctx, { sessionFile: file, sessionId: sid }, "start").catch(() => {});
+          void syncWithManager();
+          void recoverCrashedSession(sid);
           return;
         }
         // A /reload may have replaced startCtx by now; report to the live one.
@@ -975,6 +1222,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     agentLoader = null;
     monitorRegistry?.disposeAll();
     notifyCenter?.dispose();
+    recoveredSessions.clear();
+    cleanupSessionSpillFiles();
     const current = client;
     client = null;
     if (current) {
@@ -1009,6 +1258,14 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       binding.detach();
       parkRuntime({ version: EXTENSION_VERSION, runtime, dispose: teardown });
       return;
+    }
+    if (String((ctx as { mode?: string } | null)?.mode) === "print") {
+      const ids = [
+        ...workIndex.list().filter((item) => item.status === "running" || item.status === "pending").map((item) => item.id),
+        ...(subagentRegistry?.activeChildren() ?? []).map((child) => child.childId),
+      ];
+      const warning = printModeDropWarning([...new Set(ids)]);
+      if (warning) process.stderr.write(warning);
     }
     await teardown();
   });

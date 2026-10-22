@@ -10,7 +10,7 @@ pi (`@earendil-works/pi-coding-agent`) deliberately leaves subagents, background
 1. **subagents** — Multiple parallel or sequential executions; synchronous waiting with a foreground budget, automatically switching to asynchronous execution when the budget expires
 2. **monitoring** — Create monitoring tasks (command-line event streams), with events actively injected
 3. **bash auto-backgrounding** — Automatically move commands to the background when the foreground budget expires, avoiding stuck waits and actively notifying on completion
-4. **agent communication and collaboration** — ask/reply/send between parent and child subagents (in-process mailbox)
+4. **agent communication and collaboration** — ask/reply/send between parent and hosted child subagents (mailbox in the parent extension)
 
 ### Confirmed decisions
 
@@ -40,7 +40,7 @@ pi instance B (session b) ──┼── conventional-path socket ──► pi-
 pi instance C (session c) ──┘                                ├─ process engine: spawn/wait/stop/output
                                                             ├─ hosted agents: residency, retention, RPC relay
                                                             ├─ session_id namespaces
-    pi extension (TS, in-process)                           ├─ dual output writes (bounded memory + full disk log)
+    pi extension (TS, in the parent)                        ├─ dual output writes (bounded memory + full disk log)
     ├─ bash override ────► manager client ──────────────────┤─ event push (task_started/exited/output)
     ├─ monitor tool ────► start + watch output stream        └─ lifecycle: no sessions and no warm child → exit
     ├─ task_list/output/stop
@@ -419,7 +419,7 @@ execute:
 
 ### 4.3 task_* tools (`src/task-tools.ts`)
 
-- `task_list({all?})` → manager list **merged** with in-process subagent children (extension registry + `sessions/<sid>/agents/*.json`); `pi-famulus ls` reads those persisted records too
+- `task_list({all?})` → manager list **merged** with hosted subagent children (extension registry + `sessions/<sid>/agents/*.json`); `pi-famulus ls` reads those persisted records too
 - `task_output({task_id, cursor?, max_bytes?})` → manager output; return tail + file pointer
 - `task_stop({task_id})` → manager stop
 
@@ -459,6 +459,7 @@ notify({ customType, content, details }): void
 
 - 200ms batching window: merge multiple task_exited events into **one** `<pi-famulus-wake kind="task">`, containing multiple `<task>` elements
 - Deduplication: send the same event for the same task only once
+- Busy delivery queues a steer in the host. `triggerTurn:true` also queues while the host is streaming; it cannot interrupt or recover a hung stream. NotifyCenter does not infer a hang from elapsed busy time or resend queued wakes. Genuine hung-stream recovery belongs to the host.
 - All asynchronous injections share one `customType`: `pi-famulus-wake`. The former per-kind notification types are no longer emitted or registered. Their renderers were removed; older transcripts use pi's default custom-message rendering.
 - The lead-in is just one sentence, exported as `FAMULUS_WAKE_LEAD_IN`:
 

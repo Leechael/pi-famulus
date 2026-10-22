@@ -66,10 +66,10 @@ export function createHostedSessionFn(deps: HostedSessionDeps): CreateSessionFn 
       "--thinking", String(thinking),
       "--append-system-prompt", promptFile,
       ...(trustInherited ? [] : [deps.getProjectTrusted?.() ? "-a" : "-na"]),
-      ...(req.agent.tools ? ["--tools", req.agent.tools.join(",")] : []),
+      ...(req.agent.tools ? ["--tools", hostedChildTools(req.agent.tools).join(",")] : []),
     ];
     const env = { ...process.env } as Record<string, string>;
-    if (req.agent.tools) env.PI_FAMULUS_CHILD_TOOLS = req.agent.tools.join(",");
+    if (req.agent.tools) env.PI_FAMULUS_CHILD_TOOLS = hostedChildTools(req.agent.tools).join(",");
     env.PI_FAMULUS_CHILD_RUN = req.runId;
     env.PI_FAMULUS_CHILD_NAME = req.name;
     const spawned = await client.agentSpawn({
@@ -80,14 +80,7 @@ export function createHostedSessionFn(deps: HostedSessionDeps): CreateSessionFn 
       cwd,
       env,
     });
-    let warning = model.warning;
-    try {
-      await client.agentInput(req.childId, "set_steering_mode", "all", "parent");
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const note = `Steering mode was not set (${message}); queued input may wait until the current turn ends.`;
-      warning = warning ? `${warning} ${note}` : note;
-    }
+    const warning = model.warning;
     await client.agentWatch(req.childId);
     const session = new HostedRpcSession(client, req.childId, {
       warning,
@@ -108,6 +101,7 @@ class HostedRpcSession implements ChildSessionAdapter {
   private readonly unsubscribe: () => void;
   private streaming = false;
   private lastText = "";
+  private lastFailure: { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   private turns: { role: string; text: string }[] = [];
   private usage: ChildTokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   private settle: (() => void) | null = null;
@@ -172,6 +166,10 @@ class HostedRpcSession implements ChildSessionAdapter {
     return this.lastText || undefined;
   }
 
+  getLastAssistantFailure(): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined {
+    return this.lastFailure;
+  }
+
   getConversation() {
     return this.turns.map((turn) => ({ ...turn }));
   }
@@ -216,6 +214,9 @@ class HostedRpcSession implements ChildSessionAdapter {
       };
       if (event.activity === "running") this.streaming = true;
       if (event.activity === "idle" || event.activity === "failed") {
+        if (event.activity === "failed" && !this.lastFailure) {
+          this.lastFailure = { stopReason: "error", errorMessage: "hosted child process failed" };
+        }
         this.streaming = false;
         this.settle?.();
         this.settle = null;
@@ -223,7 +224,20 @@ class HostedRpcSession implements ChildSessionAdapter {
       return;
     }
     if (event.event !== "agent_rpc" || !event.record || typeof event.record !== "object") return;
-    const record = event.record as { type?: string; message?: { role?: string; content?: { type?: string; text?: string }[]; usage?: Record<string, unknown> }; toolCallId?: string };
+    const record = event.record as {
+      type?: string;
+      message?: {
+        role?: string;
+        content?: { type?: string; text?: string }[];
+        usage?: Record<string, unknown>;
+        stopReason?: string;
+        errorMessage?: string;
+      };
+      toolCallId?: string;
+      toolName?: string;
+      args?: unknown;
+      isError?: boolean;
+    };
     const type = record.type ?? "";
     if (type === "agent_start") this.streaming = true;
     if (type === "agent_settled") {
@@ -237,6 +251,18 @@ class HostedRpcSession implements ChildSessionAdapter {
         this.lastText = text;
         this.turns.push({ role: "assistant", text });
       }
+      const stopReason = record.message.stopReason;
+      if (stopReason === "error" || stopReason === "aborted") {
+        this.lastFailure = {
+          stopReason,
+          ...(record.message.errorMessage ? { errorMessage: record.message.errorMessage } : {}),
+        };
+        if (record.message.errorMessage) {
+          this.turns.push({ role: "assistant error", text: record.message.errorMessage });
+        }
+      } else {
+        this.lastFailure = undefined;
+      }
       const usage = record.message.usage;
       if (usage) {
         this.usage.input += num(usage.input);
@@ -249,10 +275,21 @@ class HostedRpcSession implements ChildSessionAdapter {
       const text = (record.message.content ?? []).map((part) => part.text ?? "").join("");
       if (text) this.turns.push({ role: "user", text });
     }
+    if (type === "tool_execution_end") {
+      const name = record.toolName ?? "tool";
+      const text = record.args === undefined ? name : `${name} ${JSON.stringify(record.args)}`;
+      this.turns.push({
+        role: record.isError ? `tool ${name} error` : `tool ${name}`,
+        text,
+      });
+    }
     const adapted: ChildSessionEvent = {
       type,
       ...(record.message?.role ? { role: record.message.role } : {}),
       ...(record.toolCallId ? { toolCallId: record.toolCallId } : {}),
+      ...(record.toolName ? { toolName: record.toolName } : {}),
+      ...(record.args !== undefined ? { args: record.args } : {}),
+      ...(record.isError !== undefined ? { isError: record.isError } : {}),
     };
     for (const listener of this.listeners) listener(adapted);
   }
@@ -260,6 +297,15 @@ class HostedRpcSession implements ChildSessionAdapter {
 
 function num(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+const SUPERVISOR_TOOLS = ["contact_supervisor", "agent_message"];
+
+/** Agent allowlists still keep the two supervisor tools. */
+export function hostedChildTools(tools: string[]): string[] {
+  const kept = new Set(tools);
+  for (const name of SUPERVISOR_TOOLS) kept.add(name);
+  return [...kept];
 }
 
 /** Request id for a child→parent decision. */

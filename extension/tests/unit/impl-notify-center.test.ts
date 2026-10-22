@@ -1,3 +1,4 @@
+import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatMonitorEvent } from "../../src/format";
@@ -236,6 +237,35 @@ describe("NotifyCenter monitor batching", () => {
     expect(events).toContainEqual({ type: "wake.dedupe", fields: { id: "sh_1" } });
     expect(events).toContainEqual({ type: "wake.emit", fields: { kind: "task", ids: ["sh_1"], batch: false } });
     expect(events).toContainEqual({ type: "wake.deliver", fields: { kind: "task", mode: "steer" } });
+    center.dispose();
+  });
+
+  it("queues one wake without inventing a hang during a long healthy host run", async () => {
+    const queued: { content: unknown; details?: unknown }[] = [];
+    // Exercise the installed host implementation, not a spy that assumes
+    // triggerTurn can interrupt streaming. Both options enqueue agent.steer.
+    const host = {
+      isStreaming: true,
+      agent: { steer: (message: typeof queued[number]) => queued.push(message) },
+    } as unknown as AgentSession;
+    const clock = new ManualClock();
+    const center = new NotifyCenter({
+      sendMessage: (message, options) => { void AgentSession.prototype.sendCustomMessage.call(host, message, options); },
+      isIdle: () => !host.isStreaming,
+      clock,
+    });
+    center.notify({
+      customType: "pi-famulus-wake",
+      content: "child finished",
+      details: { kind: "subagent-done", runId: "run_1" },
+    });
+    expect(queued).toHaveLength(1);
+    // A healthy multi-tool run can remain busy well beyond 45 seconds.
+    clock.advanceBy(90_000);
+    expect(queued.map((message) => message.details)).toEqual([
+      expect.objectContaining({ kind: "subagent-done", runId: "run_1" }),
+    ]);
+    expect(queued[0].content).not.toMatch(/produced no tokens/);
     center.dispose();
   });
 

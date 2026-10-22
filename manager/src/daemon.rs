@@ -97,6 +97,8 @@ pub struct SessionEntry {
     pub protocol: Option<u32>,
     pub connected_at: u64,
     pub last_seen: u64,
+    /// Set by shutdown_session so a later socket close is not a crash.
+    pub ended_clean: bool,
 }
 
 pub struct PendingAgent {
@@ -408,6 +410,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
                 protocol: s.protocol,
                 connected_at: s.connected_at,
                 last_seen: s.last_seen,
+                ended_clean: false,
             },
         );
     }
@@ -1199,6 +1202,7 @@ fn register_conn(
                 protocol: info.protocol,
                 connected_at,
                 last_seen: now,
+                ended_clean: false,
             },
         );
     }
@@ -1250,12 +1254,14 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
                         st.undelivered_agent_grants
                             .retain(|(owner, _), _| owner != sid);
                     }
+                    let reason = disconnect_reason(why, s);
+                    s.ended_clean = false;
                     crate::events::emit(
                         &home,
                         Some(sid),
                         "session.disconnect",
                         None,
-                        serde_json::json!({ "reason": why }),
+                        serde_json::json!({ "reason": reason }),
                     );
                 }
             }
@@ -1582,6 +1588,12 @@ fn start_agent_loops(state: &Shared) {
                 wake
                 };
                 send_agent_grants(&state, wake);
+                if matches!(
+                    &notice.event,
+                    EventKind::AgentState { activity, .. } if activity == "failed"
+                ) {
+                    stop_child_bash_of(&state, &notice.child_id);
+                }
             }
         });
     }
@@ -2372,6 +2384,44 @@ fn handle_stop(
     Ok(UnitOk {})
 }
 
+/// A hosted child died. Stop the foreground shells it started so they do
+/// not keep running with nobody reading their output.
+fn stop_child_bash_of(state: &Shared, child_id: &str) {
+    let victims: Vec<(String, u32, String)> = {
+        let mut st = state.lock().unwrap();
+        let mut victims = Vec::new();
+        for e in st.registry.tasks.values_mut() {
+            let ours = e.record.origin.as_ref().is_some_and(|origin| {
+                origin.via == "child-bash" && origin.child_id.as_deref() == Some(child_id)
+            });
+            if !ours || !e.owns_live_group() {
+                continue;
+            }
+            if e.record.status == TaskStatus::Running {
+                e.request_kill("stopped:tool");
+            }
+            victims.push((
+                e.record.task_id.clone(),
+                e.record.pid,
+                e.record.session_id.clone(),
+            ));
+        }
+        victims
+    };
+    for (task_id, pid, sid) in victims {
+        let home = state.lock().unwrap().home.clone();
+        crate::events::emit(
+            &home,
+            Some(&sid),
+            "task.stop",
+            Some(&task_id),
+            serde_json::json!({ "reason": "tool", "child_id": child_id }),
+        );
+        let _ = task::signal_group(pid, task::SIGTERM);
+        spawn_kill_reaper(state, &task_id, pid);
+    }
+}
+
 /// Observability: record that the extension moved a task to the background.
 /// Idempotent (the first time is kept); a no-op on a finished task.
 fn handle_mark_background(
@@ -2672,6 +2722,19 @@ fn queue_output_replay(
     }
 }
 
+fn disconnect_reason(why: &str, session: &SessionEntry) -> String {
+    if why != "closed" {
+        return why.to_string();
+    }
+    if session.ended_clean {
+        return "shutdown".into();
+    }
+    if session.pi_pid != 0 && !crate::sys::pid_alive(session.pi_pid) {
+        return "crash".into();
+    }
+    "closed".into()
+}
+
 fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessionOk, ProtoError> {
     let (victims, home, sid) = {
         let mut st = state.lock().unwrap();
@@ -2699,6 +2762,9 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
                 }
                 v.push((e.record.task_id.clone(), e.record.pid, running));
             }
+        }
+        if let Some(session) = st.sessions.get_mut(&sid) {
+            session.ended_clean = true;
         }
         (v, st.home.clone(), sid)
     };

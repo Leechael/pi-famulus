@@ -637,6 +637,8 @@ export class ManagerClient {
   async close(): Promise<void> {
     this.intentionalClose = true;
     this.state = "disconnected";
+    this.eventHandlers.clear();
+    this.reconnectHandlers.clear();
     this.failAllPending(new Error("manager client closed"));
     const socket = this.socket;
     this.socket = null;

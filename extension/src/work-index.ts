@@ -11,6 +11,12 @@ export type WorkKind = "shell" | "monitor" | "agent";
 export const WORK_RETAIN_MS = 10 * 60 * 1000;
 export const WORK_FINISHED_CAP = 50;
 
+/** stderr line when print mode drops live work and still exits 0. */
+export function printModeDropWarning(ids: string[]): string | null {
+  if (ids.length === 0) return null;
+  return `pi-famulus: print mode is ending; stopping ${ids.length} background item(s) (${ids.join(", ")}). The process still exits 0.\n`;
+}
+
 export interface WorkItem {
   id: string;
   kind: WorkKind;

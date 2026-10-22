@@ -311,4 +311,5 @@ export class NotifyCenter {
     }
     onDelivered?.(sourcePreview ?? (details?.kind === "monitor" ? (message.details as { event?: string }).event : undefined));
   }
+
 }

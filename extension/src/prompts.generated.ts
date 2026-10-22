@@ -49,7 +49,7 @@ export const PROMPTS = {
   "tools.subagent.rules": ["When a <pi-famulus-wake kind=\"subagent-handover\"> arrives, read <prompt> and <result> immediately and continue: subagent({action:\"resume\", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.","Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.","A failed subagent does not fail the whole run; inspect per-subagent sections in the result.","<pi-famulus-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run."],
   "tools.subagent.param.tasks": "Start new subagents in parallel. Use only when action is omitted. For any action call, omit tasks entirely; do not supply placeholder tasks.",
   "tools.subagent.param.tasks.agent": "Agent definition name (default: worker)",
-  "tools.subagent.param.tasks.prompt": "Task prompt for this subagent",
+  "tools.subagent.param.tasks.prompt": "Task prompt for this subagent. The child is a new process: it cannot see this conversation, so the prompt must be self-contained.",
   "tools.subagent.param.tasks.name": "Display name (default: agent name + ordinal)",
   "tools.subagent.param.work_kind": "Explicit planned workload class for machine-wide admission (default: other)",
   "tools.subagent.param.chain": "Start a new sequential chain (always awaited). Use only when action is omitted. For any action call, omit chain entirely.",

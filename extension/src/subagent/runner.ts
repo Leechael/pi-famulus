@@ -87,6 +87,8 @@ export interface InProcessRunnerOptions {
   stallRetryDelayMs?: number;
   /** Called on every stall detection (before any retry), with the 1-based attempt. */
   onStall?: (childId: string, attempt: number) => void;
+  /** Same tool name and arguments three times in a row. */
+  onToolLoop?: (childId: string, toolName: string, args: unknown) => void;
   /** Overrun reminder interval (ms). Default 10 minutes. */
   overrunRepeatMs?: number;
   /** Abort ceiling per user turn (ms). 0/absent = off: the soft deadline never aborts. */
@@ -116,6 +118,20 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** 429 / rate-limit text is recorded separately from other model errors. */
+export function classifyModelFailure(message: string): {
+  endReason: "model-error" | "rate-limit";
+  retryAfter?: number;
+} {
+  const rateLimited = /\b429\b|rate[\s-]?limit|too many requests/i.test(message);
+  if (!rateLimited) return { endReason: "model-error" };
+  const retry = /retry[\s-]?after[:\s]+(\d+)/i.exec(message);
+  return {
+    endReason: "rate-limit",
+    ...(retry ? { retryAfter: Number(retry[1]) } : {}),
+  };
+}
+
 export class InProcessRunner implements ChildRunner {
   private readonly opts: InProcessRunnerOptions;
 
@@ -129,6 +145,13 @@ export class InProcessRunner implements ChildRunner {
     await handle.launch();
     return handle;
   }
+
+  async attach(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<DisposableChildHandle> {
+    const handle = new InProcessChildHandle(req, this.opts);
+    onHandle?.(handle);
+    await handle.attachIdle();
+    return handle;
+  }
 }
 
 class InProcessChildHandle implements DisposableChildHandle {
@@ -138,6 +161,9 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly stallRetries: number;
   private readonly stallRetryDelayMs: number;
   private readonly onStall?: (childId: string, attempt: number) => void;
+  private readonly onToolLoop?: (childId: string, toolName: string, args: unknown) => void;
+  private lastToolKey: string | null = null;
+  private lastToolCount = 0;
   private readonly overrunRepeatMs: number;
   private readonly hardTimeoutMs: number;
   private readonly onOverrun?: (tick: OverrunTick) => void;
@@ -233,6 +259,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       ? Math.max(0, Math.floor(rawDelay))
       : DEFAULT_STALL_RETRY_DELAY_MS;
     this.onStall = opts.onStall;
+    this.onToolLoop = opts.onToolLoop;
     const rawRepeat = opts.overrunRepeatMs ?? DEFAULT_OVERRUN_REPEAT_MS;
     this.overrunRepeatMs =
       Number.isFinite(rawRepeat) && rawRepeat > 0
@@ -329,6 +356,27 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** Launch generation 1. Resolves once the prompt is issued (not completed). */
   async launch(): Promise<void> {
     await this.beginGeneration(this.req.prompt, true);
+  }
+
+  /**
+   * Bind an already-hosted session so resume() can send the next turn.
+   * The previous parent died; this generation is interrupted, not prompted.
+   */
+  async attachIdle(): Promise<void> {
+    this.sessionCreation = this.createSession(this.req);
+    const created =
+      await this.sessionCreation;
+    this.sessionCreation = null;
+    if (this.disposed) return;
+    this.session = created;
+    this.resolvedModel_ = created.resolvedModel;
+    this.unsubscribe = this.session.subscribe((event) => this.handleSessionEvent(event));
+    this.settle(this.generation, {
+      status: "interrupted",
+      text: this.session.getLastAssistantText() ?? "",
+      error: "parent session ended",
+      durationMs: 0,
+    });
   }
 
   async steer(message: string): Promise<void> {
@@ -480,11 +528,10 @@ class InProcessChildHandle implements DisposableChildHandle {
       text: this.status_ === "pending" ? "" : this.partialText(),
       durationMs: this.now() - this.startedAt,
     });
-    try {
-      await this.session?.abort();
-    } catch {
-      // abort is best-effort; the result is already settled
-    }
+    // Resume may be accepted as soon as the interrupted result is visible.
+    // Drain this abort just like a timeout/stall abort before prompting again.
+    this.abortPromise = this.session ? this.session.abort().catch(() => {}) : null;
+    await this.abortPromise;
   }
 
   dispose(): void | Promise<void> {
@@ -690,11 +737,14 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (!this.isCurrent(gen)) return;
     const failure = session?.getLastAssistantFailure?.();
     if (failure) {
+      const error = failure.errorMessage?.trim() || `Model stopped with ${failure.stopReason}`;
+      const classified = classifyModelFailure(error);
       this.settle(gen, {
         status: "failed",
         text: this.partialText(),
-        error: failure.errorMessage?.trim() || `Model stopped with ${failure.stopReason}`,
-        endReason: "model-error",
+        error,
+        endReason: classified.endReason,
+        ...(classified.retryAfter !== undefined ? { retryAfter: classified.retryAfter } : {}),
         durationMs: this.now() - this.startedAt,
       });
       return;
@@ -871,7 +921,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.toolStartedAt = null;
   }
 
-  private handleSessionEvent(event: { type: string; role?: string; toolCallId?: string; usage?: { input: number; output: number } }): void {
+  private handleSessionEvent(event: { type: string; role?: string; toolCallId?: string; toolName?: string; args?: unknown; usage?: { input: number; output: number } }): void {
     const now = this.now();
     const active = this.status_ === "running";
     let currentToolEvent = false;
@@ -915,6 +965,7 @@ class InProcessChildHandle implements DisposableChildHandle {
       if (currentToolEvent) {
         this.toolDepth++;
         this.clearStall();
+        this.noteToolCall(event.toolName, event.args);
       }
       return;
     }
@@ -929,6 +980,22 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (!active) return;
     this.lastEvent = now;
     if (this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
+  }
+
+  private noteToolCall(toolName: string | undefined, args: unknown): void {
+    const name = toolName ?? "";
+    const key = `${name}\0${JSON.stringify(args ?? null)}`;
+    if (this.lastToolKey === key) this.lastToolCount += 1;
+    else {
+      this.lastToolKey = key;
+      this.lastToolCount = 1;
+    }
+    if (this.lastToolCount !== 3 || !name) return;
+    try {
+      this.onToolLoop?.(this.req.childId, name, args);
+    } catch {
+      // loop observers must not break the child
+    }
   }
 
   private release(terminal = true): void {

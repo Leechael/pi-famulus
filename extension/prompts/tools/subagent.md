@@ -25,7 +25,7 @@ Agent definition name (default: worker)
 
 # param: tasks.prompt
 
-Task prompt for this subagent
+Task prompt for this subagent. The child is a new process: it cannot see this conversation, so the prompt must be self-contained.
 
 # param: tasks.name
 

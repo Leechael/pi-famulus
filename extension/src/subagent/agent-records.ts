@@ -32,6 +32,8 @@ export interface AgentChildRecord {
   error?: string;
   /** Why the child ended (terminal statuses only). */
   end_reason?: AgentEndReason;
+  /** Seconds until a rate-limited provider may be retried, when known. */
+  retry_after?: number;
   /** Task prompt without the agent preamble, capped. */
   prompt_head?: string;
   /** Tail of the final result text, capped. */
@@ -58,6 +60,7 @@ export type AgentEndReason =
   | "completed"
   | "failed"
   | "model-error"
+  | "rate-limit"
   | "stalled"
   | "timeout"
   | "interrupted"
@@ -66,10 +69,11 @@ export type AgentEndReason =
 /** Map a terminal child status + result to the end_reason recorded on disk. */
 export function agentEndReason(
   status: AgentChildRecord["status"],
-  result: { error?: string; endReason?: "model-error" } | undefined,
+  result: { error?: string; endReason?: "model-error" | "rate-limit" } | undefined,
 ): AgentEndReason | undefined {
   if (status === "completed") return "completed";
   if (status === "failed") {
+    if (result?.endReason === "rate-limit") return "rate-limit";
     if (result?.endReason === "model-error") return "model-error";
     return result?.error === "stalled" ? "stalled" : "failed";
   }
@@ -174,6 +178,42 @@ function parseRecord(raw: string): AgentChildRecord | null {
 }
 
 /** Load agent child records from disk (all sessions under home). */
+/** Hosted children the daemon still has warm. They outlive a gone parent session. */
+export function warmHostedChildIds(home: string): Set<string> {
+  const out = new Set<string>();
+  try {
+    const { pid } = JSON.parse(readFileSync(join(home, "manager.pid"), "utf8")) as { pid?: unknown };
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return out;
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") return out;
+    }
+  } catch {
+    return out;
+  }
+  let files: string[];
+  try {
+    files = readdirSync(join(home, "agents")).filter((name) => name.endsWith(".json"));
+  } catch {
+    return out;
+  }
+  for (const file of files) {
+    try {
+      const value = JSON.parse(readFileSync(join(home, "agents", file), "utf8")) as {
+        residency?: string;
+        child_id?: string;
+      };
+      if (value.residency === "warm" && typeof value.child_id === "string") {
+        out.add(value.child_id);
+      }
+    } catch {
+      // skip bad hosted records
+    }
+  }
+  return out;
+}
+
 export function loadAgentChildRecords(
   home: string,
   opts: { sessionId?: string; includeTerminal?: boolean; connectedSessionIds?: ReadonlySet<string> } = {},
@@ -189,6 +229,7 @@ export function loadAgentChildRecords(
   } catch {
     return [];
   }
+  const warm = opts.connectedSessionIds === undefined ? new Set<string>() : warmHostedChildIds(home);
   const out: AgentChildRecord[] = [];
   for (const sid of sessionIds) {
     const dir = agentRecordsDir(home, sid);
@@ -205,7 +246,9 @@ export function loadAgentChildRecords(
         const disconnected =
           opts.connectedSessionIds !== undefined && !opts.connectedSessionIds.has(rec.session_id);
         const shown: AgentChildRecord =
-          disconnected && (rec.status === "pending" || rec.status === "running")
+          disconnected &&
+          (rec.status === "pending" || rec.status === "running") &&
+          !warm.has(rec.child_id)
             ? { ...rec, status: "interrupted" }
             : rec;
         const terminal =
@@ -218,6 +261,12 @@ export function loadAgentChildRecords(
     }
   }
   return out;
+}
+
+/** One child by id or name, across every session under home. */
+export function findAgentChildRecord(home: string, childIdOrName: string): AgentChildRecord | undefined {
+  const recs = loadAgentChildRecords(home, { includeTerminal: true });
+  return recs.find((rec) => rec.child_id === childIdOrName) ?? recs.find((rec) => rec.name === childIdOrName);
 }
 
 export function isAgentStatusActive(status: AgentChildRecord["status"]): boolean {

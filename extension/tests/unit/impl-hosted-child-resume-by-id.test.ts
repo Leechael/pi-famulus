@@ -1,0 +1,127 @@
+/**
+ * After the parent process dies, resume by child_id must reconstruct
+ * the run from the disk record and reattach the warm hosted child.
+ */
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { agentRecordPath, writeAgentChildRecord } from "../../src/subagent/agent-records";
+import { hostedFakeState, resetHostedFakes, settleAsync, startHostedExtension, textOf, until } from "./hosted-fakes";
+
+vi.mock("../../src/manager-client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/manager-client")>();
+  const { FakeHostedManager } = await import("./hosted-fakes");
+  return { ...actual, ManagerClient: FakeHostedManager };
+});
+
+const home = mkdtempSync(join(tmpdir(), "pi-famulus-resume-id-"));
+process.env.PI_FAMULUS_HOME = home;
+process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
+afterAll(() => rmSync(home, { recursive: true, force: true }));
+afterEach(() => resetHostedFakes());
+
+const SESSION = "sess-resume-id";
+const CHILD = "ch_left_warm";
+const RUN = "run_left_warm";
+
+describe("resume a hosted child by child_id after the parent dies", () => {
+  it("regression: retries recovery after a transient hosted attach failure", async () => {
+    const sessionId = "sess-retry-attach";
+    const childId = "ch_retry_attach";
+    writeAgentChildRecord(home, {
+      v: 1, kind: "agent", child_id: childId, run_id: "run_retry_attach", session_id: sessionId,
+      name: "worker", agent: "worker", status: "running", started_at: Date.now() - 1_000,
+    });
+    hostedFakeState().lookups.set(childId, { child_id: childId, residency: "warm", activity: "idle", parent_session: sessionId });
+    const ext = await startHostedExtension({ sessionId, cwd: home });
+    try {
+      const spawn = ext.manager.agentSpawn.bind(ext.manager);
+      const spawning = vi.spyOn(ext.manager, "agentSpawn").mockRejectedValueOnce(new Error("manager connection lost")).mockImplementation(spawn);
+      const acquire = vi.spyOn(ext.manager, "acquireAgent");
+      const released = vi.spyOn(ext.manager, "releaseAgent");
+      const readRecord = () => JSON.parse(readFileSync(agentRecordPath(home, sessionId, childId), "utf8"));
+      await expect(ext.run({ action: "resume", child_id: childId, message: "continue" })).rejects.toThrow("manager connection lost");
+      await settleAsync();
+      expect(readRecord().status).toBe("interrupted");
+      expect(acquire).not.toHaveBeenCalled();
+      await ext.run({ action: "resume", child_id: childId, message: "continue" });
+      await until(() => ext.manager.inputs.some((input) => input.childId === childId && input.text === "continue"), "the recovered prompt");
+      expect(spawning).toHaveBeenCalledTimes(2);
+      expect(acquire).toHaveBeenCalledTimes(1);
+      ext.manager.finish(childId, { content: [{ type: "text", text: "RETRY SUCCESS" }], stopReason: "stop" });
+      await until(() => readRecord().status === "completed", "the recovered result");
+      expect(readRecord().result_tail).toBe("RETRY SUCCESS");
+      expect(readRecord().error).toBeUndefined();
+      await until(() => released.mock.calls.length === 1, "the recovered turn's permit release");
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
+  it("reattaches both siblings from the same persisted run", async () => {
+    const sessionId = "sess-resume-siblings";
+    const children = ["ch_sibling_a", "ch_sibling_b"];
+    for (const childId of children) {
+      writeAgentChildRecord(home, {
+        v: 1, kind: "agent", child_id: childId, run_id: "run_siblings", session_id: sessionId,
+        name: childId, agent: "worker", status: "running", started_at: Date.now() - 60_000,
+      });
+      hostedFakeState().lookups.set(childId, { child_id: childId, residency: "warm", activity: "idle", parent_session: sessionId });
+    }
+    const ext = await startHostedExtension({ sessionId, cwd: home });
+    try {
+      for (const childId of children) {
+        await ext.run({ action: "resume", child_id: childId, message: `continue ${childId}` });
+      }
+      expect(ext.manager.inputs.filter((input) => input.op === "prompt").map((input) => input.childId)).toEqual(children);
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
+  it("reattaches the warm child and sends the resume message", async () => {
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: CHILD,
+      run_id: RUN,
+      session_id: SESSION,
+      name: "worker",
+      agent: "worker",
+      status: "running",
+      started_at: Date.now() - 60_000,
+      prompt_head: "finish the review",
+    });
+    hostedFakeState().lookups.set(CHILD, {
+      child_id: CHILD,
+      residency: "warm",
+      activity: "idle",
+      parent_session: SESSION,
+    });
+
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home });
+    try {
+      let text: string;
+      try {
+        const executed = await ext.run({ action: "resume", child_id: CHILD, message: "continue the review" });
+        text = textOf(executed);
+      } catch (error) {
+        text = `refused: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      expect({
+        refused: text.startsWith("refused"),
+        namesChild: text.includes(CHILD) || ext.manager.spawns.some((spawn) => spawn.childId === CHILD),
+        prompted: ext.manager.inputs.some(
+          (input) => input.childId === CHILD && input.text.includes("continue the review"),
+        ),
+      }).toEqual({
+        refused: false,
+        namesChild: true,
+        prompted: true,
+      });
+    } finally {
+      await ext.shutdown();
+    }
+  });
+});
