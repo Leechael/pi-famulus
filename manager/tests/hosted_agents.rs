@@ -103,3 +103,33 @@ fn a_warm_agent_keeps_the_daemon_alive_after_its_parent_disconnects() {
     drop(again);
     drop(daemon);
 }
+
+/// I-38. A hosted child's foreground shell must not keep running after the
+/// child process is gone.
+#[test]
+fn a_killed_hosted_child_stops_its_shell() {
+    let home = Home::new("hosted-orphan-shell");
+    let _daemon = home.start_daemon();
+    let mut conn = home.connect();
+    conn.hello_ext("sess-orphan");
+    let spawned = spawn_fake(&home, &mut conn, "ch_orphan01");
+    let child_pid = spawned["pid"].as_u64().unwrap_or(0) as u32;
+    assert!(child_pid > 0, "hosted child pid from spawn: {spawned}");
+    let (task_id, _shell_pid) = conn.start_with(json!({
+        "type": "start",
+        "kind": "shell",
+        "command": "sleep 300",
+        "cwd": task_cwd(),
+        "env": task_env(),
+        "run_in_background": true,
+        "origin": {"via": "child-bash", "child_id": "ch_orphan01", "run_id": "run_hosted"},
+    }));
+    assert_eq!(conn.task(&task_id).unwrap()["status"], "running");
+    let _ = unsafe { libc::kill(child_pid as i32, libc::SIGKILL) };
+    let stopped = poll_until(Duration::from_secs(5), || {
+        let rec = conn.task(&task_id)?;
+        (rec["status"] != "running").then_some(rec)
+    });
+    let rec = stopped.expect("the child's shell must stop after the hosted process dies");
+    assert_ne!(rec["status"], "running", "{rec}");
+}

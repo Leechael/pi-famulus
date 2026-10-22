@@ -1582,6 +1582,12 @@ fn start_agent_loops(state: &Shared) {
                 wake
                 };
                 send_agent_grants(&state, wake);
+                if matches!(
+                    &notice.event,
+                    EventKind::AgentState { activity, .. } if activity == "failed"
+                ) {
+                    stop_child_bash_of(&state, &notice.child_id);
+                }
             }
         });
     }
@@ -2370,6 +2376,44 @@ fn handle_stop(
     let _ = task::signal_group(pid, task::SIGTERM);
     spawn_kill_reaper(state, task_id, pid);
     Ok(UnitOk {})
+}
+
+/// A hosted child died. Stop the foreground shells it started so they do
+/// not keep running with nobody reading their output (I-38).
+fn stop_child_bash_of(state: &Shared, child_id: &str) {
+    let victims: Vec<(String, u32, String)> = {
+        let mut st = state.lock().unwrap();
+        let mut victims = Vec::new();
+        for e in st.registry.tasks.values_mut() {
+            let ours = e.record.origin.as_ref().is_some_and(|origin| {
+                origin.via == "child-bash" && origin.child_id.as_deref() == Some(child_id)
+            });
+            if !ours || !e.owns_live_group() {
+                continue;
+            }
+            if e.record.status == TaskStatus::Running {
+                e.request_kill("stopped:tool");
+            }
+            victims.push((
+                e.record.task_id.clone(),
+                e.record.pid,
+                e.record.session_id.clone(),
+            ));
+        }
+        victims
+    };
+    for (task_id, pid, sid) in victims {
+        let home = state.lock().unwrap().home.clone();
+        crate::events::emit(
+            &home,
+            Some(&sid),
+            "task.stop",
+            Some(&task_id),
+            serde_json::json!({ "reason": "tool", "child_id": child_id }),
+        );
+        let _ = task::signal_group(pid, task::SIGTERM);
+        spawn_kill_reaper(state, &task_id, pid);
+    }
 }
 
 /// Observability: record that the extension moved a task to the background.

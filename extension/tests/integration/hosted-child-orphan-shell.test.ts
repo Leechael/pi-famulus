@@ -50,7 +50,7 @@ describe.skipIf(!HOSTED_INTEG)("I-38 a hosted child killed while its shell runs"
     harness = null;
   });
 
-  it.fails("does not leave the child's shell running unseen", async () => {
+  it("does not leave the child's shell running unseen", async () => {
     harness = await startHostedHarness({ scenario: "bash-hang" });
     const h = harness;
     await h.tool("subagent").execute("sub-1", { async: true, tasks: [{ prompt: "work", name: "worker" }] }, undefined, undefined, h.ctx);
