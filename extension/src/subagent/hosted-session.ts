@@ -108,6 +108,7 @@ class HostedRpcSession implements ChildSessionAdapter {
   private readonly unsubscribe: () => void;
   private streaming = false;
   private lastText = "";
+  private lastFailure: { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   private turns: { role: string; text: string }[] = [];
   private usage: ChildTokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   private settle: (() => void) | null = null;
@@ -172,6 +173,10 @@ class HostedRpcSession implements ChildSessionAdapter {
     return this.lastText || undefined;
   }
 
+  getLastAssistantFailure(): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined {
+    return this.lastFailure;
+  }
+
   getConversation() {
     return this.turns.map((turn) => ({ ...turn }));
   }
@@ -216,6 +221,9 @@ class HostedRpcSession implements ChildSessionAdapter {
       };
       if (event.activity === "running") this.streaming = true;
       if (event.activity === "idle" || event.activity === "failed") {
+        if (event.activity === "failed" && !this.lastFailure) {
+          this.lastFailure = { stopReason: "error", errorMessage: "hosted child process failed" };
+        }
         this.streaming = false;
         this.settle?.();
         this.settle = null;
@@ -223,7 +231,20 @@ class HostedRpcSession implements ChildSessionAdapter {
       return;
     }
     if (event.event !== "agent_rpc" || !event.record || typeof event.record !== "object") return;
-    const record = event.record as { type?: string; message?: { role?: string; content?: { type?: string; text?: string }[]; usage?: Record<string, unknown> }; toolCallId?: string };
+    const record = event.record as {
+      type?: string;
+      message?: {
+        role?: string;
+        content?: { type?: string; text?: string }[];
+        usage?: Record<string, unknown>;
+        stopReason?: string;
+        errorMessage?: string;
+      };
+      toolCallId?: string;
+      toolName?: string;
+      args?: unknown;
+      isError?: boolean;
+    };
     const type = record.type ?? "";
     if (type === "agent_start") this.streaming = true;
     if (type === "agent_settled") {
@@ -236,6 +257,16 @@ class HostedRpcSession implements ChildSessionAdapter {
       if (text) {
         this.lastText = text;
         this.turns.push({ role: "assistant", text });
+      }
+      const stopReason = record.message.stopReason;
+      if (stopReason === "error" || stopReason === "aborted") {
+        this.lastFailure = {
+          stopReason,
+          ...(record.message.errorMessage ? { errorMessage: record.message.errorMessage } : {}),
+        };
+        if (record.message.errorMessage) {
+          this.turns.push({ role: "assistant error", text: record.message.errorMessage });
+        }
       }
       const usage = record.message.usage;
       if (usage) {

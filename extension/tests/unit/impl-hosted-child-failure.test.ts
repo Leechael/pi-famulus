@@ -47,7 +47,7 @@ async function settledChild(fail: (manager: Awaited<ReturnType<typeof startHoste
 afterEach(() => resetHostedFakes());
 
 describe("I-37 a failed hosted child is reported as failed", () => {
-  it.fails.each([
+  it.each([
     ["429 rate limit", "429 Too Many Requests: rate limit exceeded, retry after 20s"],
     ["500 server error", "500 Internal Server Error: upstream overloaded"],
   ])("provider error (%s) settles failed with the provider's text in the wake", async (_label, providerText) => {
@@ -65,7 +65,7 @@ describe("I-37 a failed hosted child is reported as failed", () => {
     });
   });
 
-  it.fails("a child process that dies mid-run settles failed with an error, not completed", async () => {
+  it("a child process that dies mid-run settles failed with an error, not completed", async () => {
     const { child } = await settledChild((manager, childId) => {
       manager.rpc(childId, { type: "agent_start" });
       manager.state(childId, "failed", "none");
