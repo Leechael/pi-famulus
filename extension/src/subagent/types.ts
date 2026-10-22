@@ -183,6 +183,8 @@ export type CreateSessionFn = (req: ChildRunRequest) => Promise<ChildSessionAdap
 
 export interface ChildRunner {
   start(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<ChildHandle>;
+  /** Reattach a child the daemon still hosts, without sending its first prompt. */
+  attach?(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<ChildHandle>;
 }
 
 /**

@@ -145,6 +145,13 @@ export class InProcessRunner implements ChildRunner {
     await handle.launch();
     return handle;
   }
+
+  async attach(req: ChildRunRequest, onHandle?: (handle: ChildHandle) => void): Promise<DisposableChildHandle> {
+    const handle = new InProcessChildHandle(req, this.opts);
+    onHandle?.(handle);
+    await handle.attachIdle();
+    return handle;
+  }
 }
 
 class InProcessChildHandle implements DisposableChildHandle {
@@ -349,6 +356,27 @@ class InProcessChildHandle implements DisposableChildHandle {
   /** Launch generation 1. Resolves once the prompt is issued (not completed). */
   async launch(): Promise<void> {
     await this.beginGeneration(this.req.prompt, true);
+  }
+
+  /**
+   * Bind an already-hosted session so resume() can send the next turn.
+   * The previous parent died; this generation is interrupted, not prompted.
+   */
+  async attachIdle(): Promise<void> {
+    this.sessionCreation = this.createSession(this.req);
+    const created =
+      await this.sessionCreation;
+    this.sessionCreation = null;
+    if (this.disposed) return;
+    this.session = created;
+    this.resolvedModel_ = created.resolvedModel;
+    this.unsubscribe = this.session.subscribe((event) => this.handleSessionEvent(event));
+    this.settle(this.generation, {
+      status: "interrupted",
+      text: this.session.getLastAssistantText() ?? "",
+      error: "parent session ended",
+      durationMs: 0,
+    });
   }
 
   async steer(message: string): Promise<void> {

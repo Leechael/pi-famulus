@@ -41,13 +41,16 @@ interface HostedFakeState {
   tasks: Array<Record<string, unknown>>;
   /** When false, tools degrade to the local bash fallback. */
   available: boolean;
+  /** hostedLookup answers keyed by session/child id. */
+  lookups: Map<string, Record<string, unknown>>;
 }
 
 const KEY = Symbol.for("pi-famulus.test.hosted-fakes");
 
 export function hostedFakeState(): HostedFakeState {
   const scope = globalThis as typeof globalThis & { [KEY]?: HostedFakeState };
-  scope[KEY] ??= { instances: [], connectGate: null, tasks: [], available: true };
+  scope[KEY] ??= { instances: [], connectGate: null, tasks: [], available: true, lookups: new Map() };
+  scope[KEY].lookups ??= new Map();
   return scope[KEY];
 }
 
@@ -57,6 +60,7 @@ export function resetHostedFakes(): void {
   state.connectGate = null;
   state.tasks = [];
   state.available = true;
+  state.lookups.clear();
 }
 
 export class FakeHostedManager {
@@ -180,8 +184,16 @@ export class FakeHostedManager {
     this.reconnectHandlers.length = 0;
   }
 
-  async hostedLookup(): Promise<null> {
+  async hostedLookup(query: { sessionId?: string; sessionFile?: string }): Promise<Record<string, unknown> | null> {
+    const id = query.sessionId;
+    if (id && hostedFakeState().lookups.has(id)) {
+      return hostedFakeState().lookups.get(id) ?? null;
+    }
     return null;
+  }
+
+  fireReconnect(): void {
+    for (const handler of [...this.reconnectHandlers]) handler();
   }
 
   async acquireAgent(): Promise<{ granted: boolean }> {

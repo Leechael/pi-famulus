@@ -342,6 +342,77 @@ export class SubagentRegistry implements RunRegistry {
   // M3 extensions beyond Appendix B
   // -------------------------------------------------------------------------
 
+  /**
+   * Reconstruct a run/child the previous parent process wrote to disk
+   * so resume can reattach by child_id (I-39).
+   */
+  adoptExisting(info: {
+    runId: string;
+    childId: string;
+    name: string;
+    agent: string;
+    workKind?: string;
+    startedAt?: number;
+    prompt?: string;
+  }): void {
+    if (this.children.has(info.childId)) return;
+    let run = this.runs.get(info.runId);
+    if (!run) {
+      run = {
+        runId: info.runId,
+        kind: "tasks",
+        status: "interrupted",
+        createdAt: info.startedAt ?? this.now(),
+        children: [],
+      };
+      this.runs.set(info.runId, run);
+    }
+    const child: InternalChild = {
+      childId: info.childId,
+      runId: info.runId,
+      name: info.name,
+      agent: info.agent,
+      workKind: info.workKind ?? "other",
+      status: "interrupted",
+      startedAt: info.startedAt ?? this.now(),
+      endedAt: this.now(),
+      turn: 1,
+      queueMs: 0,
+      prompt: info.prompt,
+    };
+    run.children.push(child);
+    this.children.set(child.childId, child);
+    this.emit(run);
+  }
+
+  /** Bind a live hosted session to an adopted child without sending its first prompt. */
+  async attachChild(req: ChildRunRequest): Promise<ChildHandle> {
+    const child = this.children.get(req.childId);
+    if (!child) throw new Error(`unknown child ${req.childId} (adoptExisting first)`);
+    const runner = this.runner;
+    if (!runner?.attach) {
+      throw new Error(`subagent ${req.childId} has no live session to resume`);
+    }
+    child.prompt = req.taskPrompt ?? req.prompt;
+    child.preamble = req.agent.systemPrompt || undefined;
+    child.model = req.model ?? req.agent.model;
+    const handle =
+      await runner.attach(req, (startingHandle) => {
+        child.handle = startingHandle;
+      });
+    if (!this.children.has(child.childId)) return handle;
+    child.handle = handle;
+    handle.result.then((result) => this.settleChild(child.childId, result));
+    const resolved = handle.resolvedModel();
+    if (resolved) {
+      const thinking = handle.effectiveThinkingLevel?.();
+      child.model = `${resolved}${thinking ? `:${thinking}` : ""}`;
+    }
+    const run = this.runs.get(child.runId);
+    if (run) this.emit(run);
+    return handle;
+  }
+
   /** Allocate a pending child inside a run. Returns the child id. */
   addChild(runId: string, info: { name: string; agent: string; workKind?: string }): string {
     const run = this.runs.get(runId);

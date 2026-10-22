@@ -252,6 +252,12 @@ export function loadAgentChildRecords(
   return out;
 }
 
+/** One child by id or name, across every session under home. */
+export function findAgentChildRecord(home: string, childIdOrName: string): AgentChildRecord | undefined {
+  const recs = loadAgentChildRecords(home, { includeTerminal: true });
+  return recs.find((rec) => rec.child_id === childIdOrName) ?? recs.find((rec) => rec.name === childIdOrName);
+}
+
 export function isAgentStatusActive(status: AgentChildRecord["status"]): boolean {
   return status === "pending" || status === "running";
 }

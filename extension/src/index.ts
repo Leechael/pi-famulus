@@ -37,6 +37,7 @@ import {
   agentEndReason,
   headOf,
   loadAgentChildRecords,
+  findAgentChildRecord,
   tailOf,
   updateAgentChildMetrics,
   writeAgentChildRecord,
@@ -46,6 +47,7 @@ import { TranscriptWriter } from "./subagent/transcript";
 import { FleetWidget } from "./subagent/fleet-widget";
 import { WORK_RETAIN_MS, WorkIndex, type WorkItem } from "./work-index";
 import { fileURLToPath } from "node:url";
+import { AGENT_WORK_KINDS, type AgentWorkKind } from "./subagent/types";
 import { isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
 import { createHostedSessionFn } from "./subagent/hosted-session";
 import { isHostedChildProcess, registerChildMode } from "./child-mode";
@@ -640,6 +642,40 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         const loader = agentLoader;
         if (!loader) return resolveAgentDef([], name); // builtins-only fallback
         return resolveAgentDef(loader.reload().definitions, name);
+      },
+      recoverChild: async (childId) => {
+        const registry = subagentRegistry;
+        if (!registry) return undefined;
+        const rec = findAgentChildRecord(home, childId);
+        if (!rec) return undefined;
+        if (registry.handle(rec.child_id) || registry.get(rec.run_id)) {
+          return registry.get(rec.run_id);
+        }
+        const workKind = AGENT_WORK_KINDS.includes(rec.work_kind as AgentWorkKind)
+          ? rec.work_kind as AgentWorkKind
+          : undefined;
+        const loader = agentLoader;
+        const agent = resolveAgentDef(loader ? loader.reload().definitions : [], rec.agent);
+        registry.adoptExisting({
+          runId: rec.run_id,
+          childId: rec.child_id,
+          name: rec.name,
+          agent: rec.agent,
+          workKind,
+          startedAt: rec.started_at,
+          prompt: rec.prompt_head,
+        });
+        await registry.attachChild({
+          childId: rec.child_id,
+          runId: rec.run_id,
+          name: rec.name,
+          prompt: rec.prompt_head ?? "",
+          agent,
+          timeoutMs: subagentConfig.timeoutMs,
+          depth: 1,
+          ...(workKind ? { workKind } : {}),
+        });
+        return registry.get(rec.run_id);
       },
       listModels: () => {
         const current = ctx?.model;
