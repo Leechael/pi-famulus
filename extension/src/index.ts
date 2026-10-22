@@ -806,9 +806,10 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       }
       if (hosted.event === "agent_ui" && hosted.child_id) {
         const request = hosted.request ?? {};
+        const method = request.method;
+        if (method !== "select" && method !== "confirm" && method !== "input" && method !== "editor") return;
         const title = typeof request.title === "string" ? request.title : "";
         const body = typeof request.message === "string" ? request.message : "";
-        const method = typeof request.method === "string" ? request.method : "dialog";
         sessionNotify?.notify({
           customType: "pi-famulus-wake",
           content:

@@ -27,7 +27,31 @@ afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
 describe("a dialog inside a hosted child", () => {
-  it("wakes the parent with what the child is waiting for", async () => {
+  it.each([
+    { method: "notify", message: "working", notifyType: "info" },
+    { method: "setStatus", statusKey: "progress", statusText: "working" },
+    { method: "setWidget", widgetKey: "progress", widgetLines: ["working"] },
+    { method: "setTitle", title: "working" },
+    { method: "set_editor_text", text: "working" },
+  ])("does not claim a child is waiting on fire-and-forget $method", async (request) => {
+    const ext = await startHostedExtension({ sessionId: `sess-ui-${request.method}`, cwd: home });
+    try {
+      const childId = await ext.spawnChild();
+      ext.manager.rpc(childId, { type: "agent_start" });
+      const before = ext.pi.sent.length;
+      // RpcExtensionUIRequest uses the same envelope for these display-only
+      // operations, but rpc-mode.ts creates no dialog promise for them.
+      ext.manager.emit({ event: "agent_ui", child_id: childId, request: {
+        type: "extension_ui_request", id: "ui_update", ...request,
+      } });
+      await settleAsync();
+      expect(ext.pi.sent.slice(before)).toEqual([]);
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
+  it.each(["select", "confirm", "input", "editor"])("wakes the parent for a response-bearing %s dialog", async (method) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const ext = await startHostedExtension({ sessionId: "sess-ui", cwd: home });
     try {
@@ -40,7 +64,7 @@ describe("a dialog inside a hosted child", () => {
         request: {
           type: "extension_ui_request",
           id: "ui_1",
-          method: "confirm",
+          method,
           title: "Approve deploy?",
           message: "Deploy build 42 to production?",
         },
