@@ -7,10 +7,25 @@
  * buffer or string on the event loop.
  */
 import { randomUUID } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, unlinkSync, type WriteStream } from "node:fs";
 import type { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+/** Spill files created this process; unlinked on session shutdown (I-17). */
+const sessionSpillFiles = new Set<string>();
+
+/** Forget and delete every overflow file this session wrote. */
+export function cleanupSessionSpillFiles(): void {
+  for (const path of sessionSpillFiles) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // already gone, or never created
+    }
+  }
+  sessionSpillFiles.clear();
+}
 
 export interface BoundedOutputOptions {
   /** Spill to a temp file once total bytes exceed this. */
@@ -122,6 +137,7 @@ export class BoundedOutput {
 
   private openSpill(): void {
     this.path = join(tmpdir(), `${this.opts.tempFilePrefix ?? "pi-famulus-bash"}-${randomUUID()}.log`);
+    sessionSpillFiles.add(this.path);
     const stream = createWriteStream(this.path);
     stream.on("error", () => {
       this.streamFailed = true;

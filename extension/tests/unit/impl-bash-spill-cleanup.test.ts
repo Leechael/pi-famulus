@@ -75,7 +75,7 @@ describe("I-17 foreground bash overflow file", () => {
     }
   });
 
-  it.fails("deletes the spill file after session shutdown", async () => {
+  it("deletes the spill file after session shutdown", async () => {
     const ran = await overflowForeground();
     expect(existsSync(ran.path)).toBe(true);
     await ran.shutdown();

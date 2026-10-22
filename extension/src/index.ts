@@ -19,6 +19,7 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import { resolveAgent as resolveAgentDef } from "./agents/definition";
 import { createAgentLoader, type AgentLoader } from "./agents/loader";
 import { createBashOverride } from "./bash-override";
+import { cleanupSessionSpillFiles } from "./bounded-output";
 import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool } from "./comms/tools";
@@ -982,6 +983,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     agentLoader = null;
     monitorRegistry?.disposeAll();
     notifyCenter?.dispose();
+    cleanupSessionSpillFiles();
     const current = client;
     client = null;
     if (current) {
