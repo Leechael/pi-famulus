@@ -363,8 +363,6 @@ impl Hosted {
             }
         }
         self.emit_state(child_id);
-        // A respawn is a new pi process. Steering mode does not survive it.
-        self.rpc_nowait(child_id, "set_steering_mode");
         let g = self.inner.lock().unwrap();
         g.agents.get(child_id).map(|a| a.public_json()).ok_or_else(|| ProtoError::new(E_NOT_FOUND, "child vanished"))
     }
