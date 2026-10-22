@@ -148,6 +148,15 @@ describe("subagent result truncation is visible", () => {
   const text = `HEAD${"x".repeat(3000)}TAIL`;
   const omitted = text.length - KEPT;
 
+  it.each(["child", "handover"] as const)("rejects a truncated %s result with XML slashes but no retrieval hint", (where) => {
+    const result = `${"x".repeat(1996)}TAIL`;
+    const content = `<result truncated="true" omitted-chars="1008">${result}</result>`;
+    const details = { kind: "test", result, truncated: true, omittedChars: 1008, children: [{ result, truncated: true, omittedChars: 1008 }] };
+    expect(() => expectTruncatedResult(content, details, where, omitted)).toThrow();
+    expect(() => expectTruncatedResult(`${content}\nRead the full result with subagent({action:"get", child_id:"ch_a"}).`, details, where, omitted)).not.toThrow();
+    expect(() => expectTruncatedResult(`${content}\n<retrieval transcript-path="/tmp/ch_a.jsonl"/>`, details, where, omitted)).not.toThrow();
+  });
+
   it("counts the characters this construction drops", () => {
     expect(text.length).toBe(3008);
     expect(omitted).toBe(1008);
@@ -231,7 +240,7 @@ function expectTruncatedResult(
   expect(result?.[1].length).toBe(2000);
   expect(content).toContain('truncated="true"');
   expect(content).toContain(`omitted-chars="${omitted}"`);
-  expect(content.includes('action:"get"') || /(?:\/|\.jsonl\b)/.test(content)).toBe(true);
+  expect(content.includes('action:"get"') || /\b(?:transcript(?:-path)?|path)="[^"]+\.jsonl"/.test(content)).toBe(true);
   if (where === "child") {
     expect(details.children?.[0]).toMatchObject({ truncated: true, omittedChars: omitted });
     expect(details.children?.[0]?.result?.endsWith("TAIL")).toBe(true);
