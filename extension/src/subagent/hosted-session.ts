@@ -273,6 +273,14 @@ class HostedRpcSession implements ChildSessionAdapter {
       const text = (record.message.content ?? []).map((part) => part.text ?? "").join("");
       if (text) this.turns.push({ role: "user", text });
     }
+    if (type === "tool_execution_end") {
+      const name = record.toolName ?? "tool";
+      const text = record.args === undefined ? name : `${name} ${JSON.stringify(record.args)}`;
+      this.turns.push({
+        role: record.isError ? `tool ${name} error` : `tool ${name}`,
+        text,
+      });
+    }
     const adapted: ChildSessionEvent = {
       type,
       ...(record.message?.role ? { role: record.message.role } : {}),
