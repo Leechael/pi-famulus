@@ -1,5 +1,5 @@
 /**
- * I-43. session_start connects to the daemon in the background. A subagent
+ * session_start connects to the daemon in the background. A subagent
  * call that lands before that connect finishes must wait for it (bounded),
  * not fail at once.
  *
@@ -24,7 +24,7 @@ process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
-describe("I-43 a subagent call made before the daemon connects", () => {
+describe("a subagent call made before the daemon connects", () => {
   it.fails("waits for the connection and then runs the child", async () => {
     let release!: () => void;
     hostedFakeState().connectGate = new Promise<void>((resolve) => {

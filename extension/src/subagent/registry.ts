@@ -344,7 +344,7 @@ export class SubagentRegistry implements RunRegistry {
 
   /**
    * Reconstruct a run/child the previous parent process wrote to disk
-   * so resume can reattach by child_id (I-39).
+   * so resume can reattach by child_id.
    */
   adoptExisting(info: {
     runId: string;

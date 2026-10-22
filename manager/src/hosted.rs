@@ -1214,7 +1214,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    /// I-64. Closing the daemon's stdin must produce EOF in the wrapper.
+    /// Closing the daemon's stdin must produce EOF in the wrapper.
     /// If `status_write` is dropped before spawn, that fd number is reused as
     /// the stdin write end and `dup2` copies it onto fd 4, so closing stdin
     /// never reaches the child.

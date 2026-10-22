@@ -168,7 +168,7 @@ pub fn agent_active_at(a: &AgentRecord, home: &Path) -> Option<u64> {
 }
 
 /// Hosted children the daemon still has warm. They outlive a gone parent
-/// session, so `ls` must not hide them as interrupted (I-41).
+/// session, so `ls` must not hide them as interrupted.
 fn warm_hosted_ids(home: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     let Ok(files) = std::fs::read_dir(home.join("agents")) else {

@@ -12,7 +12,7 @@ import type { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-/** Spill files created this process; unlinked on session shutdown (I-17). */
+/** Spill files created this process; unlinked on session shutdown. */
 const sessionSpillFiles = new Set<string>();
 
 /** Forget and delete every overflow file this session wrote. */

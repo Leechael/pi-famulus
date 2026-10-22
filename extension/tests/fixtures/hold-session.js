@@ -1,5 +1,5 @@
 /**
- * First parent for the I-20 integration test. Speaks just enough of the
+ * First parent for the offline-parent-result integration test. Speaks just enough of the
  * daemon protocol to start a hosted child and a background shell, then
  * waits until it is killed. The test SIGKILLs this process so the
  * connection drops without shutdown_session.

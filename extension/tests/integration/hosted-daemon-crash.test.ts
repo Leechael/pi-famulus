@@ -1,5 +1,5 @@
 /**
- * I-52. When the daemon dies, the hosted child it was running dies with it.
+ * When the daemon dies, the hosted child it was running dies with it.
  * The parent must learn that: the child's record must stop saying running,
  * the parent must get a wake that names the child, and the child must be
  * resumable on the restarted daemon.
@@ -15,7 +15,7 @@ import { alive, HOSTED_INTEG, startHostedHarness, textOf, waitUntil, type Hosted
 /** Generous: the extension respawns the daemon and reconnects within a few seconds. */
 const SETTLE_MS = 20_000;
 
-describe.skipIf(!HOSTED_INTEG)("I-52 daemon SIGKILL while a hosted child runs", () => {
+describe.skipIf(!HOSTED_INTEG)("daemon SIGKILL while a hosted child runs", () => {
   let harness: HostedHarness | null = null;
 
   afterEach(async () => {

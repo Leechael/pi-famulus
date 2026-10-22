@@ -1,5 +1,5 @@
 /**
- * I-31 (feature, expected behavior). The parent should hear early when a
+ * The parent should hear early when a
  * child is stuck or going in circles:
  *
  * - the stall watchdog already aborts a silent child and re-prompts it; the
@@ -35,7 +35,7 @@ process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
-describe("I-31 a stuck or looping child is reported early", () => {
+describe("a stuck or looping child is reported early", () => {
   it("tells the parent when the stall watchdog restarts a child", async () => {
     const ext = await startHostedExtension({ sessionId: "sess-stall", cwd: home });
     try {

@@ -299,7 +299,7 @@ function num(value: unknown): number {
 
 const SUPERVISOR_TOOLS = ["contact_supervisor", "agent_message"];
 
-/** Agent allowlists still keep the two supervisor tools (I-55). */
+/** Agent allowlists still keep the two supervisor tools. */
 export function hostedChildTools(tools: string[]): string[] {
   const kept = new Set(tools);
   for (const name of SUPERVISOR_TOOLS) kept.add(name);

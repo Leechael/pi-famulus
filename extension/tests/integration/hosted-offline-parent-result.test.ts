@@ -1,10 +1,10 @@
 /**
- * I-20. A warm hosted child keeps the daemon alive after the parent is
+ * A warm hosted child keeps the daemon alive after the parent is
  * SIGKILLed. A background bash started by that parent then finishes once a
  * new extension instance has connected to the same session. The finished
  * result must arrive as a wake and task_list must list it.
  *
- * Distinct from impl-session-restart-recovery (I-19/I-40), which covers
+ * Distinct from impl-session-restart-recovery, which covers
  * work that was already gone when the new instance starts.
  *
  *   PI_FAMULUS_INTEG=1 npx vitest run tests/integration/hosted-offline-parent-result.test.ts
@@ -31,7 +31,7 @@ const HOLD_SESSION = fileURLToPath(new URL("../fixtures/hold-session.js", import
 const EXTENSION_ENTRY = fileURLToPath(new URL("../../src/index.ts", import.meta.url));
 const SESSION = "offline-sess";
 
-describe.skipIf(!HOSTED_INTEG)("I-20 results that finish while the parent is gone", () => {
+describe.skipIf(!HOSTED_INTEG)("results that finish while the parent is gone", () => {
   let harness: HostedHarness | null = null;
   let holderPid = 0;
 

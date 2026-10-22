@@ -1,5 +1,5 @@
 /**
- * I-17. Large foreground bash output spills to
+ * Large foreground bash output spills to
  * tmpdir/pi-famulus-bash-<id>.log and the result text names that path.
  * The file must stay while the session still refers to it, and must be
  * gone after session shutdown. The second assertion fails today: nothing
@@ -63,7 +63,7 @@ async function overflowForeground(): Promise<{
   return { text, path, shutdown: ext.shutdown };
 }
 
-describe("I-17 foreground bash overflow file", () => {
+describe("foreground bash overflow file", () => {
   it("keeps the spill file while the result text names it", async () => {
     const ran = await overflowForeground();
     try {

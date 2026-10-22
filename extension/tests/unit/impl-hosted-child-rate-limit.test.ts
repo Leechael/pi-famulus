@@ -1,8 +1,8 @@
 /**
- * I-58. A hosted child that hits a provider rate limit must settle as
+ * A hosted child that hits a provider rate limit must settle as
  * failed with endReason rate-limit, and the record/wake must carry
- * retry-after when the provider named one. Builds on I-37: the failure
- * is no longer reported as completed.
+ * retry-after when the provider named it. The child is no longer
+ * reported as completed.
  */
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,7 +23,7 @@ process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
-describe("I-58 a rate-limited hosted child is recorded distinctly", () => {
+describe("a rate-limited hosted child is recorded distinctly", () => {
   it("records rate-limit and retry-after on the wake and the child record", async () => {
     const providerText = "429 Too Many Requests: rate limit exceeded, retry after 20s";
     const ext = await startHostedExtension({ sessionId: "sess-rate", cwd: home });

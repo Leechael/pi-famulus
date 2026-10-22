@@ -1,5 +1,5 @@
 /**
- * I-15. /new, /resume and /fork replace the session on the same extension
+ * /new, /resume and /fork replace the session on the same extension
  * instance: session_shutdown then session_start, no re-import. Background
  * work started before the switch must not deliver its wake after the
  * replacement, and must not throw as an unhandledRejection.
@@ -186,7 +186,7 @@ async function lateWakesAfterReplacement(reason: (typeof REPLACE_REASONS)[number
   }
 }
 
-describe.each(REPLACE_REASONS)("I-15 session replacement reason %s while background work is in flight", (reason) => {
+describe.each(REPLACE_REASONS)("session replacement reason %s while background work is in flight", (reason) => {
   beforeEach(() => {
     resetHostedFakes();
     takeParkedRuntime();

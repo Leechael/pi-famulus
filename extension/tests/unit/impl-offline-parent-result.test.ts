@@ -1,10 +1,10 @@
 /**
- * I-20. A warm hosted child keeps the daemon alive after the parent dies.
+ * A warm hosted child keeps the daemon alive after the parent dies.
  * A background bash this process did not start must be adopted on connect:
  * task_list lists it, and its exit arrives as a wake. Work that already
  * finished while the parent was gone is delivered the same way.
  *
- * Distinct from impl-session-restart-recovery (I-19/I-40), which covers
+ * Distinct from impl-session-restart-recovery, which covers
  * work the daemon already ended as manager-shutdown and stale running
  * agent records. The gated integration test hosted-offline-parent-result
  * covers the same path against a real daemon.
@@ -55,7 +55,7 @@ function shellTask(partial: Record<string, unknown>): Record<string, unknown> {
   };
 }
 
-describe("I-20 results that finish while the parent is gone", () => {
+describe("results that finish while the parent is gone", () => {
   it("lists a still-running parent shell and wakes when it exits", async () => {
     hostedFakeState().tasks = [shellTask({})];
     const ext = await startHostedExtension({ sessionId: SESSION, cwd: home });

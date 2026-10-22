@@ -87,7 +87,7 @@ export interface InProcessRunnerOptions {
   stallRetryDelayMs?: number;
   /** Called on every stall detection (before any retry), with the 1-based attempt. */
   onStall?: (childId: string, attempt: number) => void;
-  /** Same tool name and arguments three times in a row (I-31). */
+  /** Same tool name and arguments three times in a row. */
   onToolLoop?: (childId: string, toolName: string, args: unknown) => void;
   /** Overrun reminder interval (ms). Default 10 minutes. */
   overrunRepeatMs?: number;
@@ -118,7 +118,7 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** 429 / rate-limit text is recorded separately from other model errors (I-58). */
+/** 429 / rate-limit text is recorded separately from other model errors. */
 export function classifyModelFailure(message: string): {
   endReason: "model-error" | "rate-limit";
   retryAfter?: number;

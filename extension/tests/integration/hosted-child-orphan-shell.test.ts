@@ -1,5 +1,5 @@
 /**
- * I-38. A hosted child's shell is a daemon task (origin child-bash) that
+ * A hosted child's shell is a daemon task (origin child-bash) that
  * the child waits on in the foreground. When the child process dies, that
  * shell must not keep running unseen: it is stopped, or the parent is told
  * that the child left it behind.
@@ -42,7 +42,7 @@ function childPids(childId: string): number[] {
     .filter((pid) => pid > 0 && pid !== process.pid);
 }
 
-describe.skipIf(!HOSTED_INTEG)("I-38 a hosted child killed while its shell runs", () => {
+describe.skipIf(!HOSTED_INTEG)("a hosted child killed while its shell runs", () => {
   let harness: HostedHarness | null = null;
 
   afterEach(async () => {

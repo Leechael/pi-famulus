@@ -1,5 +1,5 @@
 /**
- * I-59. An extension inside a hosted child can open a dialog
+ * An extension inside a hosted child can open a dialog
  * (ctx.ui.confirm and friends). The child then waits for an answer. The
  * daemon cancels such a dialog itself only when nobody watches the child
  * (manager/src/hosted.rs on_line, `extension_ui_request`); the parent always
@@ -26,7 +26,7 @@ process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
-describe("I-59 a dialog inside a hosted child", () => {
+describe("a dialog inside a hosted child", () => {
   it("wakes the parent with what the child is waiting for", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const ext = await startHostedExtension({ sessionId: "sess-ui", cwd: home });

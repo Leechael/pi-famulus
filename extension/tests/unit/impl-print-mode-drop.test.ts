@@ -1,5 +1,5 @@
 /**
- * I-61. Print mode stops background work and still exits 0. stderr must say so.
+ * Print mode stops background work and still exits 0. stderr must say so.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,7 +20,7 @@ process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
-describe("I-61 print mode drop warning", () => {
+describe("print mode drop warning", () => {
   it("names the work that print mode is about to stop", () => {
     expect(printModeDropWarning([])).toBeNull();
     expect(printModeDropWarning(["ch_1", "sh_2"])).toBe(

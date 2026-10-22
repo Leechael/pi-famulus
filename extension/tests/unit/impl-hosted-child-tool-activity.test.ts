@@ -1,6 +1,6 @@
 /**
- * I-60. Hosted child records and `show` must count tool activity.
- * Builds on I-31: tool_execution_* events now carry a name, and those
+ * Hosted child records and `show` must count tool activity.
+ * tool_execution_* events now carry a name, and those
  * turns are written into the conversation so the transcript counter
  * is not stuck at 0.
  */
@@ -23,7 +23,7 @@ process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
-describe("I-60 hosted child tool activity is recorded", () => {
+describe("hosted child tool activity is recorded", () => {
   it("counts named tool calls on the child record", async () => {
     const ext = await startHostedExtension({ sessionId: "sess-tools", cwd: home });
     try {

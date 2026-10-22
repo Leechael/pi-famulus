@@ -21,7 +21,7 @@ describe("generated prompts", () => {
     const trailing = parsed.prompts.filter((p) => (Array.isArray(p.value) ? p.value : [p.value]).some((v) => /[ \t]$/m.test(v)));
     expect(trailing.map((p) => p.id)).toEqual([]);
   });
-  it("tells the parent a subagent starts without this conversation (I-54)", () => {
+  it("tells the parent a subagent starts without this conversation", () => {
     const prompt = parsed.prompts.find((p) => p.id === "tools.subagent.param.tasks.prompt");
     const text = String(Array.isArray(prompt?.value) ? prompt.value.join("\n") : prompt?.value ?? "");
     expect(text.includes("new process")).toBe(true);

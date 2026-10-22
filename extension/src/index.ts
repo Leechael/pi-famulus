@@ -224,7 +224,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
    */
   const notifyOnExit = new Set<string>();
-  /** Sessions that already received the I-19/I-40 crash notice. */
+  /** Sessions that already received the crash-recovery notice. */
   const recoveredSessions = new Set<string>();
   const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
   const workIndex = new WorkIndex({ clock });
@@ -298,7 +298,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   /**
    * Parent-owned shells this process did not start (the previous pi died
    * while the daemon stayed up). Running ones join the index and get an
-   * exit wake; recent finished ones are delivered the same way (I-20).
+   * exit wake; recent finished ones are delivered the same way.
    * manager-shutdown / manager-crash leftovers stay for the crash notice.
    */
   const adoptParentShells = (tasks: TaskRecord[]): void => {
@@ -332,8 +332,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   };
   /**
    * A running disk record whose hosted process is gone: interrupt the live
-   * handle when this process still holds it (daemon crash, I-52), otherwise
-   * write the record. Warm children stay for resume (I-39).
+   * handle when this process still holds it (daemon crash), otherwise
+   * write the record. Warm children stay for resume.
    */
   const settleDeadHostedChildren = async (
     sessionId: string,
@@ -370,8 +370,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   /**
    * The previous process died. Settle stale running agent records (the child
    * is gone) and tell the model about that work and about commands the
-   * daemon already ended as manager-shutdown / manager-crash (I-19, I-40).
-   * A hosted child that is still warm is left for resume (I-39).
+   * daemon already ended as manager-shutdown / manager-crash.
+   * A hosted child that is still warm is left for resume.
    */
   const recoverCrashedSession = async (sessionId: string): Promise<void> => {
     if (!sessionId || recoveredSessions.has(sessionId)) return;
@@ -783,7 +783,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     const parentSessionId = startCtx.sessionManager.getSessionId();
     // Bind this session's notify centre and client. After /new /resume /fork
     // the outer `notifyCenter` is replaced; late events on the old client
-    // must not follow that rebinding (I-15).
+    // must not follow that rebinding.
     const sessionNotify = notifyCenter;
     const sessionClient = client;
     client.onEvent((event) => {

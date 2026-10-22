@@ -104,7 +104,7 @@ fn a_warm_agent_keeps_the_daemon_alive_after_its_parent_disconnects() {
     drop(daemon);
 }
 
-/// I-38. A hosted child's foreground shell must not keep running after the
+/// A hosted child's foreground shell must not keep running after the
 /// child process is gone.
 #[test]
 fn a_killed_hosted_child_stops_its_shell() {

@@ -1,15 +1,15 @@
 /**
- * I-46, I-47, I-48. Each wake that starts a parent turn re-reads the whole
+ * Each wake that starts a parent turn re-reads the whole
  * parent context. Three notices should not cost a turn, or not without
  * limit:
  *
- * - I-46: a child's progress_update is information; delivering it must not
+ * - a child's progress_update is information; delivering it must not
  *   start a parent turn.
- * - I-47: overrun reminders for a child past its soft budget back off and
+ * - overrun reminders for a child past its soft budget back off and
  *   stop after a bounded number. Today they repeat every 10 minutes for as
  *   long as the child runs: 34 wakes for a child that runs 6 hours on the
  *   default 30-minute budget.
- * - I-48: a monitor that printed nothing and timed out must not start a turn.
+ * - a monitor that printed nothing and timed out must not start a turn.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -39,7 +39,7 @@ afterEach(() => resetHostedFakes());
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 
-describe("I-46 a child's progress_update", () => {
+describe("a child's progress_update", () => {
   it.fails("reaches the idle parent without starting a turn", async () => {
     const ext = await startHostedExtension({ sessionId: "sess-progress", cwd: home });
     try {
@@ -66,7 +66,7 @@ describe("I-46 a child's progress_update", () => {
   });
 });
 
-describe("I-47 overrun reminders for a long child", () => {
+describe("overrun reminders for a long child", () => {
   it.fails("back off and stop after a bounded number", async () => {
     const clock = new ManualClock();
     const factory = new SessionFactory();
@@ -109,7 +109,7 @@ describe("I-47 overrun reminders for a long child", () => {
   });
 });
 
-describe("I-48 a silent monitor that times out", () => {
+describe("a silent monitor that times out", () => {
   it.fails("is reported without starting a turn", async () => {
     const clock = new ManualClock();
     const sent: Array<{ details?: unknown; options: { triggerTurn?: boolean; deliverAs?: string } }> = [];

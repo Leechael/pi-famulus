@@ -1,5 +1,5 @@
 /**
- * I-19 and I-40. pi crashes and the user reopens the same session. The new
+ * pi crashes and the user reopens the same session. The new
  * extension instance must tell the model about work the previous process
  * left behind, and must not leave stale records saying running.
  *
@@ -32,7 +32,7 @@ afterEach(() => resetHostedFakes());
 
 const SESSION = "sess-restart";
 
-describe("I-19/I-40 the same session reopened after pi crashed", () => {
+describe("the same session reopened after pi crashed", () => {
   it("reports the interrupted subagent and command, and settles the stale record", async () => {
     const startedAt = Date.now() - 10 * 60_000;
     writeAgentChildRecord(home, {

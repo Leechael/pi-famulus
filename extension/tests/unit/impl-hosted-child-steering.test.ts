@@ -1,5 +1,5 @@
 /**
- * I-63. A hosted child must not write the user's global settings.
+ * A hosted child must not write the user's global settings.
  * Sending set_steering_mode makes pi persist steeringMode=all into
  * settings.json. Hosted children skip that RPC.
  */
@@ -21,7 +21,7 @@ process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
-describe("I-63 hosted children do not write global settings", () => {
+describe("hosted children do not write global settings", () => {
   it("does not send set_steering_mode when spawning a hosted child", async () => {
     const ext = await startHostedExtension({ sessionId: "sess-steer", cwd: home });
     try {

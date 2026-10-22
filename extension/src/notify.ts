@@ -43,7 +43,7 @@ export interface NotifyCenterDeps {
   logEvent?: (type: string, fields?: Record<string, unknown>) => void;
   /**
    * When a wake is steered because the parent is busy, wait this long and
-   * if it is still busy, send the wake as a new turn (I-57). Default 45s.
+   * if it is still busy, send the wake as a new turn. Default 45s.
    */
   hangMs?: number;
 }

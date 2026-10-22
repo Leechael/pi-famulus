@@ -1,5 +1,5 @@
 /**
- * I-52. The daemon dies while a hosted child is mid-run. After reconnect
+ * The daemon dies while a hosted child is mid-run. After reconnect
  * the child must stop saying running, the parent must get a wake that
  * names it, and resume must be accepted.
  */
@@ -24,7 +24,7 @@ afterEach(() => resetHostedFakes());
 
 const SESSION = "sess-daemon-crash";
 
-describe("I-52 daemon dies while a hosted child runs", () => {
+describe("daemon dies while a hosted child runs", () => {
   it("marks the child interrupted, wakes the parent, and lets it resume", async () => {
     const ext = await startHostedExtension({ sessionId: SESSION, cwd: home });
     try {

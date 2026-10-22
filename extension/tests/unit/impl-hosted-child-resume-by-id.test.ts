@@ -1,5 +1,5 @@
 /**
- * I-39. After the parent process dies, resume by child_id must reconstruct
+ * After the parent process dies, resume by child_id must reconstruct
  * the run from the disk record and reattach the warm hosted child.
  */
 import { mkdtempSync, rmSync } from "node:fs";
@@ -25,7 +25,7 @@ const SESSION = "sess-resume-id";
 const CHILD = "ch_left_warm";
 const RUN = "run_left_warm";
 
-describe("I-39 resume a hosted child by child_id after the parent dies", () => {
+describe("resume a hosted child by child_id after the parent dies", () => {
   it("reattaches the warm child and sends the resume message", async () => {
     writeAgentChildRecord(home, {
       v: 1,

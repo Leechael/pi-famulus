@@ -97,7 +97,7 @@ pub struct SessionEntry {
     pub protocol: Option<u32>,
     pub connected_at: u64,
     pub last_seen: u64,
-    /// Set by shutdown_session so a later socket close is not a crash (I-34).
+    /// Set by shutdown_session so a later socket close is not a crash.
     pub ended_clean: bool,
 }
 
@@ -2385,7 +2385,7 @@ fn handle_stop(
 }
 
 /// A hosted child died. Stop the foreground shells it started so they do
-/// not keep running with nobody reading their output (I-38).
+/// not keep running with nobody reading their output.
 fn stop_child_bash_of(state: &Shared, child_id: &str) {
     let victims: Vec<(String, u32, String)> = {
         let mut st = state.lock().unwrap();

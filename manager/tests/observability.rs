@@ -370,7 +370,7 @@ fn e1_manager_writes_session_and_task_events() {
     assert_eq!(daemon[0]["protocol"], 6);
 }
 
-/// I-34. A gone parent is a crash when its pid is already dead, a shutdown
+/// A gone parent is a crash when its pid is already dead, a shutdown
 /// when it called shutdown_session, and a closed socket otherwise.
 #[test]
 fn e_session_disconnect_names_crash_shutdown_and_closed() {

@@ -1,5 +1,5 @@
 /**
- * I-55. An agent file that restricts tools (`tools: read`) must still leave
+ * An agent file that restricts tools (`tools: read`) must still leave
  * the child its two supervisor tools, contact_supervisor and agent_message
  * (design.md: they are always kept).
  *
@@ -67,7 +67,7 @@ async function hostedChildLaunch(home: string, tools: string[]): Promise<{ tools
   return { tools: i >= 0 ? argv[i + 1].split(",") : undefined, env };
 }
 
-describe("I-55 a tool allowlist keeps the supervisor tools", () => {
+describe("a tool allowlist keeps the supervisor tools", () => {
   it("a hosted child of a `tools: read` agent can still call contact_supervisor and agent_message", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-famulus-allowlist-"));
     tempDirs.push(root);

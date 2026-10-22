@@ -1,5 +1,5 @@
 /**
- * I-37. A hosted child that fails must settle as failed, and the parent's
+ * A hosted child that fails must settle as failed, and the parent's
  * wake must carry the failure. Two ways a child fails:
  *
  * - the provider rejects the request (429 rate limit, 500 server error):
@@ -46,7 +46,7 @@ async function settledChild(fail: (manager: Awaited<ReturnType<typeof startHoste
 
 afterEach(() => resetHostedFakes());
 
-describe("I-37 a failed hosted child is reported as failed", () => {
+describe("a failed hosted child is reported as failed", () => {
   it.each([
     ["429 rate limit", "429 Too Many Requests: rate limit exceeded, retry after 20s"],
     ["500 server error", "500 Internal Server Error: upstream overloaded"],
