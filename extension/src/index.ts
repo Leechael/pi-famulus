@@ -308,16 +308,14 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       if (task.kind !== "shell") continue;
       if (task.origin?.via === "child-bash") continue;
       if (sid && task.session_id && task.session_id !== sid) continue;
-      if (workIndex.get(task.task_id)) continue;
+      if (workIndex.get(task.task_id) || taskMeta.has(task.task_id)) continue;
       const startedAt = task.started_at ?? now;
-      if (!taskMeta.has(task.task_id)) {
-        taskMeta.set(task.task_id, {
-          kind: "shell",
-          command: task.command ?? "",
-          cwd: task.cwd,
-          startedAt,
-        });
-      }
+      taskMeta.set(task.task_id, {
+        kind: "shell",
+        command: task.command ?? "",
+        cwd: task.cwd,
+        startedAt,
+      });
       if (task.status === "running") {
         upsertBackgroundTask(task.task_id, startedAt);
         markNotifyOnExit(task.task_id);
