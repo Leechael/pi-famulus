@@ -341,6 +341,9 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     const lost: AgentChildRecord[] = [];
     for (const rec of stale) {
       if (rec.status !== "running" && rec.status !== "pending") continue;
+      const handle = subagentRegistry?.handle(rec.child_id);
+      // A local admission queue has no hosted process to look up yet.
+      if (handle?.status() === "pending") continue;
       let live = false;
       if (client?.isAvailable() && client.protocolLevel() >= 6) {
         const found =
@@ -348,7 +351,6 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         live = Boolean(found && (found.residency === "warm" || found.activity === "running" || found.activity === "starting"));
       }
       if (live) continue;
-      const handle = subagentRegistry?.handle(rec.child_id);
       if (handle && (handle.status() === "running" || handle.status() === "pending")) {
         if (!opts.interruptLive) continue;
         await handle.interrupt().catch(() => {});
