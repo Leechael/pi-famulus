@@ -396,10 +396,17 @@ export class SubagentRegistry implements RunRegistry {
     child.prompt = req.taskPrompt ?? req.prompt;
     child.preamble = req.agent.systemPrompt || undefined;
     child.model = req.model ?? req.agent.model;
-    const handle =
-      await runner.attach(req, (startingHandle) => {
+    let handle: ChildHandle;
+    try {
+      handle = await runner.attach(req, (startingHandle) => {
         child.handle = startingHandle;
       });
+    } catch (error) {
+      const failed = child.handle as DisposableChildHandle | undefined;
+      child.handle = undefined;
+      await failed?.dispose?.();
+      throw error;
+    }
     if (!this.children.has(child.childId)) return handle;
     child.handle = handle;
     handle.result.then((result) => this.settleChild(child.childId, result));

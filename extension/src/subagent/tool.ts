@@ -572,7 +572,8 @@ export function createSubagentTool(
       : params.child_id
         ? resolveRunByChild(registry, params.child_id)
         : undefined;
-    if (!record && params.child_id && !params.run_id && action === "resume" && deps.recoverChild) {
+    if (params.child_id && !params.run_id && action === "resume" && deps.recoverChild &&
+      (!record || !registry.findChild(record.runId, params.child_id))) {
       record =
         await deps.recoverChild(params.child_id);
     }
