@@ -33,7 +33,7 @@ afterEach(() => resetHostedFakes());
 const SESSION = "sess-restart";
 
 describe("I-19/I-40 the same session reopened after pi crashed", () => {
-  it.fails("reports the interrupted subagent and command, and settles the stale record", async () => {
+  it("reports the interrupted subagent and command, and settles the stale record", async () => {
     const startedAt = Date.now() - 10 * 60_000;
     writeAgentChildRecord(home, {
       v: 1,

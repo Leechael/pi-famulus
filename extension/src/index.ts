@@ -36,6 +36,7 @@ import { ChildShellTracker, createOverrunNotifier } from "./subagent/overrun";
 import {
   agentEndReason,
   headOf,
+  loadAgentChildRecords,
   tailOf,
   updateAgentChildMetrics,
   writeAgentChildRecord,
@@ -221,6 +222,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
    */
   const notifyOnExit = new Set<string>();
+  /** Sessions that already received the I-19/I-40 crash notice. */
+  const recoveredSessions = new Set<string>();
   const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
   const workIndex = new WorkIndex({ clock });
   const patchExited = (taskId: string, event: ManagerEvent): void => {
@@ -324,6 +327,73 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       upsertBackgroundTask(task.task_id, startedAt);
       deliverExit(task.task_id, exitEventFromRecord(task));
     }
+  };
+  /**
+   * The previous process died. Settle stale running agent records (the child
+   * is gone) and tell the model about that work and about commands the
+   * daemon already ended as manager-shutdown / manager-crash (I-19, I-40).
+   * A hosted child that is still warm is left for resume (I-39).
+   */
+  const recoverCrashedSession = async (sessionId: string): Promise<void> => {
+    if (!sessionId || recoveredSessions.has(sessionId)) return;
+    recoveredSessions.add(sessionId);
+    const stale = loadAgentChildRecords(home, { sessionId, includeTerminal: false });
+    const interrupted: AgentChildRecord[] = [];
+    for (const rec of stale) {
+      if (rec.status !== "running" && rec.status !== "pending") continue;
+      let live = false;
+      if (client?.isAvailable() && client.protocolLevel() >= 6) {
+        const found =
+          await client.hostedLookup({ sessionId: rec.child_id }).catch(() => null);
+        live = Boolean(found && (found.residency === "warm" || found.activity === "running" || found.activity === "starting"));
+      }
+      if (live) continue;
+      writeAgentChildRecord(home, {
+        ...rec,
+        status: "interrupted",
+        ended_at: rec.ended_at ?? clock.now(),
+        end_reason: "interrupted",
+        error: rec.error ?? "parent session ended",
+      });
+      interrupted.push(rec);
+    }
+    let killed: TaskRecord[] = [];
+    if (client?.isAvailable()) {
+      try {
+        const tasks = await client.list(true);
+        killed = tasks.filter((task) => {
+          if (task.session_id && task.session_id !== sessionId) return false;
+          if (task.kind !== "shell") return false;
+          return task.end_reason === "manager-shutdown" || task.end_reason === "manager-crash";
+        });
+      } catch {
+        killed = [];
+      }
+    }
+    if (interrupted.length === 0 && killed.length === 0) {
+      recoveredSessions.delete(sessionId);
+      return;
+    }
+    const lines = [
+      "System wake — not a new user message.",
+      "",
+      "This session was reopened after the previous process ended.",
+    ];
+    for (const rec of interrupted) {
+      lines.push(`Interrupted subagent ${rec.child_id} (${rec.name}).`);
+    }
+    for (const task of killed) {
+      lines.push(`Command ${task.task_id} ended while the session was gone (${task.end_reason ?? task.status}).`);
+    }
+    notifyCenter?.notify({
+      customType: "pi-famulus-wake",
+      content: lines.join("\n"),
+      details: {
+        kind: "session-recovery",
+        children: interrupted.map((rec) => rec.child_id),
+        tasks: killed.map((task) => task.task_id),
+      },
+    });
   };
   /**
    * Settle everything the manager reports as ended that we still show live:
@@ -1012,6 +1082,9 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       }
     });
     startFleetWidget(startCtx);
+    if (client?.isAvailable()) {
+      await recoverCrashedSession(startCtx.sessionManager.getSessionId());
+    }
 
     // Connect in the background: a cold manager spawn must not stall the
     // first prompt. The cache install, if one is running, finishes first so a
@@ -1032,6 +1105,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
           const sid = startCtx.sessionManager.getSessionId();
           void promptIfHostedSession(c, () => ctx, { sessionFile: file, sessionId: sid }, "start").catch(() => {});
           void syncWithManager();
+          void recoverCrashedSession(sid);
           return;
         }
         // A /reload may have replaced startCtx by now; report to the live one.
