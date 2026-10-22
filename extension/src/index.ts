@@ -45,7 +45,7 @@ import {
 } from "./subagent/agent-records";
 import { TranscriptWriter } from "./subagent/transcript";
 import { FleetWidget } from "./subagent/fleet-widget";
-import { WORK_RETAIN_MS, WorkIndex, type WorkItem } from "./work-index";
+import { printModeDropWarning, WORK_RETAIN_MS, WorkIndex, type WorkItem } from "./work-index";
 import { fileURLToPath } from "node:url";
 import { AGENT_WORK_KINDS, type AgentWorkKind } from "./subagent/types";
 import { isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
@@ -1240,6 +1240,14 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       binding.detach();
       parkRuntime({ version: EXTENSION_VERSION, runtime, dispose: teardown });
       return;
+    }
+    if (String((ctx as { mode?: string } | null)?.mode) === "print") {
+      const ids = [
+        ...workIndex.list().filter((item) => item.status === "running" || item.status === "pending").map((item) => item.id),
+        ...(subagentRegistry?.activeChildren() ?? []).map((child) => child.childId),
+      ];
+      const warning = printModeDropWarning([...new Set(ids)]);
+      if (warning) process.stderr.write(warning);
     }
     await teardown();
   });

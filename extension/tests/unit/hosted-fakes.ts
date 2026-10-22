@@ -282,10 +282,11 @@ export function fakeHostPi() {
   return { api: api as unknown as ExtensionAPI, sent, emit, tool };
 }
 
-export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: () => boolean } = {}) {
+export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: () => boolean; mode?: string } = {}) {
   return {
     cwd,
     hasUI: false,
+    mode: options.mode ?? "rpc",
     ui: { notify: () => {}, setWidget: () => {} },
     isIdle: options.idle ?? (() => true),
     sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined },
@@ -299,9 +300,9 @@ export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: ()
  * Load the extension on a fake pi and start a session. The calling test file
  * must mock `../../src/manager-client` with FakeHostedManager.
  */
-export async function startHostedExtension(opts: { sessionId: string; cwd: string; idle?: () => boolean; reason?: string }) {
+export async function startHostedExtension(opts: { sessionId: string; cwd: string; idle?: () => boolean; reason?: string; mode?: string }) {
   const pi = fakeHostPi();
-  const ctx = fakeHostCtx(opts.sessionId, opts.cwd, { idle: opts.idle });
+  const ctx = fakeHostCtx(opts.sessionId, opts.cwd, { idle: opts.idle, mode: opts.mode });
   const { default: extension } = await import("../../src/index");
   extension(pi.api);
   await pi.emit("session_start", { reason: opts.reason ?? "startup" }, ctx);
