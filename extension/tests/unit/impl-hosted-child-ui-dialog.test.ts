@@ -27,7 +27,7 @@ afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
 describe("I-59 a dialog inside a hosted child", () => {
-  it.fails("wakes the parent with what the child is waiting for", async () => {
+  it("wakes the parent with what the child is waiting for", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     const ext = await startHostedExtension({ sessionId: "sess-ui", cwd: home });
     try {

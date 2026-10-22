@@ -636,12 +636,35 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         residency?: string;
         driver?: string;
         last_text?: string;
+        request?: { type?: string; id?: string; method?: string; title?: string; message?: string };
       };
       if (hosted.event === "agent_comms" && hosted.child_id && hosted.request_id) {
         const reason = hosted.reason === "need_decision" ? "need_decision" : "progress_update";
         void comms.contactSupervisor(hosted.child_id, reason, hosted.message ?? "").then((reply) => {
           if (reason === "need_decision") void client?.agentCommsReply(hosted.request_id!, hosted.child_id!, reply).catch(() => {});
         }).catch(() => {});
+        return;
+      }
+      if (hosted.event === "agent_ui" && hosted.child_id) {
+        const request = hosted.request ?? {};
+        const title = typeof request.title === "string" ? request.title : "";
+        const body = typeof request.message === "string" ? request.message : "";
+        const method = typeof request.method === "string" ? request.method : "dialog";
+        sessionNotify?.notify({
+          customType: "pi-famulus-wake",
+          content:
+            `System wake — not a new user message.\n\n` +
+            `Subagent ${hosted.child_id} is waiting for a ${method}` +
+            (title ? `: ${title}` : ".") +
+            (body ? `\n${body}` : ""),
+          details: {
+            kind: "supervisor-request",
+            from: hosted.child_id,
+            method,
+            ...(title ? { title } : {}),
+            ...(body ? { message: body } : {}),
+          },
+        });
         return;
       }
       if (hosted.event === "agent_detach" && hosted.child_id) {
