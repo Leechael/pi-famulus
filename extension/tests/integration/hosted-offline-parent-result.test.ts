@@ -48,7 +48,7 @@ describe.skipIf(!HOSTED_INTEG)("I-20 results that finish while the parent is gon
     harness = null;
   });
 
-  it.fails("delivers the finished result as a wake and lists it after reconnect", async () => {
+  it("delivers the finished result as a wake and lists it after reconnect", async () => {
     const dirs = createHostedDirs();
     const readyPath = join(dirs.root, "holder-ready.json");
     const logPath = join(dirs.root, "holder.log");

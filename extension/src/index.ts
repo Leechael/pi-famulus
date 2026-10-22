@@ -43,7 +43,7 @@ import {
 } from "./subagent/agent-records";
 import { TranscriptWriter } from "./subagent/transcript";
 import { FleetWidget } from "./subagent/fleet-widget";
-import { WorkIndex, type WorkItem } from "./work-index";
+import { WORK_RETAIN_MS, WorkIndex, type WorkItem } from "./work-index";
 import { fileURLToPath } from "node:url";
 import { isFamulusChildSession, modelCandidates } from "./subagent/pi-runtime";
 import { createHostedSessionFn } from "./subagent/hosted-session";
@@ -291,6 +291,41 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     return out;
   };
   /**
+   * Parent-owned shells this process did not start (the previous pi died
+   * while the daemon stayed up). Running ones join the index and get an
+   * exit wake; recent finished ones are delivered the same way (I-20).
+   * manager-shutdown / manager-crash leftovers stay for the crash notice.
+   */
+  const adoptParentShells = (tasks: TaskRecord[]): void => {
+    const sid = ctx?.sessionManager.getSessionId() ?? "";
+    const now = clock.now();
+    for (const task of tasks) {
+      if (task.kind !== "shell") continue;
+      if (task.origin?.via === "child-bash") continue;
+      if (sid && task.session_id && task.session_id !== sid) continue;
+      if (workIndex.get(task.task_id)) continue;
+      const startedAt = task.started_at ?? now;
+      if (!taskMeta.has(task.task_id)) {
+        taskMeta.set(task.task_id, {
+          kind: "shell",
+          command: task.command ?? "",
+          cwd: task.cwd,
+          startedAt,
+        });
+      }
+      if (task.status === "running") {
+        upsertBackgroundTask(task.task_id, startedAt);
+        markNotifyOnExit(task.task_id);
+        continue;
+      }
+      if (task.end_reason === "manager-shutdown" || task.end_reason === "manager-crash") continue;
+      if (task.ended_at != null && now - task.ended_at > WORK_RETAIN_MS) continue;
+      if (task.status !== "completed" && task.status !== "failed" && task.status !== "killed") continue;
+      upsertBackgroundTask(task.task_id, startedAt);
+      deliverExit(task.task_id, exitEventFromRecord(task));
+    }
+  };
+  /**
    * Settle everything the manager reports as ended that we still show live:
    * monitors in the registry and shell/monitor rows in the index. Runs when
    * the user or model looks (task_list, /tasks), after task_stop, after a
@@ -316,6 +351,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       tasks = disk;
     }
     monitorRegistry?.reconcile(tasks);
+    adoptParentShells(tasks);
     for (const task of workIndex.staleLive(tasks)) {
       const event = exitEventFromRecord(task);
       // Route through the gate: if the real task_exited is processed after
@@ -995,6 +1031,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
           const file = startCtx.sessionManager.getSessionFile?.();
           const sid = startCtx.sessionManager.getSessionId();
           void promptIfHostedSession(c, () => ctx, { sessionFile: file, sessionId: sid }, "start").catch(() => {});
+          void syncWithManager();
           return;
         }
         // A /reload may have replaced startCtx by now; report to the live one.
