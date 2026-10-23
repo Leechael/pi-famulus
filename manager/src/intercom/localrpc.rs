@@ -59,7 +59,9 @@ pub fn bind_private(path: &Path) -> Result<tokio::net::UnixListener, String> {
         let listener = std::os::unix::net::UnixListener::bind(&staged)?;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        std::fs::rename(&staged, path)?;
+        // link, unlike rename, fails if anything appeared at the path since
+        // the caller cleared it, instead of silently replacing it.
+        std::fs::hard_link(&staged, path)?;
         tokio::net::UnixListener::from_std(listener)
     })();
     let _ = std::fs::remove_file(&staged);
@@ -664,6 +666,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_bind_never_replaces_a_path_that_appeared_meanwhile() {
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/ib-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.sock");
+        std::fs::write(&path, b"user data").unwrap();
+        assert!(super::bind_private(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"user data");
+        let leftovers = std::fs::read_dir(&root).unwrap().count();
+        assert_eq!(leftovers, 1, "staging left behind");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn bound_socket_is_never_visible_with_a_permissive_mode() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let root = std::path::PathBuf::from(format!(
@@ -690,17 +708,21 @@ mod tests {
             let (listener, _) = super::bind(&path)
                 .await
                 .unwrap_or_else(|error| panic!("{attempt}: {error}"));
+            assert_eq!(
+                std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             drop(listener);
             // A sibling test's fork can briefly hold the listener open, so
             // do not rely on bind's stale-socket probe here.
             std::fs::remove_file(&path).unwrap();
         }
         done.store(true, Ordering::Relaxed);
+        // The watcher may never catch the path; it must never see it open.
         let seen = watcher.join().unwrap();
-        assert_eq!(
-            seen.into_iter().collect::<Vec<_>>(),
-            vec![0o600],
-            "the socket was reachable before it was made owner-only"
+        assert!(
+            seen.iter().all(|mode| *mode == 0o600),
+            "the socket was reachable before it was made owner-only: {seen:?}"
         );
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
