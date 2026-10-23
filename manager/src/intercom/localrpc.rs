@@ -8,19 +8,22 @@ use tokio::sync::{mpsc, watch};
 
 #[cfg(unix)]
 pub async fn bind(path: &Path) -> Result<(tokio::net::UnixListener, (u64, u64)), String> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
     let parent = path.parent().ok_or("socket parent required")?;
-    if parent.exists() {
-        let m = std::fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
-        if !m.is_dir() || m.uid() != unsafe { libc::getuid() } {
-            return Err("socket directory must be private and owned by this user".into());
-        }
-        if m.mode() & 0o022 != 0 {
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| e.to_string())?;
-        }
-    } else {
-        super::config::private_dir(parent)?;
+    if let Some(ancestor) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+        super::config::private_dir(ancestor)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(parent) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let m = std::fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if !m.is_dir() || m.uid() != unsafe { libc::getuid() } || m.mode() & 0o022 != 0 {
+        return Err(format!(
+            "socket directory {} must be a directory owned by this user and not group/world writable",
+            parent.display()
+        ));
     }
     if let Ok(m) = std::fs::symlink_metadata(path) {
         if !m.file_type().is_socket() || m.uid() != unsafe { libc::getuid() } {
@@ -593,4 +596,48 @@ pub async fn call(_cfg: &Config, _req: Value) -> Result<Value, String> {
 #[cfg(not(unix))]
 pub async fn call_raw(_cfg: &Config, _req: Value) -> Result<Value, String> {
     Err("intercom native adapters support Linux/macOS only".into())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[tokio::test]
+    async fn bind_creates_missing_socket_directories_private() {
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/ib-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let path = root.join("nested/run/client.sock");
+        let (_listener, _) = super::bind(&path).await.unwrap();
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_a_writable_existing_directory_without_chmodding_it() {
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/ib-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = super::bind(&root.join("client.sock")).await.unwrap_err();
+        assert!(error.contains("writable"), "{error}");
+        assert_eq!(
+            mode(&root),
+            0o777,
+            "bind chmodded a directory it did not create"
+        );
+        assert!(!root.join("client.sock").exists());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_listener, _) = super::bind(&root.join("client.sock")).await.unwrap();
+        assert_eq!(mode(&root), 0o755);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
