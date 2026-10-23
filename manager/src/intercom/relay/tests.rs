@@ -1,78 +1,46 @@
 use super::*;
 
-// tungstenite fixes the handshake callback's error type to a full HTTP response.
-#[allow(clippy::result_large_err)]
 #[tokio::test]
-async fn dial_auto_retries_only_actual_cleartext_http_and_caches_the_plain_server() {
+async fn tls_url_answered_by_cleartext_http_fails_without_sending_the_token_in_clear() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        let (mut tls, _) = listener.accept().await.unwrap();
-        let mut record = [0u8; 5];
-        tls.read_exact(&mut record).await.unwrap();
-        assert_eq!(
-            record[0], 22,
-            "first attempt must really be TLS, not a fixture redirect"
-        );
-        let mut hello = vec![0; u16::from_be_bytes([record[3], record[4]]) as usize];
-        tls.read_exact(&mut hello).await.unwrap();
-        tls.write_all(
-            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )
-        .await
-        .unwrap();
-        tls.shutdown().await.unwrap();
-        let mut sockets = Vec::new();
         for _ in 0..2 {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut prefix = [0; 4];
-            assert_eq!(stream.peek(&mut prefix).await.unwrap(), 4);
-            assert_eq!(
-                &prefix, b"GET ",
-                "cached server must skip another TLS attempt"
-            );
-            sockets.push(
-                tokio_tungstenite::accept_hdr_async(
-                    stream,
-                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                     response| {
-                        assert_eq!(request.uri().path(), "/v1/relay");
-                        assert_eq!(request.uri().query(), None);
-                        assert_eq!(request.headers()["authorization"], "Bearer fixture");
-                        Ok(response)
-                    },
-                )
-                .await
-                .unwrap(),
-            );
+            let (mut tls, _) = listener.accept().await.unwrap();
+            let mut record = [0u8; 5];
+            tls.read_exact(&mut record).await.unwrap();
+            assert_eq!(record[0], 22, "a wss:// dial must only ever start with TLS");
+            let mut hello = vec![0; u16::from_be_bytes([record[3], record[4]]) as usize];
+            tls.read_exact(&mut hello).await.unwrap();
+            tls.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tls.shutdown().await.unwrap();
         }
-        sockets
+        tokio::time::timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err()
     });
-    let config = Config {
-        server: format!("https://{address}/discard?discard=yes#discard"),
-        token: "fixture".into(),
-        ..Config::default()
-    };
-    let first = tokio::time::timeout(Duration::from_secs(3), dial(&config))
-        .await
-        .unwrap();
-    let first = match first {
-        Ok(socket) => socket,
-        Err(error) => {
-            server.abort();
-            let _ = server.await;
-            panic!(
-                "real cleartext HTTP TLS record header must invoke Go DialAuto fallback: {error}"
-            );
-        }
-    };
-    let second = tokio::time::timeout(Duration::from_secs(3), dial(&config))
-        .await
-        .unwrap()
-        .unwrap();
-    let sockets = server.await.unwrap();
-    drop((first, second, sockets));
+    for scheme in ["wss", "https"] {
+        let config = Config {
+            server: format!("{scheme}://{address}"),
+            token: "fixture-secret".into(),
+            ..Config::default()
+        };
+        let error = tokio::time::timeout(Duration::from_secs(3), dial(&config))
+            .await
+            .unwrap()
+            .err()
+            .unwrap_or_else(|| panic!("{scheme}:// downgraded to cleartext"));
+        assert!(error.contains("cleartext"), "{error}");
+    }
+    assert!(
+        server.await.unwrap(),
+        "a cleartext retry carried the bearer token"
+    );
 }
 
 fn transport_runtime(cfg: Config) -> Shared {

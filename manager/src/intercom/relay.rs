@@ -493,42 +493,23 @@ async fn dial(c: &Config) -> Result<Socket, String> {
     dial_typed(c).await.map_err(|error| error.to_string())
 }
 async fn dial_typed(c: &Config) -> Result<Socket, TransportError> {
-    static PLAIN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let cache = PLAIN.get_or_init(Default::default);
-    let key = c.server.trim_end_matches('/');
-    let cached = cache.lock().unwrap().contains(key);
-    let first = dial_attempt(c, cached).await;
-    let result = match first {
-        Err(TransportError::TlsRecordHeader { prefix, .. }) if !cached && prefix == *b"HTTP/" => {
-            let result = dial_attempt(c, true).await;
-            if result.is_ok() {
-                cache.lock().unwrap().insert(key.into());
-            }
-            result
+    match dial_attempt(c).await {
+        Err(TransportError::TlsRecordHeader { prefix, .. }) if prefix == *b"HTTP/" => {
+            Err(TransportError::Io(
+                "relay server answered TLS with cleartext HTTP; refusing to send the relay token \
+                 unencrypted (configure an http:// or ws:// server URL to opt in)"
+                    .into(),
+            ))
         }
-        result => {
-            return if cached && result.is_ok() {
-                eprintln!(
-                    "intercom relay: server uses cleartext HTTP; the token travels unencrypted"
-                );
-                result
-            } else {
-                result
-            }
-        }
-    };
-    if result.is_ok() {
-        eprintln!("intercom relay: server uses cleartext HTTP; the token travels unencrypted");
+        result => result,
     }
-    result
 }
-async fn dial_attempt(c: &Config, plain: bool) -> Result<Socket, TransportError> {
+async fn dial_attempt(c: &Config) -> Result<Socket, TransportError> {
     let mut url =
         reqwest::Url::parse(&c.server).map_err(|error| TransportError::Io(error.to_string()))?;
     let scheme = match url.scheme() {
-        "https" | "wss" if !plain => "wss",
-        "https" | "wss" | "http" | "ws" => "ws",
+        "https" | "wss" => "wss",
+        "http" | "ws" => "ws",
         _ => return Err("relay URL must use http(s) or ws(s)".into()),
     };
     url.set_scheme(scheme)
