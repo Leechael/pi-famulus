@@ -1126,17 +1126,10 @@ impl Native {
                 let Ok(local_permit) = local_capacity.clone().try_acquire_owned() else {
                     continue;
                 };
-                let peer = stream.peer_cred().ok();
-                if peer
-                    .as_ref()
-                    .is_some_and(|credential| credential.uid() != unsafe { libc::getuid() })
-                {
+                let Some(peer) = alias::accepted_peer(&stream) else {
                     continue;
-                }
-                let pid = peer
-                    .and_then(|credential| credential.pid())
-                    .map(i64::from)
-                    .unwrap_or(0);
+                };
+                let pid = peer.unwrap_or(0);
                 if pid > 0 && pid != generation.pid {
                     continue;
                 }
@@ -1288,7 +1281,7 @@ pub(super) async fn write_control(endpoint: &Value, mut frame: Value) -> Result<
         .map_err(|error| error.to_string())
 }
 #[cfg(unix)]
-pub(super) async fn notice(_runtime: &Shared, frame: &Value, _peer_pid: i64) -> bool {
+pub(super) async fn notice(_runtime: &Shared, frame: &Value, _peer_pid: Option<i64>) -> bool {
     // Main/alias endpoints are never upstream native idle reply addresses.
     str_field(frame, "action") == "peer_idle_notice"
 }
@@ -2103,7 +2096,7 @@ mod tests {
         let id = fixture.add("pi/w");
         let request = fixture.proven(&id).await;
         let base_frame = json!({"type":"control","action":"peer_idle_notice","from":alias::from_identity(str_field(&fixture.peer.endpoint,"_socket")),"orig_msg_id":request["msg_id"],"state":"idle"});
-        assert!(notice(&fixture.runtime, &base_frame, i64::from(std::process::id())).await);
+        assert!(notice(&fixture.runtime, &base_frame, Some(i64::from(std::process::id()))).await);
         assert_eq!(
             fixture.runtime.state.lock().unwrap().subscriptions[&id].status,
             "subscribed"

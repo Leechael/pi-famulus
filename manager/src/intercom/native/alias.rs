@@ -498,8 +498,8 @@ pub(super) async fn reconcile_base(rt: &Shared) -> Result<(), String> {
                     let Ok((stream, _)) = accepted else { break };
                     let weak = weak.clone();
                     let generation = target_generation.clone();
+                    let Some(peer) = accepted_peer(&stream) else { continue };
                     connections.spawn(async move {
-                        let peer = stream.peer_cred().ok().and_then(|c| c.pid()).map(i64::from).unwrap_or(-1);
                         read_frames(stream, |frame| {
                             let weak = weak.clone();
                             let generation = generation.clone();
@@ -1131,11 +1131,13 @@ async fn spawn_alias(
                 Ok(packet) => packet,
                 Err(_) => break,
             };
-            let Some(peer) = packet["peer_pid"]
-                .as_i64()
-                .filter(|pid| *pid >= 0 && *pid <= i32::MAX as i64)
-            else {
-                break;
+            let peer = match packet.get("peer_pid") {
+                Some(Value::Null) => None,
+                Some(pid) => match pid.as_i64().filter(|pid| *pid > 0 && *pid <= i32::MAX as i64) {
+                    Some(pid) => Some(pid),
+                    None => break,
+                },
+                None => break,
             };
             let frame = &packet["frame"];
             if !frame.is_object() || str_field(frame, "type").is_empty() {
@@ -1352,11 +1354,33 @@ fn synthetic_receipt_source(socket: &str) -> Value {
     json!({"id":format!("claude/from/{basename}")})
 }
 
+/// Credentials of an accepted peer: `None` refuses it, `Some(None)` is a
+/// same-UID peer whose PID is gone. macOS answers LOCAL_PEEREPID with ENOTCONN
+/// once a one-shot writer has closed, but getpeereid keeps the connect-time UID;
+/// Linux SO_PEERCRED keeps both.
+#[cfg(unix)]
+pub(super) fn accepted_peer(stream: &tokio::net::UnixStream) -> Option<Option<i64>> {
+    let uid = unsafe { libc::getuid() };
+    if let Ok(credential) = stream.peer_cred() {
+        return (credential.uid() == uid).then(|| credential.pid().map(i64::from));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let (mut peer_uid, mut peer_gid) = (0, 0);
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) } == 0
+            && peer_uid == uid
+        {
+            return Some(None);
+        }
+    }
+    None
+}
 #[cfg(unix)]
 pub(super) async fn inbound(
     rt: &Shared,
     frame: &Value,
-    peer_pid: i64,
+    peer_pid: Option<i64>,
     target: Option<(&str, &str)>,
 ) {
     if *rt.closing.borrow() {
@@ -1394,7 +1418,7 @@ pub(super) async fn inbound(
             .and_then(|d| d.target_endpoint.clone());
         if let Some(endpoint) = endpoint {
             if socket == str_field(&endpoint, "_socket")
-                && validate_endpoint(&endpoint, Some(peer_pid)).is_ok()
+                && validate_endpoint(&endpoint, peer_pid).is_ok()
             {
                 rt.native_receipt(&endpoint, frame).await;
             }
@@ -1413,7 +1437,7 @@ pub(super) async fn inbound(
         match source {
             Some(source)
                 if str_field(&source, "harness") == "claude"
-                    && validate_endpoint(&source, Some(peer_pid)).is_ok() =>
+                    && validate_endpoint(&source, peer_pid).is_ok() =>
             {
                 rt.native_receipt(&source, frame).await;
             }
@@ -1438,11 +1462,11 @@ pub(super) async fn inbound(
         .find(|row| {
             str_field(row, "harness") == "claude"
                 && str_field(row, "_socket") == socket
-                && row["pid"].as_i64() == Some(peer_pid)
+                && peer_pid.is_none_or(|pid| row["pid"].as_i64() == Some(pid))
         })
         .cloned();
     let Some(source) = source else { return };
-    if validate_endpoint(&source, Some(peer_pid)).is_err() {
+    if validate_endpoint(&source, peer_pid).is_err() {
         return;
     }
     if str_field(frame, "action") == "notify_when_idle" {
@@ -1702,7 +1726,7 @@ async fn alias_child(args: Vec<String>) -> Result<(), String> {
                 _ = input.read_u8() => break,
                 accepted = listener.accept(), if connections.len() < 8 => {
                     let Ok((stream,_)) = accepted else { break };
-                    let peer_pid = stream.peer_cred().ok().and_then(|c|c.pid()).map(i64::from).unwrap_or(0);
+                    let Some(peer_pid) = accepted_peer(&stream) else { continue };
                     let frames = frames.clone();
                     connections.spawn(async move {
                         read_frames(stream, |frame| {
@@ -1829,6 +1853,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn closed_one_shot_peer_keeps_same_uid_credentials() {
+        use std::io::Write;
+        let fixture = Fixture::new();
+        let socket = fixture.dir.join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut peer = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        peer.write_all(b"{}\n").unwrap();
+        drop(peer);
+        let (stream, _) = listener.accept().await.unwrap();
+        let credentials = accepted_peer(&stream);
+        if cfg!(target_os = "macos") {
+            assert!(stream.peer_cred().is_err(), "macOS kept the closed peer PID");
+            assert_eq!(credentials, Some(None));
+        } else {
+            assert_eq!(credentials, Some(Some(i64::from(std::process::id()))));
+        }
+    }
     #[tokio::test]
     async fn previous_base_claim_preserves_live_same_incarnation() {
         #[cfg(target_os = "linux")]
