@@ -39,6 +39,48 @@ fn plain(fixture: &mut Fixture, manual: bool) -> common::Conn {
     manager
 }
 
+/// `intercom serve` against a running manager enables intercom there and
+/// stays up to take over later; returns once the enable succeeded.
+struct WaitingServe(Child);
+impl Drop for WaitingServe {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn serve_into_running_manager(
+    fixture: &Fixture,
+    args: &[&str],
+    cwd: &std::path::Path,
+    log: &str,
+) -> WaitingServe {
+    let log = fixture.root.join(log);
+    let file = fs::File::create(&log).unwrap();
+    let mut serve = WaitingServe(
+        fixture
+            .command()
+            .current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while !fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("taking over when it exits")
+    {
+        if let Some(status) = serve.0.try_wait().unwrap() {
+            panic!("serve exited {status}: {}", fs::read_to_string(&log).unwrap_or_default());
+        }
+        assert!(Instant::now() < deadline, "serve never enabled intercom");
+        thread::sleep(Duration::from_millis(10));
+    }
+    serve
+}
+
 fn config(fixture: &Fixture) -> Value {
     json!({"local_only":true,"name":"fixture-host","sock":fixture.sock,"state_dir":fixture.root.join("state"),"mcp_listen":"","mcp_token":"","remote_messages":"refuse"})
 }
@@ -61,8 +103,7 @@ fn relative_cli_socket_and_state_resolve_in_callers_cwd_not_existing_managers_cw
         "--state-dir",
         "relative-state",
     ];
-    let first = fixture.run_at(&args, &[], &caller);
-    assert_cli_ok(&first);
+    let _first = serve_into_running_manager(&fixture, &args, &caller, "first-serve.log");
     let expected = caller.join("relative.sock");
     assert!(
         UnixStream::connect(&expected).is_ok(),
@@ -73,8 +114,7 @@ fn relative_cli_socket_and_state_resolve_in_callers_cwd_not_existing_managers_cw
     assert!(!fixture.root.join("relative.sock").exists());
     assert!(!fixture.root.join("relative-state").exists());
     let before = fs::metadata(&expected).unwrap();
-    let repeated = fixture.run_at(&args, &[], &caller);
-    assert_cli_ok(&repeated);
+    let _repeated = serve_into_running_manager(&fixture, &args, &caller, "repeated-serve.log");
     use std::os::unix::fs::MetadataExt;
     let after = fs::metadata(&expected).unwrap();
     assert_eq!(

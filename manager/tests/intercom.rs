@@ -880,6 +880,101 @@ fn live_socket_is_never_stolen_by_a_second_manager_home() {
 }
 
 #[test]
+fn intercom_serve_stays_supervised_and_takes_over_when_the_existing_manager_exits() {
+    struct ServeProcess(Child);
+    impl Drop for ServeProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut fixture = Fixture::new();
+    let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
+    fixture.child = Some(
+        Command::new(BIN)
+            .arg("--home")
+            .arg(fixture.root.join("manager"))
+            .arg("daemon")
+            .env("HOME", &fixture.root)
+            .env("XDG_CONFIG_HOME", fixture.root.join("config"))
+            .env("CODEX_HOME", fixture.root.join("codex"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let manager_sock = fixture.root.join("manager/manager.sock");
+    let deadline = Instant::now() + TIMEOUT;
+    while UnixStream::connect(&manager_sock).is_err() {
+        assert!(Instant::now() < deadline, "ordinary manager failed to listen");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let serve_log = fixture.root.join("supervised.log");
+    let log = fs::File::create(&serve_log).unwrap();
+    let mut serve = ServeProcess(
+        fixture
+            .command()
+            .args(["serve", "--local-only"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while UnixStream::connect(&fixture.sock).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "intercom activation never became ready: {}",
+            fs::read_to_string(&serve_log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        serve.0.try_wait().unwrap().is_none(),
+        "intercom serve exited while another process owns the manager; launchd would stop supervising: {}",
+        fs::read_to_string(&serve_log).unwrap_or_default()
+    );
+    let mut external = fixture.child.take().unwrap();
+    assert_eq!(unsafe { libc::kill(external.id() as i32, libc::SIGTERM) }, 0);
+    external.wait().unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let _manager = loop {
+        if let Ok(stream) = UnixStream::connect(&manager_sock) {
+            let mut conn = common::Conn::new(stream);
+            if conn.hello_ext("takeover")["pid"] == serve.0.id() {
+                break conn;
+            }
+        }
+        assert!(
+            serve.0.try_wait().unwrap().is_none(),
+            "intercom serve exited instead of taking over: {}",
+            fs::read_to_string(&serve_log).unwrap_or_default()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "intercom serve never took over the manager: {}",
+            fs::read_to_string(&serve_log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    let mut sender = loop {
+        if let Ok(stream) = UnixStream::connect(&fixture.sock) {
+            break Peer::new(stream);
+        }
+        assert!(Instant::now() < deadline, "intercom did not return after takeover");
+        thread::sleep(Duration::from_millis(20));
+    };
+    sender.register("takeover-sender", "busy", &["read_receipts", "idle_state_v1"]);
+    let mut target = fixture.plugin("takeover-target", "busy");
+    let sent = sender.ok(json!({"op":"send","to":"pi/takeover-target","body":"supervised again"}));
+    assert_eq!(target.event("deliver")["message_id"], sent["message_id"]);
+}
+
+#[test]
 fn intercom_serve_enables_existing_manager_without_losing_its_active_task() {
     struct EnableProcess(Child);
     impl Drop for EnableProcess {

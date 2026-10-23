@@ -280,27 +280,37 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     }
     // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
     // holder removes stale socket/pid files before binding. Held until exit.
-    let daemon_lock = match lifecycle::claim_daemon(&home) {
-        Ok(Claim::Acquired(guard)) => guard,
-        Ok(Claim::AlreadyRunning { pid }) => {
-            if let Some(config) = crate::intercom::configuration() {
-                return match crate::client::enable_intercom(&home, config.clone()).await {
-                    Ok(()) => 0,
-                    Err(error) => {
-                        eprintln!("pi-famulus: cannot enable intercom: {error}");
-                        1
+    let daemon_lock = loop {
+        match lifecycle::claim_daemon(&home) {
+            Ok(Claim::Acquired(guard)) => break guard,
+            Ok(Claim::AlreadyRunning { pid }) => {
+                let Some(config) = crate::intercom::configuration() else {
+                    match pid {
+                        Some(pid) => println!("pi-famulus already running (pid {pid})"),
+                        None => println!("pi-famulus already running (starting up)"),
                     }
+                    return 0;
                 };
+                if let Err(error) = crate::client::enable_intercom(&home, config.clone()).await {
+                    eprintln!("pi-famulus: cannot enable intercom: {error}");
+                    return 1;
+                }
+                // `intercom serve` is a supervised job (launchd KeepAlive):
+                // exiting 0 here would end supervision while another
+                // process owns the manager. Stay up and take over once it
+                // exits.
+                eprintln!(
+                    "pi-famulus: intercom enabled in the running manager{}; taking over when it exits",
+                    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+                );
+                while lifecycle::lock_held(&home) {
+                    tokio::time::sleep(DAEMON_TAKEOVER_POLL).await;
+                }
             }
-            match pid {
-                Some(pid) => println!("pi-famulus already running (pid {pid})"),
-                None => println!("pi-famulus already running (starting up)"),
+            Err(e) => {
+                eprintln!("pi-famulus: daemon lock failed: {e}");
+                return 1;
             }
-            return 0;
-        }
-        Err(e) => {
-            eprintln!("pi-famulus: daemon lock failed: {e}");
-            return 1;
         }
     };
 
@@ -375,6 +385,10 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     start_agent_loops(&state);
     serve(state, listener, daemon_lock, false).await
 }
+
+/// How often `intercom serve` checks whether the manager it enabled
+/// intercom in has exited.
+const DAEMON_TAKEOVER_POLL: Duration = Duration::from_millis(500);
 
 /// Clients get this long to reconnect after an in-place upgrade before the
 /// zero-connection idle rule (§3.2) applies again.
