@@ -121,7 +121,7 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
         );
         socket
             .send(Message::Text(
-                json!({"type":"welcome","features":["send_message_id_v1"]})
+                json!({"type":"welcome","machine_id":"transport-fixture","send_message_id_v1":true})
                     .to_string()
                     .into(),
             ))
@@ -150,6 +150,10 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
     })
     .await
     .unwrap();
+    assert!(
+        rt.state.lock().unwrap().relay_message_ids,
+        "the fixture welcome must negotiate send_message_id_v1 like the real relay"
+    );
     let first = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut fence = Some(first.clone().lock_owned().await);
     // The fenced frame is small so it flushes regardless of the platform's
