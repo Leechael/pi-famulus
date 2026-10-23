@@ -218,6 +218,17 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
         "delivered",
         "native callback without an admitted outgoing route must still record a status fact"
     );
+    // The native namespace follows the first live Claude socket. Keep another
+    // peer there so removing the target's registry does not move the
+    // namespace and respawn the pi/remote alias before the orphan callback.
+    let _anchor = super::super::native::ClaudePeer::socket_namespace_flags(
+        &fixture,
+        "native",
+        "namespace-anchor",
+        "anchor.sock",
+        &[],
+    );
+    fixture.wait_session("claude/namespace-anchor");
     target.remove_registry(&fixture);
     let deadline = Instant::now() + TIMEOUT;
     loop {
