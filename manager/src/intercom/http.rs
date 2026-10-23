@@ -758,9 +758,9 @@ async fn resolve_to(rt: &Shared, to: &str) -> Result<String, String> {
         _ => Err(format!("session {to:?} is ambiguous")),
     }
 }
-// deferred: binding `from` to a caller credential | impact: any local MCP caller can still
-// speak as any live local agent session, never as a remote, webhook or unknown id |
-// trigger: MCP clients can present a per-session credential
+// deferred: binding `from` to a caller credential | impact: any holder of the one MCP bearer
+// token (this user's MCP clients) can speak as any live local agent session, never as a
+// remote, webhook or unknown id | trigger: MCP clients can present a per-session credential
 async fn local_sender(rt: &Shared, from: &str) -> Result<(), String> {
     let rows = rt.directory().await;
     if rows
