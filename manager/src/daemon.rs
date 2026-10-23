@@ -142,6 +142,11 @@ struct AgentGrant {
     queued_behind: Option<u64>,
 }
 
+struct IntercomEnableRequest {
+    config: Box<crate::intercom::config::Config>,
+    reply: tokio::sync::oneshot::Sender<Result<UnitOk, ProtoError>>,
+}
+
 pub struct DaemonState {
     pub home: PathBuf,
     pub started_at_ms: u64,
@@ -197,6 +202,8 @@ pub struct DaemonState {
     /// Hosted `pi --mode rpc` subagents.
     pub hosted: crate::hosted::Hosted,
     agent_notices: Option<mpsc::UnboundedReceiver<crate::hosted::Notice>>,
+    intercom_enable: mpsc::Sender<IntercomEnableRequest>,
+    intercom_enable_rx: Option<mpsc::Receiver<IntercomEnableRequest>>,
 }
 
 /// Bound on remembered start keys.
@@ -211,6 +218,7 @@ const PENDING_AGENT_REQUEST_IDS_MAX: usize = 8;
 impl DaemonState {
     fn new(home: PathBuf, registry: Registry, foreground: bool) -> DaemonState {
         let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let (intercom_enable, intercom_enable_rx) = mpsc::channel(1);
         let hosted_home = home.clone();
         DaemonState {
             home,
@@ -243,6 +251,8 @@ impl DaemonState {
             agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
             hosted: crate::hosted::Hosted::new(hosted_home, notice_tx),
             agent_notices: Some(notice_rx),
+            intercom_enable,
+            intercom_enable_rx: Some(intercom_enable_rx),
         }
     }
 }
@@ -273,6 +283,15 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     let daemon_lock = match lifecycle::claim_daemon(&home) {
         Ok(Claim::Acquired(guard)) => guard,
         Ok(Claim::AlreadyRunning { pid }) => {
+            if let Some(config) = crate::intercom::configuration() {
+                return match crate::client::enable_intercom(&home, config.clone()).await {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("pi-famulus: cannot enable intercom: {error}");
+                        1
+                    }
+                };
+            }
             match pid {
                 Some(pid) => println!("pi-famulus already running (pid {pid})"),
                 None => println!("pi-famulus already running (starting up)"),
@@ -386,6 +405,15 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     lifecycle::scan_tasks_except(&home, &mut registry, &live);
     for e in entries {
         registry.tasks.insert(e.record.task_id.clone(), e);
+    }
+    if let Some(config) = snap.intercom_config.clone() {
+        if let Err(error) = crate::intercom::configure(config) {
+            lifecycle::log_line(
+                &home,
+                &format!("upgrade: intercom configuration failed: {error}"),
+            );
+            return 1;
+        }
     }
     let mut st = DaemonState::new(home.clone(), registry, snap.foreground);
     st.started_at_ms = snap.started_at_ms;
@@ -550,6 +578,20 @@ fn ctrl_c_or_pending(
 async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
     let home = state.lock().unwrap().home.clone();
 
+    let intercom_clock = state.lock().unwrap().clock.clone();
+    let mut intercom = if let Some(config) = crate::intercom::configuration() {
+        match crate::intercom::start(config.clone(), intercom_clock.clone()).await {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                lifecycle::log_line(&home, &format!("intercom startup failed: {error}"));
+                eprintln!("intercom: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
     let live_cpu_sampler = spawn_live_cpu_sampler(&state);
@@ -563,9 +605,15 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
     // spawn per §3.1, so this never fires for a healthy startup).
     maybe_arm_idle_timer(&state);
 
-    let (shutdown_notify, upgrade_notify) = {
-        let st = state.lock().unwrap();
-        (st.shutdown_notify.clone(), st.upgrade_notify.clone())
+    let (shutdown_notify, upgrade_notify, mut intercom_enable_rx) = {
+        let mut st = state.lock().unwrap();
+        (
+            st.shutdown_notify.clone(),
+            st.upgrade_notify.clone(),
+            st.intercom_enable_rx
+                .take()
+                .expect("intercom enable receiver"),
+        )
     };
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
@@ -592,13 +640,29 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
+            Some(request) = intercom_enable_rx.recv(), if shutdown_task.is_none() => {
+                if request.reply.is_closed() {
+                    continue;
+                }
+                let result = enable_intercom_runtime(&state, *request.config, &mut intercom).await;
+                let _ = request.reply.send(result);
+            },
             _ = upgrade_notify.notified(), if shutdown_task.is_none() => {
                 #[cfg(unix)]
                 {
                     let ready = state.lock().unwrap().upgrade_ready.take();
                     if let Some(ready) = ready {
                         // Returns only if the upgrade did not happen.
+                        if let Some(runtime) = intercom.take() {
+                            runtime.shutdown().await;
+                        }
                         let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
+                        if let Some(config) = crate::intercom::configuration() {
+                            match crate::intercom::start(config.clone(), intercom_clock.clone()).await {
+                                Ok(runtime) => intercom = Some(runtime),
+                                Err(error) => lifecycle::log_line(&home, &format!("intercom restart after failed upgrade: {error}")),
+                            }
+                        }
                     }
                 }
                 #[cfg(windows)]
@@ -614,6 +678,9 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }
             _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
+                if let Some(runtime) = &intercom {
+                    runtime.stop_accepting();
+                }
                 shutdown_task = Some(begin_shutdown(&state));
             }
             _ = async {
@@ -633,6 +700,9 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, if cfg!(windows) { "received Ctrl-C" } else { "received SIGTERM" });
+                if let Some(runtime) = &intercom {
+                    runtime.stop_accepting();
+                }
                 shutdown_task = Some(begin_shutdown(&state));
             }
             _ = async {
@@ -649,6 +719,9 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGINT");
+                if let Some(runtime) = &intercom {
+                    runtime.stop_accepting();
+                }
                 shutdown_task = Some(begin_shutdown(&state));
             }
             _ = async {
@@ -658,6 +731,9 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             } => break,
         }
+    }
+    if let Some(intercom) = intercom {
+        intercom.shutdown().await;
     }
     live_cpu_sampler.abort();
     drop(daemon_lock);
@@ -1615,7 +1691,7 @@ fn start_agent_loops(state: &Shared) {
 pub fn maybe_arm_idle_timer(state: &Shared) {
     let mut st = state.lock().unwrap();
     let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
-    let warm = st.hosted.warm_count() > 0;
+    let warm = st.hosted.warm_count() > 0 || crate::intercom::enabled();
     if st.shutdown || st.upgrading || st.hold_idle || session_conn || warm || st.idle_timer.is_some()
     {
         return;
@@ -1627,7 +1703,7 @@ pub fn maybe_arm_idle_timer(state: &Shared) {
         let fired = {
             let mut st = state2.lock().unwrap();
             let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
-            let warm = st.hosted.warm_count() > 0;
+            let warm = st.hosted.warm_count() > 0 || crate::intercom::enabled();
             if !session_conn && !warm && !st.shutdown {
                 st.shutdown = true;
                 Some((st.home.clone(), st.shutdown_notify.clone()))
@@ -1876,6 +1952,14 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             } else {
                 respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "peers": hosted.peers(&child_id) }))).await;
             }
+        }
+        RequestKind::IntercomEnable { config } => {
+            respond(
+                &tx,
+                &id,
+                handle_intercom_enable(&state, conn_id, config).await,
+            )
+            .await;
         }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
@@ -3350,6 +3434,85 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
             .ok()
             .map(|p| p.display().to_string()),
     })
+}
+
+async fn handle_intercom_enable(
+    state: &Shared,
+    conn_id: u64,
+    config: Box<crate::intercom::config::Config>,
+) -> Result<UnitOk, ProtoError> {
+    let sender = {
+        let st = state.lock().unwrap();
+        if !st
+            .conns
+            .get(&conn_id)
+            .is_some_and(|conn| conn.role == ConnRole::Cli)
+        {
+            return Err(ProtoError::new(
+                E_FORBIDDEN,
+                "intercom_enable is a cli-only operation",
+            ));
+        }
+        if st.shutdown || st.upgrading {
+            return Err(ProtoError::new(
+                E_INTERNAL,
+                "manager is shutting down or upgrading",
+            ));
+        }
+        st.intercom_enable.clone()
+    };
+    config
+        .validate()
+        .map_err(|error| ProtoError::new(E_BAD_REQUEST, error))?;
+    let (reply, response) = tokio::sync::oneshot::channel();
+    sender
+        .try_send(IntercomEnableRequest { config, reply })
+        .map_err(|_| ProtoError::new(E_INTERNAL, "intercom enable is already pending"))?;
+    response
+        .await
+        .map_err(|_| ProtoError::new(E_INTERNAL, "manager stopped before enabling intercom"))?
+}
+
+async fn enable_intercom_runtime(
+    state: &Shared,
+    config: crate::intercom::config::Config,
+    running: &mut Option<crate::intercom::Running>,
+) -> Result<UnitOk, ProtoError> {
+    let clock = {
+        let st = state.lock().unwrap();
+        if st.shutdown || st.upgrading {
+            return Err(ProtoError::new(
+                E_INTERNAL,
+                "manager is shutting down or upgrading",
+            ));
+        }
+        st.clock.clone()
+    };
+    if let Some(current) = crate::intercom::configuration() {
+        if current != &config {
+            return Err(ProtoError::new(
+                E_BAD_REQUEST,
+                "intercom is already configured differently",
+            ));
+        }
+        if running.is_some() {
+            return Ok(UnitOk {});
+        }
+    }
+    let runtime = crate::intercom::start(config.clone(), clock)
+        .await
+        .map_err(|error| ProtoError::new(E_INTERNAL, error))?;
+    if crate::intercom::configuration().is_none() {
+        if let Err(error) = crate::intercom::configure(config) {
+            runtime.shutdown().await;
+            return Err(ProtoError::new(E_INTERNAL, error));
+        }
+    }
+    *running = Some(runtime);
+    if let Some(timer) = state.lock().unwrap().idle_timer.take() {
+        timer.abort();
+    }
+    Ok(UnitOk {})
 }
 
 fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError> {

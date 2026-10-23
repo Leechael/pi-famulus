@@ -26,6 +26,8 @@ pub struct Snapshot {
     pub trigger: String,
     pub started_at_ms: u64,
     pub foreground: bool,
+    #[serde(default)]
+    pub intercom_config: Option<crate::intercom::config::Config>,
     pub listener_fd: RawFd,
     pub lock_fd: RawFd,
     pub lifeline_read_fd: RawFd,
@@ -419,6 +421,7 @@ fn snapshot(
         trigger: trigger.to_string(),
         started_at_ms: st.started_at_ms,
         foreground: st.foreground,
+        intercom_config: crate::intercom::configuration().cloned(),
         listener_fd,
         lock_fd,
         lifeline_read_fd: lifeline.read.as_raw_fd(),

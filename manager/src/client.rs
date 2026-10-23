@@ -174,6 +174,20 @@ async fn reconnect(home: &Path) -> Result<Conn, String> {
 // Connect + spawn flow (§3.1)
 // ---------------------------------------------------------------------------
 
+/// Enable intercom without replacing the manager or its running tasks.
+pub async fn enable_intercom(
+    home: &Path,
+    config: crate::intercom::config::Config,
+) -> Result<(), String> {
+    let mut conn = reconnect(home).await?;
+    let _: UnitOk = conn
+        .roundtrip(RequestKind::IntercomEnable {
+            config: Box::new(config),
+        })
+        .await?;
+    Ok(())
+}
+
 /// Connect to a running daemon and say hello; never spawns one.
 pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
     let sock = lifecycle::socket_path(home);

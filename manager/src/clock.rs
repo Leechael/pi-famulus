@@ -47,6 +47,13 @@ impl Clock {
         Clock::default()
     }
 
+    #[cfg(all(test, feature = "test-clock"))]
+    pub(crate) fn manual_for_test() -> Clock {
+        Clock {
+            manual: Some(std::sync::Arc::new(manual::Manual::default())),
+        }
+    }
+
     /// Sleep for `d` on this clock. `label` names the timer in
     /// `clock_status` (manual clock only).
     #[allow(unused_variables)]

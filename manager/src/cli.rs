@@ -52,8 +52,17 @@ impl Sub {
 // Help sections follow docs/cli.md. `completion` stays with the built-in
 // `help` under Commands: a heading equal to that default title would merge
 // into it, and the ungrouped section is always rendered first.
+// usage flatten requires CommandArgs, which is not implemented for Box<T>.
+#[allow(clippy::large_enum_variant)]
 #[derive(usage::Subcommands)]
 pub(crate) enum Sub {
+    /// Cross-harness and cross-machine agent intercom client.
+    Intercom {
+        #[usage(flatten)]
+        options: crate::intercom::cli::Options,
+        #[usage(subcommand)]
+        action: crate::intercom::cli::Command,
+    },
     /// Read or update runtime daemon configuration.
     #[usage(display_order = 165, help_heading = "Daemon")]
     Config { #[usage(subcommand)] action: ConfigAction },

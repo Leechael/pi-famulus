@@ -272,6 +272,10 @@ pub enum HelloRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestKind {
+    /// Enable the intercom client inside an already-running manager (CLI only).
+    IntercomEnable {
+        config: Box<crate::intercom::config::Config>,
+    },
     /// §3.3 hello — must be the first message on a connection.
     Hello {
         client_kind: ClientKind,
