@@ -1,3 +1,9 @@
+// `configure` refuses on Windows, so the Unix-socket native adapters below are
+// compiled there but unreachable.
+#![cfg_attr(
+    windows,
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
 pub mod cli;
 pub mod config;
 mod deliveries;
@@ -21,7 +27,7 @@ pub fn configure(c: Config) -> Result<(), String> {
     #[cfg(windows)]
     {
         let _ = c;
-        return Err("intercom native adapters support Linux/macOS only".into());
+        Err("intercom native adapters support Linux/macOS only".into())
     }
     #[cfg(not(windows))]
     CONFIG

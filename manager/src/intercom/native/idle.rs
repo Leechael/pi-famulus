@@ -436,7 +436,7 @@ impl Native {
         #[cfg(not(unix))]
         {
             let _ = (snapshot, child, now);
-            return Err("native idle supports Linux/macOS only".into());
+            Err("native idle supports Linux/macOS only".into())
         }
         #[cfg(unix)]
         {

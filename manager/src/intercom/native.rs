@@ -2,9 +2,11 @@ mod alias;
 mod codex;
 mod desktop;
 mod idle;
+#[cfg(unix)]
 mod policy;
 use super::{str_field, Shared};
 pub use alias::alias_main;
+#[cfg(unix)]
 use alias::reconcile_aliases;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -64,7 +66,10 @@ impl Native {
             .find(|r| str_field(r, "id") == id)
             .cloned()
             .ok_or("cross-machine message refused: cannot verify Claude source")?;
-        policy::check(&row)
+        #[cfg(unix)]
+        return policy::check(&row);
+        #[cfg(not(unix))]
+        Err("cross-machine message refused: Claude source verification is unsupported on this platform".into())
     }
     pub fn stop_accepting(&self) {
         #[cfg(unix)]
