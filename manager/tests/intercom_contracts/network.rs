@@ -975,3 +975,49 @@ fn remote_directory_rows_never_shadow_or_impersonate_local_sessions() {
 fn str_field_or_empty<'a>(row: &'a Value, key: &str) -> &'a str {
     row[key].as_str().unwrap_or("")
 }
+
+#[test]
+fn mcp_list_sessions_and_relay_snapshot_omit_internal_fields() {
+    let relay = WireRelay::new(relay_basics);
+    let mut fixture = Fixture::new();
+    let address = vacant_address();
+    let listen = address.to_string();
+    start_relay_options(
+        &mut fixture,
+        &relay,
+        "",
+        &["--mcp-listen", &listen, "--mcp-token", "fixture-secret"],
+    );
+    let mut plugin = fixture.connect();
+    plugin.ok(json!({"op":"register","session":{"id":"leaky","name":"leaky","cwd":"/fixture/leaky","pid":std::process::id(),"status":"busy","_socket":"/private/socket","_generation":"g1","caps":["read_receipts"]}}));
+    let leaked = |row: &Value| {
+        row.as_object()
+            .unwrap()
+            .keys()
+            .any(|key| key.starts_with('_') || key == "pid")
+    };
+    let sessions = tool(address, "fixture-secret", "list_sessions", json!({}));
+    let listed = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "pi/leaky")
+        .expect("registered session listed over MCP");
+    assert!(!leaked(listed), "MCP list_sessions leaked internals: {listed}");
+    assert_eq!(listed["cwd"], "/fixture/leaky");
+    let deadline = Instant::now() + TIMEOUT;
+    let published = loop {
+        let snapshot = relay.request("snapshot");
+        if let Some(row) = snapshot["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["id"] == "pi/leaky")
+        {
+            break row.clone();
+        }
+        assert!(Instant::now() < deadline, "snapshot never published pi/leaky");
+    };
+    assert!(!leaked(&published), "relay snapshot leaked internals: {published}");
+    assert_eq!(published["cwd"], "/fixture/leaky");
+}

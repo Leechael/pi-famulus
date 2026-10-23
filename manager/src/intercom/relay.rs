@@ -161,7 +161,7 @@ pub async fn send(
         )
     };
     let rows = rt.directory().await;
-    let snapshot = json!({"type":"snapshot","machine_id":rt.machine,"sessions":rows.into_iter().filter(|v|str_field(v,"machine_id").is_empty()&&!str_field(v,"id").starts_with("webhook/")).collect::<Vec<_>>()});
+    let snapshot = json!({"type":"snapshot","machine_id":rt.machine,"sessions":snapshot_rows(rows)});
     let writer = {
         let mut state = rt.state.lock().unwrap();
         if state.relay_generation != generation {
@@ -752,6 +752,12 @@ impl<T: Send + 'static> Lanes<T> {
     }
 }
 const DELIVERY_WORKERS: usize = 32;
+fn snapshot_rows(rows: Vec<Value>) -> Vec<Value> {
+    rows.into_iter()
+        .filter(|v| str_field(v, "machine_id").is_empty() && !str_field(v, "id").starts_with("webhook/"))
+        .map(super::public_row)
+        .collect()
+}
 const DELIVERY_PER_TARGET: usize = 256;
 const DELIVERY_TARGETS: usize = 1024;
 fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
@@ -898,7 +904,7 @@ async fn session(
     let result = loop {
         tokio::select! {
             _=stop.changed()=>break Ok(()),
-            _=tick.tick()=>{let rows=rt.directory().await;let local:Vec<_>=rows.into_iter().filter(|v|str_field(v,"machine_id").is_empty()&&!str_field(v,"id").starts_with("webhook/")).collect();let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
+            _=tick.tick()=>{let local=snapshot_rows(rt.directory().await);let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
             if let Err(e)=ws.send(Message::Text(json!({"type":"list","id":"directory"}).to_string().into())).await{break Err(e);}}
             req=rx.recv()=>{if let Some(packet)=req{let v=packet.value;let result=ws.send(Message::Text(v.to_string().into())).await;drop(packet.fence);if let Err(e)=result{if is_control(&v){failed_control=Some(v);}break Err(e);}}}
             msg=ws.next()=>match msg{

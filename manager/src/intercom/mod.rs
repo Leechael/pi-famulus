@@ -881,6 +881,14 @@ pub(crate) fn valid_intercom_id(id: &str) -> bool {
             && crate::daemon::valid_session_id(rest)
     })
 }
+/// The directory row as published beyond this daemon: `_`-prefixed fields are
+/// internal routing state and the pid is only meaningful on this host.
+pub(crate) fn public_row(mut row: Value) -> Value {
+    if let Some(fields) = row.as_object_mut() {
+        fields.retain(|key, _| !key.starts_with('_') && key != "pid");
+    }
+    row
+}
 
 async fn probe_tool_status() -> Value {
     let mut report = json!({});
