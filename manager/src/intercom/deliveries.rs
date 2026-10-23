@@ -239,6 +239,9 @@ impl super::Runtime {
 const HISTORY_LIMIT: usize = 4096;
 const ROUTE_LIMIT: usize = 1024;
 const TTL_MS: u64 = 10 * 60 * 1000;
+const APPROVAL_TTL_MS: u64 = 24 * 3600 * 1000;
+const RETRY_MIN_MS: u64 = 1000;
+const RETRY_MAX_MS: u64 = 30 * 1000;
 
 pub(super) fn rank(status: &str) -> u8 {
     match status {
@@ -291,12 +294,36 @@ impl Delivery {
         self.status = status.into();
         self.updated_at = now;
         if status == "held" {
-            self.approval_pin = true;
+            if !self.approval_pin {
+                self.approval_pin = true;
+                self.lease_at = now;
+            }
+        } else if self.approval_pin {
+            self.approval_pin = false;
+            self.lease_at = now;
         }
         if status == "delivered" && !self.route_terminal() {
             self.lease_at = now;
         }
         changed
+    }
+    fn lease_live(&self, now: u64) -> bool {
+        let ttl = if self.approval_pin {
+            APPROVAL_TTL_MS
+        } else {
+            TTL_MS
+        };
+        now.saturating_sub(self.lease_at) <= ttl
+    }
+    pub(super) fn retry_due(&self, now: u64) -> bool {
+        !self.forwarding && now >= self.retry_at
+    }
+    pub(super) fn retry_failed(&mut self, now: u64) {
+        self.retry_delay = self
+            .retry_delay
+            .saturating_mul(2)
+            .clamp(RETRY_MIN_MS, RETRY_MAX_MS);
+        self.retry_at = now.saturating_add(self.retry_delay);
     }
 }
 impl State {
@@ -321,16 +348,12 @@ impl State {
     }
     pub fn prune_deliveries(&mut self, now: u64) {
         self.history.retain(|id| {
-            self.messages
-                .get(id)
-                .is_some_and(|d| d.status == "held" || now.saturating_sub(d.updated_at) <= TTL_MS)
+            self.messages.get(id).is_some_and(|d| {
+                d.approval_pin && d.lease_live(now) || now.saturating_sub(d.updated_at) <= TTL_MS
+            })
         });
         for pending in [&mut self.pending_local, &mut self.pending_remote] {
-            pending.retain(|id| {
-                self.messages
-                    .get(id)
-                    .is_some_and(|d| d.approval_pin || now.saturating_sub(d.lease_at) <= TTL_MS)
-            });
+            pending.retain(|id| self.messages.get(id).is_some_and(|d| d.lease_live(now)));
         }
         let retained: HashSet<String> = self
             .history
@@ -403,6 +426,9 @@ impl State {
                 updated_at: now,
                 lease_at: now,
                 approval_pin: false,
+                retry_at: 0,
+                retry_delay: 0,
+                forwarding: false,
                 reply_relay,
                 remote_native: remote && origin.starts_with("claude/") && !reply_relay,
                 target_endpoint: None,
@@ -909,6 +935,136 @@ mod tests {
     }
     fn pi_target() -> serde_json::Value {
         json!({"id":"pi/target","harness":"pi"})
+    }
+
+    #[test]
+    fn held_approval_pin_is_bounded_and_released_once_the_approval_resolves() {
+        let rt = runtime();
+        let mut state = rt.state.lock().unwrap();
+        for id in ["abandoned", "answered"] {
+            state
+                .admit(id, "pi/origin", "claude/target", false, false, 0)
+                .unwrap();
+            state
+                .messages
+                .get_mut(id)
+                .unwrap()
+                .consider("held", false, 0);
+        }
+        state.prune_deliveries(TTL_MS + 1);
+        assert!(state.active("abandoned") && state.active("answered"));
+        let answered = 2 * TTL_MS;
+        state
+            .messages
+            .get_mut("answered")
+            .unwrap()
+            .consider("delivered", false, answered);
+        state.prune_deliveries(answered + 1);
+        assert!(
+            state.active("answered"),
+            "resolving a long approval restarts the receipt lease"
+        );
+        state.prune_deliveries(answered + TTL_MS + 1);
+        assert!(
+            !state.active("answered"),
+            "a resolved approval must not stay pinned"
+        );
+        assert!(state.active("abandoned"));
+        state.prune_deliveries(APPROVAL_TTL_MS + 1);
+        assert!(
+            !state.active("abandoned") && !state.messages.contains_key("abandoned"),
+            "an abandoned approval must release its pending quota"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_forwards_stuck_terminal_receipts_concurrently_and_once_at_a_time() {
+        let rt = std::sync::Arc::new(runtime());
+        let (tx, mut rx) = mpsc::channel(16);
+        {
+            let mut state = rt.state.lock().unwrap();
+            state.sessions.insert("pi/origin".into(), session(tx, 1, 1));
+            for mid in ["stuck-a", "stuck-b"] {
+                state
+                    .admit(
+                        mid,
+                        "pi/origin",
+                        "claude/target",
+                        false,
+                        false,
+                        rt.clock.now_ms(),
+                    )
+                    .unwrap();
+                state.messages.get_mut(mid).unwrap().consider(
+                    "delivered",
+                    false,
+                    rt.clock.now_ms(),
+                );
+            }
+        }
+        let maintenance = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.maintenance().await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        let mut frames = Vec::new();
+        while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            frames.push(frame);
+        }
+        let mut ids = frames
+            .iter()
+            .map(|frame| frame.value["message_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            ["stuck-a", "stuck-b"],
+            "one unacknowledged origin write must neither stall nor duplicate the others"
+        );
+        rt.closing.send_replace(true);
+        maintenance.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_backs_off_receipt_retries_to_a_failing_origin() {
+        let rt = std::sync::Arc::new(runtime());
+        let (tx, mut rx) = mpsc::channel(16);
+        {
+            let mut state = rt.state.lock().unwrap();
+            state.sessions.insert("pi/origin".into(), session(tx, 1, 1));
+            state
+                .admit(
+                    "refused-origin",
+                    "pi/origin",
+                    "claude/target",
+                    false,
+                    false,
+                    rt.clock.now_ms(),
+                )
+                .unwrap();
+            state.messages.get_mut("refused-origin").unwrap().consider(
+                "delivered",
+                false,
+                rt.clock.now_ms(),
+            );
+        }
+        let maintenance = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.maintenance().await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut attempts = 0;
+        while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            attempts += 1;
+            let _ = frame.written.unwrap().send(Err("origin refused".into()));
+        }
+        rt.closing.send_replace(true);
+        maintenance.await.unwrap();
+        assert!(
+            (1..=4).contains(&attempts),
+            "a failing origin must not be retried every tick: {attempts} attempts in 3s"
+        );
+        assert!(rt.state.lock().unwrap().active("refused-origin"));
     }
 
     #[tokio::test]

@@ -773,9 +773,11 @@ impl Runtime {
             })
             .await;
     }
-    pub(super) async fn maintenance(&self) {
+    pub(super) async fn maintenance(self: &Arc<Self>) {
         let mut stop = self.closing.subscribe();
+        let mut forwards = tokio::task::JoinSet::new();
         loop {
+            while forwards.try_join_next().is_some() {}
             if *stop.borrow() {
                 break;
             }
@@ -804,21 +806,32 @@ impl Runtime {
             self.native.maintain_idle(self).await;
             let retries = {
                 let mut state = self.state.lock().unwrap();
-                state.prune_deliveries(self.clock.now_ms());
+                let now = self.clock.now_ms();
+                state.prune_deliveries(now);
                 state.subscriptions.retain(|_, record| {
                     record.status == "subscribed"
                         || record.admitting
-                        || self.clock.now_ms().saturating_sub(record.updated_at) <= IDLE_TTL
+                        || now.saturating_sub(record.updated_at) <= IDLE_TTL
                 });
-                state
+                let due = state
                     .messages
                     .iter()
-                    .filter(|(id, delivery)| state.active(id) && delivery.route_terminal())
-                    .map(|(id, delivery)| (id.clone(), delivery.clone()))
+                    .filter(|(id, delivery)| {
+                        state.active(id) && delivery.route_terminal() && delivery.retry_due(now)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                due.into_iter()
+                    .filter_map(|id| {
+                        let delivery = state.messages.get_mut(&id)?;
+                        delivery.forwarding = true;
+                        Some((id, delivery.clone()))
+                    })
                     .collect::<Vec<_>>()
             };
             for (id, delivery) in retries {
-                self.forward_receipt(&id, delivery, "").await;
+                let runtime = self.clone();
+                forwards.spawn(async move { runtime.retry_receipt(&id, delivery).await });
             }
         }
     }
