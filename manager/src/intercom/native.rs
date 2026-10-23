@@ -26,6 +26,7 @@ pub struct Native {
     owner: Mutex<Weak<super::Runtime>>,
     aliases: Mutex<HashMap<String, Alias>>,
     alias_reconcile: tokio::sync::Mutex<()>,
+    base_changed: tokio::sync::Notify,
     idle_returns: Mutex<HashMap<String, idle::Return>>,
     desktop: Mutex<Option<desktop::Client>>,
 }
@@ -75,6 +76,7 @@ impl Native {
             owner: Mutex::new(Weak::new()),
             aliases: Mutex::new(HashMap::new()),
             alias_reconcile: tokio::sync::Mutex::new(()),
+            base_changed: tokio::sync::Notify::new(),
             idle_returns: Mutex::new(HashMap::new()),
             desktop: Mutex::new(None),
         }
@@ -191,6 +193,22 @@ impl Native {
     pub fn reply_endpoint(&self, origin: &str) -> Result<Value, String> {
         alias::alias_endpoint(self, origin)
     }
+    /// Directory rows publish before the first reconcile binds the base
+    /// listener, so a sender can race startup; wait briefly instead of dropping.
+    #[cfg(unix)]
+    async fn ready_reply_endpoint(&self, origin: &str) -> Result<Value, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let changed = self.base_changed.notified();
+            let reply = self.reply_endpoint(origin);
+            if reply.is_ok() || self.base.lock().unwrap().is_some() {
+                return reply;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return reply;
+            }
+        }
+    }
     #[cfg(not(unix))]
     pub fn reply_endpoint(&self, _origin: &str) -> Result<Value, String> {
         Err("native adapters support Linux/macOS only".into())
@@ -251,7 +269,7 @@ impl Native {
         {
             if str_field(row, "harness") == "claude" {
                 let sock = str_field(row, "_socket");
-                let reply = self.reply_endpoint(origin)?;
+                let reply = self.ready_reply_endpoint(origin).await?;
                 let _guard = alias::alias_guard(self, &reply).await?;
                 validate_endpoint(row, None)?;
                 let mut stream = tokio::time::timeout(
@@ -364,7 +382,7 @@ impl Native {
                 .ok_or("native sender unavailable")?;
             let reply = match reply_endpoint {
                 Some(reply) => reply.clone(),
-                None => self.reply_endpoint(target)?,
+                None => self.ready_reply_endpoint(target).await?,
             };
             let mut frame = json!({"msgV":1,"msg_id":uuid::Uuid::new_v4().to_string(),"type":"control","action":"peer_message_status","from":alias::from_identity(str_field(&reply,"_socket")),"orig_msg_id":mid,"status":status});
             let reason = super::deliveries::normalize_drop_reason(reason);
@@ -489,6 +507,9 @@ pub async fn start(rt: &Shared) -> Result<(), String> {
             }
         });
         rt.native.tasks.lock().unwrap().push(task);
+        // The watcher's first tick reconciles at once; racing it here would
+        // bind the same daemon-PID socket twice.
+        let _pass = rt.native.alias_reconcile.lock().await;
         alias::reconcile_base(rt).await?;
     }
     Ok(())

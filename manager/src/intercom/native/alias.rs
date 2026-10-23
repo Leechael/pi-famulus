@@ -532,6 +532,7 @@ pub(super) async fn reconcile_base(rt: &Shared) -> Result<(), String> {
         lost_registration: false,
         fence: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
+    rt.native.base_changed.notify_waiters();
     if let Some(old) = old {
         old.task.abort();
         let _ = old.task.await;
@@ -2100,7 +2101,7 @@ mod tests {
                 .parent(),
             Some(directory.as_path())
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !running
                 .runtime
                 .native
