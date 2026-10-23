@@ -37,11 +37,13 @@ fn advance(fixture: &Fixture, ms: u64) {
     }
 }
 
+const MCP_TOKEN: &str = "clock-secret";
+
 fn start(fixture: &mut Fixture) -> SocketAddr {
     let address = vacant_address();
     let listen = address.to_string();
     fixture.start_with(
-        &["--mcp-listen", &listen],
+        &["--mcp-listen", &listen, "--mcp-token", MCP_TOKEN],
         &[("PI_FAMULUS_TEST_CLOCK", "manual")],
     );
     maintenance_barrier(fixture);
@@ -49,13 +51,13 @@ fn start(fixture: &mut Fixture) -> SocketAddr {
 }
 
 fn message_status(address: SocketAddr, id: &Value) -> Value {
-    tool(address, "", "message_status", json!({"message_id":id}))
+    tool(address, MCP_TOKEN, "message_status", json!({"message_id":id}))
 }
 
 fn unknown_message(address: SocketAddr, id: &Value) {
     let result = mcp(
         address,
-        "",
+        MCP_TOKEN,
         "tools/call",
         json!({"name":"message_status","arguments":{"message_id":id}}),
     );

@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch};
 
 #[cfg(unix)]
 pub async fn bind(path: &Path) -> Result<(tokio::net::UnixListener, (u64, u64)), String> {
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
     let parent = path.parent().ok_or("socket parent required")?;
     if let Some(ancestor) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
         super::config::private_dir(ancestor)?;
@@ -38,11 +38,33 @@ pub async fn bind(path: &Path) -> Result<(tokio::net::UnixListener, (u64, u64)),
         }
         std::fs::remove_file(path).map_err(|e| e.to_string())?;
     }
-    let listener = tokio::net::UnixListener::bind(path).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())?;
+    let listener = bind_private(path)?;
     let m = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     Ok((listener, (m.dev(), m.ino())))
+}
+/// Bind a Unix socket that is never connectable by another user: it is bound
+/// inside a fresh owner-only directory, made 0600 there, then renamed into
+/// place. A process-wide umask cannot be narrowed safely in a threaded runtime.
+#[cfg(unix)]
+pub fn bind_private(path: &Path) -> Result<tokio::net::UnixListener, String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let parent = path.parent().ok_or("socket parent required")?;
+    let staging = parent.join(format!(".{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .map_err(|e| e.to_string())?;
+    let staged = staging.join("s");
+    let result = (|| {
+        let listener = std::os::unix::net::UnixListener::bind(&staged)?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        std::fs::rename(&staged, path)?;
+        tokio::net::UnixListener::from_std(listener)
+    })();
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&staging);
+    result.map_err(|e| e.to_string())
 }
 #[cfg(not(unix))]
 pub async fn bind(_path: &Path) -> Result<(tokio::net::TcpListener, (u64, u64)), String> {
@@ -638,6 +660,53 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (_listener, _) = super::bind(&root.join("client.sock")).await.unwrap();
         assert_eq!(mode(&root), 0o755);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_socket_is_never_visible_with_a_permissive_mode() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/ib-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.join("client.sock");
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut seen = std::collections::BTreeSet::new();
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(m) = std::fs::symlink_metadata(&path) {
+                        seen.insert(m.permissions().mode() & 0o777);
+                    }
+                }
+                seen
+            })
+        };
+        for attempt in 0..300 {
+            let (listener, _) = super::bind(&path)
+                .await
+                .unwrap_or_else(|error| panic!("{attempt}: {error}"));
+            drop(listener);
+            // A sibling test's fork can briefly hold the listener open, so
+            // do not rely on bind's stale-socket probe here.
+            std::fs::remove_file(&path).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let seen = watcher.join().unwrap();
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            vec![0o600],
+            "the socket was reachable before it was made owner-only"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

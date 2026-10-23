@@ -1165,6 +1165,8 @@ async fn post_webhook_message(
 ) -> Result<String, String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+    super::config::webhook_url_allowed(&endpoint.url, &endpoint.secret)
+        .map_err(|error| format!("endpoint {}: {error}", endpoint.name))?;
     let mid = if message.id.is_empty() {
         uuid::Uuid::new_v4().to_string()
     } else {
@@ -1384,6 +1386,7 @@ pub async fn listen(c: Config, name: String, url: String, secret: String) -> Res
     if name.contains('/') {
         return Err("endpoint name must not contain '/'".into());
     }
+    super::config::webhook_url_allowed(&url, &secret)?;
     let identity = Identity::load(&c.state_dir)?;
     let mut c = c;
     if c.token.is_empty() {

@@ -219,7 +219,7 @@ fn native_pi_read_before_physical_write_ack_keeps_read_ledger_and_still_acknowle
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let state =
-            super::super::network::tool(address, "", "message_status", json!({"message_id":id}));
+            super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
         if state["status"] == "read" {
             break;
         }
@@ -245,7 +245,7 @@ fn native_pi_read_before_physical_write_ack_keeps_read_ledger_and_still_acknowle
     assert_eq!(ack["orig_msg_id"], id);
     assert_eq!(ack["from"], format!("uds:{socket}"));
     assert_eq!(
-        super::super::network::tool(address, "", "message_status", json!({"message_id":id}))
+        super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))
             ["status"],
         "read"
     );
@@ -491,7 +491,7 @@ fn native_user_to_local_pi_alias_keeps_uuid_delivered_and_read_is_ledger_only() 
     assert_eq!(receipt["from"], format!("uds:{socket}"));
     target.ok(json!({"op":"receipt","message_id":id,"status":"read"}));
     assert_eq!(
-        super::super::network::tool(address, "", "message_status", json!({"message_id":id}))
+        super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))
             ["status"],
         "read"
     );
@@ -542,7 +542,7 @@ fn native_user_to_local_codex_alias_keeps_original_uuid_through_real_host_read_r
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let status =
-            super::super::network::tool(address, "", "message_status", json!({"message_id":id}));
+            super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
         if status["status"] == "read" {
             break;
         }

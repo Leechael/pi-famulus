@@ -125,6 +125,11 @@ impl Fixture {
         self.start_with(&[], &[]);
     }
 
+    /// The MCP bearer token the daemon generated because none was configured.
+    fn mcp_token(&self) -> String {
+        fs::read_to_string(self.root.join("state/mcp-token")).unwrap()
+    }
+
     fn start_with(&mut self, args: &[&str], env: &[(&str, &str)]) {
         let log = fs::File::create(self.root.join("serve.log")).unwrap();
         let mut command = self.command();

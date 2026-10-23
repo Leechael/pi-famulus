@@ -416,7 +416,7 @@ fn online_status_mcp_url_uses_the_bound_ephemeral_listener_and_accepts_real_post
     )
     .parse()
     .unwrap();
-    let response = super::network::mcp(address, "", "tools/list", json!({}));
+    let response = super::network::mcp(address, &fixture.mcp_token(), "tools/list", json!({}));
     assert!(response["tools"]
         .as_array()
         .unwrap()

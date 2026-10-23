@@ -206,6 +206,46 @@ fn mcp_auth_origin_and_missing_sender_reject_before_delivery() {
 }
 
 #[test]
+fn mcp_without_a_configured_token_requires_a_generated_private_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = Fixture::new();
+    let address = vacant_address();
+    let listen = address.to_string();
+    fixture.start_with(&["--mcp-listen", &listen], &[]);
+    let mut target = fixture.plugin("target", "busy");
+    let _sender = fixture.plugin("sender", "busy");
+    let token_file = fixture.root.join("state/mcp-token");
+    let mode = fs::metadata(&token_file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "token file mode {mode:o}");
+    let token = fixture.mcp_token();
+    assert!(token.len() >= 64, "weak generated token {token:?}");
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send","arguments":{"from":"pi/sender","to":"pi/target","message":"unauthenticated"}}});
+    for authorization in ["", "Bearer ", "Bearer wrong"] {
+        let mut headers = vec![("MCP-Protocol-Version", "2025-11-25")];
+        if !authorization.is_empty() {
+            headers.push(("Authorization", authorization));
+        }
+        let (status, _, raw) = http(address, "/mcp", request.clone(), &headers);
+        assert_eq!(status, 401, "{authorization:?} was not rejected: {raw}");
+    }
+    target.no_event();
+    tool(
+        address,
+        &token,
+        "send",
+        json!({"from":"pi/sender","to":"pi/target","message":"authenticated"}),
+    );
+    target.event("deliver");
+    let output = fixture.run(&["status", "--json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["mcp_token_file"],
+        token_file.to_string_lossy().as_ref(),
+        "status must point clients at the generated token: {report}"
+    );
+}
+
+#[test]
 fn mcp_send_refuses_a_sender_that_is_not_a_live_local_session() {
     let mut fixture = Fixture::new();
     let address = vacant_address();
@@ -215,7 +255,7 @@ fn mcp_send_refuses_a_sender_that_is_not_a_live_local_session() {
     for from in ["codex/forged", "pi/absent", "webhook/none"] {
         let result = mcp(
             address,
-            "",
+            &fixture.mcp_token(),
             "tools/call",
             json!({"name":"send","arguments":{"from":from,"to":"pi/target","message":"forged sender"}}),
         );
@@ -232,7 +272,7 @@ fn mcp_send_refuses_a_sender_that_is_not_a_live_local_session() {
     let _sender = fixture.plugin("sender", "busy");
     let sent = tool(
         address,
-        "",
+        &fixture.mcp_token(),
         "send",
         json!({"from":"pi/sender","to":"pi/target","message":"live sender"}),
     );
@@ -245,11 +285,12 @@ fn mcp_legacy_initialize_and_modern_stateless_tools_share_contract() {
     let address = vacant_address();
     let listen = address.to_string();
     fixture.start_with(&["--mcp-listen", &listen], &[]);
+    let authorization = format!("Bearer {}", fixture.mcp_token());
     let (status, headers, raw) = http(
         address,
         "/mcp",
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
-        &[],
+        &[("Authorization", &authorization)],
     );
     assert_eq!(status, 200, "legacy initialize: {raw}");
     assert_eq!(
@@ -268,6 +309,7 @@ fn mcp_legacy_initialize_and_modern_stateless_tools_share_contract() {
         &[
             ("MCP-Protocol-Version", "2025-06-18"),
             ("Mcp-Session-Id", session),
+            ("Authorization", &authorization),
         ],
     );
     assert_eq!(status, 200, "legacy tools/list: {raw}");
@@ -279,6 +321,7 @@ fn mcp_legacy_initialize_and_modern_stateless_tools_share_contract() {
         &[
             ("MCP-Protocol-Version", "2026-07-28"),
             ("Mcp-Method", "tools/list"),
+            ("Authorization", &authorization),
         ],
     );
     assert_eq!(status, 200, "modern stateless tools/list: {raw}");

@@ -8,7 +8,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
+use std::{convert::Infallible, sync::Arc};
 
 const MODERN: &str = "2026-07-28";
 const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
@@ -31,9 +33,12 @@ pub async fn start(rt: Shared) -> Result<tokio::task::JoinHandle<()>, String> {
         .await
         .map_err(|e| e.to_string())?;
     let address = listener.local_addr().map_err(|e| e.to_string())?;
-    if !address.ip().is_loopback() && rt.cfg.mcp_token.trim().is_empty() {
+    if rt.cfg.mcp_token.trim().is_empty() {
+        return Err("refusing unauthenticated MCP; no bearer token configured".into());
+    }
+    if !address.ip().is_loopback() && !rt.cfg.mcp_allow_non_loopback {
         return Err(format!(
-            "refusing unauthenticated MCP on non-loopback address {address}; set mcp_token"
+            "refusing plain-HTTP MCP on non-loopback address {address}; set mcp_allow_non_loopback"
         ));
     }
     *rt.mcp_url.lock().unwrap() = format!("http://{address}/mcp");
@@ -41,21 +46,27 @@ pub async fn start(rt: Shared) -> Result<tokio::task::JoinHandle<()>, String> {
     Ok(tokio::spawn(async move {
         let mut stop = rt.stop.subscribe();
         let permits = Arc::new(tokio::sync::Semaphore::new(128));
+        let throttle = Arc::new(AuthThrottle::default());
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = connections.join_next(), if !connections.is_empty() => {},
                 accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else { continue };
+                    let Ok((stream, peer)) = accepted else { continue };
                     let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
                     let Ok(local) = stream.local_addr() else { continue };
                     let rt = rt.clone();
+                    let throttle = throttle.clone();
                     connections.spawn(async move {
                         let _permit = permit;
                         let service = service_fn(move |req| {
                             let rt = rt.clone();
-                            async move { Ok::<_, Infallible>(handle(rt, local, req).await) }
+                            let throttle = throttle.clone();
+                            async move {
+                                let reply = handle(rt, &throttle, local, peer.ip(), req).await;
+                                Ok::<_, Infallible>(reply)
+                            }
                         });
                         // Hyper owns HTTP framing, duplicate Content-Length validation,
                         // chunked decoding and persistent-connection request boundaries.
@@ -178,14 +189,69 @@ fn accepts(headers: &HeaderMap) -> bool {
     json && sse
 }
 
-async fn handle(rt: Shared, local: SocketAddr, req: Request<Incoming>) -> Reply {
+const FREE_AUTH_FAILURES: u32 = 5;
+const MAX_AUTH_LOCKOUT: Duration = Duration::from_secs(60);
+const AUTH_FAILURE_MEMORY: Duration = Duration::from_secs(600);
+/// Per-peer failed-bearer backoff: after a few wrong tokens a peer is refused
+/// without a token check for a doubling interval, capped at a minute.
+#[derive(Default)]
+struct AuthThrottle {
+    failures: std::sync::Mutex<std::collections::HashMap<IpAddr, (u32, Instant)>>,
+}
+impl AuthThrottle {
+    fn lockout(failures: u32) -> Duration {
+        if failures < FREE_AUTH_FAILURES {
+            return Duration::ZERO;
+        }
+        Duration::from_secs(1u64 << (failures - FREE_AUTH_FAILURES).min(6)).min(MAX_AUTH_LOCKOUT)
+    }
+    fn retry_after(&self, peer: IpAddr, now: Instant) -> Option<Duration> {
+        let failures = self.failures.lock().unwrap();
+        let (count, last) = failures.get(&peer)?;
+        let until = *last + Self::lockout(*count);
+        (until > now).then(|| until - now)
+    }
+    fn failed(&self, peer: IpAddr, now: Instant) {
+        let mut failures = self.failures.lock().unwrap();
+        if failures.len() >= 4096 {
+            failures.retain(|_, (_, last)| {
+                now.saturating_duration_since(*last) < AUTH_FAILURE_MEMORY
+            });
+        }
+        let entry = failures.entry(peer).or_insert((0, now));
+        if now.saturating_duration_since(entry.1) >= AUTH_FAILURE_MEMORY {
+            entry.0 = 0;
+        }
+        *entry = (entry.0.saturating_add(1), now);
+    }
+    fn succeeded(&self, peer: IpAddr) {
+        self.failures.lock().unwrap().remove(&peer);
+    }
+}
+
+async fn handle(
+    rt: Shared,
+    throttle: &AuthThrottle,
+    local: SocketAddr,
+    peer: IpAddr,
+    req: Request<Incoming>,
+) -> Reply {
     if req.uri().path() != "/mcp" && !req.uri().path().starts_with("/mcp/") {
         return text(404, "404 page not found");
     }
-    let token = rt.cfg.mcp_token.trim();
-    if !token.is_empty() && !bearer_ok(header(req.headers(), "authorization"), token) {
+    if let Some(wait) = throttle.retry_after(peer, Instant::now()) {
+        let mut reply = text(429, "too many failed authorization attempts");
+        let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+        reply
+            .headers_mut()
+            .insert("retry-after", seconds.to_string().parse().unwrap());
+        return reply;
+    }
+    if !bearer_ok(header(req.headers(), "authorization"), rt.cfg.mcp_token.trim()) {
+        throttle.failed(peer, Instant::now());
         return json_reply(401, rpc_error(Value::Null, -32000, "unauthorized", None));
     }
+    throttle.succeeded(peer);
     if !origin_allowed(header(req.headers(), "origin")) {
         return text(403, "forbidden origin");
     }
@@ -692,9 +758,9 @@ async fn resolve_to(rt: &Shared, to: &str) -> Result<String, String> {
         _ => Err(format!("session {to:?} is ambiguous")),
     }
 }
-// deferred: binding `from` to a caller credential | impact: any local MCP caller can still
-// speak as any live local agent session, never as a remote, webhook or unknown id |
-// trigger: MCP clients can present a per-session credential
+// deferred: binding `from` to a caller credential | impact: any holder of the one MCP bearer
+// token (this user's MCP clients) can speak as any live local agent session, never as a
+// remote, webhook or unknown id | trigger: MCP clients can present a per-session credential
 async fn local_sender(rt: &Shared, from: &str) -> Result<(), String> {
     let rows = rt.directory().await;
     if rows
@@ -1027,6 +1093,39 @@ mod tests {
         assert!(!bearer_ok("Bearer secrex", "secret"));
         assert!(!bearer_ok("Basic secret", "secret"));
         assert!(!bearer_ok("\u{80}\u{80}\u{80}\u{80}", "secret"));
+    }
+
+    #[test]
+    fn repeated_bad_tokens_lock_out_only_that_peer_with_growing_backoff() {
+        let throttle = AuthThrottle::default();
+        let attacker: IpAddr = "192.0.2.7".parse().unwrap();
+        let other: IpAddr = "192.0.2.8".parse().unwrap();
+        let start = Instant::now();
+        for attempt in 0..FREE_AUTH_FAILURES {
+            assert_eq!(throttle.retry_after(attacker, start), None, "{attempt}");
+            throttle.failed(attacker, start);
+        }
+        assert_eq!(
+            throttle.retry_after(attacker, start),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(throttle.retry_after(other, start), None);
+        let later = start + Duration::from_secs(1);
+        assert_eq!(throttle.retry_after(attacker, later), None);
+        throttle.failed(attacker, later);
+        assert_eq!(
+            throttle.retry_after(attacker, later),
+            Some(Duration::from_secs(2))
+        );
+        for _ in 0..20 {
+            throttle.failed(attacker, later);
+        }
+        assert_eq!(throttle.retry_after(attacker, later), Some(MAX_AUTH_LOCKOUT));
+        let forgotten = later + AUTH_FAILURE_MEMORY;
+        throttle.failed(attacker, forgotten);
+        assert_eq!(throttle.retry_after(attacker, forgotten), None);
+        throttle.succeeded(attacker);
+        assert!(throttle.failures.lock().unwrap().is_empty());
     }
 
     #[test]

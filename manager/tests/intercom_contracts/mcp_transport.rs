@@ -3,6 +3,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 
 const MODERN: &str = "2026-07-28";
+const TOKEN: &str = "transport-secret";
 
 struct Response {
     status: u16,
@@ -139,6 +140,9 @@ fn wire(
     if !has("Accept") {
         head.push_str("Accept: application/json, text/event-stream\r\n");
     }
+    if !has("Authorization") {
+        head.push_str(&format!("Authorization: Bearer {TOKEN}\r\n"));
+    }
     if !has("Content-Length") && !has("Transfer-Encoding") {
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
@@ -165,17 +169,17 @@ fn modern(method: &str, mut params: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).unwrap()
 }
 
-fn start(token: &str) -> (Fixture, SocketAddr) {
+fn start() -> (Fixture, SocketAddr) {
     let mut fixture = Fixture::new();
     let address = super::network::vacant_address();
     let listen = address.to_string();
-    fixture.start_with(&["--mcp-listen", &listen, "--mcp-token", token], &[]);
+    fixture.start_with(&["--mcp-listen", &listen, "--mcp-token", TOKEN], &[]);
     (fixture, address)
 }
 
 #[test]
 fn legacy_initialization_is_stateless_and_notifications_return_empty_202() {
-    let (_fixture, address) = start("");
+    let (_fixture, address) = start();
     for (offered, version) in [
         ("2025-06-18", "2025-06-18"),
         ("2025-11-25", "2025-11-25"),
@@ -213,7 +217,7 @@ fn legacy_initialization_is_stateless_and_notifications_return_empty_202() {
 
 #[test]
 fn modern_stateless_method_errors_and_http_methods_have_distinct_statuses() {
-    let (_fixture, address) = start("");
+    let (_fixture, address) = start();
     let listed = request(
         address,
         "POST",
@@ -271,7 +275,7 @@ fn modern_stateless_method_errors_and_http_methods_have_distinct_statuses() {
 
 #[test]
 fn modern_header_body_mismatches_and_unsupported_versions_are_protocol_errors() {
-    let (_fixture, address) = start("");
+    let (_fixture, address) = start();
     let body = modern("tools/list", json!({}));
     for headers in [
         vec![
@@ -308,7 +312,7 @@ fn modern_header_body_mismatches_and_unsupported_versions_are_protocol_errors() 
 
 #[test]
 fn valid_chunked_and_identical_duplicate_lengths_each_inject_exactly_once() {
-    let (fixture, address) = start("");
+    let (fixture, address) = start();
     let mut target = fixture.plugin("target", "busy");
     let _source = fixture.plugin("source", "busy");
     let body = modern(
@@ -360,7 +364,7 @@ fn valid_chunked_and_identical_duplicate_lengths_each_inject_exactly_once() {
 
 #[test]
 fn conflicting_lengths_and_malformed_header_names_reject_without_dispatch() {
-    let (fixture, address) = start("");
+    let (fixture, address) = start();
     let mut target = fixture.plugin("target", "busy");
     let _source = fixture.plugin("source", "busy");
     let body = modern(
@@ -396,7 +400,7 @@ fn conflicting_lengths_and_malformed_header_names_reject_without_dispatch() {
 
 #[test]
 fn duplicate_auth_and_version_headers_cannot_override_a_rejecting_first_value() {
-    let (fixture, address) = start("transport-secret");
+    let (fixture, address) = start();
     let mut target = fixture.plugin("target", "busy");
     let _source = fixture.plugin("source", "busy");
     let body = modern(
@@ -432,7 +436,7 @@ fn duplicate_auth_and_version_headers_cannot_override_a_rejecting_first_value() 
     let rejected = request(
         address,
         "POST",
-        &[("MCP-Protocol-Version", "1900-01-01")],
+        &[("Authorization", ""), ("MCP-Protocol-Version", "1900-01-01")],
         &body,
     );
     assert_eq!(
@@ -458,7 +462,7 @@ fn duplicate_auth_and_version_headers_cannot_override_a_rejecting_first_value() 
 
 #[test]
 fn malformed_json_and_http_content_negotiation_never_produce_successful_tools() {
-    let (_fixture, address) = start("");
+    let (_fixture, address) = start();
     let rejected = request(address, "POST", &[], br#"{"jsonrpc":"2.0","id":1,"#);
     assert!(
         (400..500).contains(&rejected.status)
@@ -511,7 +515,7 @@ fn malformed_json_and_http_content_negotiation_never_produce_successful_tools() 
 
 #[test]
 fn http_keep_alive_handles_two_distinct_requests_on_one_connection() {
-    let (_fixture, address) = start("");
+    let (_fixture, address) = start();
     let mut reader = connect(address);
     let body = modern("tools/list", json!({}));
     let headers = [

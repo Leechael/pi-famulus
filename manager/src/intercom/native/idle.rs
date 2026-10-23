@@ -1131,7 +1131,7 @@ impl Native {
         endpoint: &Value,
         capacity: Arc<tokio::sync::Semaphore>,
     ) -> Result<ReplyListener, String> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::MetadataExt;
         validate_endpoint(endpoint, None)?;
         let directory = std::path::Path::new(str_field(endpoint, "_socket"))
             .parent()
@@ -1141,13 +1141,7 @@ impl Native {
             std::process::id(),
             &uuid::Uuid::new_v4().to_string()[..8]
         ));
-        let listener = tokio::net::UnixListener::bind(&path).map_err(|error| error.to_string())?;
-        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        {
-            drop(listener);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.to_string());
-        }
+        let listener = super::super::localrpc::bind_private(&path)?;
         let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         let identity = (metadata.dev(), metadata.ino());
         let owner = self.owner.lock().unwrap().clone();

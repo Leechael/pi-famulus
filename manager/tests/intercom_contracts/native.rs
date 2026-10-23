@@ -358,7 +358,7 @@ fn native_terminal_receipt_retries_after_pi_origin_reconnect() {
     loop {
         let status = super::network::tool(
             address,
-            "",
+            &fixture.mcp_token(),
             "message_status",
             json!({"message_id":sent["message_id"]}),
         );
