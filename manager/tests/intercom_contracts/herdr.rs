@@ -393,25 +393,44 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
         let reply = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"claude","workspace_id":"ws-one","args":args}));
         assert_eq!(reply["type"], "error", "{args} in {cwd}: {reply}");
     }
-    let created = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","workspace_id":"ws-one","args":["--offline","--model","sonnet"]}));
+    let foreign = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","workspace_id":"ws-one","args":["--offline"]}));
+    assert_eq!(
+        foreign["type"], "error",
+        "relay added a tab to a workspace it did not create: {foreign}"
+    );
+    let created = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","args":["--offline","--model","sonnet"]}));
     assert_ne!(created["type"], "error", "{created}");
-    assert_eq!(herdr.request("tab.create")["params"]["cwd"], json!(cwd));
+    assert_eq!(herdr.request("workspace.create")["params"]["cwd"], json!(cwd));
     let started = herdr.request("agent.start");
     assert_eq!(
         started["params"]["args"],
         json!(["--offline", "--model", "sonnet"]),
         "a refused session_create reached agent.start"
     );
-    let shell_workspace = call(json!({"type":"workspace_close","workspace_id":"ws-one"}));
+    for foreign in ["ws-one", "ws-agents"] {
+        let closed = call(json!({"type":"workspace_close","workspace_id":foreign}));
+        assert_eq!(
+            closed["type"], "error",
+            "relay closed {foreign}, which it did not create: {closed}"
+        );
+    }
+    herdr.set_panes(vec![
+        json!({"pane_id":"pane-new","workspace_id":"ws-new","cwd":"/fixture/new","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-created"}}),
+        json!({"pane_id":"ws-new:p2","workspace_id":"ws-new","cwd":"/fixture/new"}),
+    ]);
+    let shell = call(json!({"type":"workspace_close","workspace_id":"ws-new"}));
     assert_eq!(
-        shell_workspace["type"], "error",
-        "relay closed a workspace holding a shell pane: {shell_workspace}"
+        shell["type"], "error",
+        "relay closed its workspace while the user had a shell in it: {shell}"
     );
-    let agents = call(json!({"type":"workspace_close","workspace_id":"ws-agents"}));
-    assert_ne!(agents["type"], "error", "{agents}");
+    herdr.set_panes(vec![
+        json!({"pane_id":"pane-new","workspace_id":"ws-new","cwd":"/fixture/new","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-created"}}),
+    ]);
+    let own = call(json!({"type":"workspace_close","workspace_id":"ws-new"}));
+    assert_ne!(own["type"], "error", "{own}");
     assert_eq!(
         herdr.request("workspace.close")["params"]["workspace_id"],
-        "ws-agents",
-        "the refused shell workspace close reached Herdr"
+        "ws-new",
+        "a refused workspace close reached Herdr"
     );
 }

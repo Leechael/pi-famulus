@@ -910,6 +910,7 @@ mod tests {
                 history: HashSet::new(),
                 pending_local: HashSet::new(),
                 pending_remote: HashSet::new(),
+                relay_workspaces: HashSet::new(),
                 incoming: Default::default(),
                 subscriptions: HashMap::new(),
                 idle_stable: HashMap::new(),

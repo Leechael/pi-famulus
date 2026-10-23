@@ -470,10 +470,15 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 relay_agent_args(&req["args"])?;
             }
             let workspace = str_field(req, "workspace").to_string();
+            let owned = |id: &str| rt.state.lock().unwrap().relay_workspaces.contains(id);
+            if relay && !workspace.is_empty() && !owned(&workspace) {
+                return Err("relay may add sessions only to workspaces it created".into());
+            }
             let workspace = if op == "session_create" && workspace.is_empty() {
                 panes()
                     .await?
                     .iter()
+                    .filter(|p| !relay || owned(str_field(p, "workspace_id")))
                     .find(|p| str_field(p, "cwd") == cwd || str_field(p, "foreground_cwd") == cwd)
                     .map(|p| str_field(p, "workspace_id").to_string())
                     .unwrap_or_default()
@@ -493,6 +498,18 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             if pane.is_empty() {
                 return Err("herdr did not return a pane".into());
             }
+            let created = if str_field(&result["root_pane"], "workspace_id").is_empty() {
+                str_field(&result["workspace"], "workspace_id")
+            } else {
+                str_field(&result["root_pane"], "workspace_id")
+            };
+            if relay && workspace.is_empty() && !created.is_empty() {
+                rt.state
+                    .lock()
+                    .unwrap()
+                    .relay_workspaces
+                    .insert(created.to_string());
+            }
             let session = if agent.is_empty() {
                 String::new()
             } else {
@@ -500,12 +517,7 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             };
             let mut out = json!({"pane_id":pane,"session_id":session});
             if op == "workspace_create" {
-                let wid = if str_field(&result["root_pane"], "workspace_id").is_empty() {
-                    str_field(&result["workspace"], "workspace_id")
-                } else {
-                    str_field(&result["root_pane"], "workspace_id")
-                };
-                out["workspaces"] = json!([{ "id":wid,"name":name,"cwd":cwd }]);
+                out["workspaces"] = json!([{ "id":created,"name":name,"cwd":cwd }]);
             }
             Ok(out)
         }
@@ -519,8 +531,11 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 return Err("workspace id required".into());
             }
             if relay {
-                // A relay peer may close only workspaces made of agent panes,
-                // never one holding a plain shell the user is working in.
+                // A relay peer may close only workspaces it created that hold
+                // agent panes alone, never one with a shell the user works in.
+                if !rt.state.lock().unwrap().relay_workspaces.contains(id) {
+                    return Err("relay may close only workspaces it created".into());
+                }
                 let panes = panes().await?;
                 let mut members = panes
                     .iter()
@@ -531,6 +546,7 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 }
             }
             quick("workspace.close", json!({"workspace_id":id})).await?;
+            rt.state.lock().unwrap().relay_workspaces.remove(id);
             Ok(json!({}))
         }
         "session_close" => {

@@ -104,6 +104,8 @@ pub struct State {
     pub messages: HashMap<String, Delivery>,
     pub history: HashSet<String>,
     pub pending_local: HashSet<String>,
+    /// Herdr workspaces a relay peer created; the only ones it may close or extend.
+    pub relay_workspaces: HashSet<String>,
     pub pending_remote: HashSet<String>,
     pub incoming: deliveries::InjectionDedup,
     pub subscriptions: HashMap<String, Idle>,
@@ -276,6 +278,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             history: HashSet::new(),
             pending_local: HashSet::new(),
             pending_remote: HashSet::new(),
+            relay_workspaces: HashSet::new(),
             incoming: deliveries::InjectionDedup::from_carried(std::mem::take(
                 &mut *CARRIED_DEDUP.lock().unwrap(),
             )),
