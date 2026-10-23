@@ -940,7 +940,7 @@ fn inspect_config(c: &Config) -> Result<(String, String), String> {
     let url = str_field(&v, "url");
     let token = str_field(&v, "token");
     let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
-    if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+    if !parsed.host_str().is_some_and(|host| localhost_host(&format!("{host}:0")))
         || parsed.scheme() != "http"
         || token.is_empty()
     {
@@ -1157,5 +1157,30 @@ mod tests {
             send["description"],
             "Send a message to another agent session over intercom"
         );
+    }
+
+    #[test]
+    fn inspection_discovery_accepts_bracketed_ipv6_loopback_only() {
+        let dir = std::env::temp_dir().join(format!("intercom-inspect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = Config {
+            state_dir: dir.clone(),
+            ..Config::default()
+        };
+        let check = |url: &str| {
+            std::fs::write(
+                dir.join("inspect.json"),
+                json!({"url":url,"token":"t"}).to_string(),
+            )
+            .unwrap();
+            inspect_config(&cfg)
+        };
+        for url in ["http://[::1]:4100", "http://127.0.0.1:4100", "http://localhost:4100"] {
+            assert_eq!(check(url).unwrap().0, url);
+        }
+        for url in ["http://[2001:db8::1]:4100", "http://192.0.2.1:4100", "https://[::1]:4100"] {
+            assert!(check(url).is_err(), "{url}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
