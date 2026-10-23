@@ -23,6 +23,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
+/// Bounds alias retirement and publication cleanup so a wedged native peer
+/// cannot hold daemon exit or an upgrade.
+const NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn configure(c: Config) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -156,13 +159,8 @@ impl Running {
     pub fn delivered_ids(&self) -> Vec<String> {
         self.runtime.state.lock().unwrap().incoming.ids()
     }
-    pub fn stop_accepting(&self) {
-        self.runtime.closing.send_replace(true);
-        self.runtime.native.stop_accepting();
-    }
     pub async fn shutdown(self) {
-        self.stop_accepting();
-        self.runtime.finish_idle("unavailable").await;
+        self.runtime.drain().await;
         self.runtime.stop.send_replace(true);
         let connections = std::mem::take(&mut *self.runtime.rpc_tasks.lock().unwrap());
         for connection in &connections {
@@ -171,7 +169,12 @@ impl Running {
         for connection in connections {
             let _ = connection.await;
         }
-        self.runtime.native.close().await;
+        if tokio::time::timeout(NATIVE_CLOSE_TIMEOUT, self.runtime.native.close())
+            .await
+            .is_err()
+        {
+            eprintln!("intercom native: close timed out");
+        }
         for task in self.tasks {
             task.abort();
             let _ = task.await;
@@ -185,6 +188,16 @@ impl Running {
                 }
             }
         }
+    }
+}
+impl Runtime {
+    /// Stop admitting work and settle idle watches as `unavailable` while
+    /// the native bridges and the watching processes are still alive; only
+    /// then stop the bridges.
+    pub async fn drain(&self) {
+        self.closing.send_replace(true);
+        self.finish_idle("unavailable").await;
+        self.native.stop_accepting();
     }
 }
 pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, String> {

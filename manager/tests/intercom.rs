@@ -985,6 +985,75 @@ fn intercom_serve_enables_existing_manager_without_losing_its_active_task() {
     manager.request_ok(json!({"type":"stop","task_id":task_id}));
 }
 
+const TASK_WATCHER: &str = r#"
+import json, signal, socket, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+stream = socket.socket(socket.AF_UNIX)
+stream.connect(sys.argv[1])
+out = open(sys.argv[2], 'a')
+for request in [
+    {'id': 'register', 'op': 'register', 'session': {'id': 'task-watcher', 'name': 'task watcher', 'cwd': '/fixture/project', 'status': 'busy', 'caps': ['read_receipts', 'idle_state_v1'], 'updated_at': 1}},
+    {'id': 'subscribe', 'op': 'subscribe_idle', 'to': 'pi/target'},
+]:
+    stream.sendall((json.dumps(request) + '\n').encode())
+for line in stream.makefile():
+    out.write(line)
+    out.flush()
+"#;
+
+#[test]
+fn shutdown_notifies_a_task_hosted_idle_watcher_before_terminating_it() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let target = fixture.plugin("target", "busy");
+    let script = fixture.root.join("watcher.py");
+    fs::write(&script, TASK_WATCHER).unwrap();
+    let frames = fixture.root.join("watcher.jsonl");
+    let mut manager = common::Conn::new(
+        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
+    );
+    manager.hello_ext("watcher-host");
+    manager.request_ok(json!({"type":"start","kind":"shell","command":format!("exec python3 {} {} {}", script.display(), fixture.sock.display(), frames.display()),"cwd":fixture.root,"env":{},"run_in_background":true}));
+    let deadline = Instant::now() + TIMEOUT;
+    let subscription = loop {
+        let subscribed = fs::read_to_string(&frames)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|frame| frame["id"] == "subscribe");
+        if let Some(frame) = subscribed {
+            assert_eq!(frame["status"], "subscribed", "{frame}");
+            break frame["subscription_id"].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task watcher never subscribed: {}",
+            fixture.log()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let child = fixture.child.as_mut().unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let deadline = Instant::now() + TIMEOUT;
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "manager did not shut down");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let notices: Vec<Value> = fs::read_to_string(&frames)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|frame| frame["type"] == "idle_notice")
+        .collect();
+    assert!(
+        notices
+            .iter()
+            .any(|n| n["subscription_id"] == subscription && n["status"] == "unavailable"),
+        "task-hosted watcher was terminated before its watch settled: {notices:?}"
+    );
+    drop(target);
+}
+
 #[test]
 fn intercom_and_famulus_tasks_share_foreground_manager_pid_and_shutdown() {
     let mut fixture = Fixture::new();

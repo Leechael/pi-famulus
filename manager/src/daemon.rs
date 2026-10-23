@@ -696,10 +696,7 @@ async fn serve(
                 }
             }
             _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
-                if let Some(runtime) = &intercom {
-                    runtime.stop_accepting();
-                }
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 #[cfg(unix)]
@@ -718,10 +715,7 @@ async fn serve(
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, if cfg!(windows) { "received Ctrl-C" } else { "received SIGTERM" });
-                if let Some(runtime) = &intercom {
-                    runtime.stop_accepting();
-                }
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 #[cfg(unix)]
@@ -737,10 +731,7 @@ async fn serve(
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGINT");
-                if let Some(runtime) = &intercom {
-                    runtime.stop_accepting();
-                }
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 match shutdown_task.as_mut() {
@@ -870,10 +861,21 @@ fn spawn_exe_watch(state: &Shared) {
 
 /// Mark the manager as shutting down (new hellos are refused) and run the
 /// graceful shutdown as its own task.
-fn begin_shutdown(state: &Shared) -> tokio::task::JoinHandle<()> {
+/// Intercom drains first: idle watchers learn `unavailable` while the native
+/// bridges and the tasks that may be watching are still alive.
+fn begin_shutdown(
+    state: &Shared,
+    intercom: Option<&crate::intercom::Running>,
+) -> tokio::task::JoinHandle<()> {
     state.lock().unwrap().shutdown = true;
     let s = state.clone();
-    tokio::spawn(async move { graceful_shutdown(&s).await })
+    let intercom = intercom.map(|running| running.runtime.clone());
+    tokio::spawn(async move {
+        if let Some(runtime) = intercom {
+            runtime.drain().await;
+        }
+        graceful_shutdown(&s).await
+    })
 }
 
 // ---------------------------------------------------------------------------
