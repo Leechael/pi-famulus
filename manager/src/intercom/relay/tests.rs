@@ -239,3 +239,85 @@ async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
     server.abort();
     assert_eq!(response.status(), 413);
 }
+
+type Peer = WebSocketStream<tokio::net::TcpStream>;
+async fn welcomed_peer(listener: &tokio::net::TcpListener) -> Peer {
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+    assert_eq!(peer_frame(&mut socket, |_| true).await["type"], "register");
+    socket
+        .send(Message::Text(
+            json!({"type":"welcome","machine_id":"transport-fixture","send_message_id_v1":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+}
+async fn peer_frame(socket: &mut Peer, wanted: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if wanted(&frame) {
+                    return frame;
+                }
+            }
+        }
+    })
+    .await
+    .expect("relay peer never received the expected frame")
+}
+async fn peer_send(socket: &mut Peer, frame: Value) {
+    socket
+        .send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_delivery() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(Config {
+        server: format!("http://{}", listener.local_addr().unwrap()),
+        token: "fixture".into(),
+        remote_messages: "refuse".into(),
+        ..Config::default()
+    });
+    let active = rt.clone();
+    let task = tokio::spawn(async move {
+        session(active, &mut tokio::task::JoinSet::new(), &mut false).await
+    });
+    let mut peer = welcomed_peer(&listener).await;
+    for op in [
+        "status",
+        "workspace_list",
+        "workspace_create",
+        "workspace_close",
+        "session_create",
+        "session_close",
+        "agent_prompt",
+        "agent_keys",
+        "agent_read",
+        "agent_wait",
+    ] {
+        let id = format!("call-{op}");
+        peer_send(&mut peer, json!({"type":op,"id":id,"session_id":"pi/local","workspace_id":"w1","keys":["enter"],"body":"typed","name":"n","cwd":"/","agent":"pi"})).await;
+        let reply = peer_frame(&mut peer, |frame| frame["id"] == id).await;
+        assert_eq!(reply["type"], "error", "{op}: {reply}");
+        assert!(
+            str_field(&reply, "message").contains("remote_messages=refuse"),
+            "{op} ran under remote_messages=refuse: {reply}"
+        );
+    }
+    peer_send(&mut peer, json!({"type":"deliver","session_id":"pi/local","from":"pi/remote","message_id":"refused-id","body":"typed"})).await;
+    let receipt = peer_frame(&mut peer, |frame| frame["type"] == "receipt").await;
+    assert_eq!(receipt["message_id"], "refused-id");
+    assert_eq!(receipt["status"], "refused");
+    task.abort();
+    let _ = task.await;
+}

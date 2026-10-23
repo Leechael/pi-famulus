@@ -636,6 +636,9 @@ pub async fn run(rt: Shared) {
         delay = next;
     }
 }
+// Every relay-initiated operation is refused, reads included: status and
+// agent_read/agent_wait expose local session state and terminal contents.
+const REMOTE_REFUSED: &str = "cross-machine operation refused: remote_messages=refuse";
 async fn deliver(rt: Shared, v: Value) {
     let mid = str_field(&v, "message_id");
     let target = if str_field(&v, "session_id").is_empty() {
@@ -648,7 +651,10 @@ async fn deliver(rt: Shared, v: Value) {
     } else {
         str_field(&v, "reply_to")
     };
-    let result = if target.is_empty() {
+    let refused = rt.cfg.remote_messages == "refuse";
+    let result = if refused {
+        Err(REMOTE_REFUSED.to_string())
+    } else if target.is_empty() {
         Err("deliver without session_id".into())
     } else {
         match rt.resolve(target).await {
@@ -682,6 +688,7 @@ async fn deliver(rt: Shared, v: Value) {
                 .map(|delivery| delivery.status.clone())
                 .unwrap_or_else(|| "delivered".into())
         }
+        Err(_) if refused => "refused".into(),
         Err(error) => {
             if target.starts_with("codex/") && error.contains("outcome unknown") {
                 rt.record_status(mid, "unknown", false);
@@ -782,8 +789,10 @@ async fn session(
                         "status"|"workspace_list"|"workspace_create"|"workspace_close"|"session_create"|"session_close"|"agent_prompt"|"agent_keys"|"agent_read"|"agent_wait"=>{
                             let rt=rt.clone();tokio::spawn(async move{
                                 let mut req=v.clone();req["op"]=v["type"].clone();req["machine"]=json!(rt.machine);req["to"]=if str_field(&v,"type")=="workspace_close"{v["workspace_id"].clone()}else{v["session_id"].clone()};req["workspace"]=v["workspace_id"].clone();
-                                let result=if str_field(&v,"type")=="status"{Ok(json!({"report":rt.status_report().await}))}else{super::herdr::dispatch(&rt,&req).await};
-                                let mut response=match result{Ok(v)=>v,Err(e)=>json!({"type":"error","code":"unavailable","message":e})};
+                                let mut response=if rt.cfg.remote_messages=="refuse"{json!({"type":"error","code":"refused","message":REMOTE_REFUSED})}else{
+                                    let result=if str_field(&v,"type")=="status"{Ok(json!({"report":rt.status_report().await}))}else{super::herdr::dispatch(&rt,&req).await};
+                                    match result{Ok(v)=>v,Err(e)=>json!({"type":"error","code":"unavailable","message":e})}
+                                };
                                 response["id"]=v["id"].clone();if response.get("type").is_none(){response["type"]=v["type"].clone();}
                                 let tx=rt.state.lock().unwrap().relay_tx.clone();if let Some(tx)=tx{let _=tx.send(response.into()).await;}
                             });
