@@ -35,7 +35,17 @@ fn http(
         for (key, value) in headers {
             request = request.header(*key, *value);
         }
-        let response = request.send().await.expect("HTTP response before deadline");
+        // The MCP listener binds after the local socket the fixture waits for;
+        // a refused connect sent nothing, so retrying it is safe.
+        let deadline = Instant::now() + TIMEOUT;
+        let response = loop {
+            match request.try_clone().unwrap().send().await {
+                Err(error) if error.is_connect() && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => break result.expect("HTTP response before deadline"),
+            }
+        };
         let status = response.status().as_u16();
         let headers = response
             .headers()
