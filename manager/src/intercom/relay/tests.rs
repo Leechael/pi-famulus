@@ -263,7 +263,7 @@ async fn mcp_refuses_to_start_without_a_token_or_on_an_unapproved_public_address
 }
 
 #[tokio::test]
-async fn mcp_backs_off_a_peer_that_keeps_presenting_wrong_tokens() {
+async fn mcp_wrong_tokens_on_loopback_cannot_lock_out_the_real_client() {
     let rt = transport_runtime(Config {
         mcp_listen: "127.0.0.1:0".into(),
         mcp_token: "secret".into(),
@@ -281,15 +281,14 @@ async fn mcp_backs_off_a_peer_that_keeps_presenting_wrong_tokens() {
             .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
             .send()
     };
-    assert_eq!(post("secret").await.unwrap().status(), 200);
-    for _ in 0..5 {
+    for _ in 0..20 {
         assert_eq!(post("guess").await.unwrap().status(), 401);
     }
-    let throttled = post("secret").await.unwrap();
-    assert_eq!(throttled.status(), 429);
-    assert!(throttled.headers().contains_key("retry-after"));
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(post("secret").await.unwrap().status(), 200);
+    assert_eq!(
+        post("secret").await.unwrap().status(),
+        200,
+        "another local user's bad tokens must not lock out this user's MCP client"
+    );
     server.abort();
 }
 

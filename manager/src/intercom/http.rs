@@ -193,7 +193,9 @@ const FREE_AUTH_FAILURES: u32 = 5;
 const MAX_AUTH_LOCKOUT: Duration = Duration::from_secs(60);
 const AUTH_FAILURE_MEMORY: Duration = Duration::from_secs(600);
 /// Per-peer failed-bearer backoff: after a few wrong tokens a peer is refused
-/// without a token check for a doubling interval, capped at a minute.
+/// without a token check for a doubling interval, capped at a minute. Loopback
+/// peers share one address across local users, so throttling them would let
+/// one user lock out another's clients; a 256-bit token needs no throttle there.
 #[derive(Default)]
 struct AuthThrottle {
     failures: std::sync::Mutex<std::collections::HashMap<IpAddr, (u32, Instant)>>,
@@ -206,12 +208,18 @@ impl AuthThrottle {
         Duration::from_secs(1u64 << (failures - FREE_AUTH_FAILURES).min(6)).min(MAX_AUTH_LOCKOUT)
     }
     fn retry_after(&self, peer: IpAddr, now: Instant) -> Option<Duration> {
+        if peer.is_loopback() {
+            return None;
+        }
         let failures = self.failures.lock().unwrap();
         let (count, last) = failures.get(&peer)?;
         let until = *last + Self::lockout(*count);
         (until > now).then(|| until - now)
     }
     fn failed(&self, peer: IpAddr, now: Instant) {
+        if peer.is_loopback() {
+            return;
+        }
         let mut failures = self.failures.lock().unwrap();
         if failures.len() >= 4096 {
             failures.retain(|_, (_, last)| {
@@ -1126,6 +1134,19 @@ mod tests {
         assert_eq!(throttle.retry_after(attacker, forgotten), None);
         throttle.succeeded(attacker);
         assert!(throttle.failures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn loopback_peers_are_never_locked_out_by_another_local_user() {
+        let throttle = AuthThrottle::default();
+        let start = Instant::now();
+        for peer in ["127.0.0.1", "::1"] {
+            let peer: IpAddr = peer.parse().unwrap();
+            for _ in 0..FREE_AUTH_FAILURES * 4 {
+                throttle.failed(peer, start);
+            }
+            assert_eq!(throttle.retry_after(peer, start), None);
+        }
     }
 
     #[test]
