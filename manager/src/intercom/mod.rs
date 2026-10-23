@@ -533,9 +533,7 @@ impl Runtime {
         if *self.closing.borrow() {
             return Err("intercom is shutting down".into());
         }
-        if !["", "prompting", "bypass"].contains(&mode) {
-            return Err("from_mode must be prompting or bypass".into());
-        }
+        check_from_mode(mode)?;
         let to = str_field(&target, "id");
         let remote = !str_field(&target, "machine_id").is_empty()
             && str_field(&target, "machine_id") != self.machine;
@@ -855,6 +853,24 @@ impl Runtime {
 }
 pub fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
+}
+const FROM_MODES: [&str; 3] = ["", "prompting", "bypass"];
+fn check_from_mode(mode: &str) -> Result<(), String> {
+    if FROM_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err("from_mode must be prompting or bypass".into())
+    }
+}
+/// An intercom session id: `<kind>/<id>` where the id half follows the daemon
+/// session-id grammar. Ids are interpolated into native envelopes and reply
+/// instructions, so anything else is refused at trust boundaries.
+pub(crate) fn valid_intercom_id(id: &str) -> bool {
+    id.split_once('/').is_some_and(|(kind, rest)| {
+        !kind.is_empty()
+            && kind.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && crate::daemon::valid_session_id(rest)
+    })
 }
 
 async fn probe_tool_status() -> Value {

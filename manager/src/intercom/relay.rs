@@ -784,16 +784,21 @@ const REMOTE_REFUSED: &str = "cross-machine operation refused: remote_messages=r
 async fn deliver(rt: Shared, v: Value) {
     let mid = str_field(&v, "message_id");
     let target = deliver_target(&v);
-    let origin = if str_field(&v, "reply_to").is_empty() {
-        str_field(&v, "from")
-    } else {
-        str_field(&v, "reply_to")
+    let reply_to = str_field(&v, "reply_to");
+    let origin = match reply_to {
+        "" if super::valid_intercom_id(str_field(&v, "from")) => str_field(&v, "from"),
+        "" => "",
+        reply_to => reply_to,
     };
     let refused = rt.cfg.remote_messages == "refuse";
     let result = if refused {
         Err(REMOTE_REFUSED.to_string())
     } else if target.is_empty() {
         Err("deliver without session_id".into())
+    } else if !origin.is_empty() && !super::valid_intercom_id(origin) {
+        Err(format!("deliver with invalid reply_to {origin:?}"))
+    } else if let Err(error) = super::check_from_mode(str_field(&v, "from_mode")) {
+        Err(error)
     } else {
         match rt.resolve(target).await {
             Ok(row) => {
