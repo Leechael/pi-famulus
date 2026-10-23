@@ -3,14 +3,26 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
     DigitallySignedStruct, SignatureScheme,
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// The platform trust store, loaded once per process: on macOS the Keychain
+/// walk costs ~200ms and would otherwise block a runtime worker per dial.
+pub(super) fn native_roots() -> Arc<rustls::RootCertStore> {
+    static ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in rustls_native_certs::load_native_certs().certs {
+                let _ = roots.add(certificate);
+            }
+            Arc::new(roots)
+        })
+        .clone()
+}
 
 pub(super) fn connector(insecure: bool) -> Result<tokio_tungstenite::Connector, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    for certificate in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(certificate);
-    }
+    let roots = native_roots();
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?

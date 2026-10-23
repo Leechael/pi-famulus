@@ -932,10 +932,7 @@ fn webhook_timestamp(ms: u64) -> String {
     )
 }
 fn webhook_client() -> Result<reqwest::Client, String> {
-    let mut roots = rustls::RootCertStore::empty();
-    for certificate in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(certificate);
-    }
+    let roots = tls::native_roots();
     let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
