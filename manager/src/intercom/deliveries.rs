@@ -8,24 +8,43 @@ pub(super) fn normalize_drop_reason(reason: &str) -> &str {
     }
 }
 
+const DEDUP_LIMIT: usize = 4096;
+
+#[derive(Clone)]
+struct Injected {
+    target: String,
+    unknown: Option<String>,
+}
 #[derive(Default)]
 pub struct InjectionDedup {
-    seen: HashSet<String>,
+    seen: HashMap<String, Injected>,
     order: VecDeque<String>,
     inflight: HashMap<String, tokio::sync::watch::Sender<bool>>,
 }
-impl InjectionDedup {
-    pub(super) fn delivered(&mut self, id: &str) {
+impl State {
+    pub(super) fn remember_injection(&mut self, id: &str, target: &str, unknown: Option<String>) {
         if id.is_empty() {
             return;
         }
-        if !self.seen.insert(id.to_string()) {
-            self.order.retain(|entry| entry != id);
+        let State {
+            incoming, messages, ..
+        } = self;
+        let entry = Injected {
+            target: target.into(),
+            unknown,
+        };
+        if incoming.seen.insert(id.into(), entry).is_some() {
+            incoming.order.retain(|seen| seen != id);
         }
-        self.order.push_back(id.to_string());
-        if self.order.len() > 4096 {
-            if let Some(oldest) = self.order.pop_front() {
-                self.seen.remove(&oldest);
+        incoming.order.push_back(id.into());
+        if incoming.order.len() > DEDUP_LIMIT {
+            let settled = incoming
+                .order
+                .iter()
+                .position(|id| !messages.get(id).is_some_and(|d| rank(&d.status) < 4))
+                .unwrap_or(0);
+            if let Some(evicted) = incoming.order.remove(settled) {
+                incoming.seen.remove(&evicted);
             }
         }
     }
@@ -33,16 +52,23 @@ impl InjectionDedup {
 struct InjectionAttempt<'a> {
     runtime: &'a super::Runtime,
     id: String,
-    success: bool,
+    target: String,
+    outcome: Option<Result<(), String>>,
 }
 impl Drop for InjectionAttempt<'_> {
     fn drop(&mut self) {
         if self.id.is_empty() {
             return;
         }
+        let unknown = match self.outcome.take() {
+            Some(Ok(())) => Some(None),
+            Some(Err(error)) if error.contains("outcome unknown") => Some(Some(error)),
+            Some(Err(_)) => None,
+            None => Some(Some("injection outcome unknown: cancelled".into())),
+        };
         let mut state = self.runtime.state.lock().unwrap();
-        if self.success {
-            state.incoming.delivered(&self.id);
+        if let Some(unknown) = unknown {
+            state.remember_injection(&self.id, &self.target, unknown);
         }
         if let Some(done) = state.incoming.inflight.remove(&self.id) {
             done.send_replace(true);
@@ -59,6 +85,7 @@ impl super::Runtime {
         fence: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<String, String> {
         let mid = super::str_field(&frame, "message_id");
+        let id = super::str_field(target, "id");
         let mut stop = self.stop.subscribe();
         let mut closing = self.closing.subscribe();
         if *stop.borrow() || *closing.borrow() {
@@ -67,9 +94,9 @@ impl super::Runtime {
         let mut attempt = loop {
             let waiter = {
                 let mut state = self.state.lock().unwrap();
-                if !mid.is_empty() && state.incoming.seen.contains(mid) {
-                    state.incoming.delivered(mid);
-                    return Ok("delivered".into());
+                if let Some(seen) = state.incoming.seen.get(mid).cloned() {
+                    state.remember_injection(mid, &seen.target, seen.unknown.clone());
+                    return seen.unknown.map_or(Ok("delivered".into()), Err);
                 }
                 if let Some(done) = state.incoming.inflight.get(mid) {
                     Some(done.subscribe())
@@ -91,12 +118,12 @@ impl super::Runtime {
                     break InjectionAttempt {
                         runtime: self,
                         id: mid.to_string(),
-                        success: false,
+                        target: id.to_string(),
+                        outcome: None,
                     }
                 }
             }
         };
-        let id = super::str_field(target, "id");
         let origin = super::str_field(&frame, "reply_to");
         let result = match super::str_field(target, "harness") {
             "pi" => if pinned {
@@ -120,7 +147,7 @@ impl super::Runtime {
             }
             _ => Err("unsupported session harness".into()),
         };
-        attempt.success = result.is_ok();
+        attempt.outcome = Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
         result
     }
     pub(super) async fn native_receipt(
@@ -185,8 +212,15 @@ impl super::Runtime {
                 return;
             }
             let route = admitted.is_some() && state.active(mid);
-            if status == "read" && (reporter.starts_with("pi/") || reporter.starts_with("codex/")) {
-                state.incoming.delivered(mid);
+            if status == "read"
+                && (reporter.starts_with("pi/") || reporter.starts_with("codex/"))
+                && state
+                    .incoming
+                    .seen
+                    .get(mid)
+                    .is_some_and(|seen| seen.target == reporter)
+            {
+                state.remember_injection(mid, reporter, None);
             }
             route
         };
@@ -868,5 +902,122 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    fn deliver(mid: &str) -> serde_json::Value {
+        json!({"type":"deliver","session_id":"pi/target","from":"pi/origin","body":"hello","reply_to":"pi/origin","message_id":mid})
+    }
+    fn pi_target() -> serde_json::Value {
+        json!({"id":"pi/target","harness":"pi"})
+    }
+
+    #[tokio::test]
+    async fn unknown_injection_outcome_is_not_reinjected_until_the_target_confirms_it() {
+        let rt = runtime();
+        let target = pi_target();
+        let (tx, mut rx) = mpsc::channel(4);
+        rt.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("pi/target".into(), session(tx, 1, 1));
+        let observe = async {
+            let frame = rx.recv().await.unwrap();
+            drop(frame.written);
+        };
+        let (first, _) = tokio::join!(
+            rt.inject_local(&target, deliver("unknown-outcome"), "", false, None),
+            observe
+        );
+        assert!(first.unwrap_err().contains("outcome unknown"));
+        let retry = tokio::time::timeout(
+            Duration::from_secs(1),
+            rt.inject_local(&target, deliver("unknown-outcome"), "", false, None),
+        )
+        .await
+        .expect("a retry of an unknown outcome must not wait on a second write");
+        assert!(retry.unwrap_err().contains("outcome unknown"));
+        assert!(
+            rx.try_recv().is_err(),
+            "an injection with an unknown outcome must not be duplicated"
+        );
+        rt.local_receipt("unknown-outcome", "pi/target", "read")
+            .await;
+        assert_eq!(
+            rt.inject_local(&target, deliver("unknown-outcome"), "", false, None)
+                .await
+                .unwrap(),
+            "delivered"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_injection_is_not_reinjected() {
+        let rt = runtime();
+        let target = pi_target();
+        let (tx, mut rx) = mpsc::channel(4);
+        rt.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("pi/target".into(), session(tx, 1, 1));
+        let first = rt.inject_local(&target, deliver("cancelled"), "", false, None);
+        let _written = {
+            tokio::pin!(first);
+            tokio::select! {
+                frame = rx.recv() => frame.unwrap().written,
+                _ = &mut first => panic!("injection must wait for the write acknowledgement"),
+            }
+        };
+        let retry = tokio::time::timeout(
+            Duration::from_secs(1),
+            rt.inject_local(&target, deliver("cancelled"), "", false, None),
+        )
+        .await
+        .expect("a retry of a cancelled injection must not wait on a second write");
+        assert!(retry.unwrap_err().contains("outcome unknown"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn injection_dedup_evicts_settled_ids_before_live_ones() {
+        let rt = runtime();
+        let mut state = rt.state.lock().unwrap();
+        state
+            .record_status("live-inbound", "accepted", false, 0)
+            .unwrap();
+        state.remember_injection("live-inbound", "pi/target", None);
+        for i in 0..4096 {
+            state.remember_injection(&format!("settled-{i}"), "pi/target", None);
+        }
+        assert!(state.incoming.seen.contains_key("live-inbound"));
+        assert!(!state.incoming.seen.contains_key("settled-0"));
+        assert_eq!(state.incoming.seen.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn foreign_read_receipt_cannot_preempt_a_later_real_injection() {
+        let rt = runtime();
+        let target = pi_target();
+        let (tx, mut rx) = mpsc::channel(4);
+        rt.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("pi/target".into(), session(tx, 1, 1));
+        rt.local_receipt("preempted", "pi/other", "read").await;
+        let observe = async {
+            let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("the real delivery must be injected")
+                .unwrap();
+            frame.written.unwrap().send(Ok(())).unwrap();
+        };
+        let (result, _) = tokio::join!(
+            rt.inject_local(&target, deliver("preempted"), "", false, None),
+            observe
+        );
+        assert_eq!(result.unwrap(), "delivered");
     }
 }
