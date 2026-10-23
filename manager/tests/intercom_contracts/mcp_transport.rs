@@ -436,7 +436,10 @@ fn duplicate_auth_and_version_headers_cannot_override_a_rejecting_first_value() 
     let rejected = request(
         address,
         "POST",
-        &[("Authorization", ""), ("MCP-Protocol-Version", "1900-01-01")],
+        &[
+            ("Authorization", ""),
+            ("MCP-Protocol-Version", "1900-01-01"),
+        ],
         &body,
     );
     assert_eq!(
@@ -511,6 +514,57 @@ fn malformed_json_and_http_content_negotiation_never_produce_successful_tools() 
         .status,
         400
     );
+}
+
+#[test]
+fn notify_when_idle_enforces_the_same_local_sender_policy_as_send() {
+    let (fixture, address) = start();
+    let _target = fixture.plugin("target", "busy");
+    let _source = fixture.plugin("source", "busy");
+    let body = |from: &str| {
+        modern(
+            "tools/call",
+            json!({"name":"notify_when_idle","arguments":{"from":from,"to":"pi/target"}}),
+        )
+    };
+    let headers = [
+        ("MCP-Protocol-Version", MODERN),
+        ("Mcp-Method", "tools/call"),
+        ("Mcp-Name", "notify_when_idle"),
+    ];
+    // A non-local `from` is rejected exactly like `send`'s local_sender gate:
+    // start_idle refuses any watcher that is not a live local agent session.
+    let rejected = request(address, "POST", &headers, &body("webhook/foreign"));
+    assert_eq!(rejected.status, 200);
+    let result = rejected.json();
+    assert_eq!(result["result"]["isError"], true);
+    assert!(
+        result["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not a local session"),
+        "wrong rejection: {result}"
+    );
+    let rejected = request(address, "POST", &headers, &body("pi/missing"));
+    assert_eq!(rejected.json()["result"]["isError"], true);
+    // A real local session subscribes successfully, proving the gate is the
+    // local-agent check rather than a blanket refusal.
+    let subscribed = request(address, "POST", &headers, &body("pi/source"));
+    assert_eq!(subscribed.status, 200);
+    let result = subscribed.json();
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    assert_eq!(
+        result["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not a local session"),
+        false
+    );
+    let payload: Value =
+        serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["status"], "subscribed");
+    assert_eq!(payload["target"], "pi/target");
+    assert!(!payload["subscriptionId"].as_str().unwrap().is_empty());
 }
 
 #[test]

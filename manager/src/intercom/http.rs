@@ -225,12 +225,15 @@ impl AuthThrottle {
         }
         let mut failures = self.failures.lock().unwrap();
         if failures.len() >= AUTH_FAILURE_PEERS && !failures.contains_key(&peer) {
-            failures.retain(|_, (_, last)| {
-                now.saturating_duration_since(*last) < AUTH_FAILURE_MEMORY
-            });
+            failures
+                .retain(|_, (_, last)| now.saturating_duration_since(*last) < AUTH_FAILURE_MEMORY);
             // Still full of fresh sources: evict the stalest rather than grow.
             if failures.len() >= AUTH_FAILURE_PEERS {
-                if let Some(stalest) = failures.iter().min_by_key(|(_, (_, last))| *last).map(|(ip, _)| *ip) {
+                if let Some(stalest) = failures
+                    .iter()
+                    .min_by_key(|(_, (_, last))| *last)
+                    .map(|(ip, _)| *ip)
+                {
                     failures.remove(&stalest);
                 }
             }
@@ -264,7 +267,10 @@ async fn handle(
             .insert("retry-after", seconds.to_string().parse().unwrap());
         return reply;
     }
-    if !bearer_ok(header(req.headers(), "authorization"), rt.cfg.mcp_token.trim()) {
+    if !bearer_ok(
+        header(req.headers(), "authorization"),
+        rt.cfg.mcp_token.trim(),
+    ) {
         throttle.failed(peer, Instant::now());
         return json_reply(401, rpc_error(Value::Null, -32000, "unauthorized", None));
     }
@@ -841,6 +847,10 @@ async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, Strin
             }).ok_or_else(|| "unknown message id".into())
         }
         "notify_when_idle" => {
+            // `from` authorization matches `send` without a duplicate gate:
+            // `Runtime::subscribe` -> `start_idle` rejects any watcher that is
+            // not a live local agent session ("watcher ... is not a local
+            // session"), which is exactly what `local_sender` enforces.
             let from = str_field(args, "from").trim();
             if from.is_empty() {
                 return Err(
@@ -1138,7 +1148,10 @@ mod tests {
         for _ in 0..20 {
             throttle.failed(attacker, later);
         }
-        assert_eq!(throttle.retry_after(attacker, later), Some(MAX_AUTH_LOCKOUT));
+        assert_eq!(
+            throttle.retry_after(attacker, later),
+            Some(MAX_AUTH_LOCKOUT)
+        );
         let forgotten = later + AUTH_FAILURE_MEMORY;
         throttle.failed(attacker, forgotten);
         assert_eq!(throttle.retry_after(attacker, forgotten), None);
@@ -1164,7 +1177,12 @@ mod tests {
         let throttle = AuthThrottle::default();
         let now = Instant::now();
         for n in 0..(AUTH_FAILURE_PEERS as u32 + 500) {
-            throttle.failed(IpAddr::V6(std::net::Ipv6Addr::from(0x2001_0db8_u128 << 96 | u128::from(n))), now);
+            throttle.failed(
+                IpAddr::V6(std::net::Ipv6Addr::from(
+                    0x2001_0db8_u128 << 96 | u128::from(n),
+                )),
+                now,
+            );
         }
         assert!(throttle.failures.lock().unwrap().len() <= AUTH_FAILURE_PEERS);
     }
