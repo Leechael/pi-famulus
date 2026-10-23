@@ -12,6 +12,16 @@ struct WssRelay {
     roots: PathBuf,
 }
 
+/// WSS tests also run a daemon; see `network::stable_fixture` for why the
+/// binary must be a private copy rather than the shared cargo-target path.
+fn stable_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    let binary = fixture.root.join("pi-famulus");
+    fs::copy(BIN, &binary).unwrap();
+    fixture.binary = binary;
+    fixture
+}
+
 fn openssl(root: &std::path::Path, args: &[&str]) {
     let output = Command::new("openssl")
         .current_dir(root)
@@ -216,7 +226,11 @@ impl WssRelay {
         let mut env = Vec::new();
         let (roots, absent) = (
             self.roots.to_string_lossy().into_owned(),
-            fixture.root.join("absent-cert-dir").to_string_lossy().into_owned(),
+            fixture
+                .root
+                .join("absent-cert-dir")
+                .to_string_lossy()
+                .into_owned(),
         );
         if trusted_root {
             env.push(("SSL_CERT_FILE", roots.as_str()));
@@ -258,7 +272,7 @@ impl Drop for WssRelay {
 
 #[test]
 fn wss_default_rejects_fixture_ca_without_sending_registration() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let relay = WssRelay::new(&fixture);
     relay.start(&mut fixture, false, false, false);
     assert!(
@@ -279,7 +293,7 @@ fn wss_default_rejects_fixture_ca_without_sending_registration() {
 
 #[test]
 fn wss_insecure_cli_explicitly_allows_fixture_ca_and_registers() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let relay = WssRelay::new(&fixture);
     relay.start(&mut fixture, true, false, false);
     relay.registered(&fixture);
@@ -287,7 +301,7 @@ fn wss_insecure_cli_explicitly_allows_fixture_ca_and_registers() {
 
 #[test]
 fn wss_tls_insecure_toml_explicitly_allows_fixture_ca_and_registers() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let relay = WssRelay::new(&fixture);
     relay.start(&mut fixture, false, true, false);
     relay.registered(&fixture);
@@ -295,7 +309,7 @@ fn wss_tls_insecure_toml_explicitly_allows_fixture_ca_and_registers() {
 
 #[test]
 fn wss_explicit_trusted_roots_registers_without_disabling_verification() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let relay = WssRelay::new(&fixture);
     relay.start(&mut fixture, false, false, true);
     relay.registered(&fixture);

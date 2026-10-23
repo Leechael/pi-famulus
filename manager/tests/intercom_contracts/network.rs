@@ -12,6 +12,20 @@ pub(super) fn vacant_address() -> SocketAddr {
         .unwrap()
 }
 
+/// Tests here run a daemon; give each one a private copy of the binary so
+/// the daemon's exe watcher never sees the shared cargo-target binary
+/// replaced mid-test. A concurrent `cargo build` of the target directory
+/// changes the invoked file's identity, which the watcher reports as a
+/// "binary-changed" in-place upgrade: the daemon quiesces and execs, dropping
+/// every relay and plugin connection and failing long tests at random points.
+pub(super) fn stable_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    let binary = fixture.root.join("pi-famulus");
+    fs::copy(BIN, &binary).unwrap();
+    fixture.binary = binary;
+    fixture
+}
+
 fn http(
     address: SocketAddr,
     path: &str,
@@ -111,7 +125,7 @@ pub(super) fn tool(address: SocketAddr, token: &str, name: &str, arguments: Valu
 
 #[test]
 fn mcp_lists_non_ui_tools_sends_and_queries_receipts_without_new_turn_injection() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     fixture.start_with(
@@ -164,7 +178,7 @@ fn mcp_lists_non_ui_tools_sends_and_queries_receipts_without_new_turn_injection(
 
 #[test]
 fn mcp_auth_origin_and_missing_sender_reject_before_delivery() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     fixture.start_with(
@@ -208,7 +222,7 @@ fn mcp_auth_origin_and_missing_sender_reject_before_delivery() {
 #[test]
 fn mcp_without_a_configured_token_requires_a_generated_private_one() {
     use std::os::unix::fs::PermissionsExt;
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     fixture.start_with(&["--mcp-listen", &listen], &[]);
@@ -247,7 +261,7 @@ fn mcp_without_a_configured_token_requires_a_generated_private_one() {
 
 #[test]
 fn mcp_send_refuses_a_sender_that_is_not_a_live_local_session() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     fixture.start_with(&["--mcp-listen", &listen], &[]);
@@ -281,7 +295,7 @@ fn mcp_send_refuses_a_sender_that_is_not_a_live_local_session() {
 
 #[test]
 fn mcp_legacy_initialize_and_modern_stateless_tools_share_contract() {
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     fixture.start_with(&["--mcp-listen", &listen], &[]);
@@ -449,7 +463,7 @@ fn local_webhook_signed_handoff_accepts_queued_and_preserves_message_id() {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let endpoint = HttpFixture::new(|_| (200, json!({"status":"queued"})));
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     fixture.config(&format!(
         "[[endpoint]]\nname='fixture'\nurl='{}'\nsecret='shared-key'\n",
         endpoint.url()
@@ -489,7 +503,7 @@ fn local_webhook_signed_handoff_accepts_queued_and_preserves_message_id() {
 #[test]
 fn local_webhook_client_error_does_not_retry_or_report_success() {
     let endpoint = HttpFixture::new(|_| (400, json!({"error":"refused"})));
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     fixture.config(&format!(
         "[[endpoint]]\nname='fixture'\nurl='{}'\nsecret='shared-key'\n",
         endpoint.url()
@@ -547,8 +561,15 @@ impl WireRelay {
                     Err(_) => break,
                 };
                 stream.set_nodelay(true).unwrap();
+                // A short read timeout keeps this thread polling the
+                // outbound queue promptly: fixture tests such as the 1025-
+                // delivery native-quota contract forward a frame and then wait
+                // for its wire acknowledgement, so a 50ms poll would add ~100ms
+                // per round trip and blow the per-request deadline under
+                // parallel debug-build load. Inbound frames still return from
+                // read() immediately when data arrives.
                 stream
-                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .set_read_timeout(Some(Duration::from_millis(2)))
                     .unwrap();
                 stream
                     .set_write_timeout(Some(Duration::from_secs(1)))
@@ -775,7 +796,7 @@ fn relay_queued_ack_is_success_and_early_read_receipt_keeps_exact_message_id() {
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     let mut sender = fixture.plugin("sender", "busy");
     let sent = sender.ok(json!({"op":"send","to":"pi/remote","body":"remote body"}));
@@ -800,7 +821,7 @@ fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() 
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     let mut sender = fixture.plugin("sender", "busy");
     let failed = sender.call(json!({"op":"send","to":"pi/remote","body":"do not resend"}));
@@ -821,7 +842,7 @@ fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() 
 #[test]
 fn relay_policy_refuses_remote_before_bytes_but_keeps_local_delivery() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "remote_messages='refuse'\n");
     let mut sender = fixture.plugin("sender", "busy");
     let mut target = fixture.plugin("target", "busy");
@@ -844,7 +865,7 @@ fn relay_policy_refuses_remote_before_bytes_but_keeps_local_delivery() {
 #[test]
 fn relay_redelivery_after_exec_upgrade_is_not_injected_twice() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let binary = fixture.root.join("pi-famulus");
     fs::copy(BIN, &binary).unwrap();
     fixture.binary = binary;
@@ -889,7 +910,7 @@ fn relay_redelivery_after_exec_upgrade_is_not_injected_twice() {
 #[test]
 fn relay_duplicate_delivery_is_injected_once_and_real_pi_read_is_reported() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     let mut target = fixture.plugin("target", "busy");
     let frame = json!({"type":"deliver","session_id":"pi/target","from":"pi/remote","reply_to":"pi/remote","message_id":"223bfe8d-0039-4cbd-b1f9-a892a2773d23","body":"one injection"});
@@ -915,7 +936,7 @@ fn relay_duplicate_delivery_is_injected_once_and_real_pi_read_is_reported() {
 #[test]
 fn relay_deliver_refuses_hostile_reply_to_and_from_mode_before_injection() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     let mut target = fixture.plugin("target", "busy");
     let hostile = [
@@ -955,21 +976,23 @@ fn relay_deliver_refuses_hostile_reply_to_and_from_mode_before_injection() {
 fn remote_directory_rows_never_shadow_or_impersonate_local_sessions() {
     let device = Arc::new(std::sync::Mutex::new(Value::Null));
     let seen = device.clone();
-    let relay = WireRelay::new(move |request| match request["type"].as_str().unwrap_or_default() {
-        "register" => {
-            *seen.lock().unwrap() = request["machine_id"].clone();
-            relay_basics(request)
-        }
-        "list" => vec![json!({"type":"list","id":request["id"],"sessions":[
-            {"id":"pi/remote","name":"remote fixture","harness":"pi","machine_id":"other-device","status":"busy"},
-            {"id":"webhook/hook","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
-            {"id":"pi/target","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
-            {"id":"pi/machineless","name":"no machine","harness":"pi","status":"busy"},
-            {"id":"pi/self-claimed","name":"this machine","harness":"pi","machine_id":seen.lock().unwrap().clone(),"status":"busy"},
-        ]})],
-        _ => relay_basics(request),
-    });
-    let mut fixture = Fixture::new();
+    let relay = WireRelay::new(
+        move |request| match request["type"].as_str().unwrap_or_default() {
+            "register" => {
+                *seen.lock().unwrap() = request["machine_id"].clone();
+                relay_basics(request)
+            }
+            "list" => vec![json!({"type":"list","id":request["id"],"sessions":[
+                {"id":"pi/remote","name":"remote fixture","harness":"pi","machine_id":"other-device","status":"busy"},
+                {"id":"webhook/hook","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
+                {"id":"pi/target","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
+                {"id":"pi/machineless","name":"no machine","harness":"pi","status":"busy"},
+                {"id":"pi/self-claimed","name":"this machine","harness":"pi","machine_id":seen.lock().unwrap().clone(),"status":"busy"},
+            ]})],
+            _ => relay_basics(request),
+        },
+    );
+    let mut fixture = stable_fixture();
     start_relay(
         &mut fixture,
         &relay,
@@ -981,13 +1004,28 @@ fn remote_directory_rows_never_shadow_or_impersonate_local_sessions() {
     let row = |id: &str| rows.iter().filter(|r| r["id"] == id).collect::<Vec<_>>();
     let hook = row("webhook/hook");
     assert_eq!(hook.len(), 1, "{rows:?}");
-    assert_eq!(hook[0]["harness"], "webhook", "remote row shadowed a local endpoint");
-    assert!(str_field_or_empty(hook[0], "machine_id").is_empty(), "{hook:?}");
+    assert_eq!(
+        hook[0]["harness"], "webhook",
+        "remote row shadowed a local endpoint"
+    );
+    assert!(
+        str_field_or_empty(hook[0], "machine_id").is_empty(),
+        "{hook:?}"
+    );
     let target = row("pi/target");
     assert_eq!(target.len(), 1, "{rows:?}");
-    assert_eq!(target[0]["name"], "name-target", "remote row shadowed a local Pi");
-    assert!(row("pi/machineless").is_empty(), "machineless remote row passed as local: {rows:?}");
-    assert!(row("pi/self-claimed").is_empty(), "remote row claimed this machine: {rows:?}");
+    assert_eq!(
+        target[0]["name"], "name-target",
+        "remote row shadowed a local Pi"
+    );
+    assert!(
+        row("pi/machineless").is_empty(),
+        "machineless remote row passed as local: {rows:?}"
+    );
+    assert!(
+        row("pi/self-claimed").is_empty(),
+        "remote row claimed this machine: {rows:?}"
+    );
     assert_eq!(row("pi/remote").len(), 1, "{rows:?}");
 }
 
@@ -998,7 +1036,7 @@ fn str_field_or_empty<'a>(row: &'a Value, key: &str) -> &'a str {
 #[test]
 fn mcp_list_sessions_and_relay_snapshot_omit_internal_fields() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     start_relay_options(
@@ -1022,7 +1060,10 @@ fn mcp_list_sessions_and_relay_snapshot_omit_internal_fields() {
         .iter()
         .find(|row| row["id"] == "pi/leaky")
         .expect("registered session listed over MCP");
-    assert!(!leaked(listed), "MCP list_sessions leaked internals: {listed}");
+    assert!(
+        !leaked(listed),
+        "MCP list_sessions leaked internals: {listed}"
+    );
     assert_eq!(listed["cwd"], "/fixture/leaky");
     let deadline = Instant::now() + TIMEOUT;
     let published = loop {
@@ -1035,8 +1076,14 @@ fn mcp_list_sessions_and_relay_snapshot_omit_internal_fields() {
         {
             break row.clone();
         }
-        assert!(Instant::now() < deadline, "snapshot never published pi/leaky");
+        assert!(
+            Instant::now() < deadline,
+            "snapshot never published pi/leaky"
+        );
     };
-    assert!(!leaked(&published), "relay snapshot leaked internals: {published}");
+    assert!(
+        !leaked(&published),
+        "relay snapshot leaked internals: {published}"
+    );
     assert_eq!(published["cwd"], "/fixture/leaky");
 }

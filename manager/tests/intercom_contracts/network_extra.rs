@@ -22,7 +22,7 @@ fn advance_transport(fixture: &Fixture, ms: u64) {
 #[test]
 fn relay_ping_is_a_real_websocket_ping_at_twenty_manual_seconds() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_manual_transport(&mut fixture, &relay);
     fixture.wait_session("pi/remote");
     advance_transport(&fixture, 20_000);
@@ -43,7 +43,7 @@ fn relay_without_inbound_app_frames_or_server_ping_closes_at_sixty_manual_second
         true,
         false,
     );
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_manual_transport(&mut fixture, &relay);
     relay.request("_fixture_silent");
     advance_transport(&fixture, 59_999);
@@ -73,7 +73,7 @@ fn assert_auth_reconnect_uses_shared_five_minute_clock(http401: bool) {
         false,
         http401,
     );
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_manual_transport(&mut fixture, &relay);
     let kind = if http401 {
         "_fixture_upgrade_attempt"
@@ -138,7 +138,7 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
         ],
         _ => relay_basics(request),
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let target = super::super::native::ClaudePeer::new(&fixture);
     let address = vacant_address();
     let listen = address.to_string();
@@ -269,10 +269,13 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
 #[test]
 fn relay_status_report_does_not_reveal_the_mcp_token_location() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let listen = vacant_address().to_string();
     start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
-    relay.outgoing.send(json!({"type":"status","id":"status-fields","origin_machine":"other-device"})).unwrap();
+    relay
+        .outgoing
+        .send(json!({"type":"status","id":"status-fields","origin_machine":"other-device"}))
+        .unwrap();
     let reply = relay.request("status");
     assert_eq!(reply["id"], "status-fields");
     assert_eq!(reply["report"]["mcp_status"], "running", "{reply}");
@@ -285,7 +288,7 @@ fn relay_status_report_does_not_reveal_the_mcp_token_location() {
 #[test]
 fn late_rpc_reply_is_never_redispatched_as_a_new_forwarded_status_request() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     relay.outgoing.send(json!({"type":"status","id":"reachable-status-request","origin_machine":"other-device"})).unwrap();
     assert_eq!(
@@ -327,7 +330,7 @@ fn late_rpc_reply_is_never_redispatched_as_a_new_forwarded_status_request() {
 
 fn assert_native_base_refused(variant: &str) {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     let mut first = fixture.plugin("base-first", "busy");
     let mut second = fixture.plugin("base-second", "busy");
@@ -404,7 +407,7 @@ fn published_pi_rpc_inbound_uses_new_transport_uuid_and_exact_authenticated_sour
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
@@ -423,7 +426,12 @@ fn published_pi_rpc_inbound_uses_new_transport_uuid_and_exact_authenticated_sour
     assert!(uuid::Uuid::parse_str(id).is_ok());
     assert_ne!(id, "not-a-native-transport-identity");
     assert_eq!(
-        tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))["status"],
+        tool(
+            address,
+            &fixture.mcp_token(),
+            "message_status",
+            json!({"message_id":id})
+        )["status"],
         "accepted"
     );
 }
@@ -431,7 +439,7 @@ fn published_pi_rpc_inbound_uses_new_transport_uuid_and_exact_authenticated_sour
 #[test]
 fn incoming_delivery_dedup_is_4096_entry_lru_and_hot_duplicates_refresh_recency() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     let mut target = fixture.plugin("lru-target", "busy");
     let message_id =
@@ -470,7 +478,7 @@ fn incoming_delivery_dedup_is_4096_entry_lru_and_hot_duplicates_refresh_recency(
 #[test]
 fn uncertain_incoming_injection_late_read_proves_delivery_and_dedup_survives_retry() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
@@ -511,7 +519,12 @@ fn uncertain_incoming_injection_late_read_proves_delivery_and_dedup_survives_ret
         "Go Pi injection failures nack dropped without creating a terminal ledger fact"
     );
     assert_eq!(
-        tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))["status"],
+        tool(
+            address,
+            &fixture.mcp_token(),
+            "message_status",
+            json!({"message_id":id})
+        )["status"],
         "read",
         "late authenticated read did not prove an uncertain injection happened"
     );
@@ -526,7 +539,7 @@ fn enroll_and_device_persist_credentials_without_printing_secrets() {
             json!({"tenant_id":"tenant-fixture","device_id":request.body["device_id"],"credential":"device-secret-never-print"}),
         )
     });
-    let fixture = Fixture::new();
+    let fixture = stable_fixture();
     let url = endpoint.url();
     let output = fixture.run(&[
         "enroll",
@@ -571,7 +584,7 @@ fn endpoint_http_missing_endpoint_newline_falls_back_only_to_a_running_device_bo
             (404, b"endpoint not found\n".to_vec())
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     fixture.start();
     let mut target = fixture.plugin("endpoint-receiver", "busy");
     let url = endpoint.url();
@@ -706,7 +719,7 @@ fn endpoint_http_queued_send_and_inbox_preserve_server_status_and_identity() {
             )
         }
     });
-    let fixture = Fixture::new();
+    let fixture = stable_fixture();
     let config = fs::read_to_string(fixture.root.join("client.toml"))
         .unwrap()
         .replace("local_only = true", "local_only = false");
@@ -779,7 +792,7 @@ fn endpoint_http_queued_send_and_inbox_preserve_server_status_and_identity() {
 fn listen_announces_endpoint_forwards_signed_payload_and_returns_delivery_receipt() {
     let endpoint = HttpFixture::new(|_| (200, json!({"status":"duplicate"})));
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let url = relay.url();
     let forward = endpoint.url();
     let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
@@ -841,7 +854,7 @@ fn legacy_relay_non_native_send_keeps_server_id_and_early_held_projection() {
             _ => relay_basics(request),
         },
     );
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
@@ -858,7 +871,12 @@ fn legacy_relay_non_native_send_keeps_server_id_and_early_held_projection() {
         request.get("message_id").is_none_or(|v| v == ""),
         "legacy relay was sent unsupported caller UUID: {request}"
     );
-    let status = tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
+    let status = tool(
+        address,
+        &fixture.mcp_token(),
+        "message_status",
+        json!({"message_id":id}),
+    );
     assert_eq!(
         status["status"], "held",
         "ACK overwrote receipt that arrived before it"
@@ -874,7 +892,7 @@ fn legacy_relay_rejects_native_origin_before_body_submission() {
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let _native = super::super::native::ClaudePeer::new(&fixture);
     start_relay(&mut fixture, &relay, "");
     fixture.wait_session("claude/native-fixture");
@@ -888,7 +906,7 @@ fn legacy_relay_rejects_native_origin_before_body_submission() {
 #[test]
 fn native_unverifiable_launch_settings_refuse_before_relay_body_even_when_file_allows() {
     let relay = WireRelay::new(relay_basics);
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let _native = super::super::native::ClaudePeer::with_flags(&fixture, &["--settings", "{}"]);
     fs::write(
         fixture.root.join(".claude/settings.json"),
@@ -923,7 +941,7 @@ fn native_remote_policy_reloads_source_settings_before_each_relay_body() {
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let _native = super::super::native::ClaudePeer::new(&fixture);
     start_relay(&mut fixture, &relay, "");
     fixture.wait_session("claude/native-fixture");
@@ -964,7 +982,7 @@ fn remote_native_capacity_is_independent_and_rejects_before_1025th_relay_body() 
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let _native = super::super::native::ClaudePeer::new(&fixture);
     start_relay(&mut fixture, &relay, "");
     fixture.wait_session("claude/native-fixture");
@@ -1005,7 +1023,7 @@ fn native_remote_dropped_receipts_preserve_normalized_reasons_and_opaque_origina
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let native = super::super::native::ClaudePeer::new(&fixture);
     start_relay(&mut fixture, &relay, "");
     fixture.wait_session("claude/native-fixture");
@@ -1055,7 +1073,7 @@ fn native_remote_alias_maps_transport_receipts_to_original_uuid_and_pinned_sourc
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let native = super::super::native::ClaudePeer::new(&fixture);
     let address = vacant_address();
     let listen = address.to_string();
@@ -1116,7 +1134,7 @@ fn native_remote_alias_policy_refuses_before_body_and_directory_withdrawal_retir
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let native = super::super::native::ClaudePeer::new(&fixture);
     start_relay(&mut fixture, &relay, "remote_messages='refuse'\n");
     fixture.wait_session("claude/native-fixture");
@@ -1180,7 +1198,7 @@ fn history_capacity_pins_held_and_active_and_rejects_before_local_injection() {
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
@@ -1227,7 +1245,7 @@ fn local_active_capacity_rejects_1025th_before_bytes_but_remote_history_still_ad
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     start_relay(&mut fixture, &relay, "");
     let mut sender = fixture.plugin("sender", "busy");
     let mut target = fixture.plugin("target", "busy");
@@ -1257,7 +1275,7 @@ fn relay_terminal_status_is_first_writer_wins_even_after_requeue_and_lower_recei
             relay_basics(request)
         }
     });
-    let mut fixture = Fixture::new();
+    let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
     start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
@@ -1274,7 +1292,12 @@ fn relay_terminal_status_is_first_writer_wins_even_after_requeue_and_lower_recei
                 "receipt stream remains arrival-ordered; only query projection folds status"
             );
         }
-        let status = tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
+        let status = tool(
+            address,
+            &fixture.mcp_token(),
+            "message_status",
+            json!({"message_id":id}),
+        );
         assert_eq!(
             status["status"], terminal,
             "later terminal or lower rank rewrote terminal truth"
