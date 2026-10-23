@@ -85,7 +85,16 @@ pub async fn run(
                 Err(e) => return Err(e.to_string()),
             }
             reject_external_daemon(home, cfg).await?;
-            let restart = matches!(action, ServiceCommand::Restart);
+            let mut restart = matches!(action, ServiceCommand::Restart);
+            // An agent installed by an older release runs other arguments;
+            // render it afresh so launchd reloads the current ones.
+            let detected = prepare(home, cfg, opts).await?;
+            let content = render_with_token_check(&detected, &cfg.token)?;
+            let stale = std::fs::read(&plist).map_or(true, |current| current != content.as_bytes());
+            if stale {
+                write_private_atomic(&plist, content.as_bytes(), false)?;
+                restart = true;
+            }
             if !loaded().await? {
                 bootstrap(&plist).await?;
             } else if restart {
@@ -96,7 +105,7 @@ pub async fn run(
             } else {
                 launchctl(&["kickstart", &launch_service()]).await?;
             }
-            crate::out::line(if restart {
+            crate::out::line(if matches!(action, ServiceCommand::Restart) {
                 "service restarted"
             } else {
                 "service started"
@@ -977,6 +986,9 @@ mod tests {
         }
         let root = PathBuf::from("/tmp").join(format!("fsvc-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         std::fs::create_dir(&root).unwrap();
+        // The bridge refuses a group-writable socket directory (umask 002).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let home = root.join("manager");
         let sock = root.join("i.sock");
         let child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1088,7 +1100,12 @@ mod tests {
             .output()
             .unwrap();
         let log = std::fs::read_to_string(&calls).unwrap_or_default();
+        let plist = std::fs::read_to_string(agents.join(format!("{LABEL}.plist"))).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            plist.contains("<string>serve</string>") && !plist.contains("<string>intercom</string>"),
+            "restart kept a stale launch agent: {plist}"
+        );
         assert!(
             output.status.success(),
             "restart failed: {}\n{}",

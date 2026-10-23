@@ -226,7 +226,10 @@ impl Drop for Cancel {
     }
 }
 
-pub(super) async fn start(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>) {
+pub(super) async fn start(
+    rt: &Shared,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let client = Client {
         inner: Arc::new(Inner {
             connection: tokio::sync::Mutex::new(None),
@@ -240,13 +243,16 @@ pub(super) async fn start(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>)
     };
     *rt.native.codex.lock().unwrap() = Some(client.clone());
     #[cfg(unix)]
-    rt.native
-        .tasks
-        .lock()
-        .unwrap()
-        .push(tokio::spawn(async move {
+    {
+        Some(tokio::spawn(async move {
             client.maintain().await;
-        }));
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = client;
+        None
+    }
 }
 
 impl super::Native {

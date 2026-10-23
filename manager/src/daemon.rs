@@ -639,7 +639,7 @@ async fn serve(
                 }
             },
             Some(request) = supervision_rx.recv(), if shutdown_task.is_none() => {
-                let status = apply_supervision(&state, &mut intercom, &bridge_error).await;
+                let status = apply_supervision(&state, &mut intercom, &mut bridge_error).await;
                 if let Some(reply) = request.reply {
                     let _ = reply.send(status);
                 }
@@ -656,7 +656,7 @@ async fn serve(
                         let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
                         if intercom.is_none() {
                             (intercom, bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
-                            apply_supervision(&state, &mut intercom, &bridge_error).await;
+                            apply_supervision(&state, &mut intercom, &mut bridge_error).await;
                         }
                     }
                 }
@@ -3462,13 +3462,32 @@ async fn handle_supervise(state: &Shared, conn_id: u64) -> Result<SuperviseOk, P
 }
 
 /// Makes the bridge's Supervised-only capabilities match the leases held
-/// now, and describes the bridge for a lease holder.
+/// now, and describes the bridge for a lease holder. Becoming Supervised
+/// rereads the configuration: a bridge that failed at boot, or one whose
+/// configuration changed since (enrollment, `service install`), restarts.
 async fn apply_supervision(
     state: &Shared,
     running: &mut Option<crate::intercom::Running>,
-    bridge_error: &Option<String>,
+    bridge_error: &mut Option<String>,
 ) -> String {
-    let leased = state.lock().unwrap().conns.values().any(|conn| conn.supervisor);
+    let (leased, home, clock) = {
+        let st = state.lock().unwrap();
+        (st.conns.values().any(|conn| conn.supervisor), st.home.clone(), st.clock.clone())
+    };
+    if leased && !running.as_ref().is_some_and(|running| running.supervised()) {
+        let fresh = crate::intercom::bridge_config();
+        let stale = match (running.as_ref(), &fresh) {
+            (Some(current), Ok(config)) => current.config() != config,
+            (None, _) => true,
+            (Some(_), Err(_)) => false,
+        };
+        if stale {
+            if let Some(current) = running.take() {
+                crate::intercom::carry_dedup(current.shutdown_for_handover().await);
+            }
+            (*running, *bridge_error) = start_bridge(&home, clock).await;
+        }
+    }
     let Some(running) = running.as_mut() else {
         return format!(
             "unavailable: {}",

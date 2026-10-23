@@ -211,14 +211,22 @@ pub async fn hold_supervision(home: &Path, mut report: impl FnMut(Result<String,
 
 /// `serve`: supervise the manager until a signal ends this process.
 pub async fn cmd_serve(home: &Path) -> Result<(), String> {
+    // Repeated failures (a manager that keeps refusing) are logged once.
+    let mut last_error = None;
     let lease = hold_supervision(home, |status| match status {
         Ok(intercom) => {
+            last_error = None;
             let pid = lifecycle::read_pid_file(home)
                 .map(|p| format!(" (pid {})", p.pid))
                 .unwrap_or_default();
             eprintln!("pi-famulus serve: supervising the manager{pid}; intercom {intercom}");
         }
-        Err(error) => eprintln!("pi-famulus serve: {error}; retrying"),
+        Err(error) => {
+            if last_error.as_ref() != Some(&error) {
+                eprintln!("pi-famulus serve: {error}; retrying");
+                last_error = Some(error);
+            }
+        }
     });
     tokio::select! {
         _ = lease => {}

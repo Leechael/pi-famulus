@@ -107,7 +107,10 @@ impl Drop for Reader {
         self.0.abort();
     }
 }
-pub(super) async fn start(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>) {
+pub(super) async fn start(
+    rt: &Shared,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
         let (tx, mut rx) = mpsc::channel::<Command>(64);
@@ -154,11 +157,12 @@ pub(super) async fn start(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>)
                 tokio::select! {_=stop.changed()=>return,_=tokio::time::sleep(Duration::from_secs(3))=>{},command=rx.recv()=>{if let Some(command)=command{let _=command.reply.send(Err("Desktop IPC not connected".into()));}else{return;}}}
             }
         });
-        rt.native.tasks.lock().unwrap().push(task);
+        Some(task)
     }
     #[cfg(not(unix))]
     {
-        let _ = rt;
+        let _ = (rt, stop);
+        None
     }
 }
 #[cfg(unix)]

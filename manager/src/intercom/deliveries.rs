@@ -1258,6 +1258,7 @@ mod tests {
             #[cfg(unix)]
             socket_identity: (0, 0),
             supervision: None,
+            config: crate::intercom::config::Config::default(),
         };
         let carried = running.shutdown_for_handover().await;
         drop(held);

@@ -57,6 +57,10 @@ pub enum Command {
     Help {
         path: Vec<String>,
     },
+    /// Legacy launch agents run `intercom --config C serve`; it now means
+    /// `pi-famulus serve` with C as the bridge configuration.
+    #[usage(hide)]
+    Serve,
     /// Reachable local and remote agent sessions.
     Agents {
         query: Option<String>,
@@ -268,6 +272,13 @@ pub async fn run(home: PathBuf, options: Options, action: Command) -> Result<(),
         crate::out::bytes(help_text(path)?.as_bytes());
         return Ok(());
     }
+    if matches!(action, Command::Serve) {
+        if let Some(path) = &options.config {
+            // The manager `serve` spawns inherits this as its configuration.
+            std::env::set_var("AGENT_INTERCOM_CONFIG", path);
+        }
+        return crate::client::cmd_serve(&home).await;
+    }
     let cfg = Config::load(&options)?;
     let (as_json, collection) = match &action {
         Command::Status { json, .. } => (*json, "report"),
@@ -476,7 +487,7 @@ pub async fn run(home: PathBuf, options: Options, action: Command) -> Result<(),
         Command::Service { action } => {
             return super::service::run(&home, &cfg, &options, action).await
         }
-        Command::Help { .. } => unreachable!(),
+        Command::Help { .. } | Command::Serve => unreachable!(),
     };
     let op = text(&req, "op").to_string();
     let r = match super::localrpc::call_raw(&cfg, req.clone()).await {

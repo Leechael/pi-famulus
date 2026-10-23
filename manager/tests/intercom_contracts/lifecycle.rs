@@ -50,32 +50,47 @@ fn mcp_up(address: &str) -> bool {
     TcpStream::connect(address).is_ok()
 }
 
-/// Counts connections to a stand-in Codex app-server socket.
-fn codex_host(fixture: &Fixture) -> (PathBuf, Arc<AtomicUsize>) {
+/// A stand-in Codex app-server socket: connections accepted so far, and
+/// how many are still open (the adapter has not detached).
+struct CodexHost {
+    path: String,
+    accepted: Arc<AtomicUsize>,
+    open: Arc<AtomicUsize>,
+}
+fn codex_host(fixture: &Fixture) -> CodexHost {
+    use std::io::Read;
     let path = fixture.root.join("codex-app.sock");
     let listener = UnixListener::bind(&path).unwrap();
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let seen = accepted.clone();
+    let (accepted, open) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (seen, live) = (accepted.clone(), open.clone());
     thread::spawn(move || {
         for stream in listener.incoming() {
-            if stream.is_err() {
-                break;
-            }
+            let Ok(mut stream) = stream else { break };
             seen.fetch_add(1, Ordering::SeqCst);
+            live.fetch_add(1, Ordering::SeqCst);
+            let live = live.clone();
+            thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                while matches!(stream.read(&mut buffer), Ok(n) if n > 0) {}
+                live.fetch_sub(1, Ordering::SeqCst);
+            });
         }
     });
-    (path, accepted)
+    CodexHost {
+        path: path.to_str().unwrap().to_string(),
+        accepted,
+        open,
+    }
 }
 
 #[test]
 fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() {
     let mut fixture = Fixture::new();
     let mcp = network::vacant_address().to_string();
-    let (codex, accepted) = codex_host(&fixture);
-    let codex = codex.to_str().unwrap().to_string();
+    let codex = codex_host(&fixture);
     spawn_self_managed(
         &mut fixture,
-        &[("AGENT_INTERCOM_MCP_LISTEN", &mcp), ("CODEX_APP_SERVER_SOCK", &codex)],
+        &[("AGENT_INTERCOM_MCP_LISTEN", &mcp), ("CODEX_APP_SERVER_SOCK", &codex.path)],
     );
     let pi = pi_session(&fixture, "pi-session");
     wait_for("the bridge runs without any lease", &fixture, TIMEOUT, || {
@@ -85,7 +100,7 @@ fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() 
     thread::sleep(Duration::from_secs(2));
     assert!(!mcp_up(&mcp), "a self-managed manager served MCP");
     assert_eq!(
-        accepted.load(Ordering::SeqCst),
+        codex.accepted.load(Ordering::SeqCst),
         0,
         "a self-managed manager attached to the Codex app-server"
     );
@@ -111,13 +126,13 @@ fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() 
 fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
     let mut fixture = Fixture::new();
     let mcp = network::vacant_address().to_string();
-    let (codex, accepted) = codex_host(&fixture);
-    let codex = codex.to_str().unwrap().to_string();
-    fixture.start_with(&["--mcp-listen", &mcp], &[("CODEX_APP_SERVER_SOCK", &codex)]);
+    let codex = codex_host(&fixture);
+    let env = [("CODEX_APP_SERVER_SOCK", codex.path.as_str())];
+    fixture.start_with(&["--mcp-listen", &mcp], &env);
     let pid = fixture.daemon_pid();
     wait_for("Supervised MCP listens", &fixture, TIMEOUT, || mcp_up(&mcp));
     wait_for("Supervised Codex adapter attaches", &fixture, TIMEOUT, || {
-        accepted.load(Ordering::SeqCst) > 0
+        codex.open.load(Ordering::SeqCst) > 0
     });
     thread::sleep(Duration::from_secs(7));
     assert!(alive(pid), "a supervised manager idled out without pi");
@@ -126,12 +141,29 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
     unsafe { libc::kill(serve.id() as i32, libc::SIGTERM) };
     serve.wait().unwrap();
     wait_for("MCP stops with the last lease", &fixture, TIMEOUT, || !mcp_up(&mcp));
+    wait_for("the Codex adapter detaches with the last lease", &fixture, TIMEOUT, || {
+        codex.open.load(Ordering::SeqCst) == 0
+    });
+    let demoted = codex.accepted.load(Ordering::SeqCst);
     thread::sleep(Duration::from_secs(7));
+    assert_eq!(
+        codex.accepted.load(Ordering::SeqCst),
+        demoted,
+        "the Codex adapter kept reconnecting after the last lease ended"
+    );
     assert!(alive(pid), "the manager exited while pi still used it");
     assert!(
         UnixStream::connect(&fixture.sock).is_ok(),
         "the bridge stopped with the lease"
     );
+    let reattached = codex.accepted.load(Ordering::SeqCst);
+    fixture.start_with(&["--mcp-listen", &mcp], &env);
+    assert_eq!(fixture.daemon_pid(), pid, "a second lease replaced the manager");
+    wait_for("a second lease promotes again", &fixture, TIMEOUT, || {
+        mcp_up(&mcp) && codex.accepted.load(Ordering::SeqCst) > reattached
+    });
+    fixture.release_lease();
+    wait_for("the second lease demotes again", &fixture, TIMEOUT, || !mcp_up(&mcp));
     drop(pi);
     wait_for(
         "the manager outlived its last pi after the lease ended",
@@ -178,4 +210,38 @@ fn serve_leases_an_existing_self_managed_manager_and_survives_its_replacement() 
             .is_some_and(|pid| pid as u32 != first && alive(pid as u32))
             && mcp_up(&mcp)
     });
+}
+
+#[test]
+fn a_lease_rereads_the_bridge_configuration_a_self_managed_manager_started_with() {
+    let mut fixture = Fixture::new();
+    spawn_self_managed(&mut fixture, &[]);
+    let pi = pi_session(&fixture, "pi-session");
+    wait_for("the bridge runs without any lease", &fixture, TIMEOUT, || {
+        UnixStream::connect(&fixture.sock).is_ok()
+    });
+    let machine = |fixture: &Fixture| {
+        let output = fixture.run(&["status", "--json"]);
+        serde_json::from_slice::<Value>(&output.stdout).unwrap_or_default()["machine"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(machine(&fixture).starts_with("fixture-host@"));
+    let config = fs::read_to_string(fixture.root.join("client.toml"))
+        .unwrap()
+        .replace("name = 'fixture-host'", "name = 'enrolled-host'");
+    fs::write(fixture.root.join("client.toml"), config).unwrap();
+    let mut daemon = fixture.child.take().unwrap();
+    fixture.start_with(&[], &[]);
+    wait_for("the lease applied the newer configuration", &fixture, TIMEOUT, || {
+        machine(&fixture).starts_with("enrolled-host@")
+    });
+    drop(pi);
+    fixture.release_lease();
+    let mut manager =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
+    manager.hello_cli();
+    manager.request_ok(json!({"type":"shutdown"}));
+    daemon.wait().unwrap();
 }

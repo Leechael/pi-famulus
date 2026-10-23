@@ -168,14 +168,20 @@ pub struct Running {
     #[cfg(unix)]
     socket_identity: (u64, u64),
     supervision: Option<Supervision>,
+    config: Config,
 }
 /// Capabilities that run only while the manager is Supervised (`serve` or
 /// `top` holds a lease): the Codex adapters and MCP.
 struct Supervision {
     stop: watch::Sender<bool>,
     mcp: Option<tokio::task::JoinHandle<()>>,
+    adapters: Vec<tokio::task::JoinHandle<()>>,
 }
 impl Running {
+    /// The configuration this bridge was started from.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
     pub fn supervised(&self) -> bool {
         self.supervision.is_some()
     }
@@ -186,7 +192,7 @@ impl Running {
         }
         let runtime = &self.runtime;
         let (stop, _) = watch::channel(false);
-        native::start_codex(runtime, stop.subscribe()).await;
+        let adapters = native::start_codex(runtime, stop.subscribe()).await;
         let mut mcp = None;
         if !runtime.cfg.mcp_listen.is_empty() {
             let started = if runtime.cfg.mcp_token.trim().is_empty() {
@@ -213,7 +219,11 @@ impl Running {
                 }
             }
         }
-        self.supervision = Some(Supervision { stop, mcp });
+        self.supervision = Some(Supervision {
+            stop,
+            mcp,
+            adapters,
+        });
         runtime.state.lock().unwrap().supervised = true;
     }
     /// Stops the Supervised-only capabilities when the last lease is gone.
@@ -227,10 +237,17 @@ impl Running {
                 mcp.abort();
             }
         }
+        // A later lease must not overlap the previous adapters.
+        for adapter in supervision.adapters {
+            adapter.abort();
+            let _ = adapter.await;
+        }
         self.runtime.native.stop_codex();
         let mut state = self.runtime.state.lock().unwrap();
         state.supervised = false;
-        if state.mcp_status == "running" {
+        // A token that could not be generated stays reported; a stopped or
+        // failed listener is simply off while self-managed.
+        if !state.mcp_status.starts_with("error: MCP token") {
             state.mcp_status = "disabled".into();
         }
         drop(state);
@@ -297,6 +314,7 @@ impl Runtime {
 }
 pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, String> {
     c.validate()?;
+    let config = c.clone();
     if !c.local_only && c.server.is_empty() {
         return Err("server URL is required".into());
     }
@@ -404,6 +422,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
         #[cfg(unix)]
         socket_identity,
         supervision: None,
+        config,
     };
     match native::start(&runtime).await {
         Ok(()) => runtime.state.lock().unwrap().native_status = "running".into(),

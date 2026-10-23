@@ -495,9 +495,13 @@ impl Native {
 }
 /// Codex app-server and Desktop adapters run only while the manager is
 /// Supervised; `stop` ends this supervision epoch.
-pub async fn start_codex(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>) {
-    desktop::start(rt, stop.clone()).await;
-    codex::start(rt, stop).await;
+pub async fn start_codex(
+    rt: &Shared,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let desktop = desktop::start(rt, stop.clone()).await;
+    let codex = codex::start(rt, stop).await;
+    desktop.into_iter().chain(codex).collect()
 }
 impl Native {
     pub fn stop_codex(&self) {

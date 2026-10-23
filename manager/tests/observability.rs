@@ -858,6 +858,7 @@ fn cli_on_tty(home: &Home, args: &[&str], env: &[(&str, &str)]) -> Option<String
     let mut argv: Vec<String> = vec![BIN.into(), "--home".into(), home.path.to_string_lossy().into_owned()];
     argv.extend(args.iter().map(|a| a.to_string()));
     let mut cmd = std::process::Command::new("script");
+    cmd.env("PI_FAMULUS_NO_INTERCOM", "1");
     if cfg!(target_os = "macos") {
         cmd.arg("-q").arg("/dev/null").args(&argv);
     } else {

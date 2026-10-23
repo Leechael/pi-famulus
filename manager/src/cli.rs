@@ -307,6 +307,9 @@ pub(crate) enum Sub {
     #[usage(display_order = 150, help_heading = "Inspection")]
     Doctor,
     /// Gracefully shut the manager down (kills remaining tasks).
+    ///
+    /// A running `serve` or interactive `top` starts a fresh manager at once;
+    /// stop those first to keep it down.
     #[usage(display_order = 160, help_heading = "Daemon")]
     Shutdown,
     /// Replace the running manager in place with the binary now on disk.
