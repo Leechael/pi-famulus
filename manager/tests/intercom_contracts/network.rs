@@ -617,6 +617,15 @@ impl WireRelay {
             }
         }
     }
+    fn assert_quiet(&self, window: Duration, forbidden: impl Fn(&Value) -> bool, why: &str) {
+        let deadline = Instant::now() + window;
+        while let Ok(frame) = self
+            .requests
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            assert!(!forbidden(&frame), "{why}: {frame}");
+        }
+    }
 }
 
 impl Drop for WireRelay {
@@ -749,12 +758,10 @@ fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() 
         "invalid ACK outcome: {failed}"
     );
     relay.request("send");
-    assert!(
-        !relay
-            .requests
-            .try_iter()
-            .any(|request| request["type"] == "send"),
-        "invalid ACK replayed body"
+    relay.assert_quiet(
+        RESEND_QUIET,
+        |request| request["type"] == "send",
+        "invalid ACK replayed body",
     );
 }
 

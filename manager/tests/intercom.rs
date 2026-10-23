@@ -38,6 +38,10 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 const TIMEOUT: Duration = Duration::from_secs(8);
+/// Outlasts the 750ms idle settle plus two 250ms maintenance ticks.
+const IDLE_QUIET: Duration = Duration::from_millis(1500);
+/// Outlasts the daemon's 3s relay snapshot, Desktop reconnect and webhook retry cadence.
+const RESEND_QUIET: Duration = Duration::from_millis(3500);
 static NEXT_HOME: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
@@ -329,6 +333,10 @@ impl Peer {
     }
 
     fn no_event(&mut self) {
+        self.no_event_for(Duration::from_millis(150));
+    }
+
+    fn no_event_for(&mut self, window: Duration) {
         assert!(
             self.pushed.is_empty(),
             "unexpected buffered events: {:?}",
@@ -336,7 +344,7 @@ impl Peer {
         );
         self.reader
             .get_mut()
-            .set_read_timeout(Some(Duration::from_millis(150)))
+            .set_read_timeout(Some(window))
             .unwrap();
         let mut line = String::new();
         match self.reader.read_line(&mut line) {
@@ -661,7 +669,7 @@ fn idle_is_one_shot_bound_to_watcher_and_not_a_message_receipt() {
     let id = subscribed["subscription_id"].clone();
     assert!(id.as_str().is_some_and(|s| !s.is_empty()));
     target.register("target", "waiting", &["read_receipts", "idle_state_v1"]);
-    watcher.no_event();
+    watcher.no_event_for(IDLE_QUIET);
     target.register("target", "idle", &["read_receipts", "idle_state_v1"]);
     let notice = watcher.event("idle_notice");
     assert_eq!(notice["subscription_id"], id);
@@ -677,7 +685,7 @@ fn idle_is_one_shot_bound_to_watcher_and_not_a_message_receipt() {
     );
     target.register("target", "busy", &["read_receipts", "idle_state_v1"]);
     target.register("target", "idle", &["read_receipts", "idle_state_v1"]);
-    watcher.no_event();
+    watcher.no_event_for(IDLE_QUIET);
 }
 
 #[test]
@@ -706,7 +714,7 @@ fn idle_explicit_unregister_is_exit_but_transport_loss_is_not() {
     let subscription = watcher.ok(json!({"op":"subscribe_idle","to":"pi/target"}));
     drop(target);
     fixture.wait_absent("pi/target");
-    watcher.no_event();
+    watcher.no_event_for(IDLE_QUIET);
     let status =
         watcher.ok(json!({"op":"idle_status","subscription_id":subscription["subscription_id"]}));
     assert_eq!(status["status"], "subscribed");
@@ -728,7 +736,7 @@ fn watcher_replacement_cancels_old_subscription_without_notifying_new_owner() {
         .connect()
         .ok(json!({"op":"idle_status","subscription_id":subscription["subscription_id"]}));
     assert_ne!(status["status"], "subscribed");
-    replacement.no_event();
+    replacement.no_event_for(IDLE_QUIET);
 }
 
 #[test]
