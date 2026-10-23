@@ -252,3 +252,46 @@ fn native_managed_policy_blocks_remote_idle_before_any_subscription_bytes() {
         "managed source policy was checked after remote subscription bytes"
     );
 }
+
+#[test]
+fn remote_idle_ownership_snapshot_omits_internal_directory_fields() {
+    let relay = WireRelay::new(ack);
+    let mut fixture = Fixture::new();
+    start_relay(&mut fixture, &relay, "");
+    let mut watcher = fixture.plugin("watcher", "busy");
+    // A local target row: plugins register with a host pid, and native rows
+    // carry `_`-prefixed routing state; none of that may cross to the relay.
+    let _target = fixture.plugin("target", "idle");
+    let subscribed = watcher.ok(json!({"op":"subscribe_idle","to":"pi/remote"}));
+    assert_eq!(subscribed["status"], "subscribed");
+    // The daemon also snapshots periodically, so skip earlier (pre-registration)
+    // snapshots until the ownership snapshot that carries the local target.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut sessions = Vec::new();
+    while !sessions.iter().any(|row: &Value| row["id"] == "pi/target") {
+        assert!(
+            Instant::now() < deadline,
+            "target never reached the snapshot"
+        );
+        let frame = relay
+            .requests
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("snapshot frame before deadline");
+        if frame["type"] != "snapshot" {
+            continue;
+        }
+        sessions = frame["sessions"].as_array().cloned().unwrap_or_default();
+    }
+    for row in &sessions {
+        assert!(
+            row.get("pid").is_none(),
+            "host pid leaked to the relay: {row}"
+        );
+        for key in row.as_object().unwrap().keys() {
+            assert!(
+                !key.starts_with('_'),
+                "internal field {key} leaked to the relay: {row}"
+            );
+        }
+    }
+}

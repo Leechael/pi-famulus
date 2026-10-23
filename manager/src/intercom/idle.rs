@@ -400,6 +400,8 @@ impl Runtime {
             } else if backend == "remote" {
                 // Publish ownership before forwarding a freshly registered
                 // watcher; the authenticated relay validates this snapshot.
+                // Rows cross to the relay, so internal fields (`_`-prefixed
+                // routing state and the host-only pid) must be stripped first.
                 let sessions: Vec<_> = self
                     .directory()
                     .await
@@ -409,6 +411,7 @@ impl Runtime {
                             || str_field(row, "machine_id") == self.machine)
                             && !str_field(row, "id").starts_with("webhook/")
                     })
+                    .map(super::public_row)
                     .collect();
                 let writer = self
                     .state
