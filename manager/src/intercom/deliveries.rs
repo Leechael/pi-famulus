@@ -769,7 +769,9 @@ mod tests {
                 .admit(mid, "pi/origin", target, false, false, rt.clock.now_ms())
                 .unwrap();
         }
+        let mut lease = rt.state.lock().unwrap().messages[mid].lease_at;
         for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
             let observe = async {
                 match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                     Ok(Some(frame)) => {
@@ -787,6 +789,11 @@ mod tests {
             let state = rt.state.lock().unwrap();
             assert_eq!(state.messages[mid].status, "delivered");
             assert!(state.active(mid));
+            assert!(
+                state.messages[mid].lease_at > lease,
+                "nonterminal delivered must renew the receipt lease"
+            );
+            lease = state.messages[mid].lease_at;
         }
         let receive = async {
             let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
