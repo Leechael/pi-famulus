@@ -337,3 +337,68 @@ fn herdr_session_create_prompt_keys_read_wait_and_close_use_native_methods() {
     cli.ok(json!({"op":"session_close","to":"pi/pi-pane"}));
     assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "pane-one");
 }
+
+#[test]
+fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission_bypass() {
+    use super::network::{relay_basics, start_relay_options_env, WireRelay};
+    let relay = WireRelay::new(relay_basics);
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    herdr.set_panes(vec![
+        json!({"pane_id":"pane-one","workspace_id":"ws-one","cwd":"/fixture/project","label":"Live Pi","agent":"pi","agent_status":"busy","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-pane"}}),
+        json!({"pane_id":"ws-one:p9","workspace_id":"ws-one","cwd":"/fixture/shell"}),
+    ]);
+    let path = herdr.path.to_str().unwrap().to_string();
+    start_relay_options_env(&mut fixture, &relay, "", &[], &[("HERDR_SOCKET_PATH", &path)]);
+    relay.request("register");
+    fixture.wait_session("pi/remote");
+    let _pane = pane_plugin(&fixture, "pi-pane", "pane-one");
+    let _created = pane_plugin(&fixture, "pi-created", "pane-new");
+    let call = |frame: Value| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut frame = frame;
+        frame["id"] = json!(id);
+        relay.push(frame);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let reply = relay
+                .requests
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("relay reply");
+            if reply["id"] == id {
+                return reply;
+            }
+        }
+    };
+    let shell = call(json!({"type":"agent_keys","session_id":"ws-one:p9","keys":["c","Enter"]}));
+    assert_eq!(shell["type"], "error", "relay typed into a shell pane: {shell}");
+    let agent = call(json!({"type":"agent_keys","session_id":"pi/pi-pane","keys":["Enter"]}));
+    assert_ne!(agent["type"], "error", "{agent}");
+    assert_eq!(
+        herdr.request("agent.send_keys")["params"]["target"],
+        "pane-one",
+        "the refused shell-pane keys reached Herdr"
+    );
+    let cwd = fixture.root.to_str().unwrap().to_string();
+    for (args, cwd) in [
+        (json!(["--dangerously-skip-permissions"]), cwd.as_str()),
+        (json!(["--permission-mode", "bypassPermissions"]), cwd.as_str()),
+        (json!(["--permission-mode=bypassPermissions"]), cwd.as_str()),
+        (json!(["--model", "--dangerously-skip-permissions"]), cwd.as_str()),
+        (json!("--offline"), cwd.as_str()),
+        (json!(["--offline"]), "/fixture/does-not-exist"),
+        (json!(["--offline"]), "relative/dir"),
+    ] {
+        let reply = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"claude","workspace_id":"ws-one","args":args}));
+        assert_eq!(reply["type"], "error", "{args} in {cwd}: {reply}");
+    }
+    let created = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","workspace_id":"ws-one","args":["--offline","--model","sonnet"]}));
+    assert_ne!(created["type"], "error", "{created}");
+    assert_eq!(herdr.request("tab.create")["params"]["cwd"], json!(cwd));
+    let started = herdr.request("agent.start");
+    assert_eq!(
+        started["params"]["args"],
+        json!(["--offline", "--model", "sonnet"]),
+        "a refused session_create reached agent.start"
+    );
+}

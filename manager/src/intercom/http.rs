@@ -794,6 +794,7 @@ async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, Strin
                             .iter()
                             .any(|key| str_field(row, key).to_lowercase().contains(&query))
                 })
+                .map(super::public_row)
                 .collect();
             Ok(json!(rows))
         }

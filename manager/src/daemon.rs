@@ -898,7 +898,7 @@ fn begin_shutdown(
 // Connection handling
 // ---------------------------------------------------------------------------
 
-fn valid_session_id(s: &str) -> bool {
+pub(crate) fn valid_session_id(s: &str) -> bool {
     // Session ids become directory names; keep them path-safe.
     !s.is_empty()
         && s.len() <= 128

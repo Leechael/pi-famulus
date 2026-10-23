@@ -373,19 +373,19 @@ impl Runtime {
         }
     }
     pub async fn directory(&self) -> Vec<Value> {
-        let mut rows: Vec<Value> = {
+        let (mut rows, remote): (Vec<Value>, Vec<Value>) = {
             let s = self.state.lock().unwrap();
-            s.sessions
-                .values()
-                .map(|s| s.value.clone())
-                .chain(s.remote.iter().cloned())
-                .collect()
+            (
+                s.sessions.values().map(|s| s.value.clone()).collect(),
+                s.remote.clone(),
+            )
         };
         rows.extend(self.native.list().await);
         herdr::overlay(self, &mut rows).await;
         for ep in &self.cfg.endpoints {
             rows.push(json!({"id":format!("webhook/{}",ep.name),"name":ep.name,"harness":"webhook","status":"idle","cwd":""}));
         }
+        merge_remote(&mut rows, remote, &self.machine);
         let s = self.state.lock().unwrap();
         for row in &mut rows {
             if let Some(name) = s.aliases.get(str_field(row, "id")) {
@@ -565,9 +565,7 @@ impl Runtime {
         if *self.closing.borrow() {
             return Err("intercom is shutting down".into());
         }
-        if !["", "prompting", "bypass"].contains(&mode) {
-            return Err("from_mode must be prompting or bypass".into());
-        }
+        check_from_mode(mode)?;
         let to = str_field(&target, "id");
         let remote = !str_field(&target, "machine_id").is_empty()
             && str_field(&target, "machine_id") != self.machine;
@@ -903,8 +901,43 @@ impl Drop for Forwarding<'_> {
         }
     }
 }
+/// Remote rows never shadow a local session, and a remote row cannot claim
+/// this machine (or no machine) and thereby pass as local.
+fn merge_remote(rows: &mut Vec<Value>, remote: Vec<Value>, machine: &str) {
+    let local: HashSet<String> = rows.iter().map(|r| str_field(r, "id").to_string()).collect();
+    rows.extend(remote.into_iter().filter(|row| {
+        let owner = str_field(row, "machine_id");
+        !owner.is_empty() && owner != machine && !local.contains(str_field(row, "id"))
+    }));
+}
 pub fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
+}
+const FROM_MODES: [&str; 3] = ["", "prompting", "bypass"];
+fn check_from_mode(mode: &str) -> Result<(), String> {
+    if FROM_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err("from_mode must be prompting or bypass".into())
+    }
+}
+/// An intercom session id: `<kind>/<id>` where the id half follows the daemon
+/// session-id grammar. Ids are interpolated into native envelopes and reply
+/// instructions, so anything else is refused at trust boundaries.
+pub(crate) fn valid_intercom_id(id: &str) -> bool {
+    id.split_once('/').is_some_and(|(kind, rest)| {
+        !kind.is_empty()
+            && kind.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && crate::daemon::valid_session_id(rest)
+    })
+}
+/// The directory row as published beyond this daemon: `_`-prefixed fields are
+/// internal routing state and the pid is only meaningful on this host.
+pub(crate) fn public_row(mut row: Value) -> Value {
+    if let Some(fields) = row.as_object_mut() {
+        fields.retain(|key, _| !key.starts_with('_') && key != "pid");
+    }
+    row
 }
 
 async fn probe_tool_status() -> Value {

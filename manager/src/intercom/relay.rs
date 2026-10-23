@@ -161,7 +161,7 @@ pub async fn send(
         )
     };
     let rows = rt.directory().await;
-    let snapshot = json!({"type":"snapshot","machine_id":rt.machine,"sessions":rows.into_iter().filter(|v|str_field(v,"machine_id").is_empty()&&!str_field(v,"id").starts_with("webhook/")).collect::<Vec<_>>()});
+    let snapshot = json!({"type":"snapshot","machine_id":rt.machine,"sessions":snapshot_rows(rows)});
     let writer = {
         let mut state = rt.state.lock().unwrap();
         if state.relay_generation != generation {
@@ -816,6 +816,12 @@ impl<T: Send + 'static> Lanes<T> {
     }
 }
 const DELIVERY_WORKERS: usize = 32;
+fn snapshot_rows(rows: Vec<Value>) -> Vec<Value> {
+    rows.into_iter()
+        .filter(|v| str_field(v, "machine_id").is_empty() && !str_field(v, "id").starts_with("webhook/"))
+        .map(super::public_row)
+        .collect()
+}
 const DELIVERY_PER_TARGET: usize = 256;
 const DELIVERY_TARGETS: usize = 1024;
 const DELIVERY_BYTES: usize = 64 * 1024 * 1024;
@@ -851,16 +857,21 @@ const REMOTE_REFUSED: &str = "cross-machine operation refused: remote_messages=r
 async fn deliver(rt: Shared, v: Value) {
     let mid = str_field(&v, "message_id");
     let target = deliver_target(&v);
-    let origin = if str_field(&v, "reply_to").is_empty() {
-        str_field(&v, "from")
-    } else {
-        str_field(&v, "reply_to")
+    let reply_to = str_field(&v, "reply_to");
+    let origin = match reply_to {
+        "" if super::valid_intercom_id(str_field(&v, "from")) => str_field(&v, "from"),
+        "" => "",
+        reply_to => reply_to,
     };
     let refused = rt.cfg.remote_messages == "refuse";
     let result = if refused {
         Err(REMOTE_REFUSED.to_string())
     } else if target.is_empty() {
         Err("deliver without session_id".into())
+    } else if !origin.is_empty() && !super::valid_intercom_id(origin) {
+        Err(format!("deliver with invalid reply_to {origin:?}"))
+    } else if let Err(error) = super::check_from_mode(str_field(&v, "from_mode")) {
+        Err(error)
     } else {
         match rt.resolve(target).await {
             Ok(row) => {
@@ -962,7 +973,7 @@ async fn session(
     let result = loop {
         tokio::select! {
             _=stop.changed()=>break Ok(()),
-            _=tick.tick()=>{let rows=rt.directory().await;let local:Vec<_>=rows.into_iter().filter(|v|str_field(v,"machine_id").is_empty()&&!str_field(v,"id").starts_with("webhook/")).collect();let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
+            _=tick.tick()=>{let local=snapshot_rows(rt.directory().await);let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
             if let Err(e)=ws.send(Message::Text(json!({"type":"list","id":"directory"}).to_string().into())).await{break Err(e);}}
             req=rx.recv()=>{if let Some(packet)=req{let v=packet.value;let result=ws.send(Message::Text(v.to_string().into())).await;drop(packet.fence);if let Err(e)=result{if is_control(&v){failed_control=Some(v);}break Err(e);}}}
             msg=ws.next()=>match msg{
@@ -999,7 +1010,7 @@ async fn session(
                             let rt=rt.clone();tokio::spawn(async move{
                                 let mut req=v.clone();req["op"]=v["type"].clone();req["machine"]=json!(rt.machine);req["to"]=if str_field(&v,"type")=="workspace_close"{v["workspace_id"].clone()}else{v["session_id"].clone()};req["workspace"]=v["workspace_id"].clone();
                                 let mut response=if rt.cfg.remote_messages=="refuse"{json!({"type":"error","code":"refused","message":REMOTE_REFUSED})}else{
-                                    let result=if str_field(&v,"type")=="status"{Ok(json!({"report":rt.status_report().await}))}else{super::herdr::dispatch(&rt,&req).await};
+                                    let result=if str_field(&v,"type")=="status"{Ok(json!({"report":rt.status_report().await}))}else{super::herdr::dispatch_relay(&rt,&req).await};
                                     match result{Ok(v)=>v,Err(e)=>json!({"type":"error","code":"unavailable","message":e})}
                                 };
                                 response["id"]=v["id"].clone();if response.get("type").is_none(){response["type"]=v["type"].clone();}
