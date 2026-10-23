@@ -18,6 +18,12 @@ const CACHE_TTL: u64 = 20_000;
 const FULL_REFRESH: u64 = 60_000;
 const RECEIPT_TTL: u64 = 600_000;
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Pagination is observation-only but must terminate: a host returning
+/// endless unique cursors would otherwise stall sends indefinitely. Exhausted
+/// budgets fail as ownership/observation errors before any mutation.
+const LIST_PAGE_LIMIT: usize = 64;
+const LIST_BYTES_LIMIT: usize = 16 << 20;
+const LIST_BUDGET: Duration = Duration::from_secs(30);
 const OPT_OUT: [&str; 14] = [
     "item/started",
     "item/completed",
@@ -319,7 +325,7 @@ fn untrusted_plugin_hooks(listing: &Value) -> bool {
 #[cfg(unix)]
 async fn diagnostic_reachable() -> bool {
     tokio::time::timeout(Duration::from_secs(1), async {
-        let stream = tokio::net::UnixStream::connect(control_socket()).await.map_err(|e| e.to_string())?;
+        let stream = super::validated_unix_stream(&control_socket(), Duration::from_secs(1)).await.map_err(|e| e.to_string())?;
         let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/rpc", stream).await.map_err(|e| e.to_string())?;
         super::codex_call(&mut ws, "initialize", json!({"clientInfo":{"name":"agent-intercom","title":"agent-intercom","version":"0.1.0"},"capabilities":{"optOutNotificationMethods":OPT_OUT}})).await?;
         ws.send(Message::text(json!({"method":"initialized"}).to_string())).await.map_err(|e| e.to_string())?;
@@ -541,9 +547,7 @@ impl Client {
         let mut stop = self.inner.stop.clone();
         let mut closing = self.inner.closing.clone();
         let connect = async {
-            let stream = tokio::net::UnixStream::connect(path)
-                .await
-                .map_err(|e| e.to_string())?;
+            let stream = super::validated_unix_stream(path, Duration::from_secs(3)).await?;
             tokio_tungstenite::client_async("ws://localhost/rpc", stream)
                 .await
                 .map(|(ws, _)| ws)
@@ -891,11 +895,23 @@ impl Connection {
         .map_err(|_| RpcError::transport(format!("rpc {method}: timeout")))?
     }
     async fn loaded(&self, limit: Option<usize>) -> Result<Vec<String>, RpcError> {
+        let started = Instant::now();
+        let mut pages = 0usize;
+        let mut bytes = 0usize;
         let mut result = Vec::new();
         let mut seen = HashSet::new();
         let mut cursors = HashSet::new();
         let mut cursor = String::new();
         loop {
+            if pages >= LIST_PAGE_LIMIT {
+                return Err(RpcError::transport("thread/loaded/list page limit reached"));
+            }
+            if bytes > LIST_BYTES_LIMIT {
+                return Err(RpcError::transport("thread/loaded/list byte limit reached"));
+            }
+            if started.elapsed() > LIST_BUDGET {
+                return Err(RpcError::transport("thread/loaded/list budget exhausted"));
+            }
             let mut params = json!({});
             if let Some(limit) = limit {
                 params["limit"] = json!(limit);
@@ -904,6 +920,8 @@ impl Connection {
                 params["cursor"] = json!(cursor);
             }
             let page = self.call("thread/loaded/list", params).await?;
+            pages += 1;
+            bytes += page.to_string().len();
             let values = page["data"]
                 .as_array()
                 .ok_or_else(|| RpcError::transport("malformed thread/loaded/list page"))?;
@@ -935,11 +953,23 @@ impl Connection {
         route_state(&response, thread)
     }
     async fn threads(&self, full: bool) -> Result<Vec<Value>, String> {
+        let started = Instant::now();
+        let mut pages = 0usize;
+        let mut bytes = 0usize;
         let mut result = Vec::new();
         let mut ids = HashSet::new();
         let mut cursors = HashSet::new();
         let mut cursor = String::new();
         loop {
+            if pages >= LIST_PAGE_LIMIT {
+                return Err("thread/list page limit reached".into());
+            }
+            if bytes > LIST_BYTES_LIMIT {
+                return Err("thread/list byte limit reached".into());
+            }
+            if started.elapsed() > LIST_BUDGET {
+                return Err("thread/list budget exhausted".into());
+            }
             let mut params =
                 json!({"limit":if full {50}else{100},"archived":false,"sortKey":"recency_at"});
             if !cursor.is_empty() {
@@ -949,6 +979,8 @@ impl Connection {
                 .call("thread/list", params)
                 .await
                 .map_err(|e| e.message)?;
+            pages += 1;
+            bytes += page.to_string().len();
             for thread in page["data"]
                 .as_array()
                 .ok_or("malformed thread/list page")?
@@ -1155,7 +1187,7 @@ mod tests {
     struct Fixture {
         client: Client,
         host: tokio::task::JoinHandle<()>,
-        path: PathBuf,
+        dir: PathBuf,
         _stop: watch::Sender<bool>,
         _closing: watch::Sender<bool>,
     }
@@ -1163,12 +1195,18 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             self.host.abort();
-            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
     #[cfg(unix)]
     async fn fixture(mut handler: impl FnMut(&Value) -> Vec<Value> + Send + 'static) -> Fixture {
-        let path = PathBuf::from(format!("/tmp/pi-codex-{}.sock", uuid::Uuid::new_v4()));
+        // The app-server attach path requires an owner-only socket namespace,
+        // so the fixture listener lives in a private directory, not /tmp.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pi-codex-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("host.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let host = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1225,7 +1263,7 @@ mod tests {
         Fixture {
             client,
             host,
-            path,
+            dir,
             _stop: stop,
             _closing: closing,
         }
@@ -1416,7 +1454,7 @@ mod tests {
                     return vec![
                         json!({"id":req["id"],"result":{"turn":{"id":"turn"}}}),
                         Value::Null,
-                    ]
+                    ];
                 }
                 method => panic!("unexpected method {method}"),
             };
@@ -1432,6 +1470,46 @@ mod tests {
                 .as_deref(),
             Some("delivered")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn endless_unique_cursors_hit_the_page_cap_without_mutation() {
+        // Unique cursors defeat loop detection; only the page cap terminates.
+        let fixture = fixture(|req| {
+            let result = match str_field(req, "method") {
+                "thread/list" => json!({"data":[{"id":"t","status":"idle"}],"nextCursor":format!("cursor-{}", req["id"])}),
+                "thread/loaded/list" => json!({"data":["t"],"nextCursor":format!("loaded-{}", req["id"])}),
+                method => panic!("pagination must stop before mutation: {method}"),
+            };
+            vec![json!({"id":req["id"],"result":result})]
+        })
+        .await;
+        let error = fixture.client.refresh().await.unwrap_err();
+        assert!(error.contains("page limit"), "{error}");
+        let connection = fixture.client.ensure(false).await.unwrap().unwrap();
+        let error = connection.loaded(None).await.unwrap_err();
+        assert!(
+            error.message.contains("page limit"),
+            "loaded ownership check must also terminate: {error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pagination_byte_cap_stops_oversized_hosts() {
+        let fixture = fixture(|req| {
+            let result = match str_field(req, "method") {
+                "thread/list" => json!({"data":[{"id":"t","status":"idle"}],"nextCursor":format!("cursor-{}", req["id"]),"pad":"x".repeat(2 << 20)}),
+                "thread/loaded/list" => json!({"data":["t"]}),
+                method => panic!("unexpected method {method}"),
+            };
+            vec![json!({"id":req["id"],"result":result})]
+        })
+        .await;
+        let connection = fixture.client.ensure(false).await.unwrap().unwrap();
+        let error = connection.threads(true).await.unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
     }
 
     #[cfg(unix)]
