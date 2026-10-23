@@ -332,6 +332,11 @@ impl Runtime {
         rows.dedup_by(|a, b| a["id"] == b["id"]);
         rows
     }
+    pub fn local_agent(&self, row: &Value) -> bool {
+        (str_field(row, "machine_id").is_empty() || str_field(row, "machine_id") == self.machine)
+            && row["all"] != true
+            && ["pi", "claude", "codex"].contains(&str_field(row, "harness"))
+    }
     pub async fn resolve(&self, to: &str) -> Result<Value, String> {
         let rows = self.directory().await;
         if let Some(v) = rows.iter().find(|v| str_field(v, "id") == to) {
