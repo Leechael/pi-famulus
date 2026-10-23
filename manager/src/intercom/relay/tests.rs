@@ -170,7 +170,9 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
         writer.send(super::super::Push{value:json!({"type":"send","id":uuid::Uuid::new_v4().to_string(),"message_id":uuid::Uuid::new_v4().to_string(),"to":"pi/target","body":"x".repeat(size)}),written:None,fence:fence.take()}).await.unwrap();
     }
     drop(tokio::time::timeout(Duration::from_secs(2),first.lock()).await.expect("the physical write fence must prove at least one legal frame flushed before stalling"));
-    let outcome = tokio::time::timeout(Duration::from_secs(12), &mut task).await;
+    let stalled = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), &mut task).await;
+    let waited = stalled.elapsed();
     if outcome.is_err() {
         task.abort();
         let _ = task.await;
@@ -180,6 +182,10 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
     assert!(
         matches!(&outcome,Ok(Ok(Err(error))) if error.to_string().contains("write timed out")),
         "the physical writer must close its session after Go WriteWait=10s, got {outcome:?}"
+    );
+    assert!(
+        waited >= Duration::from_secs(9),
+        "the writer closed after {waited:?}, before the 10s write deadline"
     );
 }
 
