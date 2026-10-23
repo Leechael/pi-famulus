@@ -373,7 +373,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         );
     }
     start_agent_loops(&state);
-    serve(state, listener, daemon_lock).await
+    serve(state, listener, daemon_lock, false).await
 }
 
 /// Clients get this long to reconnect after an in-place upgrade before the
@@ -406,13 +406,14 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     for e in entries {
         registry.tasks.insert(e.record.task_id.clone(), e);
     }
+    // Restored tasks outlive messaging: exiting here would close the
+    // lifeline and take every task down with it.
     if let Some(config) = snap.intercom_config.clone() {
         if let Err(error) = crate::intercom::configure(config) {
             lifecycle::log_line(
                 &home,
-                &format!("upgrade: intercom configuration failed: {error}"),
+                &format!("upgrade: intercom configuration failed: {error}; continuing without intercom"),
             );
-            return 1;
         }
     }
     let mut st = DaemonState::new(home.clone(), registry, snap.foreground);
@@ -527,7 +528,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         maybe_arm_idle_timer(&s2);
     });
     start_agent_loops(&state);
-    serve(state, listener, lock).await
+    serve(state, listener, lock, true).await
 }
 
 /// Handover keeps permits while sessions have a chance to reconnect. Once
@@ -575,13 +576,28 @@ fn ctrl_c_or_pending(
 
 /// The accept loop, shared by a fresh daemon and one restored after an
 /// in-place upgrade. Also runs the upgrade itself when asked.
-async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
+/// `restored`: this image took over live tasks from an in-place upgrade, so
+/// an intercom failure degrades messaging instead of exiting.
+async fn serve(
+    state: Shared,
+    listener: crate::ipc::Listener,
+    daemon_lock: lifecycle::DaemonLockGuard,
+    restored: bool,
+) -> i32 {
     let home = state.lock().unwrap().home.clone();
 
     let intercom_clock = state.lock().unwrap().clock.clone();
     let mut intercom = if let Some(config) = crate::intercom::configuration() {
         match crate::intercom::start(config.clone(), intercom_clock.clone()).await {
             Ok(runtime) => Some(runtime),
+            Err(error) if restored => {
+                lifecycle::log_line(
+                    &home,
+                    &format!("upgrade: intercom startup failed: {error}; continuing without intercom"),
+                );
+                eprintln!("intercom: {error}; continuing without intercom");
+                None
+            }
             Err(error) => {
                 lifecycle::log_line(&home, &format!("intercom startup failed: {error}"));
                 eprintln!("intercom: {error}");

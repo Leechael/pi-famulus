@@ -464,6 +464,58 @@ fn exec_upgrade_restores_intercom_configuration_and_reaps_predecessor_aliases() 
     assert_eq!(report["machine"], format!("fixture-host@{host}"));
 }
 
+#[test]
+fn exec_upgrade_keeps_restored_tasks_when_intercom_cannot_restart() {
+    let mut fixture = Fixture::new();
+    let binary = fixture.root.join("pi-famulus");
+    fs::copy(BIN, &binary).unwrap();
+    fixture.binary = binary;
+    fixture.start();
+    let pid = fixture.child.as_ref().unwrap().id();
+    let mut manager = common::Conn::new(
+        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
+    );
+    manager.hello_ext("restore-degraded");
+    let task = manager.request_ok(json!({"type":"start","kind":"shell","command":"sleep 60","cwd":fixture.root,"env":{},"run_in_background":true}));
+    let task_id = task["task_id"].clone();
+    let task_pid = task["pid"].as_u64().unwrap() as u32;
+    // The new image reloads the device identity; an unreadable one fails
+    // intercom startup there and only there.
+    fs::write(fixture.root.join("state/device.json"), b"not json").unwrap();
+    let output = common::run_cli(
+        &fixture.root.join("manager"),
+        &["upgrade"],
+        Duration::from_secs(30),
+    );
+    assert!(
+        output.status.success() && output.stdout.contains("upgraded in place"),
+        "upgrade with failing intercom restart: {} {} {}",
+        output.stdout,
+        output.stderr,
+        fixture.log()
+    );
+    assert!(
+        fixture.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "restored daemon exited: {}",
+        fixture.log()
+    );
+    let mut manager = common::Conn::new(
+        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
+    );
+    assert_eq!(manager.hello_ext("restore-degraded")["pid"], pid);
+    assert!(common::pid_alive(task_pid), "restored task process was killed");
+    let listed = manager.request_ok(json!({"type":"list"}));
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["task_id"] == task_id && t["status"] == "running"),
+        "restored task did not survive the intercom failure: {listed}"
+    );
+    manager.request_ok(json!({"type":"stop","task_id":task_id}));
+}
+
 pub(super) struct CodexPeer {
     pub(super) path: PathBuf,
     requests: mpsc::Receiver<Value>,
