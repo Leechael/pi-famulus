@@ -243,7 +243,10 @@ impl Running {
         };
         supervision.stop.send_replace(true);
         if let Some(mut mcp) = supervision.mcp {
-            if tokio::time::timeout(NATIVE_CLOSE_TIMEOUT, &mut mcp).await.is_err() {
+            if tokio::time::timeout(NATIVE_CLOSE_TIMEOUT, &mut mcp)
+                .await
+                .is_err()
+            {
                 mcp.abort();
             }
         }
@@ -1018,7 +1021,10 @@ impl Drop for Forwarding<'_> {
 /// Remote rows never shadow a local session, and a remote row cannot claim
 /// this machine (or no machine) and thereby pass as local.
 fn merge_remote(rows: &mut Vec<Value>, remote: Vec<Value>, machine: &str) {
-    let local: HashSet<String> = rows.iter().map(|r| str_field(r, "id").to_string()).collect();
+    let local: HashSet<String> = rows
+        .iter()
+        .map(|r| str_field(r, "id").to_string())
+        .collect();
     rows.extend(remote.into_iter().filter(|row| {
         let owner = str_field(row, "machine_id");
         !owner.is_empty() && owner != machine && !local.contains(str_field(row, "id"))
@@ -1041,7 +1047,9 @@ fn check_from_mode(mode: &str) -> Result<(), String> {
 pub(crate) fn valid_intercom_id(id: &str) -> bool {
     id.split_once('/').is_some_and(|(kind, rest)| {
         !kind.is_empty()
-            && kind.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
             && crate::daemon::valid_session_id(rest)
     })
 }
