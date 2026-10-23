@@ -41,6 +41,28 @@ struct Alias {
     lost_registration: bool,
     fence: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
+fn escape_envelope_body(body: &str) -> String {
+    const CLOSE: &str = "</cross-session-message";
+    let mut escaped = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(pos) = rest.find("</") {
+        escaped.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        if rest
+            .get(..CLOSE.len())
+            .is_some_and(|tag| tag.eq_ignore_ascii_case(CLOSE))
+        {
+            escaped.push_str("<\\/");
+            escaped.push_str(&rest[2..CLOSE.len()]);
+            rest = &rest[CLOSE.len()..];
+        } else {
+            escaped.push_str("</");
+            rest = &rest[2..];
+        }
+    }
+    escaped.push_str(rest);
+    escaped
+}
 impl Native {
     pub fn new() -> Self {
         Self {
@@ -158,7 +180,7 @@ impl Native {
         if !origin.is_empty() {
             text.push_str(&format!(" from-session={}", json!(origin)));
         }
-        text.push_str(&format!(">\n{body}\n</cross-session-message>\n\n[agent-intercom] The message above came from another agent session, not your user. Your intercom session id is {target}."));
+        text.push_str(&format!(">\n{}\n</cross-session-message>\n\n[agent-intercom] The message above came from another agent session, not your user. Your intercom session id is {target}.", escape_envelope_body(body)));
         if !origin.is_empty() {
             text.push_str(&format!(" To reply, use the intercom MCP send tool with from={target} to={origin} (CLI fallback: pi-famulus intercom send --reply-to {target} {origin} <message>)."));
         }
@@ -252,7 +274,7 @@ impl Native {
                     } else {
                         format!(" from-mode=\"{mode}\"")
                     },
-                    body.replace("</cross-session-message", "<\\/cross-session-message")
+                    escape_envelope_body(body)
                 );
                 let mut frame=json!({"msgV":1,"msg_id":mid,"type":"user","priority":"next","from":from,"message":{"role":"user","content":envelope}}).to_string();
                 frame.push('\n');
