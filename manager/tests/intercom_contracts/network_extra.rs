@@ -829,11 +829,12 @@ fn legacy_relay_non_native_send_keeps_server_id_and_early_held_projection() {
     let address = vacant_address();
     let listen = address.to_string();
     start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
+    let _origin = fixture.plugin("origin", "busy");
     let sent = tool(
         address,
         "",
         "send",
-        json!({"from":"codex/origin","to":"pi/remote","message":"legacy send"}),
+        json!({"from":"pi/origin","to":"pi/remote","message":"legacy send"}),
     );
     assert_eq!(sent["messageId"], id);
     let request = relay.request("send");

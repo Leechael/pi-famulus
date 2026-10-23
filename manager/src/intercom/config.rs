@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: String,
     pub token: String,
@@ -20,6 +20,7 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Endpoint {
     pub name: String,
     pub url: String,
@@ -61,6 +62,14 @@ impl Default for Config {
     }
 }
 
+pub fn loopback_listen(listen: &str) -> bool {
+    if let Ok(address) = listen.parse::<std::net::SocketAddr>() {
+        return address.ip().is_loopback();
+    }
+    listen
+        .rsplit_once(':')
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
+}
 pub fn hostname() -> String {
     #[cfg(unix)]
     {
@@ -151,6 +160,15 @@ impl Config {
         if self.sock.as_os_str().is_empty() || self.state_dir.as_os_str().is_empty() {
             return Err("socket and state directory must not be empty".into());
         }
+        if !self.mcp_listen.is_empty()
+            && self.mcp_token.trim().is_empty()
+            && !loopback_listen(&self.mcp_listen)
+        {
+            return Err(format!(
+                "mcp_listen {:?} is not a loopback address; set mcp_token to expose MCP beyond this host",
+                self.mcp_listen
+            ));
+        }
         Ok(())
     }
     pub fn http(&self) -> Result<reqwest::Client, String> {
@@ -227,4 +245,59 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     opts.open(path)
         .and_then(|mut f| f.write_all(bytes))
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_config_keys_are_rejected_instead_of_ignored() {
+        let error = toml::from_str::<Config>("mcp_tokne = 'typo'\n").unwrap_err();
+        assert!(error.to_string().contains("mcp_tokne"), "{error}");
+        let error = toml::from_str::<Config>(
+            "[[endpoint]]\nname = 'hook'\nurl = 'https://x'\nsecrte = 's'\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("secrte"), "{error}");
+        let parsed: Config = toml::from_str(
+            "local_only = true\nmcp_listen = ''\n[[endpoint]]\nname = 'hook'\nurl = 'https://x'\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.endpoints[0].auth, "hmac");
+        let wire = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Config>(wire).unwrap(),
+            Config::default()
+        );
+    }
+
+    #[test]
+    fn non_loopback_mcp_listen_requires_a_token() {
+        let config = |listen: &str, token: &str| Config {
+            mcp_listen: listen.into(),
+            mcp_token: token.into(),
+            ..Config::default()
+        };
+        for listen in [
+            "0.0.0.0:18790",
+            "[::]:18790",
+            "192.0.2.1:0",
+            "example.com:80",
+        ] {
+            let error = config(listen, "").validate().unwrap_err();
+            assert!(error.contains("mcp_token"), "{listen}: {error}");
+            assert!(config(listen, "  ").validate().is_err(), "{listen}");
+            assert!(config(listen, "secret").validate().is_ok(), "{listen}");
+        }
+        for listen in [
+            "",
+            "127.0.0.1:0",
+            "127.1.2.3:9",
+            "[::1]:18790",
+            "localhost:18790",
+        ] {
+            assert!(config(listen, "").validate().is_ok(), "{listen}");
+        }
+    }
 }

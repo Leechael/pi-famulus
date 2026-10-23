@@ -30,6 +30,11 @@ pub async fn start(rt: Shared) -> Result<tokio::task::JoinHandle<()>, String> {
         .await
         .map_err(|e| e.to_string())?;
     let address = listener.local_addr().map_err(|e| e.to_string())?;
+    if !address.ip().is_loopback() && rt.cfg.mcp_token.trim().is_empty() {
+        return Err(format!(
+            "refusing unauthenticated MCP on non-loopback address {address}; set mcp_token"
+        ));
+    }
     *rt.mcp_url.lock().unwrap() = format!("http://{address}/mcp");
     eprintln!("intercom MCP http://{address}/mcp");
     Ok(tokio::spawn(async move {
@@ -686,6 +691,20 @@ async fn resolve_to(rt: &Shared, to: &str) -> Result<String, String> {
         _ => Err(format!("session {to:?} is ambiguous")),
     }
 }
+// deferred: binding `from` to a caller credential | impact: any local MCP caller can still
+// speak as any live local agent session, never as a remote, webhook or unknown id |
+// trigger: MCP clients can present a per-session credential
+async fn local_sender(rt: &Shared, from: &str) -> Result<(), String> {
+    let rows = rt.directory().await;
+    if rows
+        .iter()
+        .any(|row| str_field(row, "id") == from && rt.local_agent(row))
+    {
+        Ok(())
+    } else {
+        Err(format!("from {from:?} is not a local intercom session"))
+    }
+}
 async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, String> {
     match name {
         "list_sessions" => {
@@ -710,6 +729,7 @@ async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, Strin
                     "from required: pass your intercom session id (codex/<threadId>)".into(),
                 );
             }
+            local_sender(rt, from).await?;
             let to = resolve_to(rt, str_field(args, "to")).await?;
             let value = rt
                 .send("", &to, str_field(args, "message"), from, "")
@@ -920,7 +940,9 @@ fn inspect_config(c: &Config) -> Result<(String, String), String> {
     let url = str_field(&v, "url");
     let token = str_field(&v, "token");
     let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
-    if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+    if !parsed
+        .host_str()
+        .is_some_and(|host| localhost_host(&format!("{host}:0")))
         || parsed.scheme() != "http"
         || token.is_empty()
     {
@@ -1137,5 +1159,38 @@ mod tests {
             send["description"],
             "Send a message to another agent session over intercom"
         );
+    }
+
+    #[test]
+    fn inspection_discovery_accepts_bracketed_ipv6_loopback_only() {
+        let dir = std::env::temp_dir().join(format!("intercom-inspect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = Config {
+            state_dir: dir.clone(),
+            ..Config::default()
+        };
+        let check = |url: &str| {
+            std::fs::write(
+                dir.join("inspect.json"),
+                json!({"url":url,"token":"t"}).to_string(),
+            )
+            .unwrap();
+            inspect_config(&cfg)
+        };
+        for url in [
+            "http://[::1]:4100",
+            "http://127.0.0.1:4100",
+            "http://localhost:4100",
+        ] {
+            assert_eq!(check(url).unwrap().0, url);
+        }
+        for url in [
+            "http://[2001:db8::1]:4100",
+            "http://192.0.2.1:4100",
+            "https://[::1]:4100",
+        ] {
+            assert!(check(url).is_err(), "{url}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

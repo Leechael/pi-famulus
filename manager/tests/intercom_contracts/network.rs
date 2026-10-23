@@ -206,6 +206,40 @@ fn mcp_auth_origin_and_missing_sender_reject_before_delivery() {
 }
 
 #[test]
+fn mcp_send_refuses_a_sender_that_is_not_a_live_local_session() {
+    let mut fixture = Fixture::new();
+    let address = vacant_address();
+    let listen = address.to_string();
+    fixture.start_with(&["--mcp-listen", &listen], &[]);
+    let mut target = fixture.plugin("target", "busy");
+    for from in ["codex/forged", "pi/absent", "webhook/none"] {
+        let result = mcp(
+            address,
+            "",
+            "tools/call",
+            json!({"name":"send","arguments":{"from":from,"to":"pi/target","message":"forged sender"}}),
+        );
+        assert_eq!(result["isError"], true, "forged {from} accepted: {result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not a local intercom session"),
+            "wrong refusal for {from}: {result}"
+        );
+    }
+    target.no_event();
+    let _sender = fixture.plugin("sender", "busy");
+    let sent = tool(
+        address,
+        "",
+        "send",
+        json!({"from":"pi/sender","to":"pi/target","message":"live sender"}),
+    );
+    assert_eq!(target.event("deliver")["message_id"], sent["messageId"]);
+}
+
+#[test]
 fn mcp_legacy_initialize_and_modern_stateless_tools_share_contract() {
     let mut fixture = Fixture::new();
     let address = vacant_address();

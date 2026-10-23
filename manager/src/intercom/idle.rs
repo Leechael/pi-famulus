@@ -265,13 +265,9 @@ impl Runtime {
         let rows = self.directory().await;
         let row = target_row(&rows, target)?;
         let target = str_field(&row, "id").to_string();
-        let origin = rows.iter().find(|row| {
-            str_field(row, "id") == watcher
-                && (str_field(row, "machine_id").is_empty()
-                    || str_field(row, "machine_id") == self.machine)
-                && row["all"] != true
-                && ["pi", "claude", "codex"].contains(&str_field(row, "harness"))
-        });
+        let origin = rows
+            .iter()
+            .find(|row| str_field(row, "id") == watcher && self.local_agent(row));
         if origin.is_none() && relay_origin.is_empty() {
             return Err(format!("watcher {watcher:?} is not a local session"));
         }

@@ -310,9 +310,10 @@ fn modern_header_body_mismatches_and_unsupported_versions_are_protocol_errors() 
 fn valid_chunked_and_identical_duplicate_lengths_each_inject_exactly_once() {
     let (fixture, address) = start("");
     let mut target = fixture.plugin("target", "busy");
+    let _source = fixture.plugin("source", "busy");
     let body = modern(
         "tools/call",
-        json!({"name":"send","arguments":{"from":"codex/source","to":"pi/target","message":"HTTP framed body"}}),
+        json!({"name":"send","arguments":{"from":"pi/source","to":"pi/target","message":"HTTP framed body"}}),
     );
     let length = body.len().to_string();
     let response = request(
@@ -361,9 +362,10 @@ fn valid_chunked_and_identical_duplicate_lengths_each_inject_exactly_once() {
 fn conflicting_lengths_and_malformed_header_names_reject_without_dispatch() {
     let (fixture, address) = start("");
     let mut target = fixture.plugin("target", "busy");
+    let _source = fixture.plugin("source", "busy");
     let body = modern(
         "tools/call",
-        json!({"name":"send","arguments":{"from":"codex/source","to":"pi/target","message":"must not dispatch"}}),
+        json!({"name":"send","arguments":{"from":"pi/source","to":"pi/target","message":"must not dispatch"}}),
     );
     let length = body.len().to_string();
     let other = (body.len() + 1).to_string();
@@ -396,9 +398,10 @@ fn conflicting_lengths_and_malformed_header_names_reject_without_dispatch() {
 fn duplicate_auth_and_version_headers_cannot_override_a_rejecting_first_value() {
     let (fixture, address) = start("transport-secret");
     let mut target = fixture.plugin("target", "busy");
+    let _source = fixture.plugin("source", "busy");
     let body = modern(
         "tools/call",
-        json!({"name":"send","arguments":{"from":"codex/source","to":"pi/target","message":"must not dispatch"}}),
+        json!({"name":"send","arguments":{"from":"pi/source","to":"pi/target","message":"must not dispatch"}}),
     );
     let rejected = request(
         address,
