@@ -198,3 +198,44 @@ async fn relay_tcp_endpoint_preserves_go_default_nodelay() {
         "Go net.TCPConn defaults to TCP_NODELAY; snapshot + send must not wait for delayed ACKs"
     );
 }
+
+#[tokio::test]
+async fn relay_send_rejects_a_body_whose_encoded_frame_exceeds_the_relay_frame_limit() {
+    let rt = transport_runtime(Config::default());
+    let (writer, mut wire) = mpsc::channel(8);
+    {
+        let mut state = rt.state.lock().unwrap();
+        state.relay_tx = Some(writer);
+        state.relay_message_ids = true;
+    }
+    // Each quote doubles when JSON-escaped, so the raw body fits but the frame does not.
+    let body = "\"".repeat(MAX_FRAME / 2 + 1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(&rt, "pi/origin", "pi/remote", &body, "", "oversized-id", None),
+    )
+    .await
+    .expect("oversized relay send waited for a reply instead of failing");
+    assert!(result.unwrap_err().contains("too large"));
+    assert!(wire.try_recv().is_err(), "oversized send reached the relay writer");
+}
+
+#[tokio::test]
+async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
+    let rt = transport_runtime(Config {
+        mcp_listen: "127.0.0.1:0".into(),
+        ..Config::default()
+    });
+    let server = super::super::http::start(rt.clone()).await.unwrap();
+    let url = rt.mcp_url.lock().unwrap().clone();
+    let response = reqwest::Client::new()
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(vec![b' '; MAX_FRAME + 1])
+        .send()
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(response.status(), 413);
+}

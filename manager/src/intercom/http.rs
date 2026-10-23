@@ -21,7 +21,8 @@ const VERSIONS: [&str; 5] = [
     "2025-03-26",
     "2024-11-05",
 ];
-const MAX_BODY: usize = 4 * 1024 * 1024;
+// Nothing larger than one relay frame can be delivered remotely.
+const MAX_BODY: usize = super::relay::MAX_FRAME;
 type Body = UnsyncBoxBody<Bytes, Infallible>;
 type Reply = Response<Body>;
 
@@ -205,9 +206,9 @@ async fn handle(rt: Shared, local: SocketAddr, req: Request<Incoming>) -> Reply 
             let mut reply = text(
                 if oversized { 413 } else { 400 },
                 if oversized {
-                    "request body exceeds 4194304 bytes"
+                    format!("request body exceeds {MAX_BODY} bytes")
                 } else {
-                    "failed to read body"
+                    "failed to read body".into()
                 },
             );
             reply

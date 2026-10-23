@@ -92,6 +92,18 @@ pub async fn send(
                 .into(),
         );
     }
+    let mut request =
+        json!({"type":"send","to":target,"body":body,"reply_to":origin,"from_mode":mode});
+    if capability {
+        request["message_id"] = json!(mid);
+    }
+    // Leave headroom for the request id call_on adds.
+    if request.to_string().len() + 64 > MAX_FRAME {
+        rt.state.lock().unwrap().forget_delivery(mid);
+        return Err(format!(
+            "message too large for relay: encoded send frame exceeds {MAX_FRAME} bytes"
+        ));
+    }
     let _gate = if capability {
         None
     } else {
@@ -121,11 +133,6 @@ pub async fn send(
     if writer.send(snapshot.into()).await.is_err() {
         rt.state.lock().unwrap().legacy_active = None;
         return Err("relay connection changed before send".into());
-    }
-    let mut request =
-        json!({"type":"send","to":target,"body":body,"reply_to":origin,"from_mode":mode});
-    if capability {
-        request["message_id"] = json!(mid);
     }
     let response = call_on(rt, request, generation, fence).await;
     let mut state = rt.state.lock().unwrap();
@@ -241,6 +248,7 @@ async fn call_on(
     };
     result
 }
+pub(super) const MAX_FRAME: usize = 1 << 20;
 pub(super) const AUTH_RETRY_DELAY: Duration = Duration::from_secs(300);
 pub(super) const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub(super) const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -555,8 +563,8 @@ async fn dial_attempt(c: &Config) -> Result<Socket, TransportError> {
             },
             Some(
                 tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                    .max_message_size(Some(1 << 20))
-                    .max_frame_size(Some(1 << 20)),
+                    .max_message_size(Some(MAX_FRAME))
+                    .max_frame_size(Some(MAX_FRAME)),
             ),
             Some(connector),
         )
