@@ -75,7 +75,7 @@ impl Desktop {
                                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                             ) =>
                         {
-                            continue
+                            continue;
                         }
                         Err(_) => break,
                     }
@@ -419,4 +419,53 @@ fn desktop_transport_loss_after_mutation_is_unknown_not_retried() {
     desktop.request("thread-follower-start-turn");
     desktop.assert_no_turn_mutation("unknown Desktop mutation was retried");
     _catalog.assert_passive_catalog();
+}
+
+#[test]
+fn desktop_retires_thread_state_after_completed_read_and_rediscovers_on_demand() {
+    let mut fixture = Fixture::new();
+    let desktop = Desktop::new(&fixture, false, false, true, false);
+    let catalog = super::native::CodexPeer::catalog(&fixture, false);
+    let path = desktop.path.to_str().unwrap().to_string();
+    let app_server = catalog.path.to_str().unwrap().to_string();
+    fixture.start_with(
+        &[],
+        &[
+            ("CODEX_DESKTOP_IPC_SOCK", &path),
+            ("CODEX_APP_SERVER_SOCK", &app_server),
+        ],
+    );
+    fixture.wait_session("codex/desktop-A");
+    // Retire the shared catalog so the Desktop owner serves the thread.
+    drop(catalog);
+    let mut sender = fixture.plugin("retire-sender", "busy");
+    let sent = sender.ok(json!({"op":"send","to":"codex/desktop-A","body":"read then retire"}));
+    assert_eq!(sent["status"], "delivered");
+    desktop.request("thread-owner-discovery");
+    let start = desktop.request("thread-follower-start-turn");
+    assert!(start.to_string().contains("read then retire"));
+    let read = sender.event("receipt");
+    assert_eq!(read["status"], "read");
+    assert_eq!(read["message_id"], sent["message_id"]);
+    // The completed fast path unfollows and retires the heavyweight
+    // per-thread state, but the thread stays listed and addressable.
+    let unfollowed = desktop.request("thread-stream-following-changed");
+    assert_eq!(unfollowed["params"]["following"], false);
+    assert!(
+        fixture
+            .sessions()
+            .iter()
+            .any(|row| row["id"] == "codex/desktop-A"),
+        "retired Desktop thread row must stay addressable"
+    );
+    // The next send cannot reuse stale conversation state: it re-runs owner
+    // discovery and fetches a fresh snapshot before mutating.
+    let second = sender.ok(json!({"op":"send","to":"codex/desktop-A","body":"rediscovered owner"}));
+    assert_eq!(second["status"], "delivered");
+    desktop.request("thread-owner-discovery");
+    let restart = desktop.request("thread-follower-start-turn");
+    assert!(restart.to_string().contains("rediscovered owner"));
+    let read = sender.event("receipt");
+    assert_eq!(read["status"], "read");
+    assert_eq!(read["message_id"], second["message_id"]);
 }

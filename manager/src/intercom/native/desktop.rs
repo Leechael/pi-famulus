@@ -93,12 +93,19 @@ struct Connection {
     generation: String,
     owners: HashMap<String, String>,
     states: HashMap<String, (u64, Value)>,
-    completed: HashSet<(String, String, String)>,
-    waiting: HashMap<(String, String, String), Vec<String>>,
+    /// Correlation state is per-thread and bounded: timestamps age entries
+    /// out and a size cap evicts the oldest, expiring unresolved waits with
+    /// an explicit unknown outcome.
+    completed: HashMap<(String, String, String), u64>,
+    waiting: HashMap<(String, String, String), Vec<(String, u64)>>,
     following: HashMap<String, tokio::time::Instant>,
     owner: Weak<super::super::Runtime>,
     catalog: Arc<Mutex<HashMap<String, Value>>>,
 }
+#[cfg(unix)]
+const CORRELATION_TTL_MS: u64 = 600_000;
+#[cfg(unix)]
+const CORRELATION_LIMIT: usize = 1024;
 #[cfg(unix)]
 struct Reader(tokio::task::JoinHandle<()>);
 #[cfg(unix)]
@@ -149,7 +156,15 @@ pub(super) async fn start(
                             _=stop.changed()=>return,
                             command=rx.recv()=>{let Some(mut command)=command else{return};let result=if command.observe{tokio::select!{_ = command.reply.closed()=>continue,result=connection.idle_observation(&command.thread)=>result}}else{connection.send(&mut command).await.map(|state|(state,String::new()))};let _=command.reply.send(result);},
                             frame=connection.frames.recv()=>{match frame{Some(Ok(value))=>{if connection.broadcast(&value).await.is_err(){break;}},_=>break}},
-                            _=cleanup.tick()=>{let expired=connection.following.iter().filter(|(thread,deadline)|**deadline<=tokio::time::Instant::now()&&!connection.waiting.keys().any(|(t,_,_)|t==*thread)).map(|(thread,_)|thread.clone()).collect::<Vec<_>>();for thread in expired{connection.unfollow(&thread).await;}}
+                            _=cleanup.tick()=>{
+                                let expired_waits = connection.prune_correlation(crate::proto::now_ms());
+                                for (mid, thread) in expired_waits {
+                                    if let Some(runtime) = connection.owner.upgrade() {
+                                        runtime.local_receipt(&mid, &format!("codex/{thread}"), "unknown").await;
+                                    }
+                                }
+                                let expired=connection.following.iter().filter(|(_,deadline)|**deadline<=tokio::time::Instant::now()).map(|(thread,_)|thread.clone()).collect::<Vec<_>>();for thread in expired{connection.unfollow(&thread).await;}
+                            }
                         }
                     }
                     drop(connection);
@@ -173,6 +188,10 @@ async fn connect(
 ) -> Result<Connection, String> {
     use std::os::unix::fs::MetadataExt;
     let metadata = super::socket_metadata(path)?;
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
     let parent = std::fs::metadata(path.parent().unwrap()).map_err(|e| e.to_string())?;
     if parent.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::getuid() } {
         return Err("Desktop IPC directory is not private".into());
@@ -184,6 +203,16 @@ async fn connect(
     .await
     .map_err(|_| "Desktop IPC connection timed out".to_string())?
     .map_err(|e| e.to_string())?;
+    let after = super::socket_metadata(path)?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (after.dev(), after.ino()) != identity {
+            return Err("Desktop IPC socket replaced during connect".into());
+        }
+    }
+    if stream.peer_cred().map_err(|e| e.to_string())?.uid() != unsafe { libc::getuid() } {
+        return Err("Desktop IPC peer UID mismatch".into());
+    }
     let mut connection = attach(stream, owner, catalog);
     let response = connection
         .request(
@@ -239,7 +268,7 @@ fn attach(
         generation: uuid::Uuid::new_v4().to_string(),
         owners: HashMap::new(),
         states: HashMap::new(),
-        completed: HashSet::new(),
+        completed: HashMap::new(),
         waiting: HashMap::new(),
         following: HashMap::new(),
         owner,
@@ -316,6 +345,96 @@ impl Connection {
                 let _ = self.follow(thread, &owner, false).await;
             }
         }
+        // Unfollowed threads stop streaming, so their pending waits can never
+        // resolve: settle them with an explicit unknown outcome and retire the
+        // heavyweight per-thread state. The catalog row and owner stay so the
+        // thread remains listed and addressable; the next send or observation
+        // re-discovers fresh state.
+        let unresolved = self.retire_thread_observation(thread);
+        for mid in unresolved {
+            if let Some(runtime) = self.owner.upgrade() {
+                runtime
+                    .local_receipt(&mid, &format!("codex/{thread}"), "unknown")
+                    .await;
+            }
+        }
+    }
+    /// Retire the heavyweight per-thread observation state (the conversation
+    /// state JSON and correlation entries) and return the mids of waits that
+    /// can now never resolve, so the caller settles them unknown.
+    fn retire_thread_observation(&mut self, thread: &str) -> Vec<String> {
+        self.states.remove(thread);
+        self.completed.retain(|(t, _, _), _| t != thread);
+        let mut unresolved = Vec::new();
+        self.waiting.retain(|(t, _, _), mids| {
+            if t == thread {
+                unresolved.extend(mids.iter().map(|(mid, _)| mid.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        unresolved
+    }
+    /// Drop every cached fact about a thread, including its catalog row and
+    /// owner: used when the thread is gone (discovery failure, owner change).
+    fn retire_thread_state(&mut self, thread: &str) -> Vec<String> {
+        let unresolved = self.retire_thread_observation(thread);
+        self.owners.remove(thread);
+        self.catalog.lock().unwrap().remove(thread);
+        unresolved
+    }
+    /// Ages correlation state out and enforces its size bound. Returns
+    /// `(mid, thread)` for waits that expired or were evicted unresolved so
+    /// the caller settles them with an explicit unknown outcome.
+    fn prune_correlation(&mut self, now: u64) -> Vec<(String, String)> {
+        self.completed
+            .retain(|_, at| now.saturating_sub(*at) <= CORRELATION_TTL_MS);
+        let mut expired = Vec::new();
+        self.waiting.retain(|key, mids| {
+            mids.retain(|(mid, at)| {
+                if now.saturating_sub(*at) <= CORRELATION_TTL_MS {
+                    true
+                } else {
+                    expired.push((mid.clone(), key.0.clone()));
+                    false
+                }
+            });
+            !mids.is_empty()
+        });
+        while self.completed.len() > CORRELATION_LIMIT {
+            let Some(oldest) = self
+                .completed
+                .iter()
+                .min_by_key(|(_, at)| *at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.completed.remove(&oldest);
+        }
+        let waiting_total: usize = self.waiting.values().map(Vec::len).sum();
+        if waiting_total > CORRELATION_LIMIT {
+            let mut flat: Vec<(u64, (String, String, String), String)> = self
+                .waiting
+                .iter()
+                .flat_map(|(key, mids)| {
+                    mids.iter()
+                        .map(move |(mid, at)| (*at, key.clone(), mid.clone()))
+                })
+                .collect();
+            flat.sort_unstable();
+            for (_, key, mid) in flat.into_iter().take(waiting_total - CORRELATION_LIMIT) {
+                if let Some(mids) = self.waiting.get_mut(&key) {
+                    if let Some(index) = mids.iter().position(|(m, _)| m == &mid) {
+                        mids.swap_remove(index);
+                    }
+                }
+                expired.push((mid, key.0));
+            }
+            self.waiting.retain(|_, mids| !mids.is_empty());
+        }
+        expired
     }
     /// Returns whether the event replaced the stored state of its thread.
     async fn broadcast(&mut self, event: &Value) -> Result<bool, String> {
@@ -379,10 +498,10 @@ impl Connection {
                         owner.to_string(),
                         str_field(turn, "turnId").to_string(),
                     );
-                    self.completed.insert(key.clone());
+                    self.completed.insert(key.clone(), crate::proto::now_ms());
                     if let Some(messages) = self.waiting.remove(&key) {
                         if let Some(runtime) = self.owner.upgrade() {
-                            for mid in messages {
+                            for (mid, _) in messages {
                                 runtime
                                     .local_receipt(&mid, &format!("codex/{thread}"), "read")
                                     .await;
@@ -396,7 +515,7 @@ impl Connection {
         Ok(true)
     }
     async fn fresh_state(&mut self, thread: &String) -> Result<(String, Value), String> {
-        let discovered = self
+        let discovered = match self
             .request(
                 "thread-owner-discovery",
                 json!({"hostId":"local","conversationId":thread}),
@@ -404,9 +523,35 @@ impl Connection {
                 1,
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                // Discovery failed: the cached owner and state may be stale,
+                // so retire them instead of keeping the thread half-known.
+                // Their pending sends can no longer be correlated, but their
+                // outcomes must remain explicitly unknown rather than stuck.
+                let unresolved = self.retire_thread_state(thread);
+                for mid in unresolved {
+                    if let Some(runtime) = self.owner.upgrade() {
+                        runtime
+                            .local_receipt(&mid, &format!("codex/{thread}"), "unknown")
+                            .await;
+                    }
+                }
+                return Err(error);
+            }
+        };
         let owner = str_field(&discovered, "handledByClientId").to_string();
         if owner.is_empty() {
+            let unresolved = self.retire_thread_state(thread);
+            for mid in unresolved {
+                if let Some(runtime) = self.owner.upgrade() {
+                    runtime
+                        .local_receipt(&mid, &format!("codex/{thread}"), "unknown")
+                        .await;
+                }
+            }
             return Err("Desktop owner discovery returned no owner".into());
         }
         if self
@@ -414,9 +559,16 @@ impl Connection {
             .get(thread)
             .is_some_and(|previous| previous != &owner)
         {
-            self.states.remove(thread);
-            self.waiting.retain(|(t, _, _), _| t != thread);
-            self.completed.retain(|(t, _, _)| t != thread);
+            // The previous owner can never complete turns it owned; resolve
+            // their unresolved waits with an explicit unknown outcome.
+            let unresolved = self.retire_thread_state(thread);
+            for mid in unresolved {
+                if let Some(runtime) = self.owner.upgrade() {
+                    runtime
+                        .local_receipt(&mid, &format!("codex/{thread}"), "unknown")
+                        .await;
+                }
+            }
         }
         self.owners.insert(thread.clone(), owner.clone());
         let previous = self.states.get(thread).map(|(r, _)| *r).unwrap_or(0);
@@ -477,7 +629,7 @@ impl Connection {
                 _ => {
                     return Err(format!(
                         "Desktop host state {status:?} is not an idle observation"
-                    ))
+                    ));
                 }
             }
         };
@@ -529,14 +681,14 @@ impl Connection {
         .ok_or("Desktop send outcome unknown: missing turn ID")?
         .to_string();
         let key = (thread.clone(), owner, turn);
-        if self.completed.contains(&key) {
+        if self.completed.contains_key(&key) {
             self.unfollow(thread).await;
             return Ok("read".into());
         }
         self.waiting
             .entry(key)
             .or_default()
-            .push(command.mid.clone());
+            .push((command.mid.clone(), crate::proto::now_ms()));
         Ok("delivered".into())
     }
 }
@@ -683,5 +835,187 @@ mod tests {
             client.list().is_empty(),
             "stale Desktop rows survived detach"
         );
+    }
+
+    #[tokio::test]
+    async fn unfollow_retires_heavy_state_and_resolves_waits_but_keeps_the_row() {
+        let (mut connection, mut peer) = connection();
+        connection.owners.insert("t".into(), "owner".into());
+        connection
+            .states
+            .insert("t".into(), (1, json!({"title":"cached"})));
+        connection.completed.insert(
+            ("t".into(), "owner".into(), "turn".into()),
+            crate::proto::now_ms(),
+        );
+        connection.waiting.insert(
+            ("t".into(), "owner".into(), "pending".into()),
+            vec![("mid".into(), crate::proto::now_ms())],
+        );
+        connection.following.insert(
+            "t".into(),
+            tokio::time::Instant::now() + Duration::from_secs(300),
+        );
+        connection
+            .catalog
+            .lock()
+            .unwrap()
+            .insert("t".into(), json!({"id":"codex/t"}));
+        connection.unfollow("t").await;
+        // The heavyweight state and the never-resolvable wait are retired;
+        // the catalog row and owner stay so the thread remains addressable.
+        assert!(connection.states.is_empty());
+        assert!(connection.completed.is_empty());
+        assert!(connection.waiting.is_empty());
+        assert_eq!(connection.owners["t"], "owner");
+        assert!(connection.catalog.lock().unwrap().contains_key("t"));
+        let frame = read_frame(&mut peer).await;
+        assert_eq!(frame["method"], "thread-stream-following-changed");
+        assert_eq!(frame["params"]["following"], false);
+    }
+
+    #[tokio::test]
+    async fn late_events_while_unfollowed_refresh_the_row_without_resurrecting_correlation() {
+        let (mut connection, mut peer) = connection();
+        connection.owners.insert("t".into(), "owner".into());
+        connection
+            .states
+            .insert("t".into(), (1, json!({"title":"cached"})));
+        connection.following.insert(
+            "t".into(),
+            tokio::time::Instant::now() + Duration::from_secs(300),
+        );
+        connection.unfollow("t").await;
+        let drained = read_frame(&mut peer).await;
+        assert_eq!(drained["params"]["following"], false);
+        // A late event for the still-known thread refreshes the advertised
+        // state but never resurrects retired correlation entries.
+        let event = json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner","version":11,
+            "params":{"conversationId":"t","hostId":"local","change":{"type":"snapshot","revision":2,
+            "conversationState":{"title":"refreshed","threadRuntimeStatus":{"type":"idle"},
+            "turnHistory":{"kind":"canonical","history":{"entitiesByKey":{"turn-key":{"turnId":"turn-A","status":"completed"}}}}}}}});
+        assert!(connection.broadcast(&event).await.unwrap());
+        assert_eq!(connection.states["t"].1["title"], "refreshed");
+        assert!(connection.catalog.lock().unwrap().contains_key("t"));
+        assert!(
+            connection
+                .completed
+                .contains_key(&("t".into(), "owner".into(), "turn-A".into())),
+            "new completions still correlate"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_retires_cached_thread_state() {
+        let (mut connection, mut peer) = connection();
+        connection.owners.insert("t".into(), "owner-A".into());
+        connection
+            .states
+            .insert("t".into(), (3, json!({"title":"cached"})));
+        connection
+            .catalog
+            .lock()
+            .unwrap()
+            .insert("t".into(), json!({"id":"codex/t"}));
+        let host = tokio::spawn(async move {
+            let discovery = read_frame(&mut peer).await;
+            write_frame(&mut peer, json!({"type":"response","requestId":discovery["requestId"],
+                "resultType":"error","method":"thread-owner-discovery","error":"fixture owner unavailable"})).await;
+            peer
+        });
+        let error = connection.fresh_state(&"t".to_string()).await.unwrap_err();
+        assert!(error.contains("owner unavailable"), "{error}");
+        assert!(connection.owners.is_empty());
+        assert!(connection.states.is_empty());
+        assert!(connection.catalog.lock().unwrap().is_empty());
+        drop(host.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn owner_change_resolves_previous_waits_and_retires_state() {
+        let (mut connection, mut peer) = connection();
+        connection.owners.insert("t".into(), "owner-A".into());
+        connection
+            .states
+            .insert("t".into(), (3, json!({"title":"cached"})));
+        connection.waiting.insert(
+            ("t".into(), "owner-A".into(), "turn-1".into()),
+            vec![("mid-1".into(), crate::proto::now_ms())],
+        );
+        let host = tokio::spawn(async move {
+            let discovery = read_frame(&mut peer).await;
+            write_frame(&mut peer, json!({"type":"response","requestId":discovery["requestId"],
+                "resultType":"success","method":"thread-owner-discovery","handledByClientId":"owner-B"})).await;
+            assert_eq!(read_frame(&mut peer).await["params"]["following"], true);
+            write_frame(&mut peer, json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-B","version":11,
+                "params":{"conversationId":"t","hostId":"local","change":{"type":"snapshot","revision":4,
+                "conversationState":{"title":"fresh","threadRuntimeStatus":{"type":"idle"}}}}})).await;
+            peer
+        });
+        let (owner, state) = connection.fresh_state(&"t".to_string()).await.unwrap();
+        assert_eq!(owner, "owner-B");
+        assert_eq!(state["title"], "fresh");
+        // The previous owner's unresolved wait was settled unknown and every
+        // stale fact about the thread is gone.
+        assert!(connection.waiting.is_empty());
+        assert_eq!(connection.owners["t"], "owner-B");
+        drop(host.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn correlation_state_expires_and_bounds_with_unknown_outcome() {
+        let (mut connection, _peer) = connection();
+        let now = crate::proto::now_ms();
+        let key = |thread: &str| (thread.to_string(), "owner".to_string(), "turn".to_string());
+        connection
+            .completed
+            .insert(key("stale-completed"), now - CORRELATION_TTL_MS - 1);
+        connection.waiting.insert(
+            key("expired-wait"),
+            vec![
+                ("fresh-mid".into(), now),
+                ("stale-mid".into(), now - CORRELATION_TTL_MS - 1),
+            ],
+        );
+        let expired = connection.prune_correlation(now);
+        assert_eq!(expired, vec![("stale-mid".into(), "expired-wait".into())]);
+        assert!(connection.completed.is_empty());
+        assert_eq!(connection.waiting[&key("expired-wait")].len(), 1);
+        // Completed early-turn markers evict the oldest entry, never the
+        // freshest marker that a subsequent send still needs to observe.
+        for index in 0..=CORRELATION_LIMIT as u64 {
+            connection.completed.insert(
+                ("completed".into(), format!("owner-{index}"), "turn".into()),
+                now + index,
+            );
+        }
+        connection.prune_correlation(now);
+        assert_eq!(connection.completed.len(), CORRELATION_LIMIT);
+        assert!(!connection.completed.contains_key(&(
+            "completed".into(),
+            "owner-0".into(),
+            "turn".into()
+        )));
+        assert!(connection.completed.contains_key(&(
+            "completed".into(),
+            format!("owner-{CORRELATION_LIMIT}"),
+            "turn".into()
+        )));
+        connection.completed.clear();
+        // Size bound: the oldest waiting mids beyond the cap are evicted and
+        // reported for an explicit unknown outcome.
+        connection.waiting.clear();
+        connection.waiting.insert(
+            key("bounded"),
+            (0..CORRELATION_LIMIT as u64 + 5)
+                .map(|index| (format!("m{index}"), now + index))
+                .collect(),
+        );
+        let evicted = connection.prune_correlation(now);
+        assert_eq!(evicted.len(), 5, "{evicted:?}");
+        assert!(evicted
+            .iter()
+            .all(|(mid, thread)| { thread == "bounded" && mid.starts_with('m') }));
+        assert_eq!(connection.waiting[&key("bounded")].len(), CORRELATION_LIMIT);
     }
 }
