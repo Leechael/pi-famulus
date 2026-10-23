@@ -161,8 +161,22 @@ pub struct Running {
     socket_identity: (u64, u64),
 }
 impl Running {
-    pub fn delivered_ids(&self) -> Vec<CarriedInjection> {
-        self.runtime.state.lock().unwrap().incoming.carried()
+    /// Shuts down, then returns the injection dedup table once in-flight
+    /// injections have recorded their outcomes, for an upgrade to carry.
+    pub async fn shutdown_for_handover(self) -> Vec<CarriedInjection> {
+        let runtime = self.runtime.clone();
+        self.shutdown().await;
+        let settled = tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.state.lock().unwrap().incoming.injecting() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if settled.is_err() {
+            eprintln!("intercom: in-flight injections outlived shutdown; carrying without them");
+        }
+        let carried = runtime.state.lock().unwrap().incoming.carried();
+        carried
     }
     pub async fn shutdown(self) {
         self.runtime.drain().await;
@@ -837,18 +851,36 @@ impl Runtime {
         result.is_ok()
     }
     async fn retry_receipt(&self, mid: &str, delivery: Delivery) {
-        let forwarded = self
+        let mut forward = Forwarding {
+            runtime: self,
+            mid,
+            token: delivery.token.clone(),
+            forwarded: false,
+        };
+        forward.forwarded = self
             .forward_receipt(mid, delivery.clone(), &delivery.drop_reason)
             .await;
-        let mut state = self.state.lock().unwrap();
+    }
+}
+/// Clears a delivery's in-flight forward even when the forwarding future is
+/// cancelled, so maintenance can retry it.
+struct Forwarding<'a> {
+    runtime: &'a Runtime,
+    mid: &'a str,
+    token: Arc<()>,
+    forwarded: bool,
+}
+impl Drop for Forwarding<'_> {
+    fn drop(&mut self) {
+        let mut state = self.runtime.state.lock().unwrap();
         if let Some(current) = state
             .messages
-            .get_mut(mid)
-            .filter(|current| Arc::ptr_eq(&current.token, &delivery.token))
+            .get_mut(self.mid)
+            .filter(|current| Arc::ptr_eq(&current.token, &self.token))
         {
             current.forwarding = false;
-            if !forwarded {
-                current.retry_failed(self.clock.now_ms());
+            if !self.forwarded {
+                current.retry_failed(self.runtime.clock.now_ms());
             }
         }
     }

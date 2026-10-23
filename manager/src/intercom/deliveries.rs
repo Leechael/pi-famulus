@@ -53,6 +53,9 @@ impl InjectionDedup {
         }
         dedup
     }
+    pub(super) fn injecting(&self) -> bool {
+        !self.inflight.is_empty()
+    }
     pub(super) fn carried(&self) -> Vec<CarriedInjection> {
         self.order
             .iter()
@@ -1091,6 +1094,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_terminal_forward_leaves_the_receipt_retryable() {
+        let rt = std::sync::Arc::new(runtime());
+        let (tx, mut rx) = mpsc::channel(16);
+        {
+            let mut state = rt.state.lock().unwrap();
+            state.sessions.insert("pi/origin".into(), session(tx, 1, 1));
+            state
+                .admit("cut-off", "pi/origin", "claude/target", false, false, rt.clock.now_ms())
+                .unwrap();
+        }
+        let forward = rt.receipt_with_reason("cut-off", "claude/target", "read", "");
+        let (cancelled, held) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(200), forward),
+            rx.recv()
+        );
+        assert!(cancelled.is_err(), "the forward must still be awaiting its write");
+        drop(held);
+        let state = rt.state.lock().unwrap();
+        let delivery = &state.messages["cut-off"];
+        assert!(
+            !delivery.forwarding,
+            "a cancelled forward must not block maintenance retries"
+        );
+        assert!(delivery.retry_due(delivery.retry_at));
+    }
+
+    #[tokio::test]
     async fn maintenance_backs_off_receipt_retries_to_a_failing_origin() {
         let rt = std::sync::Arc::new(runtime());
         let (tx, mut rx) = mpsc::channel(16);
@@ -1202,6 +1232,38 @@ mod tests {
             "the target's read already proved the injection"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handover_dedup_includes_injections_cancelled_by_shutdown() {
+        let rt = std::sync::Arc::new(runtime());
+        let (tx, mut rx) = mpsc::channel(4);
+        rt.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("pi/target".into(), session(tx, 1, 1));
+        let injecting = rt.clone();
+        let task = tokio::spawn(async move {
+            let _ = injecting
+                .inject_local(&pi_target(), deliver("spans-upgrade"), "", false, None)
+                .await;
+        });
+        let held = rx.recv().await.unwrap();
+        let running = crate::intercom::Running {
+            runtime: rt.clone(),
+            tasks: vec![task],
+            #[cfg(unix)]
+            socket_identity: (0, 0),
+        };
+        let carried = running.shutdown_for_handover().await;
+        drop(held);
+        let entry = carried
+            .iter()
+            .find(|entry| entry.id == "spans-upgrade")
+            .expect("an injection still writing at upgrade must be carried");
+        assert_eq!(entry.target, "pi/target");
+        assert!(entry.unknown.is_some());
     }
 
     #[tokio::test]

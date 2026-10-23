@@ -354,6 +354,54 @@ async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_deli
 }
 
 #[tokio::test]
+async fn relay_delivery_with_unknown_pi_outcome_reports_unknown_not_dropped() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(Config {
+        server: format!("http://{}", listener.local_addr().unwrap()),
+        token: "fixture".into(),
+        ..Config::default()
+    });
+    let (tx, mut pushed) = tokio::sync::mpsc::channel(4);
+    rt.state.lock().unwrap().sessions.insert(
+        "pi/local".into(),
+        super::super::Session {
+            value: json!({"id":"pi/local","harness":"pi"}),
+            owner: 1,
+            epoch: 1,
+            tx,
+            disconnect: None,
+            caps: Default::default(),
+            idle_since: None,
+        },
+    );
+    let active = rt.clone();
+    let task = tokio::spawn(async move {
+        session(
+            active.clone(),
+            &mut tokio::task::JoinSet::new(),
+            &delivery_lanes(&active),
+            &mut None,
+        )
+        .await
+    });
+    let mut peer = welcomed_peer(&listener).await;
+    peer_send(&mut peer, json!({"type":"deliver","session_id":"pi/local","from":"pi/remote","message_id":"lost-ack","body":"typed"})).await;
+    let frame = tokio::time::timeout(Duration::from_secs(3), pushed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(frame.written);
+    let receipt = peer_frame(&mut peer, |frame| frame["type"] == "receipt").await;
+    assert_eq!(receipt["message_id"], "lost-ack");
+    assert_eq!(
+        receipt["status"], "unknown",
+        "an injection that may have landed must not be reported as dropped"
+    );
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -369,6 +417,8 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
             3,
             4,
             16,
+            usize::MAX,
+            |_| 1,
             Arc::new(move |item: String| {
                 let (log, running, peak, mut gate) =
                     (log.clone(), running.clone(), peak.clone(), gate.clone());
@@ -425,13 +475,88 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
         "one target's deliveries overlapped or reordered"
     );
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !lanes.inner.queues.lock().unwrap().is_empty() {
+        while !lanes.inner.queues.lock().unwrap().lanes.is_empty() {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("idle lanes must release their table entry");
     lanes.push("pi/a", "a-after".into()).unwrap();
+}
+
+#[tokio::test]
+async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let finished = Arc::new(AtomicUsize::new(0));
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let lanes = {
+        let finished = finished.clone();
+        Lanes::new(
+            4,
+            8,
+            8,
+            10,
+            |item: &String| item.len(),
+            Arc::new(move |item: String| {
+                let (finished, mut gate) = (finished.clone(), gate.clone());
+                Box::pin(async move {
+                    if item == "boom" {
+                        panic!("delivery panicked");
+                    }
+                    let _ = gate.wait_for(|open| *open).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        )
+    };
+    lanes.push("pi/a", "aaaaaa".into()).unwrap();
+    assert_eq!(
+        lanes.push("pi/b", "bbbbb".into()),
+        Err("bbbbb".into()),
+        "queued bytes must stay within the budget across lanes"
+    );
+    lanes.push("pi/b", "bbbb".into()).unwrap();
+    lanes.push("pi/p", "boom".into()).unwrap_err();
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while finished.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    lanes.push("pi/p", "boom".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while lanes.inner.queues.lock().unwrap().lanes.contains_key("pi/p") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a panicked worker must release its lane");
+    lanes.push("pi/p", "ok".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while finished.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the lane must accept work after its worker panicked");
+    release.send_replace(false);
+    lanes.push("pi/held", "held".into()).unwrap();
+    tokio::task::yield_now().await;
+    let inner = lanes.inner.clone();
+    drop(lanes);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !inner.queues.lock().unwrap().lanes.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the lanes must abort their workers");
+    assert_eq!(finished.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

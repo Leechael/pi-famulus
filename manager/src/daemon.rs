@@ -280,6 +280,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     }
     // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
     // holder removes stale socket/pid files before binding. Held until exit.
+    let mut enabled_in = None;
     let daemon_lock = loop {
         match lifecycle::claim_daemon(&home) {
             Ok(Claim::Acquired(guard)) => break guard,
@@ -291,21 +292,23 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
                     }
                     return 0;
                 };
-                if let Err(error) = crate::client::enable_intercom(&home, config.clone()).await {
-                    eprintln!("pi-famulus: cannot enable intercom: {error}");
-                    return 1;
-                }
                 // `intercom serve` is a supervised job (launchd KeepAlive):
                 // exiting 0 here would end supervision while another
                 // process owns the manager. Stay up and take over once it
-                // exits.
-                eprintln!(
-                    "pi-famulus: intercom enabled in the running manager{}; taking over when it exits",
-                    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
-                );
-                while lifecycle::lock_held(&home) {
-                    tokio::time::sleep(DAEMON_TAKEOVER_POLL).await;
+                // exits; claiming is the probe, so a free lock is never
+                // taken and dropped under a starting daemon.
+                if enabled_in != Some(pid) {
+                    if let Err(error) = crate::client::enable_intercom(&home, config.clone()).await {
+                        eprintln!("pi-famulus: cannot enable intercom: {error}");
+                        return 1;
+                    }
+                    eprintln!(
+                        "pi-famulus: intercom enabled in the running manager{}; taking over when it exits",
+                        pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+                    );
+                    enabled_in = Some(pid);
                 }
+                tokio::time::sleep(DAEMON_TAKEOVER_POLL).await;
             }
             Err(e) => {
                 eprintln!("pi-famulus: daemon lock failed: {e}");
@@ -685,8 +688,7 @@ async fn serve(
                     if let Some(ready) = ready {
                         // Returns only if the upgrade did not happen.
                         if let Some(runtime) = intercom.take() {
-                            crate::intercom::carry_dedup(runtime.delivered_ids());
-                            runtime.shutdown().await;
+                            crate::intercom::carry_dedup(runtime.shutdown_for_handover().await);
                         }
                         let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
                         if let Some(config) = crate::intercom::configuration() {

@@ -691,56 +691,120 @@ pub async fn run(rt: Shared) {
 type Runner<T> =
     std::sync::Arc<dyn Fn(T) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 /// Per-key FIFO lanes: one worker per busy key keeps that key's items in
-/// arrival order, and a shared semaphore caps how many keys run at once.
+/// arrival order, a shared semaphore caps how many keys run at once, and a
+/// byte budget caps what all lanes hold. Dropping the lanes aborts workers.
 struct Lanes<T> {
     inner: std::sync::Arc<LanesInner<T>>,
+    workers: std::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 struct LanesInner<T> {
-    queues: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<T>>>,
+    queues: std::sync::Mutex<LaneQueues<T>>,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
     per_key: usize,
     keys: usize,
+    budget: usize,
+    size: fn(&T) -> usize,
     run: Runner<T>,
 }
+struct LaneQueues<T> {
+    lanes: std::collections::HashMap<String, std::collections::VecDeque<T>>,
+    bytes: usize,
+}
+/// Removes a worker's lane if it dies mid-item (panic or abort) so later
+/// pushes start a fresh worker instead of queueing behind a dead one.
+struct LaneWorker<T> {
+    inner: std::sync::Arc<LanesInner<T>>,
+    key: String,
+    retired: bool,
+}
+impl<T> Drop for LaneWorker<T> {
+    fn drop(&mut self) {
+        if self.retired {
+            return;
+        }
+        let mut queues = self.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(queue) = queues.lanes.remove(&self.key) {
+            let freed: usize = queue.iter().map(self.inner.size).sum();
+            queues.bytes = queues.bytes.saturating_sub(freed);
+        }
+    }
+}
 impl<T: Send + 'static> Lanes<T> {
-    fn new(workers: usize, per_key: usize, keys: usize, run: Runner<T>) -> Self {
+    fn new(
+        workers: usize,
+        per_key: usize,
+        keys: usize,
+        budget: usize,
+        size: fn(&T) -> usize,
+        run: Runner<T>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(LanesInner {
-                queues: Default::default(),
+                queues: std::sync::Mutex::new(LaneQueues {
+                    lanes: Default::default(),
+                    bytes: 0,
+                }),
                 permits: std::sync::Arc::new(tokio::sync::Semaphore::new(workers)),
                 per_key,
                 keys,
+                budget,
+                size,
                 run,
             }),
+            workers: Default::default(),
         }
     }
-    /// Returns the item back when its lane (or the lane table) is full.
+    /// Returns the item back when its lane, the lane table or the byte budget is full.
     fn push(&self, key: &str, item: T) -> Result<(), T> {
+        let size = (self.inner.size)(&item);
         let mut queues = self.inner.queues.lock().unwrap();
-        if let Some(queue) = queues.get_mut(key) {
+        if queues.bytes.saturating_add(size) > self.inner.budget {
+            return Err(item);
+        }
+        if let Some(queue) = queues.lanes.get_mut(key) {
             if queue.len() >= self.inner.per_key {
                 return Err(item);
             }
             queue.push_back(item);
+            queues.bytes += size;
             return Ok(());
         }
-        if queues.len() >= self.inner.keys {
+        if queues.lanes.len() >= self.inner.keys {
             return Err(item);
         }
-        queues.insert(key.to_string(), std::collections::VecDeque::from([item]));
+        queues
+            .lanes
+            .insert(key.to_string(), std::collections::VecDeque::from([item]));
+        queues.bytes += size;
         drop(queues);
+        let mut worker = LaneWorker {
+            inner: self.inner.clone(),
+            key: key.to_string(),
+            retired: false,
+        };
+        let mut workers = self.workers.lock().unwrap();
+        while workers.try_join_next().is_some() {}
         let inner = self.inner.clone();
-        let key = key.to_string();
-        tokio::spawn(async move {
+        workers.spawn(async move {
             loop {
                 let Ok(_permit) = inner.permits.clone().acquire_owned().await else {
                     break;
                 };
                 let next = {
                     let mut queues = inner.queues.lock().unwrap();
-                    let next = queues.get_mut(&key).and_then(|queue| queue.pop_front());
-                    if next.is_none() {
-                        queues.remove(&key);
+                    let next = queues
+                        .lanes
+                        .get_mut(&worker.key)
+                        .and_then(|queue| queue.pop_front());
+                    match &next {
+                        Some(item) => {
+                            let freed = (inner.size)(item);
+                            queues.bytes = queues.bytes.saturating_sub(freed);
+                        }
+                        None => {
+                            queues.lanes.remove(&worker.key);
+                            worker.retired = true;
+                        }
                     }
                     next
                 };
@@ -754,12 +818,15 @@ impl<T: Send + 'static> Lanes<T> {
 const DELIVERY_WORKERS: usize = 32;
 const DELIVERY_PER_TARGET: usize = 256;
 const DELIVERY_TARGETS: usize = 1024;
+const DELIVERY_BYTES: usize = 64 * 1024 * 1024;
 fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
     let rt = rt.clone();
     Lanes::new(
         DELIVERY_WORKERS,
         DELIVERY_PER_TARGET,
         DELIVERY_TARGETS,
+        DELIVERY_BYTES,
+        |frame| str_field(frame, "body").len() + 1024,
         std::sync::Arc::new(move |frame| Box::pin(deliver(rt.clone(), frame))),
     )
 }
@@ -828,7 +895,7 @@ async fn deliver(rt: Shared, v: Value) {
         }
         Err(_) if refused => "refused".into(),
         Err(error) => {
-            if target.starts_with("codex/") && error.contains("outcome unknown") {
+            if error.contains("outcome unknown") {
                 rt.record_status(mid, "unknown", false);
                 "unknown".into()
             } else {
