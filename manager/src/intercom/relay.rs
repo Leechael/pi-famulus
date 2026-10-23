@@ -1434,6 +1434,8 @@ mod listen_webhook_tests {
                         Err(error) => panic!("TLS fixture accept: {error}"),
                     };
                     accepted += 1;
+                    // BSD-derived systems inherit O_NONBLOCK from the listener.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -1641,6 +1643,8 @@ mod listen_webhook_tests {
         });
         (format!("http://{address}/hook"), rx, task)
     }
+    // tungstenite fixes the handshake callback's error type to a full HTTP response.
+    #[allow(clippy::result_large_err)]
     async fn relay_peer(
         listener: &tokio::net::TcpListener,
     ) -> (WebSocketStream<tokio::net::TcpStream>, String) {
@@ -1955,6 +1959,8 @@ mod listen_webhook_tests {
 
     #[tokio::test]
     async fn webhook_client_errors_and_ignored_are_final_without_retry() {
+        // Keep the one-time trust store load out of the timed window.
+        let _ = super::tls::native_roots();
         for (status, body, expected) in [
             (400, "{}", "HTTP 400"),
             (200, "{\"status\":\"ignored\"}", "ignored"),

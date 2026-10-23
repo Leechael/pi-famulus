@@ -1762,7 +1762,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("fma-{}", uuid::Uuid::new_v4()));
+            // Keep socket paths under macOS's 104-byte SUN_LEN inside $TMPDIR.
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let dir = std::env::temp_dir().join(format!("fma-{}", &id[..12]));
             std::fs::create_dir(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             let socket = dir.join(format!("{}.sock", std::process::id()));

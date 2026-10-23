@@ -1,5 +1,7 @@
 use super::*;
 
+// tungstenite fixes the handshake callback's error type to a full HTTP response.
+#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn dial_auto_retries_only_actual_cleartext_http_and_caches_the_plain_server() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -182,8 +184,10 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
     .unwrap();
     let first = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut fence = Some(first.clone().lock_owned().await);
-    for _ in 0..16 {
-        writer.send(super::super::Push{value:json!({"type":"send","id":uuid::Uuid::new_v4().to_string(),"message_id":uuid::Uuid::new_v4().to_string(),"to":"pi/target","body":"x".repeat(700_000)}),written:None,fence:fence.take()}).await.unwrap();
+    // The fenced frame is small so it flushes regardless of the platform's
+    // socket buffer sizing; the large frames that follow then stall.
+    for size in std::iter::once(1_000).chain(std::iter::repeat_n(700_000, 16)) {
+        writer.send(super::super::Push{value:json!({"type":"send","id":uuid::Uuid::new_v4().to_string(),"message_id":uuid::Uuid::new_v4().to_string(),"to":"pi/target","body":"x".repeat(size)}),written:None,fence:fence.take()}).await.unwrap();
     }
     drop(tokio::time::timeout(Duration::from_secs(2),first.lock()).await.expect("the physical write fence must prove at least one legal frame flushed before stalling"));
     let outcome = tokio::time::timeout(Duration::from_secs(12), &mut task).await;

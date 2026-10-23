@@ -453,7 +453,7 @@ fn exec_upgrade_restores_intercom_configuration_and_reaps_predecessor_aliases() 
     assert_cli_ok(&status);
     let report: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(report["pid"], pid);
-    let mut hostname = [0i8; 256];
+    let mut hostname = [0 as libc::c_char; 256];
     assert_eq!(
         unsafe { libc::gethostname(hostname.as_mut_ptr(), hostname.len()) },
         0
