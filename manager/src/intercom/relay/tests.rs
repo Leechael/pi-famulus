@@ -294,6 +294,40 @@ async fn mcp_backs_off_a_peer_that_keeps_presenting_wrong_tokens() {
 }
 
 #[tokio::test]
+async fn webhook_secrets_are_never_sent_over_cleartext_to_a_remote_host() {
+    let endpoint = super::super::config::Endpoint {
+        name: "hook".into(),
+        url: "http://192.0.2.1:9/hook".into(),
+        secret: "secret".into(),
+        auth: "bearer".into(),
+    };
+    let message = WebhookMessage {
+        id: "id",
+        from: "pi/a",
+        reply_to: "",
+        body: "body",
+    };
+    let error = post_webhook_message(
+        &Config::default(),
+        &endpoint,
+        &message,
+        &crate::clock::Clock::from_env(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("non-https"), "{error}");
+    let error = listen(
+        Config::default(),
+        "hook".into(),
+        "http://192.0.2.1:9/hook".into(),
+        "secret".into(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("non-https"), "{error}");
+}
+
+#[tokio::test]
 async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
     let rt = transport_runtime(Config {
         mcp_listen: "127.0.0.1:0".into(),

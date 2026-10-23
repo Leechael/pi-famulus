@@ -72,6 +72,29 @@ pub fn loopback_listen(listen: &str) -> bool {
         .rsplit_once(':')
         .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
 }
+/// A webhook secret (bearer token or HMAC key) may only travel over TLS,
+/// except to this host's own loopback listeners.
+pub fn webhook_url_allowed(url: &str, secret: &str) -> Result<(), String> {
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|error| format!("invalid url: {error}"))?;
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if parsed.scheme() == "https" || loopback {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to send a webhook secret to non-https URL {url}; use https:// or a loopback host"
+        ))
+    }
+}
 pub fn hostname() -> String {
     #[cfg(unix)]
     {
@@ -177,6 +200,10 @@ impl Config {
                     self.mcp_listen
                 ));
             }
+        }
+        for endpoint in &self.endpoints {
+            webhook_url_allowed(&endpoint.url, &endpoint.secret)
+                .map_err(|error| format!("endpoint {}: {error}", endpoint.name))?;
         }
         Ok(())
     }
@@ -355,6 +382,34 @@ mod tests {
         }
         let parsed: Config = toml::from_str("mcp_allow_non_loopback = true\n").unwrap();
         assert!(parsed.mcp_allow_non_loopback);
+    }
+
+    #[test]
+    fn webhook_secrets_require_https_except_on_loopback() {
+        let config = |url: &str, secret: &str| Config {
+            endpoints: vec![Endpoint {
+                name: "hook".into(),
+                url: url.into(),
+                secret: secret.into(),
+                auth: "bearer".into(),
+            }],
+            ..Config::default()
+        };
+        for url in ["http://hooks.example.com/x", "http://192.0.2.1/x", "ftp://x/y"] {
+            let error = config(url, "s").validate().unwrap_err();
+            assert!(error.contains("non-https"), "{url}: {error}");
+            assert!(config(url, "").validate().is_ok(), "{url} without a secret");
+        }
+        for url in [
+            "https://hooks.example.com/x",
+            "http://127.0.0.1:9/x",
+            "http://127.9.9.9/x",
+            "http://[::1]:9/x",
+            "http://LOCALHOST:9/x",
+        ] {
+            assert!(config(url, "s").validate().is_ok(), "{url}");
+        }
+        assert!(webhook_url_allowed("http://localhost.evil.test/", "s").is_err());
     }
 
     #[cfg(unix)]
