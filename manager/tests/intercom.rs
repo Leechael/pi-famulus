@@ -757,14 +757,15 @@ fn publication_unpublish_restore_requires_fresh_registration() {
     let mut fixture = Fixture::new();
     fixture.start();
     let mut target = fixture.plugin("target", "busy");
-    let mut admin = fixture.connect();
-    admin.ok(json!({"op":"session_unpublish","args":["pi/target"]}));
-    fixture.wait_absent("pi/target");
+    // macOS rejects SO_RCVTIMEO with EINVAL once the peer has shut down.
     target
         .reader
         .get_mut()
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
+    let mut admin = fixture.connect();
+    admin.ok(json!({"op":"session_unpublish","args":["pi/target"]}));
+    fixture.wait_absent("pi/target");
     let mut line = String::new();
     assert_eq!(
         target
