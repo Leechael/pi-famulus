@@ -77,6 +77,7 @@ pub struct Delivery {
     pub retry_at: u64,
     pub retry_delay: u64,
     pub forwarding: bool,
+    pub drop_reason: String,
     pub reply_relay: bool,
     pub remote_native: bool,
     pub target_endpoint: Option<Value>,
@@ -759,10 +760,20 @@ impl Runtime {
             if ignored && !rearm || d.status == "delivered" && !d.route_terminal() {
                 return;
             }
+            // Fence maintenance retries off while the first terminal forward is
+            // in flight, and keep its reason for any genuine retry.
+            d.drop_reason = reason.into();
+            if d.route_terminal() {
+                d.forwarding = true;
+            }
             d.clone()
         };
         self.record("receipt", mid, reporter, &delivery.status);
-        self.forward_receipt(mid, delivery, reason).await;
+        if delivery.route_terminal() {
+            self.retry_receipt(mid, delivery).await;
+        } else {
+            self.forward_receipt(mid, delivery, reason).await;
+        }
     }
     async fn forward_receipt(&self, mid: &str, delivery: Delivery, reason: &str) -> bool {
         let result = if delivery.reply_relay {
@@ -798,7 +809,9 @@ impl Runtime {
         result.is_ok()
     }
     async fn retry_receipt(&self, mid: &str, delivery: Delivery) {
-        let forwarded = self.forward_receipt(mid, delivery.clone(), "").await;
+        let forwarded = self
+            .forward_receipt(mid, delivery.clone(), &delivery.drop_reason)
+            .await;
         let mut state = self.state.lock().unwrap();
         if let Some(current) = state
             .messages

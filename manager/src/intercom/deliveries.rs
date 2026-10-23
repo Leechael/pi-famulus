@@ -429,6 +429,7 @@ impl State {
                 retry_at: 0,
                 retry_delay: 0,
                 forwarding: false,
+                drop_reason: String::new(),
                 reply_relay,
                 remote_native: remote && origin.starts_with("claude/") && !reply_relay,
                 target_endpoint: None,
