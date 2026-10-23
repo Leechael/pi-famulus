@@ -341,19 +341,19 @@ impl Runtime {
         }
     }
     pub async fn directory(&self) -> Vec<Value> {
-        let mut rows: Vec<Value> = {
+        let (mut rows, remote): (Vec<Value>, Vec<Value>) = {
             let s = self.state.lock().unwrap();
-            s.sessions
-                .values()
-                .map(|s| s.value.clone())
-                .chain(s.remote.iter().cloned())
-                .collect()
+            (
+                s.sessions.values().map(|s| s.value.clone()).collect(),
+                s.remote.clone(),
+            )
         };
         rows.extend(self.native.list().await);
         herdr::overlay(self, &mut rows).await;
         for ep in &self.cfg.endpoints {
             rows.push(json!({"id":format!("webhook/{}",ep.name),"name":ep.name,"harness":"webhook","status":"idle","cwd":""}));
         }
+        merge_remote(&mut rows, remote, &self.machine);
         let s = self.state.lock().unwrap();
         for row in &mut rows {
             if let Some(name) = s.aliases.get(str_field(row, "id")) {
@@ -850,6 +850,15 @@ impl Runtime {
             }
         }
     }
+}
+/// Remote rows never shadow a local session, and a remote row cannot claim
+/// this machine (or no machine) and thereby pass as local.
+fn merge_remote(rows: &mut Vec<Value>, remote: Vec<Value>, machine: &str) {
+    let local: HashSet<String> = rows.iter().map(|r| str_field(r, "id").to_string()).collect();
+    rows.extend(remote.into_iter().filter(|row| {
+        let owner = str_field(row, "machine_id");
+        !owner.is_empty() && owner != machine && !local.contains(str_field(row, "id"))
+    }));
 }
 pub fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")

@@ -931,3 +931,47 @@ fn relay_deliver_refuses_hostile_reply_to_and_from_mode_before_injection() {
     assert_eq!(delivered["message_id"], id);
     assert_eq!(delivered["reply_to"], "pi/remote");
 }
+
+#[test]
+fn remote_directory_rows_never_shadow_or_impersonate_local_sessions() {
+    let device = Arc::new(std::sync::Mutex::new(Value::Null));
+    let seen = device.clone();
+    let relay = WireRelay::new(move |request| match request["type"].as_str().unwrap_or_default() {
+        "register" => {
+            *seen.lock().unwrap() = request["machine_id"].clone();
+            relay_basics(request)
+        }
+        "list" => vec![json!({"type":"list","id":request["id"],"sessions":[
+            {"id":"pi/remote","name":"remote fixture","harness":"pi","machine_id":"other-device","status":"busy"},
+            {"id":"webhook/hook","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
+            {"id":"pi/target","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
+            {"id":"pi/machineless","name":"no machine","harness":"pi","status":"busy"},
+            {"id":"pi/self-claimed","name":"this machine","harness":"pi","machine_id":seen.lock().unwrap().clone(),"status":"busy"},
+        ]})],
+        _ => relay_basics(request),
+    });
+    let mut fixture = Fixture::new();
+    start_relay(
+        &mut fixture,
+        &relay,
+        "endpoint=[{name='hook',url='http://127.0.0.1:9/hook'}]\n",
+    );
+    assert!(device.lock().unwrap().is_string());
+    let _target = fixture.plugin("target", "busy");
+    let rows = fixture.sessions();
+    let row = |id: &str| rows.iter().filter(|r| r["id"] == id).collect::<Vec<_>>();
+    let hook = row("webhook/hook");
+    assert_eq!(hook.len(), 1, "{rows:?}");
+    assert_eq!(hook[0]["harness"], "webhook", "remote row shadowed a local endpoint");
+    assert!(str_field_or_empty(hook[0], "machine_id").is_empty(), "{hook:?}");
+    let target = row("pi/target");
+    assert_eq!(target.len(), 1, "{rows:?}");
+    assert_eq!(target[0]["name"], "name-target", "remote row shadowed a local Pi");
+    assert!(row("pi/machineless").is_empty(), "machineless remote row passed as local: {rows:?}");
+    assert!(row("pi/self-claimed").is_empty(), "remote row claimed this machine: {rows:?}");
+    assert_eq!(row("pi/remote").len(), 1, "{rows:?}");
+}
+
+fn str_field_or_empty<'a>(row: &'a Value, key: &str) -> &'a str {
+    row[key].as_str().unwrap_or("")
+}
