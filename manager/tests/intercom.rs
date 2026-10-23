@@ -1058,3 +1058,84 @@ fn intercom_and_famulus_tasks_share_foreground_manager_pid_and_shutdown() {
         "Pi listener survived manager shutdown"
     );
 }
+
+#[test]
+fn shutdown_with_live_task_and_idle_watch_reports_unavailable_and_exits() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut manager =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
+    manager.hello_ext("shutdown-live-session");
+    let task = manager.request_ok(json!({"type":"start","kind":"shell","command":"sleep 30","cwd":fixture.root,"env":{},"run_in_background":true}));
+    let task_id = task["task_id"].as_str().unwrap().to_string();
+    let mut watcher = fixture.plugin("shutdown-watcher", "busy");
+    let _target = fixture.plugin("shutdown-target", "busy");
+    let subscription = watcher.ok(json!({"op":"subscribe_idle","to":"pi/shutdown-target"}));
+    assert_eq!(subscription["delivery_mode"], "pi_push");
+    let listed = manager.request_ok(json!({"type":"list"}));
+    let pid = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["task_id"] == task_id && row["status"] == "running")
+        .and_then(|row| row["pid"].as_u64())
+        .unwrap_or_else(|| panic!("live task missing before shutdown: {listed}"))
+        as u32;
+    assert!(common::pid_alive(pid));
+    let mut control =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
+    control.hello_cli();
+    control.request_ok(json!({"type":"shutdown"}));
+    let notice = watcher.event("idle_notice");
+    assert_eq!(notice["subscription_id"], subscription["subscription_id"]);
+    assert_eq!(notice["status"], "unavailable");
+    let deadline = Instant::now() + TIMEOUT;
+    while fixture
+        .child
+        .as_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "manager hung shutting down live task with an active idle watch: {}",
+            fixture.log()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        common::poll_true(TIMEOUT, || !common::pid_alive(pid)),
+        "live task survived manager shutdown"
+    );
+    assert!(UnixStream::connect(&fixture.sock).is_err());
+}
+
+#[test]
+fn mixed_version_watchers_share_one_target_without_pushing_to_legacy_plugin() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut modern = fixture.plugin("modern-watcher", "busy");
+    let mut legacy = fixture.connect();
+    legacy.register("legacy-watcher", "busy", &["read_receipts"]);
+    let mut target = fixture.plugin("mixed-target", "busy");
+    let pushed = modern.ok(json!({"op":"subscribe_idle","to":"pi/mixed-target"}));
+    let polled = legacy.ok(json!({"op":"subscribe_idle","to":"pi/mixed-target"}));
+    assert_eq!(pushed["delivery_mode"], "pi_push");
+    assert_eq!(polled["delivery_mode"], "query_only");
+    target.register("mixed-target", "idle", &["read_receipts", "idle_state_v1"]);
+    let notice = modern.event("idle_notice");
+    assert_eq!(notice["subscription_id"], pushed["subscription_id"]);
+    assert_eq!(notice["status"], "idle");
+    assert_eq!(
+        legacy.ok(json!({"op":"idle_status","subscription_id":polled["subscription_id"]}))
+            ["status"],
+        "idle"
+    );
+    legacy.no_event_for(IDLE_QUIET);
+    let sent = legacy.ok(json!({"op":"send","to":"pi/modern-watcher","body":"from legacy"}));
+    assert_eq!(modern.event("deliver")["message_id"], sent["message_id"]);
+    let reply = modern.ok(json!({"op":"send","to":"pi/legacy-watcher","body":"to legacy"}));
+    assert_eq!(legacy.event("deliver")["message_id"], reply["message_id"]);
+}
