@@ -940,7 +940,9 @@ fn inspect_config(c: &Config) -> Result<(String, String), String> {
     let url = str_field(&v, "url");
     let token = str_field(&v, "token");
     let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
-    if !parsed.host_str().is_some_and(|host| localhost_host(&format!("{host}:0")))
+    if !parsed
+        .host_str()
+        .is_some_and(|host| localhost_host(&format!("{host}:0")))
         || parsed.scheme() != "http"
         || token.is_empty()
     {
@@ -1175,10 +1177,18 @@ mod tests {
             .unwrap();
             inspect_config(&cfg)
         };
-        for url in ["http://[::1]:4100", "http://127.0.0.1:4100", "http://localhost:4100"] {
+        for url in [
+            "http://[::1]:4100",
+            "http://127.0.0.1:4100",
+            "http://localhost:4100",
+        ] {
             assert_eq!(check(url).unwrap().0, url);
         }
-        for url in ["http://[2001:db8::1]:4100", "http://192.0.2.1:4100", "https://[::1]:4100"] {
+        for url in [
+            "http://[2001:db8::1]:4100",
+            "http://192.0.2.1:4100",
+            "https://[::1]:4100",
+        ] {
             assert!(check(url).is_err(), "{url}");
         }
         std::fs::remove_dir_all(dir).unwrap();

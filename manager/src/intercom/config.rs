@@ -255,9 +255,10 @@ mod tests {
     fn unknown_config_keys_are_rejected_instead_of_ignored() {
         let error = toml::from_str::<Config>("mcp_tokne = 'typo'\n").unwrap_err();
         assert!(error.to_string().contains("mcp_tokne"), "{error}");
-        let error =
-            toml::from_str::<Config>("[[endpoint]]\nname = 'hook'\nurl = 'https://x'\nsecrte = 's'\n")
-                .unwrap_err();
+        let error = toml::from_str::<Config>(
+            "[[endpoint]]\nname = 'hook'\nurl = 'https://x'\nsecrte = 's'\n",
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("secrte"), "{error}");
         let parsed: Config = toml::from_str(
             "local_only = true\nmcp_listen = ''\n[[endpoint]]\nname = 'hook'\nurl = 'https://x'\n",
@@ -278,13 +279,24 @@ mod tests {
             mcp_token: token.into(),
             ..Config::default()
         };
-        for listen in ["0.0.0.0:18790", "[::]:18790", "192.0.2.1:0", "example.com:80"] {
+        for listen in [
+            "0.0.0.0:18790",
+            "[::]:18790",
+            "192.0.2.1:0",
+            "example.com:80",
+        ] {
             let error = config(listen, "").validate().unwrap_err();
             assert!(error.contains("mcp_token"), "{listen}: {error}");
             assert!(config(listen, "  ").validate().is_err(), "{listen}");
             assert!(config(listen, "secret").validate().is_ok(), "{listen}");
         }
-        for listen in ["", "127.0.0.1:0", "127.1.2.3:9", "[::1]:18790", "localhost:18790"] {
+        for listen in [
+            "",
+            "127.0.0.1:0",
+            "127.1.2.3:9",
+            "[::1]:18790",
+            "localhost:18790",
+        ] {
             assert!(config(listen, "").validate().is_ok(), "{listen}");
         }
     }
