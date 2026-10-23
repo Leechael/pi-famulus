@@ -428,7 +428,15 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 fn comment_value(s: &str) -> String {
-    xml_escape(&s.replace(['\n', '\r'], " ").replace("--", "- -"))
+    // XML comments may not contain `--`; split every hyphen run.
+    let mut text = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '-' && text.ends_with('-') {
+            text.push(' ');
+        }
+        text.push(if c == '\n' || c == '\r' { ' ' } else { c });
+    }
+    xml_escape(&text)
 }
 fn render_with_token_check(d: &Detected, token: &str) -> Result<String, String> {
     let text = render_plist(d);
@@ -1222,6 +1230,21 @@ mod tests {
             "restart killed the daemon instead of stopping it: {log}"
         );
         assert_eq!(verbs, ["bootout", "bootstrap"], "{log}");
+    }
+
+    #[test]
+    fn plist_comments_never_contain_double_hyphens() {
+        let mut d = detected();
+        d.executable = PathBuf::from("/opt/a---b/--x-/pi-famulus-");
+        d.path = "/bin:/x----y".into();
+        let text = render_plist(&d);
+        for comment in text.split("<!--").skip(1) {
+            let body = comment.split("-->").next().unwrap();
+            assert!(
+                !body.contains("--") && !body.ends_with('-'),
+                "invalid XML comment: {body:?}"
+            );
+        }
     }
 
     #[test]
