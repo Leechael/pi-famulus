@@ -347,6 +347,7 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
     herdr.set_panes(vec![
         json!({"pane_id":"pane-one","workspace_id":"ws-one","cwd":"/fixture/project","label":"Live Pi","agent":"pi","agent_status":"busy","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-pane"}}),
         json!({"pane_id":"ws-one:p9","workspace_id":"ws-one","cwd":"/fixture/shell"}),
+        json!({"pane_id":"pane-two","workspace_id":"ws-agents","cwd":"/fixture/agents","label":"Agent only","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-agents"}}),
     ]);
     let path = herdr.path.to_str().unwrap().to_string();
     start_relay_options_env(&mut fixture, &relay, "", &[], &[("HERDR_SOCKET_PATH", &path)]);
@@ -400,5 +401,17 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
         started["params"]["args"],
         json!(["--offline", "--model", "sonnet"]),
         "a refused session_create reached agent.start"
+    );
+    let shell_workspace = call(json!({"type":"workspace_close","workspace_id":"ws-one"}));
+    assert_eq!(
+        shell_workspace["type"], "error",
+        "relay closed a workspace holding a shell pane: {shell_workspace}"
+    );
+    let agents = call(json!({"type":"workspace_close","workspace_id":"ws-agents"}));
+    assert_ne!(agents["type"], "error", "{agents}");
+    assert_eq!(
+        herdr.request("workspace.close")["params"]["workspace_id"],
+        "ws-agents",
+        "the refused shell workspace close reached Herdr"
     );
 }

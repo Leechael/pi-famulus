@@ -518,6 +518,18 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             if id.is_empty() {
                 return Err("workspace id required".into());
             }
+            if relay {
+                // A relay peer may close only workspaces made of agent panes,
+                // never one holding a plain shell the user is working in.
+                let panes = panes().await?;
+                let mut members = panes
+                    .iter()
+                    .filter(|pane| str_field(pane, "workspace_id") == id)
+                    .peekable();
+                if members.peek().is_none() || members.any(|pane| native_ids(pane).is_empty()) {
+                    return Err("relay may close only workspaces of agent panes".into());
+                }
+            }
             quick("workspace.close", json!({"workspace_id":id})).await?;
             Ok(json!({}))
         }
