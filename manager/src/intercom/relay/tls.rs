@@ -16,9 +16,10 @@ pub(super) fn native_roots() -> Arc<rustls::RootCertStore> {
                 eprintln!("intercom tls: platform trust store: {error}");
             }
             let mut roots = rustls::RootCertStore::empty();
-            let (_, rejected) = roots.add_parsable_certificates(loaded.certs);
-            if rejected > 0 {
-                eprintln!("intercom tls: ignored {rejected} unparsable platform certificates");
+            for certificate in loaded.certs {
+                if let Err(error) = roots.add(certificate) {
+                    eprintln!("intercom tls: ignored platform certificate: {error}");
+                }
             }
             Arc::new(roots)
         })

@@ -1503,12 +1503,23 @@ mod listen_webhook_tests {
                 .output().unwrap();
             stop.store(true, std::sync::atomic::Ordering::Release);
             let (accepted, requests) = worker.join().unwrap();
-            assert!(
-                output.status.success(),
-                "TLS case trusted={trusted} failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            if !output.status.success() {
+                let describe = |args: &[&str]| {
+                    std::process::Command::new("openssl")
+                        .args(args)
+                        .current_dir(&directory.0)
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                        .unwrap_or_default()
+                };
+                panic!(
+                    "TLS case trusted={trusted} failed:\n{}\n{}\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                    describe(&["version"]),
+                    describe(&["x509", "-in", "root.pem", "-noout", "-text"])
+                );
+            }
             assert_eq!(accepted, if trusted { 1 } else { 3 });
             assert_eq!(requests, usize::from(trusted));
         }
