@@ -519,7 +519,11 @@ impl StatusCodex {
             let mut clients = Vec::new();
             while !stopping.load(Ordering::Acquire) {
                 let stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
+                    // BSD-derived systems inherit O_NONBLOCK from the listener.
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                         continue;
@@ -671,7 +675,11 @@ fn online_status_observes_live_herdr_even_without_a_cached_binary() {
     let worker = thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
             let stream = match listener.accept() {
-                Ok((stream, _)) => stream,
+                // BSD-derived systems inherit O_NONBLOCK from the listener.
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
                     continue;
@@ -771,7 +779,11 @@ fn online_status_prefers_connected_desktop_even_with_an_empty_catalog() {
     let worker = thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
             let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
+                // BSD-derived systems inherit O_NONBLOCK from the listener.
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
                     continue;

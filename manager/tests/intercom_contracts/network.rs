@@ -274,7 +274,11 @@ impl HttpFixture {
         let worker = thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
                 let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
+                    // BSD-derived systems inherit O_NONBLOCK from the listener.
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                         continue;
@@ -444,7 +448,11 @@ impl WireRelay {
         let worker = thread::spawn(move || {
             'connections: while !stopped.load(Ordering::Relaxed) {
                 let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
+                    // BSD-derived systems inherit O_NONBLOCK from the listener.
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                         continue;
