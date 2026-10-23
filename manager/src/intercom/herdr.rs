@@ -292,8 +292,14 @@ async fn require(rt: &Runtime) -> Result<(), String> {
         .map(|_| ())
         .map_err(|_| format!("herdr not available on {}", rt.machine))
 }
-async fn pane_for(rt: &Runtime, token: &str) -> Result<String, String> {
+/// A relay peer may only drive panes that host a local agent session; raw pane
+/// ids and Herdr-detected panes without an intercom session are local-only.
+async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, String> {
     match rt.resolve(token).await {
+        Ok(row) if relay && !rt.local_agent(&row) => Err(format!(
+            "session {} is not a local agent session",
+            str_field(&row, "id")
+        )),
         Ok(row) if !str_field(&row, "herdr_pane_id").is_empty() => {
             Ok(str_field(&row, "herdr_pane_id").into())
         }
@@ -302,7 +308,8 @@ async fn pane_for(rt: &Runtime, token: &str) -> Result<String, String> {
             str_field(&row, "id")
         )),
         Err(error) => {
-            if (token.contains(":p") || token.contains(":t"))
+            if !relay
+                && (token.contains(":p") || token.contains(":t"))
                 && panes()
                     .await?
                     .iter()
@@ -346,7 +353,53 @@ async fn wait_exited(pane: &str, seconds: u64) -> bool {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
+/// Flags a relay peer may pass to an agent it starts here. Anything else could
+/// disable permission prompts or load peer-chosen code (settings, extensions).
+fn relay_agent_args(args: &Value) -> Result<(), String> {
+    let args = match args {
+        Value::Null => return Ok(()),
+        Value::Array(args) => args,
+        _ => return Err("session args must be an array of strings".into()),
+    };
+    let model = |value: &str| {
+        !value.is_empty()
+            && !value.starts_with('-')
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
+    };
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_str().ok_or("session args must be an array of strings")?;
+        let allowed = match arg {
+            "--offline" => true,
+            "--model" => args.next().and_then(Value::as_str).is_some_and(model),
+            _ => arg.strip_prefix("--model=").is_some_and(model),
+        };
+        if !allowed {
+            return Err(format!(
+                "remote session args may only be --offline or --model <name>; refused {arg:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+fn relay_cwd(cwd: &str) -> Result<(), String> {
+    let path = std::path::Path::new(cwd);
+    if path.is_absolute() && path.is_dir() {
+        Ok(())
+    } else {
+        Err(format!("remote cwd {cwd:?} must be an existing absolute directory"))
+    }
+}
 pub async fn dispatch(rt: &Runtime, req: &Value) -> Result<Value, String> {
+    run(rt, req, false).await
+}
+/// Herdr operations requested by a relay peer.
+pub async fn dispatch_relay(rt: &Runtime, req: &Value) -> Result<Value, String> {
+    run(rt, req, true).await
+}
+async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
     let op = str_field(req, "op");
     let machine = str_field(req, "machine");
     let target = str_field(req, "to");
@@ -412,6 +465,10 @@ pub async fn dispatch(rt: &Runtime, req: &Value) -> Result<Value, String> {
             {
                 return Err("--agent must be pi or claude".into());
             }
+            if relay {
+                relay_cwd(cwd)?;
+                relay_agent_args(&req["args"])?;
+            }
             let workspace = str_field(req, "workspace").to_string();
             let workspace = if op == "session_create" && workspace.is_empty() {
                 panes()
@@ -465,7 +522,7 @@ pub async fn dispatch(rt: &Runtime, req: &Value) -> Result<Value, String> {
             Ok(json!({}))
         }
         "session_close" => {
-            let pane = pane_for(rt, target).await?;
+            let pane = pane_for(rt, target, relay).await?;
             let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+c"]})).await;
             if !wait_exited(&pane, 10).await {
                 let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+d"]})).await;
@@ -475,7 +532,7 @@ pub async fn dispatch(rt: &Runtime, req: &Value) -> Result<Value, String> {
             Ok(json!({}))
         }
         "agent_prompt" | "agent_keys" | "agent_read" | "agent_wait" => {
-            let pane = pane_for(rt, target).await?;
+            let pane = pane_for(rt, target, relay).await?;
             let timeout = req["timeout_ms"].as_u64().unwrap_or(0);
             let duration = Duration::from_millis(timeout.saturating_add(5000).max(60000));
             let (method, params) = match op {
