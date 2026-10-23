@@ -1333,6 +1333,9 @@ mod listen_webhook_tests {
         }
         let directory = StateDir::new();
         std::fs::create_dir(&directory.0).unwrap();
+        // An explicit config: OpenSSL 1.1's default v3_ca section would
+        // duplicate basicConstraints alongside -addext, which webpki rejects.
+        std::fs::write(directory.0.join("root.cnf"), "[req]\ndistinguished_name=dn\nx509_extensions=root\nprompt=no\n[dn]\nCN=Webhook fixture root\n[root]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n").unwrap();
         std::fs::write(directory.0.join("leaf.cnf"), "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
         for args in [
             vec![
@@ -1347,12 +1350,8 @@ mod listen_webhook_tests {
                 "root.pem",
                 "-days",
                 "1",
-                "-subj",
-                "/CN=Webhook fixture root",
-                "-addext",
-                "basicConstraints=critical,CA:TRUE",
-                "-addext",
-                "keyUsage=critical,keyCertSign,cRLSign",
+                "-config",
+                "root.cnf",
             ],
             vec![
                 "req",
