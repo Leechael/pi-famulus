@@ -22,12 +22,18 @@ struct Command {
     fence: Option<tokio::sync::OwnedMutexGuard<()>>,
     reply: oneshot::Sender<Result<(String, String), String>>,
 }
+// Desktop rows are only true while this connection is attached; a detached
+// catalog would keep advertising threads and their alias children.
 #[cfg(unix)]
-struct Attached(Arc<AtomicBool>);
+struct Attached {
+    connected: Arc<AtomicBool>,
+    catalog: Arc<Mutex<HashMap<String, Value>>>,
+}
 #[cfg(unix)]
 impl Drop for Attached {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.catalog.lock().unwrap().clear();
+        self.connected.store(false, Ordering::Release);
     }
 }
 impl Client {
@@ -80,6 +86,7 @@ impl Client {
 #[cfg(unix)]
 struct Connection {
     writer: tokio::net::unix::OwnedWriteHalf,
+    broken: bool,
     frames: mpsc::Receiver<Result<Value, String>>,
     _reader: Reader,
     source: String,
@@ -129,9 +136,12 @@ pub(super) async fn start(rt: &Shared) {
                 let connected = connect(&path, owner.clone(), catalog.clone()).await;
                 if let Ok(mut connection) = connected {
                     attached.store(true, Ordering::Release);
-                    let _attached = Attached(attached.clone());
+                    let _attached = Attached {
+                        connected: attached.clone(),
+                        catalog: catalog.clone(),
+                    };
                     let mut cleanup = tokio::time::interval(Duration::from_secs(30));
-                    loop {
+                    while !connection.broken {
                         tokio::select! {
                             _=stop.changed()=>return,
                             command=rx.recv()=>{let Some(mut command)=command else{return};let result=if command.observe{tokio::select!{_ = command.reply.closed()=>continue,result=connection.idle_observation(&command.thread)=>result}}else{connection.send(&mut command).await.map(|state|(state,String::new()))};let _=command.reply.send(result);},
@@ -170,6 +180,29 @@ async fn connect(
     .await
     .map_err(|_| "Desktop IPC connection timed out".to_string())?
     .map_err(|e| e.to_string())?;
+    let mut connection = attach(stream, owner, catalog);
+    let response = connection
+        .request(
+            "initialize",
+            json!({"clientType":"agent-intercom"}),
+            "",
+            0,
+            None,
+        )
+        .await?;
+    let source = str_field(&response["result"], "clientId");
+    if source.is_empty() {
+        return Err("Desktop initialize: missing client id".into());
+    }
+    connection.source = source.into();
+    Ok(connection)
+}
+#[cfg(unix)]
+fn attach(
+    stream: tokio::net::UnixStream,
+    owner: Weak<super::super::Runtime>,
+    catalog: Arc<Mutex<HashMap<String, Value>>>,
+) -> Connection {
     let (mut reader, writer) = stream.into_split();
     let (tx, frames) = mpsc::channel(256);
     let reader = Reader(tokio::spawn(async move {
@@ -193,8 +226,9 @@ async fn connect(
             }
         }
     }));
-    let mut connection = Connection {
+    Connection {
         writer,
+        broken: false,
         frames,
         _reader: reader,
         source: "initializing-client".into(),
@@ -206,34 +240,27 @@ async fn connect(
         following: HashMap::new(),
         owner,
         catalog,
-    };
-    let response = connection
-        .request(
-            "initialize",
-            json!({"clientType":"agent-intercom"}),
-            "",
-            0,
-            None,
-        )
-        .await?;
-    let source = str_field(&response["result"], "clientId");
-    if source.is_empty() {
-        return Err("Desktop initialize: missing client id".into());
     }
-    connection.source = source.into();
-    Ok(connection)
 }
 #[cfg(unix)]
 impl Connection {
+    // A frame interrupted by a timeout, an I/O error or a cancelled caller
+    // leaves the length-prefixed stream unframed; the connection is then unusable.
     async fn write(&mut self, value: Value) -> Result<(), String> {
+        if self.broken {
+            return Err("Desktop IPC stream is unframed after an interrupted write".into());
+        }
         let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+        self.broken = true;
         tokio::time::timeout(Duration::from_secs(5), async {
             self.writer.write_u32_le(bytes.len() as u32).await?;
             self.writer.write_all(&bytes).await
         })
         .await
         .map_err(|_| "Desktop write outcome unknown: timeout".to_string())?
-        .map_err(|e| format!("Desktop write outcome unknown: {e}"))
+        .map_err(|e| format!("Desktop write outcome unknown: {e}"))?;
+        self.broken = false;
+        Ok(())
     }
     async fn next(&mut self) -> Result<Value, String> {
         self.frames
@@ -286,18 +313,20 @@ impl Connection {
             }
         }
     }
-    async fn broadcast(&mut self, event: &Value) -> Result<(), String> {
+    /// Returns whether the event replaced the stored state of its thread.
+    async fn broadcast(&mut self, event: &Value) -> Result<bool, String> {
         if str_field(event, "type") == "client-discovery-request" {
-            return self.write(json!({"type":"client-discovery-response","requestId":event["requestId"],"response":{"canHandle":false}})).await;
+            self.write(json!({"type":"client-discovery-response","requestId":event["requestId"],"response":{"canHandle":false}})).await?;
+            return Ok(false);
         }
         if str_field(event, "method") != "thread-stream-state-changed" || event["version"] != 11 {
-            return Ok(());
+            return Ok(false);
         }
         if event["targetClientIds"]
             .as_array()
             .is_some_and(|ids| !ids.is_empty() && !ids.iter().any(|id| id == &self.source))
         {
-            return Ok(());
+            return Ok(false);
         }
         let params = &event["params"];
         let thread = str_field(params, "conversationId");
@@ -306,7 +335,7 @@ impl Connection {
             || str_field(params, "hostId") != "local"
             || self.owners.get(thread).is_none_or(|id| id != owner)
         {
-            return Ok(());
+            return Ok(false);
         }
         let change = &params["change"];
         let revision = change["revision"].as_u64().unwrap_or(0);
@@ -318,17 +347,17 @@ impl Connection {
             "patches" if revision > previous => {
                 if previous == 0 || change["baseRevision"].as_u64() != Some(previous) {
                     self.follow(thread, owner, true).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 let mut state = self.states[thread].1.clone();
                 for patch in change["patches"].as_array().into_iter().flatten() {
                     if apply_patch(&mut state, patch).is_err() {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 state
             }
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
         let status = str_field(&state["threadRuntimeStatus"], "type");
         let row = json!({"id":format!("codex/{thread}"),"name":state["title"].as_str().unwrap_or(""),"cwd":state["cwd"].as_str().unwrap_or(""),"harness":"codex","status":status,"notify_idle":true,"_desktop":true});
@@ -360,7 +389,7 @@ impl Connection {
             }
         }
         self.states.insert(thread.into(), (revision, state));
-        Ok(())
+        Ok(true)
     }
     async fn fresh_state(&mut self, thread: &String) -> Result<(String, Value), String> {
         let discovered = self
@@ -399,11 +428,8 @@ impl Connection {
                     .as_u64()
                     .is_some_and(|r| r >= previous)
                 && str_field(&event, "sourceClientId") == owner;
-            self.broadcast(&event).await?;
-            if fresh {
-                if let Some((_, state)) = self.states.get(thread) {
-                    break state.clone();
-                }
+            if self.broadcast(&event).await? && fresh {
+                break self.states[thread].1.clone();
             }
         };
         Ok((owner, state))
@@ -564,4 +590,94 @@ fn apply_patch(root: &mut Value, patch: &Value) -> Result<(), String> {
         return Err("invalid Immer container".into());
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn connection() -> (Connection, tokio::net::UnixStream) {
+        let (ours, peer) = tokio::net::UnixStream::pair().unwrap();
+        let mut connection = attach(ours, Weak::new(), Arc::new(Mutex::new(HashMap::new())));
+        connection.source = "follower".into();
+        (connection, peer)
+    }
+    async fn read_frame(peer: &mut tokio::net::UnixStream) -> Value {
+        let size = peer.read_u32_le().await.unwrap() as usize;
+        let mut bytes = vec![0; size];
+        peer.read_exact(&mut bytes).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    async fn write_frame(peer: &mut tokio::net::UnixStream, value: Value) {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        peer.write_u32_le(bytes.len() as u32).await.unwrap();
+        peer.write_all(&bytes).await.unwrap();
+    }
+    fn snapshot(version: u64, revision: u64, title: &str) -> Value {
+        json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner","version":version,
+            "params":{"conversationId":"t","hostId":"local","change":{"type":"snapshot","revision":revision,
+            "conversationState":{"title":title,"threadRuntimeStatus":{"type":"idle"}}}}})
+    }
+
+    #[tokio::test]
+    async fn fresh_state_never_returns_the_cached_state_for_an_unapplied_snapshot() {
+        let (mut connection, mut peer) = connection();
+        connection
+            .states
+            .insert("t".into(), (5, json!({"title":"cached"})));
+        let host = tokio::spawn(async move {
+            let discovery = read_frame(&mut peer).await;
+            write_frame(&mut peer, json!({"type":"response","requestId":discovery["requestId"],
+                "resultType":"success","method":"thread-owner-discovery","handledByClientId":"owner"})).await;
+            assert_eq!(read_frame(&mut peer).await["params"]["following"], true);
+            write_frame(&mut peer, snapshot(10, 5, "unsupported version")).await;
+            write_frame(&mut peer, snapshot(11, 6, "fresh")).await;
+            peer
+        });
+        let (owner, state) = connection.fresh_state(&"t".to_string()).await.unwrap();
+        assert_eq!(owner, "owner");
+        assert_eq!(state["title"], "fresh");
+        drop(host.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_frame_write_retires_the_stream() {
+        let (mut connection, mut peer) = connection();
+        let huge = json!({"pad":"x".repeat(16 * 1024 * 1024)});
+        let error = connection.write(huge).await.unwrap_err();
+        assert!(error.contains("timeout"), "{error}");
+        let drain = tokio::spawn(async move {
+            let mut sink = vec![0; 1 << 20];
+            while peer.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+        });
+        assert!(
+            connection.write(json!({"type":"request"})).await.is_err(),
+            "a frame was appended after a partial frame"
+        );
+        assert!(connection.broken);
+        drop(connection);
+        drain.await.unwrap();
+    }
+
+    #[test]
+    fn detaching_clears_the_desktop_catalog() {
+        let catalog = Arc::new(Mutex::new(HashMap::new()));
+        catalog
+            .lock()
+            .unwrap()
+            .insert("t".to_string(), json!({"id":"codex/t","_desktop":true}));
+        let connected = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::channel(1);
+        let client = Client {
+            tx,
+            catalog: catalog.clone(),
+            connected: connected.clone(),
+        };
+        drop(Attached { connected, catalog });
+        assert!(!client.connected());
+        assert!(
+            client.list().is_empty(),
+            "stale Desktop rows survived detach"
+        );
+    }
 }
