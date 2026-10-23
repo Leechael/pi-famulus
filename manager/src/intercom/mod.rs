@@ -101,6 +101,15 @@ pub struct Delivery {
     pub origin_endpoint: Option<Value>,
     pub reply_endpoint: Option<Value>,
 }
+/// A relay-created Herdr workspace and the origin machine (the
+/// `origin_machine` frame field) that created it. Like idle-frame provenance,
+/// the origin is asserted by the sending daemon over its relay connection and
+/// trusted at device level, not authenticated per frame.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RelayWorkspace {
+    pub id: String,
+    pub origin: String,
+}
 pub struct State {
     pub sessions: HashMap<String, Session>,
     pub unpublished: HashMap<String, (Value, bool)>,
@@ -108,8 +117,9 @@ pub struct State {
     pub messages: HashMap<String, Delivery>,
     pub history: HashSet<String>,
     pub pending_local: HashSet<String>,
-    /// Herdr workspaces a relay peer created; the only ones it may close or extend.
-    pub relay_workspaces: HashSet<String>,
+    /// Herdr workspaces a relay peer created, with the origin machine that
+    /// created each; only that origin may extend or close them.
+    pub relay_workspaces: HashSet<RelayWorkspace>,
     /// A `serve` or `top` lease holds the manager (status reports it).
     pub supervised: bool,
     pub pending_remote: HashSet<String>,

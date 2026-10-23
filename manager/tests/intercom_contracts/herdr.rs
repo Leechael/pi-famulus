@@ -1,4 +1,5 @@
 use super::*;
+use std::net::{SocketAddr, TcpListener};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -350,7 +351,13 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
         json!({"pane_id":"pane-two","workspace_id":"ws-agents","cwd":"/fixture/agents","label":"Agent only","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-agents"}}),
     ]);
     let path = herdr.path.to_str().unwrap().to_string();
-    start_relay_options_env(&mut fixture, &relay, "", &[], &[("HERDR_SOCKET_PATH", &path)]);
+    start_relay_options_env(
+        &mut fixture,
+        &relay,
+        "",
+        &[],
+        &[("HERDR_SOCKET_PATH", &path)],
+    );
     relay.request("register");
     fixture.wait_session("pi/remote");
     let _pane = pane_plugin(&fixture, "pi-pane", "pane-one");
@@ -372,7 +379,10 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
         }
     };
     let shell = call(json!({"type":"agent_keys","session_id":"ws-one:p9","keys":["c","Enter"]}));
-    assert_eq!(shell["type"], "error", "relay typed into a shell pane: {shell}");
+    assert_eq!(
+        shell["type"], "error",
+        "relay typed into a shell pane: {shell}"
+    );
     let agent = call(json!({"type":"agent_keys","session_id":"pi/pi-pane","keys":["Enter"]}));
     assert_ne!(agent["type"], "error", "{agent}");
     assert_eq!(
@@ -383,24 +393,46 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
     let cwd = fixture.root.to_str().unwrap().to_string();
     for (args, cwd) in [
         (json!(["--dangerously-skip-permissions"]), cwd.as_str()),
-        (json!(["--permission-mode", "bypassPermissions"]), cwd.as_str()),
+        (
+            json!(["--permission-mode", "bypassPermissions"]),
+            cwd.as_str(),
+        ),
         (json!(["--permission-mode=bypassPermissions"]), cwd.as_str()),
-        (json!(["--model", "--dangerously-skip-permissions"]), cwd.as_str()),
+        (
+            json!(["--model", "--dangerously-skip-permissions"]),
+            cwd.as_str(),
+        ),
         (json!("--offline"), cwd.as_str()),
         (json!(["--offline"]), "/fixture/does-not-exist"),
         (json!(["--offline"]), "relative/dir"),
     ] {
-        let reply = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"claude","workspace_id":"ws-one","args":args}));
+        let reply = call(
+            json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"claude","workspace_id":"ws-one","origin_machine":"other-device","args":args}),
+        );
         assert_eq!(reply["type"], "error", "{args} in {cwd}: {reply}");
     }
-    let foreign = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","workspace_id":"ws-one","args":["--offline"]}));
+    let anonymous = call(
+        json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","args":["--offline"]}),
+    );
+    assert_eq!(
+        anonymous["type"], "error",
+        "relay created a workspace without origin provenance: {anonymous}"
+    );
+    let foreign = call(
+        json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","workspace_id":"ws-one","origin_machine":"other-device","args":["--offline"]}),
+    );
     assert_eq!(
         foreign["type"], "error",
         "relay added a tab to a workspace it did not create: {foreign}"
     );
-    let created = call(json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","args":["--offline","--model","sonnet"]}));
+    let created = call(
+        json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","origin_machine":"other-device","args":["--offline","--model","sonnet"]}),
+    );
     assert_ne!(created["type"], "error", "{created}");
-    assert_eq!(herdr.request("workspace.create")["params"]["cwd"], json!(cwd));
+    assert_eq!(
+        herdr.request("workspace.create")["params"]["cwd"],
+        json!(cwd)
+    );
     let started = herdr.request("agent.start");
     assert_eq!(
         started["params"]["args"],
@@ -408,7 +440,9 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
         "a refused session_create reached agent.start"
     );
     for foreign in ["ws-one", "ws-agents"] {
-        let closed = call(json!({"type":"workspace_close","workspace_id":foreign}));
+        let closed = call(
+            json!({"type":"workspace_close","workspace_id":foreign,"origin_machine":"other-device"}),
+        );
         assert_eq!(
             closed["type"], "error",
             "relay closed {foreign}, which it did not create: {closed}"
@@ -418,7 +452,9 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
         json!({"pane_id":"pane-new","workspace_id":"ws-new","cwd":"/fixture/new","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-created"}}),
         json!({"pane_id":"ws-new:p2","workspace_id":"ws-new","cwd":"/fixture/new"}),
     ]);
-    let shell = call(json!({"type":"workspace_close","workspace_id":"ws-new"}));
+    let shell = call(
+        json!({"type":"workspace_close","workspace_id":"ws-new","origin_machine":"other-device"}),
+    );
     assert_eq!(
         shell["type"], "error",
         "relay closed its workspace while the user had a shell in it: {shell}"
@@ -426,11 +462,481 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
     herdr.set_panes(vec![
         json!({"pane_id":"pane-new","workspace_id":"ws-new","cwd":"/fixture/new","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-created"}}),
     ]);
-    let own = call(json!({"type":"workspace_close","workspace_id":"ws-new"}));
+    let own = call(
+        json!({"type":"workspace_close","workspace_id":"ws-new","origin_machine":"other-device"}),
+    );
     assert_ne!(own["type"], "error", "{own}");
     assert_eq!(
         herdr.request("workspace.close")["params"]["workspace_id"],
         "ws-new",
         "a refused workspace close reached Herdr"
+    );
+}
+
+#[test]
+fn relay_pane_ops_revalidate_pane_ownership_after_reassignment() {
+    use super::network::{relay_basics, start_relay_options_env, WireRelay};
+    let relay = WireRelay::new(relay_basics);
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    herdr.set_panes(vec![json!({
+        "pane_id":"pane-one","workspace_id":"ws-one","cwd":"/fixture/project","label":"Live Pi",
+        "agent":"pi","agent_status":"busy",
+        "agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-pane"}
+    })]);
+    let path = herdr.path.to_str().unwrap().to_string();
+    start_relay_options_env(
+        &mut fixture,
+        &relay,
+        "",
+        &[],
+        &[("HERDR_SOCKET_PATH", &path)],
+    );
+    relay.request("register");
+    fixture.wait_session("pi/remote");
+    let _pane = pane_plugin(&fixture, "pi-pane", "pane-one");
+    let call = |frame: Value| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut frame = frame;
+        frame["id"] = json!(id);
+        relay.push(frame);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let reply = relay
+                .requests
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("relay reply");
+            if reply["id"] == id {
+                return reply;
+            }
+        }
+    };
+    // Assert no request with the given Herdr method arrives within the window.
+    let assert_no_herdr_method = |method: &str| {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while let Ok(request) = herdr
+            .requests
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            assert_ne!(
+                request["method"], method,
+                "a refused relay operation reached Herdr as {method}: {request}"
+            );
+        }
+    };
+    let keys = call(json!({"type":"agent_keys","session_id":"pi/pi-pane","keys":["Enter"]}));
+    assert_ne!(keys["type"], "error", "{keys}");
+    assert_eq!(
+        herdr.request("agent.send_keys")["params"]["target"],
+        "pane-one"
+    );
+
+    // The user reassigns the pane to a shell; the stale directory row must
+    // not keep accepting relay input.
+    herdr.set_panes(vec![json!({
+        "pane_id":"pane-one","workspace_id":"ws-one","cwd":"/fixture/shell"
+    })]);
+    let shell = call(json!({"type":"agent_keys","session_id":"pi/pi-pane","keys":["c"]}));
+    assert_eq!(
+        shell["type"], "error",
+        "relay typed into a reassigned shell pane: {shell}"
+    );
+    assert_no_herdr_method("agent.send_keys");
+
+    // The pane now hosts a different agent session; the old session's relay
+    // operations must be refused too.
+    herdr.set_panes(vec![json!({
+        "pane_id":"pane-one","workspace_id":"ws-one","agent":"pi","agent_status":"busy",
+        "agent_session":{"agent":"pi","kind":"session_id","value":"other-agent"}
+    })]);
+    let stolen = call(json!({"type":"agent_read","session_id":"pi/pi-pane"}));
+    assert_eq!(
+        stolen["type"], "error",
+        "relay read a pane reassigned to another agent: {stolen}"
+    );
+    assert_no_herdr_method("agent.read");
+    let prompt = call(json!({"type":"agent_prompt","session_id":"pi/pi-pane","body":"hi"}));
+    assert_eq!(prompt["type"], "error", "{prompt}");
+    assert_no_herdr_method("agent.prompt");
+    let closed = call(json!({"type":"session_close","session_id":"pi/pi-pane"}));
+    assert_eq!(
+        closed["type"], "error",
+        "relay closed a pane it no longer owns: {closed}"
+    );
+    assert_no_herdr_method("pane.close");
+}
+
+#[test]
+fn relay_workspace_ownership_is_scoped_to_the_creating_origin() {
+    use super::network::{relay_basics, start_relay_options_env, WireRelay};
+    let relay = WireRelay::new(relay_basics);
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    let path = herdr.path.to_str().unwrap().to_string();
+    start_relay_options_env(
+        &mut fixture,
+        &relay,
+        "",
+        &[],
+        &[("HERDR_SOCKET_PATH", &path)],
+    );
+    relay.request("register");
+    fixture.wait_session("pi/remote");
+    let call = |frame: Value| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut frame = frame;
+        frame["id"] = json!(id);
+        relay.push(frame);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let reply = relay
+                .requests
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("relay reply");
+            if reply["id"] == id {
+                return reply;
+            }
+        }
+    };
+    let assert_no_herdr_method = |method: &str| {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while let Ok(request) = herdr
+            .requests
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            assert_ne!(
+                request["method"], method,
+                "a refused relay operation reached Herdr as {method}: {request}"
+            );
+        }
+    };
+    let cwd = fixture.root.to_str().unwrap().to_string();
+    // No provenance, no workspace: refused before Herdr is asked to create.
+    let anonymous = call(json!({"type":"workspace_create","name":"Anon","cwd":cwd}));
+    assert_eq!(anonymous["type"], "error", "{anonymous}");
+    assert_no_herdr_method("workspace.create");
+    // machine-A creates the workspace.
+    let created = call(
+        json!({"type":"workspace_create","name":"Project","cwd":cwd,"origin_machine":"machine-A"}),
+    );
+    assert_ne!(created["type"], "error", "{created}");
+    assert_eq!(
+        herdr.request("workspace.create")["params"]["cwd"],
+        json!(cwd)
+    );
+    // machine-B cannot extend machine-A's workspace...
+    let foreign = call(json!({
+        "type":"session_create","name":"Intruder","cwd":cwd,"agent":"pi",
+        "workspace_id":"ws-new","origin_machine":"machine-B"
+    }));
+    assert_eq!(
+        foreign["type"], "error",
+        "another origin extended machine-A's workspace: {foreign}"
+    );
+    assert_no_herdr_method("tab.create");
+    // ...and machine-A can.
+    let own = call(json!({
+        "type":"session_create","name":"Member","cwd":cwd,"agent":"pi",
+        "workspace_id":"ws-new","origin_machine":"machine-A"
+    }));
+    assert_ne!(own["type"], "error", "{own}");
+    assert_eq!(
+        herdr.request("tab.create")["params"]["workspace_id"],
+        "ws-new"
+    );
+    // machine-B cannot close it either; a frame without provenance is refused
+    // as well; only machine-A can close it.
+    let foreign_close = call(json!({
+        "type":"workspace_close","workspace_id":"ws-new","origin_machine":"machine-B"
+    }));
+    assert_eq!(
+        foreign_close["type"], "error",
+        "another origin closed machine-A's workspace: {foreign_close}"
+    );
+    assert_no_herdr_method("workspace.close");
+    let anonymous_close = call(json!({"type":"workspace_close","workspace_id":"ws-new"}));
+    assert_eq!(anonymous_close["type"], "error", "{anonymous_close}");
+    herdr.set_panes(vec![json!({
+        "pane_id":"pane-new","workspace_id":"ws-new","cwd":cwd,"agent":"pi","agent_status":"idle",
+        "agent_session":{"agent":"pi","kind":"session_id","value":"pi-created"}
+    })]);
+    let own_close = call(json!({
+        "type":"workspace_close","workspace_id":"ws-new","origin_machine":"machine-A"
+    }));
+    assert_ne!(own_close["type"], "error", "{own_close}");
+    assert_eq!(
+        herdr.request("workspace.close")["params"]["workspace_id"],
+        "ws-new"
+    );
+}
+
+/// A two-peer relay: registers each connection's machine id and routes
+/// machine-addressed operation frames to that peer's connection, then routes
+/// the response back to the requester. This drives the real daemon-to-daemon
+/// forwarding path (no hand-crafted relay frames).
+struct RoutingRelay {
+    address: SocketAddr,
+    requests: mpsc::Receiver<Value>,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl RoutingRelay {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (tx, requests) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let worker = thread::spawn(move || {
+            let registry = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                mpsc::Sender<Value>,
+            >::new()));
+            let reply_routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                Value,
+                mpsc::Sender<Value>,
+            >::new()));
+            while !stopped.load(Ordering::Relaxed) {
+                let (stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let tx = tx.clone();
+                let stopped = stopped.clone();
+                let registry = registry.clone();
+                let reply_routes = reply_routes.clone();
+                thread::spawn(move || {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_nodelay(true).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let Ok(mut ws) = tokio_tungstenite::tungstenite::accept(stream) else {
+                        return;
+                    };
+                    let (outgoing, outbound) = mpsc::channel::<Value>();
+                    let mut own_machine = String::new();
+                    while !stopped.load(Ordering::Relaxed) {
+                        // Forward queued outbound frames to this peer.
+                        while let Ok(frame) = outbound.try_recv() {
+                            if ws
+                                .send(tokio_tungstenite::tungstenite::Message::text(
+                                    frame.to_string(),
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let frame = match ws.read() {
+                            Ok(frame) => frame,
+                            Err(tokio_tungstenite::tungstenite::Error::Io(error))
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue
+                            }
+                            Err(_) => break,
+                        };
+                        if !frame.is_text() {
+                            continue;
+                        }
+                        let Ok(value) = serde_json::from_str::<Value>(frame.to_text().unwrap())
+                        else {
+                            continue;
+                        };
+                        let _ = tx.send(value.clone());
+                        let kind = value["type"].as_str().unwrap_or_default();
+                        if kind == "register" {
+                            own_machine = value["machine_id"].as_str().unwrap_or("").to_string();
+                            registry
+                                .lock()
+                                .unwrap()
+                                .insert(own_machine.clone(), outgoing.clone());
+                            let welcome = json!({"type":"welcome","machine_id":value["device_id"],"send_message_id_v1":true});
+                            let _ = ws.send(tokio_tungstenite::tungstenite::Message::text(
+                                welcome.to_string(),
+                            ));
+                            continue;
+                        }
+                        if kind == "snapshot" {
+                            continue;
+                        }
+                        if kind == "list" {
+                            let reply = json!({"type":"list","id":value["id"],"sessions":[]});
+                            let _ = ws.send(tokio_tungstenite::tungstenite::Message::text(
+                                reply.to_string(),
+                            ));
+                            continue;
+                        }
+                        // An operation addressed to a machine routes to that
+                        // peer; anything else with a tracked id is the reply.
+                        let target = value["machine_id"].as_str().unwrap_or("");
+                        let routed = if !target.is_empty() && target != own_machine {
+                            let sender = registry.lock().unwrap().get(target).cloned();
+                            if let Some(sender) = sender {
+                                let _ = sender.send(value.clone());
+                                reply_routes
+                                    .lock()
+                                    .unwrap()
+                                    .insert(value["id"].clone(), outgoing.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !routed {
+                            if let Some(sender) = reply_routes.lock().unwrap().remove(&value["id"])
+                            {
+                                let _ = sender.send(value);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+    fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+    /// Wait until both peers registered; returns both machine ids in arrival
+    /// order.
+    fn wait_machines(&self) -> Vec<String> {
+        let mut machines = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while machines.len() < 2 {
+            let frame = self
+                .requests
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("both peers register");
+            if frame["type"] == "register" {
+                machines.push(frame["machine_id"].as_str().unwrap().to_string());
+            }
+        }
+        machines
+    }
+}
+
+impl Drop for RoutingRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Drives a remote workspace create/extend/close through the real
+/// daemon-to-daemon forwarding path. The initiating daemon stamps
+/// `origin_machine` on the forwarded frame; without that stamp the target
+/// refuses the operation for lacking provenance.
+#[test]
+fn cross_machine_workspace_ops_forward_end_to_end_with_origin_provenance() {
+    let relay = RoutingRelay::new();
+    let mut fixture_a = Fixture::new();
+    let mut fixture_b = Fixture::new();
+    let herdr_b = Herdr::new(&fixture_b);
+    // Fixture B is the target: distinct machine name, relay instead of
+    // local-only, and the Herdr fixture socket its daemon talks to.
+    std::fs::write(
+        fixture_b.root.join("client.toml"),
+        format!(
+            "local_only = false\nname = 'fixture-b'\nsock = '{}'\nstate_dir = '{}'\nmcp_listen = ''\nserver = '{}'\ntoken = 'fixture-token'\n",
+            fixture_b.sock.display(),
+            fixture_b.root.join("state").display(),
+            relay.url()
+        ),
+    )
+    .unwrap();
+    let herdr_b_path = herdr_b.path.to_str().unwrap().to_string();
+    fixture_b.spawn_serve(&[], &[("HERDR_SOCKET_PATH", &herdr_b_path)]);
+    fixture_b.wait_supervised();
+    // Fixture A is the initiator on the same relay.
+    let config = std::fs::read_to_string(fixture_a.root.join("client.toml"))
+        .unwrap()
+        .replace("local_only = true", "local_only = false");
+    std::fs::write(
+        fixture_a.root.join("client.toml"),
+        format!(
+            "{config}\nserver='{}'\ntoken='fixture-token'\n",
+            relay.url()
+        ),
+    )
+    .unwrap();
+    fixture_a.spawn_serve(&[], &[]);
+    fixture_a.wait_supervised();
+    let machines = relay.wait_machines();
+    // Fixture A keeps the default 'fixture-host' name; fixture B is the peer.
+    let machine_b = machines
+        .iter()
+        .find(|machine| !machine.starts_with("fixture-host@"))
+        .cloned()
+        .expect("fixture-b's machine id");
+
+    let cwd = fixture_b.root.to_str().unwrap().to_string();
+    let mut cli = fixture_a.connect();
+    // workspace_create crosses A -> relay -> B with origin_machine stamped by A.
+    let created = cli.ok(json!({
+        "op":"workspace_create","name":"Remote project","cwd":cwd,"machine":machine_b
+    }));
+    assert!(
+        created.get("error").is_none(),
+        "remote workspace_create refused: {created}"
+    );
+    assert_eq!(created["pane_id"], "pane-new");
+    assert!(created["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["id"] == "ws-new" && w["cwd"] == cwd));
+    assert_eq!(
+        herdr_b.request("workspace.create")["params"]["cwd"],
+        json!(cwd)
+    );
+    // session_create into that workspace extends it under the same origin.
+    let member = cli.ok(json!({
+        "op":"session_create","name":"Member","cwd":cwd,"agent":"pi",
+        "workspace":"ws-new","args":["--offline"],"machine":machine_b
+    }));
+    assert!(
+        member.get("error").is_none(),
+        "remote session_create refused: {member}"
+    );
+    assert_eq!(
+        herdr_b.request("tab.create")["params"]["workspace_id"],
+        "ws-new"
+    );
+    // workspace_close tears it down under the same origin.
+    herdr_b.set_panes(vec![json!({
+        "pane_id":"pane-new","workspace_id":"ws-new","cwd":cwd,"agent":"pi","agent_status":"idle",
+        "agent_session":{"agent":"pi","kind":"session_id","value":"pi-created"}
+    })]);
+    let closed = cli.ok(json!({"op":"workspace_close","to":"ws-new","machine":machine_b}));
+    assert!(
+        closed.get("error").is_none(),
+        "remote workspace_close refused: {closed}"
+    );
+    assert_eq!(
+        herdr_b.request("workspace.close")["params"]["workspace_id"],
+        "ws-new"
     );
 }

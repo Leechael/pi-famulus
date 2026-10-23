@@ -292,6 +292,48 @@ async fn require(rt: &Runtime) -> Result<(), String> {
         .map(|_| ())
         .map_err(|_| format!("herdr not available on {}", rt.machine))
 }
+/// Revalidates that `pane_id` still hosts the session `row` claims, right
+/// before a relay peer drives it. Directory rows can go stale the moment a
+/// user reassigns the pane to a shell or starts another agent in it; a relay
+/// operation must never land in that pane. Native session ids are the primary
+/// evidence; a Claude row without one falls back to its foreground-PID
+/// evidence. Missing, mismatched, shell and offline associations are refused.
+async fn revalidate_pane(row: &Value, pane_id: &str) -> Result<(), String> {
+    let id = str_field(row, "id");
+    if str_field(row, "status") == "offline" {
+        return Err(format!("session {id} is offline"));
+    }
+    let listed = panes().await?;
+    let Some(pane) = listed
+        .iter()
+        .find(|pane| str_field(pane, "pane_id") == pane_id)
+    else {
+        return Err(format!("session {id} pane {pane_id} no longer exists"));
+    };
+    let ids = native_ids(pane);
+    if !ids.is_empty() {
+        if ids.iter().any(|candidate| candidate == id) {
+            return Ok(());
+        }
+        return Err(format!(
+            "session {id} is no longer attached to pane {pane_id}"
+        ));
+    }
+    if str_field(row, "harness") == "claude" && row["pid"].as_u64().unwrap_or(0) > 0 {
+        if let Ok(result) = quick("pane.process_info", json!({"target": pane_id})).await {
+            if result["process_info"]["foreground_processes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|process| process["pid"].as_u64() == row["pid"].as_u64())
+            {
+                return Ok(());
+            }
+        }
+        return Err(format!("session {id} no longer owns pane {pane_id}"));
+    }
+    Err(format!("pane {pane_id} no longer hosts session {id}"))
+}
 /// A relay peer may only drive panes that host a local agent session; raw pane
 /// ids and Herdr-detected panes without an intercom session are local-only.
 async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, String> {
@@ -301,7 +343,11 @@ async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, Stri
             str_field(&row, "id")
         )),
         Ok(row) if !str_field(&row, "herdr_pane_id").is_empty() => {
-            Ok(str_field(&row, "herdr_pane_id").into())
+            let pane = str_field(&row, "herdr_pane_id").to_string();
+            if relay {
+                revalidate_pane(&row, &pane).await?;
+            }
+            Ok(pane)
         }
         Ok(row) => Err(format!(
             "session {} is not in a herdr pane",
@@ -370,7 +416,9 @@ fn relay_agent_args(args: &Value) -> Result<(), String> {
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        let arg = arg.as_str().ok_or("session args must be an array of strings")?;
+        let arg = arg
+            .as_str()
+            .ok_or("session args must be an array of strings")?;
         let allowed = match arg {
             "--offline" => true,
             "--model" => args.next().and_then(Value::as_str).is_some_and(model),
@@ -389,7 +437,9 @@ fn relay_cwd(cwd: &str) -> Result<(), String> {
     if path.is_absolute() && path.is_dir() {
         Ok(())
     } else {
-        Err(format!("remote cwd {cwd:?} must be an existing absolute directory"))
+        Err(format!(
+            "remote cwd {cwd:?} must be an existing absolute directory"
+        ))
     }
 }
 pub async fn dispatch(rt: &Runtime, req: &Value) -> Result<Value, String> {
@@ -424,6 +474,9 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
         forwarded["type"] = json!(op);
         forwarded["machine_id"] = json!(remote);
         forwarded["session_id"] = json!(target);
+        // Stamp the provenance the target checks workspace ownership against;
+        // without it every legitimate cross-machine workspace op is refused.
+        forwarded["origin_machine"] = json!(rt.machine);
         forwarded["workspace_id"] = if op == "workspace_close" {
             json!(target)
         } else {
@@ -432,6 +485,18 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
         return super::relay::call(rt, forwarded).await;
     }
     require(rt).await?;
+    // The origin of a relay operation. `origin_machine` is asserted by the
+    // sending daemon over its relay connection and trusted under the same
+    // device-level trust model as idle frames: it is not independently
+    // authenticated per frame. Workspace ownership is recorded per origin.
+    let relay_origin = str_field(req, "origin_machine").to_string();
+    let owner_of = |state: &super::State, id: &str| -> Option<String> {
+        state
+            .relay_workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.origin.clone())
+    };
     match op {
         "workspace_list" => {
             let listed = quick("workspace.list", json!({})).await?;
@@ -469,16 +534,33 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 relay_cwd(cwd)?;
                 relay_agent_args(&req["args"])?;
             }
+            if relay && relay_origin.is_empty() {
+                return Err("relay workspace operations require origin_machine provenance".into());
+            }
             let workspace = str_field(req, "workspace").to_string();
-            let owned = |id: &str| rt.state.lock().unwrap().relay_workspaces.contains(id);
-            if relay && !workspace.is_empty() && !owned(&workspace) {
-                return Err("relay may add sessions only to workspaces it created".into());
+            if relay && !workspace.is_empty() {
+                match owner_of(&rt.state.lock().unwrap(), &workspace) {
+                    Some(origin) if origin == relay_origin => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "workspace {workspace} is owned by another relay origin"
+                        ))
+                    }
+                    None => {
+                        return Err("relay may add sessions only to workspaces it created".into())
+                    }
+                }
             }
             let workspace = if op == "session_create" && workspace.is_empty() {
-                panes()
-                    .await?
+                let listed = panes().await?;
+                let state = rt.state.lock().unwrap();
+                listed
                     .iter()
-                    .filter(|p| !relay || owned(str_field(p, "workspace_id")))
+                    .filter(|p| {
+                        !relay
+                            || owner_of(&state, str_field(p, "workspace_id")).as_deref()
+                                == Some(relay_origin.as_str())
+                    })
                     .find(|p| str_field(p, "cwd") == cwd || str_field(p, "foreground_cwd") == cwd)
                     .map(|p| str_field(p, "workspace_id").to_string())
                     .unwrap_or_default()
@@ -508,7 +590,10 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                     .lock()
                     .unwrap()
                     .relay_workspaces
-                    .insert(created.to_string());
+                    .insert(super::RelayWorkspace {
+                        id: created.to_string(),
+                        origin: relay_origin.clone(),
+                    });
             }
             let session = if agent.is_empty() {
                 String::new()
@@ -531,10 +616,18 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 return Err("workspace id required".into());
             }
             if relay {
-                // A relay peer may close only workspaces it created that hold
-                // agent panes alone, never one with a shell the user works in.
-                if !rt.state.lock().unwrap().relay_workspaces.contains(id) {
-                    return Err("relay may close only workspaces it created".into());
+                // A relay peer may close only workspaces its own origin
+                // created that hold agent panes alone, never one with a shell
+                // the user works in.
+                if relay_origin.is_empty() {
+                    return Err("relay workspace close requires origin_machine provenance".into());
+                }
+                match owner_of(&rt.state.lock().unwrap(), id) {
+                    Some(origin) if origin == relay_origin => {}
+                    Some(_) => {
+                        return Err(format!("workspace {id} is owned by another relay origin"))
+                    }
+                    None => return Err("relay may close only workspaces it created".into()),
                 }
                 let panes = panes().await?;
                 let mut members = panes
@@ -546,17 +639,30 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 }
             }
             quick("workspace.close", json!({"workspace_id":id})).await?;
-            rt.state.lock().unwrap().relay_workspaces.remove(id);
+            rt.state
+                .lock()
+                .unwrap()
+                .relay_workspaces
+                .retain(|workspace| workspace.id != id);
             Ok(json!({}))
         }
         "session_close" => {
             let pane = pane_for(rt, target, relay).await?;
             let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+c"]})).await;
             if !wait_exited(&pane, 10).await {
-                let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+d"]})).await;
-                wait_exited(&pane, 5).await;
+                // The user may have reassigned the pane during the wait.
+                // Revalidate before every later destructive operation rather
+                // than sending ctrl+d or closing a shell/new agent.
+                let current = pane_for(rt, target, relay).await?;
+                let _ = quick(
+                    "agent.send_keys",
+                    json!({"target":current,"keys":["ctrl+d"]}),
+                )
+                .await;
+                wait_exited(&current, 5).await;
             }
-            quick("pane.close", json!({"pane_id":pane})).await?;
+            let current = pane_for(rt, target, relay).await?;
+            quick("pane.close", json!({"pane_id":current})).await?;
             Ok(json!({}))
         }
         "agent_prompt" | "agent_keys" | "agent_read" | "agent_wait" => {
