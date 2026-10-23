@@ -19,7 +19,12 @@ struct Injected {
 pub struct InjectionDedup {
     seen: HashMap<String, Injected>,
     order: VecDeque<String>,
-    inflight: HashMap<String, tokio::sync::watch::Sender<bool>>,
+    inflight: HashMap<String, Inflight>,
+}
+struct Inflight {
+    done: tokio::sync::watch::Sender<bool>,
+    target: String,
+    read: bool,
 }
 /// One dedup entry carried across an in-place upgrade.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -101,18 +106,22 @@ impl Drop for InjectionAttempt<'_> {
         if self.id.is_empty() {
             return;
         }
+        let mut state = self.runtime.state.lock().unwrap();
+        let inflight = state.incoming.inflight.remove(&self.id);
+        // The target's own read can beat the write ack; it settles the outcome.
+        let read = inflight.as_ref().is_some_and(|inflight| inflight.read);
         let unknown = match self.outcome.take() {
+            _ if read => Some(None),
             Some(Ok(())) => Some(None),
             Some(Err(error)) if error.contains("outcome unknown") => Some(Some(error)),
             Some(Err(_)) => None,
             None => Some(Some("injection outcome unknown: cancelled".into())),
         };
-        let mut state = self.runtime.state.lock().unwrap();
         if let Some(unknown) = unknown {
             state.remember_injection(&self.id, &self.target, unknown);
         }
-        if let Some(done) = state.incoming.inflight.remove(&self.id) {
-            done.send_replace(true);
+        if let Some(inflight) = inflight {
+            inflight.done.send_replace(true);
         }
     }
 }
@@ -139,14 +148,21 @@ impl super::Runtime {
                     state.remember_injection(mid, &seen.target, seen.unknown.clone());
                     return seen.unknown.map_or(Ok("delivered".into()), Err);
                 }
-                if let Some(done) = state.incoming.inflight.get(mid) {
-                    Some(done.subscribe())
+                if let Some(inflight) = state.incoming.inflight.get(mid) {
+                    Some(inflight.done.subscribe())
                 } else {
                     if !mid.is_empty() {
                         state
                             .incoming
                             .inflight
-                            .insert(mid.to_string(), tokio::sync::watch::channel(false).0);
+                            .insert(
+                                mid.to_string(),
+                                Inflight {
+                                    done: tokio::sync::watch::channel(false).0,
+                                    target: id.to_string(),
+                                    read: false,
+                                },
+                            );
                     }
                     None
                 }
@@ -253,15 +269,22 @@ impl super::Runtime {
                 return;
             }
             let route = admitted.is_some() && state.active(mid);
-            if status == "read"
-                && (reporter.starts_with("pi/") || reporter.starts_with("codex/"))
-                && state
+            if status == "read" && (reporter.starts_with("pi/") || reporter.starts_with("codex/")) {
+                if let Some(inflight) = state
+                    .incoming
+                    .inflight
+                    .get_mut(mid)
+                    .filter(|inflight| inflight.target == reporter)
+                {
+                    inflight.read = true;
+                } else if state
                     .incoming
                     .seen
                     .get(mid)
                     .is_some_and(|seen| seen.target == reporter)
-            {
-                state.remember_injection(mid, reporter, None);
+                {
+                    state.remember_injection(mid, reporter, None);
+                }
             }
             route
         };
@@ -1146,6 +1169,37 @@ mod tests {
                 .await
                 .unwrap(),
             "delivered"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn target_read_during_the_write_settles_an_unknown_outcome() {
+        let rt = runtime();
+        let target = pi_target();
+        let (tx, mut rx) = mpsc::channel(4);
+        rt.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("pi/target".into(), session(tx, 1, 1));
+        let observe = async {
+            let frame = rx.recv().await.unwrap();
+            rt.local_receipt("read-first", "pi/other", "read").await;
+            rt.local_receipt("read-first", "pi/target", "read").await;
+            drop(frame.written);
+        };
+        let (first, _) = tokio::join!(
+            rt.inject_local(&target, deliver("read-first"), "", false, None),
+            observe
+        );
+        assert!(first.unwrap_err().contains("outcome unknown"));
+        assert_eq!(
+            rt.inject_local(&target, deliver("read-first"), "", false, None)
+                .await
+                .unwrap(),
+            "delivered",
+            "the target's read already proved the injection"
         );
         assert!(rx.try_recv().is_err());
     }
