@@ -18,6 +18,53 @@ enum OrderedIncoming {
     Control(Value),
     Reply(Value, oneshot::Sender<Value>),
 }
+const IDLE_CONTROL_QUEUE: usize = 128;
+/// Keeps replies ordered behind earlier idle controls without letting a
+/// control backlog reject them: only controls count against the cap, and
+/// replies are already bounded by the pending-call table.
+struct OrderedQueue {
+    tx: mpsc::UnboundedSender<OrderedIncoming>,
+    controls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+struct OrderedReceiver {
+    rx: mpsc::UnboundedReceiver<OrderedIncoming>,
+    controls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+fn ordered_queue() -> (OrderedQueue, OrderedReceiver) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let controls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        OrderedQueue {
+            tx,
+            controls: controls.clone(),
+        },
+        OrderedReceiver { rx, controls },
+    )
+}
+impl OrderedQueue {
+    fn control(&self, frame: Value) -> Result<(), ()> {
+        use std::sync::atomic::Ordering;
+        if self.controls.fetch_add(1, Ordering::SeqCst) >= IDLE_CONTROL_QUEUE {
+            self.controls.fetch_sub(1, Ordering::SeqCst);
+            return Err(());
+        }
+        let _ = self.tx.send(OrderedIncoming::Control(frame));
+        Ok(())
+    }
+    fn reply(&self, frame: Value, reply: oneshot::Sender<Value>) {
+        let _ = self.tx.send(OrderedIncoming::Reply(frame, reply));
+    }
+}
+impl OrderedReceiver {
+    async fn recv(&mut self) -> Option<OrderedIncoming> {
+        let frame = self.rx.recv().await?;
+        if matches!(frame, OrderedIncoming::Control(_)) {
+            self.controls
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Some(frame)
+    }
+}
 struct PendingCall<'a> {
     runtime: &'a Runtime,
     id: String,
@@ -818,7 +865,7 @@ async fn session(
             }
         }
     }
-    let (idle_tx, mut idle_rx) = mpsc::channel::<OrderedIncoming>(128);
+    let (idle_tx, mut idle_rx) = ordered_queue();
     let idle_runtime = rt.clone();
     let idle_writer = tx.clone();
     idle_tasks.spawn(async move {
@@ -847,11 +894,11 @@ async fn session(
             msg=ws.next()=>match msg{
                 Some(Ok(Message::Text(t)))=>{
                     let v:Value=match serde_json::from_str(&t){Ok(v)=>v,Err(e)=>break Err(TransportError::Io(e.to_string()))};
-                    let pending={rt.state.lock().unwrap().pending.remove(str_field(&v,"id"))};if let Some(p)=pending{if idle_tx.try_send(OrderedIncoming::Reply(v,p)).is_err(){break Err("idle relay control queue capacity reached".into());}continue;}
+                    let pending={rt.state.lock().unwrap().pending.remove(str_field(&v,"id"))};if let Some(p)=pending{idle_tx.reply(v,p);continue;}
                     if v["rpc_reply"]==true{continue;}
                     if str_field(&v,"id")=="directory"{rt.state.lock().unwrap().remote=v["sessions"].as_array().into_iter().flatten().filter(|s|str_field(s,"machine_id")!=rt.machine).cloned().collect();continue;}
                     match str_field(&v,"type"){
-                        "idle_subscribe"|"idle_cancel"|"idle_notice"=>{if v["rpc_reply"]!=true&&idle_tx.try_send(OrderedIncoming::Control(v)).is_err(){break Err("idle relay control queue capacity reached".into());}}
+                        "idle_subscribe"|"idle_cancel"|"idle_notice"=>{if v["rpc_reply"]!=true&&idle_tx.control(v).is_err(){break Err("idle relay control queue capacity reached".into());}}
                         "receipt"=>{
                             let mid=str_field(&v,"message_id");let reporter=str_field(&v,"from");let status=str_field(&v,"status");
                             let origin={let mut state=rt.state.lock().unwrap();

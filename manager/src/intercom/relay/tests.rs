@@ -406,3 +406,29 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
     .expect("idle lanes must release their table entry");
     lanes.push("pi/a", "a-after".into()).unwrap();
 }
+
+#[tokio::test]
+async fn idle_control_backlog_never_rejects_replies_and_keeps_their_order() {
+    let (queue, mut receiver) = ordered_queue();
+    for n in 0..IDLE_CONTROL_QUEUE {
+        queue.control(json!({"n":n})).unwrap();
+    }
+    assert!(queue.control(json!({"n":"overflow"})).is_err());
+    let (reply, answered) = oneshot::channel();
+    queue.reply(json!({"id":"ack"}), reply);
+    for n in 0..IDLE_CONTROL_QUEUE {
+        match receiver.recv().await.unwrap() {
+            OrderedIncoming::Control(frame) => assert_eq!(frame["n"], n),
+            OrderedIncoming::Reply(..) => panic!("reply overtook an earlier idle control"),
+        }
+    }
+    let next = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("reply was rejected by the control backlog");
+    let OrderedIncoming::Reply(frame, reply) = next.unwrap() else {
+        panic!("reply lost behind the control backlog")
+    };
+    reply.send(frame).unwrap();
+    assert_eq!(answered.await.unwrap()["id"], "ack");
+    queue.control(json!({"n":"drained"})).unwrap();
+}
