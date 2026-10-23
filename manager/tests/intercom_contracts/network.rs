@@ -823,6 +823,51 @@ fn relay_policy_refuses_remote_before_bytes_but_keeps_local_delivery() {
 }
 
 #[test]
+fn relay_redelivery_after_exec_upgrade_is_not_injected_twice() {
+    let relay = WireRelay::new(relay_basics);
+    let mut fixture = Fixture::new();
+    let binary = fixture.root.join("pi-famulus");
+    fs::copy(BIN, &binary).unwrap();
+    fixture.binary = binary;
+    start_relay(&mut fixture, &relay, "");
+    let mut target = fixture.plugin("target", "busy");
+    let frame = json!({"type":"deliver","session_id":"pi/target","from":"pi/remote","reply_to":"pi/remote","message_id":"223bfe8d-0039-4cbd-b1f9-a892a2773d51","body":"before upgrade"});
+    relay.push(frame.clone());
+    assert_eq!(target.event("deliver")["message_id"], frame["message_id"]);
+    let output = common::run_cli(
+        &fixture.root.join("manager"),
+        &["upgrade"],
+        Duration::from_secs(30),
+    );
+    assert!(
+        output.status.success() && output.stdout.contains("upgraded in place"),
+        "upgrade failed: {} {}",
+        output.stdout,
+        output.stderr
+    );
+    relay.request("register");
+    let deadline = Instant::now() + TIMEOUT;
+    while UnixStream::connect(&fixture.sock).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "intercom socket did not return after exec upgrade: {}",
+            fixture.log()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut target = fixture.plugin("target", "busy");
+    relay.push(frame.clone());
+    let fresh = json!({"type":"deliver","session_id":"pi/target","from":"pi/remote","reply_to":"pi/remote","message_id":"223bfe8d-0039-4cbd-b1f9-a892a2773d52","body":"after upgrade"});
+    relay.push(fresh.clone());
+    assert_eq!(
+        target.event("deliver")["message_id"],
+        fresh["message_id"],
+        "a message injected before the upgrade was injected again"
+    );
+    target.no_event();
+}
+
+#[test]
 fn relay_duplicate_delivery_is_injected_once_and_real_pi_read_is_reported() {
     let relay = WireRelay::new(relay_basics);
     let mut fixture = Fixture::new();

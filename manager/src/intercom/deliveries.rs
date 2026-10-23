@@ -21,6 +21,47 @@ pub struct InjectionDedup {
     order: VecDeque<String>,
     inflight: HashMap<String, tokio::sync::watch::Sender<bool>>,
 }
+/// One dedup entry carried across an in-place upgrade.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct CarriedInjection {
+    pub id: String,
+    pub target: String,
+    #[serde(default)]
+    pub unknown: Option<String>,
+}
+impl InjectionDedup {
+    pub(super) fn from_carried(entries: Vec<CarriedInjection>) -> Self {
+        let mut dedup = Self::default();
+        let skip = entries.len().saturating_sub(DEDUP_LIMIT);
+        for entry in entries.into_iter().skip(skip) {
+            if entry.id.is_empty() {
+                continue;
+            }
+            let injected = Injected {
+                target: entry.target,
+                unknown: entry.unknown,
+            };
+            if dedup.seen.insert(entry.id.clone(), injected).is_some() {
+                dedup.order.retain(|seen| *seen != entry.id);
+            }
+            dedup.order.push_back(entry.id);
+        }
+        dedup
+    }
+    pub(super) fn carried(&self) -> Vec<CarriedInjection> {
+        self.order
+            .iter()
+            .filter_map(|id| {
+                let entry = self.seen.get(id)?;
+                Some(CarriedInjection {
+                    id: id.clone(),
+                    target: entry.target.clone(),
+                    unknown: entry.unknown.clone(),
+                })
+            })
+            .collect()
+    }
+}
 impl State {
     pub(super) fn remember_injection(&mut self, id: &str, target: &str, unknown: Option<String>) {
         if id.is_empty() {
@@ -1151,6 +1192,24 @@ mod tests {
         assert!(state.incoming.seen.contains_key("live-inbound"));
         assert!(!state.incoming.seen.contains_key("settled-0"));
         assert_eq!(state.incoming.seen.len(), 4096);
+    }
+
+    #[test]
+    fn carried_dedup_keeps_targets_and_unknown_outcomes_across_upgrade() {
+        let rt = runtime();
+        let carried = {
+            let mut state = rt.state.lock().unwrap();
+            state.remember_injection("delivered", "pi/target", None);
+            state.remember_injection("unknown", "pi/other", Some("outcome unknown".into()));
+            state.incoming.carried()
+        };
+        let carried = serde_json::from_value(serde_json::to_value(carried).unwrap()).unwrap();
+        let restored = InjectionDedup::from_carried(carried);
+        assert_eq!(restored.order, ["delivered", "unknown"]);
+        assert_eq!(restored.seen["delivered"].target, "pi/target");
+        assert_eq!(restored.seen["delivered"].unknown, None);
+        assert_eq!(restored.seen["unknown"].target, "pi/other");
+        assert_eq!(restored.seen["unknown"].unknown.as_deref(), Some("outcome unknown"));
     }
 
     #[tokio::test]

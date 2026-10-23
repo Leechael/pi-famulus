@@ -89,7 +89,10 @@ pub async fn run(
             if !loaded().await? {
                 bootstrap(&plist).await?;
             } else if restart {
-                launchctl(&["kickstart", "-k", &launch_service()]).await?;
+                // `kickstart -k` kills the job outright; bootout sends SIGTERM,
+                // so the daemon settles intercom and stops its tasks first.
+                launchctl(&["bootout", &launch_service()]).await?;
+                bootstrap(&plist).await?;
             } else {
                 launchctl(&["kickstart", &launch_service()]).await?;
             }
@@ -425,7 +428,15 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 fn comment_value(s: &str) -> String {
-    xml_escape(&s.replace(['\n', '\r'], " ").replace("--", "- -"))
+    // XML comments may not contain `--`; split every hyphen run.
+    let mut text = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '-' && text.ends_with('-') {
+            text.push(' ');
+        }
+        text.push(if c == '\n' || c == '\r' { ' ' } else { c });
+    }
+    xml_escape(&text)
 }
 fn render_with_token_check(d: &Detected, token: &str) -> Result<String, String> {
     let text = render_plist(d);
@@ -1143,6 +1154,97 @@ mod tests {
             .unwrap();
         assert_eq!(still_running.pid, before.pid);
         assert!(!cfg.sock.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn restart_stops_the_service_gracefully_instead_of_kickstart_kill() {
+        const CHILD: &str = "PI_FAMULUS_SERVICE_RESTART_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let cfg = Config {
+                sock: root.join("missing-intercom.sock"),
+                ..Config::default()
+            };
+            let opts = Options {
+                config: None,
+                sock: None,
+                state_dir: None,
+                server: None,
+                token: None,
+                name: None,
+                mcp_listen: None,
+                mcp_token: None,
+                remote_messages: None,
+                local_only: false,
+                insecure: false,
+                save_token: false,
+            };
+            run(&root.join("manager"), &cfg, &opts, ServiceCommand::Restart)
+                .await
+                .unwrap();
+            return;
+        }
+        let root = PathBuf::from("/tmp").join(format!("fsvc-{}", uuid::Uuid::new_v4()));
+        let agents = root.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join(format!("{LABEL}.plist")), "<plist/>").unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls = root.join("launchctl.log");
+        let launchctl = bin.join("launchctl");
+        std::fs::write(
+            &launchctl,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", calls.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "intercom::service::tests::restart_stops_the_service_gracefully_instead_of_kickstart_kill",
+                "--nocapture",
+            ])
+            .env(CHILD, &root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", &root)
+            .env_remove("PI_FAMULUS_TEST_CLOCK")
+            .output()
+            .unwrap();
+        let log = std::fs::read_to_string(&calls).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            output.status.success(),
+            "restart failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let verbs: Vec<&str> = log
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|verb| *verb != "print")
+            .collect();
+        assert!(
+            !log.contains("kickstart -k"),
+            "restart killed the daemon instead of stopping it: {log}"
+        );
+        assert_eq!(verbs, ["bootout", "bootstrap"], "{log}");
+    }
+
+    #[test]
+    fn plist_comments_never_contain_double_hyphens() {
+        let mut d = detected();
+        d.executable = PathBuf::from("/opt/a---b/--x-/pi-famulus-");
+        d.path = "/bin:/x----y".into();
+        let text = render_plist(&d);
+        for comment in text.split("<!--").skip(1) {
+            let body = comment.split("-->").next().unwrap();
+            assert!(
+                !body.contains("--") && !body.ends_with('-'),
+                "invalid XML comment: {body:?}"
+            );
+        }
     }
 
     #[test]

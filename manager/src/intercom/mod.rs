@@ -23,6 +23,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
+/// Bounds alias retirement and publication cleanup so a wedged native peer
+/// cannot hold daemon exit or an upgrade.
+const NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn configure(c: Config) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -39,6 +42,16 @@ pub fn enabled() -> bool {
 }
 pub fn configuration() -> Option<&'static Config> {
     CONFIG.get()
+}
+pub use deliveries::CarriedInjection;
+/// Injection dedup entries carried across an in-place upgrade; the next `start`
+/// seeds its dedup table from them so a relay redelivery is not injected twice.
+static CARRIED_DEDUP: Mutex<Vec<CarriedInjection>> = Mutex::new(Vec::new());
+pub fn carry_dedup(entries: Vec<CarriedInjection>) {
+    *CARRIED_DEDUP.lock().unwrap() = entries;
+}
+pub fn carried_dedup() -> Vec<CarriedInjection> {
+    CARRIED_DEDUP.lock().unwrap().clone()
 }
 pub type Shared = Arc<Runtime>;
 pub struct Push {
@@ -148,13 +161,11 @@ pub struct Running {
     socket_identity: (u64, u64),
 }
 impl Running {
-    pub fn stop_accepting(&self) {
-        self.runtime.closing.send_replace(true);
-        self.runtime.native.stop_accepting();
+    pub fn delivered_ids(&self) -> Vec<CarriedInjection> {
+        self.runtime.state.lock().unwrap().incoming.carried()
     }
     pub async fn shutdown(self) {
-        self.stop_accepting();
-        self.runtime.finish_idle("unavailable").await;
+        self.runtime.drain().await;
         self.runtime.stop.send_replace(true);
         let connections = std::mem::take(&mut *self.runtime.rpc_tasks.lock().unwrap());
         for connection in &connections {
@@ -163,7 +174,12 @@ impl Running {
         for connection in connections {
             let _ = connection.await;
         }
-        self.runtime.native.close().await;
+        if tokio::time::timeout(NATIVE_CLOSE_TIMEOUT, self.runtime.native.close())
+            .await
+            .is_err()
+        {
+            eprintln!("intercom native: close timed out");
+        }
         for task in self.tasks {
             task.abort();
             let _ = task.await;
@@ -177,6 +193,16 @@ impl Running {
                 }
             }
         }
+    }
+}
+impl Runtime {
+    /// Stop admitting work and settle idle watches as `unavailable` while
+    /// the native bridges and the watching processes are still alive; only
+    /// then stop the bridges.
+    pub async fn drain(&self) {
+        self.closing.send_replace(true);
+        self.finish_idle("unavailable").await;
+        self.native.stop_accepting();
     }
 }
 pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, String> {
@@ -229,7 +255,9 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             history: HashSet::new(),
             pending_local: HashSet::new(),
             pending_remote: HashSet::new(),
-            incoming: Default::default(),
+            incoming: deliveries::InjectionDedup::from_carried(std::mem::take(
+                &mut *CARRIED_DEDUP.lock().unwrap(),
+            )),
             subscriptions: HashMap::new(),
             idle_stable: HashMap::new(),
             next_epoch: 0,

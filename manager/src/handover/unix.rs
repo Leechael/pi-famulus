@@ -28,6 +28,10 @@ pub struct Snapshot {
     pub foreground: bool,
     #[serde(default)]
     pub intercom_config: Option<crate::intercom::config::Config>,
+    /// Injections intercom already attempted, so a redelivery after the
+    /// upgrade is acknowledged instead of injected again.
+    #[serde(default)]
+    pub intercom_dedup: Vec<crate::intercom::CarriedInjection>,
     pub listener_fd: RawFd,
     pub lock_fd: RawFd,
     pub lifeline_read_fd: RawFd,
@@ -422,6 +426,7 @@ fn snapshot(
         started_at_ms: st.started_at_ms,
         foreground: st.foreground,
         intercom_config: crate::intercom::configuration().cloned(),
+        intercom_dedup: crate::intercom::carried_dedup(),
         listener_fd,
         lock_fd,
         lifeline_read_fd: lifeline.read.as_raw_fd(),
@@ -454,10 +459,16 @@ fn snapshot(
     })
 }
 
+/// The snapshot carries the intercom credentials: private from creation.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("json.tmp");
-    let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut f = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)
@@ -572,5 +583,26 @@ pub fn rearm_timers(state: &Shared, id: &str) {
     }
     if lingering_unguarded {
         daemon::spawn_group_watcher(state, id, pid, job_generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn handover_file_is_private_even_over_a_stale_temporary() {
+        let dir = std::env::temp_dir().join(format!("pfm-handover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("handover.json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&path, b"{\"token\":\"secret\"}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "handover snapshot readable by others: {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"token\":\"secret\"}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

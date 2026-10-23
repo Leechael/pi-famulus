@@ -280,27 +280,37 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     }
     // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
     // holder removes stale socket/pid files before binding. Held until exit.
-    let daemon_lock = match lifecycle::claim_daemon(&home) {
-        Ok(Claim::Acquired(guard)) => guard,
-        Ok(Claim::AlreadyRunning { pid }) => {
-            if let Some(config) = crate::intercom::configuration() {
-                return match crate::client::enable_intercom(&home, config.clone()).await {
-                    Ok(()) => 0,
-                    Err(error) => {
-                        eprintln!("pi-famulus: cannot enable intercom: {error}");
-                        1
+    let daemon_lock = loop {
+        match lifecycle::claim_daemon(&home) {
+            Ok(Claim::Acquired(guard)) => break guard,
+            Ok(Claim::AlreadyRunning { pid }) => {
+                let Some(config) = crate::intercom::configuration() else {
+                    match pid {
+                        Some(pid) => println!("pi-famulus already running (pid {pid})"),
+                        None => println!("pi-famulus already running (starting up)"),
                     }
+                    return 0;
                 };
+                if let Err(error) = crate::client::enable_intercom(&home, config.clone()).await {
+                    eprintln!("pi-famulus: cannot enable intercom: {error}");
+                    return 1;
+                }
+                // `intercom serve` is a supervised job (launchd KeepAlive):
+                // exiting 0 here would end supervision while another
+                // process owns the manager. Stay up and take over once it
+                // exits.
+                eprintln!(
+                    "pi-famulus: intercom enabled in the running manager{}; taking over when it exits",
+                    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+                );
+                while lifecycle::lock_held(&home) {
+                    tokio::time::sleep(DAEMON_TAKEOVER_POLL).await;
+                }
             }
-            match pid {
-                Some(pid) => println!("pi-famulus already running (pid {pid})"),
-                None => println!("pi-famulus already running (starting up)"),
+            Err(e) => {
+                eprintln!("pi-famulus: daemon lock failed: {e}");
+                return 1;
             }
-            return 0;
-        }
-        Err(e) => {
-            eprintln!("pi-famulus: daemon lock failed: {e}");
-            return 1;
         }
     };
 
@@ -373,8 +383,12 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         );
     }
     start_agent_loops(&state);
-    serve(state, listener, daemon_lock).await
+    serve(state, listener, daemon_lock, false).await
 }
+
+/// How often `intercom serve` checks whether the manager it enabled
+/// intercom in has exited.
+const DAEMON_TAKEOVER_POLL: Duration = Duration::from_millis(500);
 
 /// Clients get this long to reconnect after an in-place upgrade before the
 /// zero-connection idle rule (§3.2) applies again.
@@ -406,15 +420,17 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     for e in entries {
         registry.tasks.insert(e.record.task_id.clone(), e);
     }
+    // Restored tasks outlive messaging: exiting here would close the
+    // lifeline and take every task down with it.
     if let Some(config) = snap.intercom_config.clone() {
         if let Err(error) = crate::intercom::configure(config) {
             lifecycle::log_line(
                 &home,
-                &format!("upgrade: intercom configuration failed: {error}"),
+                &format!("upgrade: intercom configuration failed: {error}; continuing without intercom"),
             );
-            return 1;
         }
     }
+    crate::intercom::carry_dedup(snap.intercom_dedup.clone());
     let mut st = DaemonState::new(home.clone(), registry, snap.foreground);
     st.started_at_ms = snap.started_at_ms;
     st.generation = snap.generation;
@@ -527,7 +543,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         maybe_arm_idle_timer(&s2);
     });
     start_agent_loops(&state);
-    serve(state, listener, lock).await
+    serve(state, listener, lock, true).await
 }
 
 /// Handover keeps permits while sessions have a chance to reconnect. Once
@@ -575,13 +591,28 @@ fn ctrl_c_or_pending(
 
 /// The accept loop, shared by a fresh daemon and one restored after an
 /// in-place upgrade. Also runs the upgrade itself when asked.
-async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
+/// `restored`: this image took over live tasks from an in-place upgrade, so
+/// an intercom failure degrades messaging instead of exiting.
+async fn serve(
+    state: Shared,
+    listener: crate::ipc::Listener,
+    daemon_lock: lifecycle::DaemonLockGuard,
+    restored: bool,
+) -> i32 {
     let home = state.lock().unwrap().home.clone();
 
     let intercom_clock = state.lock().unwrap().clock.clone();
     let mut intercom = if let Some(config) = crate::intercom::configuration() {
         match crate::intercom::start(config.clone(), intercom_clock.clone()).await {
             Ok(runtime) => Some(runtime),
+            Err(error) if restored => {
+                lifecycle::log_line(
+                    &home,
+                    &format!("upgrade: intercom startup failed: {error}; continuing without intercom"),
+                );
+                eprintln!("intercom: {error}; continuing without intercom");
+                None
+            }
             Err(error) => {
                 lifecycle::log_line(&home, &format!("intercom startup failed: {error}"));
                 eprintln!("intercom: {error}");
@@ -654,6 +685,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                     if let Some(ready) = ready {
                         // Returns only if the upgrade did not happen.
                         if let Some(runtime) = intercom.take() {
+                            crate::intercom::carry_dedup(runtime.delivered_ids());
                             runtime.shutdown().await;
                         }
                         let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
@@ -678,10 +710,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }
             _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
-                if let Some(runtime) = &intercom {
-                    runtime.stop_accepting();
-                }
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 #[cfg(unix)]
@@ -700,10 +729,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, if cfg!(windows) { "received Ctrl-C" } else { "received SIGTERM" });
-                if let Some(runtime) = &intercom {
-                    runtime.stop_accepting();
-                }
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 #[cfg(unix)]
@@ -719,10 +745,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGINT");
-                if let Some(runtime) = &intercom {
-                    runtime.stop_accepting();
-                }
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 match shutdown_task.as_mut() {
@@ -852,10 +875,21 @@ fn spawn_exe_watch(state: &Shared) {
 
 /// Mark the manager as shutting down (new hellos are refused) and run the
 /// graceful shutdown as its own task.
-fn begin_shutdown(state: &Shared) -> tokio::task::JoinHandle<()> {
+/// Intercom drains first: idle watchers learn `unavailable` while the native
+/// bridges and the tasks that may be watching are still alive.
+fn begin_shutdown(
+    state: &Shared,
+    intercom: Option<&crate::intercom::Running>,
+) -> tokio::task::JoinHandle<()> {
     state.lock().unwrap().shutdown = true;
     let s = state.clone();
-    tokio::spawn(async move { graceful_shutdown(&s).await })
+    let intercom = intercom.map(|running| running.runtime.clone());
+    tokio::spawn(async move {
+        if let Some(runtime) = intercom {
+            runtime.drain().await;
+        }
+        graceful_shutdown(&s).await
+    })
 }
 
 // ---------------------------------------------------------------------------
