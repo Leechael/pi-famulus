@@ -197,19 +197,31 @@ fn remote_forwarded_idle_subscribe_and_cancel_require_matching_authenticated_ori
     cancel["origin_machine"] = json!("authenticated-watcher-machine");
     relay.outgoing.send(cancel).unwrap();
     assert_eq!(relay.request("idle_cancel")["id"], "matching-cancel");
+    let control = "223bfe8d-0039-4cbd-b1f9-a892a2773d39";
+    relay
+        .outgoing
+        .send(json!({"type":"idle_subscribe","id":"control-subscribe","origin_machine":"authenticated-watcher-machine","subscription_id":control,"watcher":"codex/remote-watcher","session_id":"pi/local-target"}))
+        .unwrap();
+    assert_eq!(relay.request("idle_subscribe")["id"], "control-subscribe");
     target.register("local-target", "idle", &["read_receipts", "idle_state_v1"]);
-    let deadline = Instant::now() + Duration::from_millis(1200);
-    while let Ok(message) = relay
-        .requests
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    {
-        assert!(
-            !(message["type"] == "idle_notice" && message["subscription_id"] == id),
-            "cancelled remote watch later notified its former owner"
-        );
-        if Instant::now() >= deadline {
-            break;
+    let deadline = Instant::now() + TIMEOUT;
+    let mut settled_at = None;
+    while settled_at.is_none_or(|at: Instant| at.elapsed() < Duration::from_millis(500)) {
+        let message = relay.requests.recv_timeout(Duration::from_millis(50)).ok();
+        if let Some(message) = message.filter(|message| message["type"] == "idle_notice") {
+            assert_ne!(
+                message["subscription_id"], id,
+                "cancelled remote watch later notified its former owner"
+            );
+            if message["subscription_id"] == control {
+                assert_eq!(message["status"], "idle");
+                settled_at = Some(Instant::now());
+            }
         }
+        assert!(
+            settled_at.is_some() || Instant::now() < deadline,
+            "uncancelled control watch on the same target never settled"
+        );
     }
 }
 
