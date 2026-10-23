@@ -7,6 +7,8 @@ use tokio::sync::watch;
 const TTL: u64 = 12 * 3600 * 1000;
 const MAX_ACTIVE: usize = 32;
 const MAX_REPLAY: usize = 1024;
+#[cfg(unix)]
+const DEBT_SCAN_MS: u64 = 5000;
 
 type Notices = Vec<(String, String)>;
 type Ready = watch::Receiver<Option<Result<(), String>>>;
@@ -18,6 +20,8 @@ pub(super) struct IdleState {
     slots: HashMap<String, Slot>,
     tasks: Vec<OwnedTask>,
     connections: Arc<tokio::sync::Semaphore>,
+    #[cfg(unix)]
+    debt_scan_at: u64,
 }
 impl Default for IdleState {
     fn default() -> Self {
@@ -28,6 +32,8 @@ impl Default for IdleState {
             slots: HashMap::new(),
             tasks: Vec::new(),
             connections: Arc::new(tokio::sync::Semaphore::new(256)),
+            #[cfg(unix)]
+            debt_scan_at: 0,
         }
     }
 }
@@ -922,6 +928,40 @@ impl Native {
             .retain(|id, route| route.admitting || pending.contains(id));
         for (target, serial, epoch, seq) in due {
             self.tick_native_slot(&target, &serial, epoch, seq);
+        }
+        #[cfg(unix)]
+        self.reclaim_idle_debt(runtime.clock.now_ms());
+    }
+    #[cfg(unix)]
+    fn reclaim_idle_debt(&self, now: u64) {
+        let debts = {
+            let mut state = self.idle_state.lock().unwrap();
+            if now < state.debt_scan_at {
+                return;
+            }
+            state.debt_scan_at = now.saturating_add(DEBT_SCAN_MS);
+            state
+                .slots
+                .iter()
+                .filter(|(_, slot)| !slot.logical && slot.debt.is_some() && *slot.done.borrow())
+                .map(|(target, slot)| (target.clone(), slot.serial.clone(), slot.endpoint.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (target, serial, snapshot) in debts {
+            let fresh = self.fresh_idle_endpoint(&snapshot);
+            let mut state = self.idle_state.lock().unwrap();
+            let gone = state.slots.get(&target).is_some_and(|slot| {
+                slot.serial == serial
+                    && !slot.logical
+                    && slot.debt.is_some()
+                    && match &fresh {
+                        Ok(endpoint) => Generation::from_endpoint(endpoint) != slot.generation,
+                        Err(error) => error.starts_with("unknown native idle target"),
+                    }
+            });
+            if gone {
+                state.slots.remove(&target);
+            }
         }
     }
     pub async fn idle_notice(&self, id: &str, status: &str) -> Result<(), String> {
@@ -2289,6 +2329,65 @@ mod tests {
         assert_eq!(state.slots.len(), 32);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordering_debt_slot_is_reclaimed_once_its_subject_generation_is_gone() {
+        let runtime = runtime();
+        let mut peer = SocketFixture::new();
+        peer.register("peer", 1);
+        let target = str_field(&peer.endpoint, "id").to_string();
+        let (ready, _) = watch::channel(Some(Ok(())));
+        let (cancel, _) = watch::channel(false);
+        let (done, _) = watch::channel(true);
+        runtime.native.idle_state.lock().unwrap().slots.insert(
+            target.clone(),
+            Slot {
+                serial: "debt".into(),
+                epoch: 0,
+                endpoint: peer.endpoint.clone(),
+                generation: Generation::from_endpoint(&peer.endpoint),
+                id: uuid::Uuid::new_v4().to_string(),
+                deadline: TTL,
+                children: HashSet::new(),
+                logical: false,
+                sending: false,
+                ready,
+                cancel,
+                done,
+                debt: Some("ordering proof unavailable".into()),
+                error: None,
+                early: None,
+                listener: None,
+                timer: None,
+                timer_seq: 0,
+            },
+        );
+        runtime.native.maintain_idle(&runtime).await;
+        assert!(
+            runtime
+                .native
+                .idle_state
+                .lock()
+                .unwrap()
+                .slots
+                .contains_key(&target),
+            "a live subject generation keeps its ordering fence"
+        );
+        std::fs::remove_file(str_field(&peer.endpoint, "_registry")).unwrap();
+        runtime.native.idle_state.lock().unwrap().debt_scan_at = 0;
+        runtime.native.maintain_idle(&runtime).await;
+        assert!(
+            !runtime
+                .native
+                .idle_state
+                .lock()
+                .unwrap()
+                .slots
+                .contains_key(&target),
+            "a debt slot whose subject is gone must release its physical capacity"
+        );
+        runtime.native.stop_idle_state();
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn independent_targets_do_not_share_a_physical_send_mutex() {
