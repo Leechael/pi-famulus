@@ -1013,7 +1013,16 @@ async fn post_webhook_message(
             .try_clone()
             .ok_or("webhook request body cannot be replayed")?;
         match client.execute(request).await {
-            Err(failure) => error = format!("endpoint {}: {failure}", endpoint.name),
+            Err(failure) => {
+                // reqwest's Display omits the cause (TLS, refused, timeout).
+                let mut detail = failure.to_string();
+                let mut source = std::error::Error::source(&failure);
+                while let Some(cause) = source {
+                    detail.push_str(&format!(": {cause}"));
+                    source = cause.source();
+                }
+                error = format!("endpoint {}: {detail}", endpoint.name)
+            }
             Ok(mut response) => {
                 let status = response.status();
                 if !status.is_success() {
