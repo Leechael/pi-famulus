@@ -44,13 +44,16 @@ async fn tls_url_answered_by_cleartext_http_fails_without_sending_the_token_in_c
 }
 
 fn transport_runtime(cfg: Config) -> Shared {
+    transport_runtime_on(cfg, crate::clock::Clock::default())
+}
+fn transport_runtime_on(cfg: Config, clock: crate::clock::Clock) -> Shared {
     use std::{
         collections::{HashMap, HashSet, VecDeque},
         sync::{Arc, Mutex},
     };
     Arc::new(Runtime {
         cfg,
-        clock: crate::clock::Clock::default(),
+        clock,
         identity: Identity {
             device_id: uuid::Uuid::new_v4().to_string(),
             ..Identity::default()
@@ -142,7 +145,7 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
             active.clone(),
             &mut tokio::task::JoinSet::new(),
             &delivery_lanes(&active),
-            &mut false,
+            &mut None,
         )
         .await },
         );
@@ -300,7 +303,7 @@ async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_deli
             active.clone(),
             &mut tokio::task::JoinSet::new(),
             &delivery_lanes(&active),
-            &mut false,
+            &mut None,
         )
         .await
     });
@@ -431,4 +434,77 @@ async fn idle_control_backlog_never_rejects_replies_and_keeps_their_order() {
     reply.send(frame).unwrap();
     assert_eq!(answered.await.unwrap()["id"], "ack");
     queue.control(json!({"n":"drained"})).unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+async fn reconnect_wait(clock: &crate::clock::Clock) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(timer) = clock
+            .manual()
+            .unwrap()
+            .status()
+            .pending
+            .into_iter()
+            .find(|timer| timer.label == "intercom-relay-reconnect" && timer.due_in_ms > 0)
+        {
+            return timer.due_in_ms;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reconnect timer never armed"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn relay_that_welcomes_then_drops_keeps_backing_off_until_a_session_stays_healthy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let clock = crate::clock::Clock::manual_for_test();
+    let rt = transport_runtime_on(
+        Config {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            token: "fixture".into(),
+            ..Config::default()
+        },
+        clock.clone(),
+    );
+    let task = tokio::spawn(run(rt.clone()));
+    let mut waits = Vec::new();
+    for _ in 0..3 {
+        let mut peer = welcomed_peer(&listener).await;
+        peer.close(None).await.unwrap();
+        let wait = reconnect_wait(&clock).await;
+        waits.push(wait);
+        clock.manual().unwrap().advance(wait);
+    }
+    assert!(
+        waits[2] >= 3000,
+        "welcome-then-drop reset the backoff into a hot reconnect loop: {waits:?}"
+    );
+    let mut peer = welcomed_peer(&listener).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while rt.state.lock().unwrap().relay_tx.is_none() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    clock
+        .manual()
+        .unwrap()
+        .advance(HEALTHY_SESSION.as_millis() as u64);
+    peer.close(None).await.unwrap();
+    let wait = reconnect_wait(&clock).await;
+    assert!(
+        (750..=1250).contains(&wait),
+        "a session that stayed healthy must reset the backoff: {wait}"
+    );
+    rt.stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
 }

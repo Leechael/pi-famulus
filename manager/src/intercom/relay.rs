@@ -299,6 +299,7 @@ pub(super) const MAX_FRAME: usize = 1 << 20;
 pub(super) const AUTH_RETRY_DELAY: Duration = Duration::from_secs(300);
 pub(super) const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub(super) const BACKOFF_MAX: Duration = Duration::from_secs(30);
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub(super) enum TransportError {
@@ -665,12 +666,15 @@ pub async fn run(rt: Shared) {
     let deliveries = delivery_lanes(&rt);
     loop {
         while idle_tasks.try_join_next().is_some() {}
-        let mut registered = false;
-        let result = session(rt.clone(), &mut idle_tasks, &deliveries, &mut registered).await;
+        let mut welcomed = None;
+        let result = session(rt.clone(), &mut idle_tasks, &deliveries, &mut welcomed).await;
         if *stop.borrow() {
             break;
         }
-        if registered {
+        // A relay that welcomes and then drops at once must not defeat backoff.
+        if welcomed.is_some_and(|at| {
+            rt.clock.now_ms().saturating_sub(at) >= HEALTHY_SESSION.as_millis() as u64
+        }) {
             delay = BACKOFF_MIN;
         }
         let (mut wait, next) = next_backoff(delay);
@@ -837,11 +841,11 @@ async fn session(
     rt: Shared,
     idle_tasks: &mut tokio::task::JoinSet<()>,
     deliveries: &Lanes<Value>,
-    registered: &mut bool,
+    welcomed: &mut Option<u64>,
 ) -> Result<(), TransportError> {
     let mut ws = Conn::connect(&rt.cfg, rt.clock.clone()).await?;
     let welcome=ws.register(json!({"type":"register","machine_id":rt.machine,"machine_name":rt.cfg.name,"device_id":rt.identity.device_id})).await?;
-    *registered = true;
+    *welcomed = Some(rt.clock.now_ms());
     ws.start_ping();
     let (tx, mut rx) = mpsc::channel::<super::Push>(128);
     loop {
