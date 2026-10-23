@@ -11,9 +11,14 @@ pub(super) fn native_roots() -> Arc<rustls::RootCertStore> {
     static ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
     ROOTS
         .get_or_init(|| {
+            let loaded = rustls_native_certs::load_native_certs();
+            for error in &loaded.errors {
+                eprintln!("intercom tls: platform trust store: {error}");
+            }
             let mut roots = rustls::RootCertStore::empty();
-            for certificate in rustls_native_certs::load_native_certs().certs {
-                let _ = roots.add(certificate);
+            let (_, rejected) = roots.add_parsable_certificates(loaded.certs);
+            if rejected > 0 {
+                eprintln!("intercom tls: ignored {rejected} unparsable platform certificates");
             }
             Arc::new(roots)
         })
@@ -22,7 +27,12 @@ pub(super) fn native_roots() -> Arc<rustls::RootCertStore> {
 
 pub(super) fn connector(insecure: bool) -> Result<tokio_tungstenite::Connector, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots = native_roots();
+    // The insecure verifier ignores roots, so skip the trust store load.
+    let roots = if insecure {
+        Arc::new(rustls::RootCertStore::empty())
+    } else {
+        native_roots()
+    };
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?

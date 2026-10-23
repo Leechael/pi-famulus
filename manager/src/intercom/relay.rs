@@ -553,6 +553,9 @@ async fn dial_attempt(c: &Config, plain: bool) -> Result<Socket, TransportError>
             .host_str()
             .ok_or_else(|| TransportError::Io("relay host missing".into()))?
             .trim_matches(['[', ']']);
+        // Prepare TLS before connecting so the ClientHello follows the TCP
+        // handshake immediately.
+        let connector = tls::connector(c.tls_insecure).map_err(TransportError::Io)?;
         let stream = tokio::net::TcpStream::connect((
             host,
             url.port_or_known_default()
@@ -574,7 +577,7 @@ async fn dial_attempt(c: &Config, plain: bool) -> Result<Socket, TransportError>
                     .max_message_size(Some(1 << 20))
                     .max_frame_size(Some(1 << 20)),
             ),
-            Some(tls::connector(c.tls_insecure).map_err(TransportError::Io)?),
+            Some(connector),
         )
         .await
         .map(|(socket, _)| socket)
@@ -1312,7 +1315,14 @@ mod listen_webhook_tests {
             )
             .await;
             if std::env::var("PI_FAMULUS_WEBHOOK_TLS_CASE").unwrap() == "trusted" {
-                assert_eq!(result.unwrap(), "delivered");
+                assert_eq!(
+                    result.unwrap_or_else(|error| panic!(
+                        "{error}; trust store held {} roots from SSL_CERT_FILE={:?}",
+                        tls::native_roots().len(),
+                        std::env::var_os("SSL_CERT_FILE")
+                    )),
+                    "delivered"
+                );
             } else {
                 assert!(
                     result.is_err(),
