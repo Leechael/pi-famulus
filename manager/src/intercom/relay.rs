@@ -688,7 +688,8 @@ pub async fn run(rt: Shared) {
         delay = next;
     }
 }
-type Runner<T> = std::sync::Arc<dyn Fn(T) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+type Runner<T> =
+    std::sync::Arc<dyn Fn(T) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 /// Per-key FIFO lanes: one worker per busy key keeps that key's items in
 /// arrival order, and a shared semaphore caps how many keys run at once.
 struct Lanes<T> {
@@ -1434,8 +1435,7 @@ async fn listen_once(
             }
         }
     }.await;
-    let healthy =
-        clock.now_ms().saturating_sub(welcomed) >= HEALTHY_SESSION.as_millis() as u64;
+    let healthy = clock.now_ms().saturating_sub(welcomed) >= HEALTHY_SESSION.as_millis() as u64;
     (healthy, result.unwrap_err())
 }
 
@@ -1713,7 +1713,10 @@ mod listen_webhook_tests {
         )
         .await;
         assert!(
-            result.as_ref().unwrap_err().contains(&format!("HTTP {status}")),
+            result
+                .as_ref()
+                .unwrap_err()
+                .contains(&format!("HTTP {status}")),
             "{result:?}"
         );
         assert!(first.await.unwrap().0.starts_with("POST /redirect "));
@@ -2071,7 +2074,7 @@ mod listen_webhook_tests {
     }
 
     #[test]
-    fn listen_backoff_resets_only_after_a_healthy_session_and_classifies_auth_without_string_guessing() {
+    fn listen_backoff_resets_only_after_healthy_session_and_types_auth_errors() {
         let denied = TransportError::Http {
             status: 401,
             reason: "revoked".into(),

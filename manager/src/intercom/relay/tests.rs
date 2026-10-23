@@ -139,16 +139,15 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
         ..Config::default()
     });
     let active = rt.clone();
-    let mut task =
-        tokio::spawn(
-            async move { session(
+    let mut task = tokio::spawn(async move {
+        session(
             active.clone(),
             &mut tokio::task::JoinSet::new(),
             &delivery_lanes(&active),
             &mut None,
         )
-        .await },
-        );
+        .await
+    });
     let writer = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(writer) = rt.state.lock().unwrap().relay_tx.clone() {
@@ -221,12 +220,23 @@ async fn relay_send_rejects_a_body_whose_encoded_frame_exceeds_the_relay_frame_l
     let body = "\"".repeat(MAX_FRAME / 2 + 1);
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        send(&rt, "pi/origin", "pi/remote", &body, "", "oversized-id", None),
+        send(
+            &rt,
+            "pi/origin",
+            "pi/remote",
+            &body,
+            "",
+            "oversized-id",
+            None,
+        ),
     )
     .await
     .expect("oversized relay send waited for a reply instead of failing");
     assert!(result.unwrap_err().contains("too large"));
-    assert!(wire.try_recv().is_err(), "oversized send reached the relay writer");
+    assert!(
+        wire.try_recv().is_err(),
+        "oversized send reached the relay writer"
+    );
 }
 
 #[tokio::test]
@@ -376,7 +386,9 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
         "a full per-target lane must reject instead of growing"
     );
     for key in 0..8 {
-        lanes.push(&format!("pi/k{key}"), format!("k{key}")).unwrap();
+        lanes
+            .push(&format!("pi/k{key}"), format!("k{key}"))
+            .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(running.load(Ordering::SeqCst), 3);
@@ -388,7 +400,10 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
     })
     .await
     .unwrap();
-    assert!(peak.load(Ordering::SeqCst) <= 3, "deliveries exceeded the worker cap");
+    assert!(
+        peak.load(Ordering::SeqCst) <= 3,
+        "deliveries exceeded the worker cap"
+    );
     let lane_a: Vec<_> = log
         .lock()
         .unwrap()
@@ -399,7 +414,10 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
     let expected: Vec<_> = (0..4)
         .flat_map(|n| [(format!("a{n}"), "start"), (format!("a{n}"), "end")])
         .collect();
-    assert_eq!(lane_a, expected, "one target's deliveries overlapped or reordered");
+    assert_eq!(
+        lane_a, expected,
+        "one target's deliveries overlapped or reordered"
+    );
     tokio::time::timeout(Duration::from_secs(1), async {
         while !lanes.inner.queues.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
