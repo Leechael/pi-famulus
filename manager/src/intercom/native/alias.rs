@@ -342,6 +342,12 @@ pub(super) async fn close_base(native: &Native) {
 }
 
 #[cfg(unix)]
+/// The public base listener answers relay-scale traffic; bound it exactly
+/// like alias children (8) so a flooded listener cannot spawn an unbounded
+/// task per connection.
+const BASE_CONNECTION_LIMIT: usize = 8;
+
+#[cfg(unix)]
 fn previous_kernel_start(old: &str, current: &str) -> bool {
     if old.is_empty() || current.is_empty() || old == current {
         return false;
@@ -494,7 +500,7 @@ pub(super) async fn reconcile_base(rt: &Shared) -> Result<(), String> {
         loop {
             tokio::select! {
                 _ = closing.changed() => break,
-                accepted = listener.accept() => {
+                accepted = listener.accept(), if connections.len() < BASE_CONNECTION_LIMIT => {
                     let Ok((stream, _)) = accepted else { break };
                     let weak = weak.clone();
                     let generation = target_generation.clone();
@@ -2574,5 +2580,286 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*frames.lock().unwrap(), 0);
+    }
+
+    /// Receive a worker event without blocking the single-threaded runtime:
+    /// the base listener task runs on this runtime and must be polled
+    /// between receive polls.
+    #[cfg(unix)]
+    async fn recv_event(
+        rx: &std::sync::mpsc::Receiver<(usize, Value)>,
+        expect: &str,
+    ) -> (usize, Value) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(event) = rx.try_recv() {
+                return event;
+            }
+            assert!(std::time::Instant::now() < deadline, "{expect}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// The public base listener must stop accepting while its connection
+    /// budget is saturated (alias children cap at 8) and resume once a
+    /// connection retires.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_listener_stops_accepting_while_saturated_and_resumes_on_retire() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "FAMULUS_BASE_SATURATION_ANCHOR";
+        if std::env::var_os(CHILD).is_some() {
+            // Anchor mode: hold a live socket the namespace can bind next to.
+            // Readiness is a file, not stdout: a test-harness child owns its
+            // own banner on the shared pipe.
+            let path = PathBuf::from(std::env::var_os("FAMULUS_ANCHOR_SOCKET").unwrap());
+            let ready = PathBuf::from(std::env::var_os("FAMULUS_ANCHOR_READY").unwrap());
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&ready, []).unwrap();
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+            return;
+        }
+        // This fixture changes HOME and endpoint variables. Re-exec the real
+        // test body in an isolated process so parallel tests never observe
+        // its process-global environment or the temporary HOME after cleanup.
+        const ISOLATED: &str = "FAMULUS_BASE_SATURATION_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "intercom::native::alias::tests::base_listener_stops_accepting_while_saturated_and_resumes_on_retire",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated base-listener fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        struct Anchor(std::process::Child, PathBuf);
+        impl Drop for Anchor {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let dir = std::env::temp_dir().join(format!("fma-base-{}", &id[..12]));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = dir.join("native");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A child process owns the anchor socket so its PID differs from the
+        // in-process daemon base socket name.
+        let anchor_socket = directory.join("anchor.sock");
+        let anchor_ready = directory.join("anchor.ready");
+        let anchor_child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "intercom::native::alias::tests::base_listener_stops_accepting_while_saturated_and_resumes_on_retire",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("FAMULUS_ANCHOR_SOCKET", &anchor_socket)
+            .env("FAMULUS_ANCHOR_READY", &anchor_ready)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !anchor_ready.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("anchor child never became ready");
+        let _anchor = Anchor(anchor_child, anchor_socket.clone());
+        let anchor_pid = _anchor.0.id();
+        std::env::set_var("HOME", &dir);
+        for key in [
+            "CODEX_APP_SERVER_SOCK",
+            "CODEX_APP_SERVER_SOCKET",
+            "CODEX_DESKTOP_IPC_SOCK",
+            "CODEX_IPC_SOCK",
+            "HERDR_SESSION",
+        ] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("HERDR_SOCKET_PATH", dir.join("absent-herdr.sock"));
+        let registry = dir.join(".claude/sessions");
+        ensure_directory(&registry).unwrap();
+        let anchor_registry = registry.join(format!("{anchor_pid}.json"));
+        let anchor_entry = json!({"pid":anchor_pid,"procStart":process_start(anchor_pid),
+            "sessionId":"base-saturation-anchor","messagingSocketPath":anchor_socket,
+            "name":"anchor","kind":"interactive","entrypoint":"cli","version":"native","peerProtocol":1});
+        std::fs::write(&anchor_registry, anchor_entry.to_string()).unwrap();
+        std::fs::set_permissions(&anchor_registry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let running = crate::intercom::start(
+            crate::intercom::config::Config {
+                sock: dir.join("client.sock"),
+                state_dir: dir.join("state"),
+                local_only: true,
+                mcp_listen: String::new(),
+                ..Default::default()
+            },
+            crate::clock::Clock::default(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while running.runtime.native.base.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("base listener never bound");
+        let base_socket = running
+            .runtime
+            .native
+            .base
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .socket
+            .clone();
+        assert_eq!(base_socket.parent(), Some(directory.as_path()));
+        // Each peer holds a base connection open and waits for its refusal.
+        let mut peers = Vec::new();
+        for index in 0..BASE_CONNECTION_LIMIT + 1 {
+            let own = directory.join(format!("peer-{index}.sock"));
+            let own_listener = std::os::unix::net::UnixListener::bind(&own).unwrap();
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut link = std::os::unix::net::UnixStream::connect(&base_socket).unwrap();
+            link.write_all(
+                format!(
+                    "{}\n",
+                    json!({"msg_v":1,"type":"user","from":format!("uds:{}", own.display()),
+                        "msg_id":format!("saturation-{index}"),"message":{"role":"user","content":"hi"}})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            peers.push((own_listener, link, index));
+        }
+        // The peer phase blocks on std sockets; run it on a dedicated thread
+        // so the single-threaded test runtime keeps polling the base listener.
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<(usize, Value)>();
+        let (retire_tx, retire_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let mut peers = peers;
+            for index in 0..BASE_CONNECTION_LIMIT {
+                let (refused, _) = peers[index].0.accept().unwrap();
+                refused
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(refused)
+                    .read_line(&mut line)
+                    .unwrap_or_else(|error| panic!("refusal for peer {index}: {error}"));
+                let frame: Value = serde_json::from_str(line.trim()).unwrap();
+                event_tx.send((index, frame)).unwrap();
+            }
+            // The excess connection must stay in the backlog while the
+            // budget is saturated.
+            let excess = peers.len() - 1;
+            peers[excess]
+                .0
+                .set_nonblocking(true)
+                .expect("excess peer listener");
+            let saturated = std::time::Instant::now();
+            loop {
+                match peers[excess].0.accept() {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    other => {
+                        panic!("excess connection was served while saturated: {other:?}")
+                    }
+                }
+                if saturated.elapsed() >= Duration::from_millis(500) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            retire_rx.recv().expect("retire command");
+            // Retiring one connection frees the budget and the excess peer is
+            // served.
+            drop(peers.remove(0));
+            let retired = std::time::Instant::now();
+            let (refused, _) = loop {
+                match peers[excess - 1].0.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        assert!(
+                            retired.elapsed() < Duration::from_secs(10),
+                            "excess peer never accepted after retire"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("excess peer accept failed: {error}"),
+                }
+            };
+            // Poll in nonblocking mode instead of relying on SO_RCVTIMEO:
+            // macOS can reject that option on an accepted Unix socket.
+            refused.set_nonblocking(true).unwrap();
+            let mut refused = std::io::BufReader::new(refused);
+            let mut line = String::new();
+            loop {
+                match refused.read_line(&mut line) {
+                    Ok(_) => break,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        assert!(
+                            retired.elapsed() < Duration::from_secs(10),
+                            "excess peer refusal timed out"
+                        );
+                        line.clear();
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("excess peer read failed: {error}"),
+                }
+            }
+            let frame: Value = serde_json::from_str(line.trim()).unwrap();
+            event_tx.send((excess, frame)).unwrap();
+        });
+        let mut served = Vec::new();
+        while served.len() < BASE_CONNECTION_LIMIT {
+            let (index, frame) = recv_event(&event_rx, "served peer refusal before deadline").await;
+            assert_eq!(frame["action"], "peer_message_status");
+            assert_eq!(frame["status"], "refused");
+            assert_eq!(frame["orig_msg_id"], format!("saturation-{index}"));
+            served.push(index);
+        }
+        let excess = BASE_CONNECTION_LIMIT;
+        retire_tx.send(()).unwrap();
+        let (index, frame) = recv_event(&event_rx, "excess peer refusal after retire").await;
+        assert_eq!(index, excess);
+        assert_eq!(frame["status"], "refused");
+        assert_eq!(frame["orig_msg_id"], format!("saturation-{excess}"));
+        worker.join().unwrap();
+        running.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
