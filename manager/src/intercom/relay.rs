@@ -89,19 +89,51 @@ pub async fn enqueue_control(rt: &Runtime, frame: Value) -> Result<(), String> {
     if !is_control(&frame) {
         return Err("only idle_cancel and idle_notice may be queued".into());
     }
-    let writer = rt.state.lock().unwrap().relay_tx.clone();
-    if let Some(writer) = writer {
-        if writer.send(frame.clone().into()).await.is_ok() {
-            return Ok(());
+    loop {
+        let mut generation = rt.state.lock().unwrap().relay_generation;
+        loop {
+            let writer = rt.state.lock().unwrap().relay_tx.clone();
+            let Some(writer) = writer else { break };
+            if writer.send(frame.clone().into()).await.is_ok() {
+                // A torn-down session may have parked controls after the current
+                // session drained the outbox at setup; flush them through the
+                // healthy writer instead of waiting for the next reconnect.
+                let parked = std::mem::take(&mut rt.state.lock().unwrap().control_outbox);
+                let mut stranded: std::collections::VecDeque<Value> = Default::default();
+                for old in parked {
+                    if let Err(error) = writer.send(old.into()).await {
+                        stranded.push_back(error.0.value);
+                    }
+                }
+                if !stranded.is_empty() {
+                    park_controls(&mut rt.state.lock().unwrap(), stranded);
+                }
+                return Ok(());
+            }
+            // The send failed on a stale writer: retry once against the writer of
+            // a newer connection before parking the frame for a future session.
+            let state = rt.state.lock().unwrap();
+            if state.relay_generation == generation {
+                break;
+            }
+            generation = state.relay_generation;
         }
+        let mut state = rt.state.lock().unwrap();
+        // A healthy session may have installed its writer and drained an empty
+        // outbox while this task was descheduled. Never park behind that final
+        // drain: retry against the new generation while holding the state lock
+        // long enough to make the park-vs-retry decision atomic with setup.
+        if state.relay_tx.is_some() && state.relay_generation != generation {
+            drop(state);
+            continue;
+        }
+        if state.control_outbox.len() >= 256 {
+            state.control_outbox.pop_front();
+            eprintln!("intercom relay: outbox full; dropped oldest idle control");
+        }
+        state.control_outbox.push_back(frame);
+        return Ok(());
     }
-    let mut state = rt.state.lock().unwrap();
-    if state.control_outbox.len() >= 256 {
-        state.control_outbox.pop_front();
-        eprintln!("intercom relay: outbox full; dropped oldest idle control");
-    }
-    state.control_outbox.push_back(frame);
-    Ok(())
 }
 pub struct LegacyActive {
     pub private_id: String,
@@ -161,7 +193,8 @@ pub async fn send(
         )
     };
     let rows = rt.directory().await;
-    let snapshot = json!({"type":"snapshot","machine_id":rt.machine,"sessions":snapshot_rows(rows)});
+    let snapshot =
+        json!({"type":"snapshot","machine_id":rt.machine,"sessions":snapshot_rows(rows)});
     let writer = {
         let mut state = rt.state.lock().unwrap();
         if state.relay_generation != generation {
@@ -663,11 +696,26 @@ pub async fn run(rt: Shared) {
     let mut stop = rt.stop.subscribe();
     let mut delay = BACKOFF_MIN;
     let mut idle_tasks = tokio::task::JoinSet::new();
+    // Keep one bounded operation pool across reconnects. Side-effecting
+    // Herdr calls must finish their ownership bookkeeping even if the reply
+    // path disappears; responses are separately gated by session generation.
+    let mut op_tasks = tokio::task::JoinSet::new();
     let deliveries = delivery_lanes(&rt);
     loop {
         while idle_tasks.try_join_next().is_some() {}
+        while op_tasks.try_join_next().is_some() {}
+        if *stop.borrow() {
+            break;
+        }
         let mut welcomed = None;
-        let result = session(rt.clone(), &mut idle_tasks, &deliveries, &mut welcomed).await;
+        let result = session(
+            rt.clone(),
+            &mut idle_tasks,
+            &mut op_tasks,
+            &deliveries,
+            &mut welcomed,
+        )
+        .await;
         if *stop.borrow() {
             break;
         }
@@ -704,6 +752,7 @@ struct LanesInner<T> {
     per_key: usize,
     keys: usize,
     budget: usize,
+    max_items: usize,
     size: fn(&T) -> usize,
     run: Runner<T>,
     abandon: Abandon<T>,
@@ -711,6 +760,7 @@ struct LanesInner<T> {
 struct LaneQueues<T> {
     lanes: std::collections::HashMap<String, std::collections::VecDeque<T>>,
     bytes: usize,
+    items: usize,
 }
 /// Removes a worker's lane if it dies mid-item (panic or abort) so later
 /// pushes start a fresh worker instead of queueing behind a dead one, and
@@ -730,6 +780,7 @@ impl<T> Drop for LaneWorker<T> {
             let queue = queues.lanes.remove(&self.key).unwrap_or_default();
             let freed: usize = queue.iter().map(self.inner.size).sum();
             queues.bytes = queues.bytes.saturating_sub(freed);
+            queues.items = queues.items.saturating_sub(queue.len());
             queue
         };
         if !stranded.is_empty() {
@@ -743,6 +794,7 @@ impl<T: Send + 'static> Lanes<T> {
         per_key: usize,
         keys: usize,
         budget: usize,
+        max_items: usize,
         size: fn(&T) -> usize,
         run: Runner<T>,
         abandon: Abandon<T>,
@@ -752,11 +804,13 @@ impl<T: Send + 'static> Lanes<T> {
                 queues: std::sync::Mutex::new(LaneQueues {
                     lanes: Default::default(),
                     bytes: 0,
+                    items: 0,
                 }),
                 permits: std::sync::Arc::new(tokio::sync::Semaphore::new(workers)),
                 per_key,
                 keys,
                 budget,
+                max_items,
                 size,
                 run,
                 abandon,
@@ -764,11 +818,15 @@ impl<T: Send + 'static> Lanes<T> {
             workers: Default::default(),
         }
     }
-    /// Returns the item back when its lane, the lane table or the byte budget is full.
+    /// Returns the item back when its lane, the lane table, the byte budget
+    /// or the global item cap is full.
     fn push(&self, key: &str, item: T) -> Result<(), T> {
         let size = (self.inner.size)(&item);
         let mut queues = self.inner.queues.lock().unwrap();
         if queues.bytes.saturating_add(size) > self.inner.budget {
+            return Err(item);
+        }
+        if queues.items >= self.inner.max_items {
             return Err(item);
         }
         if let Some(queue) = queues.lanes.get_mut(key) {
@@ -777,6 +835,7 @@ impl<T: Send + 'static> Lanes<T> {
             }
             queue.push_back(item);
             queues.bytes += size;
+            queues.items += 1;
             return Ok(());
         }
         if queues.lanes.len() >= self.inner.keys {
@@ -786,6 +845,7 @@ impl<T: Send + 'static> Lanes<T> {
             .lanes
             .insert(key.to_string(), std::collections::VecDeque::from([item]));
         queues.bytes += size;
+        queues.items += 1;
         drop(queues);
         let mut worker = LaneWorker {
             inner: self.inner.clone(),
@@ -810,6 +870,7 @@ impl<T: Send + 'static> Lanes<T> {
                         Some(item) => {
                             let freed = (inner.size)(item);
                             queues.bytes = queues.bytes.saturating_sub(freed);
+                            queues.items = queues.items.saturating_sub(1);
                         }
                         None => {
                             queues.lanes.remove(&worker.key);
@@ -826,14 +887,34 @@ impl<T: Send + 'static> Lanes<T> {
     }
 }
 const DELIVERY_WORKERS: usize = 32;
+/// Hard cap on in-flight relay-initiated operations (and their overflow
+/// receipts): spawning one detached task per operation lets a chatty relay
+/// exhaust the runtime, so beyond this the caller rejects or drops instead.
+const REMOTE_OP_TASKS: usize = 64;
+/// Spawns session-owned operation work, returning false when the pool is at
+/// capacity so the caller can reject before any task exists.
+fn spawn_remote_op(
+    tasks: &mut tokio::task::JoinSet<()>,
+    work: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    while tasks.try_join_next().is_some() {}
+    if tasks.len() >= REMOTE_OP_TASKS {
+        return false;
+    }
+    tasks.spawn(work);
+    true
+}
 fn snapshot_rows(rows: Vec<Value>) -> Vec<Value> {
     rows.into_iter()
-        .filter(|v| str_field(v, "machine_id").is_empty() && !str_field(v, "id").starts_with("webhook/"))
+        .filter(|v| {
+            str_field(v, "machine_id").is_empty() && !str_field(v, "id").starts_with("webhook/")
+        })
         .map(super::public_row)
         .collect()
 }
 const DELIVERY_PER_TARGET: usize = 256;
 const DELIVERY_TARGETS: usize = 1024;
+const DELIVERY_ITEMS: usize = 4096;
 const DELIVERY_BYTES: usize = 64 * 1024 * 1024;
 fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
     let rt = rt.clone();
@@ -842,7 +923,11 @@ fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
         DELIVERY_PER_TARGET,
         DELIVERY_TARGETS,
         DELIVERY_BYTES,
-        |frame| str_field(frame, "body").len() + 1024,
+        DELIVERY_ITEMS,
+        // Charge the complete encoded frame, not just the body: the queue
+        // retains the whole Value and headers/metadata can dominate a small
+        // body, so sizing by body would let frames under-report their cost.
+        |frame| frame.to_string().len() + 256,
         {
             let rt = rt.clone();
             std::sync::Arc::new(move |frame| Box::pin(deliver(rt.clone(), frame)))
@@ -951,6 +1036,7 @@ async fn deliver(rt: Shared, v: Value) {
 async fn session(
     rt: Shared,
     idle_tasks: &mut tokio::task::JoinSet<()>,
+    op_tasks: &mut tokio::task::JoinSet<()>,
     deliveries: &Lanes<Value>,
     welcomed: &mut Option<u64>,
 ) -> Result<(), TransportError> {
@@ -999,6 +1085,11 @@ async fn session(
     });
     let mut failed_control = None;
     let mut stop = rt.stop.subscribe();
+    // A stop signaled before or during the handshake must not be missed just
+    // because the subscription was only taken after registration.
+    if *stop.borrow() {
+        return Ok(());
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     let result = loop {
         tokio::select! {
@@ -1032,20 +1123,37 @@ async fn session(
                             if let Err(v)=deliveries.push(&target,v){
                                 eprintln!("intercom relay: delivery queue for {target} full; dropped {}",str_field(&v,"message_id"));
                                 if !str_field(&v,"message_id").is_empty(){
-                                    let rt=rt.clone();tokio::spawn(async move{send_receipt(&rt,str_field(&v,"message_id"),&target,"dropped").await;});
+                                    let rt=rt.clone();
+                                    let mid=str_field(&v,"message_id").to_string();
+                                    let nack_mid=mid.clone();
+                                    if !spawn_remote_op(op_tasks,async move{send_receipt(&rt,&nack_mid,&target,"dropped").await;}){
+                                        eprintln!("intercom relay: operation pool full; delivery nack for {mid} abandoned");
+                                    }
                                 }
                             }
                         }
                         "status"|"workspace_list"|"workspace_create"|"workspace_close"|"session_create"|"session_close"|"agent_prompt"|"agent_keys"|"agent_read"|"agent_wait"=>{
-                            let rt=rt.clone();tokio::spawn(async move{
+                            let request_id=v["id"].clone();
+                            let generation=rt.state.lock().unwrap().relay_generation;
+                            let spawned = spawn_remote_op(op_tasks,{
+                                let rt=rt.clone();
+                                async move{
                                 let mut req=v.clone();req["op"]=v["type"].clone();req["machine"]=json!(rt.machine);req["to"]=if str_field(&v,"type")=="workspace_close"{v["workspace_id"].clone()}else{v["session_id"].clone()};req["workspace"]=v["workspace_id"].clone();
                                 let mut response=if rt.cfg.remote_messages=="refuse"{json!({"type":"error","code":"refused","message":REMOTE_REFUSED})}else{
                                     let result=if str_field(&v,"type")=="status"{{let mut report=rt.status_report().await;if let Some(fields)=report.as_object_mut(){fields.remove("mcp_token_file");}Ok(json!({"report":report}))}}else{super::herdr::dispatch_relay(&rt,&req).await};
                                     match result{Ok(v)=>v,Err(e)=>json!({"type":"error","code":"unavailable","message":e})}
                                 };
                                 response["id"]=v["id"].clone();if response.get("type").is_none(){response["type"]=v["type"].clone();}
-                                let tx=rt.state.lock().unwrap().relay_tx.clone();if let Some(tx)=tx{let _=tx.send(response.into()).await;}
+                                let tx={let state=rt.state.lock().unwrap();(state.relay_generation==generation).then(||state.relay_tx.clone()).flatten()};if let Some(tx)=tx{let _=tx.send(response.into()).await;}
+                                }
                             });
+                            if !spawned {
+                                let mut response=json!({"type":"error","code":"unavailable","message":"relay operation capacity reached; retry later"});
+                                response["id"]=request_id;
+                                if let Some(tx)=rt.state.lock().unwrap().relay_tx.clone(){
+                                    let _=tx.try_send(response.into());
+                                }
+                            }
                         }
                         _=>{}
                     }
@@ -1080,14 +1188,18 @@ pub async fn enroll(c: &Config, new_identity: bool) -> Result<(), String> {
     if c.token.is_empty() {
         return Err("enroll token required".into());
     }
-    if new_identity {
-        match std::fs::remove_file(c.state_dir.join("device.json")) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
+    // Build the candidate identity fully in memory: a failed or incomplete
+    // enrollment must never destroy the only persisted copy of the current
+    // device identity, so device.json is replaced (atomically, via save's
+    // temp-write + rename) only after a valid successful response.
+    let mut id = if new_identity {
+        Identity {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            ..Identity::default()
         }
-    }
-    let mut id = Identity::load(&c.state_dir)?;
+    } else {
+        Identity::load(&c.state_dir)?
+    };
     let mut req=c.http()?.post(format!("{}/v1/enroll",c.server.trim_end_matches('/'))).json(&json!({"token":c.token,"device_id":id.device_id,"name":c.name,"client_version":crate::VERSION}));
     if !id.credential.is_empty() {
         req = req.bearer_auth(&id.credential);
@@ -1535,10 +1647,17 @@ async fn listen_once(
             match str_field(&event, "type") {
                 "deliver" if str_field(&event, "session_id") == session => {
                     let mid = str_field(&event, "message_id");
-                    let message = WebhookMessage { id: mid, from: str_field(&event, "from"), reply_to: str_field(&event, "reply_to"), body: str_field(&event, "body") };
-                    let status = match post_webhook_message(c, endpoint, &message, clock).await {
-                        Ok(_) => "delivered",
-                        Err(error) => { eprintln!("forward {mid}: {error}"); "dropped" },
+                    // Mirror the daemon path: under remote_messages=refuse no
+                    // remote delivery may leave the machine, so refuse on the
+                    // wire without touching the webhook endpoint at all.
+                    let status = if c.remote_messages == "refuse" {
+                        "refused"
+                    } else {
+                        let message = WebhookMessage { id: mid, from: str_field(&event, "from"), reply_to: str_field(&event, "reply_to"), body: str_field(&event, "body") };
+                        match post_webhook_message(c, endpoint, &message, clock).await {
+                            Ok(_) => "delivered",
+                            Err(error) => { eprintln!("forward {mid}: {error}"); "dropped" },
+                        }
                     };
                     if !mid.is_empty() {
                         connection.send(Message::text(json!({"type":"receipt","message_id":mid,"from":session,"status":status}).to_string())).await?;
@@ -1593,19 +1712,8 @@ mod listen_webhook_tests {
         std::fs::write(directory.0.join("leaf.cnf"), "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
         for args in [
             vec![
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                "root.key",
-                "-out",
-                "root.pem",
-                "-days",
-                "1",
-                "-config",
-                "root.cnf",
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "root.key", "-out",
+                "root.pem", "-days", "1", "-config", "root.cnf",
             ],
             vec![
                 "req",
@@ -2050,6 +2158,147 @@ mod listen_webhook_tests {
         assert_eq!(payload["message"]["body"], "right-target");
         assert_eq!(payload["message"]["from"], "Display label");
         assert_eq!(payload["message"]["from_session"], "pi/reply-target");
+    }
+
+    #[tokio::test]
+    async fn listen_refuses_remote_deliveries_without_any_http_request_under_refuse() {
+        let state = StateDir::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (url, mut posts, http) = http_peer(vec![]).await;
+        let config = Config {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            token: "explicit-token".into(),
+            state_dir: state.0.clone(),
+            remote_messages: "refuse".into(),
+            ..Config::default()
+        };
+        let task = tokio::spawn(listen(config, "hermes".into(), url, "secret".into()));
+        let (mut socket, _) = relay_peer(&listener).await;
+        assert_eq!(json_frame(&mut socket).await["type"], "register");
+        socket
+            .send(Message::text(json!({"type":"welcome"}).to_string()))
+            .await
+            .unwrap();
+        assert_eq!(json_frame(&mut socket).await["type"], "snapshot");
+        socket
+            .send(Message::text(
+                json!({"type":"deliver","session_id":"listen/hermes","from":"pi/remote","reply_to":"pi/remote","message_id":"refused-id","body":"must not leave the machine"})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let receipt = json_frame(&mut socket).await;
+        assert_eq!(
+            receipt,
+            json!({"type":"receipt","message_id":"refused-id","from":"listen/hermes","status":"refused"})
+        );
+        assert!(
+            posts.try_recv().is_err(),
+            "webhook endpoint received an HTTP request under remote_messages=refuse"
+        );
+        task.abort();
+        let _ = task.await;
+        http.abort();
+    }
+
+    #[tokio::test]
+    async fn enroll_new_identity_preserves_the_old_device_identity_on_any_failure() {
+        let state = StateDir::new();
+        Identity {
+            device_id: "old-device-id".into(),
+            credential: "old-credential".into(),
+            tenant_id: "old-tenant".into(),
+            server: "http://old-server.invalid".into(),
+        }
+        .save(&state.0)
+        .unwrap();
+        let saved = || -> Value {
+            serde_json::from_slice(&std::fs::read(state.0.join("device.json")).unwrap()).unwrap()
+        };
+        let config = |server: &str| Config {
+            server: server.into(),
+            token: "enroll-token".into(),
+            state_dir: state.0.clone(),
+            ..Config::default()
+        };
+        // HTTP failure from the enrollment server.
+        let (url, mut posts, http) = http_peer(vec![(401, "expired")]).await;
+        let error = enroll(&config(&url), true).await.unwrap_err();
+        assert!(error.contains("enroll"), "{error}");
+        assert_eq!(saved()["device_id"], "old-device-id");
+        assert_eq!(saved()["credential"], "old-credential");
+        assert!(posts.recv().await.is_some());
+        http.await.unwrap();
+        // A 201 whose body is not a valid complete enrollment must not
+        // destroy the old identity either.
+        let (url, mut posts, http) = http_peer(vec![(
+            201,
+            "{\"device_id\":\"other-device\",\"credential\":\"\"}",
+        )])
+        .await;
+        let error = enroll(&config(&url), true).await.unwrap_err();
+        assert!(error.contains("incomplete"), "{error}");
+        assert_eq!(saved()["device_id"], "old-device-id");
+        assert_eq!(saved()["credential"], "old-credential");
+        assert!(posts.recv().await.is_some());
+        http.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enroll_new_identity_replaces_device_json_only_after_a_valid_enrollment() {
+        let state = StateDir::new();
+        Identity {
+            device_id: "old-device-id".into(),
+            credential: "old-credential".into(),
+            tenant_id: "old-tenant".into(),
+            server: "http://old-server.invalid".into(),
+        }
+        .save(&state.0)
+        .unwrap();
+        // Echo peer: answers 201 with the candidate device_id plus fresh
+        // credentials, like a real enrollment server.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut raw = vec![0; length];
+            reader.read_exact(&mut raw).await.unwrap();
+            let request: Value = serde_json::from_slice(&raw).unwrap();
+            let body = json!({"device_id":request["device_id"],"credential":"new-credential","tenant_id":"new-tenant"})
+                .to_string();
+            reader
+                .get_mut()
+                .write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                .await
+                .unwrap();
+        });
+        let config = Config {
+            server: format!("http://{address}"),
+            token: "enroll-token".into(),
+            state_dir: state.0.clone(),
+            ..Config::default()
+        };
+        enroll(&config, true).await.unwrap();
+        server.await.unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(state.0.join("device.json")).unwrap()).unwrap();
+        assert_ne!(saved["device_id"], "old-device-id");
+        assert!(uuid::Uuid::parse_str(saved["device_id"].as_str().unwrap()).is_ok());
+        assert_eq!(saved["credential"], "new-credential");
+        assert_eq!(saved["tenant_id"], "new-tenant");
+        assert_eq!(saved["server"], format!("http://{address}"));
     }
 
     #[tokio::test]

@@ -145,6 +145,7 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
         session(
             active.clone(),
             &mut tokio::task::JoinSet::new(),
+            &mut tokio::task::JoinSet::new(),
             &delivery_lanes(&active),
             &mut None,
         )
@@ -257,11 +258,27 @@ async fn mcp_refuses_to_start_without_a_token_or_on_an_unapproved_public_address
             ..Config::default()
         })
     };
-    let error = super::super::http::start(rt("127.0.0.1:0", " ", false), tokio::sync::watch::channel(false).1).await.unwrap_err();
+    let error = super::super::http::start(
+        rt("127.0.0.1:0", " ", false),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .unwrap_err();
     assert!(error.contains("unauthenticated"), "{error}");
-    let error = super::super::http::start(rt("0.0.0.0:0", "secret", false), tokio::sync::watch::channel(false).1).await.unwrap_err();
+    let error = super::super::http::start(
+        rt("0.0.0.0:0", "secret", false),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .unwrap_err();
     assert!(error.contains("mcp_allow_non_loopback"), "{error}");
-    super::super::http::start(rt("127.0.0.1:0", "secret", false), tokio::sync::watch::channel(false).1).await.unwrap().abort();
+    super::super::http::start(
+        rt("127.0.0.1:0", "secret", false),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .unwrap()
+    .abort();
 }
 
 #[tokio::test]
@@ -271,7 +288,9 @@ async fn mcp_wrong_tokens_on_loopback_cannot_lock_out_the_real_client() {
         mcp_token: "secret".into(),
         ..Config::default()
     });
-    let server = super::super::http::start(rt.clone(), rt.stop.subscribe()).await.unwrap();
+    let server = super::super::http::start(rt.clone(), rt.stop.subscribe())
+        .await
+        .unwrap();
     let url = rt.mcp_url.lock().unwrap().clone();
     let client = reqwest::Client::new();
     let post = |token: &'static str| {
@@ -335,7 +354,9 @@ async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
         mcp_token: "secret".into(),
         ..Config::default()
     });
-    let server = super::super::http::start(rt.clone(), rt.stop.subscribe()).await.unwrap();
+    let server = super::super::http::start(rt.clone(), rt.stop.subscribe())
+        .await
+        .unwrap();
     let url = rt.mcp_url.lock().unwrap().clone();
     let response = reqwest::Client::new()
         .post(url)
@@ -403,6 +424,7 @@ async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_deli
         session(
             active.clone(),
             &mut tokio::task::JoinSet::new(),
+            &mut tokio::task::JoinSet::new(),
             &delivery_lanes(&active),
             &mut None,
         )
@@ -454,6 +476,7 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
             3,
             4,
             16,
+            usize::MAX,
             usize::MAX,
             |_| 1,
             Arc::new(move |item: String| {
@@ -538,6 +561,7 @@ async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
             8,
             8,
             10,
+            usize::MAX,
             |item: &String| item.len(),
             Arc::new(move |item: String| {
                 let (finished, mut gate) = (finished.clone(), gate.clone());
@@ -573,7 +597,14 @@ async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
     tokio::task::yield_now().await;
     release.send_replace(true);
     tokio::time::timeout(Duration::from_secs(1), async {
-        while lanes.inner.queues.lock().unwrap().lanes.contains_key("pi/p") {
+        while lanes
+            .inner
+            .queues
+            .lock()
+            .unwrap()
+            .lanes
+            .contains_key("pi/p")
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -631,6 +662,172 @@ async fn idle_control_backlog_never_rejects_replies_and_keeps_their_order() {
     reply.send(frame).unwrap();
     assert_eq!(answered.await.unwrap()["id"], "ack");
     queue.control(json!({"n":"drained"})).unwrap();
+}
+
+#[tokio::test]
+async fn delivery_lanes_charge_the_full_encoded_frame_and_cap_global_items() {
+    // A small body with oversized non-body metadata must be charged for the
+    // whole encoded frame: the queue retains the entire Value, so the old
+    // body-plus-overhead sizing under-counted what the lane table held.
+    let mut metadata_frame = json!({"type":"deliver","session_id":"pi/a","body":"tiny"});
+    metadata_frame["attachment"] = json!("x".repeat(20_000));
+    let encoded = metadata_frame.to_string().len() + 256;
+    let lanes = Lanes::new(
+        1,
+        8,
+        8,
+        encoded - 1,
+        usize::MAX,
+        |frame: &Value| frame.to_string().len() + 256,
+        std::sync::Arc::new(|_: Value| Box::pin(async {})),
+        std::sync::Arc::new(|_: Vec<Value>| {}),
+    );
+    let rejected = lanes.push("pi/a", metadata_frame.clone());
+    assert!(
+        rejected.is_err(),
+        "metadata-heavy frame fit a byte budget that only charged the body"
+    );
+    assert_eq!(rejected.unwrap_err(), metadata_frame);
+    let mut light = metadata_frame;
+    light["attachment"] = json!("x".repeat(16));
+    lanes.push("pi/a", light.clone()).unwrap();
+    // A global item-count cap backstops the byte budget for many tiny frames.
+    let counted = Lanes::new(
+        1,
+        100,
+        100,
+        usize::MAX,
+        2,
+        |_: &Value| 1,
+        std::sync::Arc::new(|_: Value| Box::pin(async {})),
+        std::sync::Arc::new(|_: Vec<Value>| {}),
+    );
+    counted.push("pi/a", light.clone()).unwrap();
+    counted.push("pi/b", light.clone()).unwrap();
+    assert_eq!(
+        counted.push("pi/c", light.clone()),
+        Err(light),
+        "global item cap did not reject the third queued delivery"
+    );
+}
+
+#[tokio::test]
+async fn enqueue_control_retries_the_new_writer_and_flushes_the_parked_outbox() {
+    let rt = transport_runtime(Config::default());
+    // A dead writer for generation 1: the frame cannot be delivered and must
+    // park in the outbox.
+    let (dead_tx, dead_rx) = mpsc::channel::<super::super::Push>(8);
+    drop(dead_rx);
+    {
+        let mut state = rt.state.lock().unwrap();
+        state.relay_generation = 1;
+        state.relay_tx = Some(dead_tx);
+    }
+    enqueue_control(&rt, json!({"type":"idle_notice","id":"parked"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.state.lock().unwrap().control_outbox.len(),
+        1,
+        "failed send must park the control frame"
+    );
+    // A healthy writer appears under a new generation; the parked frame must
+    // not strand until the next session setup.
+    let (live_tx, mut live_rx) = mpsc::channel::<super::super::Push>(8);
+    {
+        let mut state = rt.state.lock().unwrap();
+        state.relay_generation = 2;
+        state.relay_tx = Some(live_tx);
+    }
+    enqueue_control(&rt, json!({"type":"idle_cancel","id":"fresh"}))
+        .await
+        .unwrap();
+    let first = live_rx.recv().await.unwrap().value;
+    let second = live_rx.recv().await.unwrap().value;
+    assert_eq!(str_field(&first, "id"), "fresh");
+    assert_eq!(
+        str_field(&second, "id"),
+        "parked",
+        "the outbox frame stranded after the healthy connection took over"
+    );
+    assert!(rt.state.lock().unwrap().control_outbox.is_empty());
+}
+
+#[tokio::test]
+async fn remote_op_pool_rejects_past_capacity_and_finishes_side_effects() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut tasks = tokio::task::JoinSet::new();
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let completed = Arc::new(AtomicUsize::new(0));
+    for _ in 0..REMOTE_OP_TASKS {
+        let (mut gate, completed) = (gate.clone(), completed.clone());
+        assert!(
+            spawn_remote_op(&mut tasks, async move {
+                let _ = gate.wait_for(|open| *open).await;
+                completed.fetch_add(1, Ordering::SeqCst);
+            }),
+            "pool rejected spawn {REMOTE_OP_TASKS}"
+        );
+    }
+    assert!(
+        !spawn_remote_op(&mut tasks, async move {}),
+        "unbounded spawn accepted past the operation cap"
+    );
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .expect("session-independent operation bookkeeping stalled");
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        REMOTE_OP_TASKS,
+        "a relay disconnect cancelled side-effecting operation bookkeeping"
+    );
+    assert!(
+        spawn_remote_op(&mut tasks, async move {}),
+        "pool did not accept work after draining"
+    );
+    while tasks.try_join_next().is_some() {}
+}
+
+#[tokio::test]
+async fn session_observes_stop_signaled_before_it_subscribed() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(Config {
+        server: format!("http://{}", listener.local_addr().unwrap()),
+        token: "fixture".into(),
+        ..Config::default()
+    });
+    // Stop fires while the handshake is still in flight; the session must
+    // notice at subscribe time instead of parking in the read loop.
+    rt.stop.send_replace(true);
+    let active = rt.clone();
+    let mut idle_tasks = tokio::task::JoinSet::new();
+    let mut op_tasks = tokio::task::JoinSet::new();
+    let lanes = delivery_lanes(&active);
+    let mut welcomed = None;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        let (result, _peer) = tokio::join!(
+            session(
+                active.clone(),
+                &mut idle_tasks,
+                &mut op_tasks,
+                &lanes,
+                &mut welcomed
+            ),
+            welcomed_peer(&listener)
+        );
+        result
+    })
+    .await;
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "session missed a pre-handshake stop signal: {outcome:?}"
+    );
 }
 
 #[cfg(feature = "test-clock")]
