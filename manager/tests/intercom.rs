@@ -38,6 +38,10 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 const TIMEOUT: Duration = Duration::from_secs(8);
+/// Outlasts the 750ms idle settle plus two 250ms maintenance ticks.
+const IDLE_QUIET: Duration = Duration::from_millis(1500);
+/// Outlasts the daemon's 3s relay snapshot, Desktop reconnect and webhook retry cadence.
+const RESEND_QUIET: Duration = Duration::from_millis(3500);
 static NEXT_HOME: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
@@ -332,6 +336,10 @@ impl Peer {
     }
 
     fn no_event(&mut self) {
+        self.no_event_for(Duration::from_millis(150));
+    }
+
+    fn no_event_for(&mut self, window: Duration) {
         assert!(
             self.pushed.is_empty(),
             "unexpected buffered events: {:?}",
@@ -339,7 +347,7 @@ impl Peer {
         );
         self.reader
             .get_mut()
-            .set_read_timeout(Some(Duration::from_millis(150)))
+            .set_read_timeout(Some(window))
             .unwrap();
         let mut line = String::new();
         match self.reader.read_line(&mut line) {
@@ -664,7 +672,7 @@ fn idle_is_one_shot_bound_to_watcher_and_not_a_message_receipt() {
     let id = subscribed["subscription_id"].clone();
     assert!(id.as_str().is_some_and(|s| !s.is_empty()));
     target.register("target", "waiting", &["read_receipts", "idle_state_v1"]);
-    watcher.no_event();
+    watcher.no_event_for(IDLE_QUIET);
     target.register("target", "idle", &["read_receipts", "idle_state_v1"]);
     let notice = watcher.event("idle_notice");
     assert_eq!(notice["subscription_id"], id);
@@ -680,7 +688,7 @@ fn idle_is_one_shot_bound_to_watcher_and_not_a_message_receipt() {
     );
     target.register("target", "busy", &["read_receipts", "idle_state_v1"]);
     target.register("target", "idle", &["read_receipts", "idle_state_v1"]);
-    watcher.no_event();
+    watcher.no_event_for(IDLE_QUIET);
 }
 
 #[test]
@@ -709,7 +717,7 @@ fn idle_explicit_unregister_is_exit_but_transport_loss_is_not() {
     let subscription = watcher.ok(json!({"op":"subscribe_idle","to":"pi/target"}));
     drop(target);
     fixture.wait_absent("pi/target");
-    watcher.no_event();
+    watcher.no_event_for(IDLE_QUIET);
     let status =
         watcher.ok(json!({"op":"idle_status","subscription_id":subscription["subscription_id"]}));
     assert_eq!(status["status"], "subscribed");
@@ -731,7 +739,7 @@ fn watcher_replacement_cancels_old_subscription_without_notifying_new_owner() {
         .connect()
         .ok(json!({"op":"idle_status","subscription_id":subscription["subscription_id"]}));
     assert_ne!(status["status"], "subscribed");
-    replacement.no_event();
+    replacement.no_event_for(IDLE_QUIET);
 }
 
 #[test]
@@ -1052,4 +1060,85 @@ fn intercom_and_famulus_tasks_share_foreground_manager_pid_and_shutdown() {
         UnixStream::connect(&fixture.sock).is_err(),
         "Pi listener survived manager shutdown"
     );
+}
+
+#[test]
+fn shutdown_with_live_task_and_idle_watch_reports_unavailable_and_exits() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut manager =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
+    manager.hello_ext("shutdown-live-session");
+    let task = manager.request_ok(json!({"type":"start","kind":"shell","command":"sleep 30","cwd":fixture.root,"env":{},"run_in_background":true}));
+    let task_id = task["task_id"].as_str().unwrap().to_string();
+    let mut watcher = fixture.plugin("shutdown-watcher", "busy");
+    let _target = fixture.plugin("shutdown-target", "busy");
+    let subscription = watcher.ok(json!({"op":"subscribe_idle","to":"pi/shutdown-target"}));
+    assert_eq!(subscription["delivery_mode"], "pi_push");
+    let listed = manager.request_ok(json!({"type":"list"}));
+    let pid = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["task_id"] == task_id && row["status"] == "running")
+        .and_then(|row| row["pid"].as_u64())
+        .unwrap_or_else(|| panic!("live task missing before shutdown: {listed}"))
+        as u32;
+    assert!(common::pid_alive(pid));
+    let mut control =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
+    control.hello_cli();
+    control.request_ok(json!({"type":"shutdown"}));
+    let notice = watcher.event("idle_notice");
+    assert_eq!(notice["subscription_id"], subscription["subscription_id"]);
+    assert_eq!(notice["status"], "unavailable");
+    let deadline = Instant::now() + TIMEOUT;
+    while fixture
+        .child
+        .as_mut()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "manager hung shutting down live task with an active idle watch: {}",
+            fixture.log()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        common::poll_true(TIMEOUT, || !common::pid_alive(pid)),
+        "live task survived manager shutdown"
+    );
+    assert!(UnixStream::connect(&fixture.sock).is_err());
+}
+
+#[test]
+fn mixed_version_watchers_share_one_target_without_pushing_to_legacy_plugin() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut modern = fixture.plugin("modern-watcher", "busy");
+    let mut legacy = fixture.connect();
+    legacy.register("legacy-watcher", "busy", &["read_receipts"]);
+    let mut target = fixture.plugin("mixed-target", "busy");
+    let pushed = modern.ok(json!({"op":"subscribe_idle","to":"pi/mixed-target"}));
+    let polled = legacy.ok(json!({"op":"subscribe_idle","to":"pi/mixed-target"}));
+    assert_eq!(pushed["delivery_mode"], "pi_push");
+    assert_eq!(polled["delivery_mode"], "query_only");
+    target.register("mixed-target", "idle", &["read_receipts", "idle_state_v1"]);
+    let notice = modern.event("idle_notice");
+    assert_eq!(notice["subscription_id"], pushed["subscription_id"]);
+    assert_eq!(notice["status"], "idle");
+    assert_eq!(
+        legacy.ok(json!({"op":"idle_status","subscription_id":polled["subscription_id"]}))
+            ["status"],
+        "idle"
+    );
+    legacy.no_event_for(IDLE_QUIET);
+    let sent = legacy.ok(json!({"op":"send","to":"pi/modern-watcher","body":"from legacy"}));
+    assert_eq!(modern.event("deliver")["message_id"], sent["message_id"]);
+    let reply = modern.ok(json!({"op":"send","to":"pi/legacy-watcher","body":"to legacy"}));
+    assert_eq!(legacy.event("deliver")["message_id"], reply["message_id"]);
 }

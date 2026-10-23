@@ -172,6 +172,22 @@ impl Desktop {
             }
         }
     }
+
+    fn assert_no_turn_mutation(&self, why: &str) {
+        let deadline = Instant::now() + RESEND_QUIET;
+        while let Ok(request) = self
+            .requests
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            assert!(
+                !matches!(
+                    request["method"].as_str(),
+                    Some("thread-follower-start-turn" | "thread-follower-steer-turn")
+                ),
+                "{why}: {request}"
+            );
+        }
+    }
 }
 
 impl Drop for Desktop {
@@ -250,13 +266,7 @@ fn shared_catalog_disconnect_before_turn_falls_back_to_healthy_desktop_and_idle_
     let idle = sender.event("idle_notice");
     assert_eq!(idle["subscription_id"], subscription["subscription_id"]);
     assert_eq!(idle["status"], "idle");
-    assert!(
-        !desktop.requests.try_iter().any(|request| matches!(
-            request["method"].as_str(),
-            Some("thread-follower-start-turn" | "thread-follower-steer-turn")
-        )),
-        "healthy Desktop received a duplicate body"
-    );
+    desktop.assert_no_turn_mutation("healthy Desktop received a duplicate body");
 }
 
 #[test]
@@ -273,13 +283,7 @@ fn shared_attach_failure_before_any_send_still_observes_healthy_desktop_idle_wit
     let idle = watcher.event("idle_notice");
     assert_eq!(idle["subscription_id"], subscription["subscription_id"]);
     assert_eq!(idle["status"], "idle");
-    assert!(
-        !desktop.requests.try_iter().any(|request| matches!(
-            request["method"].as_str(),
-            Some("thread-follower-start-turn" | "thread-follower-steer-turn")
-        )),
-        "query-only Desktop idle fallback performed a mutation"
-    );
+    desktop.assert_no_turn_mutation("query-only Desktop idle fallback performed a mutation");
 }
 
 #[test]
@@ -301,13 +305,7 @@ fn shared_loaded_list_unsupported_before_turn_still_uses_healthy_desktop_owner_o
     assert!(request.to_string().contains(body));
     assert_eq!(sender.event("receipt")["message_id"], sent["message_id"]);
     catalog.assert_passive_catalog();
-    assert!(
-        !desktop.requests.try_iter().any(|request| matches!(
-            request["method"].as_str(),
-            Some("thread-follower-start-turn" | "thread-follower-steer-turn")
-        )),
-        "Desktop retried a successful body"
-    );
+    desktop.assert_no_turn_mutation("Desktop retried a successful body");
 }
 
 #[test]
@@ -322,13 +320,7 @@ fn shared_turn_already_written_with_unknown_result_never_retries_on_healthy_desk
     catalog.request("turn/start");
     assert_ne!(sent["ok"], true);
     assert_eq!(sent["status"], "unknown");
-    assert!(
-        !desktop.requests.try_iter().any(|request| matches!(
-            request["method"].as_str(),
-            Some("thread-follower-start-turn" | "thread-follower-steer-turn")
-        )),
-        "uncertain shared mutation was retried through Desktop"
-    );
+    desktop.assert_no_turn_mutation("uncertain shared mutation was retried through Desktop");
     catalog.assert_passive_catalog();
 }
 
@@ -410,12 +402,8 @@ fn desktop_owner_discovery_failure_never_mutates_any_thread() {
     let response = sender.call(json!({"op":"send","to":"codex/desktop-A","body":"no owner"}));
     assert_ne!(response["ok"], true);
     desktop.request("thread-owner-discovery");
+    desktop.assert_no_turn_mutation("undiscovered Desktop owner was mutated");
     _catalog.assert_passive_catalog();
-    assert!(!desktop
-        .requests
-        .try_iter()
-        .any(|r| r["method"] == "thread-follower-start-turn"
-            || r["method"] == "thread-follower-steer-turn"));
 }
 
 #[test]
@@ -429,10 +417,6 @@ fn desktop_transport_loss_after_mutation_is_unknown_not_retried() {
     assert_ne!(response["ok"], true);
     assert_eq!(response["status"], "unknown");
     desktop.request("thread-follower-start-turn");
+    desktop.assert_no_turn_mutation("unknown Desktop mutation was retried");
     _catalog.assert_passive_catalog();
-    assert!(!desktop
-        .requests
-        .try_iter()
-        .any(|r| r["method"] == "thread-follower-start-turn"
-            || r["method"] == "thread-follower-steer-turn"));
 }
