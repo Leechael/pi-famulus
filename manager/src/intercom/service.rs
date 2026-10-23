@@ -499,6 +499,8 @@ fn carried_environment(
             || matches!(
                 key.as_str(),
                 "CODEX_HOME"
+                    | "CODEX_APP_SERVER_SOCK"
+                    | "CODEX_APP_SERVER_SOCKET"
                     | "CLAUDE_CONFIG_DIR"
                     | "CLAUDE_CODE_HARBOR_KITE"
                     | "HTTP_PROXY"
@@ -1254,6 +1256,7 @@ mod tests {
         assert_eq!(env[1].0, "AGENT_INTERCOM_SERVER");
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_validation_rejects_relative_and_mismatched_paths() {
         let config = Path::new("/tmp/client.toml");
@@ -1386,6 +1389,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_path_marker_uses_last_marker_and_ignores_shell_noise() {
         assert_eq!(parse_login_shell_path("noise\n__AGENT_INTERCOM_PATH__/old\nnoise\n__AGENT_INTERCOM_PATH__/bin:/opt/bin\nbye"), vec![PathBuf::from("/bin"), PathBuf::from("/opt/bin")]);
