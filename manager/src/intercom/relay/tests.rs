@@ -138,7 +138,13 @@ async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadlin
     let active = rt.clone();
     let mut task =
         tokio::spawn(
-            async move { session(active, &mut tokio::task::JoinSet::new(), &mut false).await },
+            async move { session(
+            active.clone(),
+            &mut tokio::task::JoinSet::new(),
+            &delivery_lanes(&active),
+            &mut false,
+        )
+        .await },
         );
     let writer = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -290,7 +296,13 @@ async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_deli
     });
     let active = rt.clone();
     let task = tokio::spawn(async move {
-        session(active, &mut tokio::task::JoinSet::new(), &mut false).await
+        session(
+            active.clone(),
+            &mut tokio::task::JoinSet::new(),
+            &delivery_lanes(&active),
+            &mut false,
+        )
+        .await
     });
     let mut peer = welcomed_peer(&listener).await;
     for op in [
@@ -320,4 +332,77 @@ async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_deli
     assert_eq!(receipt["status"], "refused");
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    let log = Arc::new(Mutex::new(Vec::<(String, &'static str)>::new()));
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let lanes = {
+        let (log, running, peak) = (log.clone(), running.clone(), peak.clone());
+        Lanes::new(
+            3,
+            4,
+            16,
+            Arc::new(move |item: String| {
+                let (log, running, peak, mut gate) =
+                    (log.clone(), running.clone(), peak.clone(), gate.clone());
+                Box::pin(async move {
+                    peak.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    log.lock().unwrap().push((item.clone(), "start"));
+                    let _ = gate.wait_for(|open| *open).await;
+                    tokio::task::yield_now().await;
+                    log.lock().unwrap().push((item, "end"));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+            }),
+        )
+    };
+    for n in 0..4 {
+        lanes.push("pi/a", format!("a{n}")).unwrap();
+    }
+    assert_eq!(
+        lanes.push("pi/a", "a-overflow".into()),
+        Err("a-overflow".into()),
+        "a full per-target lane must reject instead of growing"
+    );
+    for key in 0..8 {
+        lanes.push(&format!("pi/k{key}"), format!("k{key}")).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(running.load(Ordering::SeqCst), 3);
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while log.lock().unwrap().len() < 24 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(peak.load(Ordering::SeqCst) <= 3, "deliveries exceeded the worker cap");
+    let lane_a: Vec<_> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(item, _)| item.starts_with('a'))
+        .cloned()
+        .collect();
+    let expected: Vec<_> = (0..4)
+        .flat_map(|n| [(format!("a{n}"), "start"), (format!("a{n}"), "end")])
+        .collect();
+    assert_eq!(lane_a, expected, "one target's deliveries overlapped or reordered");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !lanes.inner.queues.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle lanes must release their table entry");
+    lanes.push("pi/a", "a-after".into()).unwrap();
 }

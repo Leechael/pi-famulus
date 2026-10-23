@@ -615,10 +615,11 @@ pub async fn run(rt: Shared) {
     let mut stop = rt.stop.subscribe();
     let mut delay = BACKOFF_MIN;
     let mut idle_tasks = tokio::task::JoinSet::new();
+    let deliveries = delivery_lanes(&rt);
     loop {
         while idle_tasks.try_join_next().is_some() {}
         let mut registered = false;
-        let result = session(rt.clone(), &mut idle_tasks, &mut registered).await;
+        let result = session(rt.clone(), &mut idle_tasks, &deliveries, &mut registered).await;
         if *stop.borrow() {
             break;
         }
@@ -636,16 +637,101 @@ pub async fn run(rt: Shared) {
         delay = next;
     }
 }
+type Runner<T> = std::sync::Arc<dyn Fn(T) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+/// Per-key FIFO lanes: one worker per busy key keeps that key's items in
+/// arrival order, and a shared semaphore caps how many keys run at once.
+struct Lanes<T> {
+    inner: std::sync::Arc<LanesInner<T>>,
+}
+struct LanesInner<T> {
+    queues: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<T>>>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    per_key: usize,
+    keys: usize,
+    run: Runner<T>,
+}
+impl<T: Send + 'static> Lanes<T> {
+    fn new(workers: usize, per_key: usize, keys: usize, run: Runner<T>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(LanesInner {
+                queues: Default::default(),
+                permits: std::sync::Arc::new(tokio::sync::Semaphore::new(workers)),
+                per_key,
+                keys,
+                run,
+            }),
+        }
+    }
+    /// Returns the item back when its lane (or the lane table) is full.
+    fn push(&self, key: &str, item: T) -> Result<(), T> {
+        let mut queues = self.inner.queues.lock().unwrap();
+        if let Some(queue) = queues.get_mut(key) {
+            if queue.len() >= self.inner.per_key {
+                return Err(item);
+            }
+            queue.push_back(item);
+            return Ok(());
+        }
+        if queues.len() >= self.inner.keys {
+            return Err(item);
+        }
+        queues.insert(key.to_string(), std::collections::VecDeque::from([item]));
+        drop(queues);
+        let inner = self.inner.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok(_permit) = inner.permits.clone().acquire_owned().await else {
+                    break;
+                };
+                let next = {
+                    let mut queues = inner.queues.lock().unwrap();
+                    let next = queues.get_mut(&key).and_then(|queue| queue.pop_front());
+                    if next.is_none() {
+                        queues.remove(&key);
+                    }
+                    next
+                };
+                let Some(item) = next else { break };
+                (inner.run)(item).await;
+            }
+        });
+        Ok(())
+    }
+}
+const DELIVERY_WORKERS: usize = 32;
+const DELIVERY_PER_TARGET: usize = 256;
+const DELIVERY_TARGETS: usize = 1024;
+fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
+    let rt = rt.clone();
+    Lanes::new(
+        DELIVERY_WORKERS,
+        DELIVERY_PER_TARGET,
+        DELIVERY_TARGETS,
+        std::sync::Arc::new(move |frame| Box::pin(deliver(rt.clone(), frame))),
+    )
+}
+fn deliver_target(v: &Value) -> &str {
+    if str_field(v, "session_id").is_empty() {
+        str_field(v, "to")
+    } else {
+        str_field(v, "session_id")
+    }
+}
+async fn send_receipt(rt: &Runtime, mid: &str, target: &str, status: &str) {
+    let writer = rt.state.lock().unwrap().relay_tx.clone();
+    if let Some(writer) = writer {
+        let _ = writer
+            .send(json!({"type":"receipt","message_id":mid,"from":target,"status":status}).into())
+            .await;
+    }
+}
 // Every relay-initiated operation is refused, reads included: status and
 // agent_read/agent_wait expose local session state and terminal contents.
 const REMOTE_REFUSED: &str = "cross-machine operation refused: remote_messages=refuse";
 async fn deliver(rt: Shared, v: Value) {
     let mid = str_field(&v, "message_id");
-    let target = if str_field(&v, "session_id").is_empty() {
-        str_field(&v, "to")
-    } else {
-        str_field(&v, "session_id")
-    };
+    let target = deliver_target(&v);
     let origin = if str_field(&v, "reply_to").is_empty() {
         str_field(&v, "from")
     } else {
@@ -698,16 +784,12 @@ async fn deliver(rt: Shared, v: Value) {
             }
         }
     };
-    let writer = rt.state.lock().unwrap().relay_tx.clone();
-    if let Some(writer) = writer {
-        let _ = writer
-            .send(json!({"type":"receipt","message_id":mid,"from":target,"status":status}).into())
-            .await;
-    }
+    send_receipt(&rt, mid, target, &status).await;
 }
 async fn session(
     rt: Shared,
     idle_tasks: &mut tokio::task::JoinSet<()>,
+    deliveries: &Lanes<Value>,
     registered: &mut bool,
 ) -> Result<(), TransportError> {
     let mut ws = Conn::connect(&rt.cfg, rt.clock.clone()).await?;
@@ -784,7 +866,13 @@ async fn session(
                             }
                         }
                         "deliver"=>{
-                            let rt=rt.clone();tokio::spawn(async move {deliver(rt,v).await;});
+                            let target=deliver_target(&v).to_string();
+                            if let Err(v)=deliveries.push(&target,v){
+                                eprintln!("intercom relay: delivery queue for {target} full; dropped {}",str_field(&v,"message_id"));
+                                if !str_field(&v,"message_id").is_empty(){
+                                    let rt=rt.clone();tokio::spawn(async move{send_receipt(&rt,str_field(&v,"message_id"),&target,"dropped").await;});
+                                }
+                            }
                         }
                         "status"|"workspace_list"|"workspace_create"|"workspace_close"|"session_create"|"session_close"|"agent_prompt"|"agent_keys"|"agent_read"|"agent_wait"=>{
                             let rt=rt.clone();tokio::spawn(async move{
