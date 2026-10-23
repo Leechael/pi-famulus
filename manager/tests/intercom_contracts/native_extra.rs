@@ -401,13 +401,27 @@ fn crashed_native_alias_is_republished_by_regular_sync_without_user_repair() {
 #[test]
 fn native_aliases_do_not_reintroduce_retired_default_64_process_cap() {
     let mut fixture = Fixture::new();
+    let native = ClaudePeer::new(&fixture);
     fixture.start();
-    let plugins: Vec<Peer> = (0..65)
+    let mut plugins: Vec<Peer> = (0..65)
         .map(|i| fixture.plugin(&format!("many-{i}"), "busy"))
         .collect();
+    let mut pids = std::collections::BTreeSet::new();
+    for i in 0..65 {
+        let alias = alias_record(&fixture, &format!("pi/many-{i}"));
+        let pid = alias["pid"].as_u64().unwrap() as u32;
+        assert!(common::pid_alive(pid), "alias many-{i} is not running");
+        assert!(pids.insert(pid), "alias many-{i} shares process {pid}");
+    }
     let last = alias_record(&fixture, "pi/many-64");
-    assert!(common::pid_alive(last["pid"].as_u64().unwrap() as u32));
-    assert_eq!(plugins.len(), 65);
+    let id = "223bfe8d-0039-4cbd-b1f9-a892a2773d65";
+    native.send_control(
+        last["messagingSocketPath"].as_str().unwrap(),
+        native_user(&native, id, "sixty-fifth alias delivers"),
+    );
+    let delivered = plugins[64].event("deliver");
+    assert_eq!(delivered["message_id"], id);
+    assert_eq!(delivered["body"], "sixty-fifth alias delivers");
 }
 
 #[test]
