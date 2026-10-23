@@ -23,24 +23,37 @@ pub fn socket_path() -> PathBuf {
     }
 }
 pub async fn call(method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    call_at(&socket_path(), method, params, timeout).await
+}
+async fn call_at(
+    path: &std::path::Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
     #[cfg(unix)]
     {
-        let mut stream = tokio::net::UnixStream::connect(socket_path())
-            .await
-            .map_err(|e| format!("herdr not available: {e}"))?;
         let id = uuid::Uuid::new_v4().to_string();
-        let mut line = json!({"id":id,"method":method,"params":params}).to_string();
-        line.push('\n');
-        stream
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(stream).take((1 << 20) + 1);
-        let mut line = String::new();
-        tokio::time::timeout(timeout, reader.read_line(&mut line))
-            .await
-            .map_err(|_| "Herdr timed out".to_string())?
-            .map_err(|e| e.to_string())?;
+        let line = tokio::time::timeout(timeout, async {
+            let mut stream = tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(|e| format!("herdr not available: {e}"))?;
+            let mut line = json!({"id":id,"method":method,"params":params}).to_string();
+            line.push('\n');
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut reader = BufReader::new(stream).take((1 << 20) + 1);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(line)
+        })
+        .await
+        .map_err(|_| "Herdr timed out".to_string())??;
         if line.len() > (1 << 20) {
             return Err("Herdr response exceeds frame limit".into());
         }
@@ -59,7 +72,7 @@ pub async fn call(method: &str, params: Value, timeout: Duration) -> Result<Valu
     }
     #[cfg(not(unix))]
     {
-        let _ = (method, params, timeout);
+        let _ = (path, method, params, timeout);
         Err("Herdr native IPC supports Linux/macOS only".into())
     }
 }
@@ -102,10 +115,26 @@ fn native_ids(pane: &Value) -> Vec<String> {
     }
 }
 pub async fn overlay(rt: &Runtime, rows: &mut Vec<Value>) {
-    let Ok(panes) = panes().await else { return };
+    overlay_at(&socket_path(), &rt.machine, &rt.cfg.name, rows).await;
+}
+// The directory is read on every send and listing; a wedged Herdr may delay it
+// by at most this budget rather than by every per-pane request timeout.
+const OVERLAY_BUDGET: Duration = Duration::from_secs(2);
+async fn overlay_at(
+    path: &std::path::Path,
+    machine: &str,
+    machine_name: &str,
+    rows: &mut Vec<Value>,
+) {
+    let deadline = tokio::time::Instant::now() + OVERLAY_BUDGET;
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let Ok(listed) = call_at(path, "pane.list", json!({}), remaining()).await else {
+        return;
+    };
+    let panes = listed["panes"].as_array().cloned().unwrap_or_default();
     let local = |row: &Value| {
-        let machine = str_field(row, "machine_id");
-        machine.is_empty() || machine == rt.machine
+        let row_machine = str_field(row, "machine_id");
+        row_machine.is_empty() || row_machine == machine
     };
     let mut used = HashSet::new();
     let mut bound_panes = HashSet::new();
@@ -158,7 +187,17 @@ pub async fn overlay(rt: &Runtime, rows: &mut Vec<Value>) {
         if candidates.is_empty() {
             break;
         }
-        if let Ok(result) = quick("pane.process_info", json!({"target":pane["pane_id"]})).await {
+        if remaining().is_zero() {
+            break;
+        }
+        if let Ok(result) = call_at(
+            path,
+            "pane.process_info",
+            json!({"target":pane["pane_id"]}),
+            remaining(),
+        )
+        .await
+        {
             for process in result["process_info"]["foreground_processes"]
                 .as_array()
                 .into_iter()
@@ -228,7 +267,7 @@ pub async fn overlay(rt: &Runtime, rows: &mut Vec<Value>) {
             }
             rows.push(json!({
                 "id":id,"harness":"codex","status":"offline","cwd":cwd,
-                "machine_id":rt.machine,"machine_name":rt.cfg.name,
+                "machine_id":machine,"machine_name":machine_name,
                 "herdr_pane_id":pane_id,"herdr_workspace_id":pane["workspace_id"],
                 "herdr_status":pane["agent_status"]
             }));
@@ -241,7 +280,7 @@ pub async fn overlay(rt: &Runtime, rows: &mut Vec<Value>) {
         };
         rows.push(json!({
             "id":pane_id,"name":name,"harness":agent,"cwd":cwd,
-            "machine_id":rt.machine,"machine_name":rt.cfg.name,
+            "machine_id":machine,"machine_name":machine_name,
             "herdr_pane_id":pane_id,"herdr_workspace_id":pane["workspace_id"],
             "herdr_status":pane["agent_status"],"all":true
         }));
@@ -494,5 +533,37 @@ pub async fn dispatch(rt: &Runtime, req: &Value) -> Result<Value, String> {
             })
         }
         _ => Err(format!("unknown Herdr operation {op}")),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wedged_herdr_delays_the_directory_overlay_by_at_most_its_budget() {
+        let path = PathBuf::from(format!(
+            "/tmp/hd-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let held = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                streams.push(stream);
+            }
+        });
+        let mut rows = vec![json!({"id":"pi/a","harness":"pi","herdr_pane_id":"p1"})];
+        let before = rows.clone();
+        let started = tokio::time::Instant::now();
+        overlay_at(&path, "machine", "host", &mut rows).await;
+        assert!(
+            started.elapsed() < OVERLAY_BUDGET + Duration::from_millis(500),
+            "overlay stalled for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(rows, before, "a timed-out Herdr must leave rows untouched");
+        held.abort();
+        let _ = std::fs::remove_file(path);
     }
 }
