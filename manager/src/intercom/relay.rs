@@ -1040,7 +1040,7 @@ async fn session(
                             let rt=rt.clone();tokio::spawn(async move{
                                 let mut req=v.clone();req["op"]=v["type"].clone();req["machine"]=json!(rt.machine);req["to"]=if str_field(&v,"type")=="workspace_close"{v["workspace_id"].clone()}else{v["session_id"].clone()};req["workspace"]=v["workspace_id"].clone();
                                 let mut response=if rt.cfg.remote_messages=="refuse"{json!({"type":"error","code":"refused","message":REMOTE_REFUSED})}else{
-                                    let result=if str_field(&v,"type")=="status"{Ok(json!({"report":rt.status_report().await}))}else{super::herdr::dispatch_relay(&rt,&req).await};
+                                    let result=if str_field(&v,"type")=="status"{{let mut report=rt.status_report().await;if let Some(fields)=report.as_object_mut(){fields.remove("mcp_token_file");}Ok(json!({"report":report}))}}else{super::herdr::dispatch_relay(&rt,&req).await};
                                     match result{Ok(v)=>v,Err(e)=>json!({"type":"error","code":"unavailable","message":e})}
                                 };
                                 response["id"]=v["id"].clone();if response.get("type").is_none(){response["type"]=v["type"].clone();}

@@ -267,6 +267,22 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
 }
 
 #[test]
+fn relay_status_report_does_not_reveal_the_mcp_token_location() {
+    let relay = WireRelay::new(relay_basics);
+    let mut fixture = Fixture::new();
+    let listen = vacant_address().to_string();
+    start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
+    relay.outgoing.send(json!({"type":"status","id":"status-fields","origin_machine":"other-device"})).unwrap();
+    let reply = relay.request("status");
+    assert_eq!(reply["id"], "status-fields");
+    assert_eq!(reply["report"]["mcp_status"], "running", "{reply}");
+    assert!(
+        reply["report"].get("mcp_token_file").is_none(),
+        "a relay peer learned where the MCP token lives: {reply}"
+    );
+}
+
+#[test]
 fn late_rpc_reply_is_never_redispatched_as_a_new_forwarded_status_request() {
     let relay = WireRelay::new(relay_basics);
     let mut fixture = Fixture::new();

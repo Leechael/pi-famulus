@@ -192,6 +192,7 @@ fn accepts(headers: &HeaderMap) -> bool {
 const FREE_AUTH_FAILURES: u32 = 5;
 const MAX_AUTH_LOCKOUT: Duration = Duration::from_secs(60);
 const AUTH_FAILURE_MEMORY: Duration = Duration::from_secs(600);
+const AUTH_FAILURE_PEERS: usize = 4096;
 /// Per-peer failed-bearer backoff: after a few wrong tokens a peer is refused
 /// without a token check for a doubling interval, capped at a minute. Loopback
 /// peers share one address across local users, so throttling them would let
@@ -208,7 +209,7 @@ impl AuthThrottle {
         Duration::from_secs(1u64 << (failures - FREE_AUTH_FAILURES).min(6)).min(MAX_AUTH_LOCKOUT)
     }
     fn retry_after(&self, peer: IpAddr, now: Instant) -> Option<Duration> {
-        if peer.is_loopback() {
+        if peer.to_canonical().is_loopback() {
             return None;
         }
         let failures = self.failures.lock().unwrap();
@@ -217,14 +218,20 @@ impl AuthThrottle {
         (until > now).then(|| until - now)
     }
     fn failed(&self, peer: IpAddr, now: Instant) {
-        if peer.is_loopback() {
+        if peer.to_canonical().is_loopback() {
             return;
         }
         let mut failures = self.failures.lock().unwrap();
-        if failures.len() >= 4096 {
+        if failures.len() >= AUTH_FAILURE_PEERS && !failures.contains_key(&peer) {
             failures.retain(|_, (_, last)| {
                 now.saturating_duration_since(*last) < AUTH_FAILURE_MEMORY
             });
+            // Still full of fresh sources: evict the stalest rather than grow.
+            if failures.len() >= AUTH_FAILURE_PEERS {
+                if let Some(stalest) = failures.iter().min_by_key(|(_, (_, last))| *last).map(|(ip, _)| *ip) {
+                    failures.remove(&stalest);
+                }
+            }
         }
         let entry = failures.entry(peer).or_insert((0, now));
         if now.saturating_duration_since(entry.1) >= AUTH_FAILURE_MEMORY {
@@ -1141,13 +1148,23 @@ mod tests {
     fn loopback_peers_are_never_locked_out_by_another_local_user() {
         let throttle = AuthThrottle::default();
         let start = Instant::now();
-        for peer in ["127.0.0.1", "::1"] {
+        for peer in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
             let peer: IpAddr = peer.parse().unwrap();
             for _ in 0..FREE_AUTH_FAILURES * 4 {
                 throttle.failed(peer, start);
             }
             assert_eq!(throttle.retry_after(peer, start), None);
         }
+    }
+
+    #[test]
+    fn failure_table_stays_bounded_under_a_flood_of_fresh_sources() {
+        let throttle = AuthThrottle::default();
+        let now = Instant::now();
+        for n in 0..(AUTH_FAILURE_PEERS as u32 + 500) {
+            throttle.failed(IpAddr::V6(std::net::Ipv6Addr::from(0x2001_0db8_u128 << 96 | u128::from(n))), now);
+        }
+        assert!(throttle.failures.lock().unwrap().len() <= AUTH_FAILURE_PEERS);
     }
 
     #[test]
