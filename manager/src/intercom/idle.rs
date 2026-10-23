@@ -5,6 +5,7 @@ const IDLE_TTL: u64 = 12 * 3600 * 1000;
 const IDLE_RECORDS: usize = 1024;
 const IDLE_PENDING: usize = 32;
 const IDLE_PER_WATCHER: usize = 4;
+const IDLE_FLUSH: Duration = Duration::from_secs(5);
 
 struct Admission {
     status: String,
@@ -844,7 +845,7 @@ impl Runtime {
                 self.dispatch_idle(&id, record).await;
             },
         );
-        let _ = tokio::time::timeout(Duration::from_millis(250), notifications).await;
+        let _ = tokio::time::timeout(IDLE_FLUSH, notifications).await;
     }
 }
 
@@ -991,6 +992,42 @@ mod tests {
         assert_eq!(
             runtime.state.lock().unwrap().subscriptions[&known].status,
             "idle"
+        );
+    }
+    #[tokio::test]
+    async fn shutdown_flush_waits_for_a_slow_idle_notice_write() {
+        let runtime = runtime();
+        let (tx, mut rx) = mpsc::channel(4);
+        {
+            let mut state = runtime.state.lock().unwrap();
+            state.sessions.insert(
+                "pi/watcher".into(),
+                Session {
+                    value: json!({"id":"pi/watcher","harness":"pi"}),
+                    owner: 1,
+                    epoch: 1,
+                    tx,
+                    disconnect: None,
+                    caps: HashSet::new(),
+                    idle_since: None,
+                },
+            );
+            let mut subscription = record("pi/watcher", "pi/target");
+            subscription.mode = "pi_push".into();
+            subscription.epoch = Some(1);
+            subscription.created = runtime.clock.now_ms();
+            state.subscriptions.insert("flushed".into(), subscription);
+        }
+        let writer = async {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.value["status"], "unavailable");
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            frame.written.unwrap().send(Ok(())).is_ok()
+        };
+        let (_, waited) = tokio::join!(runtime.finish_idle("unavailable"), writer);
+        assert!(
+            waited,
+            "shutdown must not abandon an idle notice the watcher is still writing"
         );
     }
     #[test]
