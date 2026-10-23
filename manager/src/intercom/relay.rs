@@ -18,6 +18,53 @@ enum OrderedIncoming {
     Control(Value),
     Reply(Value, oneshot::Sender<Value>),
 }
+const IDLE_CONTROL_QUEUE: usize = 128;
+/// Keeps replies ordered behind earlier idle controls without letting a
+/// control backlog reject them: only controls count against the cap, and
+/// replies are already bounded by the pending-call table.
+struct OrderedQueue {
+    tx: mpsc::UnboundedSender<OrderedIncoming>,
+    controls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+struct OrderedReceiver {
+    rx: mpsc::UnboundedReceiver<OrderedIncoming>,
+    controls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+fn ordered_queue() -> (OrderedQueue, OrderedReceiver) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let controls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        OrderedQueue {
+            tx,
+            controls: controls.clone(),
+        },
+        OrderedReceiver { rx, controls },
+    )
+}
+impl OrderedQueue {
+    fn control(&self, frame: Value) -> Result<(), ()> {
+        use std::sync::atomic::Ordering;
+        if self.controls.fetch_add(1, Ordering::SeqCst) >= IDLE_CONTROL_QUEUE {
+            self.controls.fetch_sub(1, Ordering::SeqCst);
+            return Err(());
+        }
+        let _ = self.tx.send(OrderedIncoming::Control(frame));
+        Ok(())
+    }
+    fn reply(&self, frame: Value, reply: oneshot::Sender<Value>) {
+        let _ = self.tx.send(OrderedIncoming::Reply(frame, reply));
+    }
+}
+impl OrderedReceiver {
+    async fn recv(&mut self) -> Option<OrderedIncoming> {
+        let frame = self.rx.recv().await?;
+        if matches!(frame, OrderedIncoming::Control(_)) {
+            self.controls
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Some(frame)
+    }
+}
 struct PendingCall<'a> {
     runtime: &'a Runtime,
     id: String,
@@ -92,6 +139,18 @@ pub async fn send(
                 .into(),
         );
     }
+    let mut request =
+        json!({"type":"send","to":target,"body":body,"reply_to":origin,"from_mode":mode});
+    if capability {
+        request["message_id"] = json!(mid);
+    }
+    // Leave headroom for the request id call_on adds.
+    if request.to_string().len() + 64 > MAX_FRAME {
+        rt.state.lock().unwrap().forget_delivery(mid);
+        return Err(format!(
+            "message too large for relay: encoded send frame exceeds {MAX_FRAME} bytes"
+        ));
+    }
     let _gate = if capability {
         None
     } else {
@@ -121,11 +180,6 @@ pub async fn send(
     if writer.send(snapshot.into()).await.is_err() {
         rt.state.lock().unwrap().legacy_active = None;
         return Err("relay connection changed before send".into());
-    }
-    let mut request =
-        json!({"type":"send","to":target,"body":body,"reply_to":origin,"from_mode":mode});
-    if capability {
-        request["message_id"] = json!(mid);
     }
     let response = call_on(rt, request, generation, fence).await;
     let mut state = rt.state.lock().unwrap();
@@ -241,9 +295,11 @@ async fn call_on(
     };
     result
 }
+pub(super) const MAX_FRAME: usize = 1 << 20;
 pub(super) const AUTH_RETRY_DELAY: Duration = Duration::from_secs(300);
 pub(super) const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub(super) const BACKOFF_MAX: Duration = Duration::from_secs(30);
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub(super) enum TransportError {
@@ -493,42 +549,23 @@ async fn dial(c: &Config) -> Result<Socket, String> {
     dial_typed(c).await.map_err(|error| error.to_string())
 }
 async fn dial_typed(c: &Config) -> Result<Socket, TransportError> {
-    static PLAIN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let cache = PLAIN.get_or_init(Default::default);
-    let key = c.server.trim_end_matches('/');
-    let cached = cache.lock().unwrap().contains(key);
-    let first = dial_attempt(c, cached).await;
-    let result = match first {
-        Err(TransportError::TlsRecordHeader { prefix, .. }) if !cached && prefix == *b"HTTP/" => {
-            let result = dial_attempt(c, true).await;
-            if result.is_ok() {
-                cache.lock().unwrap().insert(key.into());
-            }
-            result
+    match dial_attempt(c).await {
+        Err(TransportError::TlsRecordHeader { prefix, .. }) if prefix == *b"HTTP/" => {
+            Err(TransportError::Io(
+                "relay server answered TLS with cleartext HTTP; refusing to send the relay token \
+                 unencrypted (configure an http:// or ws:// server URL to opt in)"
+                    .into(),
+            ))
         }
-        result => {
-            return if cached && result.is_ok() {
-                eprintln!(
-                    "intercom relay: server uses cleartext HTTP; the token travels unencrypted"
-                );
-                result
-            } else {
-                result
-            }
-        }
-    };
-    if result.is_ok() {
-        eprintln!("intercom relay: server uses cleartext HTTP; the token travels unencrypted");
+        result => result,
     }
-    result
 }
-async fn dial_attempt(c: &Config, plain: bool) -> Result<Socket, TransportError> {
+async fn dial_attempt(c: &Config) -> Result<Socket, TransportError> {
     let mut url =
         reqwest::Url::parse(&c.server).map_err(|error| TransportError::Io(error.to_string()))?;
     let scheme = match url.scheme() {
-        "https" | "wss" if !plain => "wss",
-        "https" | "wss" | "http" | "ws" => "ws",
+        "https" | "wss" => "wss",
+        "http" | "ws" => "ws",
         _ => return Err("relay URL must use http(s) or ws(s)".into()),
     };
     url.set_scheme(scheme)
@@ -574,8 +611,8 @@ async fn dial_attempt(c: &Config, plain: bool) -> Result<Socket, TransportError>
             },
             Some(
                 tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                    .max_message_size(Some(1 << 20))
-                    .max_frame_size(Some(1 << 20)),
+                    .max_message_size(Some(MAX_FRAME))
+                    .max_frame_size(Some(MAX_FRAME)),
             ),
             Some(connector),
         )
@@ -626,14 +663,18 @@ pub async fn run(rt: Shared) {
     let mut stop = rt.stop.subscribe();
     let mut delay = BACKOFF_MIN;
     let mut idle_tasks = tokio::task::JoinSet::new();
+    let deliveries = delivery_lanes(&rt);
     loop {
         while idle_tasks.try_join_next().is_some() {}
-        let mut registered = false;
-        let result = session(rt.clone(), &mut idle_tasks, &mut registered).await;
+        let mut welcomed = None;
+        let result = session(rt.clone(), &mut idle_tasks, &deliveries, &mut welcomed).await;
         if *stop.borrow() {
             break;
         }
-        if registered {
+        // A relay that welcomes and then drops at once must not defeat backoff.
+        if welcomed.is_some_and(|at| {
+            rt.clock.now_ms().saturating_sub(at) >= HEALTHY_SESSION.as_millis() as u64
+        }) {
             delay = BACKOFF_MIN;
         }
         let (mut wait, next) = next_backoff(delay);
@@ -647,19 +688,111 @@ pub async fn run(rt: Shared) {
         delay = next;
     }
 }
+type Runner<T> =
+    std::sync::Arc<dyn Fn(T) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+/// Per-key FIFO lanes: one worker per busy key keeps that key's items in
+/// arrival order, and a shared semaphore caps how many keys run at once.
+struct Lanes<T> {
+    inner: std::sync::Arc<LanesInner<T>>,
+}
+struct LanesInner<T> {
+    queues: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<T>>>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    per_key: usize,
+    keys: usize,
+    run: Runner<T>,
+}
+impl<T: Send + 'static> Lanes<T> {
+    fn new(workers: usize, per_key: usize, keys: usize, run: Runner<T>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(LanesInner {
+                queues: Default::default(),
+                permits: std::sync::Arc::new(tokio::sync::Semaphore::new(workers)),
+                per_key,
+                keys,
+                run,
+            }),
+        }
+    }
+    /// Returns the item back when its lane (or the lane table) is full.
+    fn push(&self, key: &str, item: T) -> Result<(), T> {
+        let mut queues = self.inner.queues.lock().unwrap();
+        if let Some(queue) = queues.get_mut(key) {
+            if queue.len() >= self.inner.per_key {
+                return Err(item);
+            }
+            queue.push_back(item);
+            return Ok(());
+        }
+        if queues.len() >= self.inner.keys {
+            return Err(item);
+        }
+        queues.insert(key.to_string(), std::collections::VecDeque::from([item]));
+        drop(queues);
+        let inner = self.inner.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok(_permit) = inner.permits.clone().acquire_owned().await else {
+                    break;
+                };
+                let next = {
+                    let mut queues = inner.queues.lock().unwrap();
+                    let next = queues.get_mut(&key).and_then(|queue| queue.pop_front());
+                    if next.is_none() {
+                        queues.remove(&key);
+                    }
+                    next
+                };
+                let Some(item) = next else { break };
+                (inner.run)(item).await;
+            }
+        });
+        Ok(())
+    }
+}
+const DELIVERY_WORKERS: usize = 32;
+const DELIVERY_PER_TARGET: usize = 256;
+const DELIVERY_TARGETS: usize = 1024;
+fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
+    let rt = rt.clone();
+    Lanes::new(
+        DELIVERY_WORKERS,
+        DELIVERY_PER_TARGET,
+        DELIVERY_TARGETS,
+        std::sync::Arc::new(move |frame| Box::pin(deliver(rt.clone(), frame))),
+    )
+}
+fn deliver_target(v: &Value) -> &str {
+    if str_field(v, "session_id").is_empty() {
+        str_field(v, "to")
+    } else {
+        str_field(v, "session_id")
+    }
+}
+async fn send_receipt(rt: &Runtime, mid: &str, target: &str, status: &str) {
+    let writer = rt.state.lock().unwrap().relay_tx.clone();
+    if let Some(writer) = writer {
+        let _ = writer
+            .send(json!({"type":"receipt","message_id":mid,"from":target,"status":status}).into())
+            .await;
+    }
+}
+// Every relay-initiated operation is refused, reads included: status and
+// agent_read/agent_wait expose local session state and terminal contents.
+const REMOTE_REFUSED: &str = "cross-machine operation refused: remote_messages=refuse";
 async fn deliver(rt: Shared, v: Value) {
     let mid = str_field(&v, "message_id");
-    let target = if str_field(&v, "session_id").is_empty() {
-        str_field(&v, "to")
-    } else {
-        str_field(&v, "session_id")
-    };
+    let target = deliver_target(&v);
     let origin = if str_field(&v, "reply_to").is_empty() {
         str_field(&v, "from")
     } else {
         str_field(&v, "reply_to")
     };
-    let result = if target.is_empty() {
+    let refused = rt.cfg.remote_messages == "refuse";
+    let result = if refused {
+        Err(REMOTE_REFUSED.to_string())
+    } else if target.is_empty() {
         Err("deliver without session_id".into())
     } else {
         match rt.resolve(target).await {
@@ -693,6 +826,7 @@ async fn deliver(rt: Shared, v: Value) {
                 .map(|delivery| delivery.status.clone())
                 .unwrap_or_else(|| "delivered".into())
         }
+        Err(_) if refused => "refused".into(),
         Err(error) => {
             if target.starts_with("codex/") && error.contains("outcome unknown") {
                 rt.record_status(mid, "unknown", false);
@@ -702,21 +836,17 @@ async fn deliver(rt: Shared, v: Value) {
             }
         }
     };
-    let writer = rt.state.lock().unwrap().relay_tx.clone();
-    if let Some(writer) = writer {
-        let _ = writer
-            .send(json!({"type":"receipt","message_id":mid,"from":target,"status":status}).into())
-            .await;
-    }
+    send_receipt(&rt, mid, target, &status).await;
 }
 async fn session(
     rt: Shared,
     idle_tasks: &mut tokio::task::JoinSet<()>,
-    registered: &mut bool,
+    deliveries: &Lanes<Value>,
+    welcomed: &mut Option<u64>,
 ) -> Result<(), TransportError> {
     let mut ws = Conn::connect(&rt.cfg, rt.clock.clone()).await?;
     let welcome=ws.register(json!({"type":"register","machine_id":rt.machine,"machine_name":rt.cfg.name,"device_id":rt.identity.device_id})).await?;
-    *registered = true;
+    *welcomed = Some(rt.clock.now_ms());
     ws.start_ping();
     let (tx, mut rx) = mpsc::channel::<super::Push>(128);
     loop {
@@ -740,7 +870,7 @@ async fn session(
             }
         }
     }
-    let (idle_tx, mut idle_rx) = mpsc::channel::<OrderedIncoming>(128);
+    let (idle_tx, mut idle_rx) = ordered_queue();
     let idle_runtime = rt.clone();
     let idle_writer = tx.clone();
     idle_tasks.spawn(async move {
@@ -769,11 +899,11 @@ async fn session(
             msg=ws.next()=>match msg{
                 Some(Ok(Message::Text(t)))=>{
                     let v:Value=match serde_json::from_str(&t){Ok(v)=>v,Err(e)=>break Err(TransportError::Io(e.to_string()))};
-                    let pending={rt.state.lock().unwrap().pending.remove(str_field(&v,"id"))};if let Some(p)=pending{if idle_tx.try_send(OrderedIncoming::Reply(v,p)).is_err(){break Err("idle relay control queue capacity reached".into());}continue;}
+                    let pending={rt.state.lock().unwrap().pending.remove(str_field(&v,"id"))};if let Some(p)=pending{idle_tx.reply(v,p);continue;}
                     if v["rpc_reply"]==true{continue;}
                     if str_field(&v,"id")=="directory"{rt.state.lock().unwrap().remote=v["sessions"].as_array().into_iter().flatten().filter(|s|str_field(s,"machine_id")!=rt.machine).cloned().collect();continue;}
                     match str_field(&v,"type"){
-                        "idle_subscribe"|"idle_cancel"|"idle_notice"=>{if v["rpc_reply"]!=true&&idle_tx.try_send(OrderedIncoming::Control(v)).is_err(){break Err("idle relay control queue capacity reached".into());}}
+                        "idle_subscribe"|"idle_cancel"|"idle_notice"=>{if v["rpc_reply"]!=true&&idle_tx.control(v).is_err(){break Err("idle relay control queue capacity reached".into());}}
                         "receipt"=>{
                             let mid=str_field(&v,"message_id");let reporter=str_field(&v,"from");let status=str_field(&v,"status");
                             let origin={let mut state=rt.state.lock().unwrap();
@@ -788,13 +918,21 @@ async fn session(
                             }
                         }
                         "deliver"=>{
-                            let rt=rt.clone();tokio::spawn(async move {deliver(rt,v).await;});
+                            let target=deliver_target(&v).to_string();
+                            if let Err(v)=deliveries.push(&target,v){
+                                eprintln!("intercom relay: delivery queue for {target} full; dropped {}",str_field(&v,"message_id"));
+                                if !str_field(&v,"message_id").is_empty(){
+                                    let rt=rt.clone();tokio::spawn(async move{send_receipt(&rt,str_field(&v,"message_id"),&target,"dropped").await;});
+                                }
+                            }
                         }
                         "status"|"workspace_list"|"workspace_create"|"workspace_close"|"session_create"|"session_close"|"agent_prompt"|"agent_keys"|"agent_read"|"agent_wait"=>{
                             let rt=rt.clone();tokio::spawn(async move{
                                 let mut req=v.clone();req["op"]=v["type"].clone();req["machine"]=json!(rt.machine);req["to"]=if str_field(&v,"type")=="workspace_close"{v["workspace_id"].clone()}else{v["session_id"].clone()};req["workspace"]=v["workspace_id"].clone();
-                                let result=if str_field(&v,"type")=="status"{Ok(json!({"report":rt.status_report().await}))}else{super::herdr::dispatch(&rt,&req).await};
-                                let mut response=match result{Ok(v)=>v,Err(e)=>json!({"type":"error","code":"unavailable","message":e})};
+                                let mut response=if rt.cfg.remote_messages=="refuse"{json!({"type":"error","code":"refused","message":REMOTE_REFUSED})}else{
+                                    let result=if str_field(&v,"type")=="status"{Ok(json!({"report":rt.status_report().await}))}else{super::herdr::dispatch(&rt,&req).await};
+                                    match result{Ok(v)=>v,Err(e)=>json!({"type":"error","code":"unavailable","message":e})}
+                                };
                                 response["id"]=v["id"].clone();if response.get("type").is_none(){response["type"]=v["type"].clone();}
                                 let tx=rt.state.lock().unwrap().relay_tx.clone();if let Some(tx)=tx{let _=tx.send(response.into()).await;}
                             });
@@ -945,7 +1083,7 @@ fn webhook_client() -> Result<reqwest::Client, String> {
     .with_no_client_auth();
     reqwest::Client::builder()
         .use_preconfigured_tls(tls)
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|error| error.to_string())
@@ -1208,8 +1346,8 @@ async fn listen_loop(
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        let (registered, error) = listen_once(c, identity, name, endpoint, clock).await;
-        let (sleep, next) = listen_retry_delay(backoff, registered, &error);
+        let (healthy, error) = listen_once(c, identity, name, endpoint, clock).await;
+        let (sleep, next) = listen_retry_delay(backoff, healthy, &error);
         if error.is_auth() {
             eprintln!("relay authentication rejected: {error}; re-enroll this device");
         }
@@ -1220,10 +1358,10 @@ async fn listen_loop(
 }
 fn listen_retry_delay(
     base: Duration,
-    registered: bool,
+    healthy: bool,
     error: &TransportError,
 ) -> (Duration, Duration) {
-    let (sleep, next) = next_backoff(if registered { BACKOFF_MIN } else { base });
+    let (sleep, next) = next_backoff(if healthy { BACKOFF_MIN } else { base });
     (
         if error.is_auth() {
             AUTH_RETRY_DELAY
@@ -1272,6 +1410,7 @@ async fn listen_once(
     if let Err(error) = registered {
         return (false, error);
     }
+    let welcomed = clock.now_ms();
     let result: Result<(), TransportError> = async {
         let session = format!("listen/{name}");
         connection.send(Message::text(json!({"type":"snapshot","sessions":[{"id":session,"name":name,"harness":"webhook","status":"online"}]}).to_string())).await?;
@@ -1296,7 +1435,8 @@ async fn listen_once(
             }
         }
     }.await;
-    (true, result.unwrap_err())
+    let healthy = clock.now_ms().saturating_sub(welcomed) >= HEALTHY_SESSION.as_millis() as u64;
+    (healthy, result.unwrap_err())
 }
 
 #[cfg(test)]
@@ -1558,13 +1698,6 @@ mod listen_webhook_tests {
         });
         (format!("http://{address}/redirect"), rx, task)
     }
-    fn header<'a>(headers: &'a str, name: &str) -> &'a str {
-        headers
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.trim()))
-            .unwrap_or_default()
-    }
     async fn redirected_webhook(status: u16) {
         let (target, mut delivered, target_task) = http_peer(vec![(200, "{}")]).await;
         let (url, first, redirect_task) = redirect_peer(status, target).await;
@@ -1579,43 +1712,33 @@ mod listen_webhook_tests {
             "redirect-id",
         )
         .await;
-        assert_eq!(
-            result.unwrap(),
-            "delivered",
-            "Go standard client follows HTTP {status}"
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .contains(&format!("HTTP {status}")),
+            "{result:?}"
         );
-        let first = first.await.unwrap();
-        let second = delivered.recv().await.unwrap();
-        assert!(first.0.starts_with("POST /redirect "));
-        assert_eq!(header(&second.0, "X-Request-ID"), "redirect-id");
-        assert_eq!(
-            header(&first.0, "X-Intercom-Signature"),
-            header(&second.0, "X-Intercom-Signature")
-        );
-        assert_eq!(
-            header(&first.0, "X-Hub-Signature-256"),
-            header(&second.0, "X-Hub-Signature-256")
-        );
-        if status == 302 {
-            assert!(second.0.starts_with("GET /hook "));
-            assert!(second.1.is_empty());
-        } else {
-            assert!(second.0.starts_with("POST /hook "));
-            assert_eq!(first.1, second.1);
-        }
+        assert!(first.await.unwrap().0.starts_with("POST /redirect "));
         redirect_task.await.unwrap();
-        target_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), delivered.recv())
+                .await
+                .is_err(),
+            "signed webhook body was replayed to the redirect target"
+        );
+        target_task.abort();
     }
     #[tokio::test]
-    async fn webhook_307_redirect_preserves_raw_id_and_hmac() {
+    async fn webhook_307_redirect_is_final_and_not_replayed() {
         redirected_webhook(307).await;
     }
     #[tokio::test]
-    async fn webhook_308_redirect_preserves_raw_id_and_hmac() {
+    async fn webhook_308_redirect_is_final_and_not_replayed() {
         redirected_webhook(308).await;
     }
     #[tokio::test]
-    async fn webhook_302_redirect_switches_to_get_like_go_default_client() {
+    async fn webhook_302_redirect_is_final_and_not_followed() {
         redirected_webhook(302).await;
     }
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1951,7 +2074,7 @@ mod listen_webhook_tests {
     }
 
     #[test]
-    fn listen_backoff_resets_only_after_welcome_and_classifies_auth_without_string_guessing() {
+    fn listen_backoff_resets_only_after_healthy_session_and_types_auth_errors() {
         let denied = TransportError::Http {
             status: 401,
             reason: "revoked".into(),
@@ -2218,6 +2341,52 @@ mod listen_webhook_tests {
                 .iter()
                 .any(|timer| timer.label == "intercom_listen_reconnect"));
         }
+    }
+
+    #[cfg(feature = "test-clock")]
+    #[tokio::test]
+    async fn manual_listen_relay_that_welcomes_then_drops_keeps_backing_off() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clock = crate::clock::Clock::manual_for_test();
+        let timer = clock.clone();
+        let config = Config {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            token: "explicit-token".into(),
+            ..Config::default()
+        };
+        let task = tokio::spawn(async move {
+            let identity = Identity {
+                device_id: uuid::Uuid::new_v4().to_string(),
+                ..Identity::default()
+            };
+            let endpoint = super::super::config::Endpoint {
+                name: "hermes".into(),
+                url: "http://unused.invalid".into(),
+                secret: String::new(),
+                auth: "hmac".into(),
+            };
+            listen_loop(&config, &identity, "hermes", &endpoint, &timer).await;
+        });
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let (mut socket, _) = relay_peer(&listener).await;
+            assert_eq!(json_frame(&mut socket).await["type"], "register");
+            socket
+                .send(Message::text(json!({"type":"welcome"}).to_string()))
+                .await
+                .unwrap();
+            assert_eq!(json_frame(&mut socket).await["type"], "snapshot");
+            socket.close(None).await.unwrap();
+            let wait = wait_timer(&clock, "intercom_listen_reconnect").await;
+            waits.push(wait);
+            clock.manual().unwrap().advance(wait);
+        }
+        task.abort();
+        let _ = task.await;
+        assert!(
+            waits[2] >= 3000,
+            "welcome-then-drop reset the listen backoff: {waits:?}"
+        );
     }
 
     #[cfg(feature = "test-clock")]
