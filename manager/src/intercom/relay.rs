@@ -895,7 +895,9 @@ async fn deliver(rt: Shared, v: Value) {
         }
         Err(_) if refused => "refused".into(),
         Err(error) => {
-            if error.contains("outcome unknown") {
+            // Go parity: a pi injection failure nacks `dropped`; only codex
+            // reports an uncertain write as `unknown`.
+            if target.starts_with("codex/") && error.contains("outcome unknown") {
                 rt.record_status(mid, "unknown", false);
                 "unknown".into()
             } else {

@@ -354,54 +354,6 @@ async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_deli
 }
 
 #[tokio::test]
-async fn relay_delivery_with_unknown_pi_outcome_reports_unknown_not_dropped() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let rt = transport_runtime(Config {
-        server: format!("http://{}", listener.local_addr().unwrap()),
-        token: "fixture".into(),
-        ..Config::default()
-    });
-    let (tx, mut pushed) = tokio::sync::mpsc::channel(4);
-    rt.state.lock().unwrap().sessions.insert(
-        "pi/local".into(),
-        super::super::Session {
-            value: json!({"id":"pi/local","harness":"pi"}),
-            owner: 1,
-            epoch: 1,
-            tx,
-            disconnect: None,
-            caps: Default::default(),
-            idle_since: None,
-        },
-    );
-    let active = rt.clone();
-    let task = tokio::spawn(async move {
-        session(
-            active.clone(),
-            &mut tokio::task::JoinSet::new(),
-            &delivery_lanes(&active),
-            &mut None,
-        )
-        .await
-    });
-    let mut peer = welcomed_peer(&listener).await;
-    peer_send(&mut peer, json!({"type":"deliver","session_id":"pi/local","from":"pi/remote","message_id":"lost-ack","body":"typed"})).await;
-    let frame = tokio::time::timeout(Duration::from_secs(3), pushed.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    drop(frame.written);
-    let receipt = peer_frame(&mut peer, |frame| frame["type"] == "receipt").await;
-    assert_eq!(receipt["message_id"], "lost-ack");
-    assert_eq!(
-        receipt["status"], "unknown",
-        "an injection that may have landed must not be reported as dropped"
-    );
-    task.abort();
-    let _ = task.await;
-}
-
-#[tokio::test]
 async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
