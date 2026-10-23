@@ -282,7 +282,14 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     // holder removes stale socket/pid files before binding. Held until exit.
     let mut enabled_in = None;
     let daemon_lock = loop {
-        match lifecycle::claim_daemon(&home) {
+        // The claim retries with blocking sleeps; keep them off the runtime.
+        let claim = {
+            let home = home.clone();
+            tokio::task::spawn_blocking(move || lifecycle::claim_daemon(&home))
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+        };
+        match claim {
             Ok(Claim::Acquired(guard)) => break guard,
             Ok(Claim::AlreadyRunning { pid }) => {
                 let Some(config) = crate::intercom::configuration() else {
@@ -297,7 +304,8 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
                 // process owns the manager. Stay up and take over once it
                 // exits; claiming is the probe, so a free lock is never
                 // taken and dropped under a starting daemon.
-                if enabled_in != Some(pid) {
+                // An unreadable pid cannot prove the same manager survived.
+                if pid.is_none() || enabled_in != Some(pid) {
                     if let Err(error) = crate::client::enable_intercom(&home, config.clone()).await {
                         eprintln!("pi-famulus: cannot enable intercom: {error}");
                         return 1;

@@ -253,15 +253,26 @@ pub fn claim_daemon(home: &Path) -> io::Result<Claim> {
                 return Ok(Claim::Acquired(guard));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                note_daemon_lock_would_block(attempt)?;
+                if let Err(error) = note_daemon_lock_would_block(attempt) {
+                    // SAFETY: no guard borrows the lock on this path.
+                    drop(unsafe { Box::from_raw(lock) });
+                    return Err(error);
+                }
                 if attempt + 1 == DAEMON_LOCK_CLAIM_ATTEMPTS {
+                    // SAFETY: no guard borrows the lock on this path; freeing
+                    // it closes the fd so repeated claims do not leak one each.
+                    drop(unsafe { Box::from_raw(lock) });
                     return Ok(Claim::AlreadyRunning {
                         pid: read_pid_file(home).map(|p| p.pid),
                     });
                 }
                 std::thread::sleep(DAEMON_LOCK_RETRY_INTERVAL);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // SAFETY: no guard borrows the lock on this path.
+                drop(unsafe { Box::from_raw(lock) });
+                return Err(e);
+            }
         }
     }
     unreachable!("the bounded daemon-lock loop always returns")
@@ -507,6 +518,22 @@ mod tests {
             std::env::var_os("HOME").map(PathBuf::from).unwrap()
         };
         assert_eq!(resolve_home(None), home.join(".pi").join("agent").join("pi-famulus"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_claims_do_not_leak_the_lock_fd() {
+        let home = temp_home("claim-fd");
+        let Claim::Acquired(_guard) = claim_daemon(&home).unwrap() else {
+            panic!("first claim must acquire");
+        };
+        let open_fds = || std::fs::read_dir("/dev/fd").unwrap().count();
+        assert!(matches!(claim_daemon(&home).unwrap(), Claim::AlreadyRunning { .. }));
+        let before = open_fds();
+        for _ in 0..3 {
+            assert!(matches!(claim_daemon(&home).unwrap(), Claim::AlreadyRunning { .. }));
+        }
+        assert_eq!(open_fds(), before, "each refused claim leaked a descriptor");
     }
 
     #[test]
