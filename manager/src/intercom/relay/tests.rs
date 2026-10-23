@@ -466,6 +466,7 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
                     running.fetch_sub(1, Ordering::SeqCst);
                 })
             }),
+            Arc::new(|_| {}),
         )
     };
     for n in 0..4 {
@@ -523,12 +524,13 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
 async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     let finished = Arc::new(AtomicUsize::new(0));
+    let abandoned = Arc::new(Mutex::new(Vec::<String>::new()));
     let (release, gate) = tokio::sync::watch::channel(false);
     let lanes = {
-        let finished = finished.clone();
+        let (finished, abandoned) = (finished.clone(), abandoned.clone());
         Lanes::new(
             4,
             8,
@@ -538,13 +540,14 @@ async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
             Arc::new(move |item: String| {
                 let (finished, mut gate) = (finished.clone(), gate.clone());
                 Box::pin(async move {
+                    let _ = gate.wait_for(|open| *open).await;
                     if item == "boom" {
                         panic!("delivery panicked");
                     }
-                    let _ = gate.wait_for(|open| *open).await;
                     finished.fetch_add(1, Ordering::SeqCst);
                 })
             }),
+            Arc::new(move |items: Vec<String>| abandoned.lock().unwrap().extend(items)),
         )
     };
     lanes.push("pi/a", "aaaaaa".into()).unwrap();
@@ -554,7 +557,6 @@ async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
         "queued bytes must stay within the budget across lanes"
     );
     lanes.push("pi/b", "bbbb".into()).unwrap();
-    lanes.push("pi/p", "boom".into()).unwrap_err();
     release.send_replace(true);
     tokio::time::timeout(Duration::from_secs(3), async {
         while finished.load(Ordering::SeqCst) < 2 {
@@ -563,7 +565,11 @@ async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
     })
     .await
     .unwrap();
+    release.send_replace(false);
     lanes.push("pi/p", "boom".into()).unwrap();
+    lanes.push("pi/p", "q1".into()).unwrap();
+    tokio::task::yield_now().await;
+    release.send_replace(true);
     tokio::time::timeout(Duration::from_secs(1), async {
         while lanes.inner.queues.lock().unwrap().lanes.contains_key("pi/p") {
             tokio::task::yield_now().await;
@@ -571,6 +577,11 @@ async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
     })
     .await
     .expect("a panicked worker must release its lane");
+    assert_eq!(
+        *abandoned.lock().unwrap(),
+        ["q1"],
+        "items stranded behind a panicked worker must be handed back for a nack"
+    );
     lanes.push("pi/p", "ok".into()).unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while finished.load(Ordering::SeqCst) < 3 {

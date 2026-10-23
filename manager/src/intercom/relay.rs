@@ -688,6 +688,7 @@ pub async fn run(rt: Shared) {
         delay = next;
     }
 }
+type Abandon<T> = std::sync::Arc<dyn Fn(Vec<T>) + Send + Sync>;
 type Runner<T> =
     std::sync::Arc<dyn Fn(T) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 /// Per-key FIFO lanes: one worker per busy key keeps that key's items in
@@ -705,13 +706,15 @@ struct LanesInner<T> {
     budget: usize,
     size: fn(&T) -> usize,
     run: Runner<T>,
+    abandon: Abandon<T>,
 }
 struct LaneQueues<T> {
     lanes: std::collections::HashMap<String, std::collections::VecDeque<T>>,
     bytes: usize,
 }
 /// Removes a worker's lane if it dies mid-item (panic or abort) so later
-/// pushes start a fresh worker instead of queueing behind a dead one.
+/// pushes start a fresh worker instead of queueing behind a dead one, and
+/// hands the stranded items to `abandon`.
 struct LaneWorker<T> {
     inner: std::sync::Arc<LanesInner<T>>,
     key: String,
@@ -722,10 +725,15 @@ impl<T> Drop for LaneWorker<T> {
         if self.retired {
             return;
         }
-        let mut queues = self.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(queue) = queues.lanes.remove(&self.key) {
+        let stranded = {
+            let mut queues = self.inner.queues.lock().unwrap_or_else(|e| e.into_inner());
+            let queue = queues.lanes.remove(&self.key).unwrap_or_default();
             let freed: usize = queue.iter().map(self.inner.size).sum();
             queues.bytes = queues.bytes.saturating_sub(freed);
+            queue
+        };
+        if !stranded.is_empty() {
+            (self.inner.abandon)(stranded.into());
         }
     }
 }
@@ -737,6 +745,7 @@ impl<T: Send + 'static> Lanes<T> {
         budget: usize,
         size: fn(&T) -> usize,
         run: Runner<T>,
+        abandon: Abandon<T>,
     ) -> Self {
         Self {
             inner: std::sync::Arc::new(LanesInner {
@@ -750,6 +759,7 @@ impl<T: Send + 'static> Lanes<T> {
                 budget,
                 size,
                 run,
+                abandon,
             }),
             workers: Default::default(),
         }
@@ -833,8 +843,28 @@ fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
         DELIVERY_TARGETS,
         DELIVERY_BYTES,
         |frame| str_field(frame, "body").len() + 1024,
-        std::sync::Arc::new(move |frame| Box::pin(deliver(rt.clone(), frame))),
+        {
+            let rt = rt.clone();
+            std::sync::Arc::new(move |frame| Box::pin(deliver(rt.clone(), frame)))
+        },
+        std::sync::Arc::new(move |frames| abandon_deliveries(&rt, frames)),
     )
+}
+/// Nacks deliveries stranded behind a lane worker that died, so senders get
+/// a terminal receipt instead of waiting out their timeout.
+fn abandon_deliveries(rt: &Shared, frames: Vec<Value>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let rt = rt.clone();
+    handle.spawn(async move {
+        for frame in frames {
+            let mid = str_field(&frame, "message_id");
+            if !mid.is_empty() {
+                send_receipt(&rt, mid, deliver_target(&frame), "dropped").await;
+            }
+        }
+    });
 }
 fn deliver_target(v: &Value) -> &str {
     if str_field(v, "session_id").is_empty() {
