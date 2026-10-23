@@ -148,24 +148,33 @@ impl super::Runtime {
             let waiter = {
                 let mut state = self.state.lock().unwrap();
                 if let Some(seen) = state.incoming.seen.get(mid).cloned() {
+                    if seen.target != id {
+                        return Err(format!(
+                            "injection identity conflict: message id {mid:?} is already settled for target {:?}",
+                            seen.target
+                        ));
+                    }
                     state.remember_injection(mid, &seen.target, seen.unknown.clone());
                     return seen.unknown.map_or(Ok("delivered".into()), Err);
                 }
                 if let Some(inflight) = state.incoming.inflight.get(mid) {
+                    if inflight.target != id {
+                        return Err(format!(
+                            "injection identity conflict: message id {mid:?} is already in flight for target {:?}",
+                            inflight.target
+                        ));
+                    }
                     Some(inflight.done.subscribe())
                 } else {
                     if !mid.is_empty() {
-                        state
-                            .incoming
-                            .inflight
-                            .insert(
-                                mid.to_string(),
-                                Inflight {
-                                    done: tokio::sync::watch::channel(false).0,
-                                    target: id.to_string(),
-                                    read: false,
-                                },
-                            );
+                        state.incoming.inflight.insert(
+                            mid.to_string(),
+                            Inflight {
+                                done: tokio::sync::watch::channel(false).0,
+                                target: id.to_string(),
+                                read: false,
+                            },
+                        );
                     }
                     None
                 }
@@ -234,7 +243,15 @@ impl super::Runtime {
             if admitted.is_some_and(|delivery| delivery.target != reporter) {
                 return;
             }
-            admitted.is_some() && state.active(mid)
+            let route = admitted.is_some() && state.active(mid);
+            if status == "read" {
+                // A native target's read proves the injection as surely as a
+                // local one; settle an unknown in-flight outcome exactly like
+                // local_receipt does. `delivered` never settles here: native
+                // delivery notifications do not prove the frame was injected.
+                state.settle_injection_on_read(mid, reporter, true);
+            }
+            route
         };
         if route {
             self.receipt_with_reason(
@@ -255,10 +272,7 @@ impl super::Runtime {
         ) {
             receipt["drop_reason"] = serde_json::json!(reason);
         }
-        let writer = self.state.lock().unwrap().relay_tx.clone();
-        if let Some(writer) = writer {
-            let _ = writer.send(receipt.into()).await;
-        }
+        self.forward_relay_receipt(receipt).await;
     }
     pub(super) async fn local_receipt(&self, mid: &str, reporter: &str, status: &str) {
         let route = {
@@ -272,22 +286,8 @@ impl super::Runtime {
                 return;
             }
             let route = admitted.is_some() && state.active(mid);
-            if status == "read" && (reporter.starts_with("pi/") || reporter.starts_with("codex/")) {
-                if let Some(inflight) = state
-                    .incoming
-                    .inflight
-                    .get_mut(mid)
-                    .filter(|inflight| inflight.target == reporter)
-                {
-                    inflight.read = true;
-                } else if state
-                    .incoming
-                    .seen
-                    .get(mid)
-                    .is_some_and(|seen| seen.target == reporter)
-                {
-                    state.remember_injection(mid, reporter, None);
-                }
+            if status == "read" {
+                state.settle_injection_on_read(mid, reporter, false);
             }
             route
         };
@@ -296,9 +296,41 @@ impl super::Runtime {
             return;
         }
         self.record_status(mid, status, false);
+        self.forward_relay_receipt(
+            serde_json::json!({"type":"receipt","from":reporter,"message_id":mid,"status":status}),
+        )
+        .await;
+    }
+    /// Forwards a receipt frame to the relay, logging instead of silently
+    /// dropping when the relay disappeared and never waiting past shutdown.
+    async fn forward_relay_receipt(&self, receipt: serde_json::Value) {
         let writer = self.state.lock().unwrap().relay_tx.clone();
-        if let Some(writer) = writer {
-            let _=writer.send(serde_json::json!({"type":"receipt","from":reporter,"message_id":mid,"status":status}).into()).await;
+        let Some(writer) = writer else {
+            return;
+        };
+        let mid = super::str_field(&receipt, "message_id").to_string();
+        let mut stop = self.stop.subscribe();
+        let mut closing = self.closing.subscribe();
+        // A fresh watch subscription treats the current value as already
+        // seen, so changed() alone misses a shutdown signaled before here.
+        if *stop.borrow() || *closing.borrow() {
+            eprintln!("intercom relay: dropped receipt for {mid}: intercom is shutting down");
+            return;
+        }
+        let outcome = tokio::select! {
+            biased;
+            _ = stop.changed() => None,
+            _ = closing.changed() => None,
+            result = writer.send(receipt.into()) => Some(result),
+        };
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                eprintln!("intercom relay: dropped receipt for {mid}: relay channel closed")
+            }
+            None => {
+                eprintln!("intercom relay: dropped receipt for {mid}: intercom is shutting down")
+            }
         }
     }
 }
@@ -394,6 +426,39 @@ impl Delivery {
     }
 }
 impl State {
+    /// Settles an injection whose outcome is still unknown when the target's
+    /// `read` proves the message reached it: an in-flight write is marked
+    /// read-settled (its `Drop` then records a known outcome) and an already
+    /// carried unknown outcome is remembered as settled. Shared by
+    /// `local_receipt` and `native_receipt`; the reporter kind is restricted
+    /// to sessions whose read receipts prove an injection. The target match
+    /// itself is the identity check: a read from any other session must never
+    /// settle someone else's injection.
+    pub(super) fn settle_injection_on_read(&mut self, mid: &str, reporter: &str, native: bool) {
+        let proves_injection = if native {
+            reporter.starts_with("claude/")
+        } else {
+            reporter.starts_with("pi/") || reporter.starts_with("codex/")
+        };
+        if !proves_injection {
+            return;
+        }
+        if let Some(inflight) = self
+            .incoming
+            .inflight
+            .get_mut(mid)
+            .filter(|inflight| inflight.target == reporter)
+        {
+            inflight.read = true;
+        } else if self
+            .incoming
+            .seen
+            .get(mid)
+            .is_some_and(|seen| seen.target == reporter)
+        {
+            self.remember_injection(mid, reporter, None);
+        }
+    }
     pub(super) fn record_status(
         &mut self,
         id: &str,
@@ -1103,7 +1168,14 @@ mod tests {
             let mut state = rt.state.lock().unwrap();
             state.sessions.insert("pi/origin".into(), session(tx, 1, 1));
             state
-                .admit("cut-off", "pi/origin", "claude/target", false, false, rt.clock.now_ms())
+                .admit(
+                    "cut-off",
+                    "pi/origin",
+                    "claude/target",
+                    false,
+                    false,
+                    rt.clock.now_ms(),
+                )
                 .unwrap();
         }
         let forward = rt.receipt_with_reason("cut-off", "claude/target", "read", "");
@@ -1111,7 +1183,10 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(200), forward),
             rx.recv()
         );
-        assert!(cancelled.is_err(), "the forward must still be awaiting its write");
+        assert!(
+            cancelled.is_err(),
+            "the forward must still be awaiting its write"
+        );
         drop(held);
         let state = rt.state.lock().unwrap();
         let delivery = &state.messages["cut-off"];
@@ -1329,7 +1404,10 @@ mod tests {
         assert_eq!(restored.seen["delivered"].target, "pi/target");
         assert_eq!(restored.seen["delivered"].unknown, None);
         assert_eq!(restored.seen["unknown"].target, "pi/other");
-        assert_eq!(restored.seen["unknown"].unknown.as_deref(), Some("outcome unknown"));
+        assert_eq!(
+            restored.seen["unknown"].unknown.as_deref(),
+            Some("outcome unknown")
+        );
     }
 
     #[tokio::test]
@@ -1355,5 +1433,188 @@ mod tests {
             observe
         );
         assert_eq!(result.unwrap(), "delivered");
+    }
+
+    #[tokio::test]
+    async fn settled_injection_reused_for_another_target_is_an_identity_conflict() {
+        let rt = runtime();
+        let target = pi_target();
+        let (tx, mut rx) = mpsc::channel(4);
+        rt.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("pi/target".into(), session(tx, 1, 1));
+        let observe = async {
+            let frame = rx.recv().await.unwrap();
+            frame.written.unwrap().send(Ok(())).unwrap();
+        };
+        let (first, _) = tokio::join!(
+            rt.inject_local(&target, deliver("reused-mid"), "", false, None),
+            observe
+        );
+        assert_eq!(first.unwrap(), "delivered");
+        // Reusing the settled message id for a different target must not
+        // return the first target's outcome (or skip the injection).
+        let other = json!({"id": "pi/other", "harness": "pi"});
+        let conflict = rt
+            .inject_local(&other, deliver("reused-mid"), "", false, None)
+            .await;
+        let error = conflict.as_ref().unwrap_err();
+        assert!(
+            error.contains("injection identity conflict"),
+            "wrong outcome: {conflict:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an identity conflict must not inject into the second target"
+        );
+        // The original target keeps its settled outcome.
+        assert_eq!(
+            rt.inject_local(&target, deliver("reused-mid"), "", false, None)
+                .await
+                .unwrap(),
+            "delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_injection_reused_for_another_target_is_an_identity_conflict() {
+        let rt = runtime();
+        let target = pi_target();
+        let (tx, mut rx) = mpsc::channel(4);
+        rt.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("pi/target".into(), session(tx, 1, 1));
+        let first = rt.inject_local(&target, deliver("inflight-mid"), "", false, None);
+        tokio::pin!(first);
+        let _written = tokio::select! {
+            frame = rx.recv() => frame.unwrap().written,
+            _ = &mut first => panic!("injection must wait for the write acknowledgement"),
+        };
+        // A concurrent injection of the same message id for a different
+        // target must fail instead of waiting for (and inheriting) the first
+        // target's outcome.
+        let other = json!({"id": "pi/other", "harness": "pi"});
+        let conflict = tokio::time::timeout(
+            Duration::from_secs(1),
+            rt.inject_local(&other, deliver("inflight-mid"), "", false, None),
+        )
+        .await
+        .expect("an identity conflict must not wait on the in-flight write")
+        .unwrap_err();
+        assert!(
+            conflict.contains("injection identity conflict"),
+            "wrong outcome: {conflict}"
+        );
+        let state = rt.state.lock().unwrap();
+        assert!(
+            state
+                .incoming
+                .inflight
+                .get("inflight-mid")
+                .is_some_and(|inflight| inflight.target == "pi/target" && !inflight.read),
+            "the conflicting retry must not disturb the first target's in-flight injection"
+        );
+        drop(state);
+        drop(_written);
+    }
+
+    #[tokio::test]
+    async fn native_target_read_settles_an_unknown_injection_outcome() {
+        let rt = runtime();
+        let mid = "native-read-settles";
+        {
+            let mut state = rt.state.lock().unwrap();
+            state.incoming.inflight.insert(
+                mid.into(),
+                Inflight {
+                    done: watch::channel(false).0,
+                    target: "claude/target".into(),
+                    read: false,
+                },
+            );
+        }
+        // A native `read` from the target proves the injection exactly like a
+        // local read: the in-flight entry is marked read-settled.
+        rt.native_receipt(
+            &json!({"id": "claude/target"}),
+            &json!({"orig_msg_id": mid, "status": "read"}),
+        )
+        .await;
+        assert!(
+            rt.state
+                .lock()
+                .unwrap()
+                .incoming
+                .inflight
+                .get(mid)
+                .is_some_and(|inflight| inflight.read),
+            "a native target read must settle the in-flight injection"
+        );
+        // A native `delivered` never settles: delivery notification does not
+        // prove the frame was injected into the target's conversation.
+        let other = "native-delivered-settles-nothing";
+        {
+            let mut state = rt.state.lock().unwrap();
+            state.incoming.inflight.insert(
+                other.into(),
+                Inflight {
+                    done: watch::channel(false).0,
+                    target: "claude/target".into(),
+                    read: false,
+                },
+            );
+        }
+        rt.native_receipt(
+            &json!({"id": "claude/target"}),
+            &json!({"orig_msg_id": other, "status": "delivered"}),
+        )
+        .await;
+        assert!(
+            !rt.state
+                .lock()
+                .unwrap()
+                .incoming
+                .inflight
+                .get(other)
+                .unwrap()
+                .read,
+            "a native delivered must not settle the injection"
+        );
+        // A native read from a different session must not settle either.
+        rt.native_receipt(
+            &json!({"id": "claude/stranger"}),
+            &json!({"orig_msg_id": other, "status": "read"}),
+        )
+        .await;
+        assert!(
+            !rt.state
+                .lock()
+                .unwrap()
+                .incoming
+                .inflight
+                .get(other)
+                .unwrap()
+                .read,
+            "a read from a non-target native session must not settle the injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_forwarding_does_not_wait_when_shutdown_was_already_signaled() {
+        let rt = runtime();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(json!({"type":"fill"}).into()).await.unwrap();
+        rt.state.lock().unwrap().relay_tx = Some(tx);
+        rt.stop.send_replace(true);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            rt.forward_relay_receipt(json!({"message_id":"already-stopped"})),
+        )
+        .await
+        .expect("a pre-existing stop signal left receipt forwarding blocked");
     }
 }
