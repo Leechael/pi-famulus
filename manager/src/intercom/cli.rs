@@ -641,11 +641,21 @@ fn no_daemon(error: &str) -> bool {
     error.starts_with("client daemon is not running (")
 }
 
+/// A normally enrolled device configures no token: the saved identity
+/// credential for the selected server is the fallback credential, exactly as
+/// `call_once` resolves it.
+fn saved_credential_matches(cfg: &Config) -> bool {
+    let Ok(identity) = Identity::load(&cfg.state_dir) else {
+        return false;
+    };
+    !identity.credential.is_empty()
+        && identity.server.trim_end_matches('/') == cfg.server.trim_end_matches('/')
+}
 fn direct_fallback(cfg: &Config, error: &str) -> Result<(), String> {
     if !no_daemon(error) || cfg.local_only {
         return Err(error.into());
     }
-    if cfg.token.is_empty() {
+    if cfg.token.is_empty() && !saved_credential_matches(cfg) {
         return Err(format!("{error}\nor set a relay token (config token, --token, or AGENT_INTERCOM_TOKEN) to reach the relay without a daemon"));
     }
     Ok(())
@@ -1055,7 +1065,16 @@ mod tests {
     #[test]
     fn direct_fallback_only_allows_authenticated_missing_daemon() {
         let error = "client daemon is not running (/tmp/missing.sock): missing";
-        let mut cfg = Config::default();
+        let state_dir = std::env::temp_dir().join(format!(
+            "famulus-fallback-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut cfg = Config {
+            state_dir: state_dir.clone(),
+            ..Config::default()
+        };
         cfg.token.clear();
         cfg.local_only = false;
         assert!(direct_fallback(&cfg, error).is_err());
@@ -1065,6 +1084,42 @@ mod tests {
         assert!(direct_fallback(&cfg, error).is_err());
         cfg.local_only = false;
         assert!(direct_fallback(&cfg, "daemon closed connection or invalid frame").is_err());
+        std::fs::remove_dir_all(&state_dir).ok();
+    }
+
+    #[test]
+    fn direct_fallback_accepts_a_matching_saved_identity_credential() {
+        let error = "client daemon is not running (/tmp/missing.sock): missing";
+        for (identity_server, expected) in [
+            ("https://127.0.0.1:8443", true),
+            ("https://127.0.0.1:8443///", true),
+            ("https://another-server.invalid", false),
+        ] {
+            let state_dir = std::env::temp_dir().join(format!(
+                "famulus-fallback-ident-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&state_dir).unwrap();
+            Identity {
+                device_id: uuid::Uuid::new_v4().to_string(),
+                credential: "saved-credential".into(),
+                server: identity_server.into(),
+                ..Identity::default()
+            }
+            .save(&state_dir)
+            .unwrap();
+            // The normal enrolled configuration: no configured token, the
+            // credential lives in the saved identity for the selected server.
+            let cfg = Config {
+                state_dir,
+                ..Config::default()
+            };
+            assert!(
+                direct_fallback(&cfg, error).is_ok() == expected,
+                "saved identity for {identity_server}: expected ok={expected}"
+            );
+        }
     }
 
     #[test]

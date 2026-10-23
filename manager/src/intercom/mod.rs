@@ -312,6 +312,27 @@ impl Runtime {
         self.native.stop_accepting();
     }
 }
+/// Credential selection for daemon start, mirroring the one-shot and listen
+/// paths: an explicitly configured token always wins; the saved identity
+/// credential is adopted only when no token is configured and it belongs to
+/// the same normalized server. Anything else must enroll for the selected
+/// server or pass a token, so a credential enrolled for another server never
+/// leaks into (or overrides) an explicit selection.
+pub(crate) fn adopt_identity_credential(
+    cfg: &mut Config,
+    identity: &Identity,
+) -> Result<(), String> {
+    if !cfg.token.is_empty() || cfg.local_only {
+        return Ok(());
+    }
+    if identity.credential.is_empty()
+        || identity.server.trim_end_matches('/') != cfg.server.trim_end_matches('/')
+    {
+        return Err("enroll this device for the selected server or pass a relay token".into());
+    }
+    cfg.token = identity.credential.clone();
+    Ok(())
+}
 pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, String> {
     c.validate()?;
     let config = c.clone();
@@ -326,9 +347,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
     }
     let identity = Identity::load(&c.state_dir)?;
     let mut cfg = c;
-    if !identity.credential.is_empty() {
-        cfg.token = identity.credential.clone();
-    }
+    adopt_identity_credential(&mut cfg, &identity)?;
     let mut mcp_token_error = None;
     if !cfg.mcp_listen.is_empty() && cfg.mcp_token.trim().is_empty() {
         match config::generated_mcp_token(&cfg.state_dir) {
@@ -1177,4 +1196,80 @@ async fn tool_version(name: &str) -> Option<(std::path::PathBuf, String)> {
         return Some((path, version));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn saved_identity(credential: &str, server: &str) -> Identity {
+        Identity {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            credential: credential.into(),
+            server: server.into(),
+            ..Identity::default()
+        }
+    }
+
+    #[test]
+    fn start_preserves_explicit_token_over_conflicting_saved_credentials() {
+        let mut cfg = Config {
+            server: "http://relay.invalid".into(),
+            token: "explicit-token".into(),
+            ..Config::default()
+        };
+        let saved = saved_identity("stored-wrong-token", "http://another-server.invalid");
+        adopt_identity_credential(&mut cfg, &saved).unwrap();
+        assert_eq!(
+            cfg.token, "explicit-token",
+            "an explicit token must win over a conflicting saved credential"
+        );
+    }
+
+    #[test]
+    fn start_rejects_cross_server_saved_credentials_without_a_token() {
+        let mut cfg = Config {
+            server: "http://relay.invalid".into(),
+            ..Config::default()
+        };
+        let saved = saved_identity("must-not-leak", "http://another-server.invalid");
+        let error = adopt_identity_credential(&mut cfg, &saved).unwrap_err();
+        assert!(
+            error.contains("selected server"),
+            "unexpected rejection: {error}"
+        );
+        assert!(
+            cfg.token.is_empty(),
+            "a cross-server credential must not leak into the selected config"
+        );
+    }
+
+    #[test]
+    fn start_uses_saved_credentials_only_for_the_same_normalized_server() {
+        let mut cfg = Config {
+            server: "http://relay.invalid".into(),
+            ..Config::default()
+        };
+        let saved = saved_identity("bound-token", "http://relay.invalid///");
+        adopt_identity_credential(&mut cfg, &saved).unwrap();
+        assert_eq!(cfg.token, "bound-token");
+
+        let mut mismatched = Config {
+            server: "http://relay.invalid".into(),
+            ..Config::default()
+        };
+        let other = saved_identity("other-server-token", "http://another-server.invalid");
+        assert!(adopt_identity_credential(&mut mismatched, &other).is_err());
+
+        let mut local = Config {
+            server: "http://relay.invalid".into(),
+            local_only: true,
+            ..Config::default()
+        };
+        adopt_identity_credential(&mut local, &saved).unwrap();
+        assert!(
+            local.token.is_empty(),
+            "a local-only bridge must not adopt a remote credential"
+        );
+    }
 }
