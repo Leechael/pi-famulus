@@ -16,7 +16,7 @@ fd-lock = "4"
 blake3 = "1"
 ratatui = "0.29"
 crossterm = "0.28"
-toml = "0.8"
+toml = "1"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
