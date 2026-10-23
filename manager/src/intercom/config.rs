@@ -202,6 +202,12 @@ impl Config {
             }
         }
         for endpoint in &self.endpoints {
+            if !crate::daemon::valid_session_id(&endpoint.name) {
+                return Err(format!(
+                    "endpoint name {:?} must be 1-128 letters, digits, '-', '_' or '.'",
+                    endpoint.name
+                ));
+            }
             webhook_url_allowed(&endpoint.url, &endpoint.secret)
                 .map_err(|error| format!("endpoint {}: {error}", endpoint.name))?;
         }
@@ -410,6 +416,23 @@ mod tests {
             assert!(config(url, "s").validate().is_ok(), "{url}");
         }
         assert!(webhook_url_allowed("http://localhost.evil.test/", "s").is_err());
+    }
+
+    #[test]
+    fn endpoint_names_must_be_valid_reply_origins() {
+        let config = |name: &str| Config {
+            endpoints: vec![Endpoint {
+                name: name.into(),
+                url: "https://hooks.example.com/x".into(),
+                secret: String::new(),
+                auth: "bearer".into(),
+            }],
+            ..Config::default()
+        };
+        for name in ["my hook", "a/b", "", "hook\n"] {
+            assert!(config(name).validate().is_err(), "{name:?}");
+        }
+        assert!(config("hook-1.prod_x").validate().is_ok());
     }
 
     #[cfg(unix)]

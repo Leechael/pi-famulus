@@ -1394,8 +1394,9 @@ pub async fn call_once(c: &Config, name: &str, mut frame: Value) -> Result<Value
     }).await.map_err(|_|"one-shot relay call timed out".to_string())?
 }
 pub async fn listen(c: Config, name: String, url: String, secret: String) -> Result<(), String> {
-    if name.contains('/') {
-        return Err("endpoint name must not contain '/'".into());
+    // The name becomes the `listen/<name>` reply origin peers validate.
+    if !name.is_empty() && !crate::daemon::valid_session_id(&name) {
+        return Err("endpoint name must be 1-128 letters, digits, '-', '_' or '.'".into());
     }
     super::config::webhook_url_allowed(&url, &secret)?;
     let identity = Identity::load(&c.state_dir)?;
