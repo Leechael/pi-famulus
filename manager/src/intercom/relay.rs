@@ -1345,8 +1345,8 @@ async fn listen_loop(
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        let (registered, error) = listen_once(c, identity, name, endpoint, clock).await;
-        let (sleep, next) = listen_retry_delay(backoff, registered, &error);
+        let (healthy, error) = listen_once(c, identity, name, endpoint, clock).await;
+        let (sleep, next) = listen_retry_delay(backoff, healthy, &error);
         if error.is_auth() {
             eprintln!("relay authentication rejected: {error}; re-enroll this device");
         }
@@ -1357,10 +1357,10 @@ async fn listen_loop(
 }
 fn listen_retry_delay(
     base: Duration,
-    registered: bool,
+    healthy: bool,
     error: &TransportError,
 ) -> (Duration, Duration) {
-    let (sleep, next) = next_backoff(if registered { BACKOFF_MIN } else { base });
+    let (sleep, next) = next_backoff(if healthy { BACKOFF_MIN } else { base });
     (
         if error.is_auth() {
             AUTH_RETRY_DELAY
@@ -1409,6 +1409,7 @@ async fn listen_once(
     if let Err(error) = registered {
         return (false, error);
     }
+    let welcomed = clock.now_ms();
     let result: Result<(), TransportError> = async {
         let session = format!("listen/{name}");
         connection.send(Message::text(json!({"type":"snapshot","sessions":[{"id":session,"name":name,"harness":"webhook","status":"online"}]}).to_string())).await?;
@@ -1433,7 +1434,9 @@ async fn listen_once(
             }
         }
     }.await;
-    (true, result.unwrap_err())
+    let healthy =
+        clock.now_ms().saturating_sub(welcomed) >= HEALTHY_SESSION.as_millis() as u64;
+    (healthy, result.unwrap_err())
 }
 
 #[cfg(test)]
@@ -2068,7 +2071,7 @@ mod listen_webhook_tests {
     }
 
     #[test]
-    fn listen_backoff_resets_only_after_welcome_and_classifies_auth_without_string_guessing() {
+    fn listen_backoff_resets_only_after_a_healthy_session_and_classifies_auth_without_string_guessing() {
         let denied = TransportError::Http {
             status: 401,
             reason: "revoked".into(),
@@ -2335,6 +2338,52 @@ mod listen_webhook_tests {
                 .iter()
                 .any(|timer| timer.label == "intercom_listen_reconnect"));
         }
+    }
+
+    #[cfg(feature = "test-clock")]
+    #[tokio::test]
+    async fn manual_listen_relay_that_welcomes_then_drops_keeps_backing_off() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clock = crate::clock::Clock::manual_for_test();
+        let timer = clock.clone();
+        let config = Config {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            token: "explicit-token".into(),
+            ..Config::default()
+        };
+        let task = tokio::spawn(async move {
+            let identity = Identity {
+                device_id: uuid::Uuid::new_v4().to_string(),
+                ..Identity::default()
+            };
+            let endpoint = super::super::config::Endpoint {
+                name: "hermes".into(),
+                url: "http://unused.invalid".into(),
+                secret: String::new(),
+                auth: "hmac".into(),
+            };
+            listen_loop(&config, &identity, "hermes", &endpoint, &timer).await;
+        });
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let (mut socket, _) = relay_peer(&listener).await;
+            assert_eq!(json_frame(&mut socket).await["type"], "register");
+            socket
+                .send(Message::text(json!({"type":"welcome"}).to_string()))
+                .await
+                .unwrap();
+            assert_eq!(json_frame(&mut socket).await["type"], "snapshot");
+            socket.close(None).await.unwrap();
+            let wait = wait_timer(&clock, "intercom_listen_reconnect").await;
+            waits.push(wait);
+            clock.manual().unwrap().advance(wait);
+        }
+        task.abort();
+        let _ = task.await;
+        assert!(
+            waits[2] >= 3000,
+            "welcome-then-drop reset the listen backoff: {waits:?}"
+        );
     }
 
     #[cfg(feature = "test-clock")]
