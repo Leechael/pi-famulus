@@ -416,6 +416,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
             );
         }
     }
+    crate::intercom::carry_dedup(snap.intercom_dedup.clone());
     let mut st = DaemonState::new(home.clone(), registry, snap.foreground);
     st.started_at_ms = snap.started_at_ms;
     st.generation = snap.generation;
@@ -670,6 +671,7 @@ async fn serve(
                     if let Some(ready) = ready {
                         // Returns only if the upgrade did not happen.
                         if let Some(runtime) = intercom.take() {
+                            crate::intercom::carry_dedup(runtime.delivered_ids());
                             runtime.shutdown().await;
                         }
                         let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;

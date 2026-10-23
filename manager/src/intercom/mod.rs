@@ -40,6 +40,15 @@ pub fn enabled() -> bool {
 pub fn configuration() -> Option<&'static Config> {
     CONFIG.get()
 }
+/// Injected message ids carried across an in-place upgrade; the next `start`
+/// seeds its dedup table from them so a relay redelivery is not injected twice.
+static CARRIED_DEDUP: Mutex<Vec<String>> = Mutex::new(Vec::new());
+pub fn carry_dedup(ids: Vec<String>) {
+    *CARRIED_DEDUP.lock().unwrap() = ids;
+}
+pub fn carried_dedup() -> Vec<String> {
+    CARRIED_DEDUP.lock().unwrap().clone()
+}
 pub type Shared = Arc<Runtime>;
 pub struct Push {
     pub value: Value,
@@ -144,6 +153,9 @@ pub struct Running {
     socket_identity: (u64, u64),
 }
 impl Running {
+    pub fn delivered_ids(&self) -> Vec<String> {
+        self.runtime.state.lock().unwrap().incoming.ids()
+    }
     pub fn stop_accepting(&self) {
         self.runtime.closing.send_replace(true);
         self.runtime.native.stop_accepting();
@@ -225,7 +237,9 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             history: HashSet::new(),
             pending_local: HashSet::new(),
             pending_remote: HashSet::new(),
-            incoming: Default::default(),
+            incoming: deliveries::InjectionDedup::from_ids(std::mem::take(
+                &mut *CARRIED_DEDUP.lock().unwrap(),
+            )),
             subscriptions: HashMap::new(),
             idle_stable: HashMap::new(),
             next_epoch: 0,

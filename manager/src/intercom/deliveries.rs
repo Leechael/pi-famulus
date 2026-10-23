@@ -15,6 +15,16 @@ pub struct InjectionDedup {
     inflight: HashMap<String, tokio::sync::watch::Sender<bool>>,
 }
 impl InjectionDedup {
+    pub(super) fn from_ids(ids: Vec<String>) -> Self {
+        let mut dedup = Self::default();
+        for id in ids {
+            dedup.delivered(&id);
+        }
+        dedup
+    }
+    pub(super) fn ids(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
     pub(super) fn delivered(&mut self, id: &str) {
         if id.is_empty() {
             return;

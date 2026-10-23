@@ -28,6 +28,10 @@ pub struct Snapshot {
     pub foreground: bool,
     #[serde(default)]
     pub intercom_config: Option<crate::intercom::config::Config>,
+    /// Message ids intercom already injected, so a redelivery after the
+    /// upgrade is acknowledged instead of injected again.
+    #[serde(default)]
+    pub intercom_dedup: Vec<String>,
     pub listener_fd: RawFd,
     pub lock_fd: RawFd,
     pub lifeline_read_fd: RawFd,
@@ -422,6 +426,7 @@ fn snapshot(
         started_at_ms: st.started_at_ms,
         foreground: st.foreground,
         intercom_config: crate::intercom::configuration().cloned(),
+        intercom_dedup: crate::intercom::carried_dedup(),
         listener_fd,
         lock_fd,
         lifeline_read_fd: lifeline.read.as_raw_fd(),
