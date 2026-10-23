@@ -246,15 +246,65 @@ async fn relay_send_rejects_a_body_whose_encoded_frame_exceeds_the_relay_frame_l
 }
 
 #[tokio::test]
+async fn mcp_refuses_to_start_without_a_token_or_on_an_unapproved_public_address() {
+    let rt = |listen: &str, token: &str, allow: bool| {
+        transport_runtime(Config {
+            mcp_listen: listen.into(),
+            mcp_token: token.into(),
+            mcp_allow_non_loopback: allow,
+            ..Config::default()
+        })
+    };
+    let error = super::super::http::start(rt("127.0.0.1:0", " ", false)).await.unwrap_err();
+    assert!(error.contains("unauthenticated"), "{error}");
+    let error = super::super::http::start(rt("0.0.0.0:0", "secret", false)).await.unwrap_err();
+    assert!(error.contains("mcp_allow_non_loopback"), "{error}");
+    super::super::http::start(rt("127.0.0.1:0", "secret", false)).await.unwrap().abort();
+}
+
+#[tokio::test]
+async fn mcp_backs_off_a_peer_that_keeps_presenting_wrong_tokens() {
+    let rt = transport_runtime(Config {
+        mcp_listen: "127.0.0.1:0".into(),
+        mcp_token: "secret".into(),
+        ..Config::default()
+    });
+    let server = super::super::http::start(rt.clone()).await.unwrap();
+    let url = rt.mcp_url.lock().unwrap().clone();
+    let client = reqwest::Client::new();
+    let post = |token: &'static str| {
+        client
+            .post(&url)
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
+            .send()
+    };
+    assert_eq!(post("secret").await.unwrap().status(), 200);
+    for _ in 0..5 {
+        assert_eq!(post("guess").await.unwrap().status(), 401);
+    }
+    let throttled = post("secret").await.unwrap();
+    assert_eq!(throttled.status(), 429);
+    assert!(throttled.headers().contains_key("retry-after"));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(post("secret").await.unwrap().status(), 200);
+    server.abort();
+}
+
+#[tokio::test]
 async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
     let rt = transport_runtime(Config {
         mcp_listen: "127.0.0.1:0".into(),
+        mcp_token: "secret".into(),
         ..Config::default()
     });
     let server = super::super::http::start(rt.clone()).await.unwrap();
     let url = rt.mcp_url.lock().unwrap().clone();
     let response = reqwest::Client::new()
         .post(url)
+        .bearer_auth("secret")
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .body(vec![b' '; MAX_FRAME + 1])

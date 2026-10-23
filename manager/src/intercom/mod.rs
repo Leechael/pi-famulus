@@ -221,6 +221,13 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
     if !identity.credential.is_empty() {
         cfg.token = identity.credential.clone();
     }
+    let mut mcp_token_error = None;
+    if !cfg.mcp_listen.is_empty() && cfg.mcp_token.trim().is_empty() {
+        match config::generated_mcp_token(&cfg.state_dir) {
+            Ok(token) => cfg.mcp_token = token,
+            Err(error) => mcp_token_error = Some(format!("MCP token: {error}")),
+        }
+    }
     if !cfg.local_only && cfg.token.is_empty() {
         return Err(
             "enroll this device or pass a device credential; use --local-only for local messages"
@@ -316,7 +323,11 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
         }));
     }
     if !runtime.cfg.mcp_listen.is_empty() {
-        match http::start(runtime.clone()).await {
+        let started = match mcp_token_error {
+            Some(error) => Err(error),
+            None => http::start(runtime.clone()).await,
+        };
+        match started {
             Ok(t) => {
                 runtime.state.lock().unwrap().mcp_status = "running".into();
                 running.tasks.push(t);
@@ -331,6 +342,13 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
     Ok(running)
 }
 impl Runtime {
+    fn generated_mcp_token_file(&self) -> String {
+        let path = self.cfg.state_dir.join(config::MCP_TOKEN_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(token) if token.trim() == self.cfg.mcp_token => path.to_string_lossy().into_owned(),
+            _ => String::new(),
+        }
+    }
     pub fn record(&self, kind: &str, mid: &str, session: &str, status: &str) {
         let mut s = self.state.lock().unwrap();
         s.seq += 1;
@@ -739,7 +757,7 @@ impl Runtime {
             )
         };
         legacy.sort();
-        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"native_status":native}).as_object().unwrap().clone());
+        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native}).as_object().unwrap().clone());
         for (key, count) in [
             ("claude_n", claude),
             ("pi_n", pi),

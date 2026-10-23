@@ -211,7 +211,7 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
     assert_eq!(
         tool(
             address,
-            "",
+            &fixture.mcp_token(),
             "message_status",
             json!({"message_id":last["msg_id"]})
         )["status"],
@@ -263,7 +263,7 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
     assert_eq!(callback["from"], synthetic);
     assert_eq!(callback["session_id"], synthetic);
     assert_eq!(callback["reply_to"], prior_id);
-    assert_eq!(tool(address,"","message_status",json!({"message_id":prior_id}))["status"],"delivered","authenticated socket callback without a rediscoverable native registry row must still record its orphan status fact");
+    assert_eq!(tool(address,&fixture.mcp_token(),"message_status",json!({"message_id":prior_id}))["status"],"delivered","authenticated socket callback without a rediscoverable native registry row must still record its orphan status fact");
 }
 
 #[test]
@@ -407,7 +407,7 @@ fn published_pi_rpc_inbound_uses_new_transport_uuid_and_exact_authenticated_sour
     assert!(uuid::Uuid::parse_str(id).is_ok());
     assert_ne!(id, "not-a-native-transport-identity");
     assert_eq!(
-        tool(address, "", "message_status", json!({"message_id":id}))["status"],
+        tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))["status"],
         "accepted"
     );
 }
@@ -495,7 +495,7 @@ fn uncertain_incoming_injection_late_read_proves_delivery_and_dedup_survives_ret
         "Go Pi injection failures nack dropped without creating a terminal ledger fact"
     );
     assert_eq!(
-        tool(address, "", "message_status", json!({"message_id":id}))["status"],
+        tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))["status"],
         "read",
         "late authenticated read did not prove an uncertain injection happened"
     );
@@ -832,7 +832,7 @@ fn legacy_relay_non_native_send_keeps_server_id_and_early_held_projection() {
     let _origin = fixture.plugin("origin", "busy");
     let sent = tool(
         address,
-        "",
+        &fixture.mcp_token(),
         "send",
         json!({"from":"pi/origin","to":"pi/remote","message":"legacy send"}),
     );
@@ -842,7 +842,7 @@ fn legacy_relay_non_native_send_keeps_server_id_and_early_held_projection() {
         request.get("message_id").is_none_or(|v| v == ""),
         "legacy relay was sent unsupported caller UUID: {request}"
     );
-    let status = tool(address, "", "message_status", json!({"message_id":id}));
+    let status = tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
     assert_eq!(
         status["status"], "held",
         "ACK overwrote receipt that arrived before it"
@@ -1079,7 +1079,7 @@ fn native_remote_alias_maps_transport_receipts_to_original_uuid_and_pinned_sourc
     assert_eq!(
         tool(
             address,
-            "",
+            &fixture.mcp_token(),
             "message_status",
             json!({"message_id":sent["message_id"]})
         )["status"],
@@ -1190,7 +1190,7 @@ fn history_capacity_pins_held_and_active_and_rejects_before_local_injection() {
     target.no_event();
     let status = tool(
         address,
-        "",
+        &fixture.mcp_token(),
         "message_status",
         json!({"message_id":first_id}),
     );
@@ -1258,7 +1258,7 @@ fn relay_terminal_status_is_first_writer_wins_even_after_requeue_and_lower_recei
                 "receipt stream remains arrival-ordered; only query projection folds status"
             );
         }
-        let status = tool(address, "", "message_status", json!({"message_id":id}));
+        let status = tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
         assert_eq!(
             status["status"], terminal,
             "later terminal or lower rank rewrote terminal truth"

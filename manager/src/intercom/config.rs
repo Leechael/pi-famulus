@@ -12,6 +12,7 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub mcp_listen: String,
     pub mcp_token: String,
+    pub mcp_allow_non_loopback: bool,
     pub remote_messages: String,
     pub local_only: bool,
     pub event_log_size: usize,
@@ -54,6 +55,7 @@ impl Default for Config {
             state_dir: home.join(".agent-intercom"),
             mcp_listen: "127.0.0.1:18790".into(),
             mcp_token: String::new(),
+            mcp_allow_non_loopback: false,
             remote_messages: "allow".into(),
             local_only: false,
             event_log_size: 4096,
@@ -160,14 +162,21 @@ impl Config {
         if self.sock.as_os_str().is_empty() || self.state_dir.as_os_str().is_empty() {
             return Err("socket and state directory must not be empty".into());
         }
-        if !self.mcp_listen.is_empty()
-            && self.mcp_token.trim().is_empty()
-            && !loopback_listen(&self.mcp_listen)
-        {
-            return Err(format!(
-                "mcp_listen {:?} is not a loopback address; set mcp_token to expose MCP beyond this host",
-                self.mcp_listen
-            ));
+        if !self.mcp_listen.is_empty() && !loopback_listen(&self.mcp_listen) {
+            if !self.mcp_allow_non_loopback {
+                return Err(format!(
+                    "mcp_listen {:?} is not a loopback address; MCP is plain HTTP, so its bearer token \
+                     and every message would cross the network unencrypted. Set \
+                     mcp_allow_non_loopback = true only on a trusted network or behind a TLS proxy",
+                    self.mcp_listen
+                ));
+            }
+            if self.mcp_token.trim().is_empty() {
+                return Err(format!(
+                    "mcp_listen {:?} is not a loopback address; set mcp_token to expose MCP beyond this host",
+                    self.mcp_listen
+                ));
+            }
         }
         Ok(())
     }
@@ -223,6 +232,47 @@ impl Identity {
         std::fs::rename(&tmp, dir.join("device.json")).map_err(|e| e.to_string())
     }
 }
+pub const MCP_TOKEN_FILE: &str = "mcp-token";
+/// The MCP bearer token used when none is configured: generated once, kept
+/// owner-only in the state directory, and reused across restarts so client
+/// registrations stay valid.
+pub fn generated_mcp_token(dir: &Path) -> Result<String, String> {
+    private_dir(dir)?;
+    let path = dir.join(MCP_TOKEN_FILE);
+    if !path.exists() {
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let tmp = dir.join(format!(".mcp-token-{}", uuid::Uuid::new_v4()));
+        private_write(&tmp, token.as_bytes())?;
+        let result = std::fs::hard_link(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = result {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e.to_string());
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !m.is_file() || m.uid() != unsafe { libc::getuid() } || m.mode() & 0o077 != 0 {
+            return Err(format!(
+                "{} must be a regular file owned by this user with mode 0600",
+                path.display()
+            ));
+        }
+    }
+    let token = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let token = token.trim();
+    if token.len() < 32 {
+        return Err(format!("{} holds no usable token", path.display()));
+    }
+    Ok(token.into())
+}
 pub fn private_dir(path: &Path) -> Result<(), String> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -273,10 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_mcp_listen_requires_a_token() {
-        let config = |listen: &str, token: &str| Config {
+    fn non_loopback_mcp_listen_requires_an_explicit_opt_in_and_a_token() {
+        let config = |listen: &str, token: &str, allow: bool| Config {
             mcp_listen: listen.into(),
             mcp_token: token.into(),
+            mcp_allow_non_loopback: allow,
             ..Config::default()
         };
         for listen in [
@@ -285,10 +336,13 @@ mod tests {
             "192.0.2.1:0",
             "example.com:80",
         ] {
-            let error = config(listen, "").validate().unwrap_err();
+            let error = config(listen, "secret", false).validate().unwrap_err();
+            assert!(error.contains("mcp_allow_non_loopback"), "{listen}: {error}");
+            assert!(error.contains("unencrypted"), "{listen}: {error}");
+            let error = config(listen, "", true).validate().unwrap_err();
             assert!(error.contains("mcp_token"), "{listen}: {error}");
-            assert!(config(listen, "  ").validate().is_err(), "{listen}");
-            assert!(config(listen, "secret").validate().is_ok(), "{listen}");
+            assert!(config(listen, "  ", true).validate().is_err(), "{listen}");
+            assert!(config(listen, "secret", true).validate().is_ok(), "{listen}");
         }
         for listen in [
             "",
@@ -297,7 +351,30 @@ mod tests {
             "[::1]:18790",
             "localhost:18790",
         ] {
-            assert!(config(listen, "").validate().is_ok(), "{listen}");
+            assert!(config(listen, "", false).validate().is_ok(), "{listen}");
         }
+        let parsed: Config = toml::from_str("mcp_allow_non_loopback = true\n").unwrap();
+        assert!(parsed.mcp_allow_non_loopback);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_mcp_token_is_private_random_and_stable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("intercom-mcp-token-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("state");
+        let first = generated_mcp_token(&dir).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(generated_mcp_token(&dir).unwrap(), first);
+        let path = dir.join(MCP_TOKEN_FILE);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let other = generated_mcp_token(&root.join("other")).unwrap();
+        assert_ne!(other, first);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = generated_mcp_token(&dir).unwrap_err();
+        assert!(error.contains("0600"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
