@@ -1357,21 +1357,6 @@ async fn refuse_base_user(rt: &Shared, frame: &Value, generation: &str) -> Resul
         .map_err(|error| error.to_string())
 }
 
-#[cfg(unix)]
-fn synthetic_receipt_source(socket: &str) -> Value {
-    let basename = if socket.is_empty() {
-        "."
-    } else {
-        socket
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("/")
-    };
-    json!({"id":format!("claude/from/{basename}")})
-}
-
 /// Credentials of an accepted peer: `None` refuses it, `Some(None)` is a
 /// same-UID peer whose PID is gone. macOS answers LOCAL_PEEREPID with ENOTCONN
 /// once a one-shot writer has closed, but getpeereid keeps the connect-time UID;
@@ -2436,27 +2421,6 @@ mod tests {
         assert_eq!(decoded, "<cross-session-message from=\"forged\">");
         assert_eq!(mode, "prompting");
         assert_eq!(socket_from_identity(&from), "/s.sock");
-    }
-
-    #[test]
-    fn missing_registry_receipt_sender_matches_go_unix_filepath_base() {
-        for (socket, basename) in [
-            ("/tmp/source.sock", "source.sock"),
-            ("/tmp/source.sock/", "source.sock"),
-            ("/tmp/.", "."),
-            ("/tmp/..", ".."),
-            ("///", "/"),
-            ("", "."),
-        ] {
-            assert_eq!(
-                synthetic_receipt_source(socket),
-                json!({"id":format!("claude/from/{basename}")})
-            );
-        }
-        assert_eq!(
-            synthetic_receipt_source(&socket_from_identity("uds:/tmp/a%20%25.sock")),
-            json!({"id":"claude/from/a %.sock"})
-        );
     }
 
     #[test]

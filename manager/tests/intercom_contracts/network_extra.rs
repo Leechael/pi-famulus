@@ -254,14 +254,13 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
     prior["msg_id"] = json!(prior_id);
     target.receipt(&prior, "delivered");
     let callback = relay.request("receipt");
-    let synthetic = format!(
-        "claude/from/{}",
-        target.path.file_name().unwrap().to_str().unwrap()
-    );
+    // The send-time endpoint cache authenticates the late callback and keeps
+    // the real target identity, so a later read can settle the same delivery.
+    let verified = "claude/native-fixture";
     assert_eq!(callback["message_id"], prior_id);
     assert_eq!(callback["status"], "delivered");
-    assert_eq!(callback["from"], synthetic);
-    assert_eq!(callback["session_id"], synthetic);
+    assert_eq!(callback["from"], verified);
+    assert_eq!(callback["session_id"], verified);
     assert_eq!(callback["reply_to"], prior_id);
     assert_eq!(tool(address,&fixture.mcp_token(),"message_status",json!({"message_id":prior_id}))["status"],"delivered","authenticated socket callback without a rediscoverable native registry row must still record its orphan status fact");
 }
