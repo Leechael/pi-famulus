@@ -250,6 +250,7 @@ async fn async_main() {
         }
         Sub::Doctor => client::cmd_doctor(&home).await,
         Sub::Shutdown => run_client(client::cmd_shutdown(&home)).await,
+        Sub::Serve => run_client(client::cmd_serve(&home)).await,
         Sub::Upgrade => run_client(client::cmd_upgrade(&home)).await,
         Sub::Log {
             task_id,

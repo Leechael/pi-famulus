@@ -624,7 +624,7 @@ fn u14_upgrade_names_the_file_it_will_exec() {
     assert!(out.stderr.contains(BIN), "names this CLI: {}", out.stderr);
 
     // The same subcommand, run from the daemon's own file.
-    let o = std::process::Command::new(&bin).arg("--home").arg(&home.path).arg("upgrade").output().unwrap();
+    let o = common::famulus_command(&bin).arg("--home").arg(&home.path).arg("upgrade").output().unwrap();
     let own = (o.status, String::from_utf8_lossy(&o.stderr).into_owned());
     assert!(own.0.success(), "{}", own.1);
     assert!(!own.1.contains("upgrades to the file"), "{}", own.1);

@@ -26,8 +26,6 @@ pub struct Snapshot {
     pub trigger: String,
     pub started_at_ms: u64,
     pub foreground: bool,
-    #[serde(default)]
-    pub intercom_config: Option<crate::intercom::config::Config>,
     /// Injections intercom already attempted, so a redelivery after the
     /// upgrade is acknowledged instead of injected again.
     #[serde(default)]
@@ -425,7 +423,6 @@ fn snapshot(
         trigger: trigger.to_string(),
         started_at_ms: st.started_at_ms,
         foreground: st.foreground,
-        intercom_config: crate::intercom::configuration().cloned(),
         intercom_dedup: crate::intercom::carried_dedup(),
         listener_fd,
         lock_fd,

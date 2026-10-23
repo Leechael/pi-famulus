@@ -69,7 +69,7 @@ fn g1_output_reads_exact_ranges_across_ring_and_disk() {
 #[test]
 fn g2_autospawned_daemon_survives_sigint_to_spawning_group() {
     let home = Home::new("g2");
-    let mut cli = std::process::Command::new(BIN)
+    let mut cli = common::famulus_command(BIN)
         .arg("--home")
         .arg(&home.path)
         .arg("ls")

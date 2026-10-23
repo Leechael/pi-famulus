@@ -565,7 +565,7 @@ fn native_user_to_local_codex_alias_keeps_original_uuid_through_real_host_read_r
 fn failed_namespace_bind_preserves_old_alias_and_revokes_idle_before_retry() {
     let mut fixture = Fixture::new();
     fixture.start();
-    let pid = fixture.child.as_ref().unwrap().id();
+    let pid = fixture.daemon_pid();
     let mut plugin = fixture.plugin("migrating", "busy");
     let old = alias_record(&fixture, "pi/migrating");
     let old_socket = PathBuf::from(old["messagingSocketPath"].as_str().unwrap());
@@ -798,22 +798,10 @@ fn same_inode_successor_generation_is_not_reclaimed_until_unpublish_and_survives
     let mut control =
         common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
     control.hello_cli();
+    let daemon = fixture.daemon_pid();
+    fixture.release_lease();
     control.request_ok(json!({"type":"shutdown"}));
-    let deadline = Instant::now() + TIMEOUT;
-    while fixture
-        .child
-        .as_mut()
-        .unwrap()
-        .try_wait()
-        .unwrap()
-        .is_none()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "successor-aware shutdown did not complete"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    fixture.wait_exit(daemon, TIMEOUT, "successor-aware shutdown did not complete");
     assert_eq!(
         fs::read(&registry).unwrap(),
         bytes,

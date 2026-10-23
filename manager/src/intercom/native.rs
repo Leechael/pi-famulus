@@ -493,11 +493,21 @@ impl Native {
         Ok(())
     }
 }
+/// Codex app-server and Desktop adapters run only while the manager is
+/// Supervised; `stop` ends this supervision epoch.
+pub async fn start_codex(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>) {
+    desktop::start(rt, stop.clone()).await;
+    codex::start(rt, stop).await;
+}
+impl Native {
+    pub fn stop_codex(&self) {
+        self.codex.lock().unwrap().take();
+        self.desktop.lock().unwrap().take();
+    }
+}
 pub async fn start(rt: &Shared) -> Result<(), String> {
     *rt.native.owner.lock().unwrap() = std::sync::Arc::downgrade(rt);
     rt.native.start_idle_adapter();
-    desktop::start(rt).await;
-    codex::start(rt).await;
     #[cfg(unix)]
     {
         let dir = super::config::home().join(".claude/sessions");

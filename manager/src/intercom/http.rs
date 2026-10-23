@@ -28,7 +28,10 @@ const MAX_BODY: usize = super::relay::MAX_FRAME;
 type Body = UnsyncBoxBody<Bytes, Infallible>;
 type Reply = Response<Body>;
 
-pub async fn start(rt: Shared) -> Result<tokio::task::JoinHandle<()>, String> {
+pub async fn start(
+    rt: Shared,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<tokio::task::JoinHandle<()>, String> {
     let listener = tokio::net::TcpListener::bind(&rt.cfg.mcp_listen)
         .await
         .map_err(|e| e.to_string())?;
@@ -44,7 +47,6 @@ pub async fn start(rt: Shared) -> Result<tokio::task::JoinHandle<()>, String> {
     *rt.mcp_url.lock().unwrap() = format!("http://{address}/mcp");
     eprintln!("intercom MCP http://{address}/mcp");
     Ok(tokio::spawn(async move {
-        let mut stop = rt.stop.subscribe();
         let permits = Arc::new(tokio::sync::Semaphore::new(128));
         let throttle = Arc::new(AuthThrottle::default());
         let mut connections = tokio::task::JoinSet::new();

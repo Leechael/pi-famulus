@@ -4,7 +4,6 @@ use super::*;
 fn non_ui_command_families_have_real_help_without_starting_daemon() {
     let fixture = Fixture::new();
     for command in [
-        "serve",
         "status",
         "agents",
         "send",
@@ -65,56 +64,6 @@ fn empty_codex_hook_is_a_side_effect_free_noop() {
     assert!(
         !fixture.root.join("state/device.json").exists(),
         "empty hook must not create device identity"
-    );
-}
-
-#[test]
-fn ordinary_famulus_daemon_does_not_enable_intercom_from_environment_or_default_config() {
-    let mut fixture = Fixture::new();
-    fs::copy(
-        fixture.root.join("client.toml"),
-        fixture.root.join("config/agent-intercom.toml"),
-    )
-    .unwrap();
-    fixture.child = Some(
-        Command::new(BIN)
-            .arg("--home")
-            .arg(fixture.root.join("manager"))
-            .arg("daemon")
-            .env("HOME", &fixture.root)
-            .env("XDG_CONFIG_HOME", fixture.root.join("config"))
-            .env("AGENT_INTERCOM_SOCK", &fixture.sock)
-            .env("CODEX_HOME", fixture.root.join("codex"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + TIMEOUT;
-    let stream = loop {
-        if let Ok(stream) = UnixStream::connect(fixture.root.join("manager/manager.sock")) {
-            break stream;
-        }
-        if let Some(status) = fixture.child.as_mut().unwrap().try_wait().unwrap() {
-            panic!("ordinary daemon failed: {status}");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ordinary daemon never became ready"
-        );
-        thread::sleep(Duration::from_millis(10));
-    };
-    let mut manager = common::Conn::new(stream);
-    manager.hello_cli();
-    manager.request_ok(json!({"type":"status"}));
-    assert!(
-        !fixture.sock.exists(),
-        "ordinary manager silently enabled intercom"
-    );
-    assert!(
-        !fixture.root.join("state/device.json").exists(),
-        "ordinary manager initialized intercom identity"
     );
 }
 

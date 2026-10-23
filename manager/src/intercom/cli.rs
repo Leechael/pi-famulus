@@ -31,14 +31,32 @@ pub struct Options {
     pub save_token: bool,
 }
 
+impl Options {
+    /// No command-line overrides: the configuration file and environment only.
+    pub fn from_environment() -> Self {
+        Self {
+            config: None,
+            sock: None,
+            state_dir: None,
+            server: None,
+            token: None,
+            name: None,
+            mcp_listen: None,
+            mcp_token: None,
+            remote_messages: None,
+            local_only: false,
+            insecure: false,
+            save_token: false,
+        }
+    }
+}
+
 #[derive(usage::Subcommands)]
 pub enum Command {
     /// Read command help or the offline topics: exit-codes, herdr, idle.
     Help {
         path: Vec<String>,
     },
-    /// Run intercom inside the foreground manager daemon.
-    Serve,
     /// Reachable local and remote agent sessions.
     Agents {
         query: Option<String>,
@@ -251,15 +269,6 @@ pub async fn run(home: PathBuf, options: Options, action: Command) -> Result<(),
         return Ok(());
     }
     let cfg = Config::load(&options)?;
-    if matches!(action, Command::Serve) {
-        super::configure(cfg)?;
-        let code = crate::daemon::run(home, true, None).await;
-        return if code == 0 {
-            Ok(())
-        } else {
-            Err("intercom daemon failed".into())
-        };
-    }
     let (as_json, collection) = match &action {
         Command::Status { json, .. } => (*json, "report"),
         Command::Session {
@@ -467,7 +476,7 @@ pub async fn run(home: PathBuf, options: Options, action: Command) -> Result<(),
         Command::Service { action } => {
             return super::service::run(&home, &cfg, &options, action).await
         }
-        Command::Serve | Command::Help { .. } => unreachable!(),
+        Command::Help { .. } => unreachable!(),
     };
     let op = text(&req, "op").to_string();
     let r = match super::localrpc::call_raw(&cfg, req.clone()).await {

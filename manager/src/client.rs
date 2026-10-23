@@ -174,18 +174,72 @@ async fn reconnect(home: &Path) -> Result<Conn, String> {
 // Connect + spawn flow (§3.1)
 // ---------------------------------------------------------------------------
 
-/// Enable intercom without replacing the manager or its running tasks.
-pub async fn enable_intercom(
-    home: &Path,
-    config: crate::intercom::config::Config,
-) -> Result<(), String> {
-    let mut conn = reconnect(home).await?;
-    let _: UnitOk = conn
-        .roundtrip(RequestKind::IntercomEnable {
-            config: Box::new(config),
-        })
-        .await?;
+impl Conn {
+    /// Waits until the manager closes this connection (exit, crash or an
+    /// in-place upgrade); frames it sends meanwhile are discarded.
+    async fn closed(&mut self) {
+        while let Ok(Some(_)) = read_frame(&mut self.rd).await {}
+    }
+}
+
+/// Holds a supervision lease for as long as the returned future runs:
+/// connects (spawning the manager if none runs), asks it to supervise, and
+/// leases again whenever that manager goes away. Dropping the future ends
+/// the lease, and the manager falls back to its self-managed lifetime.
+pub async fn hold_supervision(home: &Path, mut report: impl FnMut(Result<String, String>)) {
+    loop {
+        let leased = async {
+            let mut conn = connect(home, &HelloMode::Cli).await?;
+            let granted: SuperviseOk = conn.roundtrip(RequestKind::Supervise {}).await?;
+            Ok::<_, String>((conn, granted))
+        }
+        .await;
+        match leased {
+            Ok((mut conn, granted)) => {
+                report(Ok(granted.intercom));
+                conn.closed().await;
+                report(Err("manager connection closed".into()));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                report(Err(error));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// `serve`: supervise the manager until a signal ends this process.
+pub async fn cmd_serve(home: &Path) -> Result<(), String> {
+    let lease = hold_supervision(home, |status| match status {
+        Ok(intercom) => {
+            let pid = lifecycle::read_pid_file(home)
+                .map(|p| format!(" (pid {})", p.pid))
+                .unwrap_or_default();
+            eprintln!("pi-famulus serve: supervising the manager{pid}; intercom {intercom}");
+        }
+        Err(error) => eprintln!("pi-famulus serve: {error}; retrying"),
+    });
+    tokio::select! {
+        _ = lease => {}
+        _ = termination() => {}
+    }
     Ok(())
+}
+
+async fn termination() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            return std::future::pending().await;
+        };
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+    }
+    #[cfg(windows)]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Connect to a running daemon and say hello; never spawns one.

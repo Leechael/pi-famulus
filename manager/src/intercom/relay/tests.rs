@@ -75,6 +75,7 @@ fn transport_runtime_on(cfg: Config, clock: crate::clock::Clock) -> Shared {
             pending_local: HashSet::new(),
             pending_remote: HashSet::new(),
             relay_workspaces: HashSet::new(),
+            supervised: false,
             incoming: Default::default(),
             subscriptions: HashMap::new(),
             idle_stable: HashMap::new(),
@@ -256,11 +257,11 @@ async fn mcp_refuses_to_start_without_a_token_or_on_an_unapproved_public_address
             ..Config::default()
         })
     };
-    let error = super::super::http::start(rt("127.0.0.1:0", " ", false)).await.unwrap_err();
+    let error = super::super::http::start(rt("127.0.0.1:0", " ", false), tokio::sync::watch::channel(false).1).await.unwrap_err();
     assert!(error.contains("unauthenticated"), "{error}");
-    let error = super::super::http::start(rt("0.0.0.0:0", "secret", false)).await.unwrap_err();
+    let error = super::super::http::start(rt("0.0.0.0:0", "secret", false), tokio::sync::watch::channel(false).1).await.unwrap_err();
     assert!(error.contains("mcp_allow_non_loopback"), "{error}");
-    super::super::http::start(rt("127.0.0.1:0", "secret", false)).await.unwrap().abort();
+    super::super::http::start(rt("127.0.0.1:0", "secret", false), tokio::sync::watch::channel(false).1).await.unwrap().abort();
 }
 
 #[tokio::test]
@@ -270,7 +271,7 @@ async fn mcp_wrong_tokens_on_loopback_cannot_lock_out_the_real_client() {
         mcp_token: "secret".into(),
         ..Config::default()
     });
-    let server = super::super::http::start(rt.clone()).await.unwrap();
+    let server = super::super::http::start(rt.clone(), rt.stop.subscribe()).await.unwrap();
     let url = rt.mcp_url.lock().unwrap().clone();
     let client = reqwest::Client::new();
     let post = |token: &'static str| {
@@ -334,7 +335,7 @@ async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
         mcp_token: "secret".into(),
         ..Config::default()
     });
-    let server = super::super::http::start(rt.clone()).await.unwrap();
+    let server = super::super::http::start(rt.clone(), rt.stop.subscribe()).await.unwrap();
     let url = rt.mcp_url.lock().unwrap().clone();
     let response = reqwest::Client::new()
         .post(url)

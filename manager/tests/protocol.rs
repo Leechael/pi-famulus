@@ -108,7 +108,7 @@ impl std::ops::DerefMut for ReapedChild {
 
 fn spawn_daemon(home: &Path) -> ReapedChild {
     ReapedChild(Some(
-        Command::new(BIN)
+        famulus_command(BIN)
             .arg("daemon")
             .env("PI_FAMULUS_HOME", home)
             .stdin(Stdio::null())
@@ -121,7 +121,7 @@ fn spawn_daemon(home: &Path) -> ReapedChild {
 
 fn spawn_daemon_with_agent_budget_pause(home: &Path, marker: &Path, release_marker: &Path) -> ReapedChild {
     ReapedChild(Some(
-        Command::new(BIN)
+        famulus_command(BIN)
             .arg("daemon")
             .env("PI_FAMULUS_HOME", home)
             .env("PI_FAMULUS_TEST_AGENT_BUDGET_PAUSE_CHILD", "ch-old")
@@ -137,7 +137,7 @@ fn spawn_daemon_with_agent_budget_pause(home: &Path, marker: &Path, release_mark
 
 fn spawn_daemon_with_writer_queue_marker(home: &Path, marker: &Path) -> ReapedChild {
     ReapedChild(Some(
-        Command::new(BIN)
+        famulus_command(BIN)
             .arg("daemon")
             .env("PI_FAMULUS_HOME", home)
             .env("PI_FAMULUS_TEST_WRITER_QUEUE_FULL_MARKER", marker)
@@ -493,7 +493,7 @@ fn pid_running(pid: u64) -> bool {
 
 /// Run a CLI invocation against the daemon at `home`, capturing output.
 fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> (ExitStatus, String) {
-    let mut child = Command::new(BIN)
+    let mut child = famulus_command(BIN)
         .args(args)
         .env("PI_FAMULUS_HOME", home)
         .stdin(Stdio::null())
@@ -854,7 +854,7 @@ fn t10_second_daemon_refused() {
     let blocked = d.home.join("blocked-lock-attempts");
     assert!(lifetime_lock_held(&d.home), "owner must hold manager.lock before refusal probe");
 
-    let mut duplicate = Command::new(BIN)
+    let mut duplicate = famulus_command(BIN)
         .arg("daemon")
         .env("PI_FAMULUS_HOME", &d.home)
         .env("PI_FAMULUS_TEST_DAEMON_LOCK_BLOCKED", &blocked)
@@ -1149,9 +1149,9 @@ fn p6_wrong_shape_capacity_config_refuses_reads_updates_and_admission() {
         let response = c.request(&request, &id);
         assert!(compact(&response).contains("\"ok\":false"), "admitted with {corrupt}: {response}");
         assert!(response.contains("JSON object"), "missing loud config error: {response}");
-        let get = Command::new(BIN).arg("--home").arg(&home).args(["config", "get", "max-agents"]).output().unwrap();
+        let get = famulus_command(BIN).arg("--home").arg(&home).args(["config", "get", "max-agents"]).output().unwrap();
         assert!(!get.status.success(), "config get accepted {corrupt}");
-        let set = Command::new(BIN).arg("--home").arg(&home).args(["config", "set", "max-agents", "12"]).output().unwrap();
+        let set = famulus_command(BIN).arg("--home").arg(&home).args(["config", "set", "max-agents", "12"]).output().unwrap();
         assert!(!set.status.success(), "config set accepted {corrupt}");
         assert_eq!(fs::read_to_string(home.join("config.json")).unwrap(), corrupt);
     }
@@ -1211,7 +1211,7 @@ fn p7_per_kind_budget_independence_and_queued_wakeup() {
     let flat = compact(&status);
     assert!(flat.contains("\"test\":{\"used\":1,\"total\":1}"), "per-kind status missing: {status}");
     assert!(flat.contains("\"build\":{\"used\":1,\"total\":1}"), "independent status missing: {status}");
-    let cli_status = Command::new(BIN)
+    let cli_status = famulus_command(BIN)
         .args(["--home", home.to_str().unwrap(), "status"])
         .output()
         .unwrap();
@@ -1255,7 +1255,7 @@ fn p7b_status_escapes_unknown_work_kind_control_characters() {
         "{response}"
     );
 
-    let status = Command::new(BIN)
+    let status = famulus_command(BIN)
         .args(["--home", home.to_str().unwrap(), "status"])
         .output()
         .unwrap();
@@ -1310,7 +1310,7 @@ fn p8_shrinking_kind_budget_keeps_queued_fifo_and_existing_permits() {
     );
     assert!(queued_second.read_until("p8-q2", Duration::from_millis(100)).is_none());
 
-    let set = Command::new(BIN)
+    let set = famulus_command(BIN)
         .args(["--home", home.to_str().unwrap(), "config", "set", "max-test", "1"])
         .output()
         .unwrap();
@@ -1411,7 +1411,7 @@ fn p11_capacity_increase_notifies_daemon_and_wakes_kind_queue() {
     );
     assert!(waiting.read_until("p11-wait", Duration::from_millis(100)).is_none());
 
-    let set = Command::new(BIN)
+    let set = famulus_command(BIN)
         .args(["--home", home.to_str().unwrap(), "config", "set", "max-test", "2"])
         .output()
         .unwrap();
@@ -1807,4 +1807,13 @@ fn t13_repeated_start_exit_stress() {
         n_status >= N,
         "expected ≥{N} terminal records after stress; list={list}"
     );
+}
+
+/// The manager binary without the messaging bridge: these tests do not use
+/// it, and it would bind the shared default intercom socket and publish into
+/// the real `~/.claude/sessions`.
+fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    command.env("PI_FAMULUS_NO_INTERCOM", "1");
+    command
 }

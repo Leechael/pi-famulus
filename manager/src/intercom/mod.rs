@@ -18,30 +18,34 @@ mod service;
 use config::{Config, Identity};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
 /// Bounds alias retirement and publication cleanup so a wedged native peer
 /// cannot hold daemon exit or an upgrade.
 const NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-pub fn configure(c: Config) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let _ = c;
-        Err("intercom native adapters support Linux/macOS only".into())
+/// Set by test harnesses that run managers without the messaging bridge, so
+/// they never bind the shared default intercom socket.
+pub const DISABLE_ENV: &str = "PI_FAMULUS_NO_INTERCOM";
+/// The messaging bridge every manager runs: the configuration file (or
+/// `AGENT_INTERCOM_CONFIG`) plus environment. An unenrolled device bridges
+/// local agents only.
+pub fn bridge_config() -> Result<Config, String> {
+    if cfg!(windows) {
+        return Err("intercom native adapters support Linux/macOS only".into());
     }
-    #[cfg(not(windows))]
-    CONFIG
-        .set(c)
-        .map_err(|_| "intercom already configured".into())
-}
-pub fn enabled() -> bool {
-    CONFIG.get().is_some()
-}
-pub fn configuration() -> Option<&'static Config> {
-    CONFIG.get()
+    if std::env::var_os(DISABLE_ENV).is_some() {
+        return Err(format!("disabled by {DISABLE_ENV}"));
+    }
+    let mut config = Config::load(&cli::Options::from_environment())?;
+    if !config.local_only
+        && config.token.is_empty()
+        && !config.state_dir.join("device.json").exists()
+    {
+        config.local_only = true;
+    }
+    Ok(config)
 }
 pub use deliveries::CarriedInjection;
 /// Injection dedup entries carried across an in-place upgrade; the next `start`
@@ -106,6 +110,8 @@ pub struct State {
     pub pending_local: HashSet<String>,
     /// Herdr workspaces a relay peer created; the only ones it may close or extend.
     pub relay_workspaces: HashSet<String>,
+    /// A `serve` or `top` lease holds the manager (status reports it).
+    pub supervised: bool,
     pub pending_remote: HashSet<String>,
     pub incoming: deliveries::InjectionDedup,
     pub subscriptions: HashMap<String, Idle>,
@@ -161,8 +167,75 @@ pub struct Running {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     #[cfg(unix)]
     socket_identity: (u64, u64),
+    supervision: Option<Supervision>,
+}
+/// Capabilities that run only while the manager is Supervised (`serve` or
+/// `top` holds a lease): the Codex adapters and MCP.
+struct Supervision {
+    stop: watch::Sender<bool>,
+    mcp: Option<tokio::task::JoinHandle<()>>,
 }
 impl Running {
+    pub fn supervised(&self) -> bool {
+        self.supervision.is_some()
+    }
+    /// Starts the Supervised-only capabilities; idempotent.
+    pub async fn supervise(&mut self) {
+        if self.supervision.is_some() {
+            return;
+        }
+        let runtime = &self.runtime;
+        let (stop, _) = watch::channel(false);
+        native::start_codex(runtime, stop.subscribe()).await;
+        let mut mcp = None;
+        if !runtime.cfg.mcp_listen.is_empty() {
+            let started = if runtime.cfg.mcp_token.trim().is_empty() {
+                Err(runtime
+                    .state
+                    .lock()
+                    .unwrap()
+                    .mcp_status
+                    .strip_prefix("error: ")
+                    .unwrap_or("MCP token unavailable")
+                    .to_string())
+            } else {
+                http::start(runtime.clone(), stop.subscribe()).await
+            };
+            match started {
+                Ok(task) => {
+                    runtime.state.lock().unwrap().mcp_status = "running".into();
+                    mcp = Some(task);
+                }
+                Err(error) => {
+                    runtime.state.lock().unwrap().mcp_status = format!("error: {error}");
+                    runtime.record("error", "", "mcp", &error);
+                    eprintln!("intercom MCP: {error}");
+                }
+            }
+        }
+        self.supervision = Some(Supervision { stop, mcp });
+        runtime.state.lock().unwrap().supervised = true;
+    }
+    /// Stops the Supervised-only capabilities when the last lease is gone.
+    pub async fn unsupervise(&mut self) {
+        let Some(supervision) = self.supervision.take() else {
+            return;
+        };
+        supervision.stop.send_replace(true);
+        if let Some(mut mcp) = supervision.mcp {
+            if tokio::time::timeout(NATIVE_CLOSE_TIMEOUT, &mut mcp).await.is_err() {
+                mcp.abort();
+            }
+        }
+        self.runtime.native.stop_codex();
+        let mut state = self.runtime.state.lock().unwrap();
+        state.supervised = false;
+        if state.mcp_status == "running" {
+            state.mcp_status = "disabled".into();
+        }
+        drop(state);
+        self.runtime.mcp_url.lock().unwrap().clear();
+    }
     /// Shuts down, then returns the injection dedup table once in-flight
     /// injections have recorded their outcomes, for an upgrade to carry.
     pub async fn shutdown_for_handover(self) -> Vec<CarriedInjection> {
@@ -180,8 +253,9 @@ impl Running {
         let carried = runtime.state.lock().unwrap().incoming.carried();
         carried
     }
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.runtime.drain().await;
+        self.unsupervise().await;
         self.runtime.stop.send_replace(true);
         let connections = std::mem::take(&mut *self.runtime.rpc_tasks.lock().unwrap());
         for connection in &connections {
@@ -244,6 +318,10 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             Err(error) => mcp_token_error = Some(format!("MCP token: {error}")),
         }
     }
+    let mcp_status = match mcp_token_error {
+        Some(error) => format!("error: {error}"),
+        None => "disabled".into(),
+    };
     if !cfg.local_only && cfg.token.is_empty() {
         return Err(
             "enroll this device or pass a device credential; use --local-only for local messages"
@@ -279,6 +357,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             pending_local: HashSet::new(),
             pending_remote: HashSet::new(),
             relay_workspaces: HashSet::new(),
+            supervised: false,
             incoming: deliveries::InjectionDedup::from_carried(std::mem::take(
                 &mut *CARRIED_DEDUP.lock().unwrap(),
             )),
@@ -296,7 +375,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             legacy_active: None,
             pending: HashMap::new(),
             aliases: HashMap::new(),
-            mcp_status: "disabled".into(),
+            mcp_status,
             native_status: "starting".into(),
         }),
     });
@@ -324,6 +403,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
         tasks,
         #[cfg(unix)]
         socket_identity,
+        supervision: None,
     };
     match native::start(&runtime).await {
         Ok(()) => runtime.state.lock().unwrap().native_status = "running".into(),
@@ -338,23 +418,6 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
         running.tasks.push(tokio::spawn(async move {
             relay::run(rt).await;
         }));
-    }
-    if !runtime.cfg.mcp_listen.is_empty() {
-        let started = match mcp_token_error {
-            Some(error) => Err(error),
-            None => http::start(runtime.clone()).await,
-        };
-        match started {
-            Ok(t) => {
-                runtime.state.lock().unwrap().mcp_status = "running".into();
-                running.tasks.push(t);
-            }
-            Err(error) => {
-                runtime.state.lock().unwrap().mcp_status = format!("error: {error}");
-                runtime.record("error", "", "mcp", &error);
-                eprintln!("intercom MCP: {error}");
-            }
-        }
     }
     Ok(running)
 }
@@ -772,7 +835,7 @@ impl Runtime {
             )
         };
         legacy.sort();
-        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native}).as_object().unwrap().clone());
+        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
         for (key, count) in [
             ("claude_n", claude),
             ("pi_n", pi),

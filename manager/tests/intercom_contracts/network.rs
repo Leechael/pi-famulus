@@ -759,32 +759,8 @@ pub(super) fn start_relay_options_env(
         ),
     )
     .unwrap();
-    // start_with intentionally puts --local-only on argv, so remote tests use a direct foreground launch.
-    let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
-    fixture.child = Some(
-        fixture
-            .command()
-            .arg("serve")
-            .args(args)
-            .envs(env.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + TIMEOUT;
-    while UnixStream::connect(&fixture.sock).is_err() {
-        if let Some(status) = fixture.child.as_mut().unwrap().try_wait().unwrap() {
-            panic!("remote serve exited {status}: {}", fixture.log());
-        }
-        assert!(
-            Instant::now() < deadline,
-            "remote socket readiness: {}",
-            fixture.log()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    fixture.spawn_serve(args, env);
+    fixture.wait_supervised();
 }
 
 #[test]

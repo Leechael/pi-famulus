@@ -119,8 +119,9 @@ pub(crate) enum Sub {
     /// Interactive live view of sessions, agents, tasks, and CPU (like top).
     ///
     /// On a TTY this opens a refreshable dashboard. `--once` or a pipe prints
-    /// the plain-text snapshot instead. 100% NOW equals one CPU core. Never
-    /// starts the daemon.
+    /// the plain-text snapshot instead. 100% NOW equals one CPU core. The
+    /// interactive view supervises the manager like `serve` (starting it if
+    /// none runs); `--once` and `--json` never start it.
     #[usage(display_order = 43, help_heading = "Inspection")]
     Top {
         /// Machine-readable JSON on stdout.
@@ -314,6 +315,14 @@ pub(crate) enum Sub {
     /// does this by itself when that file changes.
     #[usage(display_order = 170, help_heading = "Daemon")]
     Upgrade,
+    /// Keep the manager supervised until this command exits.
+    ///
+    /// Starts the manager if none runs and holds a supervision lease: the
+    /// manager stays up without pi sessions and also runs the Codex adapters
+    /// and MCP (when `mcp_listen` is configured). Exiting, or being killed,
+    /// returns it to its self-managed lifetime. The launchd service runs this.
+    #[usage(display_order = 175, help_heading = "Daemon")]
+    Serve,
     /// Run the manager daemon in the foreground (what clients spawn).
     #[usage(display_order = 180, help_heading = "Daemon")]
     Daemon {

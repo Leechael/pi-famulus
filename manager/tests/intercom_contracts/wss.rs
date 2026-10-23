@@ -208,41 +208,22 @@ impl WssRelay {
             fixture.root.join("client.toml"),
             format!(
                 "{config}\nserver='wss://{}/ws'\ntoken='fixture-token'\ntls_insecure={}\n",
-                self.address, toml_insecure
+                self.address,
+                insecure || toml_insecure
             ),
         )
         .unwrap();
-        let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
-        let mut command = fixture.command();
-        command.arg("serve");
-        if insecure {
-            command.arg("--insecure");
-        }
-        if trusted_root {
-            command
-                .env("SSL_CERT_FILE", &self.roots)
-                .env("SSL_CERT_DIR", fixture.root.join("absent-cert-dir"));
-        }
-        fixture.child = Some(
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(log.try_clone().unwrap()))
-                .stderr(Stdio::from(log))
-                .spawn()
-                .unwrap(),
+        let mut env = Vec::new();
+        let (roots, absent) = (
+            self.roots.to_string_lossy().into_owned(),
+            fixture.root.join("absent-cert-dir").to_string_lossy().into_owned(),
         );
-        let deadline = Instant::now() + TIMEOUT;
-        while UnixStream::connect(&fixture.sock).is_err() {
-            if let Some(status) = fixture.child.as_mut().unwrap().try_wait().unwrap() {
-                panic!("WSS serve exited {status}: {}", fixture.log());
-            }
-            assert!(
-                Instant::now() < deadline,
-                "WSS daemon failed to listen: {}",
-                fixture.log()
-            );
-            thread::sleep(Duration::from_millis(5));
+        if trusted_root {
+            env.push(("SSL_CERT_FILE", roots.as_str()));
+            env.push(("SSL_CERT_DIR", absent.as_str()));
         }
+        fixture.spawn_serve(&[], &env);
+        fixture.wait_supervised();
     }
 
     fn registered(&self, fixture: &Fixture) {

@@ -107,7 +107,7 @@ impl Drop for Reader {
         self.0.abort();
     }
 }
-pub(super) async fn start(rt: &Shared) {
+pub(super) async fn start(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>) {
     #[cfg(unix)]
     {
         let (tx, mut rx) = mpsc::channel::<Command>(64);
@@ -121,7 +121,7 @@ pub(super) async fn start(rt: &Shared) {
         *rt.native.desktop.lock().unwrap() = Some(client);
         let owner = Arc::downgrade(rt);
         let attached = connected;
-        let mut stop = rt.stop.subscribe();
+        let mut stop = stop;
         let task = tokio::spawn(async move {
             loop {
                 let path = std::env::var_os("CODEX_DESKTOP_IPC_SOCK")

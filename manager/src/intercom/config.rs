@@ -53,7 +53,7 @@ impl Default for Config {
             tls_insecure: false,
             sock,
             state_dir: home.join(".agent-intercom"),
-            mcp_listen: "127.0.0.1:18790".into(),
+            mcp_listen: String::new(),
             mcp_token: String::new(),
             mcp_allow_non_loopback: false,
             remote_messages: "allow".into(),
@@ -113,6 +113,9 @@ pub fn home() -> PathBuf {
         .unwrap_or_default()
 }
 pub fn default_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("AGENT_INTERCOM_CONFIG").filter(|path| !path.is_empty()) {
+        return path.into();
+    }
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))

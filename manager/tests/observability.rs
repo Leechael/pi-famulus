@@ -540,7 +540,7 @@ fn e4_events_cli_filters_and_skips_malformed() {
     assert!(!home.sock().exists());
 
     // -f follows new lines
-    let mut child = std::process::Command::new(BIN)
+    let mut child = common::famulus_command(BIN)
         .args(["--home", home.path.to_str().unwrap(), "events", "-f", "--json"])
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1104,7 +1104,7 @@ fn c3_agent_transcript_and_ch_ids_in_log_tail_output_wait_stop() {
     let out = cli_ok(&home, &["log", "ch_0000c301", "-n", "1"]);
     assert_eq!(out.stdout.lines().count(), 1);
     assert!(out.stdout.contains("tool bash(echo two)"), "{}", out.stdout);
-    let mut tail = std::process::Command::new(BIN)
+    let mut tail = common::famulus_command(BIN)
         .args(["--home", home.path.to_str().unwrap(), "tail", "ch_0000c301", "-n", "0"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

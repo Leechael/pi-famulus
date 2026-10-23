@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -87,6 +87,8 @@ pub struct ConnHandle {
     /// Its writer task, aborted when an upgrade cannot wait for it to flush.
     #[cfg_attr(windows, allow(dead_code))]
     pub writer: tokio::task::AbortHandle,
+    /// Holds a supervision lease (`serve` / `top`) until it disconnects.
+    pub supervisor: bool,
 }
 
 pub struct SessionEntry {
@@ -142,9 +144,10 @@ struct AgentGrant {
     queued_behind: Option<u64>,
 }
 
-struct IntercomEnableRequest {
-    config: Box<crate::intercom::config::Config>,
-    reply: tokio::sync::oneshot::Sender<Result<UnitOk, ProtoError>>,
+/// Asks the accept loop to make the messaging bridge match the current
+/// leases (Supervised iff some connection holds one).
+struct SupervisionRequest {
+    reply: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 pub struct DaemonState {
@@ -202,8 +205,8 @@ pub struct DaemonState {
     /// Hosted `pi --mode rpc` subagents.
     pub hosted: crate::hosted::Hosted,
     agent_notices: Option<mpsc::UnboundedReceiver<crate::hosted::Notice>>,
-    intercom_enable: mpsc::Sender<IntercomEnableRequest>,
-    intercom_enable_rx: Option<mpsc::Receiver<IntercomEnableRequest>>,
+    supervision: mpsc::UnboundedSender<SupervisionRequest>,
+    supervision_rx: Option<mpsc::UnboundedReceiver<SupervisionRequest>>,
 }
 
 /// Bound on remembered start keys.
@@ -218,7 +221,7 @@ const PENDING_AGENT_REQUEST_IDS_MAX: usize = 8;
 impl DaemonState {
     fn new(home: PathBuf, registry: Registry, foreground: bool) -> DaemonState {
         let (notice_tx, notice_rx) = mpsc::unbounded_channel();
-        let (intercom_enable, intercom_enable_rx) = mpsc::channel(1);
+        let (supervision, supervision_rx) = mpsc::unbounded_channel();
         let hosted_home = home.clone();
         DaemonState {
             home,
@@ -251,8 +254,8 @@ impl DaemonState {
             agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
             hosted: crate::hosted::Hosted::new(hosted_home, notice_tx),
             agent_notices: Some(notice_rx),
-            intercom_enable,
-            intercom_enable_rx: Some(intercom_enable_rx),
+            supervision,
+            supervision_rx: Some(supervision_rx),
         }
     }
 }
@@ -280,48 +283,18 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     }
     // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
     // holder removes stale socket/pid files before binding. Held until exit.
-    let mut enabled_in = None;
-    let daemon_lock = loop {
-        // The claim retries with blocking sleeps; keep them off the runtime.
-        let claim = {
-            let home = home.clone();
-            tokio::task::spawn_blocking(move || lifecycle::claim_daemon(&home))
-                .await
-                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
-        };
-        match claim {
-            Ok(Claim::Acquired(guard)) => break guard,
-            Ok(Claim::AlreadyRunning { pid }) => {
-                let Some(config) = crate::intercom::configuration() else {
-                    match pid {
-                        Some(pid) => println!("pi-famulus already running (pid {pid})"),
-                        None => println!("pi-famulus already running (starting up)"),
-                    }
-                    return 0;
-                };
-                // `intercom serve` is a supervised job (launchd KeepAlive):
-                // exiting 0 here would end supervision while another
-                // process owns the manager. Stay up and take over once it
-                // exits; claiming is the probe, so a free lock is never
-                // taken and dropped under a starting daemon.
-                // An unreadable pid cannot prove the same manager survived.
-                if pid.is_none() || enabled_in != Some(pid) {
-                    if let Err(error) = crate::client::enable_intercom(&home, config.clone()).await {
-                        eprintln!("pi-famulus: cannot enable intercom: {error}");
-                        return 1;
-                    }
-                    eprintln!(
-                        "pi-famulus: intercom enabled in the running manager{}; taking over when it exits",
-                        pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
-                    );
-                    enabled_in = Some(pid);
-                }
-                tokio::time::sleep(DAEMON_TAKEOVER_POLL).await;
+    let daemon_lock = match lifecycle::claim_daemon(&home) {
+        Ok(Claim::Acquired(guard)) => guard,
+        Ok(Claim::AlreadyRunning { pid }) => {
+            match pid {
+                Some(pid) => println!("pi-famulus already running (pid {pid})"),
+                None => println!("pi-famulus already running (starting up)"),
             }
-            Err(e) => {
-                eprintln!("pi-famulus: daemon lock failed: {e}");
-                return 1;
-            }
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("pi-famulus: daemon lock failed: {e}");
+            return 1;
         }
     };
 
@@ -394,12 +367,8 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         );
     }
     start_agent_loops(&state);
-    serve(state, listener, daemon_lock, false).await
+    serve(state, listener, daemon_lock).await
 }
-
-/// How often `intercom serve` checks whether the manager it enabled
-/// intercom in has exited.
-const DAEMON_TAKEOVER_POLL: Duration = Duration::from_millis(500);
 
 /// Clients get this long to reconnect after an in-place upgrade before the
 /// zero-connection idle rule (§3.2) applies again.
@@ -430,16 +399,6 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     lifecycle::scan_tasks_except(&home, &mut registry, &live);
     for e in entries {
         registry.tasks.insert(e.record.task_id.clone(), e);
-    }
-    // Restored tasks outlive messaging: exiting here would close the
-    // lifeline and take every task down with it.
-    if let Some(config) = snap.intercom_config.clone() {
-        if let Err(error) = crate::intercom::configure(config) {
-            lifecycle::log_line(
-                &home,
-                &format!("upgrade: intercom configuration failed: {error}; continuing without intercom"),
-            );
-        }
     }
     crate::intercom::carry_dedup(snap.intercom_dedup.clone());
     let mut st = DaemonState::new(home.clone(), registry, snap.foreground);
@@ -554,7 +513,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         maybe_arm_idle_timer(&s2);
     });
     start_agent_loops(&state);
-    serve(state, listener, lock, true).await
+    serve(state, listener, lock).await
 }
 
 /// Handover keeps permits while sessions have a chance to reconnect. Once
@@ -600,39 +559,38 @@ fn ctrl_c_or_pending(
     }
 }
 
+/// Starts the messaging bridge every manager runs; a failure leaves the
+/// manager (and its tasks) running without messaging.
+async fn start_bridge(
+    home: &Path,
+    clock: crate::clock::Clock,
+) -> (Option<crate::intercom::Running>, Option<String>) {
+    let started = match crate::intercom::bridge_config() {
+        Ok(config) => crate::intercom::start(config, clock).await,
+        Err(error) => Err(error),
+    };
+    match started {
+        Ok(running) => (Some(running), None),
+        Err(error) => {
+            lifecycle::log_line(home, &format!("intercom: {error}; continuing without messaging"));
+            (None, Some(error))
+        }
+    }
+}
+
 /// The accept loop, shared by a fresh daemon and one restored after an
 /// in-place upgrade. Also runs the upgrade itself when asked.
-/// `restored`: this image took over live tasks from an in-place upgrade, so
-/// an intercom failure degrades messaging instead of exiting.
 async fn serve(
     state: Shared,
     listener: crate::ipc::Listener,
     daemon_lock: lifecycle::DaemonLockGuard,
-    restored: bool,
 ) -> i32 {
     let home = state.lock().unwrap().home.clone();
 
     let intercom_clock = state.lock().unwrap().clock.clone();
-    let mut intercom = if let Some(config) = crate::intercom::configuration() {
-        match crate::intercom::start(config.clone(), intercom_clock.clone()).await {
-            Ok(runtime) => Some(runtime),
-            Err(error) if restored => {
-                lifecycle::log_line(
-                    &home,
-                    &format!("upgrade: intercom startup failed: {error}; continuing without intercom"),
-                );
-                eprintln!("intercom: {error}; continuing without intercom");
-                None
-            }
-            Err(error) => {
-                lifecycle::log_line(&home, &format!("intercom startup failed: {error}"));
-                eprintln!("intercom: {error}");
-                return 1;
-            }
-        }
-    } else {
-        None
-    };
+    // Restarted after a failed in-place upgrade, which only Unix performs.
+    #[cfg_attr(windows, allow(unused_mut))]
+    let (mut intercom, mut bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
@@ -647,14 +605,12 @@ async fn serve(
     // spawn per §3.1, so this never fires for a healthy startup).
     maybe_arm_idle_timer(&state);
 
-    let (shutdown_notify, upgrade_notify, mut intercom_enable_rx) = {
+    let (shutdown_notify, upgrade_notify, mut supervision_rx) = {
         let mut st = state.lock().unwrap();
         (
             st.shutdown_notify.clone(),
             st.upgrade_notify.clone(),
-            st.intercom_enable_rx
-                .take()
-                .expect("intercom enable receiver"),
+            st.supervision_rx.take().expect("supervision receiver"),
         )
     };
     #[cfg(unix)]
@@ -682,12 +638,11 @@ async fn serve(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            Some(request) = intercom_enable_rx.recv(), if shutdown_task.is_none() => {
-                if request.reply.is_closed() {
-                    continue;
+            Some(request) = supervision_rx.recv(), if shutdown_task.is_none() => {
+                let status = apply_supervision(&state, &mut intercom, &bridge_error).await;
+                if let Some(reply) = request.reply {
+                    let _ = reply.send(status);
                 }
-                let result = enable_intercom_runtime(&state, *request.config, &mut intercom).await;
-                let _ = request.reply.send(result);
             },
             _ = upgrade_notify.notified(), if shutdown_task.is_none() => {
                 #[cfg(unix)]
@@ -699,11 +654,9 @@ async fn serve(
                             crate::intercom::carry_dedup(runtime.shutdown_for_handover().await);
                         }
                         let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
-                        if let Some(config) = crate::intercom::configuration() {
-                            match crate::intercom::start(config.clone(), intercom_clock.clone()).await {
-                                Ok(runtime) => intercom = Some(runtime),
-                                Err(error) => lifecycle::log_line(&home, &format!("intercom restart after failed upgrade: {error}")),
-                            }
+                        if intercom.is_none() {
+                            (intercom, bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
+                            apply_supervision(&state, &mut intercom, &bridge_error).await;
                         }
                     }
                 }
@@ -1345,6 +1298,7 @@ fn register_conn(
             die: die.clone(),
             written: written.clone(),
             writer: writer.clone(),
+            supervisor: false,
         },
     );
     Ok(conn_id)
@@ -1352,6 +1306,9 @@ fn register_conn(
 
 fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     if let Some(h) = st.conns.remove(&conn_id) {
+        if h.supervisor {
+            let _ = st.supervision.send(SupervisionRequest { reply: None });
+        }
         st.hosted.drop_conn(conn_id);
         if h.role != ConnRole::Child {
             if let Some(sid) = h.session_id.clone() {
@@ -1735,7 +1692,7 @@ fn start_agent_loops(state: &Shared) {
 pub fn maybe_arm_idle_timer(state: &Shared) {
     let mut st = state.lock().unwrap();
     let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
-    let warm = st.hosted.warm_count() > 0 || crate::intercom::enabled();
+    let warm = st.hosted.warm_count() > 0;
     if st.shutdown || st.upgrading || st.hold_idle || session_conn || warm || st.idle_timer.is_some()
     {
         return;
@@ -1747,7 +1704,7 @@ pub fn maybe_arm_idle_timer(state: &Shared) {
         let fired = {
             let mut st = state2.lock().unwrap();
             let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
-            let warm = st.hosted.warm_count() > 0 || crate::intercom::enabled();
+            let warm = st.hosted.warm_count() > 0;
             if !session_conn && !warm && !st.shutdown {
                 st.shutdown = true;
                 Some((st.home.clone(), st.shutdown_notify.clone()))
@@ -1997,13 +1954,8 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
                 respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "peers": hosted.peers(&child_id) }))).await;
             }
         }
-        RequestKind::IntercomEnable { config } => {
-            respond(
-                &tx,
-                &id,
-                handle_intercom_enable(&state, conn_id, config).await,
-            )
-            .await;
+        RequestKind::Supervise {} => {
+            respond(&tx, &id, handle_supervise(&state, conn_id).await).await;
         }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
@@ -3480,83 +3432,59 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
     })
 }
 
-async fn handle_intercom_enable(
-    state: &Shared,
-    conn_id: u64,
-    config: Box<crate::intercom::config::Config>,
-) -> Result<UnitOk, ProtoError> {
+async fn handle_supervise(state: &Shared, conn_id: u64) -> Result<SuperviseOk, ProtoError> {
     let sender = {
-        let st = state.lock().unwrap();
-        if !st
-            .conns
-            .get(&conn_id)
-            .is_some_and(|conn| conn.role == ConnRole::Cli)
-        {
-            return Err(ProtoError::new(
-                E_FORBIDDEN,
-                "intercom_enable is a cli-only operation",
-            ));
-        }
+        let mut st = state.lock().unwrap();
         if st.shutdown || st.upgrading {
             return Err(ProtoError::new(
                 E_INTERNAL,
                 "manager is shutting down or upgrading",
             ));
         }
-        st.intercom_enable.clone()
+        let Some(conn) = st
+            .conns
+            .get_mut(&conn_id)
+            .filter(|conn| conn.role == ConnRole::Cli)
+        else {
+            return Err(ProtoError::new(E_FORBIDDEN, "supervise is a cli-only operation"));
+        };
+        conn.supervisor = true;
+        st.supervision.clone()
     };
-    config
-        .validate()
-        .map_err(|error| ProtoError::new(E_BAD_REQUEST, error))?;
     let (reply, response) = tokio::sync::oneshot::channel();
     sender
-        .try_send(IntercomEnableRequest { config, reply })
-        .map_err(|_| ProtoError::new(E_INTERNAL, "intercom enable is already pending"))?;
-    response
+        .send(SupervisionRequest { reply: Some(reply) })
+        .map_err(|_| ProtoError::new(E_INTERNAL, "manager stopped before supervising"))?;
+    let intercom = response
         .await
-        .map_err(|_| ProtoError::new(E_INTERNAL, "manager stopped before enabling intercom"))?
+        .map_err(|_| ProtoError::new(E_INTERNAL, "manager stopped before supervising"))?;
+    Ok(SuperviseOk { intercom })
 }
 
-async fn enable_intercom_runtime(
+/// Makes the bridge's Supervised-only capabilities match the leases held
+/// now, and describes the bridge for a lease holder.
+async fn apply_supervision(
     state: &Shared,
-    config: crate::intercom::config::Config,
     running: &mut Option<crate::intercom::Running>,
-) -> Result<UnitOk, ProtoError> {
-    let clock = {
-        let st = state.lock().unwrap();
-        if st.shutdown || st.upgrading {
-            return Err(ProtoError::new(
-                E_INTERNAL,
-                "manager is shutting down or upgrading",
-            ));
-        }
-        st.clock.clone()
+    bridge_error: &Option<String>,
+) -> String {
+    let leased = state.lock().unwrap().conns.values().any(|conn| conn.supervisor);
+    let Some(running) = running.as_mut() else {
+        return format!(
+            "unavailable: {}",
+            bridge_error.as_deref().unwrap_or("not running")
+        );
     };
-    if let Some(current) = crate::intercom::configuration() {
-        if current != &config {
-            return Err(ProtoError::new(
-                E_BAD_REQUEST,
-                "intercom is already configured differently",
-            ));
-        }
-        if running.is_some() {
-            return Ok(UnitOk {});
-        }
+    if leased {
+        running.supervise().await;
+    } else {
+        running.unsupervise().await;
     }
-    let runtime = crate::intercom::start(config.clone(), clock)
-        .await
-        .map_err(|error| ProtoError::new(E_INTERNAL, error))?;
-    if crate::intercom::configuration().is_none() {
-        if let Err(error) = crate::intercom::configure(config) {
-            runtime.shutdown().await;
-            return Err(ProtoError::new(E_INTERNAL, error));
-        }
+    if running.supervised() {
+        "supervised".into()
+    } else {
+        "self-managed".into()
     }
-    *running = Some(runtime);
-    if let Some(timer) = state.lock().unwrap().idle_timer.take() {
-        timer.abort();
-    }
-    Ok(UnitOk {})
 }
 
 fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError> {
@@ -4676,6 +4604,7 @@ mod tests {
                 die: Arc::new(Notify::new()),
                 written: Arc::new(Mutex::new(HashMap::new())),
                 writer: writer.abort_handle(),
+                supervisor: false,
             },
         );
         // Real initial bytes, not a fabricated OutputChunk. Wait only for the

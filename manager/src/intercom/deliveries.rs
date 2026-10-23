@@ -616,6 +616,7 @@ mod tests {
                 pending_local: HashSet::new(),
                 pending_remote: HashSet::new(),
                 relay_workspaces: HashSet::new(),
+                supervised: false,
                 incoming: Default::default(),
                 subscriptions: HashMap::new(),
                 idle_stable: HashMap::new(),
@@ -1256,6 +1257,7 @@ mod tests {
             tasks: vec![task],
             #[cfg(unix)]
             socket_identity: (0, 0),
+            supervision: None,
         };
         let carried = running.shutdown_for_handover().await;
         drop(held);

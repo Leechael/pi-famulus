@@ -465,15 +465,20 @@ fn render_plist(d: &Detected) -> String {
         d.executable.to_string_lossy().as_ref(),
         "--home",
         d.manager_home.to_string_lossy().as_ref(),
-        "intercom",
-        "--config",
-        d.config_path.to_string_lossy().as_ref(),
         "serve",
     ] {
         text.push_str(&format!("\t\t{}\n", string(arg)));
     }
     text.push_str(&format!("\t</array>\n\t<key>RunAtLoad</key><true/>\n\t<key>KeepAlive</key>\n\t<dict><key>SuccessfulExit</key><false/></dict>\n\t<key>ThrottleInterval</key><integer>5</integer>\n\t<key>StandardOutPath</key>{}\n\t<key>StandardErrorPath</key>{}\n", string(&d.log_path.to_string_lossy()), string(&d.log_path.to_string_lossy())));
-    let env = sanitized_environment(d.environment.clone());
+    // `serve` holds the supervision lease; the manager it spawns reads the
+    // bridge configuration from here.
+    let mut env = d.environment.clone();
+    env.retain(|(key, _)| key != "AGENT_INTERCOM_CONFIG");
+    env.push((
+        "AGENT_INTERCOM_CONFIG".into(),
+        d.config_path.to_string_lossy().into_owned(),
+    ));
+    let env = sanitized_environment(env);
     if !env.is_empty() {
         text.push_str("\t<key>EnvironmentVariables</key>\n\t<dict>\n");
         for (key, value) in env {
@@ -790,8 +795,10 @@ fn response_error(response: &Value) -> &str {
 fn report_pid(report: &Value) -> i64 {
     report["pid"].as_i64().unwrap_or(0)
 }
-fn matching_pid(status: &Status, report: &Value) -> bool {
-    status.loaded && status.pid > 0 && report_pid(report) == status.pid
+/// The launch agent runs `serve`, which leases the manager: ready once the
+/// agent is running and the manager reports a held lease.
+fn service_ready(status: &Status, report: &Value) -> bool {
+    status.loaded && status.pid > 0 && report_pid(report) > 0 && report["supervised"] == true
 }
 fn format_status(status: &Status, report: Option<&Value>, cli_sock: &Path, issue: &str) -> String {
     let state = if !status.loaded {
@@ -832,22 +839,23 @@ fn format_status(status: &Status, report: Option<&Value>, cli_sock: &Path, issue
             cli_sock.display()
         ));
     }
-    if status.loaded && status.pid > 0 {
-        if pid != status.pid {
-            text.push_str(&format!(
-                "Warning: daemon pid {pid} does not match launchd pid {}\n",
-                status.pid
-            ));
-        }
-    } else if pid > 0 {
+    let supervised = report["supervised"] == true;
+    if status.loaded && status.pid > 0 && !supervised {
         text.push_str(&format!(
-            "Warning: daemon pid {pid} is not confirmed as a launchd service process\n"
+            "Warning: manager pid {pid} is not supervised by the launch agent (pid {})\n",
+            status.pid
+        ));
+    } else if !status.loaded && supervised {
+        text.push_str(&format!(
+            "Warning: manager pid {pid} is supervised outside the launch agent\n"
         ));
     }
     text
 }
+/// The service's `serve` leases whatever manager runs for `home`, so a
+/// self-managed one is fine; refuse only when the intercom socket is served
+/// by some other process (another home, or the standalone agent-intercom).
 async fn reject_external_daemon(home: &Path, cfg: &Config) -> Result<(), String> {
-    // Only missing/stale sockets mean there is no daemon; other failures block install.
     #[cfg(unix)]
     match tokio::net::UnixStream::connect(&cfg.sock).await {
         Ok(stream) => drop(stream),
@@ -857,38 +865,6 @@ async fn reject_external_daemon(home: &Path, cfg: &Config) -> Result<(), String>
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            if crate::lifecycle::lock_held(home) {
-                let socket = crate::lifecycle::socket_path(home);
-                let manager = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tokio::net::UnixStream::connect(&socket),
-                )
-                .await
-                .map_err(|_| {
-                    format!(
-                        "inspect existing manager at {}: connect timed out",
-                        socket.display()
-                    )
-                })?
-                .map_err(|error| {
-                    format!("inspect existing manager at {}: {error}", socket.display())
-                })?;
-                let pid = manager
-                    .peer_cred()
-                    .map_err(|error| format!("inspect existing manager credentials: {error}"))?
-                    .pid()
-                    .map(i64::from);
-                let service = status().await.map_err(|error| {
-                    format!("check whether the manager is outside the service: {error}")
-                })?;
-                if service.loaded && service.pid > 0 && pid == Some(service.pid) {
-                    return Ok(());
-                }
-                return Err(format!(
-                    "a manager is already running outside the service at {}; stop it first",
-                    home.display()
-                ));
-            }
             return Ok(());
         }
         Err(e) => {
@@ -901,37 +877,19 @@ async fn reject_external_daemon(home: &Path, cfg: &Config) -> Result<(), String>
     let response = super::localrpc::call_raw(cfg, json!({"op":"status"}))
         .await
         .map_err(|e| format!("inspect existing daemon at {}: {e}", cfg.sock.display()))?;
-    if !response_error(&response).is_empty() {
-        return Err(format!(
-            "a daemon is already responding on {}: {}",
-            cfg.sock.display(),
-            response_error(&response)
-        ));
-    }
-    let report = response
+    let pid = response
         .get("report")
-        .filter(|r| !r.is_null())
-        .ok_or_else(|| {
-            format!(
-                "a daemon is already responding on {} but returned no status; stop it first",
-                cfg.sock.display()
-            )
-        })?;
-    let status = status()
-        .await
-        .map_err(|e| format!("check launchd before replacing the daemon: {e}"))?;
-    if matching_pid(&status, report) {
+        .map(report_pid)
+        .filter(|pid| *pid > 0);
+    let manager = crate::lifecycle::read_pid_file(home).map(|file| i64::from(file.pid));
+    if pid.is_some() && pid == manager {
         return Ok(());
     }
-    let pid = report_pid(report);
-    if pid > 0 {
-        return Err(format!(
-            "a daemon (pid {pid}) is already running outside the service; stop it first"
-        ));
-    }
     Err(format!(
-        "a daemon is already responding on {} but could not be matched to launchd; stop it first",
-        cfg.sock.display()
+        "{} is served by another process{}, not the manager at {}; stop it first",
+        cfg.sock.display(),
+        pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default(),
+        home.display()
     ))
 }
 async fn wait_ready(cfg: &Config) -> Result<(), String> {
@@ -947,11 +905,11 @@ async fn wait_ready(cfg: &Config) -> Result<(), String> {
                 .filter(|r| !r.is_null())
                 .ok_or("daemon returned an empty status report")?;
             let status = status().await?;
-            if matching_pid(&status, report) {
+            if service_ready(&status, report) {
                 Ok(())
             } else {
                 Err(format!(
-                    "daemon pid {} does not match launchd pid {}",
+                    "manager pid {} is not yet supervised by launchd pid {}",
                     report_pid(report),
                     status.pid
                 ))
@@ -997,24 +955,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn external_manager_process() {
-        if let Some(home) = std::env::var_os("PI_FAMULUS_SERVICE_PREFLIGHT_TEST_HOME") {
-            let home = PathBuf::from(home);
-            let cfg = Config {
-                sock: home.parent().unwrap().join("missing-intercom.sock"),
-                ..Config::default()
-            };
-            assert!(!cfg.sock.exists());
-            let result = reject_external_daemon(&home, &cfg).await;
-            if std::env::var("PI_FAMULUS_SERVICE_EXPECT_OWNED").as_deref() == Ok("false") {
-                assert!(result.is_err_and(|error| error.contains("outside the service")));
-            } else {
-                assert!(
-                    result.is_ok(),
-                    "launchd-owned manager with no intercom socket must be restartable: {result:?}"
-                );
-            }
-            return;
-        }
         let Some(home) = std::env::var_os("PI_FAMULUS_SERVICE_MANAGER_TEST_HOME") else {
             return;
         };
@@ -1023,7 +963,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn installation_rejects_a_running_manager_without_intercom() {
+    async fn installation_leases_this_homes_manager_but_rejects_a_foreign_socket_owner() {
         struct Manager {
             child: std::process::Child,
             root: PathBuf,
@@ -1035,9 +975,10 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.root);
             }
         }
-        let root = PathBuf::from("/tmp").join(format!("fsvc-{}", uuid::Uuid::new_v4()));
+        let root = PathBuf::from("/tmp").join(format!("fsvc-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         std::fs::create_dir(&root).unwrap();
         let home = root.join("manager");
+        let sock = root.join("i.sock");
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1046,6 +987,9 @@ mod tests {
             ])
             .env("PI_FAMULUS_SERVICE_MANAGER_TEST_HOME", &home)
             .env("HOME", &root)
+            .env("AGENT_INTERCOM_CONFIG", root.join("absent.toml"))
+            .env("AGENT_INTERCOM_SOCK", &sock)
+            .env_remove(super::super::DISABLE_ENV)
             .env_remove("PI_FAMULUS_TEST_CLOCK")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1056,104 +1000,35 @@ mod tests {
             child,
             root: root.clone(),
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut connection = loop {
-            if let Ok(connection) =
-                crate::client::connect_existing(&home, &crate::client::HelloMode::Cli).await
-            {
-                break connection;
-            }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
             assert!(
                 manager.child.try_wait().unwrap().is_none(),
                 "real manager exited during setup"
             );
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "real manager did not accept hello"
+                "real manager never bridged {}",
+                sock.display()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        }
         let cfg = Config {
-            sock: root.join("missing-intercom.sock"),
+            sock: sock.clone(),
             ..Config::default()
         };
-        assert!(!cfg.sock.exists());
-        let before: crate::proto::StatusOk = connection
-            .roundtrip(crate::proto::RequestKind::Status)
-            .await
-            .unwrap();
-        let result = reject_external_daemon(&home, &cfg).await;
-        let after: crate::proto::StatusOk = connection
-            .roundtrip(crate::proto::RequestKind::Status)
-            .await
-            .unwrap();
-        assert_eq!(before.pid, manager.child.id());
-        assert_eq!(
-            after.pid, before.pid,
-            "preflight replaced the existing manager"
-        );
+        let own = reject_external_daemon(&home, &cfg).await;
+        assert!(own.is_ok(), "the service must lease this home's manager: {own:?}");
+        let foreign = reject_external_daemon(&root.join("other-home"), &cfg).await;
         assert!(
-            !cfg.sock.exists(),
-            "preflight enabled intercom in the external manager"
+            foreign.is_err_and(|error| error.contains("served by another process")),
+            "the service must not adopt a socket another manager serves"
         );
-        assert!(
-            result.is_err_and(|error| error.contains("outside the service")),
-            "service installation must reject an existing non-intercom manager"
-        );
-        let bin = root.join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let launchctl = bin.join("launchctl");
-        for (service_pid, owned) in [(std::process::id(), false), (manager.child.id(), true)] {
-            std::fs::write(
-                &launchctl,
-                format!(
-                    "#!/bin/sh\nprintf 'fixture = {{\\n\\tstate = running\\n\\tpid = {}\\n}}\\n'\n",
-                    service_pid
-                ),
-            )
-            .unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let launcher_report = std::process::Command::new(&launchctl)
-                .arg("print")
-                .output()
-                .unwrap();
-            assert!(launcher_report.status.success());
-            let mut launcher_status = Status::default();
-            parse_status(
-                &mut launcher_status,
-                &String::from_utf8(launcher_report.stdout).unwrap(),
-            );
-            assert_eq!(launcher_status.pid, i64::from(service_pid));
-            let probe = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "intercom::service::tests::external_manager_process",
-                    "--nocapture",
-                ])
-                .env("PI_FAMULUS_SERVICE_PREFLIGHT_TEST_HOME", &home)
-                .env(
-                    "PI_FAMULUS_SERVICE_EXPECT_OWNED",
-                    if owned { "true" } else { "false" },
-                )
-                .env("PATH", &bin)
-                .env("HOME", &root)
-                .env_remove("PI_FAMULUS_TEST_CLOCK")
-                .output()
-                .unwrap();
-            assert!(
-                probe.status.success(),
-                "service restart preflight failed (owned={owned}): {}\n{}",
-                String::from_utf8_lossy(&probe.stdout),
-                String::from_utf8_lossy(&probe.stderr)
-            );
-        }
-        let still_running: crate::proto::StatusOk = connection
-            .roundtrip(crate::proto::RequestKind::Status)
-            .await
-            .unwrap();
-        assert_eq!(still_running.pid, before.pid);
-        assert!(!cfg.sock.exists());
+        let missing = Config {
+            sock: root.join("missing.sock"),
+            ..Config::default()
+        };
+        assert!(reject_external_daemon(&home, &missing).await.is_ok());
     }
 
     #[cfg(target_os = "macos")]
@@ -1259,9 +1134,8 @@ mod tests {
         for expected in [
             "<string>--home</string>",
             "<string>/Users/test/manager &amp; home</string>",
-            "<string>intercom</string>",
-            "<string>--config</string>",
             "<string>serve</string>",
+            "<key>AGENT_INTERCOM_CONFIG</key>",
             "<key>SuccessfulExit</key><false/>",
             "<key>ThrottleInterval</key><integer>5</integer>",
             "<key>StandardOutPath</key>",
@@ -1435,9 +1309,11 @@ mod tests {
         assert!(st.loaded && st.running);
         assert_eq!(st.pid, 123);
         assert_eq!(st.state, "running");
-        assert!(matching_pid(&st, &json!({"pid":123})));
-        assert!(!matching_pid(&st, &json!({"pid":999})));
-        assert!(!matching_pid(&st, &json!({})));
+        assert!(service_ready(&st, &json!({"pid":456,"supervised":true})));
+        assert!(!service_ready(&st, &json!({"pid":456,"supervised":false})));
+        assert!(!service_ready(&st, &json!({"supervised":true})));
+        st.loaded = false;
+        assert!(!service_ready(&st, &json!({"pid":456,"supervised":true})));
     }
 
     #[test]
@@ -1451,18 +1327,21 @@ mod tests {
             log_path: "/client.log".into(),
             ..Status::default()
         };
-        let report =
-            json!({"daemon":"running", "relay":"connected", "pid":456, "socket":"/other.sock"});
+        let report = json!({"daemon":"running", "relay":"connected", "pid":456, "socket":"/other.sock", "supervised":false});
         let text = format_status(&st, Some(&report), Path::new("/cli.sock"), "");
         assert!(text.starts_with("Launch agent: running (pid 123)\nInstalled: true\nPlist: /agent.plist\nLogs: /client.log\n"));
         assert!(text.contains("Daemon: running (pid 456)\nRelay: connected\nSocket: /other.sock\n"));
         assert!(
             text.contains("Warning: CLI socket /cli.sock differs from daemon socket /other.sock")
         );
-        assert!(text.contains("Warning: daemon pid 456 does not match launchd pid 123"));
+        assert!(text.contains(
+            "Warning: manager pid 456 is not supervised by the launch agent (pid 123)"
+        ));
+        let leased = json!({"daemon":"running", "pid":456, "socket":"/cli.sock", "supervised":true});
+        assert!(!format_status(&st, Some(&leased), Path::new("/cli.sock"), "").contains("Warning"));
         st.loaded = false;
-        assert!(format_status(&st, Some(&report), Path::new(""), "")
-            .contains("is not confirmed as a launchd service process"));
+        assert!(format_status(&st, Some(&leased), Path::new(""), "")
+            .contains("is supervised outside the launch agent"));
         assert!(format_status(&st, None, Path::new(""), "").ends_with("Daemon: no status report\n"));
         assert!(
             format_status(&st, None, Path::new(""), "not responding (offline)")

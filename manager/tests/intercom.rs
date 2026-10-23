@@ -17,6 +17,8 @@ mod dynamic;
 mod herdr;
 #[path = "intercom_contracts/mcp_transport.rs"]
 mod mcp_transport;
+#[path = "intercom_contracts/lifecycle.rs"]
+mod lifecycle;
 #[path = "intercom_contracts/native.rs"]
 mod native;
 #[path = "intercom_contracts/network.rs"]
@@ -87,7 +89,9 @@ impl Fixture {
         .unwrap();
     }
 
-    fn command(&self) -> Command {
+    /// The manager binary with this fixture's isolated environment. Every
+    /// manager it spawns reads `client.toml` as its bridge configuration.
+    fn base_command(&self) -> Command {
         let mut command = Command::new(&self.binary);
         for key in [
             "AGENT_INTERCOM_SERVER",
@@ -113,12 +117,138 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
             .env("HERDR_SOCKET_PATH", self.root.join("absent-herdr.sock"))
+            .env("AGENT_INTERCOM_CONFIG", self.root.join("client.toml"))
             .arg("--home")
-            .arg(self.root.join("manager"))
+            .arg(self.root.join("manager"));
+        command
+    }
+
+    fn command(&self) -> Command {
+        let mut command = self.base_command();
+        command
             .arg("intercom")
             .arg("--config")
             .arg(self.root.join("client.toml"));
         command
+    }
+
+    /// `pi-famulus serve`, which spawns this fixture's manager and keeps it
+    /// supervised. Former `intercom serve` flags become the environment
+    /// overrides the spawned manager reads with `client.toml`.
+    fn spawn_serve(&mut self, args: &[&str], env: &[(&str, &str)]) {
+        let log = fs::File::create(self.root.join("serve.log")).unwrap();
+        let mut command = self.base_command();
+        command.arg("serve").envs(env.iter().copied());
+        let mut args = args.iter();
+        while let Some(flag) = args.next() {
+            let key = match *flag {
+                "--local-only" => continue,
+                "--mcp-listen" => "AGENT_INTERCOM_MCP_LISTEN",
+                "--mcp-token" => "AGENT_INTERCOM_MCP_TOKEN",
+                "--sock" => "AGENT_INTERCOM_SOCK",
+                "--server" => "AGENT_INTERCOM_SERVER",
+                "--token" => "AGENT_INTERCOM_TOKEN",
+                "--name" => "AGENT_INTERCOM_NAME",
+                "--remote-messages" => "AGENT_INTERCOM_REMOTE_MESSAGES",
+                other => panic!("serve takes no {other}; put it in client.toml"),
+            };
+            command.env(key, args.next().expect("flag value"));
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        self.child = Some(child);
+    }
+
+    /// Waits until `serve` holds its lease and the bridge socket answers.
+    fn wait_supervised(&mut self) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if self.log().contains("pi-famulus serve: supervising")
+                && UnixStream::connect(&self.sock).is_ok()
+            {
+                return;
+            }
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                panic!("serve exited {status}: {}", self.log());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "manager never became supervised with a bridge: {}{}",
+                self.log(),
+                self.manager_log()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn manager_log(&self) -> String {
+        fs::read_to_string(self.root.join("manager/manager.log")).unwrap_or_default()
+    }
+
+    /// The manager process (not `serve`, which only holds the lease).
+    fn daemon_pid(&self) -> u32 {
+        let raw = fs::read(self.root.join("manager/manager.pid")).expect("manager.pid");
+        serde_json::from_slice::<Value>(&raw).unwrap()["pid"].as_u64().unwrap() as u32
+    }
+
+    /// Ends `serve`, releasing its lease; the manager keeps running for
+    /// whatever else holds it.
+    fn release_lease(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            child.wait().unwrap();
+        }
+    }
+
+    fn wait_exit(&self, pid: u32, budget: Duration, why: &str) {
+        let deadline = Instant::now() + budget;
+        while unsafe { libc::kill(pid as i32, 0) } == 0 {
+            assert!(Instant::now() < deadline, "{why}: {}", self.manager_log());
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Ends `serve` (releasing the lease), then shuts the manager down and
+    /// waits for it to exit.
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let pid = fs::read(self.root.join("manager/manager.pid"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .and_then(|v| v["pid"].as_u64());
+        if let Ok(mut stream) = UnixStream::connect(self.root.join("manager/manager.sock")) {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+            for request in [
+                json!({"type":"hello","client_kind":"cli","id":"cleanup-hello"}),
+                json!({"type":"shutdown","id":"cleanup-shutdown"}),
+            ] {
+                if let Ok(raw) = serde_json::to_vec(&request) {
+                    let _ = stream.write_all(&(raw.len() as u32).to_be_bytes());
+                    let _ = stream.write_all(&raw);
+                }
+            }
+        }
+        if let Some(pid) = pid {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while unsafe { libc::kill(pid as i32, 0) } == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if unsafe { libc::kill(pid as i32, 0) } == 0 {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+        }
     }
 
     fn start(&mut self) {
@@ -131,34 +261,8 @@ impl Fixture {
     }
 
     fn start_with(&mut self, args: &[&str], env: &[(&str, &str)]) {
-        let log = fs::File::create(self.root.join("serve.log")).unwrap();
-        let mut command = self.command();
-        command
-            .args(["serve", "--local-only"])
-            .args(args)
-            .envs(env.iter().copied());
-        let child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap();
-        self.child = Some(child);
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            if UnixStream::connect(&self.sock).is_ok() {
-                return;
-            }
-            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                panic!("intercom serve exited {status}: {}", self.log());
-            }
-            assert!(
-                Instant::now() < deadline,
-                "intercom socket never ready: {}",
-                self.log()
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        self.spawn_serve(args, env);
+        self.wait_supervised();
     }
 
     fn log(&self) -> String {
@@ -239,28 +343,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Ok(mut stream) = UnixStream::connect(self.root.join("manager/manager.sock")) {
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-            for request in [
-                json!({"type":"hello","client_kind":"cli","id":"cleanup-hello"}),
-                json!({"type":"shutdown","id":"cleanup-shutdown"}),
-            ] {
-                if let Ok(raw) = serde_json::to_vec(&request) {
-                    let _ = stream.write_all(&(raw.len() as u32).to_be_bytes());
-                    let _ = stream.write_all(&raw);
-                }
-            }
-        }
-        if let Some(mut child) = self.child.take() {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
-            }
-            if matches!(child.try_wait(), Ok(None)) {
-                let _ = child.kill();
-            }
-            let _ = child.wait();
-        }
+        self.stop();
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -473,7 +556,7 @@ fn local_only_toml_starts_without_token_and_creates_private_stable_identity() {
 }
 
 #[test]
-fn socket_cli_overrides_environment_which_overrides_toml() {
+fn socket_environment_overrides_toml_and_cli_flag_overrides_environment() {
     let mut fixture = Fixture::new();
     let configured = fixture.sock.clone();
     fixture.sock = fixture.root.join("env.sock");
@@ -483,35 +566,40 @@ fn socket_cli_overrides_environment_which_overrides_toml() {
         !configured.exists(),
         "TOML socket unexpectedly bound despite env override"
     );
-    let mut daemon = fixture.child.take().unwrap();
-    daemon.kill().unwrap();
-    daemon.wait().unwrap();
-    fixture.sock = fixture.root.join("cli.sock");
-    let cli = fixture.sock.to_str().unwrap().to_string();
-    fixture.start_with(&["--sock", &cli], &[("AGENT_INTERCOM_SOCK", &environment)]);
-    assert!(fixture.connect().ok(json!({"op":"list"}))["sessions"].is_array());
+    let missing = fixture.root.join("missing.sock");
+    let output = fixture.run_env(
+        &["--sock", &environment, "agents", "--json"],
+        &[("AGENT_INTERCOM_SOCK", missing.to_str().unwrap())],
+    );
+    assert!(
+        output.status.success(),
+        "--sock did not override the environment: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
-fn malformed_config_and_invalid_remote_policy_fail_without_socket() {
-    let fixture = Fixture::new();
+fn malformed_config_fails_cli_commands_and_leaves_serve_without_a_bridge() {
+    let mut fixture = Fixture::new();
     fs::write(fixture.root.join("client.toml"), "local_only = [broken\n").unwrap();
-    let output = fixture.run(&["serve", "--local-only"]);
+    let output = fixture.run(&["agents"]);
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
     assert!(
-        error.contains("toml") || error.contains("config"),
+        error.contains("toml") || error.contains("config") || error.contains("parse"),
         "wrong config error: {error}"
     );
-    assert!(!fixture.sock.exists());
-    fixture.config("remote_messages = 'silently-allow'\n");
-    let output = fixture.run(&["serve", "--local-only"]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("remote_messages"),
-        "wrong policy error: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    fixture.spawn_serve(&[], &[]);
+    let deadline = Instant::now() + TIMEOUT;
+    while !fixture.log().contains("intercom unavailable") {
+        assert!(
+            Instant::now() < deadline,
+            "serve did not report the unusable configuration: {}",
+            fixture.log()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(fixture.log().contains("parse"), "{}", fixture.log());
     assert!(!fixture.sock.exists());
 }
 
@@ -881,219 +969,23 @@ fn jsonl_fragmentation_pipelining_and_oversize_do_not_break_other_clients() {
 fn live_socket_is_never_stolen_by_a_second_manager_home() {
     let mut fixture = Fixture::new();
     fixture.start();
-    let other = Fixture::new();
-    let output = other.run(&[
-        "serve",
-        "--local-only",
-        "--sock",
-        fixture.sock.to_str().unwrap(),
-    ]);
-    assert!(
-        !output.status.success(),
-        "second serve unexpectedly succeeded"
-    );
-    assert!(fixture.connect().ok(json!({"op":"list"}))["sessions"].is_array());
-}
-
-#[test]
-fn intercom_serve_stays_supervised_and_takes_over_when_the_existing_manager_exits() {
-    struct ServeProcess(Child);
-    impl Drop for ServeProcess {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut fixture = Fixture::new();
-    let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
-    fixture.child = Some(
-        Command::new(BIN)
-            .arg("--home")
-            .arg(fixture.root.join("manager"))
-            .arg("daemon")
-            .env("HOME", &fixture.root)
-            .env("XDG_CONFIG_HOME", fixture.root.join("config"))
-            .env("CODEX_HOME", fixture.root.join("codex"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    );
-    let manager_sock = fixture.root.join("manager/manager.sock");
+    let _plugin = fixture.plugin("first-home", "busy");
+    let mut other = Fixture::new();
+    other.spawn_serve(&["--sock", fixture.sock.to_str().unwrap()], &[]);
     let deadline = Instant::now() + TIMEOUT;
-    while UnixStream::connect(&manager_sock).is_err() {
-        assert!(Instant::now() < deadline, "ordinary manager failed to listen");
-        thread::sleep(Duration::from_millis(10));
-    }
-    let serve_log = fixture.root.join("supervised.log");
-    let log = fs::File::create(&serve_log).unwrap();
-    let mut serve = ServeProcess(
-        fixture
-            .command()
-            .args(["serve", "--local-only"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + TIMEOUT;
-    while UnixStream::connect(&fixture.sock).is_err() {
+    while !other.log().contains("intercom unavailable") {
         assert!(
             Instant::now() < deadline,
-            "intercom activation never became ready: {}",
-            fs::read_to_string(&serve_log).unwrap_or_default()
+            "second manager did not refuse the live socket: {}",
+            other.log()
         );
         thread::sleep(Duration::from_millis(10));
     }
-    thread::sleep(Duration::from_millis(300));
-    assert!(
-        serve.0.try_wait().unwrap().is_none(),
-        "intercom serve exited while another process owns the manager; launchd would stop supervising: {}",
-        fs::read_to_string(&serve_log).unwrap_or_default()
-    );
-    let mut external = fixture.child.take().unwrap();
-    assert_eq!(unsafe { libc::kill(external.id() as i32, libc::SIGTERM) }, 0);
-    external.wait().unwrap();
-    let deadline = Instant::now() + TIMEOUT;
-    let _manager = loop {
-        if let Ok(stream) = UnixStream::connect(&manager_sock) {
-            let mut conn = common::Conn::new(stream);
-            if conn.hello_ext("takeover")["pid"] == serve.0.id() {
-                break conn;
-            }
-        }
-        assert!(
-            serve.0.try_wait().unwrap().is_none(),
-            "intercom serve exited instead of taking over: {}",
-            fs::read_to_string(&serve_log).unwrap_or_default()
-        );
-        assert!(
-            Instant::now() < deadline,
-            "intercom serve never took over the manager: {}",
-            fs::read_to_string(&serve_log).unwrap_or_default()
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
-    let deadline = Instant::now() + TIMEOUT;
-    let mut sender = loop {
-        if let Ok(stream) = UnixStream::connect(&fixture.sock) {
-            break Peer::new(stream);
-        }
-        assert!(Instant::now() < deadline, "intercom did not return after takeover");
-        thread::sleep(Duration::from_millis(20));
-    };
-    sender.register("takeover-sender", "busy", &["read_receipts", "idle_state_v1"]);
-    let mut target = fixture.plugin("takeover-target", "busy");
-    let sent = sender.ok(json!({"op":"send","to":"pi/takeover-target","body":"supervised again"}));
-    assert_eq!(target.event("deliver")["message_id"], sent["message_id"]);
-}
-
-#[test]
-fn intercom_serve_enables_existing_manager_without_losing_its_active_task() {
-    struct EnableProcess(Child);
-    impl Drop for EnableProcess {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut fixture = Fixture::new();
-    let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
-    fixture.child = Some(
-        Command::new(BIN)
-            .arg("--home")
-            .arg(fixture.root.join("manager"))
-            .arg("daemon")
-            .env("HOME", &fixture.root)
-            .env("XDG_CONFIG_HOME", fixture.root.join("config"))
-            .env("CODEX_HOME", fixture.root.join("codex"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    );
-    let pid = fixture.child.as_ref().unwrap().id();
-    let deadline = Instant::now() + TIMEOUT;
-    let stream = loop {
-        if let Ok(stream) = UnixStream::connect(fixture.root.join("manager/manager.sock")) {
-            break stream;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ordinary manager failed to listen: {}",
-            fixture.log()
-        );
-        thread::sleep(Duration::from_millis(10));
-    };
-    let mut manager = common::Conn::new(stream);
-    assert_eq!(manager.hello_ext("already-running-client")["pid"], pid);
-    let task=manager.request_ok(json!({"type":"start","kind":"shell","command":"printf task-alive; sleep 30","cwd":fixture.root,"env":{},"run_in_background":true}));
-    let task_id = task["task_id"].clone();
-    assert!(
-        !fixture.sock.exists(),
-        "ordinary manager enabled intercom before request"
-    );
-    let log_path = fixture.root.join("enable.log");
-    let log = fs::File::create(&log_path).unwrap();
-    let mut enabling = EnableProcess(
-        fixture
-            .command()
-            .args(["serve", "--local-only"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if UnixStream::connect(&fixture.sock).is_ok() {
-            break;
-        }
-        if let Some(status) = enabling.0.try_wait().unwrap() {
-            let listed = manager.request_ok(json!({"type":"list"}));
-            assert!(
-                listed["tasks"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|t| t["task_id"] == task_id && t["status"] == "running"),
-                "intercom activation killed existing work: {listed}"
-            );
-            panic!(
-                "intercom serve returned {status} without enabling the already-running manager: {}",
-                fs::read_to_string(&log_path).unwrap_or_default()
-            );
-        }
-        assert!(
-            Instant::now() < deadline,
-            "intercom activation never became ready: {}",
-            fs::read_to_string(&log_path).unwrap_or_default()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    let output = fixture.run(&["status", "--json"]);
-    assert_cli_ok(&output);
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["pid"], pid, "activation created a second daemon");
-    let mut sender = fixture.plugin("attached-sender", "busy");
-    let mut target = fixture.plugin("attached-target", "busy");
-    let sent =
-        sender.ok(json!({"op":"send","to":"pi/attached-target","body":"same existing manager"}));
-    assert_eq!(target.event("deliver")["message_id"], sent["message_id"]);
-    let listed = manager.request_ok(json!({"type":"list"}));
-    assert!(
-        listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["task_id"] == task_id && t["status"] == "running"),
-        "activation disrupted existing work: {listed}"
-    );
-    manager.request_ok(json!({"type":"stop","task_id":task_id}));
+    assert!(other.log().contains("in use"), "{}", other.log());
+    assert!(fixture
+        .sessions()
+        .iter()
+        .any(|row| row["id"] == "pi/first-home"));
 }
 
 const TASK_WATCHER: &str = r#"
@@ -1111,6 +1003,7 @@ for line in stream.makefile():
     out.write(line)
     out.flush()
 "#;
+
 
 #[test]
 fn shutdown_notifies_a_task_hosted_idle_watcher_before_terminating_it() {
@@ -1143,13 +1036,10 @@ fn shutdown_notifies_a_task_hosted_idle_watcher_before_terminating_it() {
         );
         thread::sleep(Duration::from_millis(20));
     };
-    let child = fixture.child.as_mut().unwrap();
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
-    let deadline = Instant::now() + TIMEOUT;
-    while child.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "manager did not shut down");
-        thread::sleep(Duration::from_millis(20));
-    }
+    let pid = fixture.daemon_pid();
+    fixture.release_lease();
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+    fixture.wait_exit(pid, TIMEOUT, "manager did not shut down");
     let notices: Vec<Value> = fs::read_to_string(&frames)
         .unwrap()
         .lines()
@@ -1169,7 +1059,7 @@ fn shutdown_notifies_a_task_hosted_idle_watcher_before_terminating_it() {
 fn intercom_and_famulus_tasks_share_foreground_manager_pid_and_shutdown() {
     let mut fixture = Fixture::new();
     fixture.start();
-    let serve_pid = fixture.child.as_ref().unwrap().id();
+    let serve_pid = fixture.daemon_pid();
     let mut manager = common::Conn::new(
         UnixStream::connect(fixture.root.join("manager/manager.sock"))
             .expect("existing manager framed socket"),
@@ -1181,7 +1071,7 @@ fn intercom_and_famulus_tasks_share_foreground_manager_pid_and_shutdown() {
     );
     assert_eq!(
         hello["pid"], serve_pid,
-        "intercom serve must itself be the manager, not a wrapper"
+        "the bridge must run inside the manager, not a separate process"
     );
     let status = fixture.run(&["status", "--json"]);
     assert_cli_ok(&status);
@@ -1209,22 +1099,9 @@ fn intercom_and_famulus_tasks_share_foreground_manager_pid_and_shutdown() {
     let mut control =
         common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
     control.hello_cli();
+    fixture.release_lease();
     control.request_ok(json!({"type":"shutdown"}));
-    let deadline = Instant::now() + TIMEOUT;
-    while fixture
-        .child
-        .as_mut()
-        .unwrap()
-        .try_wait()
-        .unwrap()
-        .is_none()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "shared manager failed to shut down"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    fixture.wait_exit(serve_pid, TIMEOUT, "shared manager failed to shut down");
     assert!(
         UnixStream::connect(&fixture.sock).is_err(),
         "Pi listener survived manager shutdown"
@@ -1257,26 +1134,17 @@ fn shutdown_with_live_task_and_idle_watch_reports_unavailable_and_exits() {
     let mut control =
         common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
     control.hello_cli();
+    let daemon = fixture.daemon_pid();
+    fixture.release_lease();
     control.request_ok(json!({"type":"shutdown"}));
     let notice = watcher.event("idle_notice");
     assert_eq!(notice["subscription_id"], subscription["subscription_id"]);
     assert_eq!(notice["status"], "unavailable");
-    let deadline = Instant::now() + TIMEOUT;
-    while fixture
-        .child
-        .as_mut()
-        .unwrap()
-        .try_wait()
-        .unwrap()
-        .is_none()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "manager hung shutting down live task with an active idle watch: {}",
-            fixture.log()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    fixture.wait_exit(
+        daemon,
+        TIMEOUT,
+        "manager hung shutting down live task with an active idle watch",
+    );
     assert!(
         common::poll_true(TIMEOUT, || !common::pid_alive(pid)),
         "live task survived manager shutdown"

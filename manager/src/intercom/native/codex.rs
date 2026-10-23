@@ -226,14 +226,14 @@ impl Drop for Cancel {
     }
 }
 
-pub(super) async fn start(rt: &Shared) {
+pub(super) async fn start(rt: &Shared, stop: tokio::sync::watch::Receiver<bool>) {
     let client = Client {
         inner: Arc::new(Inner {
             connection: tokio::sync::Mutex::new(None),
             data: Arc::new(Data::default()),
             owner: Arc::downgrade(rt),
             clock: rt.clock.clone(),
-            stop: rt.stop.subscribe(),
+            stop,
             closing: rt.closing.subscribe(),
             probe: Mutex::new(Probe::default()),
         }),

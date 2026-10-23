@@ -381,13 +381,13 @@ fn native_terminal_receipt_retries_after_pi_origin_reconnect() {
 }
 
 #[test]
-fn exec_upgrade_restores_intercom_configuration_and_reaps_predecessor_aliases() {
+fn exec_upgrade_restarts_the_bridge_from_its_configuration_and_reaps_predecessor_aliases() {
     let mut fixture = Fixture::new();
     let binary = fixture.root.join("pi-famulus");
     fs::copy(BIN, &binary).unwrap();
     fixture.binary = binary;
     fixture.start();
-    let pid = fixture.child.as_ref().unwrap().id();
+    let pid = fixture.daemon_pid();
     let _plugin = fixture.plugin("before-upgrade", "busy");
     let directory = fixture.root.join(".claude/sessions");
     let deadline = Instant::now() + TIMEOUT;
@@ -425,7 +425,7 @@ fn exec_upgrade_restores_intercom_configuration_and_reaps_predecessor_aliases() 
         "upgrade was not executed: {}",
         output.stdout
     );
-    assert_eq!(fixture.child.as_ref().unwrap().id(), pid);
+    assert_eq!(fixture.daemon_pid(), pid);
     let old_pid = old_alias["pid"].as_u64().unwrap() as u32;
     let deadline = Instant::now() + TIMEOUT;
     while common::pid_alive(old_pid) {
@@ -471,7 +471,7 @@ fn exec_upgrade_keeps_restored_tasks_when_intercom_cannot_restart() {
     fs::copy(BIN, &binary).unwrap();
     fixture.binary = binary;
     fixture.start();
-    let pid = fixture.child.as_ref().unwrap().id();
+    let pid = fixture.daemon_pid();
     let mut manager = common::Conn::new(
         UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
     );
@@ -495,7 +495,7 @@ fn exec_upgrade_keeps_restored_tasks_when_intercom_cannot_restart() {
         fixture.log()
     );
     assert!(
-        fixture.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+        common::pid_alive(pid),
         "restored daemon exited: {}",
         fixture.log()
     );
