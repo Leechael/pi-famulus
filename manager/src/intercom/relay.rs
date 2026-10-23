@@ -926,7 +926,7 @@ fn webhook_client() -> Result<reqwest::Client, String> {
     .with_no_client_auth();
     reqwest::Client::builder()
         .use_preconfigured_tls(tls)
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|error| error.to_string())
@@ -1539,13 +1539,6 @@ mod listen_webhook_tests {
         });
         (format!("http://{address}/redirect"), rx, task)
     }
-    fn header<'a>(headers: &'a str, name: &str) -> &'a str {
-        headers
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.trim()))
-            .unwrap_or_default()
-    }
     async fn redirected_webhook(status: u16) {
         let (target, mut delivered, target_task) = http_peer(vec![(200, "{}")]).await;
         let (url, first, redirect_task) = redirect_peer(status, target).await;
@@ -1560,43 +1553,30 @@ mod listen_webhook_tests {
             "redirect-id",
         )
         .await;
-        assert_eq!(
-            result.unwrap(),
-            "delivered",
-            "Go standard client follows HTTP {status}"
+        assert!(
+            result.as_ref().unwrap_err().contains(&format!("HTTP {status}")),
+            "{result:?}"
         );
-        let first = first.await.unwrap();
-        let second = delivered.recv().await.unwrap();
-        assert!(first.0.starts_with("POST /redirect "));
-        assert_eq!(header(&second.0, "X-Request-ID"), "redirect-id");
-        assert_eq!(
-            header(&first.0, "X-Intercom-Signature"),
-            header(&second.0, "X-Intercom-Signature")
-        );
-        assert_eq!(
-            header(&first.0, "X-Hub-Signature-256"),
-            header(&second.0, "X-Hub-Signature-256")
-        );
-        if status == 302 {
-            assert!(second.0.starts_with("GET /hook "));
-            assert!(second.1.is_empty());
-        } else {
-            assert!(second.0.starts_with("POST /hook "));
-            assert_eq!(first.1, second.1);
-        }
+        assert!(first.await.unwrap().0.starts_with("POST /redirect "));
         redirect_task.await.unwrap();
-        target_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), delivered.recv())
+                .await
+                .is_err(),
+            "signed webhook body was replayed to the redirect target"
+        );
+        target_task.abort();
     }
     #[tokio::test]
-    async fn webhook_307_redirect_preserves_raw_id_and_hmac() {
+    async fn webhook_307_redirect_is_final_and_not_replayed() {
         redirected_webhook(307).await;
     }
     #[tokio::test]
-    async fn webhook_308_redirect_preserves_raw_id_and_hmac() {
+    async fn webhook_308_redirect_is_final_and_not_replayed() {
         redirected_webhook(308).await;
     }
     #[tokio::test]
-    async fn webhook_302_redirect_switches_to_get_like_go_default_client() {
+    async fn webhook_302_redirect_is_final_and_not_followed() {
         redirected_webhook(302).await;
     }
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
