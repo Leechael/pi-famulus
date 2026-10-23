@@ -69,7 +69,12 @@ fn killed_alias_publication_is_reaped_within_one_second_and_recovers_latest_desi
         if listener_dead && !registry.exists() && !socket.exists() {
             break;
         }
-        assert!(Instant::now()<deadline,"dead alias publication survived the cmd.Wait cleanup window: listener_dead={listener_dead}, registry={}, socket={}, kernel={state:?}",registry.exists(),socket.exists());
+        assert!(
+            Instant::now() < deadline,
+            "dead alias publication survived the cmd.Wait cleanup window: listener_dead={listener_dead}, registry={}, socket={}, kernel={state:?}",
+            registry.exists(),
+            socket.exists()
+        );
         thread::sleep(Duration::from_millis(5));
     }
     let next = alias_record_in_phase(&fixture, "pi/fast-reap", "event-driven child recovery");
@@ -180,7 +185,10 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
         if row["procStart"] == current_start && row["intercomGeneration"] != generation {
             break row;
         }
-        assert!(Instant::now()<deadline,"base with no in-memory predecessor never reclaimed a proven prior kernel incarnation: {row}");
+        assert!(
+            Instant::now() < deadline,
+            "base with no in-memory predecessor never reclaimed a proven prior kernel incarnation: {row}"
+        );
         thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(recovered["pid"], pid);
@@ -218,8 +226,12 @@ fn native_pi_read_before_physical_write_ack_keeps_read_ledger_and_still_acknowle
     );
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let state =
-            super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
+        let state = super::super::network::tool(
+            address,
+            &fixture.mcp_token(),
+            "message_status",
+            json!({"message_id":id}),
+        );
         if state["status"] == "read" {
             break;
         }
@@ -245,8 +257,12 @@ fn native_pi_read_before_physical_write_ack_keeps_read_ledger_and_still_acknowle
     assert_eq!(ack["orig_msg_id"], id);
     assert_eq!(ack["from"], format!("uds:{socket}"));
     assert_eq!(
-        super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))
-            ["status"],
+        super::super::network::tool(
+            address,
+            &fixture.mcp_token(),
+            "message_status",
+            json!({"message_id":id})
+        )["status"],
         "read"
     );
     native.no_frame();
@@ -491,8 +507,12 @@ fn native_user_to_local_pi_alias_keeps_uuid_delivered_and_read_is_ledger_only() 
     assert_eq!(receipt["from"], format!("uds:{socket}"));
     target.ok(json!({"op":"receipt","message_id":id,"status":"read"}));
     assert_eq!(
-        super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}))
-            ["status"],
+        super::super::network::tool(
+            address,
+            &fixture.mcp_token(),
+            "message_status",
+            json!({"message_id":id})
+        )["status"],
         "read"
     );
     native.no_frame();
@@ -541,8 +561,12 @@ fn native_user_to_local_codex_alias_keeps_original_uuid_through_real_host_read_r
         .contains("native through Codex alias"));
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let status =
-            super::super::network::tool(address, &fixture.mcp_token(), "message_status", json!({"message_id":id}));
+        let status = super::super::network::tool(
+            address,
+            &fixture.mcp_token(),
+            "message_status",
+            json!({"message_id":id}),
+        );
         if status["status"] == "read" {
             break;
         }
@@ -839,4 +863,253 @@ fn unlinked_alias_socket_without_successor_recovers_with_a_new_live_child_pid() 
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// `message_status` through the plugin connection returns the friendly
+/// `unknown` status (the MCP tool errors instead), so receipts can be polled
+/// before they are recorded.
+fn plugin_message_status(fixture: &mut Fixture, mid: &Value) -> String {
+    fixture
+        .connect()
+        .call(json!({"op":"message_status","message_id":mid}))["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn duplicate_claude_session_ids_are_never_discovered_or_routable() {
+    let mut fixture = Fixture::new();
+    let one = ClaudePeer::socket_namespace_flags(
+        &fixture,
+        "dup-one",
+        "claude/dup-target",
+        "one.sock",
+        &[],
+    );
+    let two = ClaudePeer::socket_namespace_flags(
+        &fixture,
+        "dup-two",
+        "claude/dup-target",
+        "two.sock",
+        &[],
+    );
+    // A unique marker proves a discovery cycle ran; the duplicated id must
+    // still stay out of the directory.
+    let _marker = ClaudePeer::with_flags(&fixture, &[]);
+    fixture.start();
+    fixture.wait_session("claude/native-fixture");
+    assert!(
+        !fixture
+            .sessions()
+            .iter()
+            .any(|row| row["id"] == "claude/dup-target"),
+        "ambiguous duplicate session id was published: {:?}",
+        fixture.sessions()
+    );
+    let mut sender = fixture.plugin("dup-sender", "busy");
+    sender.reject(
+        json!({"op":"send","to":"claude/dup-target","body":"must not route ambiguously"}),
+        "unknown session",
+    );
+    sender.reject(
+        json!({"op":"subscribe_idle","to":"claude/dup-target"}),
+        "unknown idle target",
+    );
+    one.no_frame();
+    two.no_frame();
+}
+
+#[test]
+fn duplicate_claude_session_ids_refuse_remote_policy_before_relay_body() {
+    let relay = super::super::network::WireRelay::new(super::super::network::relay_basics);
+    let mut fixture = super::super::network::stable_fixture();
+    let _one = ClaudePeer::socket_namespace_flags(
+        &fixture,
+        "dup-one",
+        "claude/dup-target",
+        "one.sock",
+        &[],
+    );
+    let _two = ClaudePeer::socket_namespace_flags(
+        &fixture,
+        "dup-two",
+        "claude/dup-target",
+        "two.sock",
+        &[],
+    );
+    let _marker = ClaudePeer::with_flags(&fixture, &[]);
+    super::super::network::start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
+    relay.request("register");
+    fixture.wait_session("pi/remote");
+    fixture.wait_session("claude/native-fixture");
+    assert!(
+        !fixture
+            .sessions()
+            .iter()
+            .any(|row| row["id"] == "claude/dup-target"),
+        "duplicate id must not be published before the policy check"
+    );
+    let refused = fixture.connect().call(
+        json!({"op":"send","reply_to":"claude/dup-target","to":"pi/remote","body":"ambiguous source"}),
+    );
+    assert_ne!(
+        refused["ok"], true,
+        "ambiguous source authorized: {refused}"
+    );
+    // Discovery drops every row of a duplicated session id, so the source
+    // cannot be verified at all — never first-match resolved.
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot verify Claude source"),
+        "wrong refusal: {refused}"
+    );
+    assert!(
+        !relay
+            .requests
+            .try_iter()
+            .any(|request| request["type"] == "send"),
+        "policy refusal occurred after the relay body was submitted"
+    );
+}
+
+#[test]
+fn claude_ai_oauth_source_fails_closed_before_relay_body() {
+    let relay = super::super::network::WireRelay::new(super::super::network::relay_basics);
+    let mut fixture = super::super::network::stable_fixture();
+    // Server-managed settings (claude.ai / apps gateway) settle with higher
+    // precedence than local files and cannot be verified by a local scan.
+    fs::create_dir_all(fixture.root.join(".claude")).unwrap();
+    fs::write(
+        fixture.root.join(".claude/.credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":"fixture-oauth-token"}}"#,
+    )
+    .unwrap();
+    let _native = ClaudePeer::new(&fixture);
+    super::super::network::start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
+    relay.request("register");
+    fixture.wait_session("pi/remote");
+    fixture.wait_session("claude/native-fixture");
+    let refused = fixture.connect().call(
+        json!({"op":"send","reply_to":"claude/native-fixture","to":"pi/remote","body":"oauth-managed source"}),
+    );
+    assert_ne!(
+        refused["ok"], true,
+        "unverifiable server-managed settings authorized: {refused}"
+    );
+    assert!(
+        refused["error"].as_str().unwrap().contains("claude.ai"),
+        "wrong refusal: {refused}"
+    );
+    assert!(
+        !relay
+            .requests
+            .try_iter()
+            .any(|request| request["type"] == "send"),
+        "policy refusal occurred after the relay body was submitted"
+    );
+}
+
+#[test]
+fn late_receipt_after_discovery_removal_verifies_against_send_time_identity() {
+    let mut fixture = Fixture::new();
+    let native = ClaudePeer::new(&fixture);
+    // Keep a live Claude socket so removing the target's registry cannot
+    // move the namespace (and rebind the base listener) mid-test.
+    let _anchor = ClaudePeer::socket_namespace_flags(
+        &fixture,
+        "native",
+        "receipt-anchor",
+        "anchor.sock",
+        &[],
+    );
+    fixture.start();
+    fixture.wait_session("claude/native-fixture");
+    let mut sender = fixture.plugin("cache-sender", "busy");
+    let sent = sender
+        .ok(json!({"op":"send","to":"claude/native-fixture","body":"cache the endpoint identity"}));
+    let user = native.frame();
+    assert_eq!(user["msg_id"], sent["message_id"]);
+    // Remove discovery; the send-time cached endpoint identity must still
+    // authenticate a late receipt for an unknown message id.
+    native.remove_registry(&fixture);
+    fixture.wait_absent("claude/native-fixture");
+    let late_mid = uuid::Uuid::new_v4().to_string();
+    let daemon_socket = user["from"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("uds:")
+        .unwrap()
+        .to_string();
+    native.send_control(
+        &daemon_socket,
+        json!({"type":"control","action":"peer_message_status","from":format!("uds:{}", native.path.display()),"orig_msg_id":late_mid,"status":"delivered"}),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if plugin_message_status(&mut fixture, &json!(late_mid)) == "delivered" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late receipt never verified against the send-time identity"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    // The daemon's own base socket accepts control frames.
+    let daemon_pid = fixture.daemon_pid();
+    let registry = fixture
+        .root
+        .join(".claude/sessions")
+        .join(format!("{daemon_pid}.json"));
+    let deadline = Instant::now() + TIMEOUT;
+    let base_socket = loop {
+        if let Ok(entry) = fs::read(&registry) {
+            if let Ok(entry) = serde_json::from_slice::<Value>(&entry) {
+                if let Some(path) = entry["messagingSocketPath"].as_str() {
+                    break PathBuf::from(path);
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon base registry never appeared: {}",
+            fixture.log()
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    // A bare stranger socket: no registry row and no send-time cached
+    // identity, so its receipts are unverifiable.
+    let dir = fixture.root.join("stranger");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("stranger.sock");
+    let _listener = UnixListener::bind(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let fabricated = uuid::Uuid::new_v4().to_string();
+    let mut link = UnixStream::connect(&base_socket).unwrap();
+    link.write_all(
+        format!(
+            "{}\n",
+            json!({"type":"control","action":"peer_message_status","from":format!("uds:{}", path.display()),"orig_msg_id":fabricated,"status":"delivered"})
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    drop(link);
+    // The unverifiable receipt must not be recorded at all.
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        plugin_message_status(&mut fixture, &json!(fabricated)),
+        "unknown",
+        "unverifiable receipt was recorded"
+    );
 }

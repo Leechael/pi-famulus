@@ -13,7 +13,7 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
             return Err(format!(
                 "cross-machine message refused: cannot read settings {}: {e}",
                 path.display()
-            ))
+            ));
         }
     };
     let mut bytes = Vec::new();
@@ -40,12 +40,18 @@ fn check_json(bytes: &[u8], path: &Path) -> Result<(), String> {
     })?;
     for key in ["policyHelper", "policyHelpers"] {
         if settings.get(key).is_some_and(|v| !v.is_null()) {
-            return Err(format!("cross-machine message refused: {} configures {key}; effective managed policy cannot be verified",path.display()));
+            return Err(format!(
+                "cross-machine message refused: {} configures {key}; effective managed policy cannot be verified",
+                path.display()
+            ));
         }
     }
     if let Some(value) = settings.get("isolatePeerMachines") {
         if value.as_bool() != Some(false) {
-            return Err(format!("cross-machine message refused: isolatePeerMachines in {}; native cross-machine approval unavailable",path.display()));
+            return Err(format!(
+                "cross-machine message refused: isolatePeerMachines in {}; native cross-machine approval unavailable",
+                path.display()
+            ));
         }
     }
     Ok(())
@@ -159,6 +165,37 @@ fn worktree(dir: &Path) -> Result<Option<PathBuf>, String> {
         .parent()
         .map(|p| p.join(".claude/settings.local.json")))
 }
+/// Detect settings channels a local file scan cannot verify. Returns a
+/// human-readable channel description when the source may receive
+/// server-managed settings (claude.ai / apps gateway).
+fn server_managed_channel(
+    config: &Path,
+    env: &HashMap<String, String>,
+) -> Result<Option<&'static str>, String> {
+    if env
+        .get("CLAUDE_CODE_OAUTH_TOKEN")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(Some("CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+    let Some(raw) = read(&config.join(".credentials.json"))? else {
+        return Ok(None);
+    };
+    let credentials: Value = serde_json::from_slice(&raw).map_err(|e| {
+        format!("cross-machine message refused: cannot parse Claude credentials to rule out claude.ai managed settings: {e}")
+    })?;
+    if ["accessToken", "refreshToken"].iter().any(|field| {
+        credentials["claudeAiOauth"][field]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    }) {
+        return Ok(Some(
+            "claude.ai OAuth (claudeAiOauth credentials); claude.ai and the apps gateway push \
+             managed settings to signed-in clients",
+        ));
+    }
+    Ok(None)
+}
 pub(super) fn check(row: &Value) -> Result<(), String> {
     let path = PathBuf::from(str_field(row, "_registry"));
     let current = super::read_claude_entry(&path).map_err(|e| {
@@ -215,7 +252,9 @@ pub(super) fn check(row: &Value) -> Result<(), String> {
         ]
         .contains(&arg.split('=').next().unwrap_or(""))
         {
-            return Err(format!("cross-machine message refused: source uses {arg}; effective settings cannot be verified"));
+            return Err(format!(
+                "cross-machine message refused: source uses {arg}; effective settings cannot be verified"
+            ));
         }
     }
     let home = PathBuf::from(
@@ -232,6 +271,23 @@ pub(super) fn check(row: &Value) -> Result<(), String> {
         .unwrap_or_else(|| home.join(".claude"));
     if !config.is_absolute() {
         return Err("cross-machine message refused: source CLAUDE_CONFIG_DIR is relative".into());
+    }
+    // Fail closed on server-managed settings channels. claude.ai / the apps
+    // gateway settle managed settings with higher precedence than every local
+    // file scanned below, deliver them to OAuth-signed-in clients at runtime,
+    // and have no local effective-settings interface this scan can query. A
+    // source signed in via claude.ai therefore cannot be verified, so native
+    // cross-machine forwarding stays disabled for it (local, non-cross-machine
+    // behavior is unaffected — this check only runs for cross-machine sends).
+    if let Some(channel) = server_managed_channel(&config, &env)? {
+        return Err(format!(
+            "cross-machine message refused: the source Claude session is signed in via \
+             {channel}, so claude.ai / apps-gateway managed settings may apply with higher \
+             precedence than local settings files, and no local effective-settings interface \
+             exists to verify them. Native cross-machine forwarding is disabled for this \
+             source: use an ANTHROPIC_API_KEY login for cross-machine Claude sources, or send \
+             from a non-Claude session."
+        ));
     }
     let mut paths = vec![config.join("settings.json")];
     for dir in cwd.ancestors() {
@@ -291,4 +347,53 @@ pub(super) fn check(row: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_ai_oauth_credentials_fail_closed_and_api_key_sources_verify() {
+        let dir = std::env::temp_dir().join(format!("pi-policy-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir).unwrap();
+        // No credentials at all: only local files decide.
+        assert_eq!(server_managed_channel(&dir, &HashMap::new()).unwrap(), None);
+        // API-key style credentials carry no claude.ai session.
+        std::fs::write(
+            dir.join(".credentials.json"),
+            br#"{"apiKey":"sk-ant-fixture"}"#,
+        )
+        .unwrap();
+        assert_eq!(server_managed_channel(&dir, &HashMap::new()).unwrap(), None);
+        // claude.ai OAuth: server-managed settings are invisible to local scans.
+        std::fs::write(
+            dir.join(".credentials.json"),
+            br#"{"claudeAiOauth":{"accessToken":"secret"}}"#,
+        )
+        .unwrap();
+        let channel = server_managed_channel(&dir, &HashMap::new()).unwrap();
+        assert!(
+            channel.is_some_and(|channel| channel.contains("claude.ai")),
+            "expected the claude.ai channel: {channel:?}"
+        );
+        // Refresh-only credentials still represent an OAuth session: the
+        // client can obtain a fresh access token and managed settings later.
+        std::fs::write(
+            dir.join(".credentials.json"),
+            br#"{"claudeAiOauth":{"refreshToken":"secret-refresh"}}"#,
+        )
+        .unwrap();
+        assert!(server_managed_channel(&dir, &HashMap::new())
+            .unwrap()
+            .is_some());
+        // An injected OAuth token environment is equally unverifiable.
+        std::fs::remove_file(dir.join(".credentials.json")).unwrap();
+        let env = HashMap::from([("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "token".to_string())]);
+        assert!(server_managed_channel(&dir, &env).unwrap().is_some());
+        // Unparseable credentials can never authorize: fail closed, not Ok.
+        std::fs::write(dir.join(".credentials.json"), b"not json").unwrap();
+        assert!(server_managed_channel(&dir, &HashMap::new()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

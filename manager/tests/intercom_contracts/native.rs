@@ -472,9 +472,8 @@ fn exec_upgrade_keeps_restored_tasks_when_intercom_cannot_restart() {
     fixture.binary = binary;
     fixture.start();
     let pid = fixture.daemon_pid();
-    let mut manager = common::Conn::new(
-        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
-    );
+    let mut manager =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
     manager.hello_ext("restore-degraded");
     let task = manager.request_ok(json!({"type":"start","kind":"shell","command":"sleep 60","cwd":fixture.root,"env":{},"run_in_background":true}));
     let task_id = task["task_id"].clone();
@@ -499,11 +498,13 @@ fn exec_upgrade_keeps_restored_tasks_when_intercom_cannot_restart() {
         "restored daemon exited: {}",
         fixture.log()
     );
-    let mut manager = common::Conn::new(
-        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
-    );
+    let mut manager =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
     assert_eq!(manager.hello_ext("restore-degraded")["pid"], pid);
-    assert!(common::pid_alive(task_pid), "restored task process was killed");
+    assert!(
+        common::pid_alive(task_pid),
+        "restored task process was killed"
+    );
     let listed = manager.request_ok(json!({"type":"list"}));
     assert!(
         listed["tasks"]
@@ -599,7 +600,7 @@ impl CodexPeer {
                                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                             ) =>
                         {
-                            continue
+                            continue;
                         }
                         Err(_) => break,
                     };

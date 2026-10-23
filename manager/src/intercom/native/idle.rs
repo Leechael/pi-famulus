@@ -416,14 +416,17 @@ impl Native {
             row["_started_at"] = entry["startedAt"].clone();
             candidates.push(row);
         }
+        // Reject ambiguity instead of picking a winner: two live processes
+        // publishing one session id (resume race or stale registry) make the
+        // intended target unknowable, matching discovery-time duplicate
+        // rejection and remote-source policy verification.
+        if candidates.len() > 1 {
+            return Err(format!(
+                "ambiguous native idle target {target:?}: multiple live processes publish this session id"
+            ));
+        }
         let row = candidates
-            .into_iter()
-            .max_by_key(|row| {
-                (
-                    row["_started_at"].as_i64().unwrap_or(0),
-                    row["pid"].as_i64().unwrap_or(0),
-                )
-            })
+            .pop()
             .ok_or_else(|| format!("unknown native idle target {target:?}"))?;
         if row["notify_idle"] != true {
             return Err("Claude target does not advertise idle notices; upgrade the target".into());
@@ -1085,7 +1088,7 @@ async fn send_physical_idle(
                         "native idle write lacks peer-close ordering proof: {cause}"
                     )),
                     debt: true,
-                }
+                };
             }
             Err(_) => {
                 return SendOutcome {
@@ -1093,7 +1096,7 @@ async fn send_physical_idle(
                         "native idle write lacks peer-close ordering proof: timeout".into(),
                     ),
                     debt: true,
-                }
+                };
             }
         }
     }
@@ -2132,7 +2135,14 @@ mod tests {
         let id = fixture.add("pi/w");
         let request = fixture.proven(&id).await;
         let base_frame = json!({"type":"control","action":"peer_idle_notice","from":alias::from_identity(str_field(&fixture.peer.endpoint,"_socket")),"orig_msg_id":request["msg_id"],"state":"idle"});
-        assert!(notice(&fixture.runtime, &base_frame, Some(i64::from(std::process::id()))).await);
+        assert!(
+            notice(
+                &fixture.runtime,
+                &base_frame,
+                Some(i64::from(std::process::id()))
+            )
+            .await
+        );
         assert_eq!(
             fixture.runtime.state.lock().unwrap().subscriptions[&id].status,
             "subscribed"
