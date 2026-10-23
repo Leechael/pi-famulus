@@ -53,6 +53,7 @@ fn relative_cli_socket_and_state_resolve_in_callers_cwd_not_existing_managers_cw
     let _manager = plain(&mut fixture, false);
     let caller = fixture.root.join("caller-cwd");
     fs::create_dir(&caller).unwrap();
+    fs::set_permissions(&caller, fs::Permissions::from_mode(0o700)).unwrap();
     let args = [
         "serve",
         "--local-only",

@@ -57,6 +57,9 @@ impl Fixture {
         fs::create_dir_all(root.join("config")).unwrap();
         fs::create_dir_all(root.join("claude/sessions")).unwrap();
         fs::create_dir_all(root.join("codex")).unwrap();
+        // The daemon refuses a group/world-writable socket directory rather
+        // than chmodding it, so the fixture must not depend on the umask.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let sock = root.join("i.sock");
         let fixture = Self {
             binary: PathBuf::from(BIN),
