@@ -74,6 +74,9 @@ pub struct Delivery {
     pub updated_at: u64,
     pub lease_at: u64,
     pub approval_pin: bool,
+    pub retry_at: u64,
+    pub retry_delay: u64,
+    pub forwarding: bool,
     pub reply_relay: bool,
     pub remote_native: bool,
     pub target_endpoint: Option<Value>,
@@ -756,7 +759,7 @@ impl Runtime {
         self.record("receipt", mid, reporter, &delivery.status);
         self.forward_receipt(mid, delivery, reason).await;
     }
-    async fn forward_receipt(&self, mid: &str, delivery: Delivery, reason: &str) {
+    async fn forward_receipt(&self, mid: &str, delivery: Delivery, reason: &str) -> bool {
         let result = if delivery.reply_relay {
             let tx = self.state.lock().unwrap().relay_tx.clone();
             match tx {Some(tx)=>tx.send(json!({"type":"receipt","message_id":mid,"session_id":delivery.target,"from":delivery.target,"status":delivery.status}).into()).await.map_err(|_|"relay disconnected".to_string()),None=>Err("relay disconnected".into())}
@@ -786,6 +789,21 @@ impl Runtime {
                 .lock()
                 .unwrap()
                 .commit_delivery(mid, &delivery.token);
+        }
+        result.is_ok()
+    }
+    async fn retry_receipt(&self, mid: &str, delivery: Delivery) {
+        let forwarded = self.forward_receipt(mid, delivery.clone(), "").await;
+        let mut state = self.state.lock().unwrap();
+        if let Some(current) = state
+            .messages
+            .get_mut(mid)
+            .filter(|current| Arc::ptr_eq(&current.token, &delivery.token))
+        {
+            current.forwarding = false;
+            if !forwarded {
+                current.retry_failed(self.clock.now_ms());
+            }
         }
     }
 }

@@ -5,6 +5,7 @@ const IDLE_TTL: u64 = 12 * 3600 * 1000;
 const IDLE_RECORDS: usize = 1024;
 const IDLE_PENDING: usize = 32;
 const IDLE_PER_WATCHER: usize = 4;
+const IDLE_FLUSH: Duration = Duration::from_secs(5);
 
 struct Admission {
     status: String,
@@ -772,9 +773,11 @@ impl Runtime {
             })
             .await;
     }
-    pub(super) async fn maintenance(&self) {
+    pub(super) async fn maintenance(self: &Arc<Self>) {
         let mut stop = self.closing.subscribe();
+        let mut forwards = tokio::task::JoinSet::new();
         loop {
+            while forwards.try_join_next().is_some() {}
             if *stop.borrow() {
                 break;
             }
@@ -803,21 +806,32 @@ impl Runtime {
             self.native.maintain_idle(self).await;
             let retries = {
                 let mut state = self.state.lock().unwrap();
-                state.prune_deliveries(self.clock.now_ms());
+                let now = self.clock.now_ms();
+                state.prune_deliveries(now);
                 state.subscriptions.retain(|_, record| {
                     record.status == "subscribed"
                         || record.admitting
-                        || self.clock.now_ms().saturating_sub(record.updated_at) <= IDLE_TTL
+                        || now.saturating_sub(record.updated_at) <= IDLE_TTL
                 });
-                state
+                let due = state
                     .messages
                     .iter()
-                    .filter(|(id, delivery)| state.active(id) && delivery.route_terminal())
-                    .map(|(id, delivery)| (id.clone(), delivery.clone()))
+                    .filter(|(id, delivery)| {
+                        state.active(id) && delivery.route_terminal() && delivery.retry_due(now)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                due.into_iter()
+                    .filter_map(|id| {
+                        let delivery = state.messages.get_mut(&id)?;
+                        delivery.forwarding = true;
+                        Some((id, delivery.clone()))
+                    })
                     .collect::<Vec<_>>()
             };
             for (id, delivery) in retries {
-                self.forward_receipt(&id, delivery, "").await;
+                let runtime = self.clone();
+                forwards.spawn(async move { runtime.retry_receipt(&id, delivery).await });
             }
         }
     }
@@ -844,7 +858,7 @@ impl Runtime {
                 self.dispatch_idle(&id, record).await;
             },
         );
-        let _ = tokio::time::timeout(Duration::from_millis(250), notifications).await;
+        let _ = tokio::time::timeout(IDLE_FLUSH, notifications).await;
     }
 }
 
@@ -991,6 +1005,42 @@ mod tests {
         assert_eq!(
             runtime.state.lock().unwrap().subscriptions[&known].status,
             "idle"
+        );
+    }
+    #[tokio::test]
+    async fn shutdown_flush_waits_for_a_slow_idle_notice_write() {
+        let runtime = runtime();
+        let (tx, mut rx) = mpsc::channel(4);
+        {
+            let mut state = runtime.state.lock().unwrap();
+            state.sessions.insert(
+                "pi/watcher".into(),
+                Session {
+                    value: json!({"id":"pi/watcher","harness":"pi"}),
+                    owner: 1,
+                    epoch: 1,
+                    tx,
+                    disconnect: None,
+                    caps: HashSet::new(),
+                    idle_since: None,
+                },
+            );
+            let mut subscription = record("pi/watcher", "pi/target");
+            subscription.mode = "pi_push".into();
+            subscription.epoch = Some(1);
+            subscription.created = runtime.clock.now_ms();
+            state.subscriptions.insert("flushed".into(), subscription);
+        }
+        let writer = async {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.value["status"], "unavailable");
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            frame.written.unwrap().send(Ok(())).is_ok()
+        };
+        let (_, waited) = tokio::join!(runtime.finish_idle("unavailable"), writer);
+        assert!(
+            waited,
+            "shutdown must not abandon an idle notice the watcher is still writing"
         );
     }
     #[test]
