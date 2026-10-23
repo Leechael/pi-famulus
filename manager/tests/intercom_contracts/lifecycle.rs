@@ -245,3 +245,29 @@ fn a_lease_rereads_the_bridge_configuration_a_self_managed_manager_started_with(
     manager.request_ok(json!({"type":"shutdown"}));
     daemon.wait().unwrap();
 }
+
+#[test]
+fn a_legacy_launch_agent_command_still_supervises_with_its_configuration() {
+    let mut fixture = Fixture::new();
+    let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
+    // Launch agents from an older release run `intercom --config C serve`
+    // with no AGENT_INTERCOM_CONFIG of their own.
+    let child = fixture
+        .command()
+        .env_remove("AGENT_INTERCOM_CONFIG")
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .unwrap();
+    fixture.child = Some(child);
+    fixture.wait_supervised();
+    let output = fixture.run(&["status", "--json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["supervised"], true, "{report}");
+    assert!(
+        report["machine"].as_str().unwrap_or_default().starts_with("fixture-host@"),
+        "the legacy command's --config did not reach the manager: {report}"
+    );
+}

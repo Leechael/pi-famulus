@@ -87,13 +87,21 @@ pub async fn run(
             reject_external_daemon(home, cfg).await?;
             let mut restart = matches!(action, ServiceCommand::Restart);
             // An agent installed by an older release runs other arguments;
-            // render it afresh so launchd reloads the current ones.
-            let detected = prepare(home, cfg, opts).await?;
-            let content = render_with_token_check(&detected, &cfg.token)?;
-            let stale = std::fs::read(&plist).map_or(true, |current| current != content.as_bytes());
-            if stale {
-                write_private_atomic(&plist, content.as_bytes(), false)?;
-                restart = true;
+            // render it afresh so launchd reloads the current ones. If the
+            // current configuration cannot render (install would refuse it),
+            // keep the installed agent: `intercom serve` still runs `serve`.
+            let rendered = match prepare(home, cfg, opts).await {
+                Ok(detected) => render_with_token_check(&detected, &cfg.token),
+                Err(error) => Err(error),
+            };
+            match rendered {
+                Ok(content) => {
+                    if std::fs::read(&plist).map_or(true, |current| current != content.as_bytes()) {
+                        write_private_atomic(&plist, content.as_bytes(), false)?;
+                        restart = true;
+                    }
+                }
+                Err(error) => eprintln!("keeping the installed launch agent: {error}"),
             }
             if !loaded().await? {
                 bootstrap(&plist).await?;
@@ -1051,6 +1059,7 @@ mod tests {
             let root = PathBuf::from(root);
             let cfg = Config {
                 sock: root.join("missing-intercom.sock"),
+                local_only: true,
                 ..Config::default()
             };
             let opts = Options {
@@ -1103,14 +1112,14 @@ mod tests {
         let plist = std::fs::read_to_string(agents.join(format!("{LABEL}.plist"))).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&root);
         assert!(
-            plist.contains("<string>serve</string>") && !plist.contains("<string>intercom</string>"),
-            "restart kept a stale launch agent: {plist}"
-        );
-        assert!(
             output.status.success(),
             "restart failed: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            plist.contains("<string>serve</string>") && !plist.contains("<string>intercom</string>"),
+            "restart kept a stale launch agent: {plist}"
         );
         let verbs: Vec<&str> = log
             .lines()
