@@ -888,6 +888,21 @@ fn cross_machine_workspace_ops_forward_end_to_end_with_origin_provenance() {
     fixture_a.spawn_serve(&[], &[]);
     fixture_a.wait_supervised();
     let machines = relay.wait_machines();
+    // The relay records a register frame before the peer has processed the
+    // reply that makes its own relay link usable; requests sent in that gap
+    // fail with "not connected to relay". Wait for each daemon to report it.
+    for fixture in [&fixture_a, &fixture_b] {
+        let mut peer = fixture.connect();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let status = peer.ok(json!({"op":"status"}));
+            if status["report"]["relay"] == "connected" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "relay never connected: {status}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     // Fixture A keeps the default 'fixture-host' name; fixture B is the peer.
     let machine_b = machines
         .iter()
