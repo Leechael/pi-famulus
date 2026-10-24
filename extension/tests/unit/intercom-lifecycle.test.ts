@@ -11,11 +11,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerIntercom } from "../../src/intercom/intercom";
 import {
   createFakeCtx,
+  createFakeManager,
   createFakePi,
-  createFakeTransport,
   flush,
   makeTempDir,
-  type FakeTransport,
 } from "./intercom-harness";
 
 const cleanups: (() => void)[] = [];
@@ -24,13 +23,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function lifecycleHarness(options: { autoUp?: boolean; delayedClose?: boolean } = {}) {
+function lifecycleHarness(options: { autoUp?: boolean } = {}) {
   const { autoUp = true } = options;
   const { dir, cleanup } = makeTempDir("fam-ic-life-");
   cleanups.push(cleanup);
-  const fake: FakeTransport = createFakeTransport();
-  if (!autoUp) fake.setUp(false);
-
   const intervals = new Set<{ callback: () => void; unref?: () => void }>();
   const retiredIntervals: { callback: () => void }[] = [];
   vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
@@ -45,13 +41,33 @@ function lifecycleHarness(options: { autoUp?: boolean; delayedClose?: boolean } 
 
   const pi = createFakePi();
   const { ctx, state } = createFakeCtx(dir, "primary");
+  const fake = createFakeManager({ sessionId: state.sessionId });
+  if (!autoUp) fake.setUp(false);
   const registrations = fake.registrations;
-  registerIntercom(pi.pi as any, { transport: fake.transport, extensionDirs: ["/nonexistent-extensions"] });
+  registerIntercom(pi.pi as any, {
+    getClient: () => fake.getClient(),
+    extensionDirs: ["/nonexistent-extensions"],
+  });
   const emit = (name: string, event: any = {}, context: any = ctx) => pi.handlers.get(name)?.(event, context);
   const afterShutdown: (() => void)[] = [];
+  const notices: string[] = [];
+  const ctxWithNotify: any = {
+    ...ctx,
+    ui: { notify: (message: string) => notices.push(message) },
+  };
+  // Keep the live sessionManager getter (a spread would freeze its value
+  // and break stale-context simulation).
+  Object.defineProperty(
+    ctxWithNotify,
+    "sessionManager",
+    Object.getOwnPropertyDescriptor(ctx, "sessionManager")!,
+  );
   return {
-    fake, pi, ctx, state, registrations, intervals, retiredIntervals,
-    emit, afterShutdown,
+    fake, pi, ctx: ctxWithNotify, state, registrations, intervals, retiredIntervals,
+    emit: (name: string, event: any = {}, context: any = ctxWithNotify) =>
+      pi.handlers.get(name)?.(event, context),
+    notices: () => [...notices],
+    afterShutdown,
   };
 }
 
@@ -102,9 +118,12 @@ it("tools and concurrent hooks await a single registration", async () => {
   await h.emit("session_shutdown", {});
 });
 
-it("session_start rebinds a changed session id on a live connection", async () => {
+it("session_start rebinds a changed session id on a new connection", async () => {
   const h = lifecycleHarness();
   await h.emit("session_start");
+  // famulus replaces the ManagerClient on /new: a cold connection with no
+  // port; the extension re-registers the new session on it.
+  h.fake.switchTo("replacement");
   h.state.sessionId = "replacement";
   await h.emit("session_start", { reason: "switch" });
   expect(h.registrations.length).toBe(2);
@@ -267,6 +286,9 @@ it("rename waits for initial registration and cannot overwrite replacement ident
   expect(renameWaiter.req.op).toBe("register");
   renameWaiter.respond();
   h.fake.held.delete("register");
+  // famulus replaces the ManagerClient on the switch: a cold connection
+  // bound to the new session id.
+  h.fake.switchTo("replacement");
   h.state.sessionId = "replacement";
   const replacement = h.emit("session_start", { reason: "switch" });
   await Promise.all([renaming, replacement]);
@@ -287,7 +309,10 @@ it("a manager disconnect retries while busy without reviving retired retries", a
   await flush();
   expect(h.fake.registrations.length).toBe(1);
   h.fake.setUp(true);
-  retry.callback();
+  // The reconnect fires onReset, which re-arms the probe: the newest timer
+  // belongs to the new lifecycle, retired ones stay inert.
+  const retry2 = [...h.intervals].at(-1)!;
+  retry2.callback();
   await flush();
   expect(h.fake.registrations.length).toBe(2);
   expect(h.fake.registrations.map((r) => r.status)).toEqual(["idle", "busy"]);
@@ -296,11 +321,12 @@ it("a manager disconnect retries while busy without reviving retired retries", a
   expect(h.fake.registrations.length).toBe(3);
   h.fake.setUp(false);
   await flush();
-  retry.callback();
+  retry2.callback();
   await flush();
   expect(h.fake.registrations.length).toBe(3);
   h.fake.setUp(true);
-  [...h.intervals][0]!.callback();
+  const retry3 = [...h.intervals].at(-1)!;
+  retry3.callback();
   await flush();
   expect(h.fake.registrations.length).toBe(4);
   await h.emit("session_shutdown", {});
@@ -318,12 +344,111 @@ it("a disposed SDK context cancels even an in-flight registration without a shut
   expect(h.intervals.size).toBe(0);
 });
 
+it("a cold start announces nothing while the first connect is in flight", async () => {
+  const h = lifecycleHarness({ autoUp: false });
+  // famulus's background connect is still in flight when session_start
+  // runs: no outage may be announced for that. Session hooks do not block
+  // on the connect either.
+  h.fake.beginConnect();
+  await h.emit("session_start");
+  expect(h.fake.registrations.length).toBe(0);
+  expect(h.notices().filter((m) => /unavailable|not running/.test(m))).toEqual([]);
+  h.fake.setUp(true);
+  // The reconnect re-arms the probe; its tick re-registers, quietly.
+  const retry = [...h.intervals].at(-1)!;
+  retry.callback();
+  await flush();
+  expect(h.fake.registrations.length).toBe(1);
+  expect(h.notices().some((m) => /intercom active/.test(m))).toBe(true);
+  await h.emit("session_shutdown", {});
+});
+
+it("a genuinely failed connect notifies once and still retries quietly", async () => {
+  const h = lifecycleHarness({ autoUp: false });
+  h.fake.markConnectFailed();
+  await h.emit("session_start");
+  // No connect in flight and a recorded failure: one honest outage notice.
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
+  h.fake.beginConnect();
+  h.fake.setUp(true);
+  const retry = [...h.intervals].at(-1)!;
+  retry.callback();
+  await flush();
+  expect(h.fake.registrations.length).toBe(1);
+  // Still the one notice.
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
+  await h.emit("session_shutdown", {});
+});
+
+it("unread peer messages are reported dropped over the old connection on a session switch", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  h.fake.push({ type: "deliver", session_id: "pi/primary", from: "chief", reply_to: "claude/origin", body: "orphan", message_id: "orphan" });
+  await flush();
+  expect(h.pi.injections.length).toBe(1);
+  await h.emit("session_shutdown");
+  // /new: famulus replaces the ManagerClient before the extension learns
+  // about the switch.
+  h.fake.switchTo("next-session");
+  h.state.sessionId = "next-session";
+  await h.emit("session_start", { reason: "new" });
+  await flush();
+  const receipts = h.fake.requests
+    .filter((r: any) => r.op === "receipt" && r.message_id === "orphan")
+    .map((r: any) => r.status);
+  expect(receipts).toEqual(["dropped"]);
+  expect(h.fake.registrations.at(-1)!.id).toBe("next-session");
+  await h.emit("session_shutdown", {});
+});
+
+it("a reset event fences an in-flight register from the dead port", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  h.fake.held.add("register");
+  const renaming = h.emit("session_info_changed", { name: "renamed" });
+  await flush();
+  const held = h.fake.waiters.at(-1)!;
+  expect(held.req.op).toBe("register");
+  // The bridge restarts while the rename register is in flight.
+  h.fake.resetBridge();
+  held.respond();
+  await renaming;
+  await flush();
+  h.fake.held.delete("register");
+  // The stale response must not revive the dead port: no "active" notice
+  // for it, and the next activity re-registers from scratch.
+  const actives = h.notices().filter((m) => /intercom active as "renamed"/.test(m));
+  expect(actives).toEqual([]);
+  // pi itself now reports the renamed session, so the re-register carries it.
+  h.pi.sessionName = "renamed";
+  await h.emit("turn_start");
+  expect(h.fake.registrations.at(-1)!.name).toBe("renamed");
+  await h.emit("session_shutdown", {});
+});
+
+it("a lost reset is recovered: a not-registered op re-registers and retries", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  expect(h.fake.registrations.length).toBe(1);
+  // The intercom_reset event never reached us (full queue); the port died
+  // silently underneath a still-registered session.
+  h.fake.killPortSilently();
+  const sent = await h.pi.tools.get("SendMessage").execute("send", { to: "claude/peer", message: "hello" });
+  expect(sent.isError).not.toBe(true);
+  // Re-registered transparently, then the send went through. Two send ops
+  // are recorded: the first refused by the unbound port, the retried one
+  // delivered.
+  expect(h.fake.registrations.length).toBe(2);
+  expect(h.fake.requests.filter((r: any) => r.op === "send").length).toBe(2);
+  await h.emit("session_shutdown", {});
+});
+
 it("inbound transport messages do not use a disposed SDK context before the next probe", async () => {
   const h = lifecycleHarness();
   await h.emit("session_start");
   h.state.stale = true;
   expect(() =>
-    h.fake.push({ type: "deliver", body: "late", message_id: "late" }),
+    h.fake.push({ type: "deliver", session_id: "pi/primary", body: "late", message_id: "late" }),
   ).not.toThrow();
   await flush();
   expect(h.pi.injections).toEqual([]);
@@ -336,6 +461,7 @@ it("queued old-context turns and commands cannot rebind or poison a fresh lifecy
   await h.emit("session_start");
   const oldCtx = h.ctx;
   await h.emit("session_shutdown");
+  h.fake.switchTo("fresh");
   const freshCtx = { ...oldCtx, sessionManager: { getSessionId: () => "fresh" } };
   await h.emit("session_start", {}, freshCtx);
   // A valid-looking old ID still cannot replace the explicit current session.

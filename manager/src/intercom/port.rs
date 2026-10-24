@@ -76,6 +76,37 @@ impl Port {
     pub async fn handle(&mut self, req: &Value) -> Result<Value, String> {
         let conn = self.conn;
         let op = str_field(req, "op");
+        // The manager connection serves exactly the old pi plugin's surface.
+        // Before register, only registration and read-only lookups; spoofed
+        // origins (reply_to/as/inbound/session ops) are not available at all.
+        if matches!(self.origin, PortOrigin::Manager { .. }) {
+            // `as` would name an arbitrary watcher; a manager connection
+            // only ever watches as its own bound session.
+            if !str_field(req, "as").is_empty() {
+                return Err("op as= is not available to a pi session over the manager connection".into());
+            }
+            let allowed: &[&str] = if self.bound.is_empty() {
+                &["register", "list", "message_status"]
+            } else {
+                &[
+                    "register",
+                    "unregister",
+                    "list",
+                    "send",
+                    "receipt",
+                    "subscribe_idle",
+                    "message_status",
+                    "session_name",
+                ]
+            };
+            if !allowed.contains(&op) {
+                return Err(if self.bound.is_empty() {
+                    "session not registered".to_string()
+                } else {
+                    format!("op {op:?} is not available to a pi session over the manager connection")
+                });
+            }
+        }
         if !self.bound.is_empty()
             && ["send", "receipt", "subscribe_idle", "inbound"].contains(&op)
             && self
@@ -113,24 +144,9 @@ impl Port {
                         }
                         v["pid"] = json!(pi_pid);
                     }
-                    PortOrigin::Client => {
-                        // Coexistence with the famulus extension: a session
-                        // served over the manager socket is not claimable by
-                        // the legacy socket (the extension wins in either
-                        // order, with no flapping).
-                        let port_owned = {
-                            let s = self.rt.state.lock().unwrap();
-                            s.sessions
-                                .get(&id)
-                                .map(|session| session.owner)
-                                .is_some_and(|owner| s.port_conns.contains(&owner))
-                        };
-                        if port_owned {
-                            return Err(format!(
-                                "session {id} is served by the pi-famulus extension over the manager socket"
-                            ));
-                        }
-                    }
+                    // Client.sock coexistence is enforced under the state
+                    // lock below, together with the takeover.
+                    PortOrigin::Client => {}
                 }
                 v["id"] = json!(id);
                 v["harness"] = json!("pi");
@@ -160,6 +176,22 @@ impl Port {
                         return Err(
                             "session is unpublished; restore it with the local CLI".into()
                         );
+                    }
+                    if let PortOrigin::Client = self.origin {
+                        // Coexistence with the famulus extension: a session
+                        // served over the manager socket is not claimable by
+                        // the legacy socket (the extension wins in either
+                        // order, with no flapping). Checked under the same
+                        // lock as the takeover below.
+                        if s.sessions
+                            .get(&id)
+                            .map(|session| session.owner)
+                            .is_some_and(|owner| s.port_conns.contains(&owner))
+                        {
+                            return Err(format!(
+                                "session {id} is served by the pi-famulus extension over the manager socket"
+                            ));
+                        }
                     }
                     if !self.bound.is_empty()
                         && *self.bound != id
@@ -487,8 +519,9 @@ impl Port {
 
     /// End-of-life cleanup, identical to a client socket disconnect: remove
     /// the owned session, settle its idle watchers, unpublish from native
-    /// adapters. Idempotent.
-    pub async fn close(&mut self) {
+    /// adapters. Idempotent. Returns the session id when this close removed
+    /// it (the caller may settle that session's unread deliveries).
+    pub async fn close(&mut self) -> Option<String> {
         if matches!(self.origin, PortOrigin::Manager { .. }) {
             self.rt.state.lock().unwrap().port_conns.remove(&self.conn);
         }
@@ -512,7 +545,10 @@ impl Port {
         if let Some((id, epoch)) = removed {
             self.rt.cancel_idle_watcher(&id, epoch).await;
             self.rt.native.source_unpublished(&id, self.conn, epoch).await;
+            self.bound.clear();
+            return Some(id);
         }
         self.bound.clear();
+        None
     }
 }

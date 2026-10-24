@@ -208,6 +208,9 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   let autocompleteBound = false;
   let offFrames: (() => void) | undefined;
   let offReset: (() => void) | undefined;
+  /** The manager client this runtime last attached to; on a session switch
+   * famulus replaces it, but the old connection is still alive here. */
+  let attachedClient: ManagerClient | null = null;
   // Peer messages handed to Pi that have not entered the model context yet,
   // keyed by message id. Pi emits message_end when one does; until then the
   // sender only has "delivered" (the frame left the daemon).
@@ -291,13 +294,28 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     }
   }
 
+  /** The port died without an external signal (an op told us). No epoch
+   * bump: callers (tools) captured the epoch and continue legitimately. */
+  function invalidatePort() {
+    registered = false;
+    readiness = undefined;
+  }
+
   function onReset() {
     // The bridge restarted or the manager connection re-hello'd: the port
     // is gone. Re-register on the next activity or the 3s probe, exactly
-    // like a client-socket reconnect in the plugin.
+    // like a client-socket reconnect in the plugin. The epoch bump fences
+    // in-flight register continuations: a response arriving with the reset
+    // must not mark a dead port live.
     if (stopped) return;
+    epoch++;
     registered = false;
     readiness = undefined;
+    if (retryTimer) {
+      clearInterval(retryTimer);
+      retryTimer = undefined;
+    }
+    armRetry();
   }
 
   function onReceipt(frame: IntercomFrame) {
@@ -435,6 +453,16 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     rpc("receipt", { message_id: messageId, status }).catch(() => {});
   }
 
+  /** A receipt on a specific (possibly retired) manager connection. */
+  function sendReceiptOver(client: ManagerClient, messageId: string, status: "read" | "dropped") {
+    if (!client.isAvailable()) return;
+    client
+      .intercom({ op: "receipt", message_id: messageId, status })
+      .catch(() => {
+        /* the old connection is gone; the daemon settles unread as dropped */
+      });
+  }
+
   function onMessageEnd(message: any) {
     if (message?.role !== "custom" || message.customType !== CROSS_SESSION_MESSAGE_TYPE) return;
     const id = message.details?.messageId;
@@ -479,28 +507,73 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     }
   }
 
-  /** One op on the bridge; op-level errors resolve with `{error}` set. */
-  async function rpc(op: string, extra: Record<string, unknown> = {}): Promise<IntercomFrame> {
-    return (await transport.call({ op, ...extra })) as IntercomFrame;
+  /** One op on the bridge; op-level errors resolve with `{error}` set.
+   * "not registered" / "ownership ended" mean the port died underneath us
+   * (bridge restart, reconnect, session unpublished) without a reset event
+   * we saw: re-register and retry the op once. */
+  async function rpc(op: string, extra: Record<string, unknown> = {}, retried = false): Promise<IntercomFrame> {
+    const frame = (await transport.call({ op, ...extra })) as IntercomFrame;
+    if (
+      !retried &&
+      frame.error &&
+      /not registered|ownership ended/.test(frame.error) &&
+      op !== "register"
+    ) {
+      invalidatePort();
+      if (lastCtx) await start(lastCtx, true);
+      if (!registered) return frame;
+      return await rpc(op, extra, true);
+    }
+    return frame;
   }
 
-  /** Register the session; returns the daemon-assigned session id. */
-  async function register(status: string): Promise<string | undefined> {
+  /** Register the session; returns the daemon-assigned session id and the
+   * epoch at send time. A reset landing between the send and the response
+   * is what the caller must fence against; a reset that preceded the send
+   * is already accounted for by the fresh port. */
+  async function register(status: string): Promise<{ sid: string | undefined; sentEpoch: number }> {
+    const sentEpoch = epoch;
     const response = await transport.call({ op: "register", session: sessionRecord(status) });
     const error = (response as IntercomFrame).error;
     if (error) throw new Error(error);
-    return (response as IntercomFrame).session_id;
+    return { sid: (response as IntercomFrame).session_id, sentEpoch };
   }
 
   /** Fresh registration attempt; no shared state is mutated here — the
    * caller commits the result only while its epoch is still current. */
-  async function connectAndRegister(ctx: ExtensionContext, quiet = false): Promise<string | undefined> {
+  /** True when the manager connection is really down (as opposed to its
+   * first background connect still being in flight): a hello that never
+   * completed and no recorded failure means "connecting", not "down". */
+  function outageIsReal(): boolean {
+    const client = deps.getClient?.();
+    if (!client) return true;
+    return !(client.managerInfo() === null && client.lastError() === "");
+  }
+
+  async function connectAndRegister(
+    ctx: ExtensionContext,
+    quiet = false,
+    revive = false,
+  ): Promise<{ sid: string | undefined; sentEpoch: number }> {
     if (!transport.isUp()) {
-      if (!quiet && !downNotified && down !== "disabled") {
-        downNotified = true;
-        notify("pi-famulus: messaging bridge unavailable, cross-session messaging is paused (the rest of this session is unaffected)", "warning");
+      // From the retry probe, help the manager client reconnect: intercom
+      // may be the only consumer still trying. (Session hooks must not
+      // block on this: pi awaits session_start before its own connect
+      // completes.)
+      if (revive) {
+        const client = deps.getClient?.();
+        if (client) await client.ensureAvailable().catch(() => false);
       }
-      throw new IntercomError(BRIDGE_DOWN, "E_TRANSPORT", "unavailable");
+      if (!transport.isUp()) {
+        // The first connect may still be in flight: stay silent. A
+        // recorded failure is a genuine outage: say so once. The 3s
+        // probe keeps retrying either way.
+        if (!quiet && !downNotified && down !== "disabled" && outageIsReal()) {
+          downNotified = true;
+          notify("pi-famulus: messaging bridge unavailable, cross-session messaging is paused (the rest of this session is unaffected)", "warning");
+        }
+        throw new IntercomError(BRIDGE_DOWN, "E_TRANSPORT", "unavailable");
+      }
     }
     return await register(currentStatus(ctx));
   }
@@ -518,7 +591,7 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
       try {
         const key = sessionKey(lastCtx);
         if (key !== boundKey || !registered || !transport.isUp()) {
-          start(lastCtx, true).catch(() => {});
+          start(lastCtx, true, false, true).catch(() => {});
         }
       } catch {
         void stop();
@@ -527,7 +600,7 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     retryTimer.unref?.();
   }
 
-  async function start(ctx: ExtensionContext, quiet = false, explicit = false) {
+  async function start(ctx: ExtensionContext, quiet = false, explicit = false, revive = false) {
     if (stopped) return;
     let key: string;
     try {
@@ -564,13 +637,13 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     // id replaces it for reply addressing.
     sessionId = key || `fallback-${process.pid}-${path.basename(cwd)}`;
     sessionName = currentName();
-    const attemptEpoch = epoch;
     const attempt = (async () => {
       try {
-        const sid = await connectAndRegister(ctx, quiet);
-        // Commit only while this attempt is still the current lifecycle:
-        // a stale attempt must not resurrect state over a replacement.
-        if (stopped || epoch !== attemptEpoch) return;
+        const { sid, sentEpoch } = await connectAndRegister(ctx, quiet, revive);
+        // Commit only if no reset/replacement landed between the register
+        // send and its response; an earlier reset is already visible in
+        // the fresh port this register reached.
+        if (stopped || epoch !== sentEpoch) return;
         sessionName = currentName();
         if (sid) sessionId = sid;
         registered = true;
@@ -578,11 +651,11 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
         downNotified = false;
         notify(`pi-famulus intercom active as "${sessionName}"`, "info");
       } catch (e) {
-        if (stopped || epoch !== attemptEpoch) return;
+        if (stopped) return;
         started = false;
         if (e instanceof IntercomError && e.reason) {
           down = e.reason;
-          if (e.reason === "unavailable" && !quiet && !downNotified) {
+          if (e.reason === "unavailable" && !quiet && !downNotified && outageIsReal()) {
             downNotified = true;
             notify(`pi-famulus: messaging bridge unavailable (${e.message}); cross-session messaging is paused`, "warning");
           }
@@ -734,6 +807,32 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   pi.on("session_start", async (event, ctx) => {
     stopped = false;
     stopPromise = undefined;
+    const previousClient = attachedClient;
+    attachedClient = deps.getClient?.() ?? null;
+    // A session switch (/new, /resume) replaces the ManagerClient: new
+    // connection, no port. The old connection is still alive at this point,
+    // so report the old session's unread messages dropped over it before
+    // famulus drops the reference (the README's contract for the old
+    // session's queue).
+    let switchKey: string | undefined;
+    try {
+      switchKey = sessionKey(ctx);
+    } catch {
+      switchKey = undefined;
+    }
+    if (
+      previousClient &&
+      previousClient !== attachedClient &&
+      boundKey !== undefined &&
+      switchKey !== undefined &&
+      switchKey !== boundKey &&
+      unread.size > 0
+    ) {
+      for (const [id] of [...unread]) {
+        unread.delete(id);
+        sendReceiptOver(previousClient, id, "dropped");
+      }
+    }
     // (Re)attach the transport subscriptions to this session's manager
     // client (a new client per session_start; the same client reconnects in
     // place across daemon restarts and in-place upgrades).
@@ -777,9 +876,8 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   });
   pi.on("session_info_changed", async (event, ctx) => {
     if (!useContext(ctx)) return;
-    const renameEpoch = epoch;
     if (readiness) await readiness;
-    if (stopped || epoch !== renameEpoch || !useContext(ctx)) return;
+    if (stopped || !useContext(ctx)) return;
     if (ctx?.cwd) cwd = ctx.cwd;
     sessionName = currentName(event?.name);
     if (!registered || !transport.isUp()) {
@@ -788,8 +886,8 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     }
     const status = currentStatus(ctx);
     try {
-      const sid = await register(status);
-      if (stopped || epoch !== renameEpoch) return;
+      const { sid, sentEpoch } = await register(status);
+      if (stopped || epoch !== sentEpoch) return;
       if (sid) sessionId = sid;
       notify(`pi-famulus intercom active as "${sessionName}"`, "info");
     } catch (e) {
@@ -797,7 +895,7 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
         onReset();
         return;
       }
-      if (!stopped && epoch === renameEpoch) notify(`pi-famulus intercom: ${(e as Error).message}`, "error");
+      if (!stopped) notify(`pi-famulus intercom: ${(e as Error).message}`, "error");
     }
   });
   pi.on("turn_start", async (_e, ctx) => {

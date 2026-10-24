@@ -1,141 +1,282 @@
 /**
- * Test harness: a fake intercom transport modelling the manager-side bridge
- * (and a fake pi API), so the extension module can be driven without a
- * manager process. Ports the socket harness of agent-intercom @ 98183fb,
- * plugin/pi index.test.mjs / lifecycle.test.mjs.
+ * Test harness: a fake pi-famulus MANAGER modelling the real contract the
+ * extension talks through ManagerClient + protocol 7:
+ *
+ * - one manager CONNECTION per ManagerClient (a new, cold connection per
+ *   session switch, matching famulus creating a new ManagerClient);
+ * - one port per connection, bound to the hello session id on register
+ *   (identity mismatch refused), with the manager-port op surface (before
+ *   register only register/list/message_status; the plugin's ops after);
+ * - bridge-wide disabled/down/up state; coming back up models the
+ *   ManagerClient reconnect (ports die, onReconnect fires);
+ * - `resetBridge()` kills every port and pushes intercom_reset per
+ *   connection;
+ * - held ops and per-request reply overrides like the old harness.
+ *
+ * The extension's real `createManagerTransport` runs over the client
+ * facades, so transport behavior is under test too.
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { ManagerClient } from "../../src/manager-client";
 import { IntercomError, type IntercomTransport } from "../../src/intercom/transport";
 
-export interface FakeTransport {
-  transport: IntercomTransport;
-  /** Every op the extension issued, in order. */
+export interface FakeWaiter {
+  req: Record<string, any>;
+  conn: FakeConnection;
+  respond: (extra?: Record<string, unknown>) => void;
+  fail: (error: Error) => void;
+}
+
+interface FakeConnection {
+  id: number;
+  sessionId: string;
+  up: boolean;
+  /** The registered bridge id (`pi/<sessionId>`), null before register. */
+  bound: string | null;
+  frameHandlers: Set<(frame: Record<string, unknown>) => void>;
+  resetHandlers: Set<() => void>;
+}
+
+export interface FakeManager {
+  /** Pass to registerIntercom as getClient. */
+  getClient: () => ManagerClient | null;
+  /** Every op any connection issued, in order. */
   requests: Record<string, any>[];
   /** Every session record sent with op register. */
   registrations: Record<string, any>[];
   /** Ops whose response is held back until released (by name). */
   held: Set<string>;
-  /** Held requests, with manual responders. */
-  waiters: {
-    req: Record<string, any>;
-    respond: (extra?: Record<string, unknown>) => void;
-    fail: (error: Error) => void;
-  }[];
-  /** Push one bridge frame (deliver/receipt/idle_notice) to the extension. */
+  /** Held requests with manual responders. */
+  waiters: FakeWaiter[];
+  /** Push one bridge frame (deliver/receipt/idle_notice) to the connection
+   * whose port owns the frame's session_id. */
   push: (frame: Record<string, unknown>) => void;
-  /** The bridge restarted: intercom_reset semantics. */
+  /** The bridge restarted: every port dies, `intercom_reset` reaches each
+   * connection. */
   resetBridge: () => void;
-  /** The manager connection (re)opened or dropped. */
+  /** The current connection's ManagerClient reconnected (port dies,
+   * onReconnect fires). */
+  reconnect: () => void;
+  /** A session switch: the old connection dies, a new cold one (no port)
+   * becomes current. */
+  switchTo: (sessionId: string) => void;
+  /** Kill the current connection's port WITHOUT any reset notice (a lost
+   * intercom_reset): the next op gets "session not registered". */
+  killPortSilently: () => void;
+  /** The manager connection (re)opened or dropped. Coming back up models a
+   * reconnect: ports die, onReconnect fires. */
   setUp: (up: boolean) => void;
-  /** Bridge disabled (PI_FAMULUS_NO_INTERCOM). */
+  /** Model a connect in flight (famulus's background connect): the next
+   * setUp(true) resolves it. */
+  beginConnect: () => void;
+  /** The manager connection failed for real (transport level). */
+  markConnectFailed: () => void;
   setDisabled: (disabled: boolean) => void;
-  /** Bridge down with a reason (startup failure, Windows, …). */
   setDown: (reason: string | null) => void;
-  /** Fail every held op (what ManagerClient.close does to pending ops). */
   rejectHeld: (message?: string) => void;
-  /** Per-op response overrides, like the plugin harness's `reply`. */
+  /** Per-request response overrides, like the old harness's `reply`. */
   reply?: (req: Record<string, any>) => Record<string, unknown> | undefined;
   isUp: () => boolean;
+  /** Test probe. */
+  debugConnections: () => { id: number; up: boolean; bound: string | null; handlers: number }[];
 }
 
-export function createFakeTransport(options: { reply?: (req: Record<string, any>) => Record<string, unknown> | undefined } = {}): FakeTransport {
+export function createFakeManager(options: {
+  reply?: (req: Record<string, any>) => Record<string, unknown> | undefined;
+  /** The hello session id of the initial connection (what famulus's first
+   * ManagerClient hellos with); later connections come from switchTo. */
+  sessionId?: string;
+} = {}): FakeManager {
   const requests: Record<string, any>[] = [];
   const registrations: Record<string, any>[] = [];
-  const frameHandlers = new Set<(frame: Record<string, unknown>) => void>();
-  const resetHandlers = new Set<() => void>();
   const held = new Set<string>();
-  const waiters: FakeTransport["waiters"] = [];
+  const waiters: FakeWaiter[] = [];
+  const connections: FakeConnection[] = [];
+  let current: FakeConnection | null = null;
   let up = true;
   let disabled = false;
   let down: string | null = null;
+  let connecting: { resolve: (ok: boolean) => void } | null = null;
+  let connectFailed = false;
   let seq = 0;
 
-  const defaultReply = (req: Record<string, any>): Record<string, unknown> => {
+  // famulus connects the first ManagerClient before the extension's
+  // session_start: model that initial connection.
+  current = {
+    id: ++seq,
+    sessionId: options.sessionId ?? "target-session",
+    up,
+    bound: null,
+    frameHandlers: new Set(),
+    resetHandlers: new Set(),
+  };
+  connections.push(current);
+
+  const makeConnection = (sessionId: string): FakeConnection => ({
+    id: ++seq,
+    sessionId,
+    up,
+    bound: null,
+    frameHandlers: new Set(),
+    resetHandlers: new Set(),
+  });
+
+  const rows = () =>
+    connections
+      .filter((c) => c.up && c.bound)
+      .map((c) => {
+        const registration = registrations.filter((r: any) => `pi/${r.id}` === c.bound).at(-1);
+        return { id: c.bound, name: registration?.name ?? "", harness: "pi", status: registration?.status ?? "idle", cwd: registration?.cwd ?? "" };
+      });
+
+  const defaultReply = (conn: FakeConnection, req: Record<string, any>): Record<string, unknown> => {
     switch (req.op) {
       case "register":
         registrations.push(req.session);
-        return {
-          session_id: typeof req.session?.id === "string" && req.session.id.startsWith("pi/")
-            ? req.session.id
-            : `pi/${req.session?.id}`,
-        };
+        // The daemon forces pi/<hello session id> whatever the op sent.
+        conn.bound = typeof req.session?.id === "string" && req.session.id.startsWith("pi/")
+          ? req.session.id
+          : `pi/${req.session?.id}`;
+        return { session_id: conn.bound };
+      case "unregister":
+        conn.bound = null;
+        return {};
       case "list":
-        return { sessions: [] };
+        return { sessions: rows() };
       case "send":
         return { message_id: `m-${++seq}`, status: "delivered" };
       case "receipt":
-      case "unregister":
         return {};
       case "subscribe_idle":
         return { subscription_id: `sub-${++seq}`, status: "subscribed" };
+      case "message_status":
+        return { message_id: req.message_id, status: "unknown" };
+      case "session_name":
+        return {};
       default:
         return {};
     }
   };
 
-  const transport: IntercomTransport = {
-    async call(op) {
-      const req = { ...op } as Record<string, any>;
-      requests.push(req);
-      if (!up) throw new IntercomError("pi-famulus is not connected", "E_TRANSPORT", "unavailable");
-      if (disabled) throw new IntercomError("disabled by PI_FAMULUS_NO_INTERCOM", "E_INTERCOM_DISABLED", "disabled");
-      if (down) throw new IntercomError(down, "E_INTERCOM_UNAVAILABLE", "unavailable");
-      if (held.has(req.op)) {
-        return await new Promise<Record<string, unknown>>((resolve, reject) => {
-          let settled = false;
-          waiters.push({
-            req,
-            respond: (extra) => {
-              if (settled) return;
-              settled = true;
-              resolve({ ...defaultReply(req), ...extra });
-            },
-            fail: (error) => {
-              if (settled) return;
-              settled = true;
-              reject(error);
-            },
-          });
-        });
+  /** The manager-port op surface, mirroring Port::handle. */
+  const route = async (conn: FakeConnection, op: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const req = op as Record<string, any>;
+    requests.push(req);
+    if (!conn.up) throw new IntercomError("pi-famulus is not connected", "E_TRANSPORT", "unavailable");
+    if (disabled) throw new IntercomError("disabled by PI_FAMULUS_NO_INTERCOM", "E_INTERCOM_DISABLED", "disabled");
+    if (down) throw new IntercomError(down, "E_INTERCOM_UNAVAILABLE", "unavailable");
+    const opName = req.op as string;
+    if (!conn.bound) {
+      const allowedUnbound = ["register", "list", "message_status"];
+      if (!allowedUnbound.includes(opName)) return { error: "session not registered" };
+    } else {
+      const allowed = ["register", "unregister", "list", "send", "receipt", "subscribe_idle", "message_status", "session_name"];
+      if (!allowed.includes(opName)) return { error: `op ${opName} is not available to a pi session over the manager connection` };
+    }
+    if (opName === "register") {
+      // Identity binding, like the daemon: the raw hello key or the forced
+      // pi/<key> id both register this connection's session.
+      if (req.session?.id !== conn.sessionId && req.session?.id !== conn.bound) {
+        return { error: `session id mismatch: this connection is bound to pi/${conn.sessionId}` };
       }
-      // Per-request overrides merge like the plugin harness's Object.assign;
-      // an `error` key models the daemon's op-level failure frame.
-      return { ...defaultReply(req), ...options.reply?.(req) };
-    },
-    onFrame(handler) {
-      frameHandlers.add(handler);
-      return () => frameHandlers.delete(handler);
-    },
-    onReset(handler) {
-      resetHandlers.add(handler);
-      return () => resetHandlers.delete(handler);
-    },
-    isUp: () => up,
+    }
+    if (held.has(opName)) {
+      return await new Promise<Record<string, unknown>>((resolve, reject) => {
+        let settled = false;
+        waiters.push({
+          req,
+          conn,
+          respond: (extra) => {
+            if (settled) return;
+            settled = true;
+            resolve({ ...defaultReply(conn, req), ...extra });
+          },
+          fail: (error) => {
+            if (settled) return;
+            settled = true;
+            reject(error);
+          },
+        });
+      });
+    }
+    return { ...defaultReply(conn, req), ...options.reply?.(req) };
   };
 
-  return {
-    transport,
+  const clientFor = (conn: FakeConnection): ManagerClient =>
+    ({
+      isAvailable: () => conn.up,
+      protocolLevel: () => 7,
+      managerInfo: () => (conn.up ? { version: "fake", pid: 0 } : null),
+      lastError: () => (conn.up ? "" : connectFailed ? "connect failed" : ""),
+      ensureAvailable: async () => {
+        if (conn.up) return true;
+        if (connecting) await new Promise<boolean>((resolve) => (connecting!.resolve = resolve));
+        return conn.up;
+      },
+      intercom: (op: Record<string, unknown>) => route(conn, op),
+      onEvent: (handler: (event: any) => void) => {
+        const wrapped = (event: any) => {
+          if (event && typeof event === "object") handler(event);
+        };
+        conn.frameHandlers.add(wrapped);
+        return () => conn.frameHandlers.delete(wrapped);
+      },
+      onReconnect: (handler: () => void) => {
+        conn.resetHandlers.add(handler);
+        return () => conn.resetHandlers.delete(handler);
+      },
+    }) as unknown as ManagerClient;
+
+  const killPort = (conn: FakeConnection, fireReset: boolean) => {
+    conn.bound = null;
+    if (fireReset) for (const handler of [...conn.resetHandlers]) handler();
+  };
+
+  const manager: FakeManager = {
+    getClient: () => (current ? clientFor(current) : null),
     requests,
     registrations,
     held,
     waiters,
     push: (frame) => {
-      for (const handler of [...frameHandlers]) handler(frame);
+      const target = connections.find((c) => c.up && c.bound && c.bound === frame.session_id);
+      if (!target) return;
+      for (const handler of [...target.frameHandlers]) handler({ event: "intercom", frame });
     },
     resetBridge: () => {
-      for (const handler of [...resetHandlers]) handler();
+      for (const conn of connections) if (conn.up) killPort(conn, true);
+    },
+    reconnect: () => {
+      if (current) killPort(current, true);
+    },
+    switchTo: (sessionId) => {
+      // famulus replaces the ManagerClient but does not close the old
+      // connection synchronously: it stays alive (and its port with it)
+      // until famulus's teardown or GC closes it.
+      current = makeConnection(sessionId);
+      connections.push(current);
+    },
+    killPortSilently: () => {
+      if (current) current.bound = null;
     },
     setUp: (value) => {
-      // Coming back up models the ManagerClient reconnect: it re-hellos and
-      // fires its reconnect handlers, which invalidate the registration.
       const reconnected = value && !up;
       up = value;
-      if (reconnected) {
-        for (const handler of [...resetHandlers]) handler();
+      for (const conn of connections) conn.up = value;
+      if (connecting) {
+        connecting.resolve(value);
+        connecting = null;
       }
+      if (reconnected) for (const conn of connections) killPort(conn, true);
+    },
+    beginConnect: () => {
+      connecting = { resolve: () => {} };
+    },
+    markConnectFailed: () => {
+      connectFailed = true;
     },
     setDisabled: (value) => {
       disabled = value;
@@ -148,7 +289,9 @@ export function createFakeTransport(options: { reply?: (req: Record<string, any>
       for (const waiter of pending) waiter.fail(new IntercomError(message, "E_TRANSPORT", "unavailable"));
     },
     isUp: () => up,
+    debugConnections: () => connections.map((c) => ({ id: c.id, up: c.up, bound: c.bound, handlers: c.frameHandlers.size })),
   };
+  return manager;
 }
 
 /** The fake pi API the plugin tests built, with per-test hooks. */

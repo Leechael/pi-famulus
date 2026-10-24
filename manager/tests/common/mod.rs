@@ -1140,10 +1140,87 @@ impl Transport {
     /// One read of at most `buf.len()` bytes, waiting up to `d`. Times out
     /// with `ErrorKind::TimedOut`; `Ok(0)` is EOF.
     pub fn read_timeout(&mut self, buf: &mut [u8], d: Duration) -> std::io::Result<usize> {
+        self.peek_or_read(buf, d, false)
+    }
+    /// Like [`Self::read_timeout`] but leaves the bytes in the socket:
+    /// how much is immediately readable without consuming it.
+    #[cfg(unix)]
+    pub fn peek_timeout(&mut self, buf: &mut [u8], d: Duration) -> std::io::Result<usize> {
+        self.peek_or_read(buf, d, true)
+    }
+    /// The actual receive buffer (doubled by the kernel on some platforms).
+    #[cfg(unix)]
+    pub fn recv_buffer_size(&self) -> std::io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                self.stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            Ok(value as usize)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    /// Cap the receive buffer so a test controls exactly how much the
+    /// kernel accepts before the peer's writes block.
+    #[cfg(unix)]
+    pub fn set_recv_buffer_size(&self, size: usize) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe {
+            libc::setsockopt(
+                self.stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const usize as *const libc::c_void,
+                std::mem::size_of::<usize>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(unix)]
+    fn peek_or_read(&mut self, buf: &mut [u8], d: Duration, peek: bool) -> std::io::Result<usize> {
         #[cfg(unix)]
         {
             self.stream.set_read_timeout(Some(d.max(Duration::from_millis(1)))).ok();
-            self.stream.read(buf)
+            if peek {
+                // UnixStream::peek is unstable; MSG_PEEK via libc is the
+                // same syscall. SO_RCVTIMEO (set above) applies, so a
+                // timeout surfaces as EAGAIN.
+                use std::os::unix::io::AsRawFd;
+                let fd = self.stream.as_raw_fd();
+                let n = unsafe {
+                    libc::recv(
+                        fd,
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                        libc::MSG_PEEK,
+                    )
+                };
+                if n >= 0 {
+                    Ok(n as usize)
+                } else {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EAGAIN) {
+                        Err(std::io::ErrorKind::TimedOut.into())
+                    } else {
+                        Err(error)
+                    }
+                }
+            } else {
+                self.stream.read(buf)
+            }
         }
         #[cfg(windows)]
         {

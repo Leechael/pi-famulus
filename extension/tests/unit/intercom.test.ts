@@ -8,8 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerIntercom } from "../../src/intercom/intercom";
 import {
   createFakeCtx,
+  createFakeManager,
   createFakePi,
-  createFakeTransport,
   flush,
   makeTempDir,
 } from "./intercom-harness";
@@ -20,13 +20,17 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function harness(options: Parameters<typeof createFakeTransport>[0] = {}) {
+function harness(options: { reply?: (req: Record<string, any>) => Record<string, unknown> | undefined } = {}) {
   const { dir, cleanup } = makeTempDir("fam-ic-");
   cleanups.push(cleanup);
-  const fake = createFakeTransport(options);
   const pi = createFakePi();
   const { ctx, state } = createFakeCtx(dir);
-  registerIntercom(pi.pi as any, { transport: fake.transport, extensionDirs: ["/nonexistent-extensions"] });
+  const fake = createFakeManager({ ...options, sessionId: state.sessionId });
+  fake.reply = options.reply;
+  registerIntercom(pi.pi as any, {
+    getClient: () => fake.getClient(),
+    extensionDirs: ["/nonexistent-extensions"],
+  });
   const emit = (name: string, event: any = {}, context: any = ctx) => pi.handlers.get(name)?.(event, context);
   return { fake, pi, ctx, state, emit };
 }
@@ -406,6 +410,7 @@ describe("intercom behaviour", () => {
       ui: { notify: (message: string, level: string) => notices.push({ message, level }) },
     };
     h.fake.setUp(false);
+    h.fake.markConnectFailed();
     await h.emit("session_start", {}, ctx);
     for (let i = 0; i < 3; i++) await h.emit("turn_start", {}, ctx);
 
@@ -465,6 +470,7 @@ describe("intercom behaviour", () => {
       ui: { notify: (message: string, level: string) => notices.push({ message, level }) },
     };
     h.fake.setUp(false);
+    h.fake.markConnectFailed();
     await h.emit("session_start", {}, ctx);
     expect(notices.length).toBe(1);
     h.fake.setUp(true);
@@ -476,7 +482,7 @@ describe("intercom behaviour", () => {
   });
 
   // Delivery-tracking harness, ported from the plugin's trackingHarness.
-  async function tracking(options: Parameters<typeof createFakeTransport>[0] = {}) {
+  async function tracking(options: { reply?: (req: Record<string, any>) => Record<string, unknown> | undefined } = {}) {
     const h = harness(options);
     h.pi.sessionName = "target";
     const injected: { message: any; options?: any }[] = [];
@@ -493,7 +499,7 @@ describe("intercom behaviour", () => {
     const emitCtx = (name: string, event: any = {}) => h.emit(name, event, ctx);
     const push = async (frame: Record<string, unknown>) => {
       const landed = new Promise<void>((resolve) => {
-        const unsub = h.fake.transport.onFrame(() => {
+        const unsub = h.fake.getClient()!.onEvent(() => {
           unsub();
           resolve();
         });
@@ -552,7 +558,7 @@ describe("intercom behaviour", () => {
 
   it("SendMessage preserves a successful body send when idle subscription fails", async () => {
     const t = await tracking({
-      reply: (req) =>
+      reply: (req: Record<string, any>) =>
         req.op === "subscribe_idle"
           ? { error: "target does not support idle notifications" }
           : req.op === "list"
@@ -575,7 +581,7 @@ describe("intercom behaviour", () => {
   });
 
   it("SendMessage sends before subscribing and reports the daemon subscription status", async () => {
-    const t = await tracking({ reply: (req) => (req.op === "subscribe_idle" ? { status: "exited" } : undefined) });
+    const t = await tracking({ reply: (req: Record<string, any>) => (req.op === "subscribe_idle" ? { status: "exited" } : undefined) });
     const send = t.h.pi.tools.get("SendMessage");
     const result = await send.execute("both", { to: "claude/origin", message: "work", summary: "do work", notify_when_idle: true });
     expect(result.isError).not.toBe(true);
@@ -590,7 +596,7 @@ describe("intercom behaviour", () => {
 
   it("SendMessage requires a body or subscription and never subscribes after a failed send", async () => {
     const t = await tracking({
-      reply: (req) =>
+      reply: (req: Record<string, any>) =>
         req.op === "send"
           ? { error: "delivery denied" }
           : req.op === "subscribe_idle"
@@ -643,7 +649,7 @@ describe("intercom behaviour", () => {
     const t = await tracking();
     t.state.idle = false;
     for (const status of ["exited", "unavailable", "expired"]) {
-      const injection = await t.push({ type: "idle_notice", from: "claude/origin", subscription_id: `sub-${status}`, status });
+      const injection = await t.push({ type: "idle_notice", session_id: "pi/target-session", from: "claude/origin", subscription_id: `sub-${status}`, status });
       expect(injection.message.details.status).toBe(status);
       expect(injection.options).toEqual({ deliverAs: "steer", triggerTurn: true });
       await t.enterContext(injection);
@@ -887,12 +893,12 @@ describe("intercom behaviour", () => {
     const fs = await import("node:fs");
     fs.mkdirSync(pluginDir, { recursive: true });
     fs.writeFileSync(`${pluginDir}/package.json`, JSON.stringify({ name: "agent-intercom-pi" }));
-    const fake = createFakeTransport();
     const pi = createFakePi();
-    const { ctx } = createFakeCtx(dir);
+    const { ctx, state } = createFakeCtx(dir);
+    const fake = createFakeManager({ sessionId: state.sessionId });
     const notices: string[] = [];
     const ctxWithUi = { ...ctx, ui: { notify: (m: string) => notices.push(m) } };
-    registerIntercom(pi.pi as any, { transport: fake.transport, extensionDirs: [legacyDir] });
+    registerIntercom(pi.pi as any, { getClient: () => fake.getClient(), extensionDirs: [legacyDir] });
     await pi.handlers.get("session_start")!({}, ctxWithUi);
     expect(notices.filter((m) => /Remove the legacy agent-intercom/.test(m)).length).toBe(1);
     // Not twice on further session starts.

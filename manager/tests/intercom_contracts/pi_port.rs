@@ -229,15 +229,69 @@ fn the_send_response_arrives_only_after_the_deliver_frame_was_written() {
     register(&mut alice, "alice-session", "alice");
     register(&mut bob, "bob-session", "bob");
 
-    let sent = intercom_ok(
-        &mut alice,
-        json!({"op":"send","to":"pi/bob-session","body":"ordered","reply_to":"pi/alice-session"}),
-    );
-    // The daemon awaited the deliver frame's socket-write ack before
-    // answering, so bob's frame is already in his socket buffer now: it must
-    // be readable without giving the daemon any more time to schedule.
-    let deliver = intercom_frame(&mut bob, |frame| frame["type"] == "deliver");
-    assert_eq!(deliver["message_id"], sent["message_id"]);
+    // Cap bob's receive buffer: the deliver cannot hide in the socket, so
+    // the daemon's write blocks until the test drains it. If the
+    // implementation answered alice before the deliver was fully written,
+    // her small response would become readable while bob still owed bytes.
+    bob.stream.set_recv_buffer_size(8192).unwrap();
+    let body = "x".repeat(3 * 1024 * 1024);
+    alice.send(&json!({"v":1,"id":"send-1","type":"intercom","op":{"op":"send","to":"pi/bob-session","body":body,"reply_to":"pi/alice-session"}}));
+
+    // Drain bob until his deliver frame is complete — counting both what
+    // the test read and what is already buffered in his socket. Nothing of
+    // alice's response may be readable until then: the daemon answers a
+    // send only after the deliver frame was fully written.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let want = if got.len() >= 4 {
+            Some(u32::from_be_bytes([got[0], got[1], got[2], got[3]]) as usize + 4)
+        } else {
+            None
+        };
+        let buffered = {
+            let mut probe = vec![0u8; 256 * 1024];
+            bob.stream
+                .peek_timeout(&mut probe, Duration::from_millis(1))
+                .unwrap_or(0)
+        };
+        if let Some(want) = want {
+            if got.len() + buffered >= want {
+                break;
+            }
+        }
+        let mut one = [0u8; 1];
+        match alice.stream.peek_timeout(&mut one, Duration::from_millis(1)) {
+            Ok(0) => panic!("alice's connection closed before answering"),
+            Ok(n) => {
+                let mut buf = vec![0u8; 256];
+                let early = alice
+                    .stream
+                    .read_timeout(&mut buf, Duration::from_millis(200))
+                    .unwrap_or(0);
+                panic!(
+                    "alice's send response became readable ({} bytes) while bob held only {}/{} deliver bytes\n{}",
+                    n,
+                    got.len() + buffered,
+                    want.unwrap_or(0),
+                    String::from_utf8_lossy(&buf[..early])
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("peek on alice: {e}"),
+        }
+        let mut chunk = vec![0u8; 64 * 1024];
+        let n = bob
+            .stream
+            .read_timeout(&mut chunk, Duration::from_millis(200))
+            .unwrap_or_else(|e| panic!("read bob: {e}"));
+        assert!(n > 0, "bob's connection closed mid-deliver");
+        got.extend_from_slice(&chunk[..n]);
+        assert!(Instant::now() < deadline, "deliver frame never completed");
+    }
+    let response = alice.wait_id("send-1", TIMEOUT).expect("send response");
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["status"], "delivered");
 }
 
 #[test]
@@ -274,6 +328,247 @@ fn bridge_restart_pushes_intercom_reset_and_the_port_reregisters() {
     let sent = bob.ok(json!({"op":"send","to":"pi/alice-session","body":"after restart"}));
     let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
     assert_eq!(deliver["message_id"], sent["message_id"]);
+}
+
+#[test]
+fn a_slow_op_on_one_connection_does_not_block_other_sessions_or_close() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut alice = pi_conn(&fixture, "alice-session");
+    let mut bob = pi_conn(&fixture, "bob-session");
+    register(&mut alice, "alice-session", "alice");
+    register(&mut bob, "bob-session", "bob");
+
+    // Park alice: she sends a large message to bob, whose receive buffer is
+    // capped and never drained. The daemon's deliver write blocks on the
+    // socket, and alice's send op waits on the frame's written-ack.
+    bob.stream.set_recv_buffer_size(8192).unwrap();
+    let body = "x".repeat(3 * 1024 * 1024);
+    alice.send(&json!({"v":1,"id":"blocked","type":"intercom","op":{"op":"send","to":"pi/bob-session","body":body,"reply_to":"pi/alice-session"}}));
+    thread::sleep(Duration::from_millis(300));
+    // The op must really be blocked: no answer yet.
+    let mut probe = [0u8; 1];
+    let readable = alice
+        .stream
+        .peek_timeout(&mut probe, Duration::from_millis(50))
+        .unwrap_or(0);
+    assert_eq!(readable, 0, "alice's blocked op answered already");
+
+    // Meanwhile a third party messaging bob's OTHER direction and a legacy
+    // peer still work: carol registers and messages a legacy peer without
+    // waiting on alice (her op answers in well under the write-ack timeout
+    // alice is parked behind).
+    let mut carol = pi_conn(&fixture, "carol-session");
+    let registration = carol.try_request(
+        json!({"type":"intercom","op":{"op":"register","session":{"id":"carol-session","name":"carol","caps":["read_receipts","idle_state_v1"]}}}),
+        Duration::from_secs(2),
+    );
+    let registration = registration.expect("carol's register waited on alice's blocked op");
+    assert_eq!(registration["ok"], true, "{registration}");
+    let mut legacy = fixture.plugin("legacy-peer", "idle");
+    let sent = legacy.ok(json!({"op":"send","to":"pi/carol-session","body":"while alice is stuck"}));
+    assert_eq!(sent["status"], "delivered");
+
+    // Alice's connection drops: her close must not wait out her blocked op.
+    drop(alice);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fixture.sessions().iter().any(|row| row["id"] == "pi/alice-session") {
+        assert!(
+            Instant::now() < deadline,
+            "alice's close waited on her blocked op"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn dropping_the_old_connection_keeps_the_rebound_sessions_registration() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut first = pi_conn(&fixture, "alice-session");
+    register(&mut first, "alice-session", "alice-v1");
+    fixture.wait_session_field("pi/alice-session", "name", "alice-v1");
+
+    // The same pi session rebinds on a newer connection (resume/reconnect).
+    let mut second = pi_conn(&fixture, "alice-session");
+    register(&mut second, "alice-session", "alice-v2");
+    fixture.wait_session_field("pi/alice-session", "name", "alice-v2");
+
+    // The old connection dies; it must not take the rebound session with it.
+    drop(first);
+    fixture.wait_session_field("pi/alice-session", "name", "alice-v2");
+
+    // The new connection still owns the session end to end.
+    let mut legacy = fixture.plugin("bob-legacy", "idle");
+    let sent = legacy.ok(json!({"op":"send","to":"pi/alice-session","body":"after rebind"}));
+    let deliver = intercom_frame(&mut second, |frame| frame["type"] == "deliver");
+    assert_eq!(deliver["message_id"], sent["message_id"]);
+}
+
+#[test]
+fn a_failed_upgrade_leaves_the_ports_alive() {
+    let mut fixture = Fixture::new();
+    let copy = fixture.root.join("bin/pi-famulus");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    common::replace_binary(&copy, Path::new(BIN));
+    fixture.binary = copy.clone();
+    fixture.start();
+    let mut alice = pi_conn(&fixture, "alice-session");
+    register(&mut alice, "alice-session", "alice");
+    fixture.wait_session("pi/alice-session");
+
+    // Corrupt the upgrade target: the preflight rejects it, no handover.
+    fs::write(&copy, b"#!/bin/sh\necho not a pi-famulus\n").unwrap();
+    let mut manager =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
+    manager.hello_cli();
+    let accepted = manager.request(json!({"type":"upgrade"}));
+    assert_eq!(accepted["ok"], true, "upgrade request accepted: {accepted}");
+
+    // The daemon is unchanged and the port still serves: no reset, no
+    // re-registration needed.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = manager.request_ok(json!({"type":"status"}));
+        if status["last_upgrade"].is_object() {
+            assert_eq!(status["last_upgrade"]["ok"], false, "upgrade must be recorded as failed: {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no failed-upgrade record: {status}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !alice.events.iter().any(|event| event["event"] == "intercom_reset"),
+        "a failed upgrade must not reset ports"
+    );
+    register(&mut alice, "alice-session", "alice-again");
+    let mut legacy = fixture.plugin("bob-legacy", "idle");
+    let sent = legacy.ok(json!({"op":"send","to":"pi/alice-session","body":"still serving"}));
+    let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
+    assert_eq!(deliver["message_id"], sent["message_id"]);
+}
+
+#[test]
+fn unbound_ports_cannot_spoof_other_sessions() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut alice = pi_conn(&fixture, "alice-session");
+
+    // Before register, only registration and read-only lookups exist.
+    let send = intercom(
+        &mut alice,
+        json!({"op":"send","to":"pi/victim","body":"x","reply_to":"pi/victim"}),
+    );
+    assert_ne!(send["ok"], true, "unbound send: {send}");
+    assert!(
+        send["error"]["message"].as_str().is_some_and(|m| m.contains("not registered")),
+        "{send}"
+    );
+    let inbound = intercom(
+        &mut alice,
+        json!({"op":"inbound","session":{"id":"pi/victim"},"body":"x"}),
+    );
+    assert_ne!(inbound["ok"], true, "unbound inbound: {inbound}");
+    let subscribe = intercom(
+        &mut alice,
+        json!({"op":"subscribe_idle","as":"pi/victim","to":"pi/target"}),
+    );
+    assert_ne!(subscribe["ok"], true, "unbound subscribe with as: {subscribe}");
+    // Read-only ops work unbound.
+    intercom_ok(&mut alice, json!({"op":"list"}));
+
+    // After register, the rest of the client surface stays shut: a pi
+    // session speaks for its own bound id only.
+    register(&mut alice, "alice-session", "alice");
+    for op in [
+        json!({"op":"inbound","session":{"id":"pi/victim"},"body":"x"}),
+        json!({"op":"session_unpublish","args":["pi/alice-session"]}),
+        json!({"op":"workspace_list"}),
+        json!({"op":"subscribe_idle","as":"pi/victim","to":"pi/target"}),
+    ] {
+        let refused = intercom(&mut alice, op.clone());
+        assert_ne!(refused["ok"], true, "spoofing op accepted: {refused}");
+        assert!(
+            refused["error"]["message"].as_str().is_some_and(|m| m.contains("not available")),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn intercom_ops_on_one_connection_apply_in_wire_order() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut alice = pi_conn(&fixture, "alice-session");
+    let op = |id: &str, status: &str| {
+        let body = json!({"v":1,"id":id,"type":"intercom","op":{"op":"register","session":{"id":"alice-session","name":"alice","status":status,"caps":["read_receipts","idle_state_v1"]}}}).to_string();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(body.as_bytes());
+        frame
+    };
+    // Pipelined back to back; the worker must apply them in arrival order.
+    alice.stream
+        .write_all(&[op("r1", "idle"), op("r2", "busy"), op("r3", "idle")].concat())
+        .unwrap();
+    for id in ["r1", "r2", "r3"] {
+        let response = alice.wait_id(id, TIMEOUT).expect("register {id} answered");
+        assert_eq!(response["ok"], true, "register {id}: {response}");
+    }
+    // The last write in wire order wins.
+    fixture.wait_session_field("pi/alice-session", "status", "idle");
+}
+
+#[test]
+fn a_remote_unpublish_reaches_the_extension_as_a_reset() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut alice = pi_conn(&fixture, "alice-session");
+    register(&mut alice, "alice-session", "alice");
+    fixture.wait_session("pi/alice-session");
+
+    // The local CLI unpublishes the session over client.sock.
+    let mut cli = fixture.connect();
+    cli.ok(json!({
+        "op":"session_unpublish",
+        "args":["pi/alice-session"]
+    }));
+    let reset = alice
+        .wait_event(TIMEOUT, |event| event["event"] == "intercom_reset")
+        .unwrap_or_else(|| panic!("no intercom_reset after unpublish; events: {:?}", alice.events));
+    assert_eq!(reset["event"], "intercom_reset");
+    // The extension learns the truth on its next op: re-registering is
+    // refused while unpublished, with the restore hint.
+    let refused = intercom(
+        &mut alice,
+        json!({"op":"register","session":{"id":"alice-session","name":"alice"}}),
+    );
+    assert_ne!(refused["ok"], true, "re-register while unpublished: {refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unpublished")),
+        "{refused}"
+    );
+}
+
+#[test]
+fn closing_a_port_settles_unread_deliveries_as_dropped() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut alice = pi_conn(&fixture, "alice-session");
+    register(&mut alice, "alice-session", "alice");
+    fixture.wait_session("pi/alice-session");
+
+    // A legacy peer sends a message alice never reads; then her connection
+    // dies for good. The sender must get a terminal dropped receipt.
+    let mut legacy = fixture.plugin("bob-legacy", "idle");
+    let sent = legacy.ok(json!({"op":"send","to":"pi/alice-session","body":"unread"}));
+    let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
+    assert_eq!(deliver["message_id"], sent["message_id"]);
+    drop(alice);
+    let receipt = legacy.event("receipt");
+    assert_eq!(receipt["message_id"], sent["message_id"]);
+    assert_eq!(receipt["status"], "dropped");
 }
 
 #[test]
