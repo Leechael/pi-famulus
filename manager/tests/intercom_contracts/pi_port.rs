@@ -640,26 +640,6 @@ fn a_remote_unpublish_reaches_the_extension_as_a_reset() {
     );
 }
 
-/// True when a fresh legacy peer can register on the bridge socket: the
-/// file exists, a connect succeeds, and a full register round-trip
-/// answers (a dying pre-handover listener passes a bare connect and then
-/// closes mid-request).
-fn bridge_accepts_register(fixture: &Fixture) -> bool {
-    use std::io::{BufRead, Write as _};
-    let Ok(mut stream) = UnixStream::connect(&fixture.sock) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
-    let request = json!({"id":"probe","op":"register","session":{"id":"probe-peer","name":"probe"}}).to_string() + "\n";
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-    let mut reader = std::io::BufReader::new(stream);
-    let mut line = String::new();
-    matches!(reader.read_line(&mut line), Ok(n) if n > 0)
-}
-
 /// A manager connection whose hello carries a chosen pi_pid (a stand-in
 /// process the test can kill).
 fn pi_conn_as(fixture: &Fixture, session: &str, pi_pid: u32) -> common::Conn {
@@ -823,20 +803,30 @@ fn reregistration_and_pre_upgrade_receipts_survive_an_in_place_upgrade() {
     let sent = bob.ok(json!({"op":"send","to":"pi/alice-session","body":"before upgrade"}));
     let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
     assert_eq!(deliver["message_id"], sent["message_id"]);
+    drop(bob);
 
+    // Only the post-exec image can answer with a higher generation, so this
+    // is the deterministic new-image signal. The old image's client.sock
+    // peers see a refusal window while the old bridge dies and the new one
+    // rebinds — pre-existing product behavior on main (the serve loop shuts
+    // the bridge down before handover::perform), so legacy clients must
+    // retry; the test therefore never treats a bare connect as readiness.
+    let generation = manager_status_generation(&fixture)
+        .expect("read the current generation before requesting an upgrade");
     let mut manager =
         common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
     manager.hello_cli();
     let upgraded = manager.request_ok(json!({"type":"upgrade"}));
     assert!(upgraded["ok"] == true, "upgrade request: {upgraded}");
+    drop(manager); // it dies with the exec
 
-    // The bridge socket of the old image dies with it; between the
-    // upgrade response and the handover the OLD listener can still accept
-    // (and then die mid-request), so readiness needs a full register
-    // round-trip, not just a connectable path.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !fixture.root.join("state").exists() || !bridge_accepts_register(&fixture) {
-        assert!(Instant::now() < deadline, "bridge did not come back: {}", fixture.manager_log());
+    while !manager_status_generation(&fixture).is_some_and(|g| g > generation) {
+        assert!(
+            Instant::now() < deadline,
+            "the new image never appeared: {}",
+            fixture.manager_log()
+        );
         thread::sleep(Duration::from_millis(25));
     }
 
@@ -850,10 +840,69 @@ fn reregistration_and_pre_upgrade_receipts_survive_an_in_place_upgrade() {
     );
     assert_eq!(receipt["ok"], true);
 
-    // The bridge restarted under the new image: a legacy peer reconnects and
-    // messaging works end to end.
-    let mut bob = fixture.plugin("bob-legacy", "idle");
+    // The bridge restarts under the new image: a legacy peer gets a full
+    // register round-trip (never a bare connect) before it is used.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut bob = loop {
+        if let Some(peer) = bridge_peer(&fixture) {
+            break peer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bridge did not come back: {}",
+            fixture.manager_log()
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
     let sent = bob.ok(json!({"op":"send","to":"pi/alice-session","body":"after upgrade"}));
     let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
     assert_eq!(deliver["message_id"], sent["message_id"]);
+}
+
+/// The manager's `status.generation` via a fresh connection, or None while
+/// the daemon is mid-exec. Only the post-upgrade image answers with a
+/// higher generation than before the request.
+fn manager_status_generation(fixture: &Fixture) -> Option<u64> {
+    let mut conn = common::Conn::new(UnixStream::connect(
+        fixture.root.join("manager/manager.sock"),
+    ).ok()?);
+    // hello first: the daemon refuses non-hello first frames, and during
+    // the exec hellos are rejected until the new image serves them.
+    let hello = conn.try_request(
+        json!({"type":"hello","client_kind":"cli"}),
+        Duration::from_millis(1500),
+    )?;
+    if hello["ok"] != true {
+        return None;
+    }
+    conn.try_request(json!({"type":"status"}), Duration::from_millis(1500))?
+        ["generation"]
+        .as_u64()
+}
+
+/// A fresh legacy peer that has JUST completed a register round-trip, or
+/// None while the bridge socket is unbound/refused. Readiness is the
+/// round-trip, never the connect: during an in-place upgrade the old
+/// image's listener can still accept (and then die mid-request), and the
+/// file can linger unbound between images.
+fn bridge_peer(fixture: &Fixture) -> Option<Peer> {
+    use std::io::{BufRead, Write as _};
+    let mut stream = UnixStream::connect(&fixture.sock).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
+    let request =
+        json!({"id":"probe","op":"register","session":{"id":"probe-peer","name":"probe"}})
+            .to_string()
+            + "\n";
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+        return None;
+    }
+    let response: Value = serde_json::from_str(&line).ok()?;
+    if response["id"] != "probe" || response["ok"] != true {
+        return None;
+    }
+    Some(Peer::new(reader.into_inner()))
 }
