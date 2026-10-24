@@ -1140,7 +1140,22 @@ impl Transport {
     /// One read of at most `buf.len()` bytes, waiting up to `d`. Times out
     /// with `ErrorKind::TimedOut`; `Ok(0)` is EOF.
     pub fn read_timeout(&mut self, buf: &mut [u8], d: Duration) -> std::io::Result<usize> {
-        self.peek_or_read(buf, d, false)
+        #[cfg(unix)]
+        {
+            self.peek_or_read(buf, d, false)
+        }
+        #[cfg(windows)]
+        {
+            use tokio::io::AsyncReadExt;
+            let pipe = &mut self.pipe;
+            match self.rt.block_on(async { tokio::time::timeout(d, pipe.read(buf)).await }) {
+                Ok(Ok(n)) => Ok(n),
+                // The server closed its end: EOF, like a unix socket.
+                Ok(Err(e)) if e.raw_os_error() == Some(109) => Ok(0),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+            }
+        }
     }
     /// Like [`Self::read_timeout`] but leaves the bytes in the socket:
     /// how much is immediately readable without consuming it.
@@ -1227,18 +1242,6 @@ impl Transport {
                 }
             } else {
                 self.stream.read(buf)
-            }
-        }
-        #[cfg(windows)]
-        {
-            use tokio::io::AsyncReadExt;
-            let pipe = &mut self.pipe;
-            match self.rt.block_on(async { tokio::time::timeout(d, pipe.read(buf)).await }) {
-                Ok(Ok(n)) => Ok(n),
-                // The server closed its end: EOF, like a unix socket.
-                Ok(Err(e)) if e.raw_os_error() == Some(109) => Ok(0),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
             }
         }
     }
