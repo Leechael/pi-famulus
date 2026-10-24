@@ -29,6 +29,7 @@ const REGISTRATIONS = new Set<PropertyKey>([
   "registerShortcut",
   "registerFlag",
   "registerMessageRenderer",
+  "registerEntryRenderer",
   "registerProvider",
 ]);
 
@@ -51,8 +52,13 @@ export function createPiBinding(): PiBinding {
   let current: ExtensionAPI | null = null;
   let live = false;
 
-  const call = (pi: ExtensionAPI, method: PropertyKey, args: unknown[]): unknown =>
-    (Reflect.get(pi, method) as (...a: unknown[]) => unknown).apply(pi, args);
+  const call = (pi: ExtensionAPI, method: PropertyKey, args: unknown[]): unknown => {
+    const fn = Reflect.get(pi, method) as unknown;
+    // A host surface may not implement every registration kind (hosted
+    // child fakes, older pi); skipping beats crashing the replay.
+    if (typeof fn !== "function") return undefined;
+    return (fn as (...a: unknown[]) => unknown).apply(pi, args);
+  };
 
   const api = new Proxy({} as ExtensionAPI, {
     get(_target, key) {

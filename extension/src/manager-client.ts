@@ -20,8 +20,9 @@ import { realClock, type Clock, type ClockTimer } from "./clock";
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
 const EXTENSION_VERSION = "0.2.1";
 export { EXTENSION_VERSION };
-// 5: speaks per-kind agent admission and queued acquire.
-const PROTOCOL = 6;
+// 6: hosted subagents. 7: the extension's messaging bridge (`intercom`
+// request plus `intercom`/`intercom_reset` events).
+const PROTOCOL = 7;
 const HELLO_TIMEOUT_MS = 5000;
 const RECONNECT_HELLO_TIMEOUT_MS = 25_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -108,7 +109,14 @@ export interface MonitorOutputRecord {
 
 /** Server-pushed event (§3.3). Fields beyond `event` depend on the event kind. */
 export interface ManagerEvent {
-  event: "task_started" | "output" | "task_exited" | "session_rebound" | string;
+  event:
+    | "task_started"
+    | "output"
+    | "task_exited"
+    | "session_rebound"
+    | "intercom"
+    | "intercom_reset"
+    | string;
   task_id?: string;
   kind?: string;
   command?: string;
@@ -126,6 +134,8 @@ export interface ManagerEvent {
   ts?: number;
   /** Set on task_started when the daemon recorded who asked for the task. */
   origin?: { via: string; child_id?: string; run_id?: string };
+  /** An intercom bridge frame (deliver/receipt/idle_notice) for this session. */
+  frame?: Record<string, unknown>;
 }
 
 export class ManagerError extends Error {
@@ -606,6 +616,19 @@ export class ManagerClient {
       ...(tier ? { tier } : {}),
       ...(lifetimeMs !== null ? { lifetime_ms: lifetimeMs } : {}),
     });
+  }
+
+  /** The extension's messaging bridge: one intercom client-protocol op
+   * (register/send/list/receipt/…). Protocol 7+; rejected by older managers. */
+  async intercom(op: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.protocolLevel_ < 7) {
+      throw new ManagerError(
+        "E_VERSION",
+        "this pi-famulus daemon does not serve cross-session messaging (protocol " +
+          `${this.protocolLevel_}; need 7). Restart pi so it starts the current daemon.`,
+      );
+    }
+    return this.request({ type: "intercom", op });
   }
 
   /** Daemon status, including optional in-place upgrade metadata. */

@@ -28,6 +28,7 @@ import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, 
 import { ensureNativeManagerInstalled } from "./native-manager.js";
 import type { TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
+import { registerIntercom } from "./intercom/intercom";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
 import { NotifyCenter } from "./notify";
@@ -1283,6 +1284,12 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     });
     return message ? { message } : undefined;
   });
+
+  // The intercom port (cross-session messaging, absorbed from the
+  // agent-intercom pi plugin) rides the same manager connection. Registered
+  // after the session hooks above so its session_start sees the fresh
+  // client. Hosted children never reach here (child-mode returns early).
+  registerIntercom(pi, { getClient: () => client });
 
   return runtime;
 }
