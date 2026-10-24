@@ -1358,7 +1358,7 @@ fn p9_protocol_v4_uses_global_only_immediate_admission() {
     let mut second = connect(&home, CONNECT_TIMEOUT);
     let mut third = connect(&home, CONNECT_TIMEOUT);
     let hello = hello_ext_protocol(&mut first, "session-p9-first", 4);
-    assert!(compact(&hello).contains("\"protocol\":6"), "daemon advertises its max: {hello}");
+    assert!(compact(&hello).contains("\"protocol\":7"), "daemon advertises its max: {hello}");
     hello_ext_protocol(&mut second, "session-p9-second", 4);
     hello_ext_protocol(&mut third, "session-p9-third", 4);
     for (conn, id, child) in [(&mut first, "p9-a", "ch_a"), (&mut second, "p9-b", "ch_b")] {

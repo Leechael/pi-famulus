@@ -38,10 +38,13 @@ type OutTx = mpsc::Sender<OutFrame>;
 
 /// One frame queued for a connection's writer. Output events say which
 /// task and cursor they carry, so the writer can record how far the client
-/// really got (`ConnHandle::written`).
+/// really got (`ConnHandle::written`). `ack` frames (the intercom port
+/// relay) resolve only after the bytes hit the socket: delivered/read
+/// receipt semantics depend on that ordering.
 pub struct OutFrame {
     bytes: Arc<Vec<u8>>,
     output: Option<(String, u64)>,
+    ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
 
 impl OutFrame {
@@ -49,12 +52,24 @@ impl OutFrame {
         OutFrame {
             bytes,
             output: None,
+            ack: None,
         }
     }
     fn output(bytes: Arc<Vec<u8>>, task_id: &str, next_cursor: u64) -> OutFrame {
         OutFrame {
             bytes,
             output: Some((task_id.to_string(), next_cursor)),
+            ack: None,
+        }
+    }
+    fn ack(
+        bytes: Arc<Vec<u8>>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) -> OutFrame {
+        OutFrame {
+            bytes,
+            output: None,
+            ack: Some(ack),
         }
     }
 }
@@ -207,6 +222,37 @@ pub struct DaemonState {
     agent_notices: Option<mpsc::UnboundedReceiver<crate::hosted::Notice>>,
     supervision: mpsc::UnboundedSender<SupervisionRequest>,
     supervision_rx: Option<mpsc::UnboundedReceiver<SupervisionRequest>>,
+    /// The messaging bridge runtime currently served over `intercom`
+    /// requests; `None` while the bridge is down (and why, in
+    /// `intercom_error`). Swapped by the accept loop on every bridge
+    /// (re)start; brief locked access only (clone the Arc).
+    pub intercom_rt: Arc<Mutex<Option<crate::intercom::Shared>>>,
+    /// Why the bridge is down, when `intercom_rt` is `None`.
+    pub intercom_error: Arc<Mutex<Option<String>>>,
+    /// One intercom op queue per manager connection that sent an
+    /// `intercom` request (protocol 7). The map lock is held only for
+    /// get/insert/remove, never across an op: a worker task per connection
+    /// owns the port and serializes its ops in wire order.
+    pub(crate) intercom_ports: Arc<Mutex<HashMap<u64, IntercomEntry>>>,
+}
+
+/// One connection's intercom op queue. A worker task owns the port and
+/// serves the queue in wire order; close and reset only signal it, so a
+/// slow op never delays teardown or the accept loop.
+pub(crate) struct IntercomEntry {
+    tx: mpsc::Sender<IntercomOp>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    /// Bumped by reset_intercom_ports: the worker drops its port and
+    /// answers queued ops with E_INTERCOM_RESET. Keeping the entry (and
+    /// the worker) preserves wire order across the reset.
+    reset: tokio::sync::watch::Sender<u64>,
+}
+
+/// One queued intercom op: the client-protocol request plus the request id
+/// to answer with.
+struct IntercomOp {
+    id: String,
+    req: serde_json::Value,
 }
 
 /// Bound on remembered start keys.
@@ -256,6 +302,9 @@ impl DaemonState {
             agent_notices: Some(notice_rx),
             supervision,
             supervision_rx: Some(supervision_rx),
+            intercom_rt: Arc::new(Mutex::new(None)),
+            intercom_error: Arc::new(Mutex::new(None)),
+            intercom_ports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -595,6 +644,7 @@ async fn serve(
     // Restarted after a failed in-place upgrade, which only Unix performs.
     #[cfg_attr(windows, allow(unused_mut))]
     let (mut intercom, mut bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
+    publish_bridge(&state, &intercom, &bridge_error);
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
@@ -645,6 +695,7 @@ async fn serve(
             },
             Some(request) = supervision_rx.recv(), if shutdown_task.is_none() => {
                 let status = apply_supervision(&state, &mut intercom, &mut bridge_error).await;
+                bridge_changed(&state, &intercom, &bridge_error).await;
                 if let Some(reply) = request.reply {
                     let _ = reply.send(status);
                 }
@@ -662,6 +713,7 @@ async fn serve(
                         if intercom.is_none() {
                             (intercom, bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
                             apply_supervision(&state, &mut intercom, &mut bridge_error).await;
+                            bridge_changed(&state, &intercom, &bridge_error).await;
                         }
                     }
                 }
@@ -917,20 +969,38 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
         let payload = &frame.bytes;
         // An oversized frame is dropped, not written: write_frame would
         // refuse it, and ending the writer here would leave the connection
-        // mute for every later response. `respond` already substitutes an
-        // error for oversized responses, so this is a last line of defence.
+        // mute for every later response. The frame's ack (the intercom
+        // relay) gets an explicit Err so the delivery is settled instead of
+        // hanging, and the writer stays alive. `respond` already
+        // substitutes an error for oversized responses, so this is a last
+        // line of defence.
         if payload.len() > MAX_FRAME_SIZE as usize {
+            if let Some(ack) = frame.ack {
+                let _ = ack.send(Err("frame exceeds the 4 MiB limit".to_string()));
+            }
             continue;
         }
-        if let Err(e) = write_frame(&mut w, payload).await {
+        let write_result = write_frame(&mut w, payload).await;
+        if let Err(e) = &write_result {
             // The connection goes mute from here; its reader still runs.
             eprintln!("pi-famulus: connection writer stopped: {e}");
-            break;
         }
-        if let Some((task, cursor)) = frame.output {
-            let mut m = written.lock().unwrap();
-            let e = m.entry(task).or_insert(0);
-            *e = (*e).max(cursor);
+        // The output cursor advances only on a successful write: a failed
+        // frame was not received, and the resend after a reconnect must
+        // replay it.
+        if write_result.is_ok() {
+            if let Some((task, cursor)) = frame.output {
+                let mut m = written.lock().unwrap();
+                let e = m.entry(task).or_insert(0);
+                *e = (*e).max(cursor);
+            }
+        }
+        let failed = write_result.is_err();
+        if let Some(ack) = frame.ack {
+            let _ = ack.send(write_result.map_err(|e| e.to_string()));
+        }
+        if failed {
+            break;
         }
     }
 }
@@ -1180,6 +1250,25 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                 .await;
             continue;
         }
+        // Intercom ops (protocol 7) are queued to the connection's own
+        // worker instead of being dispatched as independent tasks: a
+        // connection's ops must apply in wire order, like a client socket.
+        if let RequestKind::Intercom { op } = req.kind {
+            let id = req.id;
+            match enqueue_intercom_op(&state, conn_id) {
+                Ok(queue) => {
+                    if queue.send(IntercomOp { id: id.clone(), req: op }).await.is_err() {
+                        let _ = tx
+                            .send(encode_error(&id, E_INTERNAL, "intercom port closed"))
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(encode_error(&id, &error.code, &error.message)).await;
+                }
+            }
+            continue;
+        }
         let s2 = state.clone();
         let tx2 = tx.clone();
         let guard = CountGuard::new(&inflight);
@@ -1213,6 +1302,7 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
         let mut st = state.lock().unwrap();
         remove_conn(&mut st, conn_id, "closed");
     }
+    close_intercom_port(&state, conn_id).await;
     maybe_arm_idle_timer(&state);
 }
 
@@ -2096,6 +2186,17 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         }
         RequestKind::Supervise {} => {
             respond(&tx, &id, handle_supervise(&state, conn_id).await).await;
+        }
+        RequestKind::Intercom { .. } => {
+            // Intercepted in the connection's read loop so a connection's
+            // ops serialize in wire order; reaching dispatch means the
+            // enqueue failed before the loop could answer.
+            respond::<UnitOk>(
+                &tx,
+                &id,
+                Err(ProtoError::new(E_INTERNAL, "intercom op was not queued")),
+            )
+            .await;
         }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
@@ -3653,6 +3754,456 @@ async fn handle_supervise(state: &Shared, conn_id: u64) -> Result<SuperviseOk, P
     Ok(SuperviseOk { intercom })
 }
 
+// ---------------------------------------------------------------------------
+// Intercom ports (protocol 7): the extension's messaging bridge over the
+// manager connection
+// ---------------------------------------------------------------------------
+
+const E_INTERCOM_DISABLED: &str = "E_INTERCOM_DISABLED";
+const E_INTERCOM_UNAVAILABLE: &str = "E_INTERCOM_UNAVAILABLE";
+/// The bridge restarted under this port; re-register and retry idempotent
+/// ops. `send` is never retried by the extension.
+const E_INTERCOM_RESET: &str = "E_INTERCOM_RESET";
+
+/// Publish the current bridge (and why it is down) for `intercom` requests.
+/// Brief locked access: callers only clone the runtime Arc out of it.
+/// Returns true when the published bridge (or its error) changed.
+fn publish_bridge(
+    state: &Shared,
+    intercom: &Option<crate::intercom::Running>,
+    bridge_error: &Option<String>,
+) -> bool {
+    let (rt_slot, error_slot) = {
+        let st = state.lock().unwrap();
+        (st.intercom_rt.clone(), st.intercom_error.clone())
+    };
+    let mut rt_guard = rt_slot.lock().unwrap();
+    let changed = match rt_guard.as_ref() {
+        Some(rt) => intercom
+            .as_ref()
+            .is_none_or(|running| !Arc::ptr_eq(rt, &running.runtime)),
+        None => intercom.is_some(),
+    } || *error_slot.lock().unwrap() != *bridge_error;
+    if changed {
+        *rt_guard = intercom.as_ref().map(|running| running.runtime.clone());
+        *error_slot.lock().unwrap() = bridge_error.clone();
+    }
+    changed
+}
+
+/// The bridge changed (restarted or stopped): existing ports belong to the
+/// old runtime. Push `intercom_reset` to their connections so the extension
+/// re-registers, as if its socket had closed, then close the ports. A
+/// supervision lease flip without a bridge restart leaves ports alone.
+async fn bridge_changed(
+    state: &Shared,
+    intercom: &Option<crate::intercom::Running>,
+    bridge_error: &Option<String>,
+) {
+    if publish_bridge(state, intercom, bridge_error) {
+        reset_intercom_ports(state).await;
+    }
+}
+
+async fn reset_intercom_ports(state: &Shared) {
+    let entries: Vec<(u64, IntercomEntry)> = {
+        // Both locks, brief: same order as enqueue_intercom_op. Entries
+        // STAY in the map: each connection keeps its one worker, so wire
+        // order survives the reset.
+        let st = state.lock().unwrap();
+        let guard = st.intercom_ports.lock().unwrap();
+        guard.iter().map(|(id, e)| (*id, IntercomEntry {
+            tx: e.tx.clone(),
+            shutdown: e.shutdown.clone(),
+            reset: e.reset.clone(),
+        })).collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    // Best-effort reset notice; the worker ALSO bumps the reset watch, so
+    // queued ops are answered deterministically even when this event is
+    // lost (full out-queue).
+    {
+        let st = state.lock().unwrap();
+        for (conn_id, _) in &entries {
+            if let Some(handle) = st.conns.get(conn_id) {
+                let _ = handle
+                    .tx
+                    .try_send(encode_event(&EventKind::IntercomReset {}));
+            }
+        }
+    }
+    for (_, entry) in entries {
+        entry.reset.send_modify(|generation| *generation += 1);
+    }
+}
+
+
+/// Close one connection's queue (socket close, session rebind). Brief:
+/// signals the worker, which cancels any in-flight op and closes the port;
+/// teardown never waits on the op itself.
+async fn close_intercom_port(state: &Shared, conn_id: u64) {
+    let entry = {
+        let st = state.lock().unwrap();
+        let mut guard = st.intercom_ports.lock().unwrap();
+        guard.remove(&conn_id)
+    };
+    if let Some(entry) = entry {
+        let _ = entry.shutdown.send(true);
+        // Dropping the sender ends the worker's queue once it drains.
+        drop(entry);
+    }
+}
+
+
+/// Relay one port's push frames onto its manager connection as `intercom`
+/// events. `Push::written` resolves only after the frame was actually
+/// written to the socket (or failed), because delivered/read receipt
+/// semantics depend on it; `Push::fence` is released with the ack. An
+/// oversized frame is settled as an error without touching the connection
+/// (and without killing the relay); the relay only dies with the
+/// connection's output channel.
+async fn intercom_port_relay(mut rx: mpsc::Receiver<crate::intercom::Push>, out: OutTx) {
+    while let Some(push) = rx.recv().await {
+        let frame = encode_event(&EventKind::Intercom {
+            frame: push.value,
+        });
+        let written = if frame.bytes.len() > MAX_FRAME_SIZE as usize {
+            Err("intercom frame exceeds the 4 MiB limit".to_string())
+        } else {
+            let (ack, wait) = tokio::sync::oneshot::channel();
+            match out.send(OutFrame::ack(frame.bytes, ack)).await {
+                Ok(()) => wait
+                    .await
+                    .unwrap_or_else(|_| Err("connection closed before write".to_string())),
+                // The connection is gone; nothing more can be delivered.
+                Err(_) => break,
+            }
+        };
+        if let Some(reply) = push.written {
+            let _ = reply.send(written);
+        }
+        drop(push.fence);
+    }
+    // The connection is gone: fail whatever is still queued.
+    while let Some(push) = rx.recv().await {
+        if let Some(reply) = push.written {
+            let _ = reply.send(Err("connection closed".to_string()));
+        }
+        drop(push.fence);
+    }
+}
+
+/// Serve one intercom op for a manager connection (protocol 7). Extension
+/// parent connections only: the daemon keeps one port per connection and
+/// answers with the op's result; frames for the session arrive as
+/// `intercom` events. When the bridge is down the request fails with a
+/// structured error (`disabled` vs `unavailable: <why>`).
+/// Queue one intercom op for a connection. Called from the connection's
+/// read loop, so a connection's ops are serialized per connection in wire
+/// order by its worker — the same sequential semantics a client socket
+/// connection has. The map lock is held only to look up or create the
+/// queue, never across an op.
+fn enqueue_intercom_op(
+    state: &Shared,
+    conn_id: u64,
+) -> Result<mpsc::Sender<IntercomOp>, ProtoError> {
+    let ports = {
+        let st = state.lock().unwrap();
+        st.intercom_ports.clone()
+    };
+    // The daemon-state lock is taken before the ports lock here and in
+    // close/reset, so the connection liveness check cannot race teardown.
+    let st = state.lock().unwrap();
+    let handle = st
+        .conns
+        .get(&conn_id)
+        .ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    if handle.kind != ClientKind::Extension {
+        return Err(ProtoError::new(
+            E_FORBIDDEN,
+            "intercom is available to extension sessions only",
+        ));
+    }
+    match handle.role {
+        ConnRole::Parent => {}
+        ConnRole::Cli => {
+            return Err(ProtoError::new(
+                E_FORBIDDEN,
+                "intercom is available to pi sessions, not the cli",
+            ))
+        }
+        ConnRole::Child => {
+            return Err(ProtoError::new(
+                E_FORBIDDEN,
+                "intercom is not available to a hosted child",
+            ))
+        }
+    }
+    let session_id = handle
+        .session_id
+        .clone()
+        .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "intercom requires a session"))?;
+    let pi_pid = st.sessions.get(&session_id).map(|entry| entry.pi_pid).unwrap_or(0);
+    let mut guard = ports.lock().unwrap();
+    if let Some(entry) = guard.get(&conn_id) {
+        return Ok(entry.tx.clone());
+    }
+    let (tx, rx) = mpsc::channel::<IntercomOp>(64);
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Bumped on every bridge restart so the worker drops its (dead-runtime)
+    // port and answers queued ops deterministically instead of racing a
+    // replacement worker.
+    let (reset, reset_rx) = tokio::sync::watch::channel(0u64);
+    let out = handle.tx.clone();
+    let worker_state = state.clone();
+    tokio::spawn(intercom_worker(
+        worker_state,
+        conn_id,
+        session_id,
+        pi_pid,
+        rx,
+        out,
+        shutdown_rx,
+        reset_rx,
+    ));
+    guard.insert(
+        conn_id,
+        IntercomEntry {
+            tx: tx.clone(),
+            shutdown,
+            reset,
+        },
+    );
+    Ok(tx)
+}
+
+/// A watch pair whose receiver's initial value is already seen, so
+/// `changed()` pends until a real signal. The SENDER IS RETURNED TOO and
+/// must be kept alive for as long as the receiver is used: `changed()` on
+/// a receiver whose sender was dropped completes immediately with an error,
+/// which would busy-loop the worker's select.
+fn idle_watch() -> (
+    tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<bool>,
+) {
+    let (tx, mut rx) = tokio::sync::watch::channel(false);
+    let _ = rx.borrow_and_update();
+    (tx, rx)
+}
+
+/// Serve one connection's intercom ops in wire order. The worker owns the
+/// port; it re-reads the bridge runtime before every op, so a restart or a
+/// reset can never leave a port attached to a dead runtime, and it never
+/// holds anything but the port across an op: a slow op delays only that
+/// connection's later intercom ops, never other sessions, and never the
+/// accept loop's close/reset paths.
+#[allow(unused_assignments)] // the watch senders matter alive, not read
+#[allow(clippy::too_many_arguments)] // the connection context plus its three wake sources
+async fn intercom_worker(
+    state: Shared,
+    _conn_id: u64,
+    session_id: String,
+    pi_pid: u32,
+    mut ops: mpsc::Receiver<IntercomOp>,
+    out: OutTx,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut reset: tokio::sync::watch::Receiver<u64>,
+) {
+    let (push_tx, push_rx) = mpsc::channel::<crate::intercom::Push>(128);
+    let relay = tokio::spawn(intercom_port_relay(push_rx, out.clone()));
+    // The port and its bridge runtime; the watches start never-fired and
+    // are replaced with each port so an unpublish interrupts the wait
+    // below. The senders are never read; keeping them alive is what
+    // matters (a dropped sender makes changed() complete immediately).
+    let mut port: Option<crate::intercom::port::Port> = None;
+    let mut port_rt: Option<crate::intercom::Shared> = None;
+    let (mut unpublished_tx, mut unpublished) = idle_watch();
+    let _ = &unpublished_tx;
+    let _ = reset.borrow_and_update();
+    loop {
+        // (Re)create the port whenever the bridge runtime changed under it.
+        let current = current_intercom_rt(&state);
+        let on_current =
+            matches!((&port_rt, &current), (Some(rt), Some(now)) if std::sync::Arc::ptr_eq(rt, now));
+        if !on_current {
+            if let Some(mut old) = port.take() {
+                let _ = old.close().await;
+            }
+            port_rt = None;
+            (unpublished_tx, unpublished) = idle_watch();
+            if let Some(rt) = current {
+                let created = crate::intercom::port::Port::new(
+                    rt.clone(),
+                    push_tx.clone(),
+                    crate::intercom::port::PortOrigin::Manager {
+                        session_id: session_id.clone(),
+                        pi_pid,
+                    },
+                );
+                unpublished = created.disconnected();
+                // subscribe() starts with the current value unseen, which
+                // would make the first changed() return immediately; mark
+                // it seen so only a real unpublish wakes the select.
+                let _ = unpublished.borrow_and_update();
+                port = Some(created);
+                port_rt = Some(rt);
+            }
+        }
+        // An unpublish that landed DURING the previous op is not lost:
+        // the in-op select's teardown runs Port::close(), which re-sends
+        // the disconnect watch, so the select below observes it.
+        enum Wake {
+            Shutdown,
+            Unpublished,
+            Reset,
+            Op(Option<IntercomOp>),
+        }
+        let wake = tokio::select! {
+            biased;
+            _ = shutdown.changed() => Wake::Shutdown,
+            _ = unpublished.changed() => Wake::Unpublished,
+            _ = reset.changed() => Wake::Reset,
+            op = ops.recv() => Wake::Op(op),
+        };
+        let op = match wake {
+            Wake::Shutdown => break,
+            Wake::Op(None) => break,
+            Wake::Unpublished => {
+                // The session was unpublished remotely: tell the extension
+                // to re-register. Its next op lands on a fresh, unbound
+                // port and gets a clear error until it is restored.
+                let _ = out.try_send(encode_event(&EventKind::IntercomReset {}));
+                if let Some(mut old) = port.take() {
+                    let _ = old.close().await;
+                }
+                port_rt = None;
+                (unpublished_tx, unpublished) = idle_watch();
+                continue;
+            }
+            Wake::Reset => {
+                // The bridge restarted: the port belongs to the dead
+                // runtime; the extension re-registers on the fresh port
+                // its next op creates. Answer every queued op with a
+                // deterministic reset error, in order, after whatever op
+                // was in flight has been answered. Idempotent ops may be
+                // retried by the extension after re-registering; send may
+                // not.
+                if let Some(mut old) = port.take() {
+                    let _ = old.close().await;
+                }
+                port_rt = None;
+                (unpublished_tx, unpublished) = idle_watch();
+                while let Ok(queued) = ops.try_recv() {
+                    if out
+                        .send(encode_error(
+                            &queued.id,
+                            E_INTERCOM_RESET,
+                            "intercom reset: re-register and retry idempotent ops",
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                continue;
+            }
+            Wake::Op(Some(op)) => op,
+        };
+        let Some(port) = port.as_mut() else {
+            let _ = out.send(encode_bridge_down(&state, &op.id)).await;
+            continue;
+        };
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                // Cancelled mid-op: run the cleanup the op would have
+                // done (takeover removals, watcher settle) before dying.
+                let _ = port.close().await;
+                Err("connection closed".to_string())
+            }
+            _ = unpublished.changed() => {
+                let _ = port.close().await;
+                Err("session ownership ended".to_string())
+            }
+            result = port.handle(&op.req) => result,
+        };
+        let frame = match &result {
+            Ok(value) => encode_ok_value(&op.id, value),
+            Err(error) => encode_error(&op.id, E_BAD_REQUEST, error),
+        };
+        if out.send(frame).await.is_err() {
+            break;
+        }
+    }
+    // Connection teardown: settle unread deliveries as dropped, but only
+    // when the pi session is really gone — a clean shutdown_session, or a
+    // dead pi process (the daemon's crash signal). A plain reconnect gap
+    // clears conn_id before we run; the session's queue must survive for
+    // the re-registration, and the extension reports dropped itself when
+    // the session actually changes.
+    if let Some(mut port) = port.take() {
+        let removed = port.close().await;
+        if let Some(id) = removed {
+            let gone = {
+                let st = state.lock().unwrap();
+                match st.sessions.get(&session_id) {
+                    Some(entry) => {
+                        entry.ended_clean
+                            || (entry.pi_pid != 0 && !crate::sys::pid_alive(entry.pi_pid))
+                    }
+                    None => true,
+                }
+            };
+            if gone {
+                if let Some(rt) = port_rt {
+                    rt.settle_unread_target(&id, "session closed").await;
+                }
+            }
+        }
+    }
+    relay.abort();
+}
+
+/// The bridge runtime currently published for intercom, if any.
+fn current_intercom_rt(state: &Shared) -> Option<crate::intercom::Shared> {
+    state.lock().unwrap().intercom_rt.lock().unwrap().clone()
+}
+
+/// A success response whose body is the op's JSON result.
+fn encode_ok_value(id: &str, body: &serde_json::Value) -> OutFrame {
+    OutFrame::plain(Arc::new(encode(&Response {
+        v: PROTO_VERSION,
+        id: id.to_string(),
+        ok: true,
+        body,
+    })))
+}
+
+/// The structured bridge-down error: `disabled` is a deliberate off switch,
+/// anything else is an outage the extension retries.
+fn encode_bridge_down(state: &Shared, id: &str) -> OutFrame {
+    let error = state.lock().unwrap().intercom_error.clone();
+    let message = error
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "bridge not running".to_string());
+    let disabled = message.starts_with("disabled by");
+    encode_error(
+        id,
+        if disabled {
+            E_INTERCOM_DISABLED
+        } else {
+            E_INTERCOM_UNAVAILABLE
+        },
+        &message,
+    )
+}
+
+
 /// The running bridge restarts when its configuration changed and also when
 /// the loaded identity changed: `device.json`-only updates (re-enrollment, a
 /// new identity) never touch the configuration file, but the bridge's relay
@@ -4752,6 +5303,146 @@ fn admit_agent(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn writer_records_the_output_cursor_only_on_a_successful_write() {
+        let (a, b) = tokio::io::duplex(64);
+        drop(b); // every write fails
+        let written: Written = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel(8);
+        let writers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = tokio::spawn(writer_task(a, rx, written.clone(), CountGuard::new(&writers)));
+        tx.send(OutFrame::output(Arc::new(vec![0u8; 16]), "sh_x", 42))
+            .await
+            .unwrap();
+        drop(tx);
+        let _ = task.await;
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "a failed write advanced the resend cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_intercom_frame_errors_without_killing_the_relay() {
+        let (tx, rx) = mpsc::channel::<crate::intercom::Push>(8);
+        let (out, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let relay = tokio::spawn(intercom_port_relay(rx, out));
+        let big = serde_json::json!({"type": "deliver", "body": "x".repeat(MAX_FRAME_SIZE as usize + 64)});
+        let (w, wait) = tokio::sync::oneshot::channel();
+        tx.send(crate::intercom::Push {
+            value: big,
+            written: Some(w),
+            fence: None,
+        })
+        .await
+        .unwrap();
+        // The oversized push settles as an error, promptly, and never
+        // reaches the connection.
+        let result = tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .expect("oversized frame settles promptly")
+            .expect("oversized frame settles");
+        assert!(result.is_err(), "oversized frame settled as ok: {result:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), out_rx.recv())
+                .await
+                .is_err(),
+            "the oversized frame reached the connection"
+        );
+        // The relay is alive: the next frame flows and settles.
+        let (w2, wait2) = tokio::sync::oneshot::channel();
+        tx.send(crate::intercom::Push {
+            value: serde_json::json!({"type": "receipt"}),
+            written: Some(w2),
+            fence: None,
+        })
+        .await
+        .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("relay still forwards after the oversized frame")
+            .expect("relay still forwards");
+        if let Some(ack) = frame.ack {
+            let _ = ack.send(Ok(()));
+        }
+        assert!(wait2.await.expect("receipt settles").is_ok());
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn intercom_enqueue_rejects_cli_and_child_connections() {
+        let home = std::env::temp_dir().join(format!("pi-famulus-iq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let state: Shared = Arc::new(Mutex::new(DaemonState::new(
+            home.clone(),
+            crate::registry::Registry::new(home.clone()),
+            false,
+        )));
+        let mk = |role: ConnRole, kind: ClientKind, session: Option<&str>| {
+            let (tx, rx) = mpsc::channel(8);
+            let writer = tokio::spawn(std::future::pending::<()>()).abort_handle();
+            (
+                ConnHandle {
+                    kind,
+                    role,
+                    child_id: None,
+                    session_id: session.map(str::to_string),
+                    tx,
+                    die: Arc::new(Notify::new()),
+                    written: Arc::new(Mutex::new(HashMap::new())),
+                    writer,
+                    supervisor: false,
+                },
+                rx,
+            )
+        };
+        let (cli_handle, _cli_rx) = mk(ConnRole::Cli, ClientKind::Cli, None);
+        state.lock().unwrap().conns.insert(1, cli_handle);
+        let (child_handle, _child_rx) =
+            mk(ConnRole::Child, ClientKind::Extension, Some("child-session"));
+        state.lock().unwrap().conns.insert(2, child_handle);
+        let (parent_handle, mut parent_rx) =
+            mk(ConnRole::Parent, ClientKind::Extension, Some("parent-session"));
+        state.lock().unwrap().conns.insert(3, parent_handle);
+        let cli = enqueue_intercom_op(&state, 1).unwrap_err();
+        assert_eq!(cli.code, E_FORBIDDEN, "{cli:?}");
+        let child = enqueue_intercom_op(&state, 2).unwrap_err();
+        assert_eq!(child.code, E_FORBIDDEN, "{child:?}");
+        // A parent connection without a session is rejected too.
+        let (sessionless_handle, _sessionless_rx) =
+            mk(ConnRole::Parent, ClientKind::Extension, None);
+        state.lock().unwrap().conns.insert(4, sessionless_handle);
+        let no_session = enqueue_intercom_op(&state, 4).unwrap_err();
+        assert_eq!(no_session.code, E_SESSION_REQUIRED, "{no_session:?}");
+        // A live parent connection gets a queue and a worker, and the
+        // worker answers the op.
+        let queue = enqueue_intercom_op(&state, 3).unwrap();
+        queue
+            .send(IntercomOp {
+                id: "q".into(),
+                req: serde_json::json!({"op":"list"}),
+            })
+            .await
+            .unwrap();
+        let frame = parent_rx.recv().await.expect("the worker answers the op");
+        let response = std::str::from_utf8(&frame.bytes).unwrap();
+        let response: serde_json::Value = serde_json::from_str(response).unwrap();
+        // The bare DaemonState publishes no bridge runtime, so the worker
+        // answers with the structured bridge-down error — deterministic on
+        // any host. What matters here is that the op reached the worker and
+        // got an answered envelope echoing the request id; the code pins the
+        // exact contract instead of merely "some response".
+        assert_eq!(response["id"], "q", "{response}");
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(
+            response["error"]["code"], E_INTERCOM_UNAVAILABLE,
+            "{response}"
+        );
+        drop(queue);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn client_labels_are_one_clipped_line() {

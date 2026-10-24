@@ -274,6 +274,24 @@ impl super::Runtime {
         }
         self.forward_relay_receipt(receipt).await;
     }
+    /// Settle every unread (non-terminal) delivery targeted at `target` as
+    /// dropped: the recipient's session is gone for good (its connection
+    /// died with no replacement). Senders waiting on read receipts get a
+    /// terminal answer instead of a silent "delivered" forever.
+    pub async fn settle_unread_target(&self, target: &str, reason: &str) {
+        let mids: Vec<String> = {
+            let state = self.state.lock().unwrap();
+            state
+                .messages
+                .iter()
+                .filter(|(_, delivery)| delivery.target == target && rank(&delivery.status) < 4)
+                .map(|(mid, _)| mid.clone())
+                .collect()
+        };
+        for mid in mids {
+            self.receipt_with_reason(&mid, target, "dropped", reason).await;
+        }
+    }
     pub(super) async fn local_receipt(&self, mid: &str, reporter: &str, status: &str) {
         let route = {
             let mut state = self.state.lock().unwrap();
@@ -692,6 +710,7 @@ mod tests {
                 remote: Vec::new(),
                 relay_tx: None,
                 control_outbox: VecDeque::new(),
+                port_conns: HashSet::new(),
                 relay_message_ids: false,
                 relay_generation: 0,
                 legacy_active: None,
