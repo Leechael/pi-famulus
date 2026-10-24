@@ -473,11 +473,13 @@ async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
     let lanes = {
         let (log, running, peak) = (log.clone(), running.clone(), peak.clone());
         Lanes::new(
-            3,
-            4,
-            16,
-            usize::MAX,
-            usize::MAX,
+            LaneCaps {
+                workers: 3,
+                per_key: 4,
+                keys: 16,
+                budget: usize::MAX,
+                max_items: usize::MAX,
+            },
             |_| 1,
             Arc::new(move |item: String| {
                 let (log, running, peak, mut gate) =
@@ -557,11 +559,13 @@ async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
     let lanes = {
         let (finished, abandoned) = (finished.clone(), abandoned.clone());
         Lanes::new(
-            4,
-            8,
-            8,
-            10,
-            usize::MAX,
+            LaneCaps {
+                workers: 4,
+                per_key: 8,
+                keys: 8,
+                budget: 10,
+                max_items: usize::MAX,
+            },
             |item: &String| item.len(),
             Arc::new(move |item: String| {
                 let (finished, mut gate) = (finished.clone(), gate.clone());
@@ -673,11 +677,13 @@ async fn delivery_lanes_charge_the_full_encoded_frame_and_cap_global_items() {
     metadata_frame["attachment"] = json!("x".repeat(20_000));
     let encoded = metadata_frame.to_string().len() + 256;
     let lanes = Lanes::new(
-        1,
-        8,
-        8,
-        encoded - 1,
-        usize::MAX,
+        LaneCaps {
+            workers: 1,
+            per_key: 8,
+            keys: 8,
+            budget: encoded - 1,
+            max_items: usize::MAX,
+        },
         |frame: &Value| frame.to_string().len() + 256,
         std::sync::Arc::new(|_: Value| Box::pin(async {})),
         std::sync::Arc::new(|_: Vec<Value>| {}),
@@ -693,11 +699,13 @@ async fn delivery_lanes_charge_the_full_encoded_frame_and_cap_global_items() {
     lanes.push("pi/a", light.clone()).unwrap();
     // A global item-count cap backstops the byte budget for many tiny frames.
     let counted = Lanes::new(
-        1,
-        100,
-        100,
-        usize::MAX,
-        2,
+        LaneCaps {
+            workers: 1,
+            per_key: 100,
+            keys: 100,
+            budget: usize::MAX,
+            max_items: 2,
+        },
         |_: &Value| 1,
         std::sync::Arc::new(|_: Value| Box::pin(async {})),
         std::sync::Arc::new(|_: Vec<Value>| {}),

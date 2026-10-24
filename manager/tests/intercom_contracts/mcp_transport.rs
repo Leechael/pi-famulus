@@ -553,13 +553,10 @@ fn notify_when_idle_enforces_the_same_local_sender_policy_as_send() {
     assert_eq!(subscribed.status, 200);
     let result = subscribed.json();
     assert_ne!(result["result"]["isError"], true, "{result}");
-    assert_eq!(
-        result["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("not a local session"),
-        false
-    );
+    assert!(!result["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("not a local session"));
     let payload: Value =
         serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(payload["status"], "subscribed");

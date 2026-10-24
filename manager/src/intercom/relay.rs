@@ -788,17 +788,19 @@ impl<T> Drop for LaneWorker<T> {
         }
     }
 }
+
+/// Capacity knobs for a [`Lanes`] table: the worker pool size plus the
+/// per-lane, lane-count, byte and item bounds enforced on `push`.
+#[derive(Clone, Copy)]
+struct LaneCaps {
+    workers: usize,
+    per_key: usize,
+    keys: usize,
+    budget: usize,
+    max_items: usize,
+}
 impl<T: Send + 'static> Lanes<T> {
-    fn new(
-        workers: usize,
-        per_key: usize,
-        keys: usize,
-        budget: usize,
-        max_items: usize,
-        size: fn(&T) -> usize,
-        run: Runner<T>,
-        abandon: Abandon<T>,
-    ) -> Self {
+    fn new(caps: LaneCaps, size: fn(&T) -> usize, run: Runner<T>, abandon: Abandon<T>) -> Self {
         Self {
             inner: std::sync::Arc::new(LanesInner {
                 queues: std::sync::Mutex::new(LaneQueues {
@@ -806,11 +808,11 @@ impl<T: Send + 'static> Lanes<T> {
                     bytes: 0,
                     items: 0,
                 }),
-                permits: std::sync::Arc::new(tokio::sync::Semaphore::new(workers)),
-                per_key,
-                keys,
-                budget,
-                max_items,
+                permits: std::sync::Arc::new(tokio::sync::Semaphore::new(caps.workers)),
+                per_key: caps.per_key,
+                keys: caps.keys,
+                budget: caps.budget,
+                max_items: caps.max_items,
                 size,
                 run,
                 abandon,
@@ -919,11 +921,13 @@ const DELIVERY_BYTES: usize = 64 * 1024 * 1024;
 fn delivery_lanes(rt: &Shared) -> Lanes<Value> {
     let rt = rt.clone();
     Lanes::new(
-        DELIVERY_WORKERS,
-        DELIVERY_PER_TARGET,
-        DELIVERY_TARGETS,
-        DELIVERY_BYTES,
-        DELIVERY_ITEMS,
+        LaneCaps {
+            workers: DELIVERY_WORKERS,
+            per_key: DELIVERY_PER_TARGET,
+            keys: DELIVERY_TARGETS,
+            budget: DELIVERY_BYTES,
+            max_items: DELIVERY_ITEMS,
+        },
         // Charge the complete encoded frame, not just the body: the queue
         // retains the whole Value and headers/metadata can dominate a small
         // body, so sizing by body would let frames under-report their cost.

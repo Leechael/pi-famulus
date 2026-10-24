@@ -219,6 +219,10 @@ fn file_local_only(values: &toml::Table) -> bool {
         .and_then(toml::Value::as_bool)
         .unwrap_or(false)
 }
+/// What installing the service would persist for MCP: the listen address
+/// and token to save (each `None` when unchanged), plus the config field
+/// names a `--save-token` run would write.
+type McpPersistPlan = Result<(Option<String>, Option<String>, Vec<&'static str>), String>;
 /// MCP's listen address and bearer token can come from the config file,
 /// `AGENT_INTERCOM_MCP_*` environment variables, or CLI flags. The launch
 /// agent strips `AGENT_INTERCOM_*TOKEN*` variables from its environment, so
@@ -231,7 +235,7 @@ fn mcp_persist_plan(
     cfg: &Config,
     save_token: bool,
     config_path: &Path,
-) -> Result<(Option<String>, Option<String>, Vec<&'static str>), String> {
+) -> McpPersistPlan {
     let saved_listen = values
         .get("mcp_listen")
         .and_then(toml::Value::as_str)
@@ -1299,8 +1303,10 @@ mod tests {
             ..Config::default()
         };
         // MCP disabled: nothing to carry, even with a stray token around.
-        let mut disabled = Config::default();
-        disabled.mcp_token = "env".into();
+        let disabled = Config {
+            mcp_token: "env".into(),
+            ..Config::default()
+        };
         assert_eq!(
             mcp_persist_plan(&toml::Table::new(), &disabled, false, path).unwrap(),
             (None, None, Vec::new())

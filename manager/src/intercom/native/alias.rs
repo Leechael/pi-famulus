@@ -2722,8 +2722,8 @@ mod tests {
         let (retire_tx, retire_rx) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             let mut peers = peers;
-            for index in 0..BASE_CONNECTION_LIMIT {
-                let (refused, _) = peers[index].0.accept().unwrap();
+            for (index, peer) in peers.iter().enumerate().take(BASE_CONNECTION_LIMIT) {
+                let (refused, _) = peer.0.accept().unwrap();
                 refused
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();

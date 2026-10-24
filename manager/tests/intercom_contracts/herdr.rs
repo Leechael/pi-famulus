@@ -201,7 +201,10 @@ fn herdr_overlay_lists_unbound_pi_and_identified_offline_codex_with_machine_iden
             ("CODEX_APP_SERVER_SOCK", &native_path),
         ],
     );
-    fixture.wait_session("codex/desktop-A");
+    // The herdr overlay publishes a provisional codex/desktop-A row (no
+    // name) before the native provider finishes its first sync; wait for
+    // the enriched native row so the listing below observes discovery.
+    fixture.wait_session_field("codex/desktop-A", "name", "Codex fixture");
     let _plugin = fixture.plugin("local", "idle");
     let mut cli = fixture.connect();
     let listed = cli.ok(json!({"op":"list","all":true}));

@@ -326,6 +326,25 @@ impl Fixture {
             thread::sleep(Duration::from_millis(20));
         }
     }
+    /// Like `wait_session`, but the row must also report `field == value`.
+    /// The herdr overlay can publish a provisional row for a native session
+    /// id before the native provider enriches it, so id presence alone
+    /// races discovery.
+    fn wait_session_field(&self, id: &str, field: &str, value: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self
+            .sessions()
+            .iter()
+            .any(|s| s["id"] == id && s[field].as_str() == Some(value))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "session {id} never reported {field}={value}: {}",
+                self.log()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     fn sessions(&self) -> Vec<Value> {
         let response = self.connect().ok(json!({"op": "list"}));
