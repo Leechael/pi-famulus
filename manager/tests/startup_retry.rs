@@ -8,7 +8,7 @@ use common::*;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::os::unix::net::UnixListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 const S: fn(u64) -> Duration = Duration::from_secs;
@@ -19,7 +19,7 @@ struct CliGuard(Option<Child>);
 impl CliGuard {
     fn spawn(home: &Home, session: &str) -> Self {
         Self(Some(
-            Command::new(BIN)
+            common::famulus_command(BIN)
                 .arg("--home")
                 .arg(&home.path)
                 .args(["kill-session", session])

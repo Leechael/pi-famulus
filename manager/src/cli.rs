@@ -52,8 +52,17 @@ impl Sub {
 // Help sections follow docs/cli.md. `completion` stays with the built-in
 // `help` under Commands: a heading equal to that default title would merge
 // into it, and the ungrouped section is always rendered first.
+// usage flatten requires CommandArgs, which is not implemented for Box<T>.
+#[allow(clippy::large_enum_variant)]
 #[derive(usage::Subcommands)]
 pub(crate) enum Sub {
+    /// Cross-harness and cross-machine agent intercom client.
+    Intercom {
+        #[usage(flatten)]
+        options: crate::intercom::cli::Options,
+        #[usage(subcommand)]
+        action: crate::intercom::cli::Command,
+    },
     /// Read or update runtime daemon configuration.
     #[usage(display_order = 165, help_heading = "Daemon")]
     Config { #[usage(subcommand)] action: ConfigAction },
@@ -110,8 +119,9 @@ pub(crate) enum Sub {
     /// Interactive live view of sessions, agents, tasks, and CPU (like top).
     ///
     /// On a TTY this opens a refreshable dashboard. `--once` or a pipe prints
-    /// the plain-text snapshot instead. 100% NOW equals one CPU core. Never
-    /// starts the daemon.
+    /// the plain-text snapshot instead. 100% NOW equals one CPU core. The
+    /// interactive view supervises the manager like `serve` (starting it if
+    /// none runs); `--once` and `--json` never start it.
     #[usage(display_order = 43, help_heading = "Inspection")]
     Top {
         /// Machine-readable JSON on stdout.
@@ -297,6 +307,9 @@ pub(crate) enum Sub {
     #[usage(display_order = 150, help_heading = "Inspection")]
     Doctor,
     /// Gracefully shut the manager down (kills remaining tasks).
+    ///
+    /// A running `serve` or interactive `top` starts a fresh manager at once;
+    /// stop those first to keep it down.
     #[usage(display_order = 160, help_heading = "Daemon")]
     Shutdown,
     /// Replace the running manager in place with the binary now on disk.
@@ -305,6 +318,14 @@ pub(crate) enum Sub {
     /// does this by itself when that file changes.
     #[usage(display_order = 170, help_heading = "Daemon")]
     Upgrade,
+    /// Keep the manager supervised until this command exits.
+    ///
+    /// Starts the manager if none runs and holds a supervision lease: the
+    /// manager stays up without pi sessions and also runs the Codex adapters
+    /// and MCP (when `mcp_listen` is configured). Exiting, or being killed,
+    /// returns it to its self-managed lifetime. The launchd service runs this.
+    #[usage(display_order = 175, help_heading = "Daemon")]
+    Serve,
     /// Run the manager daemon in the foreground (what clients spawn).
     #[usage(display_order = 180, help_heading = "Daemon")]
     Daemon {

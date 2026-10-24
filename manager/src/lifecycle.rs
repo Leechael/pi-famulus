@@ -253,15 +253,26 @@ pub fn claim_daemon(home: &Path) -> io::Result<Claim> {
                 return Ok(Claim::Acquired(guard));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                note_daemon_lock_would_block(attempt)?;
+                if let Err(error) = note_daemon_lock_would_block(attempt) {
+                    // SAFETY: no guard borrows the lock on this path.
+                    drop(unsafe { Box::from_raw(lock) });
+                    return Err(error);
+                }
                 if attempt + 1 == DAEMON_LOCK_CLAIM_ATTEMPTS {
+                    // SAFETY: no guard borrows the lock on this path; freeing
+                    // it closes the fd so repeated claims do not leak one each.
+                    drop(unsafe { Box::from_raw(lock) });
                     return Ok(Claim::AlreadyRunning {
                         pid: read_pid_file(home).map(|p| p.pid),
                     });
                 }
                 std::thread::sleep(DAEMON_LOCK_RETRY_INTERVAL);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // SAFETY: no guard borrows the lock on this path.
+                drop(unsafe { Box::from_raw(lock) });
+                return Err(e);
+            }
         }
     }
     unreachable!("the bounded daemon-lock loop always returns")
@@ -507,6 +518,46 @@ mod tests {
             std::env::var_os("HOME").map(PathBuf::from).unwrap()
         };
         assert_eq!(resolve_home(None), home.join(".pi").join("agent").join("pi-famulus"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fd_path(fd: i32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    fn fd_path(fd: i32) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|b| *b == 0)?;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end])))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn refused_claims_do_not_leak_the_lock_fd() {
+        let home = temp_home("claim-fd");
+        let Claim::Acquired(_guard) = claim_daemon(&home).unwrap() else {
+            panic!("first claim must acquire");
+        };
+        // Count only descriptors on this home's lock: parallel tests open
+        // and close their own fds, so a process-wide count is noise.
+        let lock = fs::canonicalize(daemon_lock_path(&home)).unwrap();
+        let open_fds = || {
+            std::fs::read_dir("/dev/fd")
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                .filter(|fd| fd_path(*fd).is_some_and(|path| path == lock))
+                .count()
+        };
+        assert!(matches!(claim_daemon(&home).unwrap(), Claim::AlreadyRunning { .. }));
+        let before = open_fds();
+        for _ in 0..3 {
+            assert!(matches!(claim_daemon(&home).unwrap(), Claim::AlreadyRunning { .. }));
+        }
+        assert_eq!(open_fds(), before, "each refused claim leaked a descriptor");
     }
 
     #[test]

@@ -37,6 +37,14 @@ enum CollectorCmd {
     Tails,
 }
 
+/// Ends the supervision lease when the live view exits.
+struct Lease(tokio::task::JoinHandle<()>);
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub fn wants_interactive(json: bool, once: bool) -> bool {
     !json && !once && crate::sys::stdio_interactive()
 }
@@ -52,6 +60,12 @@ pub async fn run(
     state.focus = focus;
     state.message = Some("loading…".into());
 
+    // The live view is `serve` with a screen: it supervises the manager
+    // until it exits.
+    let lease_home = home.to_path_buf();
+    let _lease = Lease(tokio::spawn(async move {
+        client::hold_supervision(&lease_home, |_| {}).await;
+    }));
     let _guard = TerminalGuard::enter().map_err(|e| e.to_string())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).map_err(|e| e.to_string())?;
 

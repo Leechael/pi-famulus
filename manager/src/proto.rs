@@ -272,6 +272,9 @@ pub enum HelloRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestKind {
+    /// Hold a supervision lease for this connection's lifetime (CLI only):
+    /// while `serve` or `top` stays connected the manager is Supervised.
+    Supervise {},
     /// §3.3 hello — must be the first message on a connection.
     Hello {
         client_kind: ClientKind,
@@ -506,6 +509,12 @@ impl ProtoError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: ProtoError,
+}
+
+/// Supervision lease granted; `intercom` describes the messaging bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuperviseOk {
+    pub intercom: String,
 }
 
 /// Empty success payload: renders as just `{"v":1,"id":"...","ok":true}`.

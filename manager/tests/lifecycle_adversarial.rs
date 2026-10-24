@@ -63,7 +63,7 @@ fn spawn_lock_observer_daemon(
     blocked: &std::path::Path,
     barrier: Option<&std::path::Path>,
 ) -> DaemonChild {
-    let mut command = std::process::Command::new(BIN);
+    let mut command = common::famulus_command(BIN);
     command
         .arg("--home")
         .arg(&home.path)
@@ -174,7 +174,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
         let kids: Vec<_> = sessions
             .iter()
             .map(|sid| {
-                std::process::Command::new(BIN)
+                common::famulus_command(BIN)
                     .arg("--home")
                     .arg(&home.path)
                     .args(["start", "--session", sid, "--", "true"])
@@ -358,7 +358,7 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
 
         let kids: Vec<_> = (0..24)
             .map(|_| {
-                std::process::Command::new(BIN)
+                common::famulus_command(BIN)
                     .arg("--home")
                     .arg(&home.path)
                     .arg("ls")
@@ -991,7 +991,7 @@ fn d8e_concurrent_shutdown_waiters_share_the_successor() {
     std::fs::rename(home.sock(), &retiring).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(home.sock()).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut b = CliGuard(Some(std::process::Command::new(BIN)
+    let mut b = CliGuard(Some(common::famulus_command(BIN)
         .arg("--home").arg(&home.path).arg("ls")
         .env("PI_FAMULUS_TEST_CLOCK", "manual")
         .env("PI_FAMULUS_TEST_OWNER", test_owner())
@@ -2192,7 +2192,7 @@ fn t14_tasks_inherit_only_stdio() {
     let home = Home::new("t14");
     let extra = std::fs::File::open("/dev/null").unwrap(); // O_CLOEXEC here
     let raw = extra.as_raw_fd();
-    let mut cmd = std::process::Command::new(BIN);
+    let mut cmd = common::famulus_command(BIN);
     cmd.arg("--home")
         .arg(&home.path)
         .arg("daemon")

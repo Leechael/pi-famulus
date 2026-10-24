@@ -15,6 +15,7 @@ mod gc;
 mod handover;
 mod hosted;
 mod inspect;
+mod intercom;
 mod ipc;
 mod lifecycle;
 mod monitor;
@@ -49,6 +50,9 @@ fn main() {
             let command = args.next().unwrap_or_default();
             std::process::exit(runner::main(std::ffi::OsStr::new(&command)));
         }
+        Some("__intercom_alias") => {
+            std::process::exit(intercom::native::alias_main(args.collect()));
+        }
         Some("__rpc") => {
             std::process::exit(rpc_child::main(args.collect()));
         }
@@ -75,6 +79,9 @@ async fn async_main() {
         None
     };
     let code = match cli.cmd {
+        Sub::Intercom { options, action } => {
+            run_client(intercom::cli::run(home, options, action)).await
+        }
         Sub::Daemon {
             foreground,
             handover,
@@ -243,6 +250,7 @@ async fn async_main() {
         }
         Sub::Doctor => client::cmd_doctor(&home).await,
         Sub::Shutdown => run_client(client::cmd_shutdown(&home)).await,
+        Sub::Serve => run_client(client::cmd_serve(&home)).await,
         Sub::Upgrade => run_client(client::cmd_upgrade(&home)).await,
         Sub::Log {
             task_id,

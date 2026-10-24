@@ -17,6 +17,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/cli.rs` | black box | CLI help/version, completion scripts, strict parser errors (no daemon / no `--home`) |
+| `tests/intercom.rs`, `tests/intercom_contracts/**` | black box, real Unix sockets and WebSockets | opt-in intercom enable/upgrade/shutdown; Pi, Claude and Codex routing; receipts, quotas, receiver deduplication, physical and remote idle; MCP HTTP; CLI, enrollment and relay fallback |
 | `tests/platform.rs` | black box, every OS | the lifecycle cells that hold on every platform, stated with `taskkit` instead of `sh` (the only daemon suite on Windows); see [Windows](#windows) |
 | `tests/resource_bench.rs` | benchmark, opt-in | daemon memory, handles/fds and CPU under idle, spawn, 20 running tasks, churn, leftovers and 128 MiB of output, against budgets; see [Windows](#windows) |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
@@ -94,12 +95,104 @@ each to about 1s (`d5` 1.1s, `d6` 1.0s, `d4` 0.8s). `d3` no longer sleeps a
 fixed 1.5s per round (15.8s → 1.5s). Both modes are stable with 3–4
 concurrent copies of the integration suites.
 
+## Intercom client contracts
+
+The intercom client is native Rust inside the manager. It is opt-in: enabling
+it in a running manager must preserve the manager PID and its existing tasks.
+Without intercom, the normal manager idle lifecycle is unchanged. These tests
+do not require the old Go client as a runtime dependency or start its server.
+
+Run Cargo commands serially when sharing this checkout with another worker:
+
+```bash
+cd manager
+flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 test --locked --test intercom
+flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 test --locked --features test-clock --test intercom
+flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 test --locked --bin pi-famulus intercom::
+flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 clippy --locked --all-targets -- -D warnings
+```
+
+The contract modules cover these boundaries:
+
+- Existing-daemon enable is CLI-only, bounded and idempotent for the same
+  configuration. Shutdown stops intercom admission before task grace; exec
+  upgrade cleans up its helpers and restores the runtime on rollback.
+- Pi publication, inbound RPC, ownership fencing and transport UUIDs are
+  exercised over the real local RPC connection. Unpublishing closes the owner
+  connection; restoring still blocks inbound messages until fresh registration.
+  Receipt tests distinguish physical dispatch, ledger-only read observations,
+  Codex receipt sinks and native callback delivery, including normalized drop
+  reasons, canonical-terminal retries and admission-identity commit fencing.
+- Native alias tests check actual child PIDs, kernel incarnation tokens, socket
+  device/inode identity and publication generations. They include immediate
+  crash reaping, recovery from an owned previous incarnation, live successors,
+  failed namespace binds and capability revocation while a child is stopped.
+  A stopped listener with a genuinely full socket backlog must not prevent
+  production reconciliation from being cancelled during shutdown.
+- Physical native idle requires a dedicated listener, write shutdown and full
+  peer EOF. Tests preserve write ordering, cancellation debt, early notices and
+  the real 32/32/1024 limits. Remote idle tests cover authenticated tuples,
+  notice-before-ACK ordering, replay, renewal, expiry and late replies.
+- The full quota tests use 1025 incoming native deliveries without callbacks,
+  verify that the independent outgoing pool remains usable, and then exercise
+  both registered and registry-absent native callbacks. Receiver deduplication
+  exercises all 4096 successful entries, hot-entry refresh and actual eviction;
+  capacities are not reduced for tests.
+- Codex tests use real Unix WebSocket peers, including initialization,
+  notifications, pagination, busy ownership, reconnect generations and uncertain
+  writes. Desktop fallback is exercised after real shared endpoint discovery,
+  with pre-turn failures distinguished from mutations already written on the
+  shared connection. MCP tests use raw modern and legacy HTTP requests,
+  stateless sessions, authentication, framing and tool calls.
+- CLI tests include offline help/status, startup-cached online versions with
+  live adapter diagnostics, the actual bound MCP URL, enrollment and secret
+  redaction, TLS verification, and authenticated one-shot relay fallback when
+  no daemon is running. Transport tests observe real WebSocket pings, read-idle
+  disconnects and authenticated retry delays. Webhook tests check signed payloads,
+  retry timing and HTTP forwarding. Probe processes must not block normal manager
+  work and must be killed on shutdown.
+
+Linux verification snapshot (2026-10-22): the complete manager suites reported
+668 passed without `test-clock` and 689 with it, with two existing ignored
+helpers in each mode. The intercom integration binary accounted for 141 and
+150 of those tests respectively. Both all-target Clippy configurations ran with
+`-D warnings`; the normal build and six authenticated no-daemon WebSocket
+oracles also completed. The opt-in resource benchmark was not enabled.
+
+Validation boundaries:
+
+- Linux fixtures use real processes, Unix sockets, WebSockets and physical write
+  backpressure. They do not establish compatibility with an installed Claude
+  CLI, a real Codex Desktop application, or macOS `launchctl`.
+- macOS service plist/environment logic has portable unit coverage; actual
+  service installation, native adapter smoke tests and platform compilation
+  require the corresponding host and SDK. A portable ownership test runs the
+  production manager in an isolated subprocess without intercom and verifies
+  that service preflight refuses it without replacing its PID or enabling it.
+  With the intercom socket absent, isolated launcher reports distinguish an
+  unrelated live PID from the actual manager socket's OS peer PID, preserving
+  restart of an owned service without trusting the informational PID file.
+  Linux cross-check attempts stopped
+  in the `blake3`/`ring` native build toolchains, before complete Rust cfg checks.
+  No Windows native-adapter support is added by this migration.
+- Database-backed Herdr integration requires `INTERCOM_TEST_DATABASE_URL`;
+  without it, protocol fixtures and unit tests are not evidence of a real
+  database integration run.
+- Inspection CLI consumers remain available, but the old client's unwired
+  inspection HTTP/SSE producer is not introduced here. There is no Web UI.
+- This checkout has no `prek.toml` or `.pre-commit-config.yaml`; `prek` cannot run
+  repository hooks until such a configuration exists. This is separate from
+  Cargo and contract test results.
+
 ## Time in tests
 
-The daemon's own timers are the 5s idle grace, the 2s kill grace (stop
+The manager lifecycle timers are the 5s idle grace, the 2s kill grace (stop
 reaper and graceful shutdown) and the 500ms leftover-group poll (now only a
-fallback, for a runner that died without reporting). Those are the only
-timers the manual clock covers; they go through `src/clock.rs`. The task
+fallback, for a runner that died without reporting). They go through
+`src/clock.rs`; the opt-in intercom runtime also uses this clock for delivery
+expiry, idle subscription TTLs, receipt settle windows, relay heartbeats/read-idle
+expiry and reconnect scheduling. Physical socket write deadlines remain real-time
+I/O bounds. The task
 runner's own timers (the 2s lifeline grace and the guardian poll — 100ms
 for the first second, then 1s backoff) run in the runner process on real
 time via `std::thread::sleep` and are never advanced by the manual clock.
@@ -108,8 +201,9 @@ cargo feature **and** `PI_FAMULUS_TEST_CLOCK=manual` in the daemon's environment
 the daemon's timers run on a manual clock instead:
 
 - Virtual time starts at 0 and moves only on `clock_advance {ms}`.
-  `clock_status` lists the pending timers by label (`idle`, `kill-grace`,
-  `shutdown-grace`, `group-poll`) and time left.
+  `clock_status` lists the pending timers and time left, including lifecycle
+  labels (`idle`, `kill-grace`, `shutdown-grace`, `group-poll`) and any timers
+  armed by an enabled intercom runtime.
 - Both requests exist only under the feature. They are sent as the first
   frame of a fresh connection, without hello, so they never count as an
   active connection and never cancel the idle timer.

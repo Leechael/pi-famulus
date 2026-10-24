@@ -1,17 +1,17 @@
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 
 fn run(args: &[&str]) -> Output {
-    Command::new(BIN)
+    famulus_command(BIN)
         .args(args)
         .output()
         .expect("run pi-famulus")
 }
 
 fn run_with_home(home: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(BIN)
+    famulus_command(BIN)
         .arg("--home")
         .arg(home)
         .args(args)
@@ -46,7 +46,7 @@ fn concurrent_capacity_config_sets_preserve_fields_and_valid_json() {
     let workers: Vec<_> = (1..=16).map(|n| {
         let home = home.clone();
         std::thread::spawn(move || {
-            let mut command = Command::new(BIN);
+            let mut command = famulus_command(BIN);
             command
                 .arg("--home")
                 .arg(&home)
@@ -253,7 +253,7 @@ fn doctor_resolves_the_new_home_and_environment_contract() {
     let env_home = root.join("env");
     let flag_home = root.join("flag");
     let doctor = |home_env: Option<&str>, flag: bool| {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = famulus_command(BIN);
         // resolve_home uses USERPROFILE on Windows, HOME on Unix.
         cmd.env("HOME", &root)
             .env("USERPROFILE", &root)
@@ -299,4 +299,13 @@ fn unknown_flags_remain_errors() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("--definitely-unknown"));
+}
+
+/// The manager binary without the messaging bridge: these tests do not use
+/// it, and it would bind the shared default intercom socket and publish into
+/// the real `~/.claude/sessions`.
+fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    command.env("PI_FAMULUS_NO_INTERCOM", "1");
+    command
 }

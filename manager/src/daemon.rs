@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -87,6 +87,8 @@ pub struct ConnHandle {
     /// Its writer task, aborted when an upgrade cannot wait for it to flush.
     #[cfg_attr(windows, allow(dead_code))]
     pub writer: tokio::task::AbortHandle,
+    /// Holds a supervision lease (`serve` / `top`) until it disconnects.
+    pub supervisor: bool,
 }
 
 pub struct SessionEntry {
@@ -140,6 +142,12 @@ struct AgentGrant {
     request_id: String,
     tx: OutTx,
     queued_behind: Option<u64>,
+}
+
+/// Asks the accept loop to make the messaging bridge match the current
+/// leases (Supervised iff some connection holds one).
+struct SupervisionRequest {
+    reply: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 pub struct DaemonState {
@@ -197,6 +205,8 @@ pub struct DaemonState {
     /// Hosted `pi --mode rpc` subagents.
     pub hosted: crate::hosted::Hosted,
     agent_notices: Option<mpsc::UnboundedReceiver<crate::hosted::Notice>>,
+    supervision: mpsc::UnboundedSender<SupervisionRequest>,
+    supervision_rx: Option<mpsc::UnboundedReceiver<SupervisionRequest>>,
 }
 
 /// Bound on remembered start keys.
@@ -211,6 +221,7 @@ const PENDING_AGENT_REQUEST_IDS_MAX: usize = 8;
 impl DaemonState {
     fn new(home: PathBuf, registry: Registry, foreground: bool) -> DaemonState {
         let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let (supervision, supervision_rx) = mpsc::unbounded_channel();
         let hosted_home = home.clone();
         DaemonState {
             home,
@@ -243,6 +254,8 @@ impl DaemonState {
             agent_budget: Arc::new(Mutex::new(crate::capacity::MaxAgentsCache::default())),
             hosted: crate::hosted::Hosted::new(hosted_home, notice_tx),
             agent_notices: Some(notice_rx),
+            supervision,
+            supervision_rx: Some(supervision_rx),
         }
     }
 }
@@ -387,6 +400,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     for e in entries {
         registry.tasks.insert(e.record.task_id.clone(), e);
     }
+    crate::intercom::carry_dedup(snap.intercom_dedup.clone());
     let mut st = DaemonState::new(home.clone(), registry, snap.foreground);
     st.started_at_ms = snap.started_at_ms;
     st.generation = snap.generation;
@@ -513,7 +527,8 @@ fn reap_disconnected_agent_permits(st: &mut DaemonState) {
         .collect();
     // A permit carries its work kind, so removing its owner also removes that
     // kind's usage. Do not reap a lease whose session reconnected during grace.
-    st.agent_permits.retain(|(sid, _), _| connected.contains(sid));
+    st.agent_permits
+        .retain(|(sid, _), _| connected.contains(sid));
     st.pending_agents
         .retain(|pending| connected.contains(&pending.session_id));
     st.cancelled_acquires
@@ -545,10 +560,41 @@ fn ctrl_c_or_pending(
     }
 }
 
+/// Starts the messaging bridge every manager runs; a failure leaves the
+/// manager (and its tasks) running without messaging.
+async fn start_bridge(
+    home: &Path,
+    clock: crate::clock::Clock,
+) -> (Option<crate::intercom::Running>, Option<String>) {
+    let started = match crate::intercom::bridge_config() {
+        Ok(config) => crate::intercom::start(config, clock).await,
+        Err(error) => Err(error),
+    };
+    match started {
+        Ok(running) => (Some(running), None),
+        Err(error) => {
+            lifecycle::log_line(
+                home,
+                &format!("intercom: {error}; continuing without messaging"),
+            );
+            (None, Some(error))
+        }
+    }
+}
+
 /// The accept loop, shared by a fresh daemon and one restored after an
 /// in-place upgrade. Also runs the upgrade itself when asked.
-async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
+async fn serve(
+    state: Shared,
+    listener: crate::ipc::Listener,
+    daemon_lock: lifecycle::DaemonLockGuard,
+) -> i32 {
     let home = state.lock().unwrap().home.clone();
+
+    let intercom_clock = state.lock().unwrap().clock.clone();
+    // Restarted after a failed in-place upgrade, which only Unix performs.
+    #[cfg_attr(windows, allow(unused_mut))]
+    let (mut intercom, mut bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
@@ -563,12 +609,17 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
     // spawn per §3.1, so this never fires for a healthy startup).
     maybe_arm_idle_timer(&state);
 
-    let (shutdown_notify, upgrade_notify) = {
-        let st = state.lock().unwrap();
-        (st.shutdown_notify.clone(), st.upgrade_notify.clone())
+    let (shutdown_notify, upgrade_notify, mut supervision_rx) = {
+        let mut st = state.lock().unwrap();
+        (
+            st.shutdown_notify.clone(),
+            st.upgrade_notify.clone(),
+            st.supervision_rx.take().expect("supervision receiver"),
+        )
     };
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     #[cfg(unix)]
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
     #[cfg(windows)]
@@ -592,13 +643,26 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
+            Some(request) = supervision_rx.recv(), if shutdown_task.is_none() => {
+                let status = apply_supervision(&state, &mut intercom, &mut bridge_error).await;
+                if let Some(reply) = request.reply {
+                    let _ = reply.send(status);
+                }
+            },
             _ = upgrade_notify.notified(), if shutdown_task.is_none() => {
                 #[cfg(unix)]
                 {
                     let ready = state.lock().unwrap().upgrade_ready.take();
                     if let Some(ready) = ready {
                         // Returns only if the upgrade did not happen.
+                        if let Some(runtime) = intercom.take() {
+                            crate::intercom::carry_dedup(runtime.shutdown_for_handover().await);
+                        }
                         let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
+                        if intercom.is_none() {
+                            (intercom, bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
+                            apply_supervision(&state, &mut intercom, &mut bridge_error).await;
+                        }
                     }
                 }
                 #[cfg(windows)]
@@ -614,7 +678,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }
             _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 #[cfg(unix)]
@@ -633,7 +697,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, if cfg!(windows) { "received Ctrl-C" } else { "received SIGTERM" });
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 #[cfg(unix)]
@@ -649,7 +713,7 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGINT");
-                shutdown_task = Some(begin_shutdown(&state));
+                shutdown_task = Some(begin_shutdown(&state, intercom.as_ref()));
             }
             _ = async {
                 match shutdown_task.as_mut() {
@@ -658,6 +722,9 @@ async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifec
                 }
             } => break,
         }
+    }
+    if let Some(intercom) = intercom {
+        intercom.shutdown().await;
     }
     live_cpu_sampler.abort();
     drop(daemon_lock);
@@ -703,7 +770,9 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
             }
             let mut st = state.lock().unwrap();
             for (id, reading) in readings {
-                let Some(entry) = st.registry.tasks.get_mut(&id) else { continue };
+                let Some(entry) = st.registry.tasks.get_mut(&id) else {
+                    continue;
+                };
                 if entry.record.status != TaskStatus::Running {
                     continue;
                 }
@@ -713,11 +782,17 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
     })
 }
 
-fn apply_live_cpu_sample(record: &mut TaskRecord, reading: Option<task::LiveCpuReading>, sampled_at: u64) {
+fn apply_live_cpu_sample(
+    record: &mut TaskRecord,
+    reading: Option<task::LiveCpuReading>,
+    sampled_at: u64,
+) {
     match reading {
         Some(reading) => {
-            record.live_cpu_user_ms = Some(record.live_cpu_user_ms.unwrap_or(0).max(reading.user_ms));
-            record.live_cpu_sys_ms = Some(record.live_cpu_sys_ms.unwrap_or(0).max(reading.system_ms));
+            record.live_cpu_user_ms =
+                Some(record.live_cpu_user_ms.unwrap_or(0).max(reading.user_ms));
+            record.live_cpu_sys_ms =
+                Some(record.live_cpu_sys_ms.unwrap_or(0).max(reading.system_ms));
             record.live_cpu_percent = reading.percent;
             record.live_cpu_sampled_at = Some(sampled_at);
             record.live_cpu_stale = false;
@@ -776,17 +851,28 @@ fn spawn_exe_watch(state: &Shared) {
 
 /// Mark the manager as shutting down (new hellos are refused) and run the
 /// graceful shutdown as its own task.
-fn begin_shutdown(state: &Shared) -> tokio::task::JoinHandle<()> {
+/// Intercom drains first: idle watchers learn `unavailable` while the native
+/// bridges and the tasks that may be watching are still alive.
+fn begin_shutdown(
+    state: &Shared,
+    intercom: Option<&crate::intercom::Running>,
+) -> tokio::task::JoinHandle<()> {
     state.lock().unwrap().shutdown = true;
     let s = state.clone();
-    tokio::spawn(async move { graceful_shutdown(&s).await })
+    let intercom = intercom.map(|running| running.runtime.clone());
+    tokio::spawn(async move {
+        if let Some(runtime) = intercom {
+            runtime.drain().await;
+        }
+        graceful_shutdown(&s).await
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Connection handling
 // ---------------------------------------------------------------------------
 
-fn valid_session_id(s: &str) -> bool {
+pub(crate) fn valid_session_id(s: &str) -> bool {
     // Session ids become directory names; keep them path-safe.
     !s.is_empty()
         && s.len() <= 128
@@ -956,19 +1042,19 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
                 _ => ConnRole::Parent,
             };
             (
-            client_kind,
-            session_id,
-            pi_pid,
-            HelloInfo {
-                cwd,
-                extension_version,
-                protocol,
-                role,
-                child_id,
-                token,
-                session_file,
-                pi_version,
-            },
+                client_kind,
+                session_id,
+                pi_pid,
+                HelloInfo {
+                    cwd,
+                    extension_version,
+                    protocol,
+                    role,
+                    child_id,
+                    token,
+                    session_file,
+                    pi_version,
+                },
             )
         }
         _ => {
@@ -1035,13 +1121,15 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
     let (started_at, hosted_notice) = {
         let st = state.lock().unwrap();
         let notice = if notice_role != ConnRole::Child {
-            st.hosted.lookup(notice_session.as_deref(), notice_file.as_deref())
+            st.hosted
+                .lookup(notice_session.as_deref(), notice_file.as_deref())
         } else {
             None
         };
         if notice_role == ConnRole::Parent {
             if let Some(file) = notice_file.as_deref() {
-                st.hosted.claim_owner(notice_session.as_deref().unwrap_or(""), Some(file));
+                st.hosted
+                    .claim_owner(notice_session.as_deref().unwrap_or(""), Some(file));
             }
         }
         (st.started_at_ms, notice)
@@ -1225,6 +1313,7 @@ fn register_conn(
             die: die.clone(),
             written: written.clone(),
             writer: writer.clone(),
+            supervisor: false,
         },
     );
     Ok(conn_id)
@@ -1232,6 +1321,9 @@ fn register_conn(
 
 fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     if let Some(h) = st.conns.remove(&conn_id) {
+        if h.supervisor {
+            let _ = st.supervision.send(SupervisionRequest { reply: None });
+        }
         st.hosted.drop_conn(conn_id);
         if h.role != ConnRole::Child {
             if let Some(sid) = h.session_id.clone() {
@@ -1532,7 +1624,10 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
     );
 }
 
-fn release_settled_sibling_permit(st: &mut DaemonState, notice: &crate::hosted::Notice) -> Vec<AgentGrant> {
+fn release_settled_sibling_permit(
+    st: &mut DaemonState,
+    notice: &crate::hosted::Notice,
+) -> Vec<AgentGrant> {
     let activity = match &notice.event {
         EventKind::AgentState { activity, .. } => activity.as_str(),
         _ => return Vec::new(),
@@ -1550,12 +1645,17 @@ fn release_settled_sibling_permit(st: &mut DaemonState, notice: &crate::hosted::
         return Vec::new();
     }
     // A parked respawn emits idle before the sibling prompt starts a turn.
-    let release = st.agent_permits.get(&key).is_some_and(|permit| permit.release_on_settle && permit.turn_started);
+    let release = st
+        .agent_permits
+        .get(&key)
+        .is_some_and(|permit| permit.release_on_settle && permit.turn_started);
     if !release {
         return Vec::new();
     }
     st.agent_permits.remove(&key);
-    st.undelivered_agent_grants.retain(|(owner, _), grant| owner != &notice.parent_session || grant.child_id != notice.child_id);
+    st.undelivered_agent_grants.retain(|(owner, _), grant| {
+        owner != &notice.parent_session || grant.child_id != notice.child_id
+    });
     wake_pending(st)
 }
 
@@ -1566,26 +1666,26 @@ fn start_agent_loops(state: &Shared) {
         tokio::spawn(async move {
             while let Some(notice) = rx.recv().await {
                 let wake = {
-                let mut st = state.lock().unwrap();
-                let wake = release_settled_sibling_permit(&mut st, &notice);
-                let mut targets = Vec::new();
-                if let Some(session) = st.sessions.get(&notice.parent_session) {
-                    if let Some(conn_id) = session.conn_id {
+                    let mut st = state.lock().unwrap();
+                    let wake = release_settled_sibling_permit(&mut st, &notice);
+                    let mut targets = Vec::new();
+                    if let Some(session) = st.sessions.get(&notice.parent_session) {
+                        if let Some(conn_id) = session.conn_id {
+                            targets.push(conn_id);
+                        }
+                    }
+                    if let Some(conn_id) = st.hosted.child_of_conn(&notice.child_id) {
                         targets.push(conn_id);
                     }
-                }
-                if let Some(conn_id) = st.hosted.child_of_conn(&notice.child_id) {
-                    targets.push(conn_id);
-                }
-                targets.extend(st.hosted.watcher_ids(&notice.child_id));
-                targets.sort_unstable();
-                targets.dedup();
-                for conn_id in targets {
-                    if let Some(conn) = st.conns.get(&conn_id) {
-                        let _ = conn.tx.try_send(encode_event(&notice.event));
+                    targets.extend(st.hosted.watcher_ids(&notice.child_id));
+                    targets.sort_unstable();
+                    targets.dedup();
+                    for conn_id in targets {
+                        if let Some(conn) = st.conns.get(&conn_id) {
+                            let _ = conn.tx.try_send(encode_event(&notice.event));
+                        }
                     }
-                }
-                wake
+                    wake
                 };
                 send_agent_grants(&state, wake);
                 if matches!(
@@ -1601,7 +1701,9 @@ fn start_agent_loops(state: &Shared) {
     tokio::spawn(async move {
         loop {
             let clock = state.lock().unwrap().clock.clone();
-            clock.sleep("agent-retention", Duration::from_millis(250)).await;
+            clock
+                .sleep("agent-retention", Duration::from_millis(250))
+                .await;
             if state.lock().unwrap().shutdown {
                 break;
             }
@@ -1616,7 +1718,12 @@ pub fn maybe_arm_idle_timer(state: &Shared) {
     let mut st = state.lock().unwrap();
     let session_conn = st.conns.values().any(|c| c.role != ConnRole::Child);
     let warm = st.hosted.warm_count() > 0;
-    if st.shutdown || st.upgrading || st.hold_idle || session_conn || warm || st.idle_timer.is_some()
+    if st.shutdown
+        || st.upgrading
+        || st.hold_idle
+        || session_conn
+        || warm
+        || st.idle_timer.is_some()
     {
         return;
     }
@@ -1779,25 +1886,58 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         RequestKind::ReleaseAgent { child_id } => {
             respond(&tx, &id, handle_release_agent(&state, conn_id, &child_id)).await;
         }
-        RequestKind::AgentSpawn { child_id, run_id, name, argv, cwd, env } => {
-            match parent_session(&state, conn_id) {
-                Ok(parent) => {
-                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
-                    respond(&tx, &id, hosted.spawn(&parent, &child_id, &run_id, &name, argv, cwd, env).await).await
-                }
-                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+        RequestKind::AgentSpawn {
+            child_id,
+            run_id,
+            name,
+            argv,
+            cwd,
+            env,
+        } => match parent_session(&state, conn_id) {
+            Ok(parent) => {
+                let hosted = {
+                    let st = state.lock().unwrap();
+                    st.hosted.clone()
+                };
+                respond(
+                    &tx,
+                    &id,
+                    hosted
+                        .spawn(&parent, &child_id, &run_id, &name, argv, cwd, env)
+                        .await,
+                )
+                .await
             }
-        }
-        RequestKind::AgentInput { child_id, op, text, source, since } => {
-            match authorize_agent(&state, conn_id, &child_id, true) {
-                Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
-                Ok(()) => {
-                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
-                    let source = if source.is_empty() { "parent".into() } else { source };
-                    respond(&tx, &id, hosted.rpc(&child_id, &op, &text, &source, since.as_deref()).await).await
-                }
+            Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+        },
+        RequestKind::AgentInput {
+            child_id,
+            op,
+            text,
+            source,
+            since,
+        } => match authorize_agent(&state, conn_id, &child_id, true) {
+            Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
+            Ok(()) => {
+                let hosted = {
+                    let st = state.lock().unwrap();
+                    st.hosted.clone()
+                };
+                let source = if source.is_empty() {
+                    "parent".into()
+                } else {
+                    source
+                };
+                respond(
+                    &tx,
+                    &id,
+                    hosted
+                        .rpc(&child_id, &op, &text, &source, since.as_deref())
+                        .await,
+                )
+                .await
             }
-        }
+        },
         RequestKind::AgentWatch { child_id } => {
             let result = authorize_agent(&state, conn_id, &child_id, true).and_then(|()| {
                 let st = state.lock().unwrap();
@@ -1806,41 +1946,97 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             respond(&tx, &id, result).await
         }
         RequestKind::AgentUnwatch { child_id } => {
-            { let st = state.lock().unwrap(); st.hosted.unwatch(&child_id, conn_id); }
+            {
+                let st = state.lock().unwrap();
+                st.hosted.unwatch(&child_id, conn_id);
+            }
             respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
         }
-        RequestKind::AgentComms { request_id, reason, message } => {
+        RequestKind::AgentComms {
+            request_id,
+            reason,
+            message,
+        } => {
             let (child_id, hosted) = {
                 let st = state.lock().unwrap();
-                (st.conns.get(&conn_id).and_then(|c| c.child_id.clone()).unwrap_or_default(), st.hosted.clone())
+                (
+                    st.conns
+                        .get(&conn_id)
+                        .and_then(|c| c.child_id.clone())
+                        .unwrap_or_default(),
+                    st.hosted.clone(),
+                )
             };
-            match hosted.comms(&child_id, &request_id, &reason, &message).await {
-                Ok(reply) => respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "reply": reply }))).await,
+            match hosted
+                .comms(&child_id, &request_id, &reason, &message)
+                .await
+            {
+                Ok(reply) => {
+                    respond(
+                        &tx,
+                        &id,
+                        Ok::<_, ProtoError>(serde_json::json!({ "reply": reply })),
+                    )
+                    .await
+                }
                 Err(e) => respond(&tx, &id, Err::<serde_json::Value, _>(e)).await,
             }
         }
-        RequestKind::AgentCommsReply { request_id, child_id, message } => {
+        RequestKind::AgentCommsReply {
+            request_id,
+            child_id,
+            message,
+        } => {
             let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
                 let st = state.lock().unwrap();
-                st.hosted.comms_reply(&request_id, &child_id, &message).map(|()| UnitOk {})
+                st.hosted
+                    .comms_reply(&request_id, &child_id, &message)
+                    .map(|()| UnitOk {})
             });
             respond(&tx, &id, result).await
         }
-        RequestKind::AgentUiResponse { child_id, rpc_id, value, cancelled } => {
+        RequestKind::AgentUiResponse {
+            child_id,
+            rpc_id,
+            value,
+            cancelled,
+        } => {
             let result = authorize_agent(&state, conn_id, &child_id, false).and_then(|()| {
                 let st = state.lock().unwrap();
-                st.hosted.ui_response(&child_id, &rpc_id, &value, cancelled).map(|()| UnitOk {})
+                st.hosted
+                    .ui_response(&child_id, &rpc_id, &value, cancelled)
+                    .map(|()| UnitOk {})
             });
             respond(&tx, &id, result).await
         }
-        RequestKind::HostedLookup { session_id, session_file } => {
-            let notice = { let st = state.lock().unwrap(); st.hosted.lookup(session_id.as_deref(), session_file.as_deref()) };
-            respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "hosted": notice }))).await
+        RequestKind::HostedLookup {
+            session_id,
+            session_file,
+        } => {
+            let notice = {
+                let st = state.lock().unwrap();
+                st.hosted
+                    .lookup(session_id.as_deref(), session_file.as_deref())
+            };
+            respond(
+                &tx,
+                &id,
+                Ok::<_, ProtoError>(serde_json::json!({ "hosted": notice })),
+            )
+            .await
         }
-        RequestKind::AgentCache { expires_at, tier, lifetime_ms } => {
+        RequestKind::AgentCache {
+            expires_at,
+            tier,
+            lifetime_ms,
+        } => {
             {
                 let st = state.lock().unwrap();
-                let child_id = st.conns.get(&conn_id).and_then(|c| c.child_id.clone()).unwrap_or_default();
+                let child_id = st
+                    .conns
+                    .get(&conn_id)
+                    .and_then(|c| c.child_id.clone())
+                    .unwrap_or_default();
                 st.hosted.cache(&child_id, expires_at, tier, lifetime_ms);
             }
             respond(&tx, &id, Ok::<_, ProtoError>(UnitOk {})).await
@@ -1856,8 +2052,16 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             match authorize_agent(&state, conn_id, &child_id, false) {
                 Err(e) => respond(&tx, &id, Err::<UnitOk, _>(e)).await,
                 Ok(()) => {
-                    let hosted = { let st = state.lock().unwrap(); st.hosted.clone() };
-                    respond(&tx, &id, hosted.takeover(&child_id).await.map(|()| UnitOk {})).await
+                    let hosted = {
+                        let st = state.lock().unwrap();
+                        st.hosted.clone()
+                    };
+                    respond(
+                        &tx,
+                        &id,
+                        hosted.takeover(&child_id).await.map(|()| UnitOk {}),
+                    )
+                    .await
                 }
             }
         }
@@ -1872,10 +2076,26 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
                 )
             };
             if !is_child {
-                respond(&tx, &id, Err::<serde_json::Value, _>(ProtoError::new(E_FORBIDDEN, "agent_peers is for a hosted child"))).await;
+                respond(
+                    &tx,
+                    &id,
+                    Err::<serde_json::Value, _>(ProtoError::new(
+                        E_FORBIDDEN,
+                        "agent_peers is for a hosted child",
+                    )),
+                )
+                .await;
             } else {
-                respond(&tx, &id, Ok::<_, ProtoError>(serde_json::json!({ "peers": hosted.peers(&child_id) }))).await;
+                respond(
+                    &tx,
+                    &id,
+                    Ok::<_, ProtoError>(serde_json::json!({ "peers": hosted.peers(&child_id) })),
+                )
+                .await;
             }
+        }
+        RequestKind::Supervise {} => {
+            respond(&tx, &id, handle_supervise(&state, conn_id).await).await;
         }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
@@ -1930,9 +2150,17 @@ fn handle_clock(
     })
 }
 
-fn authorize_agent(state: &Shared, conn_id: u64, child_id: &str, sibling_input: bool) -> Result<(), ProtoError> {
+fn authorize_agent(
+    state: &Shared,
+    conn_id: u64,
+    child_id: &str,
+    sibling_input: bool,
+) -> Result<(), ProtoError> {
     let st = state.lock().unwrap();
-    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    let conn = st
+        .conns
+        .get(&conn_id)
+        .ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
     let role = match conn.role {
         ConnRole::Cli => "cli",
         ConnRole::Child => "child",
@@ -1940,16 +2168,33 @@ fn authorize_agent(state: &Shared, conn_id: u64, child_id: &str, sibling_input: 
     };
     let session = conn.session_id.clone();
     let caller = conn.child_id.clone();
-    st.hosted.authorize(role, session.as_deref(), caller.as_deref(), child_id, sibling_input)
+    st.hosted.authorize(
+        role,
+        session.as_deref(),
+        caller.as_deref(),
+        child_id,
+        sibling_input,
+    )
 }
 
 fn parent_session(state: &Shared, conn_id: u64) -> Result<String, ProtoError> {
     let st = state.lock().unwrap();
-    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+    let conn = st
+        .conns
+        .get(&conn_id)
+        .ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
     if conn.role == ConnRole::Child {
-        return Err(ProtoError::new(E_FORBIDDEN, "a hosted child cannot spawn subagents"));
+        return Err(ProtoError::new(
+            E_FORBIDDEN,
+            "a hosted child cannot spawn subagents",
+        ));
     }
-    conn.session_id.clone().ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "agent_spawn requires an extension session"))
+    conn.session_id.clone().ok_or_else(|| {
+        ProtoError::new(
+            E_SESSION_REQUIRED,
+            "agent_spawn requires an extension session",
+        )
+    })
 }
 
 async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoError>) {
@@ -2650,11 +2895,7 @@ fn handle_watch_on(
     Ok(())
 }
 
-fn handle_unwatch(
-    state: &Shared,
-    conn_id: u64,
-    task_id: &str,
-) -> Result<UnitOk, ProtoError> {
+fn handle_unwatch(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, ProtoError> {
     let mut st = state.lock().unwrap();
     let acc = access_for(&st, conn_id);
     let e = st.registry.visible_mut(task_id, &acc)?;
@@ -2793,17 +3034,33 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
 /// Parent acquires use the connection's session. A hosted child acquires for a
 /// same-run sibling under that sibling's parent session, so the turn shares
 /// the machine permit with the parent.
-fn admission_owner(st: &DaemonState, conn_id: u64, child_id: &str) -> Result<(String, u32, bool), ProtoError> {
-    let conn = st.conns.get(&conn_id).ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+fn admission_owner(
+    st: &DaemonState,
+    conn_id: u64,
+    child_id: &str,
+) -> Result<(String, u32, bool), ProtoError> {
+    let conn = st
+        .conns
+        .get(&conn_id)
+        .ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
     let from_child = conn.role == ConnRole::Child;
     let sid = if from_child {
         let caller = conn.child_id.clone().unwrap_or_default();
-        st.hosted.authorize("child", None, Some(&caller), child_id, true)?;
-        st.hosted.parent_of(child_id).ok_or_else(|| ProtoError::new(E_NOT_FOUND, "unknown child"))?
+        st.hosted
+            .authorize("child", None, Some(&caller), child_id, true)?;
+        st.hosted
+            .parent_of(child_id)
+            .ok_or_else(|| ProtoError::new(E_NOT_FOUND, "unknown child"))?
     } else {
-        conn.session_id.clone().ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?
+        conn.session_id
+            .clone()
+            .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "extension session required"))?
     };
-    let protocol = st.sessions.get(&sid).and_then(|s| s.protocol).unwrap_or(if from_child { 6 } else { 0 });
+    let protocol = st
+        .sessions
+        .get(&sid)
+        .and_then(|s| s.protocol)
+        .unwrap_or(if from_child { 6 } else { 0 });
     Ok((sid, protocol, from_child))
 }
 
@@ -2819,16 +3076,24 @@ async fn handle_acquire_agent(
     let session = {
         let st = state.lock().unwrap();
         admission_owner(&st, conn_id, child_id).map(|(sid, protocol, from_child)| {
-            (sid, protocol, st.home.clone(), st.agent_budget.clone(), st.agent_admission.clone(), from_child)
+            (
+                sid,
+                protocol,
+                st.home.clone(),
+                st.agent_budget.clone(),
+                st.agent_admission.clone(),
+                from_child,
+            )
         })
     };
-    let (sid, client_protocol, home, budget_cache, admission_lock, release_on_settle) = match session {
-        Ok(parts) => parts,
-        Err(error) => {
-            respond::<AgentAdmissionOk>(tx, request_id, Err(error)).await;
-            return;
-        }
-    };
+    let (sid, client_protocol, home, budget_cache, admission_lock, release_on_settle) =
+        match session {
+            Ok(parts) => parts,
+            Err(error) => {
+                respond::<AgentAdmissionOk>(tx, request_id, Err(error)).await;
+                return;
+            }
+        };
     // The #46 global budget cache remains authoritative for the machine-wide
     // cap. Serialize its refresh and this state commit so an older read cannot
     // overtake a newer admission; config I/O remains outside `state`.
@@ -2847,8 +3112,7 @@ async fn handle_acquire_agent(
                 conn.session_id.as_deref() == Some(sid.as_str())
             }
         });
-        if !still_here
-        {
+        if !still_here {
             (
                 Some(Err(ProtoError::new(
                     E_SESSION_REQUIRED,
@@ -2978,9 +3242,9 @@ async fn handle_acquire_agent(
                                     );
                                     (
                                         Some(Ok(AgentAdmissionOk {
-                                        granted: true,
-                                        rejection: None,
-                                        queued_behind: None,
+                                            granted: true,
+                                            rejection: None,
+                                            queued_behind: None,
                                         })),
                                         wake,
                                     )
@@ -2996,9 +3260,9 @@ async fn handle_acquire_agent(
                                     {
                                         (
                                             Some(Ok(AgentAdmissionOk {
-                                            granted: false,
-                                            rejection: Some("capacity_queue_full".into()),
-                                            queued_behind: None,
+                                                granted: false,
+                                                rejection: Some("capacity_queue_full".into()),
+                                                queued_behind: None,
                                             })),
                                             wake,
                                         )
@@ -3216,7 +3480,12 @@ fn service_unconfirmed_agent_grants(state: &Shared, conn_id: u64, tx: &OutTx) ->
                 }
             })
             .map(|((owner, request_id), grant)| {
-                (owner.clone(), request_id.clone(), grant.child_id.clone(), grant.queued_behind)
+                (
+                    owner.clone(),
+                    request_id.clone(),
+                    grant.child_id.clone(),
+                    grant.queued_behind,
+                )
             })
             .collect::<Vec<_>>()
     };
@@ -3352,6 +3621,114 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
     })
 }
 
+async fn handle_supervise(state: &Shared, conn_id: u64) -> Result<SuperviseOk, ProtoError> {
+    let sender = {
+        let mut st = state.lock().unwrap();
+        if st.shutdown || st.upgrading {
+            return Err(ProtoError::new(
+                E_INTERNAL,
+                "manager is shutting down or upgrading",
+            ));
+        }
+        let Some(conn) = st
+            .conns
+            .get_mut(&conn_id)
+            .filter(|conn| conn.role == ConnRole::Cli)
+        else {
+            return Err(ProtoError::new(
+                E_FORBIDDEN,
+                "supervise is a cli-only operation",
+            ));
+        };
+        conn.supervisor = true;
+        st.supervision.clone()
+    };
+    let (reply, response) = tokio::sync::oneshot::channel();
+    sender
+        .send(SupervisionRequest { reply: Some(reply) })
+        .map_err(|_| ProtoError::new(E_INTERNAL, "manager stopped before supervising"))?;
+    let intercom = response
+        .await
+        .map_err(|_| ProtoError::new(E_INTERNAL, "manager stopped before supervising"))?;
+    Ok(SuperviseOk { intercom })
+}
+
+/// The running bridge restarts when its configuration changed and also when
+/// the loaded identity changed: `device.json`-only updates (re-enrollment, a
+/// new identity) never touch the configuration file, but the bridge's relay
+/// credential and device id came from the identity loaded at start.
+fn bridge_stale(
+    current: &crate::intercom::Running,
+    fresh: &crate::intercom::config::Config,
+) -> bool {
+    if current.config() != fresh {
+        return true;
+    }
+    identity_changed_since(&current.runtime.identity, &fresh.state_dir)
+}
+fn identity_changed_since(
+    current: &crate::intercom::config::Identity,
+    state_dir: &std::path::Path,
+) -> bool {
+    match crate::intercom::config::Identity::load(state_dir) {
+        Ok(loaded) => {
+            loaded.device_id != current.device_id
+                || loaded.tenant_id != current.tenant_id
+                || loaded.credential != current.credential
+                || loaded.server != current.server
+        }
+        Err(_) => false,
+    }
+}
+/// Makes the bridge's Supervised-only capabilities match the leases held
+/// now, and describes the bridge for a lease holder. Becoming Supervised
+/// rereads the configuration: a bridge that failed at boot, or one whose
+/// configuration changed since (enrollment, `service install`), restarts.
+async fn apply_supervision(
+    state: &Shared,
+    running: &mut Option<crate::intercom::Running>,
+    bridge_error: &mut Option<String>,
+) -> String {
+    let (leased, home, clock) = {
+        let st = state.lock().unwrap();
+        (
+            st.conns.values().any(|conn| conn.supervisor),
+            st.home.clone(),
+            st.clock.clone(),
+        )
+    };
+    if leased && !running.as_ref().is_some_and(|running| running.supervised()) {
+        let fresh = crate::intercom::bridge_config();
+        let stale = match (running.as_ref(), &fresh) {
+            (Some(current), Ok(config)) => bridge_stale(current, config),
+            (None, _) => true,
+            (Some(_), Err(_)) => false,
+        };
+        if stale {
+            if let Some(current) = running.take() {
+                crate::intercom::carry_dedup(current.shutdown_for_handover().await);
+            }
+            (*running, *bridge_error) = start_bridge(&home, clock).await;
+        }
+    }
+    let Some(running) = running.as_mut() else {
+        return format!(
+            "unavailable: {}",
+            bridge_error.as_deref().unwrap_or("not running")
+        );
+    };
+    if leased {
+        running.supervise().await;
+    } else {
+        running.unsupervise().await;
+    }
+    if running.supervised() {
+        "supervised".into()
+    } else {
+        "self-managed".into()
+    }
+}
+
 fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError> {
     let st = state.lock().unwrap();
     if let Some(h) = st.conns.get(&conn_id) {
@@ -3375,18 +3752,18 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
     }
     #[cfg(unix)]
     {
-    let generation = st.generation;
-    drop(st);
-    if !crate::handover::request(state, "cli") {
-        return Err(ProtoError::new(
-            E_INTERNAL,
-            "an upgrade is already in progress",
-        ));
-    }
-    Ok(UpgradeOk {
-        from_version: crate::VERSION.to_string(),
-        generation,
-    })
+        let generation = st.generation;
+        drop(st);
+        if !crate::handover::request(state, "cli") {
+            return Err(ProtoError::new(
+                E_INTERNAL,
+                "an upgrade is already in progress",
+            ));
+        }
+        Ok(UpgradeOk {
+            from_version: crate::VERSION.to_string(),
+            generation,
+        })
     }
 }
 
@@ -3631,9 +4008,21 @@ impl Outcome {
         {
             let code = status.and_then(|s| s.code());
             match code {
-                Some(c) if c == 128 + task::SIGTERM => Outcome { code: None, signal: Some(task::SIGTERM), usage: None },
-                Some(c) if c == 128 + task::SIGKILL => Outcome { code: None, signal: Some(task::SIGKILL), usage: None },
-                other => Outcome { code: other, signal: None, usage: None },
+                Some(c) if c == 128 + task::SIGTERM => Outcome {
+                    code: None,
+                    signal: Some(task::SIGTERM),
+                    usage: None,
+                },
+                Some(c) if c == 128 + task::SIGKILL => Outcome {
+                    code: None,
+                    signal: Some(task::SIGKILL),
+                    usage: None,
+                },
+                other => Outcome {
+                    code: other,
+                    signal: None,
+                    usage: None,
+                },
             }
         }
     }
@@ -3741,7 +4130,10 @@ async fn watch_shell_start(state: Shared, tid: String, pid: u32) {
                     if let Some(e) = st.registry.tasks.get_mut(&tid) {
                         e.request_kill(crate::shellstart::SHELL_START_HUNG);
                     }
-                    lifecycle::log_line(&home, &format!("task {tid}: shell start-up hung; killing"));
+                    lifecycle::log_line(
+                        &home,
+                        &format!("task {tid}: shell start-up hung; killing"),
+                    );
                 }
                 kill_group_hard(pid).await;
                 return;
@@ -4004,9 +4396,14 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         // `shellstart`): crash status, MSYS marker, and a short tail.
         // A nested shell can look the same after side effects.
         #[cfg(windows)]
-        if entry.kill_reason.is_none() && crate::sys::task_shell().kind == crate::sys::ShellKind::Posix {
+        if entry.kill_reason.is_none()
+            && crate::sys::task_shell().kind == crate::sys::ShellKind::Posix
+        {
             let out = entry.output.lock().unwrap();
-            let skip = out.ring.len().saturating_sub(crate::shellstart::MAX_STARTUP_FAILURE_OUTPUT as usize);
+            let skip = out
+                .ring
+                .len()
+                .saturating_sub(crate::shellstart::MAX_STARTUP_FAILURE_OUTPUT as usize);
             let tail = out.ring.slice(skip, out.ring.len() - skip);
             if crate::shellstart::is_startup_crash(code, out.total_size, &tail) {
                 entry.record.end_reason = Some(crate::shellstart::SHELL_START_FAILED.to_string());
@@ -4358,9 +4755,15 @@ mod tests {
 
     #[test]
     fn client_labels_are_one_clipped_line() {
-        assert_eq!(clean_label("watch\n\x1b[31mbuild\t "), Some("watch [31mbuild".into()));
+        assert_eq!(
+            clean_label("watch\n\x1b[31mbuild\t "),
+            Some("watch [31mbuild".into())
+        );
         assert_eq!(clean_label(" \n "), None);
-        assert_eq!(clean_label("tail \u{202E}gol.exe"), Some("tail gol.exe".into()));
+        assert_eq!(
+            clean_label("tail \u{202E}gol.exe"),
+            Some("tail gol.exe".into())
+        );
         let long = clean_label(&"x".repeat(500)).unwrap();
         assert_eq!(long.chars().count(), crate::events::COMMAND_CHARS);
     }
@@ -4408,14 +4811,21 @@ mod tests {
         let mut record = running_record_for_cpu_test();
         apply_live_cpu_sample(
             &mut record,
-            Some(task::LiveCpuReading { user_ms: 120, system_ms: 30, percent: Some(24.0) }),
+            Some(task::LiveCpuReading {
+                user_ms: 120,
+                system_ms: 30,
+                percent: Some(24.0),
+            }),
             1_000,
         );
         assert_eq!(record.live_cpu_sampled_at, Some(1_000));
         assert!(!record.live_cpu_stale);
 
         apply_live_cpu_sample(&mut record, None, 6_000);
-        assert_eq!((record.live_cpu_user_ms, record.live_cpu_sys_ms), (Some(120), Some(30)));
+        assert_eq!(
+            (record.live_cpu_user_ms, record.live_cpu_sys_ms),
+            (Some(120), Some(30))
+        );
         assert_eq!(record.live_cpu_percent, None);
         assert_eq!(record.live_cpu_sampled_at, Some(1_000));
         assert!(record.live_cpu_stale);
@@ -4469,6 +4879,7 @@ mod tests {
                 die: Arc::new(Notify::new()),
                 written: Arc::new(Mutex::new(HashMap::new())),
                 writer: writer.abort_handle(),
+                supervisor: false,
             },
         );
         // Real initial bytes, not a fabricated OutputChunk. Wait only for the
@@ -4577,24 +4988,45 @@ mod tests {
     /// transient, and any later session request may re-serve a retained grant.
     async fn queued_grant_after_full_writer(retry_acquire: bool) {
         let home = std::env::temp_dir().join(format!(
-            "pi-famulus-grant-{}-{}-{retry_acquire}", std::process::id(), now_ms()
+            "pi-famulus-grant-{}-{}-{retry_acquire}",
+            std::process::id(),
+            now_ms()
         ));
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("config.json"), r#"{"maxAgents":3,"maxTest":1}"#).unwrap();
         let state = Arc::new(Mutex::new(DaemonState::new(
-            home.clone(), Registry::new(home.clone()), false,
+            home.clone(),
+            Registry::new(home.clone()),
+            false,
         )));
         let (holder_tx, mut holder_rx) = mpsc::channel(2);
         let (waiter_tx, mut waiter_rx) = mpsc::channel(2);
         let writer = tokio::spawn(std::future::pending::<()>());
         let mut connections = Vec::new();
         for (session, tx) in [("p16-holder", &holder_tx), ("p16-waiter", &waiter_tx)] {
-            connections.push(register_conn(
-                &state, tx, &Arc::new(Notify::new()),
-                &Arc::new(Mutex::new(HashMap::new())), &writer.abort_handle(),
-                ClientKind::Extension, Some(session.into()), Some(std::process::id()),
-                HelloInfo { cwd: None, extension_version: None, protocol: Some(5), role: ConnRole::Parent, child_id: None, token: None, session_file: None, pi_version: None },
-            ).unwrap());
+            connections.push(
+                register_conn(
+                    &state,
+                    tx,
+                    &Arc::new(Notify::new()),
+                    &Arc::new(Mutex::new(HashMap::new())),
+                    &writer.abort_handle(),
+                    ClientKind::Extension,
+                    Some(session.into()),
+                    Some(std::process::id()),
+                    HelloInfo {
+                        cwd: None,
+                        extension_version: None,
+                        protocol: Some(5),
+                        role: ConnRole::Parent,
+                        child_id: None,
+                        token: None,
+                        session_file: None,
+                        pi_version: None,
+                    },
+                )
+                .unwrap(),
+            );
         }
         let request = |id: &str, kind: &str, child: &str| {
             let mut input = json!({ "id": id, "type": kind });
@@ -4606,28 +5038,65 @@ mod tests {
             }
             parse_request(input.to_string().as_bytes()).unwrap()
         };
-        dispatch(state.clone(), connections[0],
-            request("p16-hold", "acquire_agent", "ch_hold"), holder_tx.clone()).await;
-        let held: serde_json::Value = serde_json::from_slice(&holder_rx.try_recv().unwrap().bytes).unwrap();
+        dispatch(
+            state.clone(),
+            connections[0],
+            request("p16-hold", "acquire_agent", "ch_hold"),
+            holder_tx.clone(),
+        )
+        .await;
+        let held: serde_json::Value =
+            serde_json::from_slice(&holder_rx.try_recv().unwrap().bytes).unwrap();
         assert_eq!(held["granted"], true);
-        dispatch(state.clone(), connections[1],
-            request("p16-wait", "acquire_agent", "ch_wait"), waiter_tx.clone()).await;
-        assert!(waiter_rx.try_recv().is_err(), "waiter must not bypass held capacity");
+        dispatch(
+            state.clone(),
+            connections[1],
+            request("p16-wait", "acquire_agent", "ch_wait"),
+            waiter_tx.clone(),
+        )
+        .await;
+        assert!(
+            waiter_rx.try_recv().is_err(),
+            "waiter must not bypass held capacity"
+        );
 
         for id in ["p16-status-0", "p16-status-1"] {
-            dispatch(state.clone(), connections[1], request(id, "status", ""), waiter_tx.clone()).await;
+            dispatch(
+                state.clone(),
+                connections[1],
+                request(id, "status", ""),
+                waiter_tx.clone(),
+            )
+            .await;
         }
         assert_eq!(waiter_tx.capacity(), 0);
-        dispatch(state.clone(), connections[0],
-            request("p16-release", "release_agent", "ch_hold"), holder_tx.clone()).await;
-        let released: serde_json::Value = serde_json::from_slice(&holder_rx.try_recv().unwrap().bytes).unwrap();
+        dispatch(
+            state.clone(),
+            connections[0],
+            request("p16-release", "release_agent", "ch_hold"),
+            holder_tx.clone(),
+        )
+        .await;
+        let released: serde_json::Value =
+            serde_json::from_slice(&holder_rx.try_recv().unwrap().bytes).unwrap();
         assert_eq!(released["ok"], true);
         assert_eq!(waiter_tx.capacity(), 0, "release must hit the full writer");
-        assert_eq!(state.lock().unwrap().undelivered_agent_grants
-            .get(&("p16-waiter".into(), "p16-wait".into())).map(|grant| grant.child_id.as_str()), Some("ch_wait"));
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .undelivered_agent_grants
+                .get(&("p16-waiter".into(), "p16-wait".into()))
+                .map(|grant| grant.child_id.as_str()),
+            Some("ch_wait")
+        );
         for id in ["p16-status-0", "p16-status-1"] {
-            let frame: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
-            assert_eq!(frame["id"], id, "full writer must not lose queued responses");
+            let frame: serde_json::Value =
+                serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
+            assert_eq!(
+                frame["id"], id,
+                "full writer must not lose queued responses"
+            );
         }
         let next = if retry_acquire {
             request("p16-wait", "acquire_agent", "ch_wait")
@@ -4635,20 +5104,29 @@ mod tests {
             request("p16-after-drain", "status", "")
         };
         dispatch(state.clone(), connections[1], next, waiter_tx.clone()).await;
-        let grant: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
+        let grant: serde_json::Value =
+            serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
         assert_eq!(grant["id"], "p16-wait");
         assert_eq!(grant["granted"], true);
         if !retry_acquire {
-            let status: serde_json::Value = serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
+            let status: serde_json::Value =
+                serde_json::from_slice(&waiter_rx.try_recv().unwrap().bytes).unwrap();
             assert_eq!(status["id"], "p16-after-drain");
             assert_eq!(status["agent_capacity"]["by_kind"]["test"]["used"], 1);
         }
-        assert!(waiter_rx.try_recv().is_err(), "one request must not duplicate its retained grant");
+        assert!(
+            waiter_rx.try_recv().is_err(),
+            "one request must not duplicate its retained grant"
+        );
         {
             let st = state.lock().unwrap();
             assert!(st.pending_agents.is_empty());
             assert!(st.undelivered_agent_grants.is_empty());
-            assert_eq!(st.agent_permits.len(), 1, "retry must not allocate another permit");
+            assert_eq!(
+                st.agent_permits.len(),
+                1,
+                "retry must not allocate another permit"
+            );
         }
         writer.abort();
         drop(state);
@@ -4664,9 +5142,12 @@ mod tests {
 
     #[tokio::test]
     async fn queued_grant_survives_full_writer_and_status_request() {
-        tokio::time::timeout(Duration::from_secs(3), queued_grant_after_full_writer(false))
-            .await
-            .expect("status-triggered grant recovery stalled");
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            queued_grant_after_full_writer(false),
+        )
+        .await
+        .expect("status-triggered grant recovery stalled");
     }
 
     #[test]
@@ -4727,7 +5208,9 @@ mod tests {
             fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
                 assert!(!self.polled, "ctrl-c future polled after it completed");
                 self.polled = true;
-                Poll::Ready(Err(std::io::Error::other("ctrl-c handler already registered")))
+                Poll::Ready(Err(std::io::Error::other(
+                    "ctrl-c handler already registered",
+                )))
             }
         }
 
@@ -4755,5 +5238,46 @@ mod tests {
         }
         assert_eq!(accepted, 2);
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod intercom_bridge_tests {
+    use super::identity_changed_since;
+
+    #[test]
+    fn bridge_staleness_detects_device_json_only_identity_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "famulus-ident-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let enrolled = crate::intercom::config::Identity {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            credential: "credential-one".into(),
+            server: "https://relay.invalid".into(),
+            ..Default::default()
+        };
+        enrolled.save(&dir).unwrap();
+        assert!(
+            !identity_changed_since(&enrolled, &dir),
+            "an unchanged device.json must not restart the bridge"
+        );
+        // Re-enrollment rotates the credential and device id in device.json
+        // alone; the configuration file never changes.
+        let rotated = crate::intercom::config::Identity {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            credential: "credential-two".into(),
+            server: "https://relay.invalid".into(),
+            ..Default::default()
+        };
+        rotated.save(&dir).unwrap();
+        assert!(
+            identity_changed_since(&enrolled, &dir),
+            "a device.json-only identity change must reload the bridge"
+        );
+        assert!(!identity_changed_since(&rotated, &dir));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

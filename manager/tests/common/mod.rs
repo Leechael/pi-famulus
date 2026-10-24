@@ -374,7 +374,7 @@ impl Home {
     }
     /// Spawn `pi-famulus --home H daemon` as a direct child of the test.
     pub fn spawn_daemon(&self) -> DaemonChild {
-        let child = Command::new(BIN)
+        let child = famulus_command(BIN)
             .arg("--home")
             .arg(&self.path)
             .env("PI_FAMULUS_TEST_CLOCK", self.clock_env())
@@ -407,7 +407,7 @@ impl Home {
     /// Start a daemon from `bin` with extra environment; waits until it
     /// accepts connections.
     pub fn start_daemon_from(&self, bin: &Path, env: &[(&str, &str)]) -> DaemonChild {
-        let mut cmd = Command::new(bin);
+        let mut cmd = famulus_command(bin);
         cmd.arg("--home")
             .arg(&self.path)
             .env("PI_FAMULUS_TEST_CLOCK", self.clock_env())
@@ -622,7 +622,7 @@ pub fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> CliOut {
 }
 
 pub fn run_cli_env(home: &Path, args: &[&str], timeout: Duration, env: &[(&str, &str)]) -> CliOut {
-    let mut child = Command::new(BIN)
+    let mut child = famulus_command(BIN)
         .arg("--home")
         .arg(home)
         .args(args)
@@ -1554,4 +1554,13 @@ pub fn wait_for_pids_for(c: &mut Conn, task_id: &str, n: usize, timeout: Duratio
         }
     })
     .unwrap_or_else(|| panic!("task {task_id} did not print {n} pids"))
+}
+
+/// The manager binary without the messaging bridge: these tests do not use
+/// it, and it would bind the shared default intercom socket and publish into
+/// the real `~/.claude/sessions`.
+pub fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    command.env("PI_FAMULUS_NO_INTERCOM", "1");
+    command
 }

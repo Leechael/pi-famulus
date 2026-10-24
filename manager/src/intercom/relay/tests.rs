@@ -1,0 +1,912 @@
+use super::*;
+
+#[tokio::test]
+async fn tls_url_answered_by_cleartext_http_fails_without_sending_the_token_in_clear() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut tls, _) = listener.accept().await.unwrap();
+            let mut record = [0u8; 5];
+            tls.read_exact(&mut record).await.unwrap();
+            assert_eq!(record[0], 22, "a wss:// dial must only ever start with TLS");
+            let mut hello = vec![0; u16::from_be_bytes([record[3], record[4]]) as usize];
+            tls.read_exact(&mut hello).await.unwrap();
+            tls.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tls.shutdown().await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err()
+    });
+    for scheme in ["wss", "https"] {
+        let config = Config {
+            server: format!("{scheme}://{address}"),
+            token: "fixture-secret".into(),
+            ..Config::default()
+        };
+        let error = tokio::time::timeout(Duration::from_secs(3), dial(&config))
+            .await
+            .unwrap()
+            .err()
+            .unwrap_or_else(|| panic!("{scheme}:// downgraded to cleartext"));
+        assert!(error.contains("cleartext"), "{error}");
+    }
+    assert!(
+        server.await.unwrap(),
+        "a cleartext retry carried the bearer token"
+    );
+}
+
+fn transport_runtime(cfg: Config) -> Shared {
+    transport_runtime_on(cfg, crate::clock::Clock::default())
+}
+fn transport_runtime_on(cfg: Config, clock: crate::clock::Clock) -> Shared {
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        sync::{Arc, Mutex},
+    };
+    Arc::new(Runtime {
+        cfg,
+        clock,
+        identity: Identity {
+            device_id: uuid::Uuid::new_v4().to_string(),
+            ..Identity::default()
+        },
+        machine: "transport-fixture".into(),
+        stop: tokio::sync::watch::channel(false).0,
+        closing: tokio::sync::watch::channel(false).0,
+        rpc_tasks: Mutex::new(Vec::new()),
+        native: super::super::native::Native::new(),
+        legacy_gate: tokio::sync::Mutex::new(()),
+        tool_status: tokio::sync::OnceCell::new(),
+        mcp_url: Mutex::new(String::new()),
+        state: Mutex::new(super::super::State {
+            sessions: HashMap::new(),
+            unpublished: HashMap::new(),
+            exited: HashSet::new(),
+            messages: HashMap::new(),
+            history: HashSet::new(),
+            pending_local: HashSet::new(),
+            pending_remote: HashSet::new(),
+            relay_workspaces: HashSet::new(),
+            supervised: false,
+            incoming: Default::default(),
+            subscriptions: HashMap::new(),
+            idle_stable: HashMap::new(),
+            next_epoch: 0,
+            next_conn: 0,
+            events: VecDeque::new(),
+            seq: 0,
+            remote: Vec::new(),
+            relay_tx: None,
+            control_outbox: VecDeque::new(),
+            relay_message_ids: false,
+            relay_generation: 0,
+            legacy_active: None,
+            pending: HashMap::new(),
+            aliases: HashMap::new(),
+            mcp_status: String::new(),
+            native_status: String::new(),
+        }),
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stalled_real_relay_writer_fails_after_original_ten_second_write_deadline() {
+    use std::os::fd::AsRawFd;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, hold) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let registration = socket.next().await.unwrap().unwrap();
+        assert!(
+            matches!(registration,Message::Text(ref text) if serde_json::from_str::<Value>(text).unwrap()["type"]=="register")
+        );
+        let size: libc::c_int = 1024;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    socket.get_ref().as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        socket
+            .send(Message::Text(
+                json!({"type":"welcome","machine_id":"transport-fixture","send_message_id_v1":true})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = hold.await;
+        drop(socket);
+    });
+    let rt = transport_runtime(Config {
+        server: format!("http://{address}"),
+        token: "fixture".into(),
+        ..Config::default()
+    });
+    let active = rt.clone();
+    let mut task = tokio::spawn(async move {
+        session(
+            active.clone(),
+            &mut tokio::task::JoinSet::new(),
+            &mut tokio::task::JoinSet::new(),
+            &delivery_lanes(&active),
+            &mut None,
+        )
+        .await
+    });
+    let writer = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(writer) = rt.state.lock().unwrap().relay_tx.clone() {
+                break writer;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        rt.state.lock().unwrap().relay_message_ids,
+        "the fixture welcome must negotiate send_message_id_v1 like the real relay"
+    );
+    let first = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let mut fence = Some(first.clone().lock_owned().await);
+    // The fenced frame is small so it flushes regardless of the platform's
+    // socket buffer sizing; the large frames that follow then stall.
+    for size in std::iter::once(1_000).chain(std::iter::repeat_n(700_000, 16)) {
+        writer.send(super::super::Push{value:json!({"type":"send","id":uuid::Uuid::new_v4().to_string(),"message_id":uuid::Uuid::new_v4().to_string(),"to":"pi/target","body":"x".repeat(size)}),written:None,fence:fence.take()}).await.unwrap();
+    }
+    drop(tokio::time::timeout(Duration::from_secs(2),first.lock()).await.expect("the physical write fence must prove at least one legal frame flushed before stalling"));
+    let stalled = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), &mut task).await;
+    let waited = stalled.elapsed();
+    if outcome.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    let _ = release.send(());
+    server.await.unwrap();
+    assert!(
+        matches!(&outcome,Ok(Ok(Err(error))) if error.to_string().contains("write timed out")),
+        "the physical writer must close its session after Go WriteWait=10s, got {outcome:?}"
+    );
+    assert!(
+        waited >= Duration::from_secs(9),
+        "the writer closed after {waited:?}, before the 10s write deadline"
+    );
+}
+
+#[tokio::test]
+async fn relay_tcp_endpoint_preserves_go_default_nodelay() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(stream).await.unwrap()
+    });
+    let config = Config {
+        server: format!("http://{address}"),
+        token: "fixture".into(),
+        ..Config::default()
+    };
+    let socket = dial(&config).await.unwrap();
+    let _server = server.await.unwrap();
+    let MaybeTlsStream::Plain(stream) = socket.get_ref() else {
+        panic!("plain fixture unexpectedly negotiated TLS")
+    };
+    assert!(
+        stream.nodelay().unwrap(),
+        "Go net.TCPConn defaults to TCP_NODELAY; snapshot + send must not wait for delayed ACKs"
+    );
+}
+
+#[tokio::test]
+async fn relay_send_rejects_a_body_whose_encoded_frame_exceeds_the_relay_frame_limit() {
+    let rt = transport_runtime(Config::default());
+    let (writer, mut wire) = mpsc::channel(8);
+    {
+        let mut state = rt.state.lock().unwrap();
+        state.relay_tx = Some(writer);
+        state.relay_message_ids = true;
+    }
+    // Each quote doubles when JSON-escaped, so the raw body fits but the frame does not.
+    let body = "\"".repeat(MAX_FRAME / 2 + 1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(
+            &rt,
+            "pi/origin",
+            "pi/remote",
+            &body,
+            "",
+            "oversized-id",
+            None,
+        ),
+    )
+    .await
+    .expect("oversized relay send waited for a reply instead of failing");
+    assert!(result.unwrap_err().contains("too large"));
+    assert!(
+        wire.try_recv().is_err(),
+        "oversized send reached the relay writer"
+    );
+}
+
+#[tokio::test]
+async fn mcp_refuses_to_start_without_a_token_or_on_an_unapproved_public_address() {
+    let rt = |listen: &str, token: &str, allow: bool| {
+        transport_runtime(Config {
+            mcp_listen: listen.into(),
+            mcp_token: token.into(),
+            mcp_allow_non_loopback: allow,
+            ..Config::default()
+        })
+    };
+    let error = super::super::http::start(
+        rt("127.0.0.1:0", " ", false),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("unauthenticated"), "{error}");
+    let error = super::super::http::start(
+        rt("0.0.0.0:0", "secret", false),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("mcp_allow_non_loopback"), "{error}");
+    super::super::http::start(
+        rt("127.0.0.1:0", "secret", false),
+        tokio::sync::watch::channel(false).1,
+    )
+    .await
+    .unwrap()
+    .abort();
+}
+
+#[tokio::test]
+async fn mcp_wrong_tokens_on_loopback_cannot_lock_out_the_real_client() {
+    let rt = transport_runtime(Config {
+        mcp_listen: "127.0.0.1:0".into(),
+        mcp_token: "secret".into(),
+        ..Config::default()
+    });
+    let server = super::super::http::start(rt.clone(), rt.stop.subscribe())
+        .await
+        .unwrap();
+    let url = rt.mcp_url.lock().unwrap().clone();
+    let client = reqwest::Client::new();
+    let post = |token: &'static str| {
+        client
+            .post(&url)
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
+            .send()
+    };
+    for _ in 0..20 {
+        assert_eq!(post("guess").await.unwrap().status(), 401);
+    }
+    assert_eq!(
+        post("secret").await.unwrap().status(),
+        200,
+        "another local user's bad tokens must not lock out this user's MCP client"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn webhook_secrets_are_never_sent_over_cleartext_to_a_remote_host() {
+    let endpoint = super::super::config::Endpoint {
+        name: "hook".into(),
+        url: "http://192.0.2.1:9/hook".into(),
+        secret: "secret".into(),
+        auth: "bearer".into(),
+    };
+    let message = WebhookMessage {
+        id: "id",
+        from: "pi/a",
+        reply_to: "",
+        body: "body",
+    };
+    let error = post_webhook_message(
+        &Config::default(),
+        &endpoint,
+        &message,
+        &crate::clock::Clock::from_env(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("non-https"), "{error}");
+    let error = listen(
+        Config::default(),
+        "hook".into(),
+        "http://192.0.2.1:9/hook".into(),
+        "secret".into(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("non-https"), "{error}");
+}
+
+#[tokio::test]
+async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
+    let rt = transport_runtime(Config {
+        mcp_listen: "127.0.0.1:0".into(),
+        mcp_token: "secret".into(),
+        ..Config::default()
+    });
+    let server = super::super::http::start(rt.clone(), rt.stop.subscribe())
+        .await
+        .unwrap();
+    let url = rt.mcp_url.lock().unwrap().clone();
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth("secret")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(vec![b' '; MAX_FRAME + 1])
+        .send()
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(response.status(), 413);
+}
+
+type Peer = WebSocketStream<tokio::net::TcpStream>;
+async fn welcomed_peer(listener: &tokio::net::TcpListener) -> Peer {
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+    assert_eq!(peer_frame(&mut socket, |_| true).await["type"], "register");
+    socket
+        .send(Message::Text(
+            json!({"type":"welcome","machine_id":"transport-fixture","send_message_id_v1":true})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+}
+async fn peer_frame(socket: &mut Peer, wanted: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if wanted(&frame) {
+                    return frame;
+                }
+            }
+        }
+    })
+    .await
+    .expect("relay peer never received the expected frame")
+}
+async fn peer_send(socket: &mut Peer, frame: Value) {
+    socket
+        .send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn remote_messages_refuse_rejects_every_relay_initiated_operation_and_delivery() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(Config {
+        server: format!("http://{}", listener.local_addr().unwrap()),
+        token: "fixture".into(),
+        remote_messages: "refuse".into(),
+        ..Config::default()
+    });
+    let active = rt.clone();
+    let task = tokio::spawn(async move {
+        session(
+            active.clone(),
+            &mut tokio::task::JoinSet::new(),
+            &mut tokio::task::JoinSet::new(),
+            &delivery_lanes(&active),
+            &mut None,
+        )
+        .await
+    });
+    let mut peer = welcomed_peer(&listener).await;
+    for op in [
+        "status",
+        "workspace_list",
+        "workspace_create",
+        "workspace_close",
+        "session_create",
+        "session_close",
+        "agent_prompt",
+        "agent_keys",
+        "agent_read",
+        "agent_wait",
+    ] {
+        let id = format!("call-{op}");
+        peer_send(&mut peer, json!({"type":op,"id":id,"session_id":"pi/local","workspace_id":"w1","keys":["enter"],"body":"typed","name":"n","cwd":"/","agent":"pi"})).await;
+        let reply = peer_frame(&mut peer, |frame| frame["id"] == id).await;
+        assert_eq!(reply["type"], "error", "{op}: {reply}");
+        assert!(
+            str_field(&reply, "message").contains("remote_messages=refuse"),
+            "{op} ran under remote_messages=refuse: {reply}"
+        );
+    }
+    peer_send(&mut peer, json!({"type":"deliver","session_id":"pi/local","from":"pi/remote","message_id":"refused-id","body":"typed"})).await;
+    let receipt = peer_frame(&mut peer, |frame| frame["type"] == "receipt").await;
+    assert_eq!(receipt["message_id"], "refused-id");
+    assert_eq!(receipt["status"], "refused");
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn delivery_lanes_keep_per_target_order_and_cap_concurrency() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    let log = Arc::new(Mutex::new(Vec::<(String, &'static str)>::new()));
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let lanes = {
+        let (log, running, peak) = (log.clone(), running.clone(), peak.clone());
+        Lanes::new(
+            LaneCaps {
+                workers: 3,
+                per_key: 4,
+                keys: 16,
+                budget: usize::MAX,
+                max_items: usize::MAX,
+            },
+            |_| 1,
+            Arc::new(move |item: String| {
+                let (log, running, peak, mut gate) =
+                    (log.clone(), running.clone(), peak.clone(), gate.clone());
+                Box::pin(async move {
+                    peak.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    log.lock().unwrap().push((item.clone(), "start"));
+                    let _ = gate.wait_for(|open| *open).await;
+                    tokio::task::yield_now().await;
+                    log.lock().unwrap().push((item, "end"));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+            }),
+            Arc::new(|_| {}),
+        )
+    };
+    for n in 0..4 {
+        lanes.push("pi/a", format!("a{n}")).unwrap();
+    }
+    assert_eq!(
+        lanes.push("pi/a", "a-overflow".into()),
+        Err("a-overflow".into()),
+        "a full per-target lane must reject instead of growing"
+    );
+    for key in 0..8 {
+        lanes
+            .push(&format!("pi/k{key}"), format!("k{key}"))
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(running.load(Ordering::SeqCst), 3);
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while log.lock().unwrap().len() < 24 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        peak.load(Ordering::SeqCst) <= 3,
+        "deliveries exceeded the worker cap"
+    );
+    let lane_a: Vec<_> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(item, _)| item.starts_with('a'))
+        .cloned()
+        .collect();
+    let expected: Vec<_> = (0..4)
+        .flat_map(|n| [(format!("a{n}"), "start"), (format!("a{n}"), "end")])
+        .collect();
+    assert_eq!(
+        lane_a, expected,
+        "one target's deliveries overlapped or reordered"
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !lanes.inner.queues.lock().unwrap().lanes.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle lanes must release their table entry");
+    lanes.push("pi/a", "a-after".into()).unwrap();
+}
+
+#[tokio::test]
+async fn delivery_lanes_cap_bytes_survive_a_panicking_item_and_abort_on_drop() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    let finished = Arc::new(AtomicUsize::new(0));
+    let abandoned = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let lanes = {
+        let (finished, abandoned) = (finished.clone(), abandoned.clone());
+        Lanes::new(
+            LaneCaps {
+                workers: 4,
+                per_key: 8,
+                keys: 8,
+                budget: 10,
+                max_items: usize::MAX,
+            },
+            |item: &String| item.len(),
+            Arc::new(move |item: String| {
+                let (finished, mut gate) = (finished.clone(), gate.clone());
+                Box::pin(async move {
+                    let _ = gate.wait_for(|open| *open).await;
+                    if item == "boom" {
+                        panic!("delivery panicked");
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+            Arc::new(move |items: Vec<String>| abandoned.lock().unwrap().extend(items)),
+        )
+    };
+    lanes.push("pi/a", "aaaaaa".into()).unwrap();
+    assert_eq!(
+        lanes.push("pi/b", "bbbbb".into()),
+        Err("bbbbb".into()),
+        "queued bytes must stay within the budget across lanes"
+    );
+    lanes.push("pi/b", "bbbb".into()).unwrap();
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while finished.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    release.send_replace(false);
+    lanes.push("pi/p", "boom".into()).unwrap();
+    lanes.push("pi/p", "q1".into()).unwrap();
+    tokio::task::yield_now().await;
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while lanes
+            .inner
+            .queues
+            .lock()
+            .unwrap()
+            .lanes
+            .contains_key("pi/p")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a panicked worker must release its lane");
+    assert_eq!(
+        *abandoned.lock().unwrap(),
+        ["q1"],
+        "items stranded behind a panicked worker must be handed back for a nack"
+    );
+    lanes.push("pi/p", "ok".into()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while finished.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the lane must accept work after its worker panicked");
+    release.send_replace(false);
+    lanes.push("pi/held", "held".into()).unwrap();
+    tokio::task::yield_now().await;
+    let inner = lanes.inner.clone();
+    drop(lanes);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !inner.queues.lock().unwrap().lanes.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the lanes must abort their workers");
+    assert_eq!(finished.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn idle_control_backlog_never_rejects_replies_and_keeps_their_order() {
+    let (queue, mut receiver) = ordered_queue();
+    for n in 0..IDLE_CONTROL_QUEUE {
+        queue.control(json!({"n":n})).unwrap();
+    }
+    assert!(queue.control(json!({"n":"overflow"})).is_err());
+    let (reply, answered) = oneshot::channel();
+    queue.reply(json!({"id":"ack"}), reply);
+    for n in 0..IDLE_CONTROL_QUEUE {
+        match receiver.recv().await.unwrap() {
+            OrderedIncoming::Control(frame) => assert_eq!(frame["n"], n),
+            OrderedIncoming::Reply(..) => panic!("reply overtook an earlier idle control"),
+        }
+    }
+    let next = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("reply was rejected by the control backlog");
+    let OrderedIncoming::Reply(frame, reply) = next.unwrap() else {
+        panic!("reply lost behind the control backlog")
+    };
+    reply.send(frame).unwrap();
+    assert_eq!(answered.await.unwrap()["id"], "ack");
+    queue.control(json!({"n":"drained"})).unwrap();
+}
+
+#[tokio::test]
+async fn delivery_lanes_charge_the_full_encoded_frame_and_cap_global_items() {
+    // A small body with oversized non-body metadata must be charged for the
+    // whole encoded frame: the queue retains the entire Value, so the old
+    // body-plus-overhead sizing under-counted what the lane table held.
+    let mut metadata_frame = json!({"type":"deliver","session_id":"pi/a","body":"tiny"});
+    metadata_frame["attachment"] = json!("x".repeat(20_000));
+    let encoded = metadata_frame.to_string().len() + 256;
+    let lanes = Lanes::new(
+        LaneCaps {
+            workers: 1,
+            per_key: 8,
+            keys: 8,
+            budget: encoded - 1,
+            max_items: usize::MAX,
+        },
+        |frame: &Value| frame.to_string().len() + 256,
+        std::sync::Arc::new(|_: Value| Box::pin(async {})),
+        std::sync::Arc::new(|_: Vec<Value>| {}),
+    );
+    let rejected = lanes.push("pi/a", metadata_frame.clone());
+    assert!(
+        rejected.is_err(),
+        "metadata-heavy frame fit a byte budget that only charged the body"
+    );
+    assert_eq!(rejected.unwrap_err(), metadata_frame);
+    let mut light = metadata_frame;
+    light["attachment"] = json!("x".repeat(16));
+    lanes.push("pi/a", light.clone()).unwrap();
+    // A global item-count cap backstops the byte budget for many tiny frames.
+    let counted = Lanes::new(
+        LaneCaps {
+            workers: 1,
+            per_key: 100,
+            keys: 100,
+            budget: usize::MAX,
+            max_items: 2,
+        },
+        |_: &Value| 1,
+        std::sync::Arc::new(|_: Value| Box::pin(async {})),
+        std::sync::Arc::new(|_: Vec<Value>| {}),
+    );
+    counted.push("pi/a", light.clone()).unwrap();
+    counted.push("pi/b", light.clone()).unwrap();
+    assert_eq!(
+        counted.push("pi/c", light.clone()),
+        Err(light),
+        "global item cap did not reject the third queued delivery"
+    );
+}
+
+#[tokio::test]
+async fn enqueue_control_retries_the_new_writer_and_flushes_the_parked_outbox() {
+    let rt = transport_runtime(Config::default());
+    // A dead writer for generation 1: the frame cannot be delivered and must
+    // park in the outbox.
+    let (dead_tx, dead_rx) = mpsc::channel::<super::super::Push>(8);
+    drop(dead_rx);
+    {
+        let mut state = rt.state.lock().unwrap();
+        state.relay_generation = 1;
+        state.relay_tx = Some(dead_tx);
+    }
+    enqueue_control(&rt, json!({"type":"idle_notice","id":"parked"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.state.lock().unwrap().control_outbox.len(),
+        1,
+        "failed send must park the control frame"
+    );
+    // A healthy writer appears under a new generation; the parked frame must
+    // not strand until the next session setup.
+    let (live_tx, mut live_rx) = mpsc::channel::<super::super::Push>(8);
+    {
+        let mut state = rt.state.lock().unwrap();
+        state.relay_generation = 2;
+        state.relay_tx = Some(live_tx);
+    }
+    enqueue_control(&rt, json!({"type":"idle_cancel","id":"fresh"}))
+        .await
+        .unwrap();
+    let first = live_rx.recv().await.unwrap().value;
+    let second = live_rx.recv().await.unwrap().value;
+    assert_eq!(str_field(&first, "id"), "fresh");
+    assert_eq!(
+        str_field(&second, "id"),
+        "parked",
+        "the outbox frame stranded after the healthy connection took over"
+    );
+    assert!(rt.state.lock().unwrap().control_outbox.is_empty());
+}
+
+#[tokio::test]
+async fn remote_op_pool_rejects_past_capacity_and_finishes_side_effects() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut tasks = tokio::task::JoinSet::new();
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let completed = Arc::new(AtomicUsize::new(0));
+    for _ in 0..REMOTE_OP_TASKS {
+        let (mut gate, completed) = (gate.clone(), completed.clone());
+        assert!(
+            spawn_remote_op(&mut tasks, async move {
+                let _ = gate.wait_for(|open| *open).await;
+                completed.fetch_add(1, Ordering::SeqCst);
+            }),
+            "pool rejected spawn {REMOTE_OP_TASKS}"
+        );
+    }
+    assert!(
+        !spawn_remote_op(&mut tasks, async move {}),
+        "unbounded spawn accepted past the operation cap"
+    );
+    release.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .expect("session-independent operation bookkeeping stalled");
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        REMOTE_OP_TASKS,
+        "a relay disconnect cancelled side-effecting operation bookkeeping"
+    );
+    assert!(
+        spawn_remote_op(&mut tasks, async move {}),
+        "pool did not accept work after draining"
+    );
+    while tasks.try_join_next().is_some() {}
+}
+
+#[tokio::test]
+async fn session_observes_stop_signaled_before_it_subscribed() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(Config {
+        server: format!("http://{}", listener.local_addr().unwrap()),
+        token: "fixture".into(),
+        ..Config::default()
+    });
+    // Stop fires while the handshake is still in flight; the session must
+    // notice at subscribe time instead of parking in the read loop.
+    rt.stop.send_replace(true);
+    let active = rt.clone();
+    let mut idle_tasks = tokio::task::JoinSet::new();
+    let mut op_tasks = tokio::task::JoinSet::new();
+    let lanes = delivery_lanes(&active);
+    let mut welcomed = None;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        let (result, _peer) = tokio::join!(
+            session(
+                active.clone(),
+                &mut idle_tasks,
+                &mut op_tasks,
+                &lanes,
+                &mut welcomed
+            ),
+            welcomed_peer(&listener)
+        );
+        result
+    })
+    .await;
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "session missed a pre-handshake stop signal: {outcome:?}"
+    );
+}
+
+#[cfg(feature = "test-clock")]
+async fn reconnect_wait(clock: &crate::clock::Clock) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(timer) = clock
+            .manual()
+            .unwrap()
+            .status()
+            .pending
+            .into_iter()
+            .find(|timer| timer.label == "intercom-relay-reconnect" && timer.due_in_ms > 0)
+        {
+            return timer.due_in_ms;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reconnect timer never armed"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn relay_that_welcomes_then_drops_keeps_backing_off_until_a_session_stays_healthy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let clock = crate::clock::Clock::manual_for_test();
+    let rt = transport_runtime_on(
+        Config {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            token: "fixture".into(),
+            ..Config::default()
+        },
+        clock.clone(),
+    );
+    let task = tokio::spawn(run(rt.clone()));
+    let mut waits = Vec::new();
+    for _ in 0..3 {
+        let mut peer = welcomed_peer(&listener).await;
+        peer.close(None).await.unwrap();
+        let wait = reconnect_wait(&clock).await;
+        waits.push(wait);
+        clock.manual().unwrap().advance(wait);
+    }
+    assert!(
+        waits[2] >= 3000,
+        "welcome-then-drop reset the backoff into a hot reconnect loop: {waits:?}"
+    );
+    let mut peer = welcomed_peer(&listener).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while rt.state.lock().unwrap().relay_tx.is_none() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    clock
+        .manual()
+        .unwrap()
+        .advance(HEALTHY_SESSION.as_millis() as u64);
+    peer.close(None).await.unwrap();
+    let wait = reconnect_wait(&clock).await;
+    assert!(
+        (750..=1250).contains(&wait),
+        "a session that stayed healthy must reset the backoff: {wait}"
+    );
+    rt.stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
