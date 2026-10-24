@@ -140,7 +140,7 @@ describe("extension across /reload", () => {
     expect(managers[0].shutdownCalls).toBe(0);
     expect(managers[0].closeCalls).toBe(0);
     expect(after.tools).toEqual(expect.arrayContaining(["bash", "subagent", "monitor", "task_list"]));
-    expect([...after.commands.keys()].sort()).toEqual(["attach", "famulus", "reply", "tasks"]);
+    expect([...after.commands.keys()].sort()).toEqual(["attach", "famulus", "intercom", "rename", "reply", "tasks"]);
 
     await after.emit("session_shutdown", { reason: "quit" });
     expect(managers[0].shutdownCalls).toBe(1);

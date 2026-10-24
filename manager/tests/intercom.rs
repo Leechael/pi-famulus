@@ -21,6 +21,8 @@ mod mcp_transport;
 mod lifecycle;
 #[path = "intercom_contracts/native.rs"]
 mod native;
+#[path = "intercom_contracts/pi_port.rs"]
+mod pi_port;
 #[path = "intercom_contracts/network.rs"]
 mod network;
 #[path = "intercom_contracts/wss.rs"]
