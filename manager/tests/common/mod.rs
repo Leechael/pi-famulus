@@ -1148,6 +1148,13 @@ impl Transport {
     pub fn peek_timeout(&mut self, buf: &mut [u8], d: Duration) -> std::io::Result<usize> {
         self.peek_or_read(buf, d, true)
     }
+    /// A second handle to the same socket (for a test's reader thread).
+    #[cfg(unix)]
+    pub fn try_clone(&self) -> std::io::Result<Transport> {
+        Ok(Transport {
+            stream: self.stream.try_clone()?,
+        })
+    }
     /// The actual receive buffer (doubled by the kernel on some platforms).
     #[cfg(unix)]
     pub fn recv_buffer_size(&self) -> std::io::Result<usize> {

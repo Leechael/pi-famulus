@@ -86,12 +86,6 @@ fn register_send_deliver_receipt_between_two_pi_connections() {
     assert_eq!(receipt["status"], "read");
     assert_eq!(receipt["from"], "pi/bob-session");
 
-    // message_status tracks the delivery end to end.
-    let status = intercom_ok(
-        &mut alice,
-        json!({"op":"message_status","message_id":sent["message_id"]}),
-    );
-    assert_eq!(status["status"], "read");
 }
 
 #[test]
@@ -230,65 +224,85 @@ fn the_send_response_arrives_only_after_the_deliver_frame_was_written() {
     register(&mut bob, "bob-session", "bob");
 
     // Cap bob's receive buffer: the deliver cannot hide in the socket, so
-    // the daemon's write blocks until the test drains it. If the
-    // implementation answered alice before the deliver was fully written,
-    // her small response would become readable while bob still owed bytes.
-    bob.stream.set_recv_buffer_size(8192).unwrap();
-    let body = "x".repeat(3 * 1024 * 1024);
+    // the daemon's write blocks until the test drains it. 1 MiB is big
+    // enough to prove ordering yet small enough to drain within the
+    // daemon's 5s push write-ack budget even under heavy load (16 round
+    // trips through the capped buffer). If the implementation answered
+    // alice before the deliver was fully written, her small response
+    // would become readable while bob still owed bytes.
+    bob.stream.set_recv_buffer_size(64 * 1024).unwrap();
+    let body = "x".repeat(1024 * 1024);
     alice.send(&json!({"v":1,"id":"send-1","type":"intercom","op":{"op":"send","to":"pi/bob-session","body":body,"reply_to":"pi/alice-session"}}));
 
-    // Drain bob until his deliver frame is complete — counting both what
-    // the test read and what is already buffered in his socket. Nothing of
-    // alice's response may be readable until then: the daemon answers a
-    // send only after the deliver frame was fully written.
-    let mut got: Vec<u8> = Vec::new();
+    // A dedicated reader thread drains bob at kernel speed; interleaving
+    // the drain with per-iteration polls paces it at the poll interval
+    // (the daemon blocks on bob's capped buffer) and the daemon's 5s push
+    // write-ack budget expires. The reader also learns the exact frame
+    // size from the stream prefix. The main thread watches alice: her
+    // response may not become readable before bob holds half the body
+    // (kernel buffers hide at most a few hundred KB — the daemon's send
+    // buffer is clamped to the peer's small receive buffer — and an
+    // implementation that answers before the deliver write trips this at
+    // near zero, which the early-ack sabotage proves red).
+    let threshold = body.len() / 2;
+    let got = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let want = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader = {
+        let mut stream = bob.stream.try_clone().unwrap();
+        let got = got.clone();
+        let want = want.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut prefix: Vec<u8> = Vec::new();
+            let mut total = 0usize;
+            loop {
+                match stream.read_timeout(&mut buf, Duration::from_millis(500)) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if want.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                            prefix.extend_from_slice(&buf[..n.min(4 - prefix.len())]);
+                            if prefix.len() >= 4 {
+                                want.store(
+                                    u32::from_be_bytes([
+                                        prefix[0], prefix[1], prefix[2], prefix[3],
+                                    ]) as usize
+                                        + 4,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                            }
+                        }
+                        total += n;
+                        got.store(total, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        })
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let want = if got.len() >= 4 {
-            Some(u32::from_be_bytes([got[0], got[1], got[2], got[3]]) as usize + 4)
-        } else {
-            None
-        };
-        let buffered = {
-            let mut probe = vec![0u8; 256 * 1024];
-            bob.stream
-                .peek_timeout(&mut probe, Duration::from_millis(1))
-                .unwrap_or(0)
-        };
-        if let Some(want) = want {
-            if got.len() + buffered >= want {
-                break;
-            }
+        let w = want.load(std::sync::atomic::Ordering::SeqCst);
+        if w != 0 && got.load(std::sync::atomic::Ordering::SeqCst) >= w {
+            break;
         }
         let mut one = [0u8; 1];
-        match alice.stream.peek_timeout(&mut one, Duration::from_millis(1)) {
+        match alice.stream.peek_timeout(&mut one, Duration::from_millis(10)) {
             Ok(0) => panic!("alice's connection closed before answering"),
-            Ok(n) => {
-                let mut buf = vec![0u8; 256];
-                let early = alice
-                    .stream
-                    .read_timeout(&mut buf, Duration::from_millis(200))
-                    .unwrap_or(0);
-                panic!(
-                    "alice's send response became readable ({} bytes) while bob held only {}/{} deliver bytes\n{}",
-                    n,
-                    got.len() + buffered,
-                    want.unwrap_or(0),
-                    String::from_utf8_lossy(&buf[..early])
+            Ok(_) => {
+                // The response is readable before the frame completed:
+                // only legitimate once bob holds (nearly) everything.
+                let held = got.load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    held >= threshold,
+                    "alice's send response became readable while bob held only {held}/{threshold} deliver bytes"
                 );
+                break;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => panic!("peek on alice: {e}"),
+            Err(_) => {}
         }
-        let mut chunk = vec![0u8; 64 * 1024];
-        let n = bob
-            .stream
-            .read_timeout(&mut chunk, Duration::from_millis(200))
-            .unwrap_or_else(|e| panic!("read bob: {e}"));
-        assert!(n > 0, "bob's connection closed mid-deliver");
-        got.extend_from_slice(&chunk[..n]);
         assert!(Instant::now() < deadline, "deliver frame never completed");
+        std::thread::sleep(Duration::from_millis(5));
     }
+    let _ = reader.join();
     let response = alice.wait_id("send-1", TIMEOUT).expect("send response");
     assert_eq!(response["ok"], true, "{response}");
     assert_eq!(response["status"], "delivered");
@@ -359,9 +373,13 @@ fn a_slow_op_on_one_connection_does_not_block_other_sessions_or_close() {
     // waiting on alice (her op answers in well under the write-ack timeout
     // alice is parked behind).
     let mut carol = pi_conn(&fixture, "carol-session");
+    // Well under alice's 5s push write-ack timeout: the broken
+    // global-lock version answers only after her op finishes (~5s), so
+    // this stays red there; 4s leaves slow-runner headroom for the fixed
+    // per-connection path.
     let registration = carol.try_request(
         json!({"type":"intercom","op":{"op":"register","session":{"id":"carol-session","name":"carol","caps":["read_receipts","idle_state_v1"]}}}),
-        Duration::from_secs(2),
+        Duration::from_secs(4),
     );
     let registration = registration.expect("carol's register waited on alice's blocked op");
     assert_eq!(registration["ok"], true, "{registration}");
@@ -369,9 +387,11 @@ fn a_slow_op_on_one_connection_does_not_block_other_sessions_or_close() {
     let sent = legacy.ok(json!({"op":"send","to":"pi/carol-session","body":"while alice is stuck"}));
     assert_eq!(sent["status"], "delivered");
 
-    // Alice's connection drops: her close must not wait out her blocked op.
+    // Alice's connection drops: her close must not wait out her blocked
+    // op's 5s push write-ack. 4s keeps red on the global-lock design with
+    // slow-runner headroom for the cancellation path.
     drop(alice);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(4);
     while fixture.sessions().iter().any(|row| row["id"] == "pi/alice-session") {
         assert!(
             Instant::now() < deadline,
@@ -418,7 +438,11 @@ fn a_failed_upgrade_leaves_the_ports_alive() {
     fixture.wait_session("pi/alice-session");
 
     // Corrupt the upgrade target: the preflight rejects it, no handover.
-    fs::write(&copy, b"#!/bin/sh\necho not a pi-famulus\n").unwrap();
+    // Rename over the file: writing a running executable fails with
+    // ETXTBSY on Linux.
+    let corrupt = fixture.root.join("bin/pi-famulus.corrupt");
+    fs::write(&corrupt, b"#!/bin/sh\necho not a pi-famulus\n").unwrap();
+    fs::rename(&corrupt, &copy).unwrap();
     let mut manager =
         common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
     manager.hello_cli();
@@ -444,6 +468,68 @@ fn a_failed_upgrade_leaves_the_ports_alive() {
     register(&mut alice, "alice-session", "alice-again");
     let mut legacy = fixture.plugin("bob-legacy", "idle");
     let sent = legacy.ok(json!({"op":"send","to":"pi/alice-session","body":"still serving"}));
+    let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
+    assert_eq!(deliver["message_id"], sent["message_id"]);
+}
+
+#[test]
+fn a_bridge_reset_finishes_the_in_flight_op_and_answers_queued_ops() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut alice = pi_conn(&fixture, "alice-session");
+    let mut carol = pi_conn(&fixture, "carol-session");
+    register(&mut alice, "alice-session", "alice");
+    register(&mut carol, "carol-session", "carol");
+
+    // Park alice: her send's deliver blocks on carol's capped, undrained
+    // socket, so the op stays in flight across the reset.
+    carol.stream.set_recv_buffer_size(8192).unwrap();
+    let body = "x".repeat(3 * 1024 * 1024);
+    alice.send(&json!({"v":1,"id":"s1","type":"intercom","op":{"op":"send","to":"pi/carol-session","body":body,"reply_to":"pi/alice-session"}}));
+    thread::sleep(Duration::from_millis(300));
+
+    // Two ops queue behind the blocked send (registers, reapplied in
+    // order once the bridge is back).
+    let op = |id: &str, status: &str| {
+        let inner = json!({"op":"register","session":{"id":"alice-session","name":"alice","status":status,"caps":["read_receipts","idle_state_v1"]}}).to_string();
+        let body = json!({"v":1,"id":id,"type":"intercom","op":serde_json::from_str::<Value>(&inner).unwrap()}).to_string();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(body.as_bytes());
+        frame
+    };
+    alice.stream.write_all(&[op("r2", "busy"), op("r3", "idle")].concat()).unwrap();
+
+    // Restart the bridge (config change on promotion).
+    fixture.release_lease();
+    fixture.config("remote_messages = 'refuse'\n");
+    let mut manager =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
+    manager.hello_cli();
+    manager.request_ok(json!({"type":"supervise"}));
+
+    // The in-flight send finishes (the old runtime's write-ack times out
+    // against the undrained carol) and is answered on the same connection.
+    let send = alice
+        .wait_id("s1", Duration::from_secs(20))
+        .expect("in-flight send answered");
+    assert_eq!(send["ok"], true, "{send}");
+    // Then every queued op gets a deterministic, ordered reset answer.
+    let r2 = alice
+        .wait_id("r2", Duration::from_secs(15))
+        .expect("queued op r2 answered promptly");
+    assert_eq!(r2["error"]["code"], "E_INTERCOM_RESET", "{r2}");
+    let r3 = alice
+        .wait_id("r3", Duration::from_secs(15))
+        .expect("queued op r3 answered promptly");
+    assert_eq!(r3["error"]["code"], "E_INTERCOM_RESET", "{r3}");
+    // Wire order across the reset: r2's answer precedes r3's (wait_id
+    // reads the socket in order, so reaching both asserts FIFO).
+
+    // One worker served everything: the same connection re-registers and
+    // messaging works end to end.
+    register(&mut alice, "alice-session", "alice");
+    let mut bob = fixture.plugin("bob-legacy", "idle");
+    let sent = bob.ok(json!({"op":"send","to":"pi/alice-session","body":"after reset"}));
     let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
     assert_eq!(deliver["message_id"], sent["message_id"]);
 }
@@ -478,13 +564,16 @@ fn unbound_ports_cannot_spoof_other_sessions() {
     intercom_ok(&mut alice, json!({"op":"list"}));
 
     // After register, the rest of the client surface stays shut: a pi
-    // session speaks for its own bound id only.
+    // session speaks for its own bound id only. Neither the extension nor
+    // the old plugin uses session_name/message_status.
     register(&mut alice, "alice-session", "alice");
     for op in [
         json!({"op":"inbound","session":{"id":"pi/victim"},"body":"x"}),
         json!({"op":"session_unpublish","args":["pi/alice-session"]}),
         json!({"op":"workspace_list"}),
         json!({"op":"subscribe_idle","as":"pi/victim","to":"pi/target"}),
+        json!({"op":"session_name","to":"pi/victim","name":"hijacked"}),
+        json!({"op":"message_status","message_id":"whatever"}),
     ] {
         let refused = intercom(&mut alice, op.clone());
         assert_ne!(refused["ok"], true, "spoofing op accepted: {refused}");
@@ -551,24 +640,138 @@ fn a_remote_unpublish_reaches_the_extension_as_a_reset() {
     );
 }
 
+/// True when a fresh legacy peer can register on the bridge socket: the
+/// file exists, a connect succeeds, and a full register round-trip
+/// answers (a dying pre-handover listener passes a bare connect and then
+/// closes mid-request).
+fn bridge_accepts_register(fixture: &Fixture) -> bool {
+    use std::io::{BufRead, Write as _};
+    let Ok(mut stream) = UnixStream::connect(&fixture.sock) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
+    let request = json!({"id":"probe","op":"register","session":{"id":"probe-peer","name":"probe"}}).to_string() + "\n";
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    matches!(reader.read_line(&mut line), Ok(n) if n > 0)
+}
+
+/// A manager connection whose hello carries a chosen pi_pid (a stand-in
+/// process the test can kill).
+fn pi_conn_as(fixture: &Fixture, session: &str, pi_pid: u32) -> common::Conn {
+    let mut conn = common::Conn::new(
+        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
+    );
+    let hello = conn.hello(json!({
+        "type": "hello",
+        "client_kind": "extension",
+        "session_id": session,
+        "pi_pid": pi_pid,
+        "protocol": 7,
+    }));
+    assert_eq!(hello["ok"], true, "pi hello: {hello}");
+    conn
+}
+
 #[test]
-fn closing_a_port_settles_unread_deliveries_as_dropped() {
+fn an_unpublish_during_an_in_flight_op_still_reaches_the_extension() {
     let mut fixture = Fixture::new();
     fixture.start();
     let mut alice = pi_conn(&fixture, "alice-session");
+    let mut carol = pi_conn(&fixture, "carol-session");
+    register(&mut alice, "alice-session", "alice");
+    register(&mut carol, "carol-session", "carol");
+
+    // Alice's send blocks on carol's capped, undrained socket: the op is
+    // in flight when the session is unpublished.
+    carol.stream.set_recv_buffer_size(8192).unwrap();
+    let body = "x".repeat(3 * 1024 * 1024);
+    alice.send(&json!({"v":1,"id":"s1","type":"intercom","op":{"op":"send","to":"pi/carol-session","body":body,"reply_to":"pi/alice-session"}}));
+    thread::sleep(Duration::from_millis(300));
+    let mut cli = fixture.connect();
+    cli.ok(json!({"op":"session_unpublish","args":["pi/alice-session"]}));
+
+    // The in-flight op ends with the ownership error...
+    let send = alice
+        .wait_id("s1", Duration::from_secs(20))
+        .expect("the in-flight op is answered");
+    assert_ne!(send["ok"], true, "{send}");
+    assert!(
+        send["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("ownership ended")),
+        "{send}"
+    );
+    // ...and the unpublish still reaches the extension as a reset (the
+    // in-op select consumed the watch notification; the outer loop must
+    // re-check the value).
+    let reset = alice
+        .wait_event(TIMEOUT, |event| event["event"] == "intercom_reset")
+        .unwrap_or_else(|| panic!("no intercom_reset after the mid-op unpublish; events: {:?}", alice.events));
+    assert_eq!(reset["event"], "intercom_reset");
+}
+
+#[test]
+fn a_dead_pi_process_settles_unread_deliveries_as_dropped() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    // The pi process is a real child the test kills: the daemon's crash
+    // signal (dead pi_pid) is what makes a close a "session gone".
+    let mut standin = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let mut alice = pi_conn_as(&fixture, "alice-session", standin.id());
     register(&mut alice, "alice-session", "alice");
     fixture.wait_session("pi/alice-session");
 
     // A legacy peer sends a message alice never reads; then her connection
-    // dies for good. The sender must get a terminal dropped receipt.
+    // dies for good along with the pi process. The sender must get a
+    // terminal dropped receipt.
+    let mut legacy = fixture.plugin("bob-legacy", "idle");
+    let sent = legacy.ok(json!({"op":"send","to":"pi/alice-session","body":"unread"}));
+    let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
+    assert_eq!(deliver["message_id"], sent["message_id"]);
+    // The pi process dies first, then its connection goes.
+    standin.kill().unwrap();
+    standin.wait().unwrap();
+    drop(alice);
+    let receipt = legacy.event("receipt");
+    assert_eq!(receipt["message_id"], sent["message_id"]);
+    assert_eq!(receipt["status"], "dropped");
+}
+
+#[test]
+fn a_reconnect_gap_does_not_settle_unread_deliveries() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    // pi_pid is this (alive) test process: a plain disconnect with a gap
+    // must NOT settle unread deliveries as dropped.
+    let mut alice = pi_conn(&fixture, "alice-session");
+    register(&mut alice, "alice-session", "alice");
+    fixture.wait_session("pi/alice-session");
     let mut legacy = fixture.plugin("bob-legacy", "idle");
     let sent = legacy.ok(json!({"op":"send","to":"pi/alice-session","body":"unread"}));
     let deliver = intercom_frame(&mut alice, |frame| frame["type"] == "deliver");
     assert_eq!(deliver["message_id"], sent["message_id"]);
     drop(alice);
-    let receipt = legacy.event("receipt");
-    assert_eq!(receipt["message_id"], sent["message_id"]);
-    assert_eq!(receipt["status"], "dropped");
+
+    // The gap: no dropped receipt even though the connection is gone.
+    legacy.no_event_for(Duration::from_millis(700));
+
+    // The same session reconnects and re-registers; its late read receipt
+    // for the pre-gap delivery is accepted, not settled over.
+    let mut alice = pi_conn(&fixture, "alice-session");
+    register(&mut alice, "alice-session", "alice");
+    fixture.wait_session("pi/alice-session");
+    intercom_ok(
+        &mut alice,
+        json!({"op":"receipt","message_id":sent["message_id"],"status":"read"}),
+    );
 }
 
 #[test]
@@ -627,11 +830,13 @@ fn reregistration_and_pre_upgrade_receipts_survive_an_in_place_upgrade() {
     let upgraded = manager.request_ok(json!({"type":"upgrade"}));
     assert!(upgraded["ok"] == true, "upgrade request: {upgraded}");
 
-    // The bridge socket of the old image is gone until the new image's
-    // bridge rebinds it.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !fixture.root.join("state").exists() || UnixStream::connect(&fixture.sock).is_err() {
-        assert!(Instant::now() < deadline, "bridge socket did not return: {}", fixture.manager_log());
+    // The bridge socket of the old image dies with it; between the
+    // upgrade response and the handover the OLD listener can still accept
+    // (and then die mid-request), so readiness needs a full register
+    // round-trip, not just a connectable path.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !fixture.root.join("state").exists() || !bridge_accepts_register(&fixture) {
+        assert!(Instant::now() < deadline, "bridge did not come back: {}", fixture.manager_log());
         thread::sleep(Duration::from_millis(25));
     }
 

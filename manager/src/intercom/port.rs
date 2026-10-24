@@ -86,7 +86,7 @@ impl Port {
                 return Err("op as= is not available to a pi session over the manager connection".into());
             }
             let allowed: &[&str] = if self.bound.is_empty() {
-                &["register", "list", "message_status"]
+                &["register", "list"]
             } else {
                 &[
                     "register",
@@ -95,8 +95,6 @@ impl Port {
                     "send",
                     "receipt",
                     "subscribe_idle",
-                    "message_status",
-                    "session_name",
                 ]
             };
             if !allowed.contains(&op) {

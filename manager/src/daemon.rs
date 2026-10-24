@@ -242,6 +242,10 @@ pub struct DaemonState {
 pub(crate) struct IntercomEntry {
     tx: mpsc::Sender<IntercomOp>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// Bumped by reset_intercom_ports: the worker drops its port and
+    /// answers queued ops with E_INTERCOM_RESET. Keeping the entry (and
+    /// the worker) preserves wire order across the reset.
+    reset: tokio::sync::watch::Sender<u64>,
 }
 
 /// One queued intercom op: the client-protocol request plus the request id
@@ -3757,6 +3761,9 @@ async fn handle_supervise(state: &Shared, conn_id: u64) -> Result<SuperviseOk, P
 
 const E_INTERCOM_DISABLED: &str = "E_INTERCOM_DISABLED";
 const E_INTERCOM_UNAVAILABLE: &str = "E_INTERCOM_UNAVAILABLE";
+/// The bridge restarted under this port; re-register and retry idempotent
+/// ops. `send` is never retried by the extension.
+const E_INTERCOM_RESET: &str = "E_INTERCOM_RESET";
 
 /// Publish the current bridge (and why it is down) for `intercom` requests.
 /// Brief locked access: callers only clone the runtime Arc out of it.
@@ -3800,17 +3807,23 @@ async fn bridge_changed(
 
 async fn reset_intercom_ports(state: &Shared) {
     let entries: Vec<(u64, IntercomEntry)> = {
-        // Both locks, brief: same order as enqueue_intercom_op.
+        // Both locks, brief: same order as enqueue_intercom_op. Entries
+        // STAY in the map: each connection keeps its one worker, so wire
+        // order survives the reset.
         let st = state.lock().unwrap();
-        let mut guard = st.intercom_ports.lock().unwrap();
-        std::mem::take(&mut *guard).into_iter().collect()
+        let guard = st.intercom_ports.lock().unwrap();
+        guard.iter().map(|(id, e)| (*id, IntercomEntry {
+            tx: e.tx.clone(),
+            shutdown: e.shutdown.clone(),
+            reset: e.reset.clone(),
+        })).collect()
     };
     if entries.is_empty() {
         return;
     }
-    // Best-effort reset notice; the extension also recovers on its own:
-    // its next op lands on a fresh, unbound port and the "not registered"
-    // error triggers a re-register.
+    // Best-effort reset notice; the worker ALSO bumps the reset watch, so
+    // queued ops are answered deterministically even when this event is
+    // lost (full out-queue).
     {
         let st = state.lock().unwrap();
         for (conn_id, _) in &entries {
@@ -3821,10 +3834,9 @@ async fn reset_intercom_ports(state: &Shared) {
             }
         }
     }
-    // The workers keep running: they notice the new bridge runtime on the
-    // next op and recreate their ports, so nothing here waits on an
-    // in-flight op.
-    drop(entries);
+    for (_, entry) in entries {
+        entry.reset.send_modify(|generation| *generation += 1);
+    }
 }
 
 
@@ -3938,9 +3950,12 @@ fn enqueue_intercom_op(
     if let Some(entry) = guard.get(&conn_id) {
         return Ok(entry.tx.clone());
     }
-    eprintln!("DEBUG enqueue: creating worker for conn {conn_id}");
     let (tx, rx) = mpsc::channel::<IntercomOp>(64);
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Bumped on every bridge restart so the worker drops its (dead-runtime)
+    // port and answers queued ops deterministically instead of racing a
+    // replacement worker.
+    let (reset, reset_rx) = tokio::sync::watch::channel(0u64);
     let out = handle.tx.clone();
     let worker_state = state.clone();
     tokio::spawn(intercom_worker(
@@ -3951,12 +3966,14 @@ fn enqueue_intercom_op(
         rx,
         out,
         shutdown_rx,
+        reset_rx,
     ));
     guard.insert(
         conn_id,
         IntercomEntry {
             tx: tx.clone(),
             shutdown,
+            reset,
         },
     );
     Ok(tx)
@@ -3983,6 +4000,7 @@ fn idle_watch() -> (
 /// connection's later intercom ops, never other sessions, and never the
 /// accept loop's close/reset paths.
 #[allow(unused_assignments)] // the watch senders matter alive, not read
+#[allow(clippy::too_many_arguments)] // the connection context plus its three wake sources
 async fn intercom_worker(
     state: Shared,
     _conn_id: u64,
@@ -3991,17 +4009,19 @@ async fn intercom_worker(
     mut ops: mpsc::Receiver<IntercomOp>,
     out: OutTx,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut reset: tokio::sync::watch::Receiver<u64>,
 ) {
     let (push_tx, push_rx) = mpsc::channel::<crate::intercom::Push>(128);
     let relay = tokio::spawn(intercom_port_relay(push_rx, out.clone()));
-    // The port and its bridge runtime; the watch starts never-fired and is
-    // replaced with each port so an unpublish interrupts the wait below.
+    // The port and its bridge runtime; the watches start never-fired and
+    // are replaced with each port so an unpublish interrupts the wait
+    // below. The senders are never read; keeping them alive is what
+    // matters (a dropped sender makes changed() complete immediately).
     let mut port: Option<crate::intercom::port::Port> = None;
     let mut port_rt: Option<crate::intercom::Shared> = None;
-    // The senders are never read; keeping them alive is what matters (a
-    // dropped sender makes the receiver's changed() complete immediately).
     let (mut unpublished_tx, mut unpublished) = idle_watch();
     let _ = &unpublished_tx;
+    let _ = reset.borrow_and_update();
     loop {
         // (Re)create the port whenever the bridge runtime changed under it.
         let current = current_intercom_rt(&state);
@@ -4031,15 +4051,20 @@ async fn intercom_worker(
                 port_rt = Some(rt);
             }
         }
+        // An unpublish that landed DURING the previous op is not lost:
+        // the in-op select's teardown runs Port::close(), which re-sends
+        // the disconnect watch, so the select below observes it.
         enum Wake {
             Shutdown,
             Unpublished,
+            Reset,
             Op(Option<IntercomOp>),
         }
         let wake = tokio::select! {
             biased;
             _ = shutdown.changed() => Wake::Shutdown,
             _ = unpublished.changed() => Wake::Unpublished,
+            _ = reset.changed() => Wake::Reset,
             op = ops.recv() => Wake::Op(op),
         };
         let op = match wake {
@@ -4055,20 +4080,54 @@ async fn intercom_worker(
                 }
                 port_rt = None;
                 (unpublished_tx, unpublished) = idle_watch();
-                let _ = &unpublished_tx;
+                continue;
+            }
+            Wake::Reset => {
+                // The bridge restarted: the port belongs to the dead
+                // runtime; the extension re-registers on the fresh port
+                // its next op creates. Answer every queued op with a
+                // deterministic reset error, in order, after whatever op
+                // was in flight has been answered. Idempotent ops may be
+                // retried by the extension after re-registering; send may
+                // not.
+                if let Some(mut old) = port.take() {
+                    let _ = old.close().await;
+                }
+                port_rt = None;
+                (unpublished_tx, unpublished) = idle_watch();
+                while let Ok(queued) = ops.try_recv() {
+                    if out
+                        .send(encode_error(
+                            &queued.id,
+                            E_INTERCOM_RESET,
+                            "intercom reset: re-register and retry idempotent ops",
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 continue;
             }
             Wake::Op(Some(op)) => op,
         };
         let Some(port) = port.as_mut() else {
-
             let _ = out.send(encode_bridge_down(&state, &op.id)).await;
             continue;
         };
         let result = tokio::select! {
             biased;
-            _ = shutdown.changed() => Err("connection closed".to_string()),
-            _ = unpublished.changed() => Err("session ownership ended".to_string()),
+            _ = shutdown.changed() => {
+                // Cancelled mid-op: run the cleanup the op would have
+                // done (takeover removals, watcher settle) before dying.
+                let _ = port.close().await;
+                Err("connection closed".to_string())
+            }
+            _ = unpublished.changed() => {
+                let _ = port.close().await;
+                Err("session ownership ended".to_string())
+            }
             result = port.handle(&op.req) => result,
         };
         let frame = match &result {
@@ -4080,19 +4139,25 @@ async fn intercom_worker(
         }
     }
     // Connection teardown: settle unread deliveries as dropped, but only
-    // when the pi session itself is really gone (a rebind or reconnect has
-    // a live replacement connection and keeps its queue semantics).
+    // when the pi session is really gone — a clean shutdown_session, or a
+    // dead pi process (the daemon's crash signal). A plain reconnect gap
+    // clears conn_id before we run; the session's queue must survive for
+    // the re-registration, and the extension reports dropped itself when
+    // the session actually changes.
     if let Some(mut port) = port.take() {
         let removed = port.close().await;
         if let Some(id) = removed {
-            let session_alive = {
+            let gone = {
                 let st = state.lock().unwrap();
-                st.sessions
-                    .get(&session_id)
-                    .and_then(|session| session.conn_id)
-                    .is_some()
+                match st.sessions.get(&session_id) {
+                    Some(entry) => {
+                        entry.ended_clean
+                            || (entry.pi_pid != 0 && !crate::sys::pid_alive(entry.pi_pid))
+                    }
+                    None => true,
+                }
             };
-            if !session_alive {
+            if gone {
                 if let Some(rt) = port_rt {
                     rt.settle_unread_target(&id, "session closed").await;
                 }
@@ -5316,41 +5381,43 @@ mod tests {
             false,
         )));
         let mk = |role: ConnRole, kind: ClientKind, session: Option<&str>| {
-            let (tx, _rx) = mpsc::channel(8);
+            let (tx, rx) = mpsc::channel(8);
             let writer = tokio::spawn(std::future::pending::<()>()).abort_handle();
-            ConnHandle {
-                kind,
-                role,
-                child_id: None,
-                session_id: session.map(str::to_string),
-                tx,
-                die: Arc::new(Notify::new()),
-                written: Arc::new(Mutex::new(HashMap::new())),
-                writer,
-                supervisor: false,
-            }
+            (
+                ConnHandle {
+                    kind,
+                    role,
+                    child_id: None,
+                    session_id: session.map(str::to_string),
+                    tx,
+                    die: Arc::new(Notify::new()),
+                    written: Arc::new(Mutex::new(HashMap::new())),
+                    writer,
+                    supervisor: false,
+                },
+                rx,
+            )
         };
-        state.lock().unwrap().conns.insert(1, mk(ConnRole::Cli, ClientKind::Cli, None));
-        state
-            .lock()
-            .unwrap()
-            .conns
-            .insert(2, mk(ConnRole::Child, ClientKind::Extension, Some("child-session")));
-        state
-            .lock()
-            .unwrap()
-            .conns
-            .insert(3, mk(ConnRole::Parent, ClientKind::Extension, Some("parent-session")));
+        let (cli_handle, _cli_rx) = mk(ConnRole::Cli, ClientKind::Cli, None);
+        state.lock().unwrap().conns.insert(1, cli_handle);
+        let (child_handle, _child_rx) =
+            mk(ConnRole::Child, ClientKind::Extension, Some("child-session"));
+        state.lock().unwrap().conns.insert(2, child_handle);
+        let (parent_handle, mut parent_rx) =
+            mk(ConnRole::Parent, ClientKind::Extension, Some("parent-session"));
+        state.lock().unwrap().conns.insert(3, parent_handle);
         let cli = enqueue_intercom_op(&state, 1).unwrap_err();
         assert_eq!(cli.code, E_FORBIDDEN, "{cli:?}");
         let child = enqueue_intercom_op(&state, 2).unwrap_err();
         assert_eq!(child.code, E_FORBIDDEN, "{child:?}");
         // A parent connection without a session is rejected too.
-        state.lock().unwrap().conns.insert(4, mk(ConnRole::Parent, ClientKind::Extension, None));
+        let (sessionless_handle, _sessionless_rx) =
+            mk(ConnRole::Parent, ClientKind::Extension, None);
+        state.lock().unwrap().conns.insert(4, sessionless_handle);
         let no_session = enqueue_intercom_op(&state, 4).unwrap_err();
         assert_eq!(no_session.code, E_SESSION_REQUIRED, "{no_session:?}");
-        // A live parent connection gets a queue and a worker; the queue
-        // accepts an op and the worker answers it.
+        // A live parent connection gets a queue and a worker, and the
+        // worker answers the op.
         let queue = enqueue_intercom_op(&state, 3).unwrap();
         queue
             .send(IntercomOp {
@@ -5359,6 +5426,20 @@ mod tests {
             })
             .await
             .unwrap();
+        let frame = parent_rx.recv().await.expect("the worker answers the op");
+        let response = std::str::from_utf8(&frame.bytes).unwrap();
+        let response: serde_json::Value = serde_json::from_str(response).unwrap();
+        // The bare DaemonState publishes no bridge runtime, so the worker
+        // answers with the structured bridge-down error — deterministic on
+        // any host. What matters here is that the op reached the worker and
+        // got an answered envelope echoing the request id; the code pins the
+        // exact contract instead of merely "some response".
+        assert_eq!(response["id"], "q", "{response}");
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(
+            response["error"]["code"], E_INTERCOM_UNAVAILABLE,
+            "{response}"
+        );
         drop(queue);
         let _ = std::fs::remove_dir_all(&home);
     }

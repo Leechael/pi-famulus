@@ -510,19 +510,26 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   /** One op on the bridge; op-level errors resolve with `{error}` set.
    * "not registered" / "ownership ended" mean the port died underneath us
    * (bridge restart, reconnect, session unpublished) without a reset event
-   * we saw: re-register and retry the op once. */
+   * we saw: re-register and retry the op once. A queued op interrupted by
+   * a bridge restart (E_INTERCOM_RESET) never ran; idempotent ops re-register
+   * and retry, but `send` is NEVER retried — the daemon refuses to promise
+   * an interrupted send did not take effect. */
   async function rpc(op: string, extra: Record<string, unknown> = {}, retried = false): Promise<IntercomFrame> {
-    const frame = (await transport.call({ op, ...extra })) as IntercomFrame;
-    if (
-      !retried &&
-      frame.error &&
-      /not registered|ownership ended/.test(frame.error) &&
-      op !== "register"
-    ) {
-      invalidatePort();
-      if (lastCtx) await start(lastCtx, true);
-      if (!registered) return frame;
-      return await rpc(op, extra, true);
+    const frame = (await transport.call({ op, ...extra })) as IntercomFrame & { code?: string };
+    if (!retried && op !== "register") {
+      const interrupted =
+        frame.code === "E_INTERCOM_RESET" ||
+        (frame.error !== undefined && /not registered|ownership ended/.test(frame.error));
+      if (interrupted) {
+        invalidatePort();
+        if (lastCtx) await start(lastCtx, true);
+        if (!registered) return frame;
+        // Never auto-retry a body: the daemon refuses to promise an
+        // interrupted send did not take effect. The tool result carries
+        // the error; the model decides whether to send again.
+        if (op === "send") return frame;
+        return await rpc(op, extra, true);
+      }
     }
     return frame;
   }
@@ -728,6 +735,20 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     if (resp.error) throw new Error(resp.error);
     const rows = resp.sessions || [];
     listCache = { rows, at: now() };
+    if (registered && sessionId && !rows.some((row) => row.id === sessionId)) {
+      // The directory no longer lists us: the port died without a reset
+      // we saw (lost event). Self-heal: re-register and answer from the
+      // fresh listing.
+      invalidatePort();
+      if (lastCtx) await start(lastCtx, true);
+      if (!registered) return rows;
+      const fresh = await rpc("list");
+      assertActive(listEpoch);
+      if (fresh.error) throw new Error(fresh.error);
+      const freshRows = fresh.sessions || [];
+      listCache = { rows: freshRows, at: now() };
+      return freshRows;
+    }
     return rows;
   }
 

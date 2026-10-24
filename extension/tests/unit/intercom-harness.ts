@@ -36,6 +36,11 @@ interface FakeConnection {
   up: boolean;
   /** The registered bridge id (`pi/<sessionId>`), null before register. */
   bound: string | null;
+  /** The first op after a silent reset is refused with E_INTERCOM_RESET. */
+  pendingResetError: boolean;
+  /** The next send op is refused "session not registered" (a send racing
+   * a dead port). */
+  failNextSend: boolean;
   frameHandlers: Set<(frame: Record<string, unknown>) => void>;
   resetHandlers: Set<() => void>;
 }
@@ -66,6 +71,12 @@ export interface FakeManager {
   /** Kill the current connection's port WITHOUT any reset notice (a lost
    * intercom_reset): the next op gets "session not registered". */
   killPortSilently: () => void;
+  /** Like killPortSilently, but the daemon answers the next op with
+   * E_INTERCOM_RESET (queued across a bridge restart). */
+  resetBridgeSilently: () => void;
+  /** The next send op is refused "session not registered" (a send racing a
+   * dead port), regardless of registration state. */
+  failNextSend: () => void;
   /** The manager connection (re)opened or dropped. Coming back up models a
    * reconnect: ports die, onReconnect fires. */
   setUp: (up: boolean) => void;
@@ -110,6 +121,8 @@ export function createFakeManager(options: {
     sessionId: options.sessionId ?? "target-session",
     up,
     bound: null,
+    pendingResetError: false,
+    failNextSend: false,
     frameHandlers: new Set(),
     resetHandlers: new Set(),
   };
@@ -120,6 +133,8 @@ export function createFakeManager(options: {
     sessionId,
     up,
     bound: null,
+    pendingResetError: false,
+    failNextSend: false,
     frameHandlers: new Set(),
     resetHandlers: new Set(),
   });
@@ -169,12 +184,22 @@ export function createFakeManager(options: {
     if (disabled) throw new IntercomError("disabled by PI_FAMULUS_NO_INTERCOM", "E_INTERCOM_DISABLED", "disabled");
     if (down) throw new IntercomError(down, "E_INTERCOM_UNAVAILABLE", "unavailable");
     const opName = req.op as string;
+    if (conn.pendingResetError) {
+      // An op queued when the bridge restarted, answered before it ran —
+      // ahead of the (unbound) allowlist, like the daemon's reset drain.
+      conn.pendingResetError = false;
+      return { error: "intercom reset: re-register and retry idempotent ops", code: "E_INTERCOM_RESET" };
+    }
     if (!conn.bound) {
-      const allowedUnbound = ["register", "list", "message_status"];
+      const allowedUnbound = ["register", "list"];
       if (!allowedUnbound.includes(opName)) return { error: "session not registered" };
     } else {
-      const allowed = ["register", "unregister", "list", "send", "receipt", "subscribe_idle", "message_status", "session_name"];
+      const allowed = ["register", "unregister", "list", "send", "receipt", "subscribe_idle"];
       if (!allowed.includes(opName)) return { error: `op ${opName} is not available to a pi session over the manager connection` };
+    }
+    if (conn.failNextSend && opName === "send") {
+      conn.failNextSend = false;
+      return { error: "session not registered" };
     }
     if (opName === "register") {
       // Identity binding, like the daemon: the raw hello key or the forced
@@ -261,6 +286,17 @@ export function createFakeManager(options: {
     },
     killPortSilently: () => {
       if (current) current.bound = null;
+    },
+    resetBridgeSilently: () => {
+      // The intercom_reset event was lost (full out-queue); the port died
+      // and the next op is answered with E_INTERCOM_RESET.
+      if (current) {
+        current.bound = null;
+        current.pendingResetError = true;
+      }
+    },
+    failNextSend: () => {
+      if (current) current.failNextSend = true;
     },
     setUp: (value) => {
       const reconnected = value && !up;

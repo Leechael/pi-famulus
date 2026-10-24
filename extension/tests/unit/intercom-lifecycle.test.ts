@@ -426,20 +426,51 @@ it("a reset event fences an in-flight register from the dead port", async () => 
   await h.emit("session_shutdown", {});
 });
 
-it("a lost reset is recovered: a not-registered op re-registers and retries", async () => {
+it("a lost reset is recovered: the session re-registers transparently", async () => {
   const h = lifecycleHarness();
   await h.emit("session_start");
   expect(h.fake.registrations.length).toBe(1);
   // The intercom_reset event never reached us (full queue); the port died
-  // silently underneath a still-registered session.
+  // silently underneath a still-registered session. An idempotent op
+  // recovers; a body is never auto-retried (asserted in its own test).
   h.fake.killPortSilently();
+  const listed = await h.pi.tools.get("ListSessions").execute("list", {});
+  expect(listed.isError).not.toBe(true);
+  expect(h.fake.registrations.length).toBe(2);
   const sent = await h.pi.tools.get("SendMessage").execute("send", { to: "claude/peer", message: "hello" });
   expect(sent.isError).not.toBe(true);
-  // Re-registered transparently, then the send went through. Two send ops
-  // are recorded: the first refused by the unbound port, the retried one
-  // delivered.
+  expect(h.fake.requests.filter((r: any) => r.op === "send").length).toBe(1);
+  await h.emit("session_shutdown", {});
+});
+
+it("a queued idempotent op interrupted by a bridge reset re-registers and retries", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  expect(h.fake.registrations.length).toBe(1);
+  h.fake.resetBridgeSilently();
+  const result = await h.pi.tools.get("ListSessions").execute("list", {});
+  expect(result.isError).not.toBe(true);
+  // Re-registered transparently, then the list was retried and answered.
   expect(h.fake.registrations.length).toBe(2);
-  expect(h.fake.requests.filter((r: any) => r.op === "send").length).toBe(2);
+  expect(h.fake.requests.filter((r: any) => r.op === "list").length).toBe(2);
+  await h.emit("session_shutdown", {});
+});
+
+it("a send interrupted by a dead port is never auto-retried", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  // The port dies (bridge restart / lost reset): the tool's ops land on a
+  // fresh unbound port. Idempotent ops recover transparently; the body is
+  // never resent — the daemon refuses to promise it did not run.
+  h.fake.failNextSend();
+  const result = await h.pi.tools.get("SendMessage").execute("send", { to: "claude/peer", message: "hello" });
+  expect(result.isError).toBe(true);
+  // The body was NOT resent; the re-register still happened.
+  expect(h.fake.requests.filter((r: any) => r.op === "send").length).toBe(1);
+  expect(h.fake.registrations.length).toBe(2);
+  // A later send works again without any further ceremony.
+  const again = await h.pi.tools.get("SendMessage").execute("send-2", { to: "claude/peer", message: "again" });
+  expect(again.isError).not.toBe(true);
   await h.emit("session_shutdown", {});
 });
 
