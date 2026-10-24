@@ -925,6 +925,7 @@ mod tests {
                 remote: Vec::new(),
                 relay_tx: None,
                 control_outbox: VecDeque::new(),
+                port_conns: HashSet::new(),
                 relay_message_ids: false,
                 relay_generation: 0,
                 legacy_active: None,

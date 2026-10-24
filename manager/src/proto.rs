@@ -19,8 +19,10 @@ pub const PROTO_VERSION: u32 = 1;
 /// in-place upgrade (`upgrade`, status `generation`/`last_upgrade`, start
 /// keys, resend on reconnect); 4 = machine-wide agent admission; 5 = per-kind
 /// agent budgets and queued acquire; 6 = hosted subagents (`pi --mode rpc`
-/// processes: spawn, input, watch, comms, cache, hosting lookup).
-pub const PROTOCOL: u32 = 6;
+/// processes: spawn, input, watch, comms, cache, hosting lookup); 7 = the
+/// extension's messaging bridge (`intercom` request + `intercom`/
+/// `intercom_reset` events over the manager connection).
+pub const PROTOCOL: u32 = 7;
 /// The first protocol level whose manager understands `upgrade`.
 pub const PROTOCOL_UPGRADE: u32 = 3;
 /// §3.3: max frame 4 MiB.
@@ -460,6 +462,15 @@ pub enum RequestKind {
     /// executable path (exec, same pid; see `handover.rs`). Answered before
     /// the handover starts; the result shows in `status.last_upgrade`.
     Upgrade,
+    /// The extension's messaging bridge: one intercom client-protocol op
+    /// (`register`, `send`, `list`, `receipt`, …) per request. Accepted from
+    /// extension connections with the parent role only (protocol 7+); the
+    /// daemon keeps one port per connection and answers with the op's
+    /// result. Bridge frames for the session arrive as `intercom` events.
+    Intercom {
+        /// The op request object, e.g. `{"op":"send","to":"…","body":"…"}`.
+        op: serde_json::Value,
+    },
     /// Test-only (`test-clock` feature): pending manual-clock timers. Sent
     /// as the first frame of a connection, without hello, so it never counts
     /// as an active connection.
@@ -798,6 +809,17 @@ pub enum EventKind {
         child_id: String,
         request: serde_json::Value,
     },
+    /// An intercom bridge frame for this connection's registered session
+    /// (a `deliver`, `receipt` or `idle_notice` client-protocol frame).
+    /// Only extension parent connections that sent an `intercom` request
+    /// receive these (protocol 7+).
+    Intercom {
+        frame: serde_json::Value,
+    },
+    /// The messaging bridge restarted (or stopped and came back): every
+    /// port belonged to the previous bridge runtime. The extension must
+    /// re-register its session, as if its socket had closed.
+    IntercomReset {},
 }
 
 // ---------------------------------------------------------------------------

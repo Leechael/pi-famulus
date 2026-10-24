@@ -38,10 +38,13 @@ type OutTx = mpsc::Sender<OutFrame>;
 
 /// One frame queued for a connection's writer. Output events say which
 /// task and cursor they carry, so the writer can record how far the client
-/// really got (`ConnHandle::written`).
+/// really got (`ConnHandle::written`). `ack` frames (the intercom port
+/// relay) resolve only after the bytes hit the socket: delivered/read
+/// receipt semantics depend on that ordering.
 pub struct OutFrame {
     bytes: Arc<Vec<u8>>,
     output: Option<(String, u64)>,
+    ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
 
 impl OutFrame {
@@ -49,12 +52,24 @@ impl OutFrame {
         OutFrame {
             bytes,
             output: None,
+            ack: None,
         }
     }
     fn output(bytes: Arc<Vec<u8>>, task_id: &str, next_cursor: u64) -> OutFrame {
         OutFrame {
             bytes,
             output: Some((task_id.to_string(), next_cursor)),
+            ack: None,
+        }
+    }
+    fn ack(
+        bytes: Arc<Vec<u8>>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) -> OutFrame {
+        OutFrame {
+            bytes,
+            output: None,
+            ack: Some(ack),
         }
     }
 }
@@ -207,6 +222,24 @@ pub struct DaemonState {
     agent_notices: Option<mpsc::UnboundedReceiver<crate::hosted::Notice>>,
     supervision: mpsc::UnboundedSender<SupervisionRequest>,
     supervision_rx: Option<mpsc::UnboundedReceiver<SupervisionRequest>>,
+    /// The messaging bridge runtime currently served over `intercom`
+    /// requests; `None` while the bridge is down (and why, in
+    /// `intercom_error`). Swapped by the accept loop on every bridge
+    /// (re)start; brief locked access only (clone the Arc).
+    pub intercom_rt: Arc<Mutex<Option<crate::intercom::Shared>>>,
+    /// Why the bridge is down, when `intercom_rt` is `None`.
+    pub intercom_error: Arc<Mutex<Option<String>>>,
+    /// One intercom port per manager connection that sent an `intercom`
+    /// request (protocol 7). Owned here so a connection close, a session
+    /// rebind, and a bridge restart can all close ports the same way.
+    pub intercom_ports: Arc<tokio::sync::Mutex<HashMap<u64, PortEntry>>>,
+}
+
+/// A manager connection's intercom port and the task relaying its push
+/// frames onto the connection as `intercom` events.
+pub struct PortEntry {
+    pub port: crate::intercom::port::Port,
+    relay: tokio::task::AbortHandle,
 }
 
 /// Bound on remembered start keys.
@@ -256,6 +289,9 @@ impl DaemonState {
             agent_notices: Some(notice_rx),
             supervision,
             supervision_rx: Some(supervision_rx),
+            intercom_rt: Arc::new(Mutex::new(None)),
+            intercom_error: Arc::new(Mutex::new(None)),
+            intercom_ports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -595,6 +631,7 @@ async fn serve(
     // Restarted after a failed in-place upgrade, which only Unix performs.
     #[cfg_attr(windows, allow(unused_mut))]
     let (mut intercom, mut bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
+    publish_bridge(&state, &intercom, &bridge_error);
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
@@ -645,6 +682,7 @@ async fn serve(
             },
             Some(request) = supervision_rx.recv(), if shutdown_task.is_none() => {
                 let status = apply_supervision(&state, &mut intercom, &mut bridge_error).await;
+                bridge_changed(&state, &intercom, &bridge_error).await;
                 if let Some(reply) = request.reply {
                     let _ = reply.send(status);
                 }
@@ -662,6 +700,7 @@ async fn serve(
                         if intercom.is_none() {
                             (intercom, bridge_error) = start_bridge(&home, intercom_clock.clone()).await;
                             apply_supervision(&state, &mut intercom, &mut bridge_error).await;
+                            bridge_changed(&state, &intercom, &bridge_error).await;
                         }
                     }
                 }
@@ -922,15 +961,22 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
         if payload.len() > MAX_FRAME_SIZE as usize {
             continue;
         }
-        if let Err(e) = write_frame(&mut w, payload).await {
+        let write_result = write_frame(&mut w, payload).await;
+        if let Err(e) = &write_result {
             // The connection goes mute from here; its reader still runs.
             eprintln!("pi-famulus: connection writer stopped: {e}");
-            break;
         }
+        let failed = write_result.is_err();
         if let Some((task, cursor)) = frame.output {
             let mut m = written.lock().unwrap();
             let e = m.entry(task).or_insert(0);
             *e = (*e).max(cursor);
+        }
+        if let Some(ack) = frame.ack {
+            let _ = ack.send(write_result.map_err(|e| e.to_string()));
+        }
+        if failed {
+            break;
         }
     }
 }
@@ -1213,6 +1259,7 @@ async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
         let mut st = state.lock().unwrap();
         remove_conn(&mut st, conn_id, "closed");
     }
+    close_intercom_port(&state, conn_id).await;
     maybe_arm_idle_timer(&state);
 }
 
@@ -2096,6 +2143,9 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         }
         RequestKind::Supervise {} => {
             respond(&tx, &id, handle_supervise(&state, conn_id).await).await;
+        }
+        RequestKind::Intercom { op } => {
+            respond(&tx, &id, handle_intercom(&state, conn_id, &op).await).await;
         }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
@@ -3651,6 +3701,246 @@ async fn handle_supervise(state: &Shared, conn_id: u64) -> Result<SuperviseOk, P
         .await
         .map_err(|_| ProtoError::new(E_INTERNAL, "manager stopped before supervising"))?;
     Ok(SuperviseOk { intercom })
+}
+
+// ---------------------------------------------------------------------------
+// Intercom ports (protocol 7): the extension's messaging bridge over the
+// manager connection
+// ---------------------------------------------------------------------------
+
+const E_INTERCOM_DISABLED: &str = "E_INTERCOM_DISABLED";
+const E_INTERCOM_UNAVAILABLE: &str = "E_INTERCOM_UNAVAILABLE";
+
+/// Publish the current bridge (and why it is down) for `intercom` requests.
+/// Brief locked access: callers only clone the runtime Arc out of it.
+/// Returns true when the published bridge (or its error) changed.
+fn publish_bridge(
+    state: &Shared,
+    intercom: &Option<crate::intercom::Running>,
+    bridge_error: &Option<String>,
+) -> bool {
+    let (rt_slot, error_slot) = {
+        let st = state.lock().unwrap();
+        (st.intercom_rt.clone(), st.intercom_error.clone())
+    };
+    let mut rt_guard = rt_slot.lock().unwrap();
+    let changed = match rt_guard.as_ref() {
+        Some(rt) => intercom
+            .as_ref()
+            .is_none_or(|running| !Arc::ptr_eq(rt, &running.runtime)),
+        None => intercom.is_some(),
+    } || *error_slot.lock().unwrap() != *bridge_error;
+    if changed {
+        *rt_guard = intercom.as_ref().map(|running| running.runtime.clone());
+        *error_slot.lock().unwrap() = bridge_error.clone();
+    }
+    changed
+}
+
+/// The bridge changed (restarted or stopped): existing ports belong to the
+/// old runtime. Push `intercom_reset` to their connections so the extension
+/// re-registers, as if its socket had closed, then close the ports. A
+/// supervision lease flip without a bridge restart leaves ports alone.
+async fn bridge_changed(
+    state: &Shared,
+    intercom: &Option<crate::intercom::Running>,
+    bridge_error: &Option<String>,
+) {
+    if publish_bridge(state, intercom, bridge_error) {
+        reset_intercom_ports(state).await;
+    }
+}
+
+async fn reset_intercom_ports(state: &Shared) {
+    let ports = {
+        let st = state.lock().unwrap();
+        st.intercom_ports.clone()
+    };
+    let entries: Vec<(u64, PortEntry)> = {
+        let mut guard = ports.lock().await;
+        std::mem::take(&mut *guard).into_iter().collect()
+    };
+    if entries.is_empty() {
+        return;
+    }
+    {
+        let st = state.lock().unwrap();
+        for (conn_id, _) in &entries {
+            if let Some(handle) = st.conns.get(conn_id) {
+                let _ = handle
+                    .tx
+                    .try_send(encode_event(&EventKind::IntercomReset {}));
+            }
+        }
+    }
+    for (_, entry) in entries {
+        entry.relay.abort();
+        let mut port = entry.port;
+        port.close().await;
+    }
+}
+
+/// Close one connection's port (socket close, session rebind): the same
+/// cleanup as a client.sock disconnect.
+async fn close_intercom_port(state: &Shared, conn_id: u64) {
+    let ports = {
+        let st = state.lock().unwrap();
+        st.intercom_ports.clone()
+    };
+    let entry = {
+        let mut guard = ports.lock().await;
+        guard.remove(&conn_id)
+    };
+    if let Some(entry) = entry {
+        entry.relay.abort();
+        let mut port = entry.port;
+        port.close().await;
+    }
+}
+
+/// Relay one port's push frames onto its manager connection as `intercom`
+/// events. `Push::written` resolves only after the frame was actually
+/// written to the socket (or failed), because delivered/read receipt
+/// semantics depend on it; `Push::fence` is released with the ack.
+async fn intercom_port_relay(mut rx: mpsc::Receiver<crate::intercom::Push>, out: OutTx) {
+    while let Some(push) = rx.recv().await {
+        let (ack, wait) = tokio::sync::oneshot::channel();
+        let frame = encode_event(&EventKind::Intercom {
+            frame: push.value,
+        });
+        let queued = out
+            .send(OutFrame::ack(frame.bytes, ack))
+            .await
+            .map_err(|_| "connection closed".to_string());
+        let written = match queued {
+            Ok(()) => wait
+                .await
+                .unwrap_or_else(|_| Err("connection closed before write".to_string())),
+            Err(e) => Err(e),
+        };
+        let failed = written.is_err();
+        if let Some(reply) = push.written {
+            let _ = reply.send(written);
+        }
+        drop(push.fence);
+        if failed {
+            break;
+        }
+    }
+    // The connection is gone: fail whatever is still queued.
+    while let Some(push) = rx.recv().await {
+        if let Some(reply) = push.written {
+            let _ = reply.send(Err("connection closed".to_string()));
+        }
+        drop(push.fence);
+    }
+}
+
+/// Serve one intercom op for a manager connection (protocol 7). Extension
+/// parent connections only: the daemon keeps one port per connection and
+/// answers with the op's result; frames for the session arrive as
+/// `intercom` events. When the bridge is down the request fails with a
+/// structured error (`disabled` vs `unavailable: <why>`).
+async fn handle_intercom(
+    state: &Shared,
+    conn_id: u64,
+    op: &serde_json::Value,
+) -> Result<serde_json::Value, ProtoError> {
+    let session_id = {
+        let st = state.lock().unwrap();
+        match st.conns.get(&conn_id) {
+            Some(handle) if handle.kind == ClientKind::Extension => match handle.role {
+                ConnRole::Parent => handle.session_id.clone(),
+                ConnRole::Cli => {
+                    return Err(ProtoError::new(
+                        E_FORBIDDEN,
+                        "intercom is available to pi sessions, not the cli",
+                    ))
+                }
+                ConnRole::Child => {
+                    return Err(ProtoError::new(
+                        E_FORBIDDEN,
+                        "intercom is not available to a hosted child",
+                    ))
+                }
+            },
+            Some(_) => {
+                return Err(ProtoError::new(
+                    E_FORBIDDEN,
+                    "intercom is available to extension sessions only",
+                ))
+            }
+            None => return Err(ProtoError::new(E_INTERNAL, "connection gone")),
+        }
+    };
+    let session_id = session_id
+        .ok_or_else(|| ProtoError::new(E_SESSION_REQUIRED, "intercom requires a session"))?;
+    let rt = {
+        let st = state.lock().unwrap();
+        st.intercom_rt.clone()
+    };
+    let rt = rt.lock().unwrap().clone();
+    let rt = match rt {
+        Some(rt) => rt,
+        None => {
+            let error = {
+                let st = state.lock().unwrap();
+                st.intercom_error.clone()
+            };
+            let message = error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "bridge not running".to_string());
+            // `disabled` (PI_FAMULUS_NO_INTERCOM, Windows) is a deliberate
+            // off switch; anything else is an outage the extension retries.
+            let disabled = message.starts_with("disabled by");
+            return Err(ProtoError::new(
+                if disabled {
+                    E_INTERCOM_DISABLED
+                } else {
+                    E_INTERCOM_UNAVAILABLE
+                },
+                message,
+            ));
+        }
+    };
+    let ports = {
+        let st = state.lock().unwrap();
+        st.intercom_ports.clone()
+    };
+    let mut guard = ports.lock().await;
+    match guard.entry(conn_id) {
+        std::collections::hash_map::Entry::Occupied(_) => {}
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            let out = {
+                let st = state.lock().unwrap();
+                st.conns.get(&conn_id).map(|handle| handle.tx.clone())
+            };
+            let out = out.ok_or_else(|| ProtoError::new(E_INTERNAL, "connection gone"))?;
+            let pi_pid = {
+                let st = state.lock().unwrap();
+                st.sessions.get(&session_id).map(|entry| entry.pi_pid).unwrap_or(0)
+            };
+            let (tx, rx) = mpsc::channel::<crate::intercom::Push>(128);
+            let port = crate::intercom::port::Port::new(
+                rt,
+                tx,
+                crate::intercom::port::PortOrigin::Manager {
+                    session_id,
+                    pi_pid,
+                },
+            );
+            let relay = tokio::spawn(intercom_port_relay(rx, out)).abort_handle();
+            vacant.insert(PortEntry { port, relay });
+        }
+    }
+    let entry = guard.get_mut(&conn_id).expect("port just ensured");
+    entry
+        .port
+        .handle(op)
+        .await
+        .map_err(|error| ProtoError::new(E_BAD_REQUEST, error))
 }
 
 /// The running bridge restarts when its configuration changed and also when

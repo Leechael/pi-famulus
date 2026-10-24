@@ -86,6 +86,7 @@ fn transport_runtime_on(cfg: Config, clock: crate::clock::Clock) -> Shared {
             remote: Vec::new(),
             relay_tx: None,
             control_outbox: VecDeque::new(),
+            port_conns: std::collections::HashSet::new(),
             relay_message_ids: false,
             relay_generation: 0,
             legacy_active: None,

@@ -12,6 +12,7 @@ mod http;
 mod idle;
 mod localrpc;
 pub(crate) mod native;
+pub mod port;
 mod relay;
 mod service;
 
@@ -133,6 +134,10 @@ pub struct State {
     pub remote: Vec<Value>,
     pub relay_tx: Option<mpsc::Sender<Push>>,
     pub control_outbox: VecDeque<Value>,
+    /// Bridge-runtime connection ids owned by famulus manager-connection
+    /// ports (protocol 7 `intercom`): a legacy client socket refuses to
+    /// claim their sessions, and closing the port drops the mark.
+    pub port_conns: HashSet<u64>,
     pub relay_message_ids: bool,
     pub relay_generation: u64,
     pub legacy_active: Option<relay::LegacyActive>,
@@ -420,6 +425,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             remote: Vec::new(),
             relay_tx: None,
             control_outbox: VecDeque::new(),
+            port_conns: HashSet::new(),
             relay_message_ids: false,
             relay_generation: 0,
             legacy_active: None,
