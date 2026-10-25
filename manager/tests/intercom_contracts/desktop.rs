@@ -7,6 +7,7 @@ use std::sync::{mpsc, Arc};
 struct Desktop {
     cached_busy: bool,
     path: PathBuf,
+    search_path: String,
     requests: mpsc::Receiver<Value>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
@@ -30,9 +31,37 @@ impl Desktop {
         owner_ok: bool,
         drop_after_mutation: bool,
     ) -> Self {
+        Self::with_initialize_gate(
+            fixture,
+            cached_busy,
+            fresh_busy,
+            owner_ok,
+            drop_after_mutation,
+            None,
+        )
+    }
+
+    fn with_initialize_gate(
+        fixture: &Fixture,
+        cached_busy: bool,
+        fresh_busy: bool,
+        owner_ok: bool,
+        drop_after_mutation: bool,
+        initialize_gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    ) -> Self {
         let directory = fixture.root.join("desktop");
         fs::create_dir_all(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        // The status API reports live Codex attachment only when a CLI is
+        // installed. Keep readiness independent of tools on the test host.
+        let codex = directory.join("codex");
+        fs::write(&codex, "#!/bin/sh\nprintf 'codex-fixture 1.0\\n'\n").unwrap();
+        fs::set_permissions(codex, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![directory.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let search_path = std::env::join_paths(paths).unwrap().into_string().unwrap();
         let path = directory.join("ipc.sock");
         let listener = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -41,6 +70,7 @@ impl Desktop {
         let stopped = stop.clone();
         let (tx, requests) = mpsc::channel();
         let worker = thread::spawn(move || {
+            let mut initialize_gate = initialize_gate;
             while !stopped.load(Ordering::Relaxed) {
                 let mut stream = match listener.accept() {
                     // BSD-derived systems inherit O_NONBLOCK from the listener.
@@ -95,6 +125,12 @@ impl Desktop {
                     let response = |result: Value| json!({"type":"response","requestId":request["requestId"],"resultType":"success","method":method,"handledByClientId":"owner-A","result":result});
                     match method {
                         "initialize" => {
+                            if let Some((initialized, gate)) = initialize_gate.take() {
+                                let _ = initialized.send(());
+                                if gate.recv_timeout(TIMEOUT).is_err() {
+                                    break;
+                                }
+                            }
                             if desktop_write(&mut stream, &response(json!({"clientId":"follower"})))
                                 .is_err()
                             {
@@ -154,9 +190,27 @@ impl Desktop {
         Self {
             cached_busy,
             path,
+            search_path,
             requests,
             stop,
             worker: Some(worker),
+        }
+    }
+
+    fn wait_attached(&self, fixture: &Fixture) {
+        // A shared thread/list row (or receipt of initialize at this peer) does
+        // not prove the daemon has processed the Desktop initialize response.
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let status = fixture.connect().ok(json!({"op":"status"}));
+            if status["report"]["codex_app_server"] == "Desktop IPC attached" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Desktop never attached: {status}"
+            );
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -208,9 +262,11 @@ fn start(fixture: &mut Fixture, desktop: &Desktop) -> super::native::CodexPeer {
         &[
             ("CODEX_DESKTOP_IPC_SOCK", &path),
             ("CODEX_APP_SERVER_SOCK", &app_server),
+            ("PATH", &desktop.search_path),
         ],
     );
     fixture.wait_session("codex/desktop-A");
+    desktop.wait_attached(fixture);
     catalog
 }
 
@@ -224,12 +280,14 @@ fn start_shared_scenario(
         &[
             ("CODEX_DESKTOP_IPC_SOCK", desktop.path.to_str().unwrap()),
             ("CODEX_APP_SERVER_SOCK", catalog.path.to_str().unwrap()),
+            ("PATH", &desktop.search_path),
         ],
     );
     fixture.wait_session("codex/desktop-A");
     catalog.request("thread/list");
     catalog.request("thread/loaded/list");
     desktop.request("initialize");
+    desktop.wait_attached(fixture);
     let row = fixture
         .sessions()
         .into_iter()
@@ -329,8 +387,15 @@ fn desktop_unsolicited_snapshot_from_unknown_owner_does_not_publish_a_thread() {
     let mut fixture = Fixture::new();
     let desktop = Desktop::new(&fixture, false, false, true, false);
     let path = desktop.path.to_str().unwrap().to_string();
-    fixture.start_with(&[], &[("CODEX_DESKTOP_IPC_SOCK", &path)]);
+    fixture.start_with(
+        &[],
+        &[
+            ("CODEX_DESKTOP_IPC_SOCK", &path),
+            ("PATH", &desktop.search_path),
+        ],
+    );
     desktop.request("initialize");
+    desktop.wait_attached(&fixture);
     let deadline = Instant::now() + Duration::from_millis(350);
     loop {
         assert!(
@@ -393,6 +458,74 @@ fn desktop_fresh_owner_idle_starts_instead_of_steering_cached_busy_turn() {
     _catalog.assert_passive_catalog();
 }
 
+/// Regression: catalog visibility must not let fixture startup return before
+/// the independently scheduled Desktop initialize handshake has completed.
+#[test]
+fn desktop_start_waits_for_initialize_after_shared_catalog_discovery() {
+    let mut fixture = Fixture::new();
+    let (release, gate) = mpsc::channel();
+    let (initialized, initializing) = mpsc::channel();
+    let desktop = Desktop::with_initialize_gate(
+        &fixture,
+        true,
+        false,
+        true,
+        false,
+        Some((initialized, gate)),
+    );
+    let _catalog = thread::scope(|scope| {
+        let (ready, started) = mpsc::channel();
+        let socket = fixture.sock.clone();
+        let gatekeeper = scope.spawn(move || {
+            initializing.recv_timeout(TIMEOUT).unwrap();
+            let mut observer = Peer::new(UnixStream::connect(socket).unwrap());
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let listed = observer.ok(json!({"op":"list"}));
+                if listed["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["id"] == "codex/desktop-A")
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "shared catalog never published desktop-A: {listed}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let premature = started.recv_timeout(Duration::from_millis(250));
+            release.send(()).unwrap();
+            premature
+        });
+        let catalog = start(&mut fixture, &desktop);
+        let _ = ready.send(());
+        let premature = gatekeeper.join().unwrap();
+        assert!(
+            matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+            "fixture startup returned while Desktop initialize was still blocked: {premature:?}"
+        );
+        catalog
+    });
+    let mut sender = fixture.plugin("sender", "busy");
+    let sent = sender.ok(
+        json!({"op":"send","to":"codex/desktop-A","body":"Desktop start after delayed initialize"}),
+    );
+    assert_eq!(sent["status"], "delivered");
+    let request = desktop.request("thread-follower-start-turn");
+    assert_eq!(request["targetClientId"], "owner-A");
+    assert_eq!(
+        request["params"]["turnStart"]["request"]["threadId"],
+        "desktop-A"
+    );
+    let read = sender.event("receipt");
+    assert_eq!(read["status"], "read");
+    assert_eq!(read["message_id"], sent["message_id"]);
+    _catalog.assert_passive_catalog();
+}
+
 #[test]
 fn desktop_owner_discovery_failure_never_mutates_any_thread() {
     let mut fixture = Fixture::new();
@@ -433,9 +566,11 @@ fn desktop_retires_thread_state_after_completed_read_and_rediscovers_on_demand()
         &[
             ("CODEX_DESKTOP_IPC_SOCK", &path),
             ("CODEX_APP_SERVER_SOCK", &app_server),
+            ("PATH", &desktop.search_path),
         ],
     );
     fixture.wait_session("codex/desktop-A");
+    desktop.wait_attached(&fixture);
     // Retire the shared catalog so the Desktop owner serves the thread.
     drop(catalog);
     let mut sender = fixture.plugin("retire-sender", "busy");
