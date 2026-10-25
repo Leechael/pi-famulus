@@ -12,6 +12,7 @@ import { after, describe, it } from "node:test";
 import { type FauxEpisode, runFaux } from "./run-faux.ts";
 import { followedByAssistant, type Item, toolResults, wakes } from "../lib/transcript.ts";
 import { FAMULUS_WAKE_LEAD_IN } from "../lib/wake-adapter.ts";
+import { observeProcessExit, type ProcessExitObserver } from "../lib/process-exit-observer.ts";
 
 const episodes: FauxEpisode[] = [];
 after(() => {
@@ -28,21 +29,6 @@ function explain(ep: FauxEpisode): string {
   return `${lines.join("\n")}\nfaux calls: ${ep.calls.length}\nstderr: ${ep.stderr.slice(0, 800)}${
     ep.midwayError ? `\nmidwayError: ${ep.midwayError}` : ""
   }`;
-}
-
-/** Poll until `pid` is gone (ESRCH); false after timeoutMs. */
-async function waitPidGone(pid: number, timeoutMs = 10_000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      process.kill(pid, 0);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ESRCH") return true;
-      throw err;
-    }
-    if (Date.now() > deadline) return false;
-    await new Promise((res) => setTimeout(res, 100));
-  }
 }
 
 /** Every faux call was scripted: no unexpected LLM requests, no exhaustion. */
@@ -168,18 +154,20 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match(lastText, /WOKE: timeout/);
   });
 
-  it("(e2) a manager crash ends a backgrounded command with an orphaned exit wake", async () => {
+  it("(e2) a manager crash ends a backgrounded command with an orphaned exit wake", async (t) => {
     // Keep in sync with scripts/manager-crash.ts (importing it here would pull
     // faux-dsl.ts -> @earendil-works/pi-ai, which only resolves inside pi).
     const commandMarker = "crash-start";
     let managerPid = 0;
     let runnerPid = 0;
+    let runnerObserver: ProcessExitObserver | undefined;
+    t.after(() => runnerObserver?.dispose());
     const ep = await runFaux({
       script: "manager-crash.ts",
       famulusConfig: { foregroundBudgetMs: 300 },
       midway: {
         when: (items) => toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true),
-        act: (sb) => {
+        act: async (sb) => {
           // A stalled or failing manager must hang the test at most 3s and
           // fail with a diagnostic, not a cryptic JSON parse error.
           const mgr = sb.env.PI_FAMULUS_MANAGER_PATH;
@@ -224,7 +212,9 @@ describe("faux e2e", { concurrency: true }, () => {
             fail("ls", `runner pid is not a positive integer: ${JSON.stringify(foundRow.pid)}`);
           }
           runnerPid = foundRow.pid as number;
-
+          // Windows can recycle a PID as soon as its last handle closes.
+          // Pin the original runner before crashing its manager.
+          runnerObserver = await observeProcessExit(runnerPid, 20_000);
           process.kill(managerPid, "SIGKILL");
         },
       },
@@ -246,9 +236,10 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match((ep.items.at(-1) as { text?: string }).text ?? "", /WOKE orphaned/);
     // The runner only exits after its process group is empty, so its death
     // proves the lifeline tore down `sleep 30` (SIGTERM, then SIGKILL).
-    // Windows job teardown can lag past 10s on a busy runner; 20s is still
-    // before that sleep would exit on its own.
-    assert.ok(await waitPidGone(runnerPid, 20_000), `runner pid ${runnerPid} still alive 20s after the manager crash\n${explain(ep)}`);
+    // Keep the same 20s bound, but wait on the captured Windows process
+    // handle, not whichever process happens to own this numeric PID later.
+    assert.ok(runnerObserver, `runner observer not captured\n${explain(ep)}`);
+    assert.ok(await runnerObserver.waitForExit(), `original runner ${runnerObserver.identity} still alive 20s after the manager crash\n${explain(ep)}`);
   });
 
   // Windows has no in-place upgrade (the manager refuses it; manager/tests/platform.rs u1).
