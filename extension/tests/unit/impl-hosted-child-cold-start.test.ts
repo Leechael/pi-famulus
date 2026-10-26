@@ -25,7 +25,7 @@ afterAll(() => rmSync(home, { recursive: true, force: true }));
 afterEach(() => resetHostedFakes());
 
 describe("a subagent call made before the daemon connects", () => {
-  it.fails("waits for the connection and then runs the child", async () => {
+  it("waits for the connection and then runs the child", async () => {
     let release!: () => void;
     hostedFakeState().connectGate = new Promise<void>((resolve) => {
       release = resolve;
@@ -35,8 +35,10 @@ describe("a subagent call made before the daemon connects", () => {
       expect(ext.manager.isAvailable()).toBe(false);
       await ext.run({ async: true, tasks: [{ prompt: "work", name: "worker" }] });
       await settleAsync();
+      expect(ext.manager.spawns).toHaveLength(0);
+      expect(wakeDetails(ext.pi.sent, "subagent-done")).toHaveLength(0);
       release();
-      await until(() => ext.manager.spawns.length > 0, "the hosted child to be spawned", 1000).catch(() => {});
+      await until(() => ext.manager.spawns.length > 0, "the hosted child to be spawned", 1000);
       const spawned = ext.manager.spawns.length;
       if (spawned > 0) {
         const childId = ext.manager.spawns[0].childId;
@@ -48,6 +50,21 @@ describe("a subagent call made before the daemon connects", () => {
       expect({ spawned, status: child?.status, error: child?.error }).toEqual({ spawned: 1, status: "completed", error: undefined });
     } finally {
       release();
+      await ext.shutdown();
+    }
+  });
+
+  it("still reports a connection that cannot become available", async () => {
+    hostedFakeState().available = false;
+    const ext = await startHostedExtension({ sessionId: "sess-unavailable", cwd: home });
+    try {
+      await ext.run({ async: true, tasks: [{ prompt: "work", name: "worker" }] });
+      await until(() => wakeDetails(ext.pi.sent, "subagent-done").length > 0, "the failed child wake");
+      const child = ((wakeDetails(ext.pi.sent, "subagent-done")[0].children ?? []) as Array<{ status?: string; error?: string }>)[0];
+      expect(ext.manager.spawns).toHaveLength(0);
+      expect(child?.status).toBe("failed");
+      expect(child?.error).toContain("pi-famulus daemon is not connected");
+    } finally {
       await ext.shutdown();
     }
   });
