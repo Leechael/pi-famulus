@@ -29,20 +29,22 @@ const home = join(root, "manager");
 const bridgeSock = join(root, "bridge", "client.sock");
 mkdirSync(join(root, "bridge"), { recursive: true });
 mkdirSync(join(root, "state"), { recursive: true });
-const configPath = join(root, "client.toml");
+mkdirSync(home, { recursive: true });
+const configPath = join(home, "config.json");
 const writeConfig = (name = "intercom-integ-host") =>
   writeFileSync(
     configPath,
-    [
-      "local_only = true",
-      `name = '${name}'`,
-      `sock = '${bridgeSock}'`,
-      `state_dir = '${join(root, "state")}'`,
-      "mcp_listen = ''",
-    ].join("\n") + "\n",
+    JSON.stringify({
+      messaging: {
+        localOnly: true,
+        name,
+        sock: bridgeSock,
+        stateDir: join(root, "state"),
+        mcpListen: "",
+      },
+    }),
   );
 writeConfig();
-process.env.AGENT_INTERCOM_CONFIG = configPath;
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -106,7 +108,6 @@ describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
       execFileSync(BIN, ["--home", home, "shutdown"], { stdio: "ignore", timeout: 10_000 });
     } catch { /* already stopped */ }
     rmSync(root, { recursive: true, force: true });
-    delete process.env.AGENT_INTERCOM_CONFIG;
   });
 
   it("registers, delivers, reports receipts, resets, reconnects, and switches sessions", { timeout: 180_000 }, async () => {
@@ -135,8 +136,8 @@ describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
 
     // deliver: bob messages alice; the module injects the envelope.
     await bob.intercom({ op: "send", to: "pi/alice-session", body: "hello alice", reply_to: "pi/bob-session" });
-    await waitFor(() => injections.some((i) => i.message.customType === "agent-intercom-cross-session"), "the deliver envelope");
-    const envelope = injections.find((i) => i.message.customType === "agent-intercom-cross-session")!;
+    await waitFor(() => injections.some((i) => i.message.customType === "pi-famulus-cross-session"), "the deliver envelope");
+    const envelope = injections.find((i) => i.message.customType === "pi-famulus-cross-session")!;
     // from equals from-session here, so the envelope carries one attribute.
     expect(envelope.message.content).toContain('<cross-session-message from="pi/bob-session">');
     expect(envelope.message.content).toContain("hello alice");

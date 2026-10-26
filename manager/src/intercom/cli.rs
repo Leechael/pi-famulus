@@ -6,8 +6,6 @@ use std::path::PathBuf;
 #[derive(usage::Args)]
 pub struct Options {
     #[usage(long, global)]
-    pub config: Option<PathBuf>,
-    #[usage(long, global)]
     pub sock: Option<PathBuf>,
     #[usage(long, global)]
     pub state_dir: Option<PathBuf>,
@@ -32,10 +30,9 @@ pub struct Options {
 }
 
 impl Options {
-    /// No command-line overrides: the configuration file and environment only.
-    pub fn from_environment() -> Self {
+    /// No command-line overrides: the shared configuration file only.
+    pub fn without_overrides() -> Self {
         Self {
-            config: None,
             sock: None,
             state_dir: None,
             server: None,
@@ -57,8 +54,7 @@ pub enum Command {
     Help {
         path: Vec<String>,
     },
-    /// Legacy launch agents run `intercom --config C serve`; it now means
-    /// `pi-famulus serve` with C as the bridge configuration.
+    /// Compatibility entry point for an installed service.
     #[usage(hide)]
     Serve,
     /// Reachable local and remote agent sessions.
@@ -273,13 +269,9 @@ pub async fn run(home: PathBuf, options: Options, action: Command) -> Result<(),
         return Ok(());
     }
     if matches!(action, Command::Serve) {
-        if let Some(path) = &options.config {
-            // The manager `serve` spawns inherits this as its configuration.
-            std::env::set_var("AGENT_INTERCOM_CONFIG", path);
-        }
         return crate::client::cmd_serve(&home).await;
     }
-    let cfg = Config::load(&options)?;
+    let cfg = Config::load(&home, &options)?;
     let (as_json, collection) = match &action {
         Command::Status { json, .. } => (*json, "report"),
         Command::Session {
@@ -656,7 +648,7 @@ fn direct_fallback(cfg: &Config, error: &str) -> Result<(), String> {
         return Err(error.into());
     }
     if cfg.token.is_empty() && !saved_credential_matches(cfg) {
-        return Err(format!("{error}\nor set a relay token (config token, --token, or AGENT_INTERCOM_TOKEN) to reach the relay without a daemon"));
+        return Err(format!("{error}\nor set messaging.token in config.json (or pass --token) to reach the relay without a daemon"));
     }
     Ok(())
 }
@@ -841,7 +833,7 @@ fn help_text(path: &[String]) -> Result<String, String> {
             _ => None,
         };
         if let Some(text) = text {
-            return Ok(text.replace("agent-intercom-client", "pi-famulus intercom"));
+            return Ok(text.to_owned());
         }
     }
     let mut args = vec![OsStr::new("intercom")];
@@ -918,9 +910,9 @@ Work without Herdr:
 
 ## Examples
 
-    agent-intercom-client session list
-    agent-intercom-client session prompt --until idle --timeout 2m pi/my-session "hello"
-    agent-intercom-client workspace add --name demo --cwd /tmp/proj --agent pi
+    pi-famulus intercom session list
+    pi-famulus intercom session prompt --until idle --timeout 2m pi/my-session "hello"
+    pi-famulus intercom workspace add --name demo --cwd /tmp/proj --agent pi
 "#;
 
 const HELP_IDLE: &str = r#"# Idle subscriptions
@@ -937,8 +929,8 @@ watches require upgraded daemons and relay; Pi targets need a plugin advertising
 
 ## Commands
 
-    agent-intercom-client notify-idle <to> --from <session-id>
-    agent-intercom-client idle-status <subscription-id>
+    pi-famulus intercom notify-idle <to> --from <session-id>
+    pi-famulus intercom idle-status <subscription-id>
 
 `<to>` is an exact intercom session ID or a unique name. `--from` is a local
 watcher session ID, not a webhook endpoint shortcut; in a Codex shell it defaults
@@ -984,13 +976,13 @@ session.
 
 ## Example
 
-    agent-intercom-client notify-idle review --from codex/my-thread
+    pi-famulus intercom notify-idle review --from codex/my-thread
     # result includes: <subscription-uuid> subscribed query_only
-    agent-intercom-client idle-status <subscription-uuid>
+    pi-famulus intercom idle-status <subscription-uuid>
     # later result includes: <subscription-uuid> idle query_only
 
 For receipt semantics and protocol details, see `docs/message-status.md` in the
-source agent-intercom repository. Use `agents` to discover targets before subscribing.
+source pi-famulus repository. Use `agents` to discover targets before subscribing.
 "#;
 
 #[cfg(test)]
@@ -1006,7 +998,6 @@ mod tests {
         ] {
             let text = help_text(&[topic.into()]).unwrap();
             assert!(text.starts_with(expected));
-            assert!(!text.contains("agent-intercom-client"));
         }
         assert!(help_text(&["idle".into()]).unwrap().contains("12 hours"));
         assert!(help_text(&["herdr".into()])

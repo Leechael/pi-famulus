@@ -87,7 +87,7 @@ pi install npm:pi-famulus
 | :--- | :--- |
 | `/tasks` | 实时列出 shell、monitor 和子代理；`ctrl+x` 停止选中的项 |
 | `/reply <child> <text>` | 直接回答子代理的问题，不经过模型 |
-| `/famulus` | 显示 `pi-famulus` 二进制路径，以及 manager 和扩展的版本 |
+| `/famulus` | 显示二进制、manager 和配置信息，可通过菜单编辑 `config.json` 或重载扩展 |
 | fleet 行（编辑器下方的状态行） | 显示正在运行的 shell、monitor 和子代理 |
 
 **用最强的模型做计划，用便宜的模型做实现。** 在 pi 里选好你最强的模型，然后把下面的内容存成 `~/.pi/agent/agents/worker.md`：
@@ -137,7 +137,7 @@ pi-famulus 替你启动和停止进程。这一节写明它保证什么，以及
 - **子代理能再启动子代理吗？** 不能，嵌套只有一层。
 - **pi 退出后后台任务会怎样？** 最后一个 pi 会话关闭、并且没有仍处于 warm 的托管子代理时，5 秒后守护进程停止仍在运行的任务并退出。之后可以用 `pi-famulus show <id>` 查看记录。
 - **`/reload` 会中断正在运行的任务吗？** 不会。shell、monitor 和子代理继续运行，结果照常送达。如果这次 reload 加载的是另一个版本的 pi-famulus，旧版本的任务会先被停止。
-- **怎么知道用的是哪个二进制、哪个版本？** 输入 `/famulus`，它显示 `pi-famulus` 二进制路径及其版本、正在运行的 manager 的版本和 pid，以及扩展的版本。
+- **怎么知道用的是哪个二进制、哪个版本？** 输入 `/famulus`，它显示 `pi-famulus` 二进制路径及其版本、正在运行的 manager 的版本和 pid、扩展版本和配置路径。菜单支持编辑 `config.json` 和重载扩展。
 - **为什么 pi 的 bash 命令在长时间构建时卡住？** 装了 pi-famulus 后，`bash` 等 20 秒就不再等，把命令转到后台，这一回合继续。要改这个时限，在 `~/.pi/agent/pi-famulus/config.json` 里设置 `foregroundBudgetMs`（[配置说明](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)）。
 - **怎么查看或停止运行中的任务？** 在 pi TUI 里输入 `/tasks`，选中一项后按 `ctrl+x`。在终端里，`pi-famulus ls` 列出正在运行的任务。
 - **支持 Windows 吗？** 支持 x64 和 arm64。守护进程原地重新执行自己的升级方式只在 Linux 和 macOS 上可用。在 Windows 上，需要替换二进制并手动重启守护进程。除非 `PI_FAMULUS_SHELL` 指定了别的 shell，装了 Git for Windows 时 `bash` 命令在 Git Bash 里运行，否则用 `PATH` 上的 `bash.exe`（WSL 的除外），再没有就用 `cmd.exe`（见[配置](https://github.com/Leechael/pi-famulus/blob/main/docs/configuration.md)）。Git Bash 的运行时在多个副本同时启动时可能崩溃或卡住（[git-for-windows/git#6368](https://github.com/git-for-windows/git/issues/6368)）。用 posix shell（`cmd.exe` 以外的 shell）时，pi-famulus 会错开 shell 的启动来避开这个问题。疑似启动崩溃的任务以 `shell-start-failed` 结束。任务 20 秒内没有输出、job 里除了 shell 之外没有别的进程时，会以 `shell-start-hung` 被停止，所以只跑 shell 内置命令、20 秒不出声的命令也会被停掉。两种情况下 agent 都会被告知先检查有没有副作用再重试。

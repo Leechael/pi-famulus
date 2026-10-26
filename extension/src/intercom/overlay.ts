@@ -1,7 +1,7 @@
 /**
  * The /intercom overlay: session list + compose box.
  *
- * Upstream baseline: agent-intercom @ 98183fb, plugin/pi — verbatim port of
+ * Upstream baseline: pi-famulus @ 98183fb, plugin/pi — verbatim port of
  * the plugin's SessionListOverlay/ComposeOverlay and their text helpers.
  */
 
@@ -293,7 +293,7 @@ export class SessionListOverlay implements OverlayComponent {
     const sessions = this.filteredSessions();
     this.clampSelection(sessions);
     if (sessions.length === 0) {
-      const empty = this.filterQuery ? ` No sessions matching "${this.filterQuery}"` : " No other agent-intercom sessions";
+      const empty = this.filterQuery ? ` No sessions matching "${this.filterQuery}"` : " No other pi-famulus sessions";
       lines.push(row(this.theme.fg("dim", empty)));
     } else {
       const startIndex = Math.max(

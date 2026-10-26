@@ -2,7 +2,7 @@
 //! ops against the bridge runtime, shared by the legacy client socket and the
 //! famulus manager connection (`intercom` request, protocol 7).
 //!
-//! Extracted from `localrpc.rs` (agent-intercom client protocol) so the
+//! Extracted from `localrpc.rs` (pi-famulus client protocol) so the
 //! famulus manager connection serves the same protocol over manager.sock
 //! without a second socket. The manager variant binds the registration to
 //! the hello session identity and marks its connection ids in
@@ -24,7 +24,7 @@ pub enum PortOrigin {
     Manager { session_id: String, pi_pid: u32 },
 }
 
-/// One connection's intercom session: the ops of the agent-intercom client
+/// One connection's intercom session: the ops of the pi-famulus client
 /// protocol plus end-of-life cleanup identical to a client socket
 /// disconnect (remove the owned session, settle its idle watchers, unpublish
 /// from native adapters).

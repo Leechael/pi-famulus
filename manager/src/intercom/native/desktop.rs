@@ -217,7 +217,9 @@ async fn connect(
     let response = connection
         .request(
             "initialize",
-            json!({"clientType":"agent-intercom"}),
+            // Codex Desktop routes this existing client type to its
+            // cross-session messaging integration.
+            json!({"clientType":"pi-famulus"}),
             "",
             0,
             None,

@@ -83,26 +83,60 @@ impl Fixture {
         fs::write(
             self.root.join("client.toml"),
             format!(
-                "local_only = true\nname = 'fixture-host'\nsock = '{}'\nstate_dir = '{}'\nmcp_listen = ''\n{extra}",
+                "local_only = true\nname = 'fixture-host'\nsock = '{}'\nstate_dir = '{}'\n{extra}",
                 self.sock.display(),
                 self.root.join("state").display()
             ),
         )
         .unwrap();
+        self.sync_config();
     }
 
-    /// The manager binary with this fixture's isolated environment. Every
-    /// manager it spawns reads `client.toml` as its bridge configuration.
+    /// Translate the fixture's concise TOML into the single runtime JSON file.
+    fn sync_config(&self) {
+        let text = fs::read_to_string(self.root.join("client.toml")).unwrap();
+        let legacy: toml::Value = toml::from_str(&text).unwrap_or_else(|_| toml::Value::String(text.clone()));
+        let mut messaging = serde_json::to_value(legacy).unwrap();
+        fn camel_keys(value: &mut Value) {
+            if let Some(object) = value.as_object_mut() {
+                let old = std::mem::take(object);
+                for (key, mut value) in old {
+                    camel_keys(&mut value);
+                    let key = match key.as_str() {
+                        "tls_insecure" => "tlsInsecure".into(),
+                        "state_dir" => "stateDir".into(),
+                        "mcp_listen" => "mcpListen".into(),
+                        "mcp_token" => "mcpToken".into(),
+                        "mcp_allow_non_loopback" => "mcpAllowNonLoopback".into(),
+                        "remote_messages" => "remoteMessages".into(),
+                        "local_only" => "localOnly".into(),
+                        "event_log_size" => "eventLogSize".into(),
+                        "endpoint" => "endpoints".into(),
+                        _ => key,
+                    };
+                    object.insert(key, value);
+                }
+            } else if let Some(array) = value.as_array_mut() {
+                for value in array {
+                    camel_keys(value);
+                }
+            }
+        }
+        camel_keys(&mut messaging);
+        let manager = self.root.join("manager");
+        fs::create_dir_all(&manager).unwrap();
+        fs::write(
+            manager.join("config.json"),
+            serde_json::to_vec(&json!({"messaging":messaging})).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The manager binary with this fixture's isolated environment.
     fn base_command(&self) -> Command {
+        self.sync_config();
         let mut command = Command::new(&self.binary);
         for key in [
-            "AGENT_INTERCOM_SERVER",
-            "AGENT_INTERCOM_TOKEN",
-            "AGENT_INTERCOM_SOCK",
-            "AGENT_INTERCOM_NAME",
-            "AGENT_INTERCOM_MCP_LISTEN",
-            "AGENT_INTERCOM_MCP_TOKEN",
-            "AGENT_INTERCOM_REMOTE_MESSAGES",
             "XDG_RUNTIME_DIR",
             "CODEX_THREAD_ID",
             "CODEX_APP_SERVER_SOCK",
@@ -119,7 +153,6 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
             .env("HERDR_SOCKET_PATH", self.root.join("absent-herdr.sock"))
-            .env("AGENT_INTERCOM_CONFIG", self.root.join("client.toml"))
             .arg("--home")
             .arg(self.root.join("manager"));
         command
@@ -127,35 +160,42 @@ impl Fixture {
 
     fn command(&self) -> Command {
         let mut command = self.base_command();
-        command
-            .arg("intercom")
-            .arg("--config")
-            .arg(self.root.join("client.toml"));
+        command.arg("intercom");
         command
     }
 
     /// `pi-famulus serve`, which spawns this fixture's manager and keeps it
-    /// supervised. Former `intercom serve` flags become the environment
-    /// overrides the spawned manager reads with `client.toml`.
+    /// supervised. Former flags are materialized into the fixture JSON.
     fn spawn_serve(&mut self, args: &[&str], env: &[(&str, &str)]) {
         let log = fs::File::create(self.root.join("serve.log")).unwrap();
+        if !args.is_empty() {
+            let path = self.root.join("client.toml");
+            let mut values: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            fn set(values: &mut toml::Table, key: &str, value: &str) {
+                values.insert(key.into(), toml::Value::String(value.into()));
+            }
+            let mut args = args.iter();
+            while let Some(flag) = args.next() {
+                let key = match *flag {
+                    "--local-only" => {
+                        values.insert("local_only".into(), toml::Value::Boolean(true));
+                        continue;
+                    }
+                    "--mcp-listen" => "mcp_listen",
+                    "--mcp-token" => "mcp_token",
+                    "--sock" => "sock",
+                    "--server" => "server",
+                    "--token" => "token",
+                    "--name" => "name",
+                    "--remote-messages" => "remote_messages",
+                    other => panic!("serve takes no {other}; put it in client.toml"),
+                };
+                set(&mut values, key, args.next().expect("flag value"));
+            }
+            fs::write(&path, toml::to_string(&values).unwrap()).unwrap();
+        }
         let mut command = self.base_command();
         command.arg("serve").envs(env.iter().copied());
-        let mut args = args.iter();
-        while let Some(flag) = args.next() {
-            let key = match *flag {
-                "--local-only" => continue,
-                "--mcp-listen" => "AGENT_INTERCOM_MCP_LISTEN",
-                "--mcp-token" => "AGENT_INTERCOM_MCP_TOKEN",
-                "--sock" => "AGENT_INTERCOM_SOCK",
-                "--server" => "AGENT_INTERCOM_SERVER",
-                "--token" => "AGENT_INTERCOM_TOKEN",
-                "--name" => "AGENT_INTERCOM_NAME",
-                "--remote-messages" => "AGENT_INTERCOM_REMOTE_MESSAGES",
-                other => panic!("serve takes no {other}; put it in client.toml"),
-            };
-            command.env(key, args.next().expect("flag value"));
-        }
         let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().unwrap()))
@@ -577,24 +617,20 @@ fn local_only_toml_starts_without_token_and_creates_private_stable_identity() {
 }
 
 #[test]
-fn socket_environment_overrides_toml_and_cli_flag_overrides_environment() {
+fn socket_cli_flag_overrides_shared_config() {
     let mut fixture = Fixture::new();
     let configured = fixture.sock.clone();
-    fixture.sock = fixture.root.join("env.sock");
-    let environment = fixture.sock.to_str().unwrap().to_string();
-    fixture.start_with(&[], &[("AGENT_INTERCOM_SOCK", &environment)]);
+    fixture.sock = fixture.root.join("flag.sock");
+    let flag = fixture.sock.to_str().unwrap().to_string();
+    fixture.start_with(&["--sock", &flag], &[]);
     assert!(
         !configured.exists(),
-        "TOML socket unexpectedly bound despite env override"
+        "configured socket unexpectedly bound despite CLI override"
     );
-    let missing = fixture.root.join("missing.sock");
-    let output = fixture.run_env(
-        &["--sock", &environment, "agents", "--json"],
-        &[("AGENT_INTERCOM_SOCK", missing.to_str().unwrap())],
-    );
+    let output = fixture.run(&["--sock", &flag, "agents", "--json"]);
     assert!(
         output.status.success(),
-        "--sock did not override the environment: {}",
+        "--sock did not select the running bridge: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

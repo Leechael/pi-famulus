@@ -8,7 +8,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const LABEL: &str = "com.agent-intercom.client";
+// Existing launchd jobs are managed under their original label so upgrade
+// does not strand a running service.
+const LABEL: &str = "com.pi-famulus.client";
 const BINARY_NAME: &str = "pi-famulus";
 const READY_WAIT: Duration = Duration::from_secs(5);
 const READY_INTERVAL: Duration = Duration::from_millis(200);
@@ -33,8 +35,7 @@ struct Detected {
     token_source: &'static str,
     token_value: String,
     would_save: Vec<&'static str>,
-    /// Env/CLI-only MCP settings that must survive the launch agent's token
-    /// stripping; persisted into the private config during install.
+    /// CLI-only MCP settings persisted into the shared config during install.
     mcp_listen_save: Option<String>,
     mcp_token_save: Option<String>,
     tools: BTreeMap<String, String>,
@@ -174,7 +175,7 @@ fn plist_path() -> PathBuf {
     super::config::home().join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 fn log_path() -> PathBuf {
-    super::config::home().join("Library/Logs/agent-intercom/client.log")
+    super::config::home().join("Library/Logs/pi-famulus/client.log")
 }
 fn uid() -> u32 {
     #[cfg(unix)]
@@ -198,51 +199,57 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
-fn read_config(path: &Path) -> Result<toml::Table, String> {
+fn read_config(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            toml::from_str(&text).map_err(|e| format!("read config {}: {e}", path.display()))
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("read config {}: {e}", path.display()))?;
+            value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| format!("config {} must contain an object", path.display()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
         Err(e) => Err(format!("read config {}: {e}", path.display())),
     }
 }
-fn file_token(values: &toml::Table) -> &str {
-    values
-        .get("token")
-        .and_then(toml::Value::as_str)
+fn file_section(values: &serde_json::Map<String, Value>) -> Option<&serde_json::Map<String, Value>> {
+    values.get("messaging").and_then(Value::as_object)
+}
+fn file_token(values: &serde_json::Map<String, Value>) -> &str {
+    file_section(values)
+        .and_then(|section| section.get("token"))
+        .and_then(Value::as_str)
         .unwrap_or("")
 }
-fn file_local_only(values: &toml::Table) -> bool {
-    values
-        .get("local_only")
-        .and_then(toml::Value::as_bool)
+fn file_local_only(values: &serde_json::Map<String, Value>) -> bool {
+    file_section(values)
+        .and_then(|section| section.get("localOnly"))
+        .and_then(Value::as_bool)
         .unwrap_or(false)
 }
 /// What installing the service would persist for MCP: the listen address
 /// and token to save (each `None` when unchanged), plus the config field
 /// names a `--save-token` run would write.
 type McpPersistPlan = Result<(Option<String>, Option<String>, Vec<&'static str>), String>;
-/// MCP's listen address and bearer token can come from the config file,
-/// `AGENT_INTERCOM_MCP_*` environment variables, or CLI flags. The launch
-/// agent strips `AGENT_INTERCOM_*TOKEN*` variables from its environment, so
-/// an env/CLI-only MCP configuration would silently launch a differently
-/// configured daemon after install. Detect that case: persist it through the
-/// private config flow when `--save-token` opts in, otherwise refuse with an
-/// actionable error instead of installing a broken service.
+/// MCP CLI overrides must be persisted before installing the launch agent,
+/// or the installed manager would launch with different settings. Detect that
+/// case: persist through the shared JSON file when `--save-token` opts in,
+/// otherwise refuse with an actionable error.
 fn mcp_persist_plan(
-    values: &toml::Table,
+    values: &serde_json::Map<String, Value>,
     cfg: &Config,
     save_token: bool,
     config_path: &Path,
 ) -> McpPersistPlan {
-    let saved_listen = values
-        .get("mcp_listen")
-        .and_then(toml::Value::as_str)
+    let section = file_section(values);
+    let saved_listen = section
+        .and_then(|section| section.get("mcpListen"))
+        .and_then(Value::as_str)
         .unwrap_or("");
-    let saved_token = values
-        .get("mcp_token")
-        .and_then(toml::Value::as_str)
+    let saved_token = section
+        .and_then(|section| section.get("mcpToken"))
+        .and_then(Value::as_str)
         .unwrap_or("");
     // An empty effective token is fine: the daemon generates a stable one in
     // its state directory, which the launch agent's home keeps intact.
@@ -267,9 +274,8 @@ fn mcp_persist_plan(
     if !save_token && (saving_secret || enabling_listener) {
         let verb = if fields.len() == 1 { "is" } else { "are" };
         return Err(format!(
-            "MCP is enabled (mcp_listen = {:?}) but {} {} only available from the environment or a \
-             command-line flag; the launch agent strips AGENT_INTERCOM_MCP_TOKEN, so put {} in {} \
-             or rerun with --save-token",
+            "MCP is enabled (messaging.mcpListen = {:?}) but {} {} only available from a \
+             command-line flag; put {} in {} or rerun with --save-token",
             cfg.mcp_listen,
             fields.join(" and "),
             verb,
@@ -288,7 +294,7 @@ fn mcp_persist_plan(
 }
 
 fn token_plan(
-    values: &toml::Table,
+    values: &serde_json::Map<String, Value>,
     token: &str,
     local_only: bool,
     save_token: bool,
@@ -322,12 +328,7 @@ fn token_plan(
 }
 
 async fn prepare(home: &Path, cfg: &Config, opts: &Options) -> Result<Detected, String> {
-    let config_path = absolute(
-        &opts
-            .config
-            .clone()
-            .unwrap_or_else(super::config::default_path),
-    )?;
+    let config_path = super::config::unified_path(home);
     let values = read_config(&config_path)?;
     let (token_source, token_value, mut would_save) = token_plan(
         &values,
@@ -361,10 +362,10 @@ async fn prepare(home: &Path, cfg: &Config, opts: &Options) -> Result<Detected, 
     })
 }
 
-fn launchd_socket(values: &toml::Table) -> PathBuf {
-    match values.get("sock").and_then(toml::Value::as_str) {
+fn launchd_socket(values: &serde_json::Map<String, Value>) -> PathBuf {
+    match file_section(values).and_then(|section| section.get("sock")).and_then(Value::as_str) {
         Some(sock) if !sock.is_empty() => PathBuf::from(sock),
-        _ => std::env::temp_dir().join(format!("agent-intercom-{}/client.sock", uid())),
+        _ => std::env::temp_dir().join(format!("pi-famulus-{}/client.sock", uid())),
     }
 }
 fn validate_socket(service_sock: &Path, cli_sock: &Path, config_path: &Path) -> Result<(), String> {
@@ -488,42 +489,48 @@ fn persist_install_config(
 ) -> Result<(), String> {
     let mut values = read_config(path)?;
     let mut changed = false;
-    if !token.is_empty() && save_token && file_token(&values) != token {
-        values.insert("token".into(), toml::Value::String(token.into()));
+    if !values.contains_key("messaging") {
+        values.insert("messaging".into(), json!({}));
+    }
+    let section = values
+        .get_mut("messaging")
+        .and_then(Value::as_object_mut)
+        .ok_or("config messaging must be an object")?;
+    if !token.is_empty()
+        && save_token
+        && section.get("token").and_then(Value::as_str).unwrap_or("") != token
+    {
+        section.insert("token".into(), Value::String(token.into()));
         changed = true;
     }
     if let Some(listen) = mcp_listen {
-        if values
-            .get("mcp_listen")
-            .and_then(toml::Value::as_str)
-            .unwrap_or("")
-            != listen
-        {
-            values.insert("mcp_listen".into(), toml::Value::String(listen.into()));
+        let key = "mcpListen";
+        if section.get(key).and_then(Value::as_str).unwrap_or("") != listen {
+            section.insert(key.into(), Value::String(listen.into()));
             changed = true;
         }
     }
     if let Some(mcp_token) = mcp_token {
-        if values
-            .get("mcp_token")
-            .and_then(toml::Value::as_str)
-            .unwrap_or("")
-            != mcp_token
-        {
-            values.insert("mcp_token".into(), toml::Value::String(mcp_token.into()));
+        let key = "mcpToken";
+        if section.get(key).and_then(Value::as_str).unwrap_or("") != mcp_token {
+            section.insert(key.into(), Value::String(mcp_token.into()));
             changed = true;
         }
     }
-    if local_only && !file_local_only(&values) {
-        values.insert("local_only".into(), toml::Value::Boolean(true));
+    let local_only_key = "localOnly";
+    if local_only
+        && !section
+            .get(local_only_key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        section.insert(local_only_key.into(), Value::Bool(true));
         changed = true;
     }
     if !changed {
         return Ok(());
     }
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    let text = toml::to_string(&values).map_err(|e| format!("persist install config: {e}"))?;
-    write_private_atomic(&target, text.as_bytes(), true)
+    super::config::write_json(path, &values)
         .map_err(|e| format!("persist install config: {e}"))
 }
 
@@ -640,14 +647,8 @@ fn render_plist(d: &Detected) -> String {
     }
     text.push_str(&format!("\t</array>\n\t<key>RunAtLoad</key><true/>\n\t<key>KeepAlive</key>\n\t<dict><key>SuccessfulExit</key><false/></dict>\n\t<key>ThrottleInterval</key><integer>5</integer>\n\t<key>StandardOutPath</key>{}\n\t<key>StandardErrorPath</key>{}\n", string(&d.log_path.to_string_lossy()), string(&d.log_path.to_string_lossy())));
     // `serve` holds the supervision lease; the manager it spawns reads the
-    // bridge configuration from here.
-    let mut env = d.environment.clone();
-    env.retain(|(key, _)| key != "AGENT_INTERCOM_CONFIG");
-    env.push((
-        "AGENT_INTERCOM_CONFIG".into(),
-        d.config_path.to_string_lossy().into_owned(),
-    ));
-    let env = sanitized_environment(env);
+    // shared file under --home.
+    let env = sanitized_environment(d.environment.clone());
     if !env.is_empty() {
         text.push_str("\t<key>EnvironmentVariables</key>\n\t<dict>\n");
         for (key, value) in env {
@@ -663,7 +664,7 @@ fn render_plist(d: &Detected) -> String {
     text
 }
 fn sensitive_env_key(key: &str) -> bool {
-    key.starts_with("AGENT_INTERCOM_") && key.to_uppercase().contains("TOKEN")
+    key.to_uppercase().contains("TOKEN")
 }
 fn sanitized_environment(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
     env.retain(|(key, _)| !key.is_empty() && !sensitive_env_key(key));
@@ -676,11 +677,10 @@ fn carried_environment(
 ) -> Vec<(String, String)> {
     let mut values = BTreeMap::new();
     for (key, value) in source {
-        if value.is_empty() || sensitive_env_key(&key) || key == "AGENT_INTERCOM_SOCK" {
+        if value.is_empty() || sensitive_env_key(&key) {
             continue;
         }
         if key == "PATH"
-            || key.starts_with("AGENT_INTERCOM_")
             || matches!(
                 key.as_str(),
                 "CODEX_HOME"
@@ -762,7 +762,7 @@ async fn login_shell_path() -> Vec<PathBuf> {
 async fn read_login_shell_path(shell: &std::ffi::OsStr) -> Vec<PathBuf> {
     use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new(shell);
-    cmd.args(["-lic", "printf '\\n__AGENT_INTERCOM_PATH__%s\\n' \"$PATH\""])
+    cmd.args(["-lic", "printf '\\n__PI_FAMULUS_PATH__%s\\n' \"$PATH\""])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -796,7 +796,7 @@ async fn read_login_shell_path(shell: &std::ffi::OsStr) -> Vec<PathBuf> {
     parse_login_shell_path(&String::from_utf8_lossy(&out))
 }
 fn parse_login_shell_path(text: &str) -> Vec<PathBuf> {
-    text.rsplit_once("__AGENT_INTERCOM_PATH__")
+    text.rsplit_once("__PI_FAMULUS_PATH__")
         .map(|(_, rest)| std::env::split_paths(rest.lines().next().unwrap_or("").trim()).collect())
         .unwrap_or_default()
 }
@@ -1023,7 +1023,7 @@ fn format_status(status: &Status, report: Option<&Value>, cli_sock: &Path, issue
 }
 /// The service's `serve` leases whatever manager runs for `home`, so a
 /// self-managed one is fine; refuse only when the intercom socket is served
-/// by some other process (another home, or the standalone agent-intercom).
+/// by some other process (another home, or the standalone pi-famulus).
 async fn reject_external_daemon(home: &Path, cfg: &Config) -> Result<(), String> {
     #[cfg(unix)]
     match tokio::net::UnixStream::connect(&cfg.sock).await {
@@ -1104,8 +1104,8 @@ mod tests {
         Detected {
             executable: "/opt/homebrew/bin/pi-famulus".into(),
             manager_home: "/Users/test/manager & home".into(),
-            config_path: "/Users/test/client.toml".into(),
-            log_path: "/Users/test/Library/Logs/agent-intercom/client.log".into(),
+            config_path: "/Users/test/manager & home/config.json".into(),
+            log_path: "/Users/test/Library/Logs/pi-famulus/client.log".into(),
             path: "/opt/homebrew/bin:/usr/bin".into(),
             token_source: "config",
             token_value: "secret-relay-token".into(),
@@ -1156,6 +1156,12 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let home = root.join("manager");
         let sock = root.join("i.sock");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string(&json!({"messaging":{"localOnly":true,"sock":sock}})).unwrap(),
+        )
+        .unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1164,8 +1170,6 @@ mod tests {
             ])
             .env("PI_FAMULUS_SERVICE_MANAGER_TEST_HOME", &home)
             .env("HOME", &root)
-            .env("AGENT_INTERCOM_CONFIG", root.join("absent.toml"))
-            .env("AGENT_INTERCOM_SOCK", &sock)
             .env_remove(super::super::DISABLE_ENV)
             .env_remove("PI_FAMULUS_TEST_CLOCK")
             .stdin(std::process::Stdio::null())
@@ -1222,20 +1226,7 @@ mod tests {
                 local_only: true,
                 ..Config::default()
             };
-            let opts = Options {
-                config: None,
-                sock: None,
-                state_dir: None,
-                server: None,
-                token: None,
-                name: None,
-                mcp_listen: None,
-                mcp_token: None,
-                remote_messages: None,
-                local_only: false,
-                insecure: false,
-                save_token: false,
-            };
+            let opts = Options::without_overrides();
             run(&root.join("manager"), &cfg, &opts, ServiceCommand::Restart)
                 .await
                 .unwrap();
@@ -1296,63 +1287,45 @@ mod tests {
     }
 
     #[test]
-    fn mcp_env_only_configuration_requires_save_token_or_a_config_value() {
-        let path = Path::new("/tmp/client.toml");
+    fn mcp_cli_only_configuration_requires_save_token_or_a_config_value() {
+        let path = Path::new("/tmp/config.json");
+        let empty = serde_json::Map::new();
+        let object = |value: Value| value.as_object().unwrap().clone();
         let mut cfg = Config {
             mcp_listen: "127.0.0.1:7".into(),
             ..Config::default()
         };
-        // MCP disabled: nothing to carry, even with a stray token around.
         let disabled = Config {
-            mcp_token: "env".into(),
+            mcp_token: "cli".into(),
             ..Config::default()
         };
         assert_eq!(
-            mcp_persist_plan(&toml::Table::new(), &disabled, false, path).unwrap(),
+            mcp_persist_plan(&empty, &disabled, false, path).unwrap(),
             (None, None, Vec::new())
         );
-        // Enabled with a file-configured listen address and an empty token:
-        // the daemon generates a stable token in its state directory, so
-        // there is nothing to persist.
-        let mut values = toml::Table::new();
-        values.insert(
-            "mcp_listen".into(),
-            toml::Value::String(cfg.mcp_listen.clone()),
-        );
+        let values = object(json!({"messaging":{"mcpListen":cfg.mcp_listen}}));
         assert_eq!(
             mcp_persist_plan(&values, &cfg, false, path).unwrap(),
             (None, None, Vec::new())
         );
-        // Env/CLI-only token: refuse without --save-token, persist with it.
-        cfg.mcp_token = "env-token".into();
-        let error = mcp_persist_plan(&toml::Table::new(), &cfg, false, path).unwrap_err();
-        assert!(
-            error.contains("strips AGENT_INTERCOM_MCP_TOKEN") && error.contains("--save-token"),
-            "not actionable: {error}"
-        );
+        cfg.mcp_token = "cli-token".into();
+        let error = mcp_persist_plan(&empty, &cfg, false, path).unwrap_err();
+        assert!(error.contains("--save-token"), "not actionable: {error}");
         assert_eq!(
-            mcp_persist_plan(&toml::Table::new(), &cfg, true, path).unwrap(),
+            mcp_persist_plan(&empty, &cfg, true, path).unwrap(),
             (
                 Some("127.0.0.1:7".into()),
-                Some("env-token".into()),
+                Some("cli-token".into()),
                 vec!["mcp_listen to config", "mcp_token to config"]
             )
         );
-        // Env/CLI-only listen address is carried the same way.
         let mut no_token = cfg.clone();
         no_token.mcp_token.clear();
         assert_eq!(
-            mcp_persist_plan(&toml::Table::new(), &no_token, true, path)
-                .unwrap()
-                .0,
+            mcp_persist_plan(&empty, &no_token, true, path).unwrap().0,
             Some("127.0.0.1:7".into())
         );
-        // Explicit negative overrides must survive installation too: an old
-        // file listener/token must not be resurrected by launchd. Empty
-        // overrides persist no secret and need no --save-token opt-in.
-        let mut saved = toml::Table::new();
-        saved.insert("mcp_listen".into(), toml::Value::String("0.0.0.0:7".into()));
-        saved.insert("mcp_token".into(), toml::Value::String("file-token".into()));
+        let saved = object(json!({"messaging":{"mcpListen":"0.0.0.0:7","mcpToken":"file-token"}}));
         assert_eq!(
             mcp_persist_plan(&saved, &Config::default(), false, path).unwrap(),
             (Some(String::new()), None, vec!["mcp_listen to config"])
@@ -1365,31 +1338,24 @@ mod tests {
             mcp_persist_plan(&saved, &generated, false, path).unwrap(),
             (None, Some(String::new()), vec!["mcp_token to config"])
         );
-        // File-configured values need no carry, even with other env overrides.
-        let mut values = toml::Table::new();
-        values.insert(
-            "mcp_listen".into(),
-            toml::Value::String(cfg.mcp_listen.clone()),
-        );
-        values.insert("mcp_token".into(), toml::Value::String("env-token".into()));
+        let mut values = object(json!({"messaging":{"mcpListen":cfg.mcp_listen,"mcpToken":"cli-token"}}));
         assert_eq!(
             mcp_persist_plan(&values, &cfg, false, path).unwrap(),
             (None, None, Vec::new())
         );
-        // A file token overridden from the environment is env-only again.
-        values.insert("mcp_token".into(), toml::Value::String("file-token".into()));
+        values = object(json!({"messaging":{"mcpListen":cfg.mcp_listen,"mcpToken":"file-token"}}));
         assert!(mcp_persist_plan(&values, &cfg, false, path).is_err());
         assert_eq!(
             mcp_persist_plan(&values, &cfg, true, path).unwrap().1,
-            Some("env-token".into())
+            Some("cli-token".into())
         );
     }
 
     #[test]
-    fn install_config_persists_env_only_mcp_settings() {
+    fn install_config_persists_cli_only_mcp_settings() {
         let dir = temp_dir();
-        let path = dir.join("client.toml");
-        std::fs::write(&path, "local_only = true\n").unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{\"messaging\":{\"localOnly\":true}}\n").unwrap();
         persist_install_config(
             &path,
             "",
@@ -1400,13 +1366,13 @@ mod tests {
         )
         .unwrap();
         let values = read_config(&path).unwrap();
-        assert_eq!(values["mcp_listen"].as_str(), Some("127.0.0.1:7"));
-        assert_eq!(values["mcp_token"].as_str(), Some("mcp-secret"));
-        assert_eq!(values["local_only"].as_bool(), Some(true));
+        assert_eq!(values["messaging"]["mcpListen"].as_str(), Some("127.0.0.1:7"));
+        assert_eq!(values["messaging"]["mcpToken"].as_str(), Some("mcp-secret"));
+        assert_eq!(values["messaging"]["localOnly"].as_bool(), Some(true));
         persist_install_config(&path, "", false, false, Some(""), Some("")).unwrap();
         let values = read_config(&path).unwrap();
-        assert_eq!(values["mcp_listen"].as_str(), Some(""));
-        assert_eq!(values["mcp_token"].as_str(), Some(""));
+        assert_eq!(values["messaging"]["mcpListen"].as_str(), Some(""));
+        assert_eq!(values["messaging"]["mcpToken"].as_str(), Some(""));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1422,20 +1388,7 @@ mod tests {
                 local_only: true,
                 ..Config::default()
             };
-            let opts = Options {
-                config: None,
-                sock: None,
-                state_dir: None,
-                server: None,
-                token: None,
-                name: None,
-                mcp_listen: None,
-                mcp_token: None,
-                remote_messages: None,
-                local_only: false,
-                insecure: false,
-                save_token: false,
-            };
+            let opts = Options::without_overrides();
             let error = run(&root.join("manager"), &cfg, &opts, ServiceCommand::Install)
                 .await
                 .unwrap_err();
@@ -1451,13 +1404,14 @@ mod tests {
         std::fs::write(agents.join(format!("{LABEL}.plist")), original).unwrap();
         // The install validates that the service socket matches the config.
         let sock = root.join("install-intercom.sock");
+        std::fs::create_dir_all(root.join("manager")).unwrap();
         std::fs::write(
-            root.join("client.toml"),
-            format!(
-                "local_only = true\nsock = '{}'\nstate_dir = '{}'\n",
-                sock.display(),
-                root.join("state").display()
-            ),
+            root.join("manager/config.json"),
+            serde_json::to_string(&json!({"messaging":{
+                "localOnly":true,
+                "sock":sock,
+                "stateDir":root.join("state")
+            }})).unwrap(),
         )
         .unwrap();
         let bin = root.join("bin");
@@ -1483,7 +1437,6 @@ mod tests {
             .env(CHILD, &root)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("HOME", &root)
-            .env("AGENT_INTERCOM_CONFIG", root.join("client.toml"))
             .env_remove("PI_FAMULUS_TEST_CLOCK")
             .output()
             .unwrap();
@@ -1537,23 +1490,22 @@ mod tests {
     #[test]
     fn plist_preserves_launchd_contract_and_manager_arguments() {
         let mut d = detected();
-        d.would_save = vec!["token to config", "local_only=true"];
+        d.would_save = vec!["token to config", "localOnly=true"];
         d.environment
             .push(("HTTP_PROXY".into(), "http://u:p&ss@proxy".into()));
         d.environment
-            .push(("AGENT_INTERCOM_MCP_TOKEN".into(), "mcp-secret".into()));
+            .push(("UNRELATED_TOKEN".into(), "mcp-secret".into()));
         let text = render_with_token_check(&d, "secret-relay-token").unwrap();
         for expected in [
             "<string>--home</string>",
             "<string>/Users/test/manager &amp; home</string>",
             "<string>serve</string>",
-            "<key>AGENT_INTERCOM_CONFIG</key>",
             "<key>SuccessfulExit</key><false/>",
             "<key>ThrottleInterval</key><integer>5</integer>",
             "<key>StandardOutPath</key>",
             "<key>StandardErrorPath</key>",
             "http://u:p&amp;ss@proxy",
-            "would save token to config; would save local_only=true",
+            "would save token to config; would save localOnly=true",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }
@@ -1578,8 +1530,8 @@ mod tests {
 
     #[test]
     fn token_plans_match_config_and_save_token_precedence() {
-        let mut values = toml::Table::new();
-        let path = Path::new("/tmp/client.toml");
+        let mut values = serde_json::Map::new();
+        let path = Path::new("/tmp/config.json");
         assert!(token_plan(&values, "", false, false, path)
             .unwrap_err()
             .contains("token is required"));
@@ -1602,16 +1554,14 @@ mod tests {
                 vec!["local_only=true"]
             )
         );
-        values.insert("token".into(), toml::Value::String("file".into()));
-        assert_eq!(
-            token_plan(&values, "env", false, false, path).unwrap().1,
-            "file"
-        );
+        values.insert("token".into(), Value::String("file".into()));
+        assert!(token_plan(&values, "env", false, false, path).is_err());
+        values.insert("messaging".into(), json!({"token":"file"}));
         assert_eq!(
             token_plan(&values, "new", false, true, path).unwrap().1,
             "new"
         );
-        values.insert("local_only".into(), toml::Value::Boolean(true));
+        values["messaging"].as_object_mut().unwrap().insert("localOnly".into(), Value::Bool(true));
         assert!(token_plan(&values, "file", true, true, path)
             .unwrap()
             .2
@@ -1619,35 +1569,29 @@ mod tests {
     }
 
     #[test]
-    fn carried_environment_filters_secrets_socket_and_unrelated_values() {
+    fn carried_environment_filters_secrets_and_unrelated_values() {
         let source = [
             ("PATH", "/old"),
-            ("AGENT_INTERCOM_TOKEN", "secret"),
-            ("AGENT_INTERCOM_MCP_TOKEN", "secret"),
-            ("AGENT_INTERCOM_someToken", "secret"),
-            ("AGENT_INTERCOM_SOCK", "/wrong/socket"),
-            ("AGENT_INTERCOM_SERVER", "relay"),
             ("CODEX_HOME", "/codex"),
             ("CLAUDE_CONFIG_DIR", "/claude"),
             ("CLAUDE_CODE_HARBOR_KITE", "1"),
             ("http_proxy", "http://proxy"),
             ("HTTPS_PROXY", "http://proxy"),
             ("UNRELATED_SECRET", "secret"),
-            ("AGENT_INTERCOM_EMPTY", ""),
+            ("UNRELATED_TOKEN", "secret"),
+            ("EMPTY", ""),
         ];
         let env = carried_environment("/new", source.map(|(k, v)| (k.into(), v.into())));
         assert_eq!(env[0], ("PATH".into(), "/new".into()));
-        assert_eq!(env.len(), 7);
-        assert!(!env
-            .iter()
-            .any(|(k, _)| k.contains("TOKEN") || k == "AGENT_INTERCOM_SOCK"));
-        assert_eq!(env[1].0, "AGENT_INTERCOM_SERVER");
+        assert_eq!(env.len(), 6);
+        assert!(!env.iter().any(|(k, _)| k.contains("TOKEN")));
+        assert_eq!(env[1].0, "CLAUDE_CODE_HARBOR_KITE");
     }
 
     #[cfg(unix)]
     #[test]
     fn socket_validation_rejects_relative_and_mismatched_paths() {
-        let config = Path::new("/tmp/client.toml");
+        let config = Path::new("/tmp/config.json");
         assert!(validate_socket(
             Path::new("relative.sock"),
             Path::new("relative.sock"),
@@ -1662,16 +1606,16 @@ mod tests {
         );
         validate_socket(Path::new("/one/../two"), Path::new("/two"), config).unwrap();
         assert_eq!(
-            launchd_socket(&toml::Table::new()),
-            std::env::temp_dir().join(format!("agent-intercom-{}/client.sock", uid()))
+            launchd_socket(&serde_json::Map::new()),
+            std::env::temp_dir().join(format!("pi-famulus-{}/client.sock", uid()))
         );
     }
 
     #[test]
     fn config_updates_preserve_unknown_values_and_noop_is_read_only() {
         let dir = temp_dir();
-        let path = dir.join("client.toml");
-        let initial = "# preserved on no-op\nserver = 'https://relay'\ntoken = 'old'\n[future]\nenabled = true\n";
+        let path = dir.join("config.json");
+        let initial = "{\n  \"messaging\": {\"server\":\"https://relay\",\"token\":\"old\"},\n  \"future\": {\"enabled\":true}\n}\n";
         std::fs::write(&path, initial).unwrap();
         persist_install_config(&path, "ignored", false, false, None, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
@@ -1697,9 +1641,9 @@ mod tests {
     fn config_updates_follow_symlinks_and_preserve_private_permissions() {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = temp_dir();
-        let target = dir.join("actual.toml");
-        let link = dir.join("client.toml");
-        std::fs::write(&target, "token = 'old'\n").unwrap();
+        let target = dir.join("actual.json");
+        let link = dir.join("config.json");
+        std::fs::write(&target, "{\"messaging\":{\"token\":\"old\"}}\n").unwrap();
         symlink(&target, &link).unwrap();
         persist_install_config(&link, "new", false, true, None, None).unwrap();
         assert!(std::fs::symlink_metadata(&link)
@@ -1717,7 +1661,7 @@ mod tests {
     #[test]
     fn launchctl_status_ignores_nested_coalition_state_and_pid() {
         let mut st = Status::default();
-        parse_status(&mut st, "gui/501/com.agent-intercom.client = {\n\tstate = running\n\tpid = 123\n\tcoalitions = {\n\t\tstate = waiting\n\t\tpid = 999\n\t}\n}\n");
+        parse_status(&mut st, "gui/501/com.pi-famulus.client = {\n\tstate = running\n\tpid = 123\n\tcoalitions = {\n\t\tstate = waiting\n\t\tpid = 999\n\t}\n}\n");
         assert!(st.loaded && st.running);
         assert_eq!(st.pid, 123);
         assert_eq!(st.state, "running");
@@ -1785,7 +1729,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_path_marker_uses_last_marker_and_ignores_shell_noise() {
-        assert_eq!(parse_login_shell_path("noise\n__AGENT_INTERCOM_PATH__/old\nnoise\n__AGENT_INTERCOM_PATH__/bin:/opt/bin\nbye"), vec![PathBuf::from("/bin"), PathBuf::from("/opt/bin")]);
+        assert_eq!(parse_login_shell_path("noise\n__PI_FAMULUS_PATH__/old\nnoise\n__PI_FAMULUS_PATH__/bin:/opt/bin\nbye"), vec![PathBuf::from("/bin"), PathBuf::from("/opt/bin")]);
         assert!(parse_login_shell_path("no marker").is_empty());
         assert_eq!(comment_value("x--y\nz&\""), "x- -y z&amp;&#34;");
     }
@@ -1796,7 +1740,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let shell = dir.join("shell");
-        std::fs::write(&shell, "#!/bin/sh\nprintf '\\n__AGENT_INTERCOM_PATH__/from/login:/bin\\n'\nexec /bin/sleep 5\n").unwrap();
+        std::fs::write(&shell, "#!/bin/sh\nprintf '\\n__PI_FAMULUS_PATH__/from/login:/bin\\n'\nexec /bin/sleep 5\n").unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             read_login_shell_path(shell.as_os_str()).await,

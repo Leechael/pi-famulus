@@ -1,6 +1,6 @@
 //! Cross-session messaging over the manager connection (protocol 7 `intercom`).
 //!
-//! The pi-famulus extension serves the agent-intercom client protocol on its
+//! The pi-famulus extension serves the pi-famulus client protocol on its
 //! existing manager socket instead of the legacy client socket: one port per
 //! manager connection, push frames as `intercom` events, identity bound to
 //! the hello session, and `intercom_reset` when the bridge restarts.
@@ -863,21 +863,69 @@ fn reregistration_and_pre_upgrade_receipts_survive_an_in_place_upgrade() {
 /// the daemon is mid-exec. Only the post-upgrade image answers with a
 /// higher generation than before the request.
 fn manager_status_generation(fixture: &Fixture) -> Option<u64> {
-    let mut conn = common::Conn::new(UnixStream::connect(
-        fixture.root.join("manager/manager.sock"),
-    ).ok()?);
+    let conn =
+        common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).ok()?);
+    manager_connection_generation(conn)
+}
+
+fn manager_connection_generation(mut conn: common::Conn) -> Option<u64> {
     // hello first: the daemon refuses non-hello first frames, and during
     // the exec hellos are rejected until the new image serves them.
-    let hello = conn.try_request(
+    let hello = manager_probe_request(
+        &mut conn,
+        "probe-hello",
         json!({"type":"hello","client_kind":"cli"}),
-        Duration::from_millis(1500),
     )?;
     if hello["ok"] != true {
         return None;
     }
-    conn.try_request(json!({"type":"status"}), Duration::from_millis(1500))?
-        ["generation"]
+    manager_probe_request(&mut conn, "probe-status", json!({"type":"status"}))?["generation"]
         .as_u64()
+}
+
+fn manager_probe_request(conn: &mut common::Conn, id: &str, mut request: Value) -> Option<Value> {
+    request["v"] = json!(1);
+    request["id"] = json!(id);
+    let body = serde_json::to_vec(&request).unwrap();
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    // Unlike Conn::try_request, readiness probes must tolerate write errors:
+    // the old image can close an accepted connection before either request.
+    conn.send_raw(&frame).ok()?;
+    conn.wait_id(id, Duration::from_millis(1500))
+}
+
+#[test]
+fn generation_probe_tolerates_a_peer_closed_before_hello() {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    assert_eq!(
+        manager_connection_generation(common::Conn::new(stream)),
+        None
+    );
+}
+
+#[test]
+fn generation_probe_tolerates_a_peer_closed_before_status() {
+    let (stream, mut peer) = UnixStream::pair().unwrap();
+    let server = thread::spawn(move || {
+        use std::io::Read;
+        let mut prefix = [0; 4];
+        peer.read_exact(&mut prefix).unwrap();
+        let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+        peer.read_exact(&mut body).unwrap();
+        let hello: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hello["type"], "hello");
+        // Refuse the next write before releasing the hello response, so the
+        // client's status write deterministically gets BrokenPipe.
+        peer.shutdown(std::net::Shutdown::Read).unwrap();
+        common::Conn::new(peer).send(&json!({"id":hello["id"],"ok":true}));
+    });
+    assert_eq!(
+        manager_connection_generation(common::Conn::new(stream)),
+        None
+    );
+    server.join().unwrap();
 }
 
 /// A fresh legacy peer that has JUST completed a register round-trip, or

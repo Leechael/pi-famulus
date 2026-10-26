@@ -165,6 +165,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   let managerPath = resolveManagerPath(config, home);
   let famulusInfo: {
     extensionVersion: string;
+    configPath: string;
     managerPath: string | null;
     describeSearch: () => string;
     getClient: () => ManagerClient | null;
@@ -225,6 +226,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
    */
   const notifyOnExit = new Set<string>();
+  /** Reload replaces extensions, not the parent process; do not replay historical results. */
+  let recoverPreviousProcess = true;
   /** Sessions that already received the crash-recovery notice. */
   const recoveredSessions = new Set<string>();
   const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
@@ -322,6 +325,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         markNotifyOnExit(task.task_id);
         continue;
       }
+      if (!recoverPreviousProcess) continue;
       if (task.end_reason === "manager-shutdown" || task.end_reason === "manager-crash") continue;
       if (task.ended_at != null && now - task.ended_at > WORK_RETAIN_MS) continue;
       if (task.status !== "completed" && task.status !== "failed" && task.status !== "killed") continue;
@@ -380,18 +384,18 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    * A hosted child that is still warm is left for resume.
    */
   const recoverCrashedSession = async (sessionId: string): Promise<void> => {
-    if (!sessionId || recoveredSessions.has(sessionId)) return;
+    if (!recoverPreviousProcess || !sessionId || recoveredSessions.has(sessionId)) return;
     const manager = client;
     const center = notifyCenter;
     recoveredSessions.add(sessionId);
     const interrupted =
       await settleDeadHostedChildren(sessionId);
-    if (client !== manager || notifyCenter !== center) return;
+    if (!recoverPreviousProcess || client !== manager || notifyCenter !== center) return;
     let killed: TaskRecord[] = [];
     if (manager?.isAvailable()) {
       try {
         const tasks = await manager.list(true);
-        if (client !== manager || notifyCenter !== center) return;
+        if (!recoverPreviousProcess || client !== manager || notifyCenter !== center) return;
         killed = tasks.filter((task) => {
           if (task.session_id && task.session_id !== sessionId) return false;
           if (task.kind !== "shell") return false;
@@ -614,6 +618,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   });
   famulusInfo = {
     extensionVersion: EXTENSION_VERSION,
+    configPath: join(home, "config.json"),
     managerPath,
     describeSearch: () => describeManagerSearch(config, home),
     getClient: () => client,
@@ -737,6 +742,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   };
 
   pi.on("session_start", async (event, startCtx) => {
+    recoverPreviousProcess = event.reason !== "reload";
     if (parkedSessionId !== null) {
       const resumed = event.reason === "reload" && startCtx.sessionManager.getSessionId() === parkedSessionId;
       parkedSessionId = null;
@@ -1286,7 +1292,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   });
 
   // The intercom port (cross-session messaging, absorbed from the
-  // agent-intercom pi plugin) rides the same manager connection. Registered
+  // pi-famulus pi plugin) rides the same manager connection. Registered
   // after the session hooks above so its session_start sees the fresh
   // client. Hosted children never reach here (child-mode returns early).
   registerIntercom(pi, { getClient: () => client });

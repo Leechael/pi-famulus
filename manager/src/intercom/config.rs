@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
     pub server: String,
     pub token: String,
@@ -16,7 +16,6 @@ pub struct Config {
     pub remote_messages: String,
     pub local_only: bool,
     pub event_log_size: usize,
-    #[serde(rename = "endpoint")]
     pub endpoints: Vec<Endpoint>,
 }
 
@@ -38,13 +37,13 @@ impl Default for Config {
     fn default() -> Self {
         let home = home();
         let sock = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(|v| PathBuf::from(v).join("agent-intercom/client.sock"))
+            .map(|v| PathBuf::from(v).join("pi-famulus/client.sock"))
             .unwrap_or_else(|| {
                 #[cfg(unix)]
                 let uid = unsafe { libc::getuid() };
                 #[cfg(not(unix))]
                 let uid = 0;
-                std::env::temp_dir().join(format!("agent-intercom-{uid}/client.sock"))
+                std::env::temp_dir().join(format!("pi-famulus-{uid}/client.sock"))
             });
         Self {
             server: "https://127.0.0.1:8443".into(),
@@ -52,7 +51,7 @@ impl Default for Config {
             name: String::new(),
             tls_insecure: false,
             sock,
-            state_dir: home.join(".agent-intercom"),
+            state_dir: home.join(".pi/agent/pi-famulus/messaging"),
             mcp_listen: String::new(),
             mcp_token: String::new(),
             mcp_allow_non_loopback: false,
@@ -112,42 +111,55 @@ pub fn home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default()
 }
-pub fn default_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("AGENT_INTERCOM_CONFIG").filter(|path| !path.is_empty()) {
-        return path.into();
+pub fn unified_path(home: &Path) -> PathBuf {
+    home.join("config.json")
+}
+fn read_json(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| format!("parse {}: {e}", path.display()))?;
+            value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| format!("{} must contain a JSON object", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
-        .join("agent-intercom.toml")
+}
+/// Atomically persist the shared JSON file without discarding unrelated
+/// Famulus settings. Configuration may contain relay and MCP bearer tokens.
+pub fn write_json(
+    path: &Path,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let dir = target.parent().ok_or("config file parent required")?;
+    private_dir(dir)?;
+    let tmp = dir.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
+    let mut bytes = serde_json::to_vec_pretty(values).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    private_write(&tmp, &bytes)?;
+    if let Err(error) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write {}: {error}", target.display()));
+    }
+    Ok(())
 }
 
 impl Config {
-    pub fn load(opts: &super::cli::Options) -> Result<Self, String> {
-        let path = opts.config.clone().unwrap_or_else(default_path);
-        let mut c = match std::fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).map_err(|e| format!("parse {}: {e}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+    pub fn load(home: &Path, opts: &super::cli::Options) -> Result<Self, String> {
+        let path = unified_path(home);
+        let values = read_json(&path)?;
+        let mut c = if let Some(messaging) = values.get("messaging") {
+            serde_json::from_value(messaging.clone())
+                .map_err(|e| format!("parse {} messaging: {e}", path.display()))?
+        } else {
+            Self::default()
         };
-        for (key, target) in [
-            ("SERVER", &mut c.server),
-            ("TOKEN", &mut c.token),
-            ("NAME", &mut c.name),
-            ("MCP_LISTEN", &mut c.mcp_listen),
-            ("MCP_TOKEN", &mut c.mcp_token),
-            ("REMOTE_MESSAGES", &mut c.remote_messages),
-        ] {
-            if let Ok(v) = std::env::var(format!("AGENT_INTERCOM_{key}")) {
-                if !v.is_empty() {
-                    *target = v;
-                }
-            }
-        }
-        if let Some(v) = std::env::var_os("AGENT_INTERCOM_SOCK") {
-            if !v.is_empty() {
-                c.sock = v.into();
-            }
+        if c.state_dir == Self::default().state_dir {
+            c.state_dir = home.join("messaging");
         }
         for (v, target) in [
             (&opts.server, &mut c.server),
@@ -342,12 +354,12 @@ mod tests {
         let error = toml::from_str::<Config>("mcp_tokne = 'typo'\n").unwrap_err();
         assert!(error.to_string().contains("mcp_tokne"), "{error}");
         let error = toml::from_str::<Config>(
-            "[[endpoint]]\nname = 'hook'\nurl = 'https://x'\nsecrte = 's'\n",
+            "[[endpoints]]\nname = 'hook'\nurl = 'https://x'\nsecrte = 's'\n",
         )
         .unwrap_err();
         assert!(error.to_string().contains("secrte"), "{error}");
         let parsed: Config = toml::from_str(
-            "local_only = true\nmcp_listen = ''\n[[endpoint]]\nname = 'hook'\nurl = 'https://x'\n",
+            "localOnly = true\nmcpListen = ''\n[[endpoints]]\nname = 'hook'\nurl = 'https://x'\n",
         )
         .unwrap();
         assert_eq!(parsed.endpoints[0].auth, "hmac");
@@ -356,6 +368,24 @@ mod tests {
             serde_json::from_value::<Config>(wire).unwrap(),
             Config::default()
         );
+    }
+
+    #[test]
+    fn messaging_is_loaded_from_the_shared_json_file() {
+        let home = std::env::temp_dir().join(format!("famulus-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.json"),
+            "{\"foregroundBudgetMs\":1234,\"messaging\":{\"name\":\"workstation\",\"localOnly\":true,\"mcpListen\":\"127.0.0.1:9\",\"endpoints\":[{\"name\":\"hook\",\"url\":\"https://example.test/hook\"}]}}\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&home, &super::super::cli::Options::without_overrides()).unwrap();
+        assert_eq!(loaded.name, "workstation");
+        assert!(loaded.local_only);
+        assert_eq!(loaded.mcp_listen, "127.0.0.1:9");
+        assert_eq!(loaded.endpoints.len(), 1);
+        assert_eq!(loaded.state_dir, home.join("messaging"));
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -389,7 +419,7 @@ mod tests {
         ] {
             assert!(config(listen, "", false).validate().is_ok(), "{listen}");
         }
-        let parsed: Config = toml::from_str("mcp_allow_non_loopback = true\n").unwrap();
+        let parsed: Config = toml::from_str("mcpAllowNonLoopback = true\n").unwrap();
         assert!(parsed.mcp_allow_non_loopback);
     }
 

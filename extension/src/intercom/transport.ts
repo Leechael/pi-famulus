@@ -2,7 +2,7 @@
  * The intercom transport: one op at a time onto the famulus manager
  * connection, frames pushed back as `intercom` events.
  *
- * Upstream baseline: agent-intercom @ 98183fb, plugin/pi — this interface
+ * Upstream baseline: pi-famulus @ 98183fb, plugin/pi — this interface
  * replaces the plugin's Unix socket (`client.sock`) with the manager
  * connection the extension already holds (`manager.sock`, protocol 7).
  */

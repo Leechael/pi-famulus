@@ -8,7 +8,7 @@
  *
  * Uses the binary at ../../manager/target/debug/pi-famulus unless
  * PI_FAMULUS_MANAGER_PATH overrides it. The messaging bridge binds an
- * isolated client.sock under the temp home (AGENT_INTERCOM_CONFIG).
+ * isolated client.sock configured in the temp home's config.json.
  */
 import { spawnSync } from "node:child_process";
 import { connect as connectStream } from "node:net";
@@ -36,17 +36,19 @@ const home = join(root, "manager");
 const bridgeSock = join(root, "bridge", "client.sock");
 mkdirSync(join(root, "bridge"), { recursive: true });
 mkdirSync(join(root, "state"), { recursive: true });
+mkdirSync(home, { recursive: true });
 writeFileSync(
-  join(root, "client.toml"),
-  [
-    "local_only = true",
-    "name = 'intercom-integ-host'",
-    `sock = '${bridgeSock}'`,
-    `state_dir = '${join(root, "state")}'`,
-    "mcp_listen = ''",
-  ].join("\n") + "\n",
+  join(home, "config.json"),
+  JSON.stringify({
+    messaging: {
+      localOnly: true,
+      name: "intercom-integ-host",
+      sock: bridgeSock,
+      stateDir: join(root, "state"),
+      mcpListen: "",
+    },
+  }),
 );
-process.env.AGENT_INTERCOM_CONFIG = join(root, "client.toml");
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -72,7 +74,6 @@ describe.skipIf(!RUN)("real pi-famulus intercom integration", () => {
     // Stop the daemon (a best-effort CLI shutdown; the temp home is removed anyway).
     spawnSync(BIN, ["--home", home, "shutdown"], { stdio: "ignore", timeout: 10_000 });
     rmSync(root, { recursive: true, force: true });
-    delete process.env.AGENT_INTERCOM_CONFIG;
   });
 
   it("serves register/send/deliver/receipt over manager.sock", { timeout: 60_000 }, async () => {

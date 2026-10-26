@@ -312,7 +312,7 @@ fn untrusted_plugin_hooks(listing: &Value) -> bool {
         .flatten()
         .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
         .any(|hook| {
-            str_field(hook, "pluginId") == "intercom@agent-intercom"
+            str_field(hook, "pluginId") == "intercom@pi-famulus"
                 && !str_field(hook, "currentHash").is_empty()
                 && seen.insert(str_field(hook, "key"))
                 && matches!(
@@ -327,7 +327,7 @@ async fn diagnostic_reachable() -> bool {
     tokio::time::timeout(Duration::from_secs(1), async {
         let stream = super::validated_unix_stream(&control_socket(), Duration::from_secs(1)).await.map_err(|e| e.to_string())?;
         let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/rpc", stream).await.map_err(|e| e.to_string())?;
-        super::codex_call(&mut ws, "initialize", json!({"clientInfo":{"name":"agent-intercom","title":"agent-intercom","version":"0.1.0"},"capabilities":{"optOutNotificationMethods":OPT_OUT}})).await?;
+        super::codex_call(&mut ws, "initialize", json!({"clientInfo":{"name":"pi-famulus","title":"pi-famulus","version":"0.1.0"},"capabilities":{"optOutNotificationMethods":OPT_OUT}})).await?;
         ws.send(Message::text(json!({"method":"initialized"}).to_string())).await.map_err(|e| e.to_string())?;
         Ok::<_, String>(())
     }).await.is_ok_and(|result| result.is_ok())
@@ -589,7 +589,7 @@ impl Client {
             tasks.retain(|task| !task.is_finished());
             tasks.push(task);
         }
-        connection.call("initialize", json!({"clientInfo":{"name":"agent-intercom","title":"agent-intercom","version":"0.1.0"},
+        connection.call("initialize", json!({"clientInfo":{"name":"pi-famulus","title":"pi-famulus","version":"0.1.0"},
             "capabilities":{"optOutNotificationMethods":OPT_OUT}})).await.map_err(|e| format!("codex initialize: {}", e.message))?;
         connection
             .tx

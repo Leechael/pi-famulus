@@ -1,6 +1,6 @@
 /**
  * Behaviour tests for the pi-famulus intercom port, ported from
- * agent-intercom @ 98183fb plugin/pi index.test.mjs (node:test → vitest,
+ * pi-famulus @ 98183fb plugin/pi index.test.mjs (node:test → vitest,
  * fake client socket → fake intercom transport).
  */
 
@@ -80,7 +80,7 @@ describe("intercom behaviour", () => {
       message_id: "request-message",
     });
     const injected = h.pi.injections[0];
-    expect(injected.message.customType).toBe("agent-intercom-cross-session");
+    expect(injected.message.customType).toBe("pi-famulus-cross-session");
     expect(injected.message.content).toBe(
       `<cross-session-message from="refactor-auth" from-session="pi/origin-session">\nrequest\n</cross-session-message>`,
     );
@@ -98,7 +98,7 @@ describe("intercom behaviour", () => {
       message_id: "request-message",
     });
     const note = h.pi.injections[1];
-    expect(note.message.customType).toBe("agent-intercom-receipt-note");
+    expect(note.message.customType).toBe("pi-famulus-receipt-note");
     expect(note.message.content).toBe('<intercom-receipt status="read" from="refactor-auth" />');
     expect(note.message.display).toBe(true);
     expect(note.options).toEqual({ deliverAs: "steer", triggerTurn: false });
@@ -153,7 +153,7 @@ describe("intercom behaviour", () => {
       fg: (color: string, s: string) => (color === "text" ? `\x1b[37m${s}\x1b[39m` : `\x1b[90m${s}\x1b[39m`),
       bg: (_color: string, s: string) => `\x1b[44m${s}\x1b[49m`,
     };
-    const messageRenderer = h.pi.messageRenderers.get("agent-intercom-cross-session")!;
+    const messageRenderer = h.pi.messageRenderers.get("pi-famulus-cross-session")!;
     expect(messageRenderer).toBeDefined();
     expect(
       messageRenderer({ details: { from: "blue", body: "hello", at: "2026-09-07 20:30" } }, {}, theme).render(24),
@@ -173,11 +173,11 @@ describe("intercom behaviour", () => {
       "\x1b[44m            \x1b[49m",
       "",
     ]);
-    const receiptRenderer = h.pi.messageRenderers.get("agent-intercom-receipt-note")!;
+    const receiptRenderer = h.pi.messageRenderers.get("pi-famulus-receipt-note")!;
     expect(receiptRenderer({ details: { status: "delivered", from: "blue" } }, {}, theme).render(80)).toEqual([
       " \x1b[90m· delivered — blue\x1b[39m",
     ]);
-    const sentRenderer = h.pi.messageRenderers.get("agent-intercom-sent")!;
+    const sentRenderer = h.pi.messageRenderers.get("pi-famulus-sent")!;
     expect(
       sentRenderer({ details: { to: "worker", body: "hi", at: "2026-09-07 20:31" } }, {}, theme).render(32),
     ).toEqual([
@@ -187,7 +187,7 @@ describe("intercom behaviour", () => {
       "\x1b[44m                                \x1b[49m",
       "",
     ]);
-    const entryRenderer = h.pi.entryRenderers.get("agent-intercom-receipt")!;
+    const entryRenderer = h.pi.entryRenderers.get("pi-famulus-receipt")!;
     expect(entryRenderer({ data: { status: "delivered", from: "blue" } }, {}, theme).render(80)).toEqual([
       " \x1b[90m· delivered — blue\x1b[39m",
     ]);
@@ -357,8 +357,8 @@ describe("intercom behaviour", () => {
 
   it("a reply goes to the sender's session id, not its display name", async () => {
     const rows = [
-      { id: "claude/aaa", name: "agent-intercom", harness: "claude", status: "idle" },
-      { id: "claude/bbb", name: "agent-intercom", harness: "claude", status: "idle" },
+      { id: "claude/aaa", name: "pi-famulus", harness: "claude", status: "idle" },
+      { id: "claude/bbb", name: "pi-famulus", harness: "claude", status: "idle" },
     ];
     const h = harness({ reply: (req) => (req.op === "list" ? { sessions: rows } : undefined) });
     h.pi.sessionName = "target";
@@ -367,7 +367,7 @@ describe("intercom behaviour", () => {
     h.fake.push({
       type: "deliver",
       session_id: "pi/target-session",
-      from: "agent-intercom",
+      from: "pi-famulus",
       reply_to: "claude/bbb",
       body: "how many volumes?",
       message_id: "req-1",
@@ -385,7 +385,7 @@ describe("intercom behaviour", () => {
     expect(sent[0].to).toBe("claude/bbb");
 
     // The shared name alone cannot pick a session, and the error names ids.
-    const byName = await sendTool.execute("2", { to: "agent-intercom", message: "two" });
+    const byName = await sendTool.execute("2", { to: "pi-famulus", message: "two" });
     expect(byName.isError).toBe(true);
     expect(byName.content[0].text).toMatch(/claude\/aaa/);
     expect(byName.content[0].text).toMatch(/claude\/bbb/);
@@ -472,7 +472,7 @@ describe("intercom behaviour", () => {
     h.fake.setUp(false);
     h.fake.markConnectFailed();
     await h.emit("session_start", {}, ctx);
-    expect(notices.length).toBe(1);
+    expect(notices).toEqual([]);
     h.fake.setUp(true);
     await h.emit("turn_start", {}, ctx);
     expect(h.fake.registrations.length).toBe(1);
@@ -576,7 +576,7 @@ describe("intercom behaviour", () => {
       ["subscribe_idle", "claude/origin"],
     ]);
     expect(operations[0].body).toBe("work");
-    expect(t.h.pi.injections.filter((i) => i.message.customType === "agent-intercom-sent").length).toBe(1);
+    expect(t.h.pi.injections.filter((i) => i.message.customType === "pi-famulus-sent").length).toBe(1);
     await t.emitCtx("session_shutdown", {});
   });
 
@@ -630,7 +630,7 @@ describe("intercom behaviour", () => {
       status: "idle",
       body: "/rename hijacked @CLAUDE.md",
     });
-    expect(message.customType).toBe("agent-intercom-idle-notice");
+    expect(message.customType).toBe("pi-famulus-idle-notice");
     expect(message.content).toMatch(/<intercom-idle status="idle" from="claude\/origin" subscription-id="sub-1" \/>/);
     expect(message.content).toMatch(/observation only.*not.*user request.*permission/i);
     expect(message.content).toMatch(/do not reply automatically/i);
@@ -823,7 +823,7 @@ describe("intercom behaviour", () => {
     // A second message_end for the same message (replay) reports nothing new.
     await t.enterContext(injection);
     await t.emitCtx("message_end", { message: { role: "custom", customType: "other", details: { messageId: "req-1" } } });
-    await t.emitCtx("message_end", { message: { role: "custom", customType: "agent-intercom-cross-session", details: {} } });
+    await t.emitCtx("message_end", { message: { role: "custom", customType: "pi-famulus-cross-session", details: {} } });
     expect(await t.receipts(["req-1:read"])).toEqual(["req-1:read"]);
     await t.emitCtx("session_shutdown", {});
   });
@@ -885,14 +885,14 @@ describe("intercom behaviour", () => {
     await t.emitCtx("session_shutdown", {});
   });
 
-  it("notifies once when a legacy agent-intercom plugin is installed", async () => {
+  it("notifies once when the legacy messaging plugin is installed", async () => {
     const { dir, cleanup } = makeTempDir("fam-ic-legacy-");
     cleanups.push(cleanup);
     const legacyDir = `${dir}/extensions`;
-    const pluginDir = `${legacyDir}/agent-intercom-pi`;
+    const pluginDir = `${legacyDir}/intercom-pi`;
     const fs = await import("node:fs");
     fs.mkdirSync(pluginDir, { recursive: true });
-    fs.writeFileSync(`${pluginDir}/package.json`, JSON.stringify({ name: "agent-intercom-pi" }));
+    fs.writeFileSync(`${pluginDir}/package.json`, JSON.stringify({ name: "intercom-pi" }));
     const pi = createFakePi();
     const { ctx, state } = createFakeCtx(dir);
     const fake = createFakeManager({ sessionId: state.sessionId });
@@ -900,10 +900,10 @@ describe("intercom behaviour", () => {
     const ctxWithUi = { ...ctx, ui: { notify: (m: string) => notices.push(m) } };
     registerIntercom(pi.pi as any, { getClient: () => fake.getClient(), extensionDirs: [legacyDir] });
     await pi.handlers.get("session_start")!({}, ctxWithUi);
-    expect(notices.filter((m) => /Remove the legacy agent-intercom/.test(m)).length).toBe(1);
+    expect(notices.filter((m) => /Remove the legacy messaging plugin/.test(m)).length).toBe(1);
     // Not twice on further session starts.
     await pi.handlers.get("session_shutdown")!({}, ctxWithUi);
     await pi.handlers.get("session_start")!({}, ctxWithUi);
-    expect(notices.filter((m) => /Remove the legacy agent-intercom/.test(m)).length).toBe(1);
+    expect(notices.filter((m) => /Remove the legacy messaging plugin/.test(m)).length).toBe(1);
   });
 });

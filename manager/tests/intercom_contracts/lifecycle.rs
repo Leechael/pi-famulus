@@ -88,10 +88,8 @@ fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() 
     let mut fixture = Fixture::new();
     let mcp = network::vacant_address().to_string();
     let codex = codex_host(&fixture);
-    spawn_self_managed(
-        &mut fixture,
-        &[("AGENT_INTERCOM_MCP_LISTEN", &mcp), ("CODEX_APP_SERVER_SOCK", &codex.path)],
-    );
+    fixture.config(&format!("mcp_listen = '{mcp}'\n"));
+    spawn_self_managed(&mut fixture, &[("CODEX_APP_SERVER_SOCK", &codex.path)]);
     let pi = pi_session(&fixture, "pi-session");
     wait_for("the bridge runs without any lease", &fixture, TIMEOUT, || {
         UnixStream::connect(&fixture.sock).is_ok()
@@ -177,12 +175,13 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
 fn serve_leases_an_existing_self_managed_manager_and_survives_its_replacement() {
     let mut fixture = Fixture::new();
     let mcp = network::vacant_address().to_string();
-    spawn_self_managed(&mut fixture, &[("AGENT_INTERCOM_MCP_LISTEN", &mcp)]);
+    fixture.config(&format!("mcp_listen = '{mcp}'\n"));
+    spawn_self_managed(&mut fixture, &[]);
     let mut pi = pi_session(&fixture, "pi-session");
     let (task, task_pid) = pi.start("sleep 30");
     let first = fixture.daemon_pid();
     let mut daemon = fixture.child.take().unwrap();
-    fixture.start_with(&[], &[("AGENT_INTERCOM_MCP_LISTEN", &mcp)]);
+    fixture.start_with(&["--mcp-listen", &mcp], &[]);
     assert_eq!(fixture.daemon_pid(), first, "serve replaced a running manager");
     wait_for("leasing promotes the running manager", &fixture, TIMEOUT, || mcp_up(&mcp));
     let listed = pi.request_ok(json!({"type":"list"}));
@@ -247,14 +246,11 @@ fn a_lease_rereads_the_bridge_configuration_a_self_managed_manager_started_with(
 }
 
 #[test]
-fn a_legacy_launch_agent_command_still_supervises_with_its_configuration() {
+fn the_service_entry_point_still_supervises_with_shared_configuration() {
     let mut fixture = Fixture::new();
     let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
-    // Launch agents from an older release run `intercom --config C serve`
-    // with no AGENT_INTERCOM_CONFIG of their own.
     let child = fixture
         .command()
-        .env_remove("AGENT_INTERCOM_CONFIG")
         .arg("serve")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().unwrap()))
@@ -268,6 +264,6 @@ fn a_legacy_launch_agent_command_still_supervises_with_its_configuration() {
     assert_eq!(report["supervised"], true, "{report}");
     assert!(
         report["machine"].as_str().unwrap_or_default().starts_with("fixture-host@"),
-        "the legacy command's --config did not reach the manager: {report}"
+        "the service entry point did not use the shared config: {report}"
     );
 }
