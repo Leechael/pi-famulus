@@ -879,7 +879,7 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
         }
       }
     }
-    await start(ctx, false, true);
+    await start(ctx, true, true);
     if (!useContext(ctx)) return;
     dropOtherSessions(ctx);
     bindAgentAutocomplete(ctx);

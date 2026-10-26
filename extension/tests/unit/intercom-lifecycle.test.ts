@@ -363,20 +363,18 @@ it("a cold start announces nothing while the first connect is in flight", async 
   await h.emit("session_shutdown", {});
 });
 
-it("a genuinely failed connect notifies once and still retries quietly", async () => {
+it("a genuinely failed startup connect stays quiet and still retries", async () => {
   const h = lifecycleHarness({ autoUp: false });
   h.fake.markConnectFailed();
   await h.emit("session_start");
-  // No connect in flight and a recorded failure: one honest outage notice.
-  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(0);
   h.fake.beginConnect();
   h.fake.setUp(true);
   const retry = [...h.intervals].at(-1)!;
   retry.callback();
   await flush();
   expect(h.fake.registrations.length).toBe(1);
-  // Still the one notice.
-  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(0);
   await h.emit("session_shutdown", {});
 });
 
