@@ -33,11 +33,30 @@ fn main() {
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut tests: Vec<(&'static str, kit::TestFn)> = vec![
         ("c2_hello_validation", c2_hello_validation),
-        ("f1_frame_limits_and_malformed_input", f1_frame_limits_and_malformed_input),
-        ("c4_duplicate_hello_rebinds_session", c4_duplicate_hello_rebinds_session),
-        ("s3_crashed_session_survives_and_reattaches", s3_crashed_session_survives_and_reattaches),
-        ("s5_shutdown_session_stops_only_own_tasks", s5_shutdown_session_stops_only_own_tasks),
-        ("t1_exit_codes_output_and_events", t1_exit_codes_output_and_events),
+        (
+            "f1_frame_limits_and_malformed_input",
+            f1_frame_limits_and_malformed_input,
+        ),
+        (
+            "c4_duplicate_hello_rebinds_session",
+            c4_duplicate_hello_rebinds_session,
+        ),
+        (
+            "c5_fixture_startup_waits_for_the_spawned_daemon_to_serve",
+            c5_fixture_startup_waits_for_the_spawned_daemon_to_serve,
+        ),
+        (
+            "s3_crashed_session_survives_and_reattaches",
+            s3_crashed_session_survives_and_reattaches,
+        ),
+        (
+            "s5_shutdown_session_stops_only_own_tasks",
+            s5_shutdown_session_stops_only_own_tasks,
+        ),
+        (
+            "t1_exit_codes_output_and_events",
+            t1_exit_codes_output_and_events,
+        ),
         ("t3_timeout_ms_hard_kill", t3_timeout_ms_hard_kill),
         ("t4_stop_kills_a_running_task", t4_stop_kills_a_running_task),
         ("t6_stop_kills_the_whole_tree", t6_stop_kills_the_whole_tree),
@@ -115,6 +134,21 @@ fn lifetime_lock_held(home: &Home) -> bool {
 // ===========================================================================
 // Connections and sessions (C2, C4, C7, C8, S2, S3, S5, S6)
 // ===========================================================================
+
+fn c5_fixture_startup_waits_for_the_spawned_daemon_to_serve() {
+    let home = Home::new("w-c5");
+    let daemon = home.start_daemon_from(
+        std::path::Path::new(BIN),
+        &[("PI_FAMULUS_TEST_SLOW_SCAN_MS", "4000")],
+    );
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    assert!(
+        log.contains("daemon started"),
+        "fixture declared startup before the initial scan finished: {log}"
+    );
+    let mut connection = home.connect();
+    assert_eq!(connection.hello_cli()["pid"], daemon.id());
+}
 
 /// C2: an extension hello without session/pi_pid or with a path-like id is
 /// refused and closed; a second hello on a live connection is rejected.

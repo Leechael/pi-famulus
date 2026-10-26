@@ -404,8 +404,8 @@ impl Home {
         replace_binary(&dst, Path::new(BIN));
         dst
     }
-    /// Start a daemon from `bin` with extra environment; waits until it
-    /// accepts connections.
+    /// Start a daemon from `bin` with extra environment; waits until the
+    /// spawned process answers the manager protocol.
     pub fn start_daemon_from(&self, bin: &Path, env: &[(&str, &str)]) -> DaemonChild {
         let mut cmd = famulus_command(bin);
         cmd.arg("--home")
@@ -419,22 +419,58 @@ impl Home {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let child = self.adopt(cmd.spawn().expect("spawn daemon"));
-        // The first run of a freshly copied binary is slow on macOS (code
-        // signature assessment), hence the longer wait.
-        assert!(
-            poll_true(Duration::from_secs(20), || self.reachable() && self.pidfile_pid().is_some()),
-            "daemon did not start listening within 20s"
-        );
-        child
+        self.wait_for_started_daemon(self.adopt(cmd.spawn().expect("spawn daemon")))
     }
-    /// Spawn a daemon and wait until it accepts connections.
+    /// Spawn a daemon and wait until that process answers hello.
     pub fn start_daemon(&self) -> DaemonChild {
-        let child = self.spawn_daemon();
+        self.wait_for_started_daemon(self.spawn_daemon())
+    }
+    fn wait_for_started_daemon(&self, mut child: DaemonChild) -> DaemonChild {
+        // Reuse the copied-binary startup budget for every daemon: signature
+        // assessment and initial scans are not lifecycle timing assertions.
+        let budget = Duration::from_secs(20);
+        let deadline = Instant::now() + budget;
+        let expected_pid = child.id();
+        let mut last_probe = String::from("no protocol response");
+        let ready = poll_true(budget, || {
+            if let Some(status) = child.try_wait().expect("inspect starting daemon") {
+                panic!(
+                    "daemon {expected_pid} exited {status} before readiness: {}",
+                    fs::read_to_string(self.path.join("daemon.stderr")).unwrap_or_default()
+                );
+            }
+            if self.pidfile_pid() != Some(expected_pid) {
+                return false;
+            }
+            let Ok(stream) = Transport::connect(&self.path) else {
+                return false;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let mut connection = Conn::new(stream);
+            match connection.try_request(
+                json!({"type":"hello","client_kind":"cli"}),
+                remaining.min(Duration::from_secs(1)),
+            ) {
+                Some(response) => {
+                    let ready = response["ok"] == true
+                        && response["pid"].as_u64() == Some(u64::from(expected_pid));
+                    last_probe = response.to_string();
+                    ready
+                }
+                None => {
+                    last_probe = connection.close_reason;
+                    false
+                }
+            }
+        });
         assert!(
-            // The daemon binds, then writes manager.pid: ready means both.
-            poll_true(Duration::from_secs(3), || self.reachable() && self.pidfile_pid().is_some()),
-            "daemon did not start listening within 3s"
+            ready,
+            "daemon {expected_pid} did not answer hello within {budget:?}; last probe: {last_probe}; log: {}; stderr: {}",
+            fs::read_to_string(self.path.join("manager.log")).unwrap_or_default(),
+            fs::read_to_string(self.path.join("daemon.stderr")).unwrap_or_default()
         );
         child
     }
