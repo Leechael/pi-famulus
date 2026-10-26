@@ -474,13 +474,21 @@ fn incoming_delivery_dedup_is_4096_entry_lru_and_hot_duplicates_refresh_recency(
     );
 }
 
+#[cfg(feature = "test-clock")]
 #[test]
 fn uncertain_incoming_injection_late_read_proves_delivery_and_dedup_survives_retry() {
     let relay = WireRelay::new(relay_basics);
     let mut fixture = stable_fixture();
     let address = vacant_address();
     let listen = address.to_string();
-    start_relay_options(&mut fixture, &relay, "", &["--mcp-listen", &listen]);
+    start_relay_options_env(
+        &mut fixture,
+        &relay,
+        "",
+        &["--mcp-listen", &listen],
+        &[("PI_FAMULUS_TEST_CLOCK", "manual")],
+    );
+    fixture.wait_session("pi/remote");
     let mut target = fixture.plugin("slow-incoming", "busy");
     let id = "223bfe8d-0039-4cbd-b1f9-a892a2773d40";
     let body = "z".repeat(900 * 1024);
@@ -488,6 +496,28 @@ fn uncertain_incoming_injection_late_read_proves_delivery_and_dedup_survives_ret
     relay.outgoing.send(frame.clone()).unwrap();
     let mut prefix = [0u8; 1];
     target.reader.get_mut().read_exact(&mut prefix).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let state = common::clock_request(
+            &fixture.root.join("manager"),
+            json!({"type":"clock_status"}),
+        );
+        if state["pending"].as_array().is_some_and(|timers| {
+            timers
+                .iter()
+                .any(|timer| timer["label"] == "intercom-write-ack")
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "injection write acknowledgement timer never armed: {state}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Expire only the caller's acknowledgement wait. The transport's physical
+    // write deadline stays on real time so it can finish the complete frame.
+    advance_transport(&fixture, 5_000);
     let outcome = relay.request("receipt");
     assert_eq!(outcome["message_id"], id);
     let mut line = String::from_utf8(prefix.to_vec()).unwrap();

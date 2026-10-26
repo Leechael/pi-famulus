@@ -564,10 +564,13 @@ impl Runtime {
         .await
         .map_err(|_| "plugin write timeout".to_string())?
         .map_err(|_| "plugin disconnected".to_string())?;
-        tokio::time::timeout(Duration::from_secs(5), rx)
-            .await
-            .map_err(|_| "plugin write outcome unknown".to_string())?
-            .map_err(|_| "plugin write outcome unknown".to_string())?
+        tokio::select! {
+            biased;
+            result = rx => result.map_err(|_| "plugin write outcome unknown".to_string())?,
+            _ = self.clock.sleep("intercom-write-ack", Duration::from_secs(5)) => {
+                Err("plugin write outcome unknown".into())
+            }
+        }
     }
     pub async fn send(
         &self,
