@@ -404,8 +404,8 @@ impl Home {
         replace_binary(&dst, Path::new(BIN));
         dst
     }
-    /// Start a daemon from `bin` with extra environment; waits until it
-    /// accepts connections.
+    /// Start a daemon from `bin` with extra environment; waits until the
+    /// spawned process answers the manager protocol.
     pub fn start_daemon_from(&self, bin: &Path, env: &[(&str, &str)]) -> DaemonChild {
         let mut cmd = famulus_command(bin);
         cmd.arg("--home")
@@ -419,22 +419,58 @@ impl Home {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let child = self.adopt(cmd.spawn().expect("spawn daemon"));
-        // The first run of a freshly copied binary is slow on macOS (code
-        // signature assessment), hence the longer wait.
-        assert!(
-            poll_true(Duration::from_secs(20), || self.reachable() && self.pidfile_pid().is_some()),
-            "daemon did not start listening within 20s"
-        );
-        child
+        self.wait_for_started_daemon(self.adopt(cmd.spawn().expect("spawn daemon")))
     }
-    /// Spawn a daemon and wait until it accepts connections.
+    /// Spawn a daemon and wait until that process answers hello.
     pub fn start_daemon(&self) -> DaemonChild {
-        let child = self.spawn_daemon();
+        self.wait_for_started_daemon(self.spawn_daemon())
+    }
+    fn wait_for_started_daemon(&self, mut child: DaemonChild) -> DaemonChild {
+        // Reuse the copied-binary startup budget for every daemon: signature
+        // assessment and initial scans are not lifecycle timing assertions.
+        let budget = Duration::from_secs(20);
+        let deadline = Instant::now() + budget;
+        let expected_pid = child.id();
+        let mut last_probe = String::from("no protocol response");
+        let ready = poll_true(budget, || {
+            if let Some(status) = child.try_wait().expect("inspect starting daemon") {
+                panic!(
+                    "daemon {expected_pid} exited {status} before readiness: {}",
+                    fs::read_to_string(self.path.join("daemon.stderr")).unwrap_or_default()
+                );
+            }
+            if self.pidfile_pid() != Some(expected_pid) {
+                return false;
+            }
+            let Ok(stream) = Transport::connect(&self.path) else {
+                return false;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let mut connection = Conn::new(stream);
+            match connection.try_request(
+                json!({"type":"hello","client_kind":"cli"}),
+                remaining.min(Duration::from_secs(1)),
+            ) {
+                Some(response) => {
+                    let ready = response["ok"] == true
+                        && response["pid"].as_u64() == Some(u64::from(expected_pid));
+                    last_probe = response.to_string();
+                    ready
+                }
+                None => {
+                    last_probe = connection.close_reason;
+                    false
+                }
+            }
+        });
         assert!(
-            // The daemon binds, then writes manager.pid: ready means both.
-            poll_true(Duration::from_secs(3), || self.reachable() && self.pidfile_pid().is_some()),
-            "daemon did not start listening within 3s"
+            ready,
+            "daemon {expected_pid} did not answer hello within {budget:?}; last probe: {last_probe}; log: {}; stderr: {}",
+            fs::read_to_string(self.path.join("manager.log")).unwrap_or_default(),
+            fs::read_to_string(self.path.join("daemon.stderr")).unwrap_or_default()
         );
         child
     }
@@ -555,7 +591,7 @@ impl Home {
 /// said. With `PI_FAMULUS_TEST_ARTIFACTS` set (CI uploads it), copy it there:
 /// logs, per-session events and task records; files over 1 MiB (large task
 /// output) and sockets are skipped.
-fn keep_failed_home(home: &Path) {
+pub fn keep_failed_home(home: &Path) {
     let Some(dir) = std::env::var_os("PI_FAMULUS_TEST_ARTIFACTS") else { return };
     let Some(name) = home.file_name() else { return };
     copy_small_files(home, &Path::new(&dir).join(name));
@@ -579,6 +615,16 @@ pub struct CliOut {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Bind a valid fixture socket without depending on the test runner's umask.
+#[cfg(unix)]
+pub fn bind_private_unix(path: &Path) -> std::os::unix::net::UnixListener {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = std::os::unix::net::UnixListener::bind(path).expect("bind fixture socket");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .expect("set fixture socket permissions");
+    listener
 }
 
 /// Atomically put a copy of `src` at `dst` (copy beside it, then rename),
@@ -1284,10 +1330,14 @@ impl Conn {
     }
 
     pub fn send(&mut self, v: &Value) {
+        self.try_send(v).expect("write frame");
+    }
+
+    fn try_send(&mut self, v: &Value) -> std::io::Result<()> {
         let body = serde_json::to_vec(v).unwrap();
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(&body);
-        self.send_raw(&frame).expect("write frame");
+        self.send_raw(&frame)
     }
 
     /// Read one frame from the socket before `deadline`.
@@ -1334,13 +1384,20 @@ impl Conn {
     }
 
     /// Send `req` with a fresh id; return the response echoing it (or None on
-    /// timeout / close). Other frames are kept in `pending`.
+    /// timeout, close or write failure). Other frames are kept in `pending`.
     pub fn try_request(&mut self, mut req: Value, timeout: Duration) -> Option<Value> {
+        if self.closed {
+            return None;
+        }
         self.next_id += 1;
         let id = format!("q{}", self.next_id);
         req["v"] = json!(1);
         req["id"] = json!(id);
-        self.send(&req);
+        if let Err(error) = self.try_send(&req) {
+            self.closed = true;
+            self.close_reason = format!("write error: {error} ({:?})", error.kind());
+            return None;
+        }
         if let Some(pos) = self.pending.iter().position(|f| f["id"] == json!(id)) {
             return self.pending.remove(pos);
         }

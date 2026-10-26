@@ -871,28 +871,37 @@ fn manager_status_generation(fixture: &Fixture) -> Option<u64> {
 fn manager_connection_generation(mut conn: common::Conn) -> Option<u64> {
     // hello first: the daemon refuses non-hello first frames, and during
     // the exec hellos are rejected until the new image serves them.
-    let hello = manager_probe_request(
-        &mut conn,
-        "probe-hello",
+    let hello = conn.try_request(
         json!({"type":"hello","client_kind":"cli"}),
+        Duration::from_millis(1500),
     )?;
     if hello["ok"] != true {
         return None;
     }
-    manager_probe_request(&mut conn, "probe-status", json!({"type":"status"}))?["generation"]
-        .as_u64()
+    conn.try_request(json!({"type":"status"}), Duration::from_millis(1500))?["generation"].as_u64()
 }
 
-fn manager_probe_request(conn: &mut common::Conn, id: &str, mut request: Value) -> Option<Value> {
-    request["v"] = json!(1);
-    request["id"] = json!(id);
-    let body = serde_json::to_vec(&request).unwrap();
-    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
-    frame.extend_from_slice(&body);
-    // Unlike Conn::try_request, readiness probes must tolerate write errors:
-    // the old image can close an accepted connection before either request.
-    conn.send_raw(&frame).ok()?;
-    conn.wait_id(id, Duration::from_millis(1500))
+#[test]
+fn optional_request_records_a_failed_write_without_panicking() {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    let mut conn = common::Conn::new(stream);
+    assert_eq!(conn.try_request(json!({"type":"status"}), TIMEOUT), None);
+    assert!(conn.closed);
+    assert!(
+        conn.close_reason.contains("write error"),
+        "{}",
+        conn.close_reason
+    );
+    assert_eq!(conn.try_request(json!({"type":"status"}), TIMEOUT), None);
+}
+
+#[test]
+#[should_panic(expected = "no response")]
+fn required_request_still_rejects_a_failed_write() {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    common::Conn::new(stream).request(json!({"type":"status"}));
 }
 
 #[test]

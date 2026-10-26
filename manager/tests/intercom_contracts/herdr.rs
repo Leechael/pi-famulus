@@ -1,6 +1,5 @@
 use super::*;
 use std::net::{SocketAddr, TcpListener};
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
@@ -15,7 +14,7 @@ struct Herdr {
 impl Herdr {
     fn new(fixture: &Fixture) -> Self {
         let path = fixture.root.join("herdr.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = common::bind_private_unix(&path);
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();

@@ -37,7 +37,7 @@ interface HostingView {
 export function createHostedSessionFn(deps: HostedSessionDeps): CreateSessionFn {
   return async (req) => {
     const client = deps.getClient();
-    if (!client || !client.isAvailable()) {
+    if (!client || !(await client.ensureAvailable())) {
       throw new Error("pi-famulus daemon is not connected; a subagent needs it to run pi --mode rpc.");
     }
     client.requireHostedProtocol();

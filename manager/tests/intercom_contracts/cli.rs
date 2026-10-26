@@ -450,7 +450,7 @@ struct StatusCodex {
 impl StatusCodex {
     fn new(fixture: &Fixture, hooks: Value) -> Self {
         let path = fixture.root.join("status-codex.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = common::bind_private_unix(&path);
         listener.set_nonblocking(true).unwrap();
         let hooks = std::sync::Arc::new(std::sync::Mutex::new(hooks));
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -613,7 +613,7 @@ fn online_status_observes_live_herdr_even_without_a_cached_binary() {
     let path = fixture.root.join("empty-bin");
     fs::create_dir(&path).unwrap();
     let socket = fixture.root.join("status-herdr.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let listener = common::bind_private_unix(&socket);
     listener.set_nonblocking(true).unwrap();
     let version = std::sync::Arc::new(AtomicU64::new(1));
     let live_version = version.clone();
@@ -717,8 +717,7 @@ fn online_status_prefers_connected_desktop_even_with_an_empty_catalog() {
     fs::create_dir(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.join("ipc.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = common::bind_private_unix(&socket);
     listener.set_nonblocking(true).unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopping = stop.clone();
