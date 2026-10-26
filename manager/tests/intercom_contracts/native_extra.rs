@@ -175,7 +175,7 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
     fs::rename(&dead_socket, &socket).unwrap();
     let generation = uuid::Uuid::new_v4().to_string();
     let registry = sessions.join(format!("{pid}.json"));
-    let row = json!({"pid":pid,"sessionId":format!("agent-intercom-{pid}"),"cwd":fixture.root,"startedAt":1,"procStart":old_start,"version":"agent-intercom","peerProtocol":1,"kind":"interactive","entrypoint":"agent-intercom","messagingSocketPath":socket,"name":"previous incarnation","nameSource":"derived","status":"idle","intercomGeneration":generation});
+    let row = json!({"pid":pid,"sessionId":format!("pi-famulus-{pid}"),"cwd":fixture.root,"startedAt":1,"procStart":old_start,"version":"pi-famulus","peerProtocol":1,"kind":"interactive","entrypoint":"pi-famulus","messagingSocketPath":socket,"name":"previous incarnation","nameSource":"derived","status":"idle","intercomGeneration":generation});
     fs::write(&registry, serde_json::to_vec(&row).unwrap()).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).unwrap();
     drop(resume);

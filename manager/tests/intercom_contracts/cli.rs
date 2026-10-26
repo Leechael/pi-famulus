@@ -122,9 +122,8 @@ fn service_print_preserves_selected_manager_home_and_safe_environment_without_sa
     let secret = "print-only-secret<&>";
     let socket = fixture.root.join("existing-codex.sock");
     let output = fixture.run_env(
-        &["service", "print", "--save-token"],
+        &["service", "print", "--save-token", "--token", secret],
         &[
-            ("AGENT_INTERCOM_TOKEN", secret),
             ("HTTP_PROXY", "http://proxy.invalid:1234"),
             ("CODEX_APP_SERVER_SOCK", socket.to_str().unwrap()),
         ],
@@ -136,11 +135,10 @@ fn service_print_preserves_selected_manager_home_and_safe_environment_without_sa
         "<string>{}</string>",
         fixture.root.join("manager").display()
     )));
-    assert!(plist.contains(&fixture.root.join("client.toml").display().to_string()));
+    assert!(plist.contains(&fixture.root.join("manager/config.json").display().to_string()));
     assert!(plist.contains("HTTP_PROXY") && plist.contains("http://proxy.invalid:1234"));
     assert!(plist.contains("CODEX_APP_SERVER_SOCK") && plist.contains(socket.to_str().unwrap()));
     assert!(!plist.contains(secret) && !plist.contains("print-only-secret&lt;&amp;"));
-    assert!(!plist.contains("AGENT_INTERCOM_TOKEN"));
     assert_eq!(
         fs::read(fixture.root.join("client.toml")).unwrap(),
         before,
@@ -148,7 +146,7 @@ fn service_print_preserves_selected_manager_home_and_safe_environment_without_sa
     );
     assert!(!fixture
         .root
-        .join("Library/LaunchAgents/com.agent-intercom.client.plist")
+        .join("Library/LaunchAgents/com.pi-famulus.client.plist")
         .exists());
     assert!(!fixture.sock.exists());
 }
@@ -160,8 +158,8 @@ fn service_print_refuses_token_in_carried_environment_without_echoing_it() {
     let secret = "hidden-token<&>";
     let proxy = format!("http://user:{secret}@proxy.invalid");
     let output = fixture.run_env(
-        &["service", "print", "--save-token"],
-        &[("AGENT_INTERCOM_TOKEN", secret), ("HTTP_PROXY", &proxy)],
+        &["service", "print", "--save-token", "--token", secret],
+        &[("HTTP_PROXY", &proxy)],
     );
     assert!(!output.status.success());
     let all = format!(
@@ -186,17 +184,17 @@ fn codex_setup_trusts_only_matching_untrusted_hashes_and_deduplicates_keys() {
     let host = super::native::CodexPeer::hooks(
         &fixture,
         json!([
-            hook("missing", "intercom@agent-intercom", "hash-A", "untrusted"),
-            hook("missing", "intercom@agent-intercom", "hash-B", "untrusted"),
-            hook("trusted", "intercom@agent-intercom", "hash-C", "trusted"),
+            hook("missing", "intercom@pi-famulus", "hash-A", "untrusted"),
+            hook("missing", "intercom@pi-famulus", "hash-B", "untrusted"),
+            hook("trusted", "intercom@pi-famulus", "hash-C", "trusted"),
             hook(
                 "future",
-                "intercom@agent-intercom",
+                "intercom@pi-famulus",
                 "hash-D",
                 "unknown-future-state"
             ),
             hook("foreign", "other@plugin", "hash-E", "untrusted"),
-            hook("empty", "intercom@agent-intercom", "", "untrusted")
+            hook("empty", "intercom@pi-famulus", "", "untrusted")
         ]),
     );
     let output = fixture.run_env(
@@ -222,7 +220,7 @@ fn codex_setup_modified_hook_requires_force_and_only_then_writes_trust() {
         &fixture,
         json!([hook(
             "modified",
-            "intercom@agent-intercom",
+            "intercom@pi-famulus",
             "new-hash",
             "modified"
         )]),
@@ -249,11 +247,11 @@ fn daemon_never_seeds_codex_hook_trust_without_explicit_setup() {
         json!([
             hook(
                 "modified",
-                "intercom@agent-intercom",
+                "intercom@pi-famulus",
                 "new-hash",
                 "modified"
             ),
-            hook("missing", "intercom@agent-intercom", "hash-A", "untrusted")
+            hook("missing", "intercom@pi-famulus", "hash-A", "untrusted")
         ]),
     );
     fixture.start_with(
@@ -554,7 +552,7 @@ fn online_status_uses_live_codex_reachability_and_readonly_hook_trust() {
         &fixture,
         json!([hook(
             "pending",
-            "intercom@agent-intercom",
+            "intercom@pi-famulus",
             "hash-A",
             "modified"
         )]),
@@ -573,18 +571,18 @@ fn online_status_uses_live_codex_reachability_and_readonly_hook_trust() {
         "untrusted; run pi-famulus intercom codex setup"
     );
     *host.hooks.lock().unwrap() = json!([
-        hook("duplicate", "intercom@agent-intercom", "hash-A", "trusted"),
+        hook("duplicate", "intercom@pi-famulus", "hash-A", "trusted"),
         hook(
             "duplicate",
-            "intercom@agent-intercom",
+            "intercom@pi-famulus",
             "hash-B",
             "untrusted"
         ),
         hook("foreign", "other@plugin", "hash-C", "untrusted"),
-        hook("empty", "intercom@agent-intercom", "", "untrusted"),
+        hook("empty", "intercom@pi-famulus", "", "untrusted"),
         hook(
             "future",
-            "intercom@agent-intercom",
+            "intercom@pi-famulus",
             "hash-D",
             "unknown-future-state"
         )

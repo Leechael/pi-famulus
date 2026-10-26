@@ -2,7 +2,7 @@
  * @name editor completion: suggest live sessions, insert a
  * `<RequestSendMessage to=… host=… />` marker.
  *
- * Upstream baseline: agent-intercom @ 98183fb, plugin/pi — verbatim port of
+ * Upstream baseline: pi-famulus @ 98183fb, plugin/pi — verbatim port of
  * the plugin's autocomplete provider.
  */
 

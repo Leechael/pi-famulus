@@ -370,7 +370,7 @@ fn assert_native_base_refused(variant: &str) {
     assert_eq!(refused["from"], format!("uds:{socket}"));
     assert_ne!(refused["msg_id"], id);
     assert!(uuid::Uuid::parse_str(refused["msg_id"].as_str().unwrap()).is_ok());
-    assert_eq!(refused["reason"],"agent-intercom: the relay peer is this machine's hub, not an agent session, and cannot receive messages. If you were replying to a message from this machine, that sender gave no reply address and cannot be answered — ask for a resend from a named session (ListAgents).");
+    assert_eq!(refused["reason"],"pi-famulus: the relay peer is this machine's hub, not an agent session, and cannot receive messages. If you were replying to a message from this machine, that sender gave no reply address and cannot be answered — ask for a resend from a named session (ListAgents).");
     first.no_event();
     second.no_event();
     assert!(

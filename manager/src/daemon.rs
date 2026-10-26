@@ -615,7 +615,7 @@ async fn start_bridge(
     home: &Path,
     clock: crate::clock::Clock,
 ) -> (Option<crate::intercom::Running>, Option<String>) {
-    let started = match crate::intercom::bridge_config() {
+    let started = match crate::intercom::bridge_config(home) {
         Ok(config) => crate::intercom::start(config, clock).await,
         Err(error) => Err(error),
     };
@@ -4249,7 +4249,7 @@ async fn apply_supervision(
         )
     };
     if leased && !running.as_ref().is_some_and(|running| running.supervised()) {
-        let fresh = crate::intercom::bridge_config();
+        let fresh = crate::intercom::bridge_config(&home);
         let stale = match (running.as_ref(), &fresh) {
             (Some(current), Ok(config)) => bridge_stale(current, config),
             (None, _) => true,

@@ -1,6 +1,6 @@
 //! Cross-session messaging over the manager connection (protocol 7 `intercom`).
 //!
-//! The pi-famulus extension serves the agent-intercom client protocol on its
+//! The pi-famulus extension serves the pi-famulus client protocol on its
 //! existing manager socket instead of the legacy client socket: one port per
 //! manager connection, push frames as `intercom` events, identity bound to
 //! the hello session, and `intercom_reset` when the bridge restarts.

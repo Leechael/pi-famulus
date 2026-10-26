@@ -1,6 +1,6 @@
 /**
  * Lifecycle tests for the pi-famulus intercom port, ported from
- * agent-intercom @ 98183fb plugin/pi lifecycle.test.mjs (node:test → vitest,
+ * pi-famulus @ 98183fb plugin/pi lifecycle.test.mjs (node:test → vitest,
  * mock Unix socket → fake intercom transport + mocked timers).
  *
  * Models the manager-connection boundary, not plugin internals: requests and

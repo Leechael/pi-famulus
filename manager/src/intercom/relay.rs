@@ -1330,7 +1330,7 @@ async fn post_webhook_message(
         message.id.into()
     };
     let from = if message.from.is_empty() {
-        "agent-intercom"
+        "pi-famulus"
     } else {
         message.from
     };
@@ -2532,7 +2532,7 @@ mod listen_webhook_tests {
             .0
             .to_ascii_lowercase()
             .contains(&format!("x-request-id: {mid}")));
-        assert_eq!(payload["message"]["from"], "agent-intercom");
+        assert_eq!(payload["message"]["from"], "pi-famulus");
         assert!(payload["message"].get("from_session").is_none());
         assert!(first
             .0

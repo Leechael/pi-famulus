@@ -57,6 +57,26 @@ The daemon reads these keys from the same file:
 
 The retention keys take a duration such as `"30m"` or `"0s"` and are read when the daemon starts, so restart the daemon after changing them. An invalid value falls back to 24h and is reported by `pi-famulus doctor`.
 
+## Messaging bridge keys
+
+The messaging bridge reads only the `messaging` object in this same file. It has no alternate configuration file or environment overrides.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `server` | `"https://127.0.0.1:8443"` | Relay server URL. |
+| `token` | `""` | Relay or enrollment token. |
+| `name` | `""` | Device name used during enrollment. |
+| `tlsInsecure` | `false` | Disable normal relay TLS certificate verification. |
+| `sock` | `$XDG_RUNTIME_DIR/pi-famulus/client.sock`, or `pi-famulus-<uid>/client.sock` under the temporary directory | Local bridge socket. |
+| `stateDir` | `"~/.pi/agent/pi-famulus/messaging"` | Device identity and bridge state directory. |
+| `mcpListen` | `""` | MCP listener address; empty disables it. |
+| `mcpToken` | `""` | MCP bearer token; empty generates a stable private token. |
+| `mcpAllowNonLoopback` | `false` | Permit a non-loopback MCP listener. Also requires a non-empty `mcpToken`. |
+| `remoteMessages` | `"allow"` | Remote message policy: `allow` or `refuse`. |
+| `localOnly` | `false` | Local sessions only; automatically enabled when unenrolled and no token exists. |
+| `eventLogSize` | `4096` | Maximum retained bridge events. |
+| `endpoints` | `[]` | Webhook objects with required `name` and `url`, optional `secret` (default empty), and `auth` (default `"hmac"`). Secret-bearing webhooks require HTTPS or a loopback URL. |
+
 ## Environment variables
 
 | Variable | Meaning |

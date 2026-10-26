@@ -559,7 +559,7 @@ fn preflight(req: &Value, version: &str, headers: &HeaderMap, single: bool) -> R
 }
 
 fn server_info() -> Value {
-    json!({"name":"agent-intercom","version":"0.1.0"})
+    json!({"name":"pi-famulus","version":"0.1.0"})
 }
 fn capabilities() -> Value {
     json!({"logging":{},"tools":{"listChanged":true}})

@@ -1292,7 +1292,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   });
 
   // The intercom port (cross-session messaging, absorbed from the
-  // agent-intercom pi plugin) rides the same manager connection. Registered
+  // pi-famulus pi plugin) rides the same manager connection. Registered
   // after the session hooks above so its session_start sees the fresh
   // client. Hosted children never reach here (child-mode returns early).
   registerIntercom(pi, { getClient: () => client });

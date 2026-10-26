@@ -29,17 +29,16 @@ const NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Set by test harnesses that run managers without the messaging bridge, so
 /// they never bind the shared default intercom socket.
 pub const DISABLE_ENV: &str = "PI_FAMULUS_NO_INTERCOM";
-/// The messaging bridge every manager runs: the configuration file (or
-/// `AGENT_INTERCOM_CONFIG`) plus environment. An unenrolled device bridges
-/// local agents only.
-pub fn bridge_config() -> Result<Config, String> {
+/// The messaging bridge every manager runs: Famulus `config.json` only.
+/// An unenrolled device bridges local agents only.
+pub fn bridge_config(home: &std::path::Path) -> Result<Config, String> {
     if cfg!(windows) {
         return Err("intercom native adapters support Linux/macOS only".into());
     }
     if std::env::var_os(DISABLE_ENV).is_some() {
         return Err(format!("disabled by {DISABLE_ENV}"));
     }
-    let mut config = Config::load(&cli::Options::from_environment())?;
+    let mut config = Config::load(home, &cli::Options::without_overrides())?;
     if !config.local_only
         && config.token.is_empty()
         && !config.state_dir.join("device.json").exists()

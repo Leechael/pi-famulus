@@ -1,7 +1,7 @@
 /**
  * TUI widgets for intercom message cards.
  *
- * Upstream baseline: agent-intercom @ 98183fb, plugin/pi — verbatim port of
+ * Upstream baseline: pi-famulus @ 98183fb, plugin/pi — verbatim port of
  * the plugin's ChatText/ChatCard renderers and text-measurement helpers.
  */
 

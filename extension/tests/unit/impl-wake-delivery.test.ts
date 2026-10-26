@@ -41,7 +41,7 @@ describe("wake.inject: when a wake enters the model's context", () => {
     const events: unknown[] = [];
     const deps = { now: () => T0, logEvent: (type: string) => events.push(type) };
     logWakeInjected({ role: "assistant", content: [] }, deps);
-    logWakeInjected({ role: "custom", customType: "agent-intercom-cross-session", content: "x", details: { kind: "x" } }, deps);
+    logWakeInjected({ role: "custom", customType: "pi-famulus-cross-session", content: "x", details: { kind: "x" } }, deps);
     logWakeInjected({ role: "user", customType: "pi-famulus-wake", content: "x", details: { kind: "task" } }, deps);
     logWakeInjected(undefined, deps);
     expect(events).toEqual([]);

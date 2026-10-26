@@ -1,7 +1,7 @@
 /**
  * Types for the pi-famulus intercom port.
  *
- * Upstream baseline: agent-intercom @ 98183fb, plugin/pi (the pi plugin's
+ * Upstream baseline: pi-famulus @ 98183fb, plugin/pi (the pi plugin's
  * observable behaviour — tools, commands, envelopes, receipts, busy/idle
  * publication — is preserved; the client.sock transport is replaced by the
  * famulus manager connection, protocol 7 `intercom` request + events).
