@@ -55,6 +55,32 @@ pub(super) struct AliasBase {
 }
 
 #[cfg(unix)]
+struct PendingAlias<'a> {
+    native: &'a Native,
+    origin: &'a str,
+}
+
+#[cfg(unix)]
+impl<'a> PendingAlias<'a> {
+    fn new(native: &'a Native, origin: &'a str) -> Self {
+        native.pending_aliases.lock().unwrap().insert(origin.into());
+        Self { native, origin }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PendingAlias<'_> {
+    fn drop(&mut self) {
+        self.native
+            .pending_aliases
+            .lock()
+            .unwrap()
+            .remove(self.origin);
+        self.native.base_changed.notify_waiters();
+    }
+}
+
+#[cfg(unix)]
 #[derive(Debug, PartialEq)]
 enum Publication {
     Owned,
@@ -847,6 +873,7 @@ pub(super) async fn reconcile_aliases(rt: &Shared) -> Result<(), String> {
         if refreshed {
             continue;
         }
+        let _pending = PendingAlias::new(&rt.native, &id);
         if repair {
             let old = rt.native.aliases.lock().unwrap().remove(&id);
             drop(guard);
@@ -1862,6 +1889,94 @@ mod tests {
             self.listener.take();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[tokio::test]
+    async fn reply_endpoint_waits_for_pending_alias_instead_of_using_base() {
+        let mut base = Fixture::new();
+        let alias = Fixture::new();
+        let native = Native::new();
+        *native.base.lock().unwrap() = Some(base.base());
+        let pending = PendingAlias::new(&native, "pi/starting");
+        let reply = native.ready_reply_endpoint("pi/starting");
+        tokio::pin!(reply);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(reply.as_mut(), cx).is_pending()
+            ))
+            .await,
+            "a published alias still being admitted must not fall back to the base socket"
+        );
+        let (kill, _) = tokio::sync::watch::channel(false);
+        let (_, exited) = tokio::sync::watch::channel(None);
+        let (updates, _) = tokio::sync::mpsc::channel(8);
+        native.aliases.lock().unwrap().insert(
+            "pi/starting".into(),
+            Alias {
+                child: AliasChild { kill, exited },
+                socket: alias.socket.clone(),
+                registry: alias.registry.clone(),
+                generation: alias.generation.clone(),
+                socket_identity: alias.identity,
+                updates,
+                source_identity: String::new(),
+                target: json!({}),
+                lost_registration: false,
+                fence: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            },
+        );
+        drop(pending);
+        let endpoint = tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .expect("alias admission must wake the sender")
+            .unwrap();
+        assert_eq!(endpoint["_socket"], json!(alias.socket));
+        assert_eq!(endpoint["_alias_origin"], "pi/starting");
+        assert_eq!(endpoint["_generation"], alias.generation);
+        assert_eq!(endpoint["_alias_base"], false);
+        close_base(&native).await;
+    }
+
+    #[tokio::test]
+    async fn pending_alias_does_not_block_other_origins_or_survive_cancellation() {
+        let mut base = Fixture::new();
+        let native = Native::new();
+        *native.base.lock().unwrap() = Some(base.base());
+        let pending = PendingAlias::new(&native, "pi/starting");
+        let unrelated = native.ready_reply_endpoint("claude/native").await.unwrap();
+        assert_eq!(unrelated["_alias_base"], true);
+        let reply = native.ready_reply_endpoint("pi/starting");
+        tokio::pin!(reply);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(reply.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        drop(pending);
+        assert!(native.pending_aliases.lock().unwrap().is_empty());
+        let endpoint = tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .expect("cancelled alias startup must wake the sender")
+            .unwrap();
+        assert_eq!(endpoint["_alias_base"], true);
+        close_base(&native).await;
+    }
+
+    #[tokio::test]
+    async fn pending_alias_timeout_never_returns_the_base_endpoint() {
+        let mut base = Fixture::new();
+        let native = Native::new();
+        *native.base.lock().unwrap() = Some(base.base());
+        let _pending = PendingAlias::new(&native, "pi/starting");
+        assert_eq!(
+            native
+                .ready_reply_endpoint("pi/starting")
+                .await
+                .unwrap_err(),
+            "native reply alias startup timed out"
+        );
+        close_base(&native).await;
     }
 
     #[tokio::test]

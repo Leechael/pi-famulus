@@ -25,6 +25,8 @@ pub struct Native {
     idle_state: Mutex<idle::IdleState>,
     owner: Mutex<Weak<super::Runtime>>,
     aliases: Mutex<HashMap<String, Alias>>,
+    #[cfg(unix)]
+    pending_aliases: Mutex<HashSet<String>>,
     alias_reconcile: tokio::sync::Mutex<()>,
     base_changed: tokio::sync::Notify,
     idle_returns: Mutex<HashMap<String, idle::Return>>,
@@ -140,6 +142,8 @@ impl Native {
             idle_state: Mutex::new(idle::IdleState::default()),
             owner: Mutex::new(Weak::new()),
             aliases: Mutex::new(HashMap::new()),
+            #[cfg(unix)]
+            pending_aliases: Mutex::new(HashSet::new()),
             alias_reconcile: tokio::sync::Mutex::new(()),
             base_changed: tokio::sync::Notify::new(),
             idle_returns: Mutex::new(HashMap::new()),
@@ -327,19 +331,30 @@ impl Native {
     pub fn reply_endpoint(&self, origin: &str) -> Result<Value, String> {
         alias::alias_endpoint(self, origin)
     }
-    /// Directory rows publish before the first reconcile binds the base
-    /// listener, so a sender can race startup; wait briefly instead of dropping.
+    /// Directory rows and alias registries can publish before their reply
+    /// endpoints are admitted; wait for startup instead of using the wrong socket.
     #[cfg(unix)]
     async fn ready_reply_endpoint(&self, origin: &str) -> Result<Value, String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let changed = self.base_changed.notified();
-            let reply = self.reply_endpoint(origin);
-            if reply.is_ok() || self.base.lock().unwrap().is_some() {
+            let (pending, reply) = {
+                let pending = self.pending_aliases.lock().unwrap();
+                (pending.contains(origin), self.reply_endpoint(origin))
+            };
+            let waiting_for_alias = pending
+                && !reply
+                    .as_ref()
+                    .is_ok_and(|endpoint| endpoint["_alias_base"] != true);
+            if !waiting_for_alias && (reply.is_ok() || self.base.lock().unwrap().is_some()) {
                 return reply;
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                return reply;
+                return if waiting_for_alias {
+                    Err("native reply alias startup timed out".into())
+                } else {
+                    reply
+                };
             }
         }
     }
