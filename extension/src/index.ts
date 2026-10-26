@@ -165,6 +165,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   let managerPath = resolveManagerPath(config, home);
   let famulusInfo: {
     extensionVersion: string;
+    configPath: string;
     managerPath: string | null;
     describeSearch: () => string;
     getClient: () => ManagerClient | null;
@@ -614,6 +615,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   });
   famulusInfo = {
     extensionVersion: EXTENSION_VERSION,
+    configPath: join(home, "config.json"),
     managerPath,
     describeSearch: () => describeManagerSearch(config, home),
     getClient: () => client,
