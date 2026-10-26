@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { agentRecordPath, writeAgentChildRecord } from "../../src/subagent/agent-records";
-import { fakeHostCtx, hostedFakeState, resetHostedFakes, settleAsync, startHostedExtension, textOf, until } from "./hosted-fakes";
+import { fakeHostCtx, fakeHostPi, hostedFakeState, resetHostedFakes, settleAsync, startHostedExtension, textOf, until } from "./hosted-fakes";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();
@@ -123,6 +123,64 @@ describe("the same session reopened after pi crashed", () => {
       expect(ext.pi.sent.some((sent) => (sent.message.content ?? "").includes("sh_old_sync"))).toBe(false);
     } finally {
       release();
+      await ext.shutdown();
+    }
+  });
+
+  it("discards crash recovery already waiting on list when the same runtime reloads", async () => {
+    const sessionId = "sess-reload-pending-recovery";
+    let connect!: () => void;
+    hostedFakeState().connectGate = new Promise<void>((resolve) => { connect = resolve; });
+    const ext = await startHostedExtension({ sessionId, cwd: home });
+    let activePi = ext.pi;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      let lists = 0;
+      ext.manager.list = async () => {
+        lists++;
+        await gate;
+        return [{ task_id: "sh_reload_history", session_id: sessionId, kind: "shell", status: "killed", end_reason: "manager-shutdown" }];
+      };
+      connect();
+      await until(() => lists >= 2, "background sync and recovery waiting on list");
+      await ext.pi.emit("session_shutdown", { reason: "reload" }, ext.ctx);
+      activePi = fakeHostPi();
+      const { default: extension } = await import("../../src/index");
+      extension(activePi.api);
+      await activePi.emit("session_start", { reason: "reload" }, ext.ctx);
+      release();
+      await settleAsync();
+      expect(ext.pi.sent).toHaveLength(0);
+      expect(activePi.sent).toHaveLength(0);
+    } finally {
+      connect(); release();
+      await activePi.emit("session_shutdown", { reason: "quit" }, ext.ctx);
+    }
+  });
+
+  it("does not treat a fresh reload runtime as crash recovery", async () => {
+    const sessionId = "sess-reload-no-crash";
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_reload",
+      run_id: "run_reload",
+      session_id: sessionId,
+      name: "worker",
+      agent: "worker",
+      status: "running",
+      started_at: Date.now() - 1000,
+    });
+    hostedFakeState().tasks = [{
+      task_id: "sh_reload_killed", session_id: sessionId, kind: "shell", status: "killed", end_reason: "manager-shutdown",
+    }];
+    const ext = await startHostedExtension({ sessionId, cwd: home, reason: "reload" });
+    try {
+      await settleAsync();
+      expect(ext.pi.sent).toHaveLength(0);
+      expect(JSON.parse(readFileSync(agentRecordPath(home, sessionId, "ch_reload"), "utf8")).status).toBe("running");
+    } finally {
       await ext.shutdown();
     }
   });

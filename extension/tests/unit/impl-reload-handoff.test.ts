@@ -147,6 +147,38 @@ describe("extension across /reload", () => {
     expect(managers[0].closeCalls).toBe(1);
   });
 
+  it("does not replay unknown finished shells after a same-version reload", async () => {
+    const before = fakePi();
+    await loadExtension(before.api);
+    await before.emit("session_start", { reason: "startup" }, fakeCtx().ctx);
+    await flushMicrotasks();
+    hostedFakeState().tasks = ["bash-fg", "bash-bg"].map((via) => ({
+      task_id: `sh_history_${via}`,
+      session_id: "sess-1",
+      kind: "shell",
+      command: "printf history",
+      origin: { via },
+      status: "completed",
+      exit_code: 0,
+      started_at: Date.now() - 1000,
+      ended_at: Date.now() - 500,
+    }));
+    await before.emit("session_shutdown", { reason: "reload" });
+    const after = fakePi();
+    await loadExtension(after.api);
+    const host = fakeCtx();
+    await after.emit("session_start", { reason: "reload" }, host.ctx);
+    try {
+      await after.toolByName.get("task_list")!.execute("list", { all: true }, undefined, undefined, host.ctx);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(managers).toHaveLength(1);
+      expect(before.sent).toHaveLength(0);
+      expect(after.sent).toHaveLength(0);
+    } finally {
+      await after.emit("session_shutdown", { reason: "quit" });
+    }
+  });
+
   it("still ends the session's tasks on quit", async () => {
     const pi = fakePi();
     await loadExtension(pi.api);

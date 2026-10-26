@@ -128,14 +128,14 @@ describe("results that finish while the parent is gone", () => {
     }
   });
 
-  it("delivers a parent shell that already finished while offline", async () => {
+  it.each(["startup", "resume"])("delivers a parent shell that already finished while offline on %s", async (reason) => {
     hostedFakeState().tasks = [shellTask({
       status: "completed",
       exit_code: 0,
       ended_at: Date.now() - 500,
       output_size: 12,
     })];
-    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home });
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home, reason });
     try {
       const listed = await ext.pi.tool("task_list").execute("list-2", { all: true }, undefined, undefined, ext.ctx);
       expect(textOf(listed)).toContain("sh_bg");
@@ -146,6 +146,47 @@ describe("results that finish while the parent is gone", () => {
           return details?.kind === "task" && (details.taskId === "sh_bg" || content.includes("sh_bg"));
         });
       }, "a task wake for the offline result");
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
+  it("a fresh reload runtime does not replay finished shells on connect or later task_list calls", async () => {
+    hostedFakeState().tasks = ["bash-fg", "bash-bg"].map((via) => shellTask({
+      task_id: `sh_finished_${via}`,
+      origin: { via },
+      status: "completed",
+      exit_code: 0,
+      ended_at: Date.now() - 500,
+    }));
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home, reason: "reload" });
+    try {
+      await settleAsync();
+      for (let i = 0; i < 2; i++) {
+        const listed = await ext.pi.tool("task_list").execute(`list-${i}`, { all: true }, undefined, undefined, ext.ctx);
+        expect(textOf(listed)).toBe("No tasks.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(ext.pi.sent).toHaveLength(0);
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
+  it("a fresh reload runtime adopts a running shell and reports its later exit only once", async () => {
+    hostedFakeState().tasks = [shellTask({})];
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home, reason: "reload" });
+    try {
+      await ext.pi.tool("task_list").execute("list-running", {}, undefined, undefined, ext.ctx);
+      expect(ext.pi.sent).toHaveLength(0);
+      const ended = shellTask({ status: "completed", exit_code: 0, ended_at: Date.now() });
+      hostedFakeState().tasks = [ended];
+      ext.manager.emit({ event: "task_exited", task_id: "sh_bg", kind: "shell", exit_code: 0 });
+      await until(() => ext.pi.sent.length === 1, "the running shell's exit wake after reload");
+      await ext.pi.tool("task_list").execute("list-ended", { all: true }, undefined, undefined, ext.ctx);
+      ext.manager.emit({ event: "task_exited", task_id: "sh_bg", kind: "shell", exit_code: 0 });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(ext.pi.sent).toHaveLength(1);
     } finally {
       await ext.shutdown();
     }
