@@ -1190,7 +1190,7 @@ mod tests {
         std::fs::create_dir(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         let shared_socket = shared.join("host.sock");
-        let _shared_listener = tokio::net::UnixListener::bind(&shared_socket).unwrap();
+        let _shared_listener = crate::intercom::localrpc::bind_private(&shared_socket).unwrap();
         assert!(
             super::validated_unix_stream(&shared_socket, Duration::from_secs(1))
                 .await
@@ -1202,7 +1202,7 @@ mod tests {
         std::fs::create_dir(&private).unwrap();
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
         let private_socket = private.join("host.sock");
-        let _private_listener = tokio::net::UnixListener::bind(&private_socket).unwrap();
+        let _private_listener = crate::intercom::localrpc::bind_private(&private_socket).unwrap();
         assert!(
             super::validated_unix_stream(&private_socket, Duration::from_secs(1))
                 .await

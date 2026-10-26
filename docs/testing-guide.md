@@ -13,6 +13,22 @@ Automated suites (run first, all must be green):
 (cd eval && npm run deps && npm run test:e2e && npm run test:unit)   # local: nub
 ```
 
+## Automated fixture rules
+
+- Use `Fixture::with_private_binary()` for intercom tests that need an isolated executable, and `common::replace_binary()` elsewhere. Do not copy a binary directly and immediately execute it: a concurrent child can inherit the writable descriptor before exec.
+- Bind valid native integration-test sockets with `common::bind_private_unix()`; native unit fixtures can reuse `localrpc::bind_private()`. Their permissions must not depend on the caller's umask. Keep deliberately unsafe namespaces explicit in rejection tests; do not relax production validation.
+- Treat startup as complete only after a successful protocol round-trip. A socket path, successful connect, registry entry or log line is not proof that the intended image or provider can handle a request. Wait for the required generation or provider attachment where applicable.
+- Use `Conn::try_request()` for probes that may encounter a closing image; use `request()` or `request_ok()` for operations the test requires to succeed. Optional probes must not make required assertions optional.
+- For manual-clock tests, wait until the intended timer is armed before advancing it. Keep caller acknowledgement deadlines separate from physical transport deadlines. Do not replace a missing readiness condition with a longer sleep.
+- Failed homes are copied to `PI_FAMULUS_TEST_ARTIFACTS` before cleanup when that variable is set. Preserve the failure's logs instead of treating a successful rerun as a root-cause diagnosis.
+
+Run intercom coverage with the inherited umask as well as a group-writable umask in a separate process; never change the process-wide umask inside a parallel test:
+
+```bash
+(cd manager && cargo test --locked --test intercom && cargo test --locked --features test-clock --test intercom)
+(cd manager && umask 0002 && cargo test --locked --features test-clock --test intercom)
+```
+
 ## 0. Install into an isolated home
 
 Plain `pi` talks to whatever daemon already runs at `~/.pi/agent/pi-famulus`, possibly an older binary with other sessions attached. Test against a separate home instead:

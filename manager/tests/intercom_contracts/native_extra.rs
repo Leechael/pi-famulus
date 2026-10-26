@@ -442,10 +442,8 @@ fn native_aliases_do_not_reintroduce_retired_default_64_process_cap() {
 
 #[test]
 fn invalid_upgrade_target_keeps_intercom_connections_and_aliases_live() {
-    let mut fixture = Fixture::new();
-    let binary = fixture.root.join("pi-famulus");
-    fs::copy(BIN, &binary).unwrap();
-    fixture.binary = binary.clone();
+    let mut fixture = Fixture::with_private_binary();
+    let binary = fixture.binary.clone();
     fixture.start();
     let mut sender = fixture.plugin("sender", "busy");
     let mut target = fixture.plugin("target", "busy");
@@ -1092,8 +1090,7 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
     fs::create_dir(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     let path = dir.join("stranger.sock");
-    let _listener = UnixListener::bind(&path).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let _listener = common::bind_private_unix(&path);
     let fabricated = uuid::Uuid::new_v4().to_string();
     let mut link = UnixStream::connect(&base_socket).unwrap();
     link.write_all(

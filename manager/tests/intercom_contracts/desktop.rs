@@ -1,6 +1,5 @@
 use super::*;
 use std::io::Read;
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
@@ -63,8 +62,7 @@ impl Desktop {
         ));
         let search_path = std::env::join_paths(paths).unwrap().into_string().unwrap();
         let path = directory.join("ipc.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = common::bind_private_unix(&path);
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();

@@ -79,6 +79,16 @@ impl Fixture {
         fixture
     }
 
+    /// Isolate the daemon's executable identity from concurrent Cargo builds.
+    /// `replace_binary` also waits for the copied file to become executable.
+    fn with_private_binary() -> Self {
+        let mut fixture = Self::new();
+        let binary = fixture.root.join("pi-famulus");
+        common::replace_binary(&binary, std::path::Path::new(BIN));
+        fixture.binary = binary;
+        fixture
+    }
+
     fn config(&self, extra: &str) {
         fs::write(
             self.root.join("client.toml"),
@@ -205,14 +215,43 @@ impl Fixture {
         self.child = Some(child);
     }
 
-    /// Waits until `serve` holds its lease and the bridge socket answers.
+    /// Waits until `serve` holds its lease and a read-only bridge RPC succeeds.
     fn wait_supervised(&mut self) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            if self.log().contains("pi-famulus serve: supervising")
-                && UnixStream::connect(&self.sock).is_ok()
-            {
-                return;
+            if self.log().contains("pi-famulus serve: supervising") {
+                let response = UnixStream::connect(&self.sock)
+                    .and_then(|stream| Peer::new(stream).try_call(json!({"op":"list"}), deadline));
+                match response {
+                    Ok(response) => {
+                        assert_eq!(
+                            response["ok"], true,
+                            "bridge readiness RPC failed: {response}"
+                        );
+                        assert!(
+                            response["sessions"].is_array(),
+                            "invalid bridge list: {response}"
+                        );
+                        assert!(
+                            Instant::now() < deadline,
+                            "bridge readiness RPC finished after deadline"
+                        );
+                        return;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("bridge readiness RPC failed: {error}"),
+                }
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
                 panic!("serve exited {status}: {}", self.log());
@@ -405,6 +444,9 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop();
+        if std::thread::panicking() {
+            common::keep_failed_home(&self.root);
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -426,31 +468,103 @@ impl Peer {
         }
     }
 
-    fn write(&mut self, value: &Value) {
+    fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "intercom RPC deadline expired",
+                )
+            })
+    }
+
+    fn try_write(&mut self, value: &Value, deadline: Instant) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(value).unwrap();
         bytes.push(b'\n');
-        self.reader.get_mut().write_all(&bytes).unwrap();
+        let mut remaining = bytes.as_slice();
+        while !remaining.is_empty() {
+            self.reader
+                .get_mut()
+                .set_write_timeout(Some(Self::remaining(deadline)?))?;
+            match self.reader.get_mut().write(remaining) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "intercom socket wrote no request bytes",
+                    ));
+                }
+                Ok(written) => remaining = &remaining[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Self::remaining(deadline)?;
+        Ok(())
+    }
+
+    fn write(&mut self, value: &Value) {
+        self.try_write(value, Instant::now() + TIMEOUT).unwrap();
+    }
+
+    fn try_read(&mut self, deadline: Instant) -> std::io::Result<Value> {
+        let mut line = Vec::new();
+        loop {
+            self.reader
+                .get_mut()
+                .set_read_timeout(Some(Self::remaining(deadline)?))?;
+            let available = match self.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "intercom closed socket before response",
+                    ));
+                }
+                break;
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |index| index + 1);
+            line.extend_from_slice(&available[..consumed]);
+            self.reader.consume(consumed);
+            Self::remaining(deadline)?;
+            if newline.is_some() {
+                break;
+            }
+        }
+        let response = serde_json::from_slice(&line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid JSONL: {error}: {:?}",
+                    String::from_utf8_lossy(&line)
+                ),
+            )
+        })?;
+        Self::remaining(deadline)?;
+        Ok(response)
     }
 
     fn read(&mut self) -> Value {
-        let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
-            .expect("read JSONL response before deadline");
-        assert!(n > 0, "intercom closed socket before response");
-        serde_json::from_str(&line).unwrap_or_else(|e| panic!("invalid JSONL: {e}: {line:?}"))
+        self.try_read(Instant::now() + TIMEOUT)
+            .expect("read JSONL response before deadline")
     }
 
-    fn call(&mut self, mut request: Value) -> Value {
+    fn try_call(&mut self, mut request: Value, deadline: Instant) -> std::io::Result<Value> {
         self.sequence += 1;
         let id = format!("request-{}", self.sequence);
         request["id"] = json!(id);
-        self.write(&request);
+        self.try_write(&request, deadline)?;
         loop {
-            let response = self.read();
+            let response = self.try_read(deadline)?;
             if response["id"] == id {
-                return response;
+                Self::remaining(deadline)?;
+                return Ok(response);
             }
             assert!(
                 response["type"].is_string(),
@@ -458,6 +572,11 @@ impl Peer {
             );
             self.pushed.push_back(response);
         }
+    }
+
+    fn call(&mut self, request: Value) -> Value {
+        self.try_call(request, Instant::now() + TIMEOUT)
+            .expect("intercom RPC response before deadline")
     }
 
     fn ok(&mut self, request: Value) -> Value {
@@ -537,6 +656,240 @@ fn assert_cli_ok(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn peer_rpc_rejects_buffered_success_after_its_deadline() {
+    let (stream, mut server) = UnixStream::pair().unwrap();
+    let mut peer = Peer::new(stream);
+    writeln!(
+        server,
+        "{}",
+        json!({"id":"request-1","ok":true,"sessions":[]})
+    )
+    .unwrap();
+    assert!(!peer.reader.fill_buf().unwrap().is_empty());
+    let expired = Instant::now();
+    let result = peer.try_call(json!({"op":"list"}), expired);
+    assert!(
+        matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut),
+        "expired readiness budget accepted buffered success: {result:?}"
+    );
+}
+
+#[test]
+fn peer_rpc_deadline_covers_progress_events_and_fragmented_lines() {
+    for events in [true, false] {
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        let mut peer = Peer::new(stream);
+        let (started, progress) = std::sync::mpsc::channel();
+        let (budget, deadline) = std::sync::mpsc::channel::<Instant>();
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                server.set_write_timeout(Some(TIMEOUT)).unwrap();
+                let chunk = if events {
+                    b"{\"type\":\"fixture-progress\"}\n".as_slice()
+                } else {
+                    b" ".as_slice()
+                };
+                server.write_all(chunk).unwrap();
+                started.send(()).unwrap();
+                let deadline = deadline.recv().unwrap();
+                // Keep making real I/O progress past the budget, without sleeps.
+                while Instant::now() < deadline + Duration::from_millis(50) {
+                    if server.write_all(chunk).is_err() {
+                        return;
+                    }
+                }
+                let _ = writeln!(
+                    server,
+                    "{}",
+                    json!({"id":"request-1","ok":true,"sessions":[]})
+                );
+            });
+            progress.recv_timeout(TIMEOUT).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(50);
+            budget.send(deadline).unwrap();
+            let result = peer.try_call(json!({"op":"list"}), deadline);
+            drop(peer);
+            writer.join().unwrap();
+            assert!(
+                matches!(result, Err(ref error) if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )),
+                "readiness progress extended the absolute deadline (events={events}): {result:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn fixture_drop_preserves_failed_logs_but_cleans_successful_homes() {
+    const CHILD_MODE: &str = "PI_FAMULUS_FIXTURE_DROP_CHILD";
+    const CHILD_HOME: &str = "PI_FAMULUS_FIXTURE_DROP_HOME";
+    const LOG: &str = "fixture artifact regression log\n";
+    if let Ok(mode) = std::env::var(CHILD_MODE) {
+        let fixture = Fixture::new();
+        let home = fixture.root.clone();
+        fs::write(home.join("serve.log"), LOG).unwrap();
+        fs::write(
+            std::env::var_os(CHILD_HOME).unwrap(),
+            home.to_str().unwrap(),
+        )
+        .unwrap();
+        if mode == "panic" {
+            panic!("intentional fixture artifact regression panic");
+        }
+        assert_eq!(mode, "success");
+        drop(fixture);
+        assert!(!home.exists(), "successful fixture home was retained");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    for mode in ["success", "panic"] {
+        let artifacts = fixture.root.join(format!("{mode}-artifacts"));
+        let report = fixture.root.join(format!("{mode}-home"));
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fixture_drop_preserves_failed_logs_but_cleans_successful_homes",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, mode)
+            .env(CHILD_HOME, &report)
+            .env("PI_FAMULUS_TEST_ARTIFACTS", &artifacts)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            mode == "success",
+            "unexpected child outcome: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let home = PathBuf::from(fs::read_to_string(report).unwrap());
+        assert!(!home.exists(), "fixture home was not cleaned after {mode}");
+        if mode == "panic" {
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("intentional fixture artifact regression panic"));
+            assert_eq!(
+                fs::read_to_string(artifacts.join(home.file_name().unwrap()).join("serve.log"))
+                    .expect("failed fixture log was not preserved"),
+                LOG
+            );
+        } else {
+            assert!(
+                !artifacts.exists(),
+                "successful fixture created failure artifacts"
+            );
+        }
+    }
+}
+
+#[test]
+fn fixture_startup_requires_a_nonregistering_bridge_roundtrip() {
+    let mut fixture = Fixture::new();
+    let listener = common::bind_private_unix(&fixture.sock);
+    fs::write(
+        fixture.root.join("serve.log"),
+        "pi-famulus serve: supervising\n",
+    )
+    .unwrap();
+    let (ready, readiness) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            fixture.wait_supervised();
+            ready.send(()).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "startup returned after a bare connect without a bridge RPC"
+        );
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            request["op"], "list",
+            "readiness must not register a session"
+        );
+        assert!(request["id"].is_string());
+        assert!(matches!(
+            readiness.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            json!({"id":request["id"],"ok":true,"sessions":[]})
+        )
+        .unwrap();
+        readiness.recv_timeout(TIMEOUT).unwrap();
+        waiter.join().unwrap();
+    });
+}
+
+#[test]
+fn fixture_startup_retries_a_bridge_closed_during_upgrade() {
+    let mut fixture = Fixture::new();
+    let listener = common::bind_private_unix(&fixture.sock);
+    listener.set_nonblocking(true).unwrap();
+    fs::write(
+        fixture.root.join("serve.log"),
+        "pi-famulus serve: supervising\n",
+    )
+    .unwrap();
+    fixture.child = Some(
+        Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| fixture.wait_supervised());
+        let deadline = Instant::now() + TIMEOUT;
+        for attempt in 0..2 {
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            !waiter.is_finished(),
+                            "readiness did not retry a closed bridge"
+                        );
+                        assert!(
+                            Instant::now() < deadline,
+                            "readiness never retried bridge RPC"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept readiness probe: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                request["op"], "list",
+                "readiness must not register a session"
+            );
+            if attempt == 1 {
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    json!({"id":request["id"],"ok":true,"sessions":[]})
+                )
+                .unwrap();
+            }
+        }
+        waiter.join().unwrap();
+    });
 }
 
 #[test]

@@ -15,11 +15,7 @@ struct WssRelay {
 /// WSS tests also run a daemon; see `network::stable_fixture` for why the
 /// binary must be a private copy rather than the shared cargo-target path.
 fn stable_fixture() -> Fixture {
-    let mut fixture = Fixture::new();
-    let binary = fixture.root.join("pi-famulus");
-    fs::copy(BIN, &binary).unwrap();
-    fixture.binary = binary;
-    fixture
+    Fixture::with_private_binary()
 }
 
 fn openssl(root: &std::path::Path, args: &[&str]) {

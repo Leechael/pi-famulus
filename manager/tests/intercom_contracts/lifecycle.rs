@@ -1,6 +1,5 @@
 use super::*;
 use std::net::TcpStream;
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -60,7 +59,7 @@ struct CodexHost {
 fn codex_host(fixture: &Fixture) -> CodexHost {
     use std::io::Read;
     let path = fixture.root.join("codex-app.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = common::bind_private_unix(&path);
     let (accepted, open) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (seen, live) = (accepted.clone(), open.clone());
     thread::spawn(move || {

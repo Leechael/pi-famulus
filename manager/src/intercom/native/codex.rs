@@ -1207,7 +1207,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("host.sock");
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let listener = crate::intercom::localrpc::bind_private(&path).unwrap();
         let host = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();

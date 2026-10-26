@@ -1,6 +1,5 @@
 use super::*;
 use std::collections::{BTreeMap, HashMap};
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -30,7 +29,7 @@ fn fresh(id: &str, status: &str, turns: Value) -> Value {
 impl Host {
     fn new(fixture: &Fixture) -> Self {
         let path = fixture.root.join("codex-state.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = common::bind_private_unix(&path);
         listener.set_nonblocking(true).unwrap();
         let model = Arc::new(Mutex::new(Model {
             reads: [

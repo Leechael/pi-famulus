@@ -555,7 +555,7 @@ impl Home {
 /// said. With `PI_FAMULUS_TEST_ARTIFACTS` set (CI uploads it), copy it there:
 /// logs, per-session events and task records; files over 1 MiB (large task
 /// output) and sockets are skipped.
-fn keep_failed_home(home: &Path) {
+pub fn keep_failed_home(home: &Path) {
     let Some(dir) = std::env::var_os("PI_FAMULUS_TEST_ARTIFACTS") else { return };
     let Some(name) = home.file_name() else { return };
     copy_small_files(home, &Path::new(&dir).join(name));
@@ -579,6 +579,16 @@ pub struct CliOut {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Bind a valid fixture socket without depending on the test runner's umask.
+#[cfg(unix)]
+pub fn bind_private_unix(path: &Path) -> std::os::unix::net::UnixListener {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = std::os::unix::net::UnixListener::bind(path).expect("bind fixture socket");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .expect("set fixture socket permissions");
+    listener
 }
 
 /// Atomically put a copy of `src` at `dst` (copy beside it, then rename),
@@ -1284,10 +1294,14 @@ impl Conn {
     }
 
     pub fn send(&mut self, v: &Value) {
+        self.try_send(v).expect("write frame");
+    }
+
+    fn try_send(&mut self, v: &Value) -> std::io::Result<()> {
         let body = serde_json::to_vec(v).unwrap();
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(&body);
-        self.send_raw(&frame).expect("write frame");
+        self.send_raw(&frame)
     }
 
     /// Read one frame from the socket before `deadline`.
@@ -1334,13 +1348,20 @@ impl Conn {
     }
 
     /// Send `req` with a fresh id; return the response echoing it (or None on
-    /// timeout / close). Other frames are kept in `pending`.
+    /// timeout, close or write failure). Other frames are kept in `pending`.
     pub fn try_request(&mut self, mut req: Value, timeout: Duration) -> Option<Value> {
+        if self.closed {
+            return None;
+        }
         self.next_id += 1;
         let id = format!("q{}", self.next_id);
         req["v"] = json!(1);
         req["id"] = json!(id);
-        self.send(&req);
+        if let Err(error) = self.try_send(&req) {
+            self.closed = true;
+            self.close_reason = format!("write error: {error} ({:?})", error.kind());
+            return None;
+        }
         if let Some(pos) = self.pending.iter().position(|f| f["id"] == json!(id)) {
             return self.pending.remove(pos);
         }

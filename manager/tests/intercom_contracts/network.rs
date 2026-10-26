@@ -19,11 +19,7 @@ pub(super) fn vacant_address() -> SocketAddr {
 /// "binary-changed" in-place upgrade: the daemon quiesces and execs, dropping
 /// every relay and plugin connection and failing long tests at random points.
 pub(super) fn stable_fixture() -> Fixture {
-    let mut fixture = Fixture::new();
-    let binary = fixture.root.join("pi-famulus");
-    common::replace_binary(&binary, std::path::Path::new(BIN));
-    fixture.binary = binary;
-    fixture
+    Fixture::with_private_binary()
 }
 
 fn http(
@@ -926,15 +922,7 @@ fn relay_redelivery_after_exec_upgrade_is_not_injected_twice() {
         output.stderr
     );
     relay.request("register");
-    let deadline = Instant::now() + TIMEOUT;
-    while UnixStream::connect(&fixture.sock).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "intercom socket did not return after exec upgrade: {}",
-            fixture.log()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    fixture.wait_supervised();
     let mut target = fixture.plugin("target", "busy");
     relay.push(frame.clone());
     let fresh = json!({"type":"deliver","session_id":"pi/target","from":"pi/remote","reply_to":"pi/remote","message_id":"223bfe8d-0039-4cbd-b1f9-a892a2773d52","body":"after upgrade"});

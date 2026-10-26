@@ -1,6 +1,5 @@
 use super::*;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
@@ -382,10 +381,7 @@ fn native_terminal_receipt_retries_after_pi_origin_reconnect() {
 
 #[test]
 fn exec_upgrade_restarts_the_bridge_from_its_configuration_and_reaps_predecessor_aliases() {
-    let mut fixture = Fixture::new();
-    let binary = fixture.root.join("pi-famulus");
-    fs::copy(BIN, &binary).unwrap();
-    fixture.binary = binary;
+    let mut fixture = Fixture::with_private_binary();
     fixture.start();
     let pid = fixture.daemon_pid();
     let _plugin = fixture.plugin("before-upgrade", "busy");
@@ -466,10 +462,7 @@ fn exec_upgrade_restarts_the_bridge_from_its_configuration_and_reaps_predecessor
 
 #[test]
 fn exec_upgrade_keeps_restored_tasks_when_intercom_cannot_restart() {
-    let mut fixture = Fixture::new();
-    let binary = fixture.root.join("pi-famulus");
-    fs::copy(BIN, &binary).unwrap();
-    fixture.binary = binary;
+    let mut fixture = Fixture::with_private_binary();
     fixture.start();
     let pid = fixture.daemon_pid();
     let mut manager =
@@ -559,7 +552,7 @@ impl CodexPeer {
     ) -> Self {
         let thread_id = thread_id.to_string();
         let path = fixture.root.join("codex-host.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = common::bind_private_unix(&path);
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -737,6 +730,21 @@ impl Drop for CodexPeer {
             let _ = worker.join();
         }
     }
+}
+
+#[test]
+fn codex_peer_socket_is_private() {
+    let fixture = Fixture::new();
+    let codex = CodexPeer::new(&fixture, false);
+    assert_eq!(
+        fs::symlink_metadata(&codex.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "Codex fixture socket must not depend on the inherited umask"
+    );
 }
 
 #[test]
