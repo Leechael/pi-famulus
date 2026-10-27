@@ -99,7 +99,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       { path: ["messaging", "enabled"], kind: "bool", default: "false", description: "Opt in to cross-session messaging tools, commands, and connections.", applies: "reload the extension and restart the manager daemon to apply" },
       { path: ["messaging", "name"], kind: "text", default: hostname(), description: "Device name shown to peers; the hostname when unset." },
       { path: ["messaging", "server"], kind: "text", default: "https://127.0.0.1:8443", description: "Relay server URL." },
-      { path: ["messaging", "token"], kind: "secret", default: "not set", description: "Relay credential; hosted servers require a device credential. Saved credentials for the same server take precedence. Enrollment tokens are only for messaging enroll." },
+      { path: ["messaging", "token"], kind: "secret", default: "not set", description: "Enrollment token; Enter exchanges it for a saved device credential. The token is not stored.", applies: "exchanges immediately" },
       { path: ["messaging", "localOnly"], kind: "bool", default: "false", description: "Only local sessions, no relay. Enable explicitly for local-only messaging." },
       { path: ["messaging", "remoteMessages"], kind: "enum", values: ["allow", "refuse"], default: "allow", description: "Whether messages from other machines are accepted." },
       { path: ["messaging", "tlsInsecure"], kind: "bool", default: "false", description: "Skip relay TLS certificate verification." },
@@ -212,6 +212,7 @@ export interface SettingsPageDeps {
   tui: PiTuiModule;
   theme: { fg(color: string, text: string): string };
   configPath: string;
+  enrollMessagingToken(token: string): Promise<void>;
   requestRender(): void;
   /** Report a save or its failure under the list. */
   notice(text: string, error?: boolean): void;
@@ -239,7 +240,7 @@ function valueEditor(
   deps: SettingsPageDeps,
   spec: SettingSpec,
   raw: unknown,
-  save: (value: unknown) => boolean,
+  save: (value: unknown) => boolean | Promise<boolean>,
   done: (shown?: string) => void,
 ): PiTuiInteractive {
   const input = new deps.tui.Input();
@@ -253,6 +254,7 @@ function valueEditor(
       ? "enter save · empty keeps the current value · esc cancel"
       : `enter save · empty resets to ${spec.default} · esc cancel`;
   let error = "";
+  let pending = false;
   input.onSubmit = (text) => {
     if (spec.kind === "secret" && text.trim() === "") return done();
     const parsed = parseInput(spec, text);
@@ -261,7 +263,19 @@ function valueEditor(
       deps.requestRender();
       return;
     }
-    if (save(parsed.value)) done(displayValue(spec, parsed.value));
+    error = "";
+    const saved = save(parsed.value);
+    if (typeof saved === "boolean") {
+      if (saved) done(displayValue(spec, parsed.value));
+    } else {
+      pending = true;
+      deps.requestRender();
+      void saved.then((success) => {
+        pending = false;
+        if (success) done("exchanged");
+        deps.requestRender();
+      });
+    }
   };
   input.onEscape = () => done();
   return {
@@ -269,12 +283,12 @@ function valueEditor(
       deps.theme.fg("accent", keyOf(spec)),
       deps.theme.fg("dim", spec.description),
       "",
-      ...input.render(width),
+      ...(pending ? [deps.theme.fg("dim", "Exchanging token...")] : input.render(width)),
       "",
-      error ? deps.theme.fg("error", error) : deps.theme.fg("dim", hint),
+      error ? deps.theme.fg("error", error) : deps.theme.fg("dim", pending ? "Waiting for enrollment response" : hint),
     ],
     invalidate: () => input.invalidate(),
-    handleInput: (data) => input.handleInput(data),
+    handleInput: (data) => { if (!pending) input.handleInput(data); },
   };
 }
 
@@ -288,7 +302,19 @@ export function sectionPage(deps: SettingsPageDeps, section: SettingsSection, cl
     config = {};
   }
   const specs = new Map(section.specs.map((spec) => [keyOf(spec), spec]));
-  const save = (spec: SettingSpec & { applies?: string }, value: unknown): boolean => {
+  const enroll = async (token: string): Promise<boolean> => {
+    try {
+      await deps.enrollMessagingToken(token);
+      setConfigValue(deps.configPath, ["messaging", "token"], undefined);
+      deps.notice("Device enrolled; device credential saved.");
+      return true;
+    } catch (error) {
+      deps.notice(`Device enrollment failed: ${(error as Error).message.replaceAll(token, "[redacted]")}`, true);
+      return false;
+    }
+  };
+  const save = (spec: SettingSpec & { applies?: string }, value: unknown): boolean | Promise<boolean> => {
+    if (keyOf(spec) === "messaging.token") return enroll(value as string);
     try {
       setConfigValue(deps.configPath, spec.path, value);
     } catch (error) {
