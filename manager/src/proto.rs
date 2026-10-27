@@ -471,6 +471,12 @@ pub enum RequestKind {
         /// The op request object, e.g. `{"op":"send","to":"…","body":"…"}`.
         op: serde_json::Value,
     },
+    /// Skip the messaging relay's reconnect backoff and attempt now,
+    /// restarting the relay task first if it died. Answers ok with an empty
+    /// body; `E_INTERCOM_DISABLED` / `E_INTERCOM_UNAVAILABLE` when there is
+    /// no relay to reconnect. Managers that predate it answer with a
+    /// bad-request error for the unknown type.
+    MessagingReconnect,
     /// Test-only (`test-clock` feature): pending manual-clock timers. Sent
     /// as the first frame of a connection, without hello, so it never counts
     /// as an active connection.
@@ -692,6 +698,14 @@ pub struct MessagingStatus {
     /// Empty when connected, deliberately disabled, or explicitly local-only.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// Epoch ms of the next scheduled reconnect attempt; present only while
+    /// `disconnected` with a retry scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<u64>,
+    /// This device's enrolled id for the configured server; empty when the
+    /// device has no credential for it (not enrolled) or there is no bridge.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device_id: String,
 }
 
 /// Outcome of an in-place upgrade attempt.

@@ -86,6 +86,7 @@ fn transport_runtime_on(cfg: Config, clock: crate::clock::Clock) -> Shared {
             remote: Vec::new(),
             relay_tx: None,
             relay_error: String::new(),
+            relay_link: Default::default(),
             control_outbox: VecDeque::new(),
             port_conns: std::collections::HashSet::new(),
             relay_message_ids: false,
@@ -911,4 +912,128 @@ async fn relay_that_welcomes_then_drops_keeps_backing_off_until_a_session_stays_
         .await
         .unwrap()
         .unwrap();
+}
+
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+fn fixture_config(address: std::net::SocketAddr) -> Config {
+    Config {
+        server: format!("http://{address}"),
+        token: "fixture".into(),
+        ..Config::default()
+    }
+}
+
+#[tokio::test]
+async fn supervisor_restarts_a_relay_task_that_panicked() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(fixture_config(listener.local_addr().unwrap()));
+    let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = starts.clone();
+    let task = tokio::spawn(supervise_with(rt.clone(), move |rt| {
+        if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::spawn(async { panic!("relay iteration blew up") })
+        } else {
+            tokio::spawn(run(rt))
+        }
+    }));
+    until("the panic to be recorded", || {
+        rt.state.lock().unwrap().relay_error.contains("relay iteration blew up")
+    })
+    .await;
+    let (state, error) = rt.relay_status();
+    assert_eq!(state, "disconnected");
+    assert!(error.contains("panicked"), "{error}");
+    assert!(rt.relay_retry_at().is_some(), "a restart is scheduled");
+    // The restarted relay task dials and registers like a first start.
+    let _peer = welcomed_peer(&listener).await;
+    until("the restarted relay to connect", || rt.state.lock().unwrap().relay_tx.is_some()).await;
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    rt.stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn supervisor_restarts_a_relay_task_that_returned_early() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(fixture_config(listener.local_addr().unwrap()));
+    let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = starts.clone();
+    let task = tokio::spawn(supervise_with(rt.clone(), move |rt| {
+        if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::spawn(async {})
+        } else {
+            tokio::spawn(run(rt))
+        }
+    }));
+    until("the early return to be recorded", || {
+        rt.state.lock().unwrap().relay_error.contains("exited unexpectedly")
+    })
+    .await;
+    let _peer = welcomed_peer(&listener).await;
+    rt.stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap();
+}
+
+/// A relay that answers every upgrade with HTTP 401, which parks the
+/// reconnect loop for the 300s auth backoff. Counts the attempts.
+async fn rejecting_relay() -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = attempts.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        }
+    });
+    (address, attempts)
+}
+
+#[tokio::test]
+async fn reconnect_now_attempts_at_once_instead_of_waiting_out_the_backoff() {
+    let (address, attempts) = rejecting_relay().await;
+    let seen = || attempts.load(std::sync::atomic::Ordering::SeqCst);
+    let rt = transport_runtime(fixture_config(address));
+    let task = tokio::spawn(supervise(rt.clone()));
+    until("the first attempt", || seen() == 1).await;
+    until("a retry to be scheduled", || rt.relay_retry_at().is_some()).await;
+    let now = rt.clock.now_ms();
+    let retry_at = rt.relay_retry_at().unwrap();
+    assert!(
+        retry_at >= now + 250_000,
+        "an auth failure schedules the long backoff: retry_at={retry_at} now={now}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(seen(), 1, "no attempt before the backoff elapses");
+    rt.relay_reconnect_now();
+    until("an immediate second attempt", || seen() == 2).await;
+    until("the next retry to be scheduled", || rt.relay_retry_at().is_some_and(|at| at >= now + 250_000)).await;
+    rt.stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn no_retry_time_is_reported_while_connected() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(fixture_config(listener.local_addr().unwrap()));
+    let task = tokio::spawn(supervise(rt.clone()));
+    let _peer = welcomed_peer(&listener).await;
+    until("the relay to connect", || rt.state.lock().unwrap().relay_tx.is_some()).await;
+    assert_eq!(rt.relay_retry_at(), None);
+    rt.stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap();
 }

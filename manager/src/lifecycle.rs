@@ -98,6 +98,43 @@ pub fn log_line(home: &Path, msg: &str) {
     }
 }
 
+/// Point the daemon's stdout and stderr at manager.log (append). A daemon
+/// spawned by the extension inherits pipes whose reader is that pi process;
+/// once it exits every write fails with EPIPE, and `eprintln!` panics on a
+/// failed write. Call once the daemon is committed to serving, after
+/// anything the spawner reads from the pipes (contention and startup
+/// failures) has been printed. Best effort: on failure the original
+/// descriptors stay.
+pub fn redirect_stdio_to_log(home: &Path) {
+    let Ok(file) = OpenOptions::new().create(true).append(true).open(log_path(home)) else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: dup2 onto the standard descriptors from a descriptor we own.
+        unsafe {
+            libc::dup2(file.as_raw_fd(), 1);
+            libc::dup2(file.as_raw_fd(), 2);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::IntoRawHandle;
+        use windows_sys::Win32::System::Console::{
+            SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        // deferred: running this on Windows (type-checked only) | impact: daemon spawned with dead pipes could still lose relay logs there | trigger: first Windows messaging support or Windows CI coverage
+        // The process-wide standard handles own the file from here on.
+        let handle = file.into_raw_handle();
+        // SAFETY: `handle` is a valid, leaked file handle.
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, handle as _);
+            SetStdHandle(STD_ERROR_HANDLE, handle as _);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pid file & daemon claim (§3.1)
 // ---------------------------------------------------------------------------

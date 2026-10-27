@@ -44,7 +44,13 @@ fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
             .contains("fixture relay temporarily offline"),
         "{report}"
     );
+    assert!(
+        report["relay_retry_at"].as_u64().is_some_and(|at| at > 0),
+        "a disconnected relay reports its next attempt: {report}"
+    );
     wait_status("connected", None);
+    let connected = peer.call(json!({"op":"status"}))["report"].clone();
+    assert!(connected["relay_retry_at"].is_null(), "{connected}");
     relay
         .outgoing
         .send(json!({"_fixture_disconnect":true}))
