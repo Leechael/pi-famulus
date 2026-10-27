@@ -366,6 +366,12 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
             return 1;
         }
     };
+    // Committed to serving: everything the spawner reads from our pipes (the
+    // contention line, startup failures) is out. Later output goes to
+    // manager.log, which survives the spawner.
+    if !foreground {
+        lifecycle::redirect_stdio_to_log(&home);
+    }
 
     let mut registry = Registry::new(home.clone());
     // Test hook: stand in for a scan over a large home (thousands of records).
@@ -437,6 +443,12 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
             std::process::exit(1);
         }
     };
+    // deferred: integration test of this redirect from a pre-fix image | impact: none known; an upgrade from an old binary would keep spawner pipes until the next restart | trigger: any report of EPIPE-style relay stalls after an upgrade
+    // The previous image redirected already unless it ran in the foreground;
+    // either way the restored image serves for good now.
+    if !restored.snap.foreground {
+        lifecycle::redirect_stdio_to_log(&home);
+    }
     let live = crate::handover::live_ids(&restored);
     let crate::handover::Restored {
         snap,
@@ -2199,6 +2211,9 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             )
             .await;
         }
+        RequestKind::MessagingReconnect => {
+            respond(&tx, &id, handle_messaging_reconnect(&state)).await
+        }
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
         RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
         #[cfg(feature = "test-clock")]
@@ -3740,6 +3755,8 @@ fn messaging_status(state: &Shared) -> MessagingStatus {
                 state: state.into(),
                 name: rt.cfg.display_name(),
                 error,
+                retry_at_ms: rt.relay_retry_at(),
+                device_id: rt.enrolled_device_id(),
             }
         }
         None => {
@@ -3749,7 +3766,42 @@ fn messaging_status(state: &Shared) -> MessagingStatus {
                 state: if disabled { "disabled" } else { "unavailable" }.into(),
                 name: String::new(),
                 error: if disabled { String::new() } else { error },
+                retry_at_ms: None,
+                device_id: String::new(),
             }
+        }
+    }
+}
+
+/// Wake the relay out of its backoff. Refuses when there is no relay to
+/// wake: messaging off, failed to start, or local-only.
+fn handle_messaging_reconnect(state: &Shared) -> Result<UnitOk, ProtoError> {
+    let (rt_slot, error_slot) = {
+        let st = state.lock().unwrap();
+        (st.intercom_rt.clone(), st.intercom_error.clone())
+    };
+    let runtime = rt_slot.lock().unwrap().clone();
+    match runtime {
+        Some(rt) if rt.cfg.local_only => Err(ProtoError::new(
+            E_INTERCOM_DISABLED,
+            "messaging is local-only; there is no relay to reconnect",
+        )),
+        Some(rt) => {
+            rt.relay_reconnect_now();
+            Ok(UnitOk {})
+        }
+        None => {
+            let error = error_slot
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "bridge not running".to_string());
+            let code = if error.starts_with("disabled by") {
+                E_INTERCOM_DISABLED
+            } else {
+                E_INTERCOM_UNAVAILABLE
+            };
+            Err(ProtoError::new(code, error))
         }
     }
 }

@@ -3,11 +3,17 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { collectFamulusInfo, formatFamulusInfo, registerFamulusCommand, type FamulusCommandDeps } from "../../src/tui/famulus-command";
-import type { ManagerClient, MessagingStatus } from "../../src/manager-client";
+import { ManagerError, type ManagerClient, type MessagingStatus } from "../../src/manager-client";
 import { visibleWidth } from "../../src/tui/pi-tui-load";
 
-function client(connected: boolean, lastError = "", messaging?: MessagingStatus | Error): ManagerClient {
+function client(
+  connected: boolean,
+  lastError = "",
+  messaging?: MessagingStatus | Error,
+  messagingReconnect: () => Promise<void> = async () => {},
+): ManagerClient {
   return {
+    messagingReconnect,
     isAvailable: () => connected,
     managerInfo: () => ({ version: "0.1.6+abc", pid: 4242 }),
     lastError: () => lastError,
@@ -32,7 +38,8 @@ async function runInteractive(
   drive: (screen: Component, round: number) => void | Promise<void>,
   extra: {
     editor?: (title: string, text: string) => Promise<string | undefined>;
-    messaging?: MessagingStatus;
+    messaging?: MessagingStatus | (() => MessagingStatus);
+    messagingReconnect?: () => Promise<void>;
     enrollMessagingToken?: FamulusCommandDeps["enrollMessagingToken"];
   } = {},
 ) {
@@ -47,7 +54,11 @@ async function runInteractive(
     configPath,
     managerPath: null,
     describeSearch: () => "PATH",
-    getClient: () => client(true, "", extra.messaging ?? { state: "connected", name: "castle" }),
+    getClient: () => client(
+      true, "",
+      (typeof extra.messaging === "function" ? extra.messaging() : extra.messaging) ?? { state: "connected", name: "castle" },
+      extra.messagingReconnect,
+    ),
     enrollMessagingToken: extra.enrollMessagingToken,
   });
   const notify = vi.fn();
@@ -285,6 +296,29 @@ describe("/famulus settings", () => {
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ messaging: { localOnly: true } });
   });
 
+  it("shows enrollment on the token row instead of 'not set'", async () => {
+    const rows: string[] = [];
+    for (const messaging of [
+      { state: "connected", name: "castle", device_id: "0123456789abcdef" },
+      { state: "disconnected", name: "castle", device_id: "" },
+      { state: "disconnected", name: "castle" },
+    ]) {
+      await runInteractive(freshConfig(), (screen) => {
+        press(screen, KEY.down, KEY.down, KEY.down, KEY.enter, KEY.down, KEY.down, KEY.down);
+        rows.push(screen.render(200).join("\n"));
+        press(screen, KEY.esc, KEY.esc);
+      }, { messaging });
+    }
+    expect(rows[0]).toMatch(/token\s+enrolled · device 01234567\b/);
+    expect(rows[0]).not.toContain("89abcdef");
+    expect(rows[0]).toContain("Entering a token re-enrolls");
+    for (const row of rows.slice(1)) {
+      expect(row).toMatch(/token\s+not enrolled/);
+      expect(row).not.toContain("not set");
+      expect(row).toContain("Entering a token enrolls");
+    }
+  });
+
   it("never shows a stored secret", async () => {
     const configPath = freshConfig('{"messaging":{"token":"s3cret-token"}}\n');
     let screens: string[] = [];
@@ -297,7 +331,7 @@ describe("/famulus settings", () => {
       press(screen, KEY.esc, KEY.esc);
     });
     expect(screens.join("\n")).not.toContain("s3cret-token");
-    expect(screens[0]).toMatch(/token\s+set/);
+    expect(screens[0]).toMatch(/token\s+not enrolled/);
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ messaging: { token: "s3cret-token" } });
   });
 
@@ -448,5 +482,62 @@ describe("/famulus settings", () => {
   it("reloads the extension from the overview", async () => {
     const { reload } = await runInteractive(freshConfig(), (screen) => press(screen, KEY.up, KEY.enter));
     expect(reload).toHaveBeenCalledOnce();
+  });
+});
+
+describe("/famulus messaging status and reconnect", () => {
+  const down = (extra: Partial<MessagingStatus> = {}): MessagingStatus => ({
+    state: "disconnected", name: "castle", error: "IO error: Connection reset by peer (os error 104)", ...extra,
+  });
+
+  it("states the link and its retry countdown once, and the error once", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(5_000_000);
+    let shown = "";
+    await runInteractive(freshConfig(), (screen) => {
+      shown = screen.render(120).join("\n");
+      press(screen, KEY.esc);
+    }, { messaging: down({ retry_at_ms: 5_012_000 }) });
+    vi.restoreAllMocks();
+    expect(shown).toContain("Messaging:  disconnected · name castle · retry in 12s");
+    expect(shown.match(/os error 104/g)).toHaveLength(1);
+    expect(shown).toContain("Messaging error: IO error");
+  });
+
+  it("offers reconnect only while the relay is disconnected or unavailable", async () => {
+    const offered: Record<string, boolean> = {};
+    for (const state of ["connected", "disconnected", "unavailable", "local_only", "disabled"]) {
+      await runInteractive(freshConfig(), (screen) => {
+        offered[state] = screen.render(120).join("\n").includes("Reconnect messaging now");
+        press(screen, KEY.esc);
+      }, { messaging: { state, name: "castle" } });
+    }
+    expect(offered).toEqual({ connected: false, disconnected: true, unavailable: true, local_only: false, disabled: false });
+  });
+
+  it("requests a reconnect, reports it, and shows the refreshed status", async () => {
+    let state = "disconnected";
+    const reconnect = vi.fn(async () => { state = "connected"; });
+    const screens: string[] = [];
+    const { notify } = await runInteractive(freshConfig(), (screen, round) => {
+      screens.push(screen.render(120).join("\n"));
+      if (round === 0) press(screen, KEY.down, KEY.down, KEY.down, KEY.down, KEY.enter);
+      else press(screen, KEY.esc);
+    }, { messaging: () => ({ state, name: "castle" }), messagingReconnect: reconnect });
+    expect(reconnect).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("Reconnect requested"), "info");
+    expect(screens[0]).toContain("disconnected");
+    expect(screens[1]).toContain("Messaging:  connected");
+    expect(screens[1]).not.toContain("Reconnect messaging now");
+  });
+
+  it.each([
+    [new ManagerError("E_BAD_REQUEST", "unknown variant `messaging_reconnect`, expected one of `status`"), "manager is too old to reconnect on demand; restart it"],
+    [new ManagerError("E_BAD_REQUEST", "messaging is disabled"), "messaging is disabled"],
+  ])("reports a failed reconnect as an error (%#)", async (error, text) => {
+    const { notify } = await runInteractive(freshConfig(), (screen, round) => {
+      if (round === 0) press(screen, KEY.down, KEY.down, KEY.down, KEY.down, KEY.enter);
+      else press(screen, KEY.esc);
+    }, { messaging: down(), messagingReconnect: async () => { throw error; } });
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining(text), "error");
   });
 });

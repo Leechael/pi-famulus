@@ -5,6 +5,7 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname } from "node:path";
+import type { MessagingStatus } from "../manager-client";
 import type { PiTuiInteractive, PiTuiModule, PiTuiSettingItem, PiTuiSettingsListTheme } from "./pi-tui-load";
 
 type Kind = "int" | "text" | "secret" | "bool" | "enum" | "duration";
@@ -212,6 +213,8 @@ export interface SettingsPageDeps {
   tui: PiTuiModule;
   theme: { fg(color: string, text: string): string };
   configPath: string;
+  /** What the manager reported; null when it is unreachable or silent. */
+  messaging?: MessagingStatus | null;
   enrollMessagingToken(token: string): Promise<void>;
   requestRender(): void;
   /** Report a save or its failure under the list. */
@@ -229,6 +232,12 @@ export function listTheme(theme: SettingsPageDeps["theme"]): PiTuiSettingsListTh
 }
 
 const keyOf = (spec: SettingSpec) => spec.path.join(".");
+
+/** The token is removed after enrollment, so the row shows enrollment instead. */
+function enrollmentValue(messaging: SettingsPageDeps["messaging"]): string {
+  if (!messaging) return "unknown";
+  return messaging.device_id ? `enrolled · device ${messaging.device_id.slice(0, 8)}` : "not enrolled";
+}
 
 function describe(spec: SettingSpec & { applies?: string }, section: SettingsSection, raw: unknown): string {
   const state = raw === undefined ? `not set (default ${spec.default})` : `default ${spec.default}`;
@@ -272,7 +281,7 @@ function valueEditor(
       deps.requestRender();
       void saved.then((success) => {
         pending = false;
-        if (success) done("exchanged");
+        if (success) done("enrolled");
         deps.requestRender();
       });
     }
@@ -326,11 +335,14 @@ export function sectionPage(deps: SettingsPageDeps, section: SettingsSection, cl
   };
   const items: PiTuiSettingItem[] = section.specs.map((spec) => {
     const raw = lookup(config, spec.path);
+    const isToken = keyOf(spec) === "messaging.token";
     const item: PiTuiSettingItem = {
       id: keyOf(spec),
       label: spec.path[spec.path.length - 1],
-      description: describe(spec, section, raw),
-      currentValue: displayValue(spec, raw),
+      description: isToken
+        ? `Entering a token ${deps.messaging?.device_id ? "re-enrolls" : "enrolls"} this device. ${spec.description} · ${spec.applies}`
+        : describe(spec, section, raw),
+      currentValue: isToken ? enrollmentValue(deps.messaging) : displayValue(spec, raw),
     };
     if (spec.kind === "bool") item.values = ["true", "false"];
     else if (spec.kind === "enum") item.values = spec.values;

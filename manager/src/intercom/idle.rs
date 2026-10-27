@@ -925,6 +925,7 @@ mod tests {
                 remote: Vec::new(),
                 relay_tx: None,
             relay_error: String::new(),
+            relay_link: Default::default(),
                 control_outbox: VecDeque::new(),
                 port_conns: HashSet::new(),
                 relay_message_ids: false,

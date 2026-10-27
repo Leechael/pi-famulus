@@ -696,8 +696,85 @@ async fn dial_attempt(c: &Config) -> Result<Socket, TransportError> {
     .map_err(|_| TransportError::Io("relay dial timed out".into()))?;
     result
 }
+/// The relay supervisor's reconnect schedule, kept in [`super::State`].
+#[derive(Default)]
+pub struct Link {
+    /// Epoch ms of the next scheduled attempt while waiting out a backoff.
+    pub retry_at_ms: Option<u64>,
+    /// Wakes the backoff wait so the next attempt happens at once.
+    pub wake: std::sync::Arc<tokio::sync::Notify>,
+}
+/// Aborts the wrapped task when dropped, so aborting the supervisor never
+/// leaves its relay task running on its own.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+/// Best-effort diagnostics: unlike `eprintln!`, a closed or broken stderr
+/// must not be able to panic the relay.
+fn log_line(message: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "intercom relay: {message}");
+}
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(text) => *text,
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map_or_else(|| "unknown panic".into(), |text| (*text).into()),
+    }
+}
+/// Runs [`run`] under supervision: if the relay task ever ends while the
+/// bridge is not stopping (a panic, or an early return), the reason becomes
+/// the relay error and the task is restarted after a backoff that
+/// `Runtime::relay_reconnect_now` can cut short.
+pub async fn supervise(rt: Shared) {
+    supervise_with(rt, |rt| tokio::spawn(run(rt))).await
+}
+async fn supervise_with(rt: Shared, start: impl Fn(Shared) -> tokio::task::JoinHandle<()>) {
+    let mut stop = rt.stop.subscribe();
+    let mut delay = BACKOFF_MIN;
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        let mut task = AbortOnDrop(start(rt.clone()));
+        let joined = (&mut task.0).await;
+        if *stop.borrow() {
+            break;
+        }
+        let reason = match joined {
+            Ok(()) => "relay task exited unexpectedly".to_string(),
+            Err(error) if error.is_panic() => {
+                format!("relay task panicked: {}", panic_message(error.into_panic()))
+            }
+            Err(error) => format!("relay task failed: {error}"),
+        };
+        let (wait, next) = next_backoff(delay);
+        let wake = {
+            // A panic may have poisoned the lock; the state is still usable.
+            let mut state = rt.state.lock().unwrap_or_else(|e| e.into_inner());
+            // The dead session's sender no longer reaches a writer.
+            state.relay_tx = None;
+            state.relay_error = reason.clone();
+            state.relay_link.retry_at_ms = Some(rt.clock.now_ms().saturating_add(wait.as_millis() as u64));
+            state.relay_link.wake.clone()
+        };
+        log_line(&reason);
+        tokio::select! {
+            _ = stop.changed() => break,
+            _ = wake.notified() => {}
+            _ = rt.clock.sleep("intercom-relay-restart", wait) => {}
+        }
+        rt.state.lock().unwrap_or_else(|e| e.into_inner()).relay_link.retry_at_ms = None;
+        delay = next;
+    }
+}
 pub async fn run(rt: Shared) {
     let mut stop = rt.stop.subscribe();
+    let wake = rt.state.lock().unwrap().relay_link.wake.clone();
     let mut delay = BACKOFF_MIN;
     let mut idle_tasks = tokio::task::JoinSet::new();
     // Keep one bounded operation pool across reconnects. Side-effecting
@@ -711,6 +788,10 @@ pub async fn run(rt: Shared) {
         if *stop.borrow() {
             break;
         }
+        // An attempt starts now: no retry is pending, and a reconnect request
+        // that arrived before this point is already satisfied.
+        rt.state.lock().unwrap().relay_link.retry_at_ms = None;
+        let _ = futures_util::FutureExt::now_or_never(wake.notified());
         let mut welcomed = None;
         let result = session(
             rt.clone(),
@@ -730,15 +811,25 @@ pub async fn run(rt: Shared) {
             delay = BACKOFF_MIN;
         }
         let (mut wait, next) = next_backoff(delay);
+        let mut failure = None;
         if let Err(error) = result {
             if error.is_auth() {
                 wait = AUTH_RETRY_DELAY;
             }
-            let error = error.to_string();
-            rt.state.lock().unwrap().relay_error = error.clone();
-            eprintln!("intercom relay: {error}");
+            failure = Some(error.to_string());
         }
-        tokio::select! {_=stop.changed()=>break,_=rt.clock.sleep("intercom-relay-reconnect",wait)=>{}}
+        {
+            // Error and schedule are published together.
+            let mut state = rt.state.lock().unwrap();
+            if let Some(error) = &failure {
+                state.relay_error = error.clone();
+            }
+            state.relay_link.retry_at_ms = Some(rt.clock.now_ms().saturating_add(wait.as_millis() as u64));
+        }
+        if let Some(error) = failure {
+            log_line(&error);
+        }
+        tokio::select! {_=stop.changed()=>break,_=wake.notified()=>{},_=rt.clock.sleep("intercom-relay-reconnect",wait)=>{}}
         delay = next;
     }
 }

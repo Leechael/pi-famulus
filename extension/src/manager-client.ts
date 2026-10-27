@@ -188,6 +188,10 @@ export interface MessagingStatus {
   name: string;
   /** Why the bridge is not running. */
   error?: string;
+  /** Epoch ms of the next reconnect attempt; only while disconnected with one scheduled. */
+  retry_at_ms?: number;
+  /** Enrolled device id for the configured server; absent or empty when not enrolled. */
+  device_id?: string;
 }
 
 export interface SessionInfo {
@@ -655,6 +659,11 @@ export class ManagerClient {
         ? { messaging: res.messaging as MessagingStatus }
         : {}),
     };
+  }
+
+  /** Ask the daemon to retry the relay connection now instead of at the next scheduled attempt. */
+  async messagingReconnect(): Promise<void> {
+    await this.request({ type: "messaging_reconnect" });
   }
 
   /** Connected sessions (status). Older managers may reject this for extension clients. */

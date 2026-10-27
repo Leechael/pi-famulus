@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { dirname } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type { ManagerClient, MessagingStatus } from "../manager-client";
+import { ManagerError, type ManagerClient, type MessagingStatus } from "../manager-client";
 import { SETTINGS_SECTIONS, listTheme, readConfigText, sectionPage, writeConfigText } from "./famulus-settings";
 import { loadPiTui, truncateToWidth, wrapTextWithAnsi } from "./pi-tui-load";
 
@@ -52,7 +52,11 @@ export function formatMessaging(info: FamulusInfo): string {
   const m = info.messaging;
   if (!m) return info.daemon ? "not reported by this manager" : "unknown (manager not connected)";
   const state = RELAY_STATES[m.state] ?? "unavailable";
-  const label = m.name && RELAY_STATES[m.state] ? `${state} · name ${singleLine(m.name)}` : state;
+  let label = m.name && RELAY_STATES[m.state] ? `${state} · name ${singleLine(m.name)}` : state;
+  if (m.state === "disconnected" && typeof m.retry_at_ms === "number") {
+    const seconds = Math.ceil((m.retry_at_ms - Date.now()) / 1000);
+    label += seconds > 0 ? ` · retry in ${seconds}s` : " · retrying";
+  }
   const error = singleLine(m.error ?? "");
   return `${label}${error ? ` (${error})` : ""}`;
 }
@@ -126,7 +130,26 @@ export async function collectFamulusInfo(deps: FamulusCommandDeps): Promise<Famu
   };
 }
 
-type OverviewChoice = "edit-raw" | "reload" | undefined;
+type OverviewChoice = "edit-raw" | "reload" | "reconnect" | undefined;
+
+/** Whether "Reconnect messaging now" makes sense for what the manager reported. */
+const canReconnect = (m: MessagingStatus | null) => m?.state === "disconnected" || m?.state === "unavailable";
+
+/** Ask the manager to retry the relay now; the notice text says how that went. */
+export async function requestMessagingReconnect(client: ManagerClient | null): Promise<{ text: string; error: boolean }> {
+  if (!client?.isAvailable()) return { text: "The manager is not connected.", error: true };
+  try {
+    await client.messagingReconnect();
+    return { text: "Reconnect requested; the status refreshes below.", error: false };
+  } catch (error) {
+    const message = (error as Error).message;
+    // An older daemon rejects the request type itself.
+    if (error instanceof ManagerError && error.code === "E_BAD_REQUEST" && /unknown|unrecognized|unsupported/i.test(message)) {
+      return { text: "The manager is too old to reconnect on demand; restart it.", error: true };
+    }
+    return { text: `Reconnect failed: ${singleLine(message)}`, error: true };
+  }
+}
 
 /** Status first, then one row per settings section and the two actions. */
 function showOverview(
@@ -146,6 +169,7 @@ function showOverview(
       tui: piTui,
       theme,
       configPath,
+      messaging: info.messaging,
       enrollMessagingToken,
       requestRender: () => tui.requestRender(),
       notice: (text: string, error = false) => {
@@ -160,6 +184,13 @@ function showOverview(
         currentValue: "›",
         submenu: (_current: string, close: (value?: string) => void) => sectionPage(deps, section, () => close()),
       })),
+      ...(canReconnect(info.messaging) ? [{
+        id: "reconnect",
+        label: "Reconnect messaging now",
+        description: "Retry the relay connection immediately instead of waiting for the next attempt",
+        currentValue: "",
+        values: [""],
+      }] : []),
       {
         id: "edit-raw",
         label: "Edit config.json",
@@ -174,7 +205,7 @@ function showOverview(
       10,
       listTheme(theme),
       (id) => {
-        if (id === "edit-raw" || id === "reload") done(id);
+        if (id === "edit-raw" || id === "reload" || id === "reconnect") done(id);
       },
       () => done(undefined),
     );
@@ -215,6 +246,11 @@ export function registerFamulusCommand(pi: ExtensionAPI, deps: FamulusCommandDep
       while (true) {
         const action = await showOverview(ctx, await collectFamulusInfo(deps), deps.configPath,
           deps.enrollMessagingToken ?? ((token) => exchangeMessagingToken(deps.managerPath, deps.configPath, token)));
+        if (action === "reconnect") {
+          const outcome = await requestMessagingReconnect(deps.getClient());
+          ctx.ui.notify(outcome.text, outcome.error ? "error" : "info");
+          continue;
+        }
         if (action === "reload") {
           await ctx.reload();
           return;

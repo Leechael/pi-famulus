@@ -131,6 +131,8 @@ pub struct State {
     pub remote: Vec<Value>,
     pub relay_tx: Option<mpsc::Sender<Push>>,
     pub relay_error: String,
+    /// Reconnect schedule and wake-up for the relay supervisor.
+    pub relay_link: relay::Link,
     pub control_outbox: VecDeque<Value>,
     /// Bridge-runtime connection ids owned by famulus manager-connection
     /// ports (protocol 7 `intercom`): a legacy client socket refuses to
@@ -330,6 +332,36 @@ impl Runtime {
             ("disconnected", state.relay_error.clone())
         }
     }
+    /// Epoch ms of the next scheduled reconnect attempt; only while the
+    /// relay is disconnected and one is scheduled.
+    pub fn relay_retry_at(&self) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        if self.cfg.local_only || state.relay_tx.is_some() {
+            None
+        } else {
+            state.relay_link.retry_at_ms
+        }
+    }
+    /// The loaded identity's device id when it holds a credential for the
+    /// configured server (the same test `adopt_identity_credential` uses),
+    /// else empty.
+    pub fn enrolled_device_id(&self) -> String {
+        let identity = &self.identity;
+        if !self.cfg.local_only
+            && !identity.credential.is_empty()
+            && identity.server.trim_end_matches('/') == self.cfg.server.trim_end_matches('/')
+        {
+            identity.device_id.clone()
+        } else {
+            String::new()
+        }
+    }
+    /// Skip the current reconnect backoff: the relay supervisor attempts at
+    /// once (restarting the relay task first if it died).
+    pub fn relay_reconnect_now(&self) {
+        let wake = self.state.lock().unwrap().relay_link.wake.clone();
+        wake.notify_one();
+    }
     /// Stop admitting work and settle idle watches as `unavailable` while
     /// the native bridges and the watching processes are still alive; only
     /// then stop the bridges.
@@ -431,6 +463,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             remote: Vec::new(),
             relay_tx: None,
             relay_error: String::new(),
+            relay_link: Default::default(),
             control_outbox: VecDeque::new(),
             port_conns: HashSet::new(),
             relay_message_ids: false,
@@ -480,7 +513,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
     if !runtime.cfg.local_only {
         let rt = runtime.clone();
         running.tasks.push(tokio::spawn(async move {
-            relay::run(rt).await;
+            relay::supervise(rt).await;
         }));
     }
     Ok(running)
@@ -898,7 +931,7 @@ impl Runtime {
             )
         };
         legacy.sort();
-        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"name":self.cfg.display_name(),"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"relay_error":relay_error,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
+        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"name":self.cfg.display_name(),"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"relay_error":relay_error,"relay_retry_at":self.relay_retry_at(),"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
         for (key, count) in [
             ("claude_n", claude),
             ("pi_n", pi),
