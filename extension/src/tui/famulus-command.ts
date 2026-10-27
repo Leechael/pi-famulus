@@ -58,7 +58,22 @@ export function formatMessaging(info: FamulusInfo): string {
     label += seconds > 0 ? ` · retry in ${seconds}s` : " · retrying";
   }
   const error = singleLine(m.error ?? "");
-  return `${label}${error ? ` (${error})` : ""}`;
+  const count = m.conflicts?.length ?? 0;
+  const conflicts = count ? ` · ${count} session${count === 1 ? "" : "s"} unpublished` : "";
+  return `${label}${conflicts}${error ? ` (${error})` : ""}`;
+}
+
+/** Why some local sessions are invisible to peers, one entry per session. */
+export function formatConflicts(m: MessagingStatus | null): string {
+  if (!m?.conflicts?.length) return "";
+  const rows = m.conflicts.map((c) => {
+    const id = singleLine(c.id);
+    const name = singleLine(c.name);
+    const who = name && name !== id ? `${name} (${id})` : id;
+    const owner = singleLine(c.owner);
+    return owner ? `${who} owned by ${owner}` : `${who} not listed`;
+  });
+  return `Unpublished: the relay assigns these sessions to another device, so peers cannot reach them until they restart: ${rows.join("; ")}`;
 }
 
 export function formatFamulusInfo(info: FamulusInfo): string {
@@ -221,6 +236,8 @@ function showOverview(
         })];
         const error = singleLine(info.messaging?.error ?? "");
         if (error) lines.push(...wrapTextWithAnsi(theme.fg("error", `Messaging error: ${error}`), width));
+        const conflicts = formatConflicts(info.messaging);
+        if (conflicts) lines.push(...wrapTextWithAnsi(theme.fg("warning", conflicts), width));
         lines.push("", ...list.render(width));
         if (notice) lines.push("", ...wrapTextWithAnsi(notice, width));
         return lines.map((line) => truncateToWidth(line, width));

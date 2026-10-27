@@ -3751,12 +3751,22 @@ fn messaging_status(state: &Shared) -> MessagingStatus {
     match runtime {
         Some(rt) => {
             let (state, error) = rt.relay_status();
+            let field = |v: &serde_json::Value, key: &str| v[key].as_str().unwrap_or_default().to_string();
             MessagingStatus {
                 state: state.into(),
                 name: rt.cfg.display_name(),
                 error,
                 retry_at_ms: rt.relay_retry_at(),
                 device_id: rt.enrolled_device_id(),
+                conflicts: rt
+                    .relay_conflicts()
+                    .iter()
+                    .map(|v| crate::proto::RelayConflict {
+                        id: field(v, "id"),
+                        name: field(v, "name"),
+                        owner: field(v, "owner"),
+                    })
+                    .collect(),
             }
         }
         None => {
@@ -3768,6 +3778,7 @@ fn messaging_status(state: &Shared) -> MessagingStatus {
                 error: if disabled { String::new() } else { error },
                 retry_at_ms: None,
                 device_id: String::new(),
+                conflicts: Vec::new(),
             }
         }
     }

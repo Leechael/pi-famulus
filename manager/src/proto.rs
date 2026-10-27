@@ -706,6 +706,22 @@ pub struct MessagingStatus {
     /// device has no credential for it (not enrolled) or there is no bridge.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub device_id: String,
+    /// Local sessions the connected relay assigns to another device, so peers
+    /// cannot reach them. Empty when all are published or the link is down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<RelayConflict>,
+}
+
+/// A local session the relay directory lists under another device, or not
+/// at all (`owner` empty).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RelayConflict {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// The owning device's name, or its id when the relay names none.
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// Outcome of an in-place upgrade attempt.
