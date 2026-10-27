@@ -323,6 +323,22 @@ fn live_pill(state: &TopState) -> Vec<Span<'static>> {
     }
 }
 
+/// Relay link of the messaging bridge: `● msg connected · name`.
+fn messaging_spans(m: &crate::proto::MessagingStatus) -> Vec<Span<'static>> {
+    let (dot, color, label) = match m.state.as_str() {
+        "connected" => ("● ", OK, "connected"),
+        "disconnected" => ("○ ", ERR, "disconnected"),
+        "local_only" => ("◌ ", MUTED, "local-only"),
+        _ => ("○ ", DIM, "off"),
+    };
+    let mut spans = vec![sp(fg(color), dot), sp(fg(DIM), "msg "), sp(fg(color), label)];
+    if !m.name.is_empty() {
+        spans.push(sp(fg(DIM), " · "));
+        spans.push(sp(fg(TEXT), m.name.clone()));
+    }
+    spans
+}
+
 fn interval_text(ms: u64) -> String {
     if ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
@@ -344,6 +360,10 @@ fn brand_line(state: &TopState, width: usize) -> Line<'static> {
         sp(fg(MUTED), format!("{}", h.sessions_conn)),
         sp(fg(DIM), format!("/{}", h.sessions_tot)),
     ];
+    if let Some(m) = &h.messaging {
+        left.push(Span::raw("   "));
+        left.extend(messaging_spans(m));
+    }
     left.push(Span::raw(" "));
     let mut right = live_pill(state);
     right.push(Span::raw(" "));
@@ -439,12 +459,19 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
     if spans_width(&title) + spans_width(&pill) <= room {
         block = block.title(Line::from(pill).right_aligned());
     }
+    let mut pid_w = 0;
     if let Some(pid) = h.pid {
         let up = h.uptime_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into());
-        block = block.title_bottom(Line::from(lead(
-            BOX_OVERVIEW,
-            seg_bottom(BOX_OVERVIEW, vec![sp(fg(DIM), format!("pid {pid} · up {up}"))]),
-        )));
+        let left = lead(BOX_OVERVIEW, seg_bottom(BOX_OVERVIEW, vec![sp(fg(DIM), format!("pid {pid} · up {up}"))]));
+        pid_w = spans_width(&left);
+        block = block.title_bottom(Line::from(left));
+    }
+    if let Some(m) = &h.messaging {
+        // Shares the bottom border with `pid · up`; dropped when they would collide.
+        let msg = trail(BOX_OVERVIEW, seg_bottom(BOX_OVERVIEW, messaging_spans(m)));
+        if pid_w + spans_width(&msg) <= room {
+            block = block.title_bottom(Line::from(msg).right_aligned());
+        }
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2980,6 +3007,33 @@ mod tests {
         let col = |needle: &str| fmt::display_width(&line[..line.find(needle).unwrap()]) as u16;
         assert!(agents.0 <= col("agents") && col("agents") < agents.1, "{line:?} {hits:?}");
         assert!(scope.0 <= col("active") && col("active") < scope.1, "{line:?} {hits:?}");
+    }
+
+    #[test]
+    fn the_header_shows_the_messaging_relay_state_and_device_name() {
+        let mut snap = snap();
+        snap.daemon = Some(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.7", "pid": 42, "uptime_ms": 1, "sessions": [],
+                "task_counts": {"running": 0, "terminal": 0},
+                "messaging": {"state": "disconnected", "name": "castle"}
+            }))
+            .unwrap(),
+        );
+        let cases = [("connected", "msg connected · castle"), ("disconnected", "msg disconnected · castle"), ("local_only", "msg local-only · castle")];
+        for (relay, shown) in cases {
+            snap.daemon.as_mut().unwrap().messaging.as_mut().unwrap().state = relay.into();
+            for (cols, rows) in [(120, 30), (120, 12)] {
+                let mut state = TopState::new(1_000, None, None);
+                state.apply(&snap, &[], &HashMap::new());
+                let text = render(cols, rows, &mut state);
+                assert!(text.contains(shown), "{relay} {cols}x{rows}: {text}");
+            }
+        }
+        snap.daemon.as_mut().unwrap().messaging = None;
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        assert!(!render(120, 30, &mut state).contains("msg "), "an older daemon shows no messaging state");
     }
 
     #[test]

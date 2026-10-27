@@ -80,7 +80,7 @@ These keys belong in the `messaging` object in the same `config.json`. This is t
 |---|---|---|
 | `server` | `"https://127.0.0.1:8443"` | Relay server URL. |
 | `token` | `""` | Relay or enrollment token. |
-| `name` | `""` | Device name used during enrollment. |
+| `name` | `""` | Device name used during enrollment and shown by `/famulus` and `pi-famulus top`; the hostname when empty. |
 | `tlsInsecure` | `false` | Disable normal relay TLS certificate verification. |
 | `sock` | See below | Local bridge socket path. |
 | `stateDir` | `~/.pi/agent/pi-famulus/messaging` | Device identity and bridge state directory. |

@@ -1,11 +1,12 @@
 /**
- * /famulus — which pi-famulus binary this session uses and which versions run.
+ * /famulus — which pi-famulus binary this session uses, which versions run,
+ * whether messaging reaches its relay, and the settings pages.
  */
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ManagerClient } from "../manager-client";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ManagerClient, MessagingStatus } from "../manager-client";
+import { SETTINGS_SECTIONS, listTheme, readConfigText, sectionPage, writeConfigText } from "./famulus-settings";
+import { loadPiTui, truncateToWidth } from "./pi-tui-load";
 
 export interface FamulusCommandDeps {
   extensionVersion: string;
@@ -26,6 +27,22 @@ export interface FamulusInfo {
   binaryVersion: string | null;
   daemon: { version: string; pid: number } | null;
   daemonError: string;
+  /** Null when the manager is not connected or did not report it. */
+  messaging: MessagingStatus | null;
+}
+
+const RELAY_STATES: Record<string, string> = {
+  connected: "connected",
+  disconnected: "disconnected",
+  local_only: "local-only",
+};
+
+export function formatMessaging(info: FamulusInfo): string {
+  const m = info.messaging;
+  if (!m) return info.daemon ? "not reported by this manager" : "unknown (manager not connected)";
+  const state = RELAY_STATES[m.state];
+  if (!state) return `unavailable${m.error ? ` (${m.error})` : ""}`;
+  return m.name ? `${state} · name ${m.name}` : state;
 }
 
 export function formatFamulusInfo(info: FamulusInfo): string {
@@ -39,6 +56,7 @@ export function formatFamulusInfo(info: FamulusInfo): string {
     `pi-famulus extension ${info.extensionVersion}`,
     `CLI binary: ${binary}`,
     `Manager: ${manager}`,
+    `Messaging: ${formatMessaging(info)}`,
     `Config: ${info.configPath}`,
   ].join("\n");
 }
@@ -53,6 +71,21 @@ export function readBinaryVersion(path: string): Promise<string | null> {
   });
 }
 
+const STATUS_TIMEOUT_MS = 2000;
+
+async function readMessaging(client: ManagerClient): Promise<MessagingStatus | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), STATUS_TIMEOUT_MS);
+  });
+  try {
+    const status = client.status().then((s) => s.messaging ?? null, () => null);
+    return await Promise.race([status, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function collectFamulusInfo(deps: FamulusCommandDeps): Promise<FamulusInfo> {
   const client = deps.getClient();
   const connected = client?.isAvailable() ?? false;
@@ -64,31 +97,74 @@ export async function collectFamulusInfo(deps: FamulusCommandDeps): Promise<Famu
     binaryVersion: deps.managerPath ? await (deps.binaryVersion ?? readBinaryVersion)(deps.managerPath) : null,
     daemon: connected ? client?.managerInfo() ?? null : null,
     daemonError: connected ? "" : client?.lastError() ?? "",
+    messaging: connected && client ? await readMessaging(client) : null,
   };
 }
 
-function readConfigForEdit(path: string): string {
-  try {
-    return readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "{}\n";
-    throw error;
-  }
-}
+type OverviewChoice = "edit-raw" | "reload" | undefined;
 
-function writeConfig(path: string, text: string): void {
-  const parsed: unknown = JSON.parse(text);
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("config.json must contain a JSON object");
+/** Status first, then one row per settings section and the two actions. */
+function showOverview(ctx: ExtensionCommandContext, info: FamulusInfo, configPath: string): Promise<OverviewChoice> {
+  const piTui = loadPiTui();
+  if (!piTui) {
+    ctx.ui.notify(formatFamulusInfo(info), "info");
+    return Promise.resolve(undefined);
   }
-  mkdirSync(dirname(path), { recursive: true });
-  const temporary = `${path}.${process.pid}.tmp`;
-  try {
-    writeFileSync(temporary, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
-    renameSync(temporary, path);
-  } finally {
-    rmSync(temporary, { force: true });
-  }
+  return ctx.ui.custom<OverviewChoice>((tui, theme, _kb, done) => {
+    let notice = "";
+    const deps = {
+      tui: piTui,
+      theme,
+      configPath,
+      requestRender: () => tui.requestRender(),
+      notice: (text: string, error = false) => {
+        notice = theme.fg(error ? "error" : "success", text);
+      },
+    };
+    const items = [
+      ...SETTINGS_SECTIONS.map((section) => ({
+        id: `section:${section.id}`,
+        label: section.label,
+        description: `${section.specs.length} settings · ${section.applies}`,
+        currentValue: "›",
+        submenu: (_current: string, close: (value?: string) => void) => sectionPage(deps, section, () => close()),
+      })),
+      {
+        id: "edit-raw",
+        label: "Edit config.json",
+        description: "The whole file in the editor, for webhook endpoints and anything not listed",
+        currentValue: "",
+        values: [""],
+      },
+      { id: "reload", label: "Reload extension", description: "Apply extension settings now", currentValue: "", values: [""] },
+    ];
+    const list = new piTui.SettingsList(
+      items,
+      10,
+      listTheme(theme),
+      (id) => {
+        if (id === "edit-raw" || id === "reload") done(id);
+      },
+      () => done(undefined),
+    );
+    return {
+      render(width: number) {
+        const status = formatFamulusInfo(info).split("\n");
+        const lines = [theme.fg("accent", status[0]), ...status.slice(1).map((line) => {
+          const at = line.indexOf(": ");
+          return `  ${theme.fg("dim", line.slice(0, at + 1).padEnd(12))}${line.slice(at + 2)}`;
+        }), "", ...list.render(width)];
+        if (notice) lines.push("", notice);
+        return lines.map((line) => truncateToWidth(line, width));
+      },
+      invalidate: () => list.invalidate(),
+      handleInput(data: string) {
+        notice = "";
+        list.handleInput(data);
+        tui.requestRender();
+      },
+    };
+  });
 }
 
 export function registerFamulusCommand(pi: ExtensionAPI, deps: FamulusCommandDeps): void {
@@ -100,19 +176,15 @@ export function registerFamulusCommand(pi: ExtensionAPI, deps: FamulusCommandDep
         return;
       }
       while (true) {
-        const action = await ctx.ui.select(formatFamulusInfo(await collectFamulusInfo(deps)), [
-          "Edit configuration",
-          "Reload extension",
-          "Close",
-        ]);
-        if (action === "Reload extension") {
+        const action = await showOverview(ctx, await collectFamulusInfo(deps), deps.configPath);
+        if (action === "reload") {
           await ctx.reload();
           return;
         }
-        if (action !== "Edit configuration") return;
+        if (action !== "edit-raw") return;
         let current: string;
         try {
-          current = readConfigForEdit(deps.configPath);
+          current = readConfigText(deps.configPath);
         } catch (error) {
           ctx.ui.notify(`Cannot read ${deps.configPath}: ${(error as Error).message}`, "error");
           continue;
@@ -120,8 +192,11 @@ export function registerFamulusCommand(pi: ExtensionAPI, deps: FamulusCommandDep
         const edited = await ctx.ui.editor(`Edit ${deps.configPath}`, current);
         if (edited === undefined) continue;
         try {
-          writeConfig(deps.configPath, edited);
-          ctx.ui.notify(`Saved ${deps.configPath}. Reload the extension to apply extension settings.`, "info");
+          writeConfigText(deps.configPath, edited);
+          ctx.ui.notify(
+            `Saved ${deps.configPath}. Reload the extension for extension settings; restart the manager daemon for messaging settings.`,
+            "info",
+          );
         } catch (error) {
           ctx.ui.notify(`Configuration was not saved: ${(error as Error).message}`, "error");
         }

@@ -46,11 +46,48 @@ export interface PiTuiModule {
     options?: { gap?: number },
   ) => PiTuiComponent;
   matchesKey(data: string, key: string): boolean;
+  SettingsList: new (
+    items: PiTuiSettingItem[],
+    maxVisible: number,
+    theme: PiTuiSettingsListTheme,
+    onChange: (id: string, newValue: string) => void,
+    onCancel: () => void,
+  ) => PiTuiInteractive & { updateValue(id: string, newValue: string): void };
+  Input: new () => PiTuiInteractive & {
+    focused: boolean;
+    onSubmit?: (value: string) => void;
+    onEscape?: () => void;
+    getValue(): string;
+    setValue(value: string): void;
+  };
   Box: new (
     paddingX?: number,
     paddingY?: number,
     bgFn?: (text: string) => string,
   ) => { addChild(component: unknown): void };
+}
+
+export interface PiTuiInteractive extends PiTuiComponent {
+  handleInput(data: string): void;
+}
+
+export interface PiTuiSettingItem {
+  id: string;
+  label: string;
+  description?: string;
+  currentValue: string;
+  /** Enter cycles through these. */
+  values?: string[];
+  /** Enter opens this; `done(value)` sets the shown value, `done()` cancels. */
+  submenu?: (currentValue: string, done: (selectedValue?: string) => void) => PiTuiInteractive;
+}
+
+export interface PiTuiSettingsListTheme {
+  label: (text: string, selected: boolean) => string;
+  value: (text: string, selected: boolean) => string;
+  description: (text: string) => string;
+  cursor: string;
+  hint: (text: string) => string;
 }
 
 export interface PiTuiWidth {

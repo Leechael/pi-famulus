@@ -3638,6 +3638,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         .unwrap()
         .get(&home)
         .map_err(|e| ProtoError::new(E_INTERNAL, format!("invalid capacity config: {e}")))?;
+    let messaging = messaging_status(state);
     let st = state.lock().unwrap();
     // Status is read-only. Extensions need it so task_list can drop ghost
     // agents whose session is no longer connected. Shutdown stays cli-only.
@@ -3719,7 +3720,30 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         exe: crate::handover::exe_path()
             .ok()
             .map(|p| p.display().to_string()),
+        messaging: Some(messaging),
     })
+}
+
+/// The bridge's relay link. Takes the state lock only to clone the bridge
+/// slots, never while a slot lock is held.
+fn messaging_status(state: &Shared) -> MessagingStatus {
+    let (rt_slot, error_slot) = {
+        let st = state.lock().unwrap();
+        (st.intercom_rt.clone(), st.intercom_error.clone())
+    };
+    let runtime = rt_slot.lock().unwrap().clone();
+    match runtime {
+        Some(rt) => MessagingStatus {
+            state: rt.relay_state().into(),
+            name: rt.cfg.display_name(),
+            error: String::new(),
+        },
+        None => MessagingStatus {
+            state: "unavailable".into(),
+            name: String::new(),
+            error: error_slot.lock().unwrap().clone().unwrap_or_default(),
+        },
+    }
 }
 
 async fn handle_supervise(state: &Shared, conn_id: u64) -> Result<SuperviseOk, ProtoError> {

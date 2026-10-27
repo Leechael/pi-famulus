@@ -320,6 +320,16 @@ impl Running {
     }
 }
 impl Runtime {
+    /// Relay link state: `connected`, `disconnected` or `local_only`.
+    pub fn relay_state(&self) -> &'static str {
+        if self.cfg.local_only {
+            "local_only"
+        } else if self.state.lock().unwrap().relay_tx.is_some() {
+            "connected"
+        } else {
+            "disconnected"
+        }
+    }
     /// Stop admitting work and settle idle watches as `unavailable` while
     /// the native bridges and the watching processes are still alive; only
     /// then stop the bridges.
@@ -873,16 +883,13 @@ impl Runtime {
                 panes += 1;
             }
         }
-        let (relay, mcp, native, mut legacy) = {
+        let relay = match self.relay_state() {
+            "local_only" => "disabled (local_only)",
+            state => state,
+        };
+        let (mcp, native, mut legacy) = {
             let state = self.state.lock().unwrap();
             (
-                if self.cfg.local_only {
-                    "disabled (local_only)"
-                } else if state.relay_tx.is_some() {
-                    "connected"
-                } else {
-                    "disconnected"
-                },
                 state.mcp_status.clone(),
                 state.native_status.clone(),
                 state
@@ -894,7 +901,7 @@ impl Runtime {
             )
         };
         legacy.sort();
-        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
+        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"name":self.cfg.display_name(),"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
         for (key, count) in [
             ("claude_n", claude),
             ("pi_n", pi),

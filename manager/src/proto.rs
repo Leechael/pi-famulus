@@ -674,6 +674,23 @@ pub struct StatusOk {
     /// The daemon's binary: the file an in-place upgrade execs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
+    /// The messaging bridge's relay link; absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging: Option<MessagingStatus>,
+}
+
+/// Relay link of the messaging bridge, as `status` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessagingStatus {
+    /// `connected`, `disconnected`, `local_only`, or `unavailable` while the
+    /// bridge itself is not running.
+    pub state: String,
+    /// `messaging.name`, or the hostname when it is unset.
+    #[serde(default)]
+    pub name: String,
+    /// Why the bridge is not running (`unavailable` only).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 /// Outcome of an in-place upgrade attempt.

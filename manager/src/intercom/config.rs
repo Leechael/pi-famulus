@@ -94,6 +94,16 @@ pub fn webhook_url_allowed(url: &str, secret: &str) -> Result<(), String> {
         ))
     }
 }
+impl Config {
+    /// The configured device name, or the hostname when none is set.
+    pub fn display_name(&self) -> String {
+        if self.name.is_empty() {
+            hostname()
+        } else {
+            self.name.clone()
+        }
+    }
+}
 pub fn hostname() -> String {
     #[cfg(unix)]
     {
@@ -368,6 +378,15 @@ mod tests {
             serde_json::from_value::<Config>(wire).unwrap(),
             Config::default()
         );
+    }
+
+    #[test]
+    fn an_unset_name_displays_as_the_hostname() {
+        let mut config = Config::default();
+        assert_eq!(config.display_name(), hostname());
+        assert!(!config.display_name().is_empty());
+        config.name = "workstation".into();
+        assert_eq!(config.display_name(), "workstation");
     }
 
     #[test]
