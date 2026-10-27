@@ -9,6 +9,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerIntercom } from "../../src/intercom/intercom";
+import type { MessagingStatus } from "../../src/manager-client";
 import {
   createFakeCtx,
   createFakeManager,
@@ -23,7 +24,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function lifecycleHarness(options: { autoUp?: boolean } = {}) {
+function lifecycleHarness(options: { autoUp?: boolean; messaging?: MessagingStatus } = {}) {
   const { autoUp = true } = options;
   const { dir, cleanup } = makeTempDir("fam-ic-life-");
   cleanups.push(cleanup);
@@ -44,8 +45,11 @@ function lifecycleHarness(options: { autoUp?: boolean } = {}) {
   const fake = createFakeManager({ sessionId: state.sessionId });
   if (!autoUp) fake.setUp(false);
   const registrations = fake.registrations;
+  let messaging: MessagingStatus = options.messaging ?? { state: "connected", name: "primary" };
+  const status = vi.fn(async () => ({ sessions: [], messaging }));
   registerIntercom(pi.pi as any, {
-    getClient: () => fake.getClient(),
+    enabled: true,
+    getClient: () => Object.assign(fake.getClient()!, { status }),
     extensionDirs: ["/nonexistent-extensions"],
   });
   const emit = (name: string, event: any = {}, context: any = ctx) => pi.handlers.get(name)?.(event, context);
@@ -67,9 +71,35 @@ function lifecycleHarness(options: { autoUp?: boolean } = {}) {
     emit: (name: string, event: any = {}, context: any = ctxWithNotify) =>
       pi.handlers.get(name)?.(event, context),
     notices: () => [...notices],
+    status,
+    setMessaging: (value: MessagingStatus) => { messaging = value; },
     afterShutdown,
   };
 }
+
+it.each([undefined, false])("does not register any messaging surface without opt-in (%s)", (enabled) => {
+  const pi = createFakePi();
+  const getClient = vi.fn(() => null);
+  registerIntercom(pi.pi as any, { enabled, getClient });
+  expect(pi.tools.size).toBe(0);
+  expect(pi.commands.size).toBe(0);
+  expect(pi.handlers.size).toBe(0);
+  expect(pi.messageRenderers.size).toBe(0);
+  expect(getClient).not.toHaveBeenCalled();
+});
+
+it("preserves the environment disable override even with opt-in", () => {
+  vi.stubEnv("PI_FAMULUS_NO_INTERCOM", "1");
+  try {
+    const pi = createFakePi();
+    registerIntercom(pi.pi as any, { enabled: true });
+    expect(pi.tools.size).toBe(0);
+    expect(pi.commands.size).toBe(0);
+    expect(pi.handlers.size).toBe(0);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
 
 // Regression: a dead extension instance must not be revived by queued hooks,
 // a previously queued retry tick, or a tool retaining its old closure.

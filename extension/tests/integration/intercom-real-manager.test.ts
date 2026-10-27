@@ -34,13 +34,14 @@ if (RUN && process.platform === "win32") {
 const root = mkdtempSync(join(tmpdir(), "pi-famulus-intercom-integ-"));
 const home = join(root, "manager");
 const bridgeSock = join(root, "bridge", "client.sock");
-mkdirSync(join(root, "bridge"), { recursive: true });
-mkdirSync(join(root, "state"), { recursive: true });
-mkdirSync(home, { recursive: true });
+mkdirSync(join(root, "bridge"), { recursive: true, mode: 0o700 });
+mkdirSync(join(root, "state"), { recursive: true, mode: 0o700 });
+mkdirSync(home, { recursive: true, mode: 0o700 });
 writeFileSync(
   join(home, "config.json"),
   JSON.stringify({
     messaging: {
+      enabled: true,
       localOnly: true,
       name: "intercom-integ-host",
       sock: bridgeSock,

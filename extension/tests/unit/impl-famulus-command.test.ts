@@ -101,6 +101,7 @@ describe("/famulus status", () => {
   });
 
   it.each([
+    [{ state: "disabled", name: "" }, "Messaging: disabled"],
     [{ state: "disconnected", name: "castle" }, "Messaging: disconnected · name castle"],
     [{ state: "local_only", name: "castle" }, "Messaging: local-only · name castle"],
     [{ state: "unavailable", name: "", error: "disabled by PI_FAMULUS_NO_INTERCOM" }, "Messaging: unavailable (disabled by PI_FAMULUS_NO_INTERCOM)"],
@@ -115,6 +116,17 @@ describe("/famulus status", () => {
       getClient: () => client(true, "", messaging as MessagingStatus | Error | undefined),
     });
     expect(formatFamulusInfo(info).split("\n")).toContain(line);
+  });
+
+  it("reports a disabled plugin even when the daemon has messaging enabled", async () => {
+    const manager = client(true, "", { state: "connected", name: "castle" });
+    const status = vi.spyOn(manager, "status");
+    const info = await collectFamulusInfo({
+      extensionVersion: "0.2.1", configPath: "/c.json", managerPath: null,
+      describeSearch: () => "PATH", getClient: () => manager, messagingEnabled: false,
+    });
+    expect(formatFamulusInfo(info)).toContain("Messaging: disabled");
+    expect(status).not.toHaveBeenCalled();
   });
 
   it("says where it looked when no binary is found and why the manager is not connected", async () => {
@@ -214,13 +226,30 @@ describe("/famulus settings", () => {
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({});
   });
 
+  it("defaults messaging to disabled and explains both apply steps when enabled", async () => {
+    const configPath = freshConfig();
+    let section = "";
+    let saved = "";
+    await runInteractive(configPath, (screen) => {
+      press(screen, KEY.down, KEY.down, KEY.down, KEY.enter);
+      section = screen.render(160).join("\n");
+      press(screen, KEY.enter);
+      saved = screen.render(160).join("\n");
+      press(screen, KEY.esc, KEY.esc);
+    });
+    expect(section).toMatch(/enabled\s+false/);
+    expect(saved).toContain("reload the extension");
+    expect(saved).toContain("restart the manager daemon");
+    expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ messaging: { enabled: true } });
+  });
+
   it("toggles a messaging flag into the messaging object and shows the hostname as the default name", async () => {
     const configPath = freshConfig();
     let section = "";
     await runInteractive(configPath, (screen) => {
       press(screen, KEY.down, KEY.down, KEY.down, KEY.enter); // Messaging
       section = screen.render(120).join("\n");
-      press(screen, KEY.down, KEY.down, KEY.down, KEY.enter); // localOnly: false → true
+      press(screen, KEY.down, KEY.down, KEY.down, KEY.down, KEY.enter); // localOnly: false → true
       press(screen, KEY.esc, KEY.esc);
     });
     expect(section).toMatch(new RegExp(`name\\s+${hostname().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
@@ -231,7 +260,7 @@ describe("/famulus settings", () => {
     const configPath = freshConfig('{"messaging":{"token":"s3cret-token"}}\n');
     let screens: string[] = [];
     await runInteractive(configPath, (screen) => {
-      press(screen, KEY.down, KEY.down, KEY.down, KEY.enter, KEY.down, KEY.down);
+      press(screen, KEY.down, KEY.down, KEY.down, KEY.enter, KEY.down, KEY.down, KEY.down);
       screens.push(screen.render(120).join("\n"));
       press(screen, KEY.enter);
       screens.push(screen.render(120).join("\n"));

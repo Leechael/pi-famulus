@@ -28,6 +28,7 @@ function harness(options: { reply?: (req: Record<string, any>) => Record<string,
   const fake = createFakeManager({ ...options, sessionId: state.sessionId });
   fake.reply = options.reply;
   registerIntercom(pi.pi as any, {
+    enabled: true,
     getClient: () => fake.getClient(),
     extensionDirs: ["/nonexistent-extensions"],
   });
@@ -898,7 +899,7 @@ describe("intercom behaviour", () => {
     const fake = createFakeManager({ sessionId: state.sessionId });
     const notices: string[] = [];
     const ctxWithUi = { ...ctx, ui: { notify: (m: string) => notices.push(m) } };
-    registerIntercom(pi.pi as any, { getClient: () => fake.getClient(), extensionDirs: [legacyDir] });
+    registerIntercom(pi.pi as any, { enabled: true, getClient: () => fake.getClient(), extensionDirs: [legacyDir] });
     await pi.handlers.get("session_start")!({}, ctxWithUi);
     expect(notices.filter((m) => /Remove the legacy messaging plugin/.test(m)).length).toBe(1);
     // Not twice on further session starts.

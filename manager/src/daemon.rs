@@ -609,7 +609,7 @@ fn ctrl_c_or_pending(
     }
 }
 
-/// Starts the messaging bridge every manager runs; a failure leaves the
+/// Starts the opt-in messaging bridge; a failure leaves the
 /// manager (and its tasks) running without messaging.
 async fn start_bridge(
     home: &Path,
@@ -621,6 +621,7 @@ async fn start_bridge(
     };
     match started {
         Ok(running) => (Some(running), None),
+        Err(error) if error.starts_with("disabled by") => (None, Some(error)),
         Err(error) => {
             lifecycle::log_line(
                 home,
@@ -3738,11 +3739,15 @@ fn messaging_status(state: &Shared) -> MessagingStatus {
             name: rt.cfg.display_name(),
             error: String::new(),
         },
-        None => MessagingStatus {
-            state: "unavailable".into(),
-            name: String::new(),
-            error: error_slot.lock().unwrap().clone().unwrap_or_default(),
-        },
+        None => {
+            let error = error_slot.lock().unwrap().clone().unwrap_or_default();
+            let disabled = error.starts_with("disabled by");
+            MessagingStatus {
+                state: if disabled { "disabled" } else { "unavailable" }.into(),
+                name: String::new(),
+                error: if disabled { String::new() } else { error },
+            }
+        }
     }
 }
 
@@ -4287,6 +4292,12 @@ async fn apply_supervision(
         }
     }
     let Some(running) = running.as_mut() else {
+        if bridge_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("disabled by"))
+        {
+            return "disabled".into();
+        }
         return format!(
             "unavailable: {}",
             bridge_error.as_deref().unwrap_or("not running")

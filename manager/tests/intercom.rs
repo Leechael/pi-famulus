@@ -133,6 +133,9 @@ impl Fixture {
             }
         }
         camel_keys(&mut messaging);
+        if let Some(object) = messaging.as_object_mut() {
+            object.entry("enabled").or_insert(json!(true));
+        }
         let manager = self.root.join("manager");
         fs::create_dir_all(&manager).unwrap();
         fs::write(
@@ -1463,6 +1466,103 @@ fn shutdown_notifies_a_task_hosted_idle_watcher_before_terminating_it() {
         "task-hosted watcher was terminated before its watch settled: {notices:?}"
     );
     drop(target);
+}
+
+fn manager_status_connection(fixture: &Fixture) -> common::Conn {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(stream) = UnixStream::connect(fixture.root.join("manager/manager.sock")) {
+            let mut manager = common::Conn::new(stream);
+            manager.hello_ext("status-session");
+            manager.request_ok(json!({"type":"status"}));
+            return manager;
+        }
+        assert!(Instant::now() < deadline, "{}", fixture.log());
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn hosted_manager_messaging_is_disabled_until_explicitly_enabled() {
+    for (mut settings, disabled_env) in [
+        (json!({}), false),
+        (
+            json!({"server":"http://127.0.0.1:1","token":"bootstrap"}),
+            false,
+        ),
+        (json!({"enabled":false,"localOnly":true}), false),
+        (json!({"enabled":true,"localOnly":true}), true),
+    ] {
+        let mut fixture = Fixture::with_private_binary();
+        let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        relay.set_nonblocking(true).unwrap();
+        if settings.get("server").is_some() {
+            settings["server"] = json!(format!("http://{}", relay.local_addr().unwrap()));
+        }
+        let mut command = fixture.base_command();
+        settings["sock"] = json!(fixture.sock);
+        settings["stateDir"] = json!(fixture.root.join("state"));
+        fs::write(
+            fixture.root.join("manager/config.json"),
+            serde_json::to_vec(&json!({"messaging":settings})).unwrap(),
+        )
+        .unwrap();
+        if disabled_env {
+            command.env("PI_FAMULUS_NO_INTERCOM", "1");
+        }
+        let log = fs::File::create(fixture.root.join("serve.log")).unwrap();
+        fixture.child = Some(
+            command
+                .arg("serve")
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .unwrap(),
+        );
+        let mut manager = manager_status_connection(&fixture);
+        let status = manager.request_ok(json!({"type":"status"}));
+        assert_eq!(status["messaging"]["state"], "disabled", "{status}");
+        assert!(
+            status["messaging"]["error"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "{status}"
+        );
+        let response = manager.request(json!({"type":"intercom","op":{"op":"list"}}));
+        assert_eq!(
+            response["error"]["code"], "E_INTERCOM_DISABLED",
+            "{response}"
+        );
+        assert!(!fixture.sock.exists());
+        assert!(!fixture.root.join("state/device.json").exists());
+        assert!(!fixture.root.join("manager/messaging/device.json").exists());
+        assert!(
+            relay.accept().is_err(),
+            "disabled messaging connected to the relay"
+        );
+    }
+}
+
+#[test]
+fn hosted_enabled_without_enrollment_reports_an_actionable_failure() {
+    let mut fixture = Fixture::with_private_binary();
+    let config = fs::read_to_string(fixture.root.join("client.toml"))
+        .unwrap()
+        .replace("local_only = true", "local_only = false");
+    fs::write(fixture.root.join("client.toml"), config).unwrap();
+    fixture.spawn_serve(&[], &[]);
+    let mut manager = manager_status_connection(&fixture);
+    let status = manager.request_ok(json!({"type":"status"}));
+    assert_eq!(status["messaging"]["state"], "unavailable", "{status}");
+    assert!(
+        status["messaging"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("enroll"),
+        "{status}"
+    );
+    assert!(!fixture.root.join("state/device.json").exists());
 }
 
 #[test]

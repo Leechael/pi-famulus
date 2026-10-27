@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
+    pub enabled: bool,
     pub server: String,
     pub token: String,
     pub name: String,
@@ -46,6 +47,7 @@ impl Default for Config {
                 std::env::temp_dir().join(format!("pi-famulus-{uid}/client.sock"))
             });
         Self {
+            enabled: false,
             server: "https://127.0.0.1:8443".into(),
             token: String::new(),
             name: String::new(),

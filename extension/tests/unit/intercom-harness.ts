@@ -241,6 +241,7 @@ export function createFakeManager(options: {
         if (connecting) await new Promise<boolean>((resolve) => (connecting!.resolve = resolve));
         return conn.up;
       },
+      status: async () => ({ sessions: [], messaging: { state: "connected", name: "fake" } }),
       intercom: (op: Record<string, unknown>) => route(conn, op),
       onEvent: (handler: (event: any) => void) => {
         const wrapped = (event: any) => {

@@ -27,15 +27,16 @@ if (RUN && !existsSync(BIN)) {
 const root = mkdtempSync(join(tmpdir(), "pi-famulus-intercom-integ-"));
 const home = join(root, "manager");
 const bridgeSock = join(root, "bridge", "client.sock");
-mkdirSync(join(root, "bridge"), { recursive: true });
-mkdirSync(join(root, "state"), { recursive: true });
-mkdirSync(home, { recursive: true });
+mkdirSync(join(root, "bridge"), { recursive: true, mode: 0o700 });
+mkdirSync(join(root, "state"), { recursive: true, mode: 0o700 });
+mkdirSync(home, { recursive: true, mode: 0o700 });
 const configPath = join(home, "config.json");
 const writeConfig = (name = "intercom-integ-host") =>
   writeFileSync(
     configPath,
     JSON.stringify({
       messaging: {
+        enabled: true,
         localOnly: true,
         name,
         sock: bridgeSock,
@@ -101,6 +102,7 @@ describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
   const emit = (name: string, event: any = {}, ctx: any = ctxAlice.ctx) => handlers.get(name)?.(event, ctx);
 
   afterAll(async () => {
+    await emit("session_shutdown");
     await alice?.close();
     await bob?.close();
     try {
@@ -113,7 +115,7 @@ describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
   it("registers, delivers, reports receipts, resets, reconnects, and switches sessions", { timeout: 180_000 }, async () => {
     alice = new ManagerClient({ home, sessionId: "alice-session", managerPath: BIN });
     current = alice;
-    registerIntercom(pi as any, { getClient: () => current });
+    registerIntercom(pi as any, { enabled: true, getClient: () => current });
     await alice.connect();
     bob = new ManagerClient({ home, sessionId: "bob-session", managerPath: BIN });
     await bob.connect();

@@ -3,7 +3,7 @@
  * instance adopts the runtime (manager connection, subagents, monitors) the
  * old one parked, while quit and session replacement still tear it down.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -119,6 +119,7 @@ describe("extension across /reload", () => {
   beforeEach(() => {
     resetHostedFakes();
     takeParkedRuntime(); // nothing left over from another test
+    rmSync(join(home, "config.json"), { force: true });
   });
 
   afterEach(() => {
@@ -140,11 +141,84 @@ describe("extension across /reload", () => {
     expect(managers[0].shutdownCalls).toBe(0);
     expect(managers[0].closeCalls).toBe(0);
     expect(after.tools).toEqual(expect.arrayContaining(["bash", "subagent", "monitor", "task_list"]));
-    expect([...after.commands.keys()].sort()).toEqual(["attach", "famulus", "intercom", "rename", "reply", "tasks"]);
+    expect([...after.commands.keys()].sort()).toEqual(["attach", "famulus", "reply", "tasks"]);
 
     await after.emit("session_shutdown", { reason: "quit" });
     expect(managers[0].shutdownCalls).toBe(1);
     expect(managers[0].closeCalls).toBe(1);
+  });
+
+  it("applies messaging opt-in on reload without replacing the existing manager runtime", async () => {
+    const before = fakePi();
+    await loadExtension(before.api);
+    expect(before.tools).not.toContain("SendMessage");
+    expect(before.commands.has("famulus")).toBe(true);
+    await before.emit("session_start", { reason: "startup" }, fakeCtx().ctx);
+    const manager = managers[0];
+    const messagingOps = vi.fn(async () => ({ session_id: "pi/sess-1" }));
+    Object.assign(manager, {
+      intercom: messagingOps,
+      status: async () => ({ sessions: [], messaging: { state: "local_only", name: "test" } }),
+    });
+    const eventListeners = new Set<Function>();
+    const reconnectListeners = new Set<Function>();
+    const onEvent = manager.onEvent.bind(manager);
+    const offEventSpy = vi.spyOn(manager, "onEvent").mockImplementation((handler) => {
+      eventListeners.add(handler);
+      const off = onEvent(handler);
+      return () => { eventListeners.delete(handler); off(); };
+    });
+    const offReconnectSpy = vi.spyOn(manager, "onReconnect").mockImplementation((handler) => {
+      reconnectListeners.add(handler);
+      return () => { reconnectListeners.delete(handler); };
+    });
+    const retryTimers = new Set<ReturnType<typeof setInterval>>();
+    const setIntervalOriginal = globalThis.setInterval;
+    const clearIntervalOriginal = globalThis.clearInterval;
+    const intervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: any, ms: number, ...args: any[]) => {
+      const timer = setIntervalOriginal(callback, ms, ...args);
+      if (ms === 3000) retryTimers.add(timer);
+      return timer;
+    }) as typeof setInterval);
+    const clearSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation((timer) => {
+      retryTimers.delete(timer as ReturnType<typeof setInterval>);
+      clearIntervalOriginal(timer);
+    });
+    expect(retryTimers.size).toBe(0);
+    expect(eventListeners.size).toBe(0);
+    await before.emit("session_shutdown", { reason: "reload" });
+    writeFileSync(join(home, "config.json"), JSON.stringify({ messaging: { enabled: true } }));
+    const enabled = fakePi();
+    await loadExtension(enabled.api);
+    expect(enabled.tools).toContain("SendMessage");
+    expect(enabled.commands.has("intercom")).toBe(true);
+    await enabled.emit("session_start", { reason: "reload" }, fakeCtx().ctx);
+    expect(retryTimers.size).toBe(1);
+    expect(eventListeners.size).toBe(2);
+    expect(reconnectListeners.size).toBe(1);
+    expect(messagingOps).toHaveBeenCalledWith(expect.objectContaining({ op: "register" }));
+    await enabled.emit("session_shutdown", { reason: "reload" });
+    expect(retryTimers.size).toBe(0);
+    expect(eventListeners.size).toBe(0);
+    expect(reconnectListeners.size).toBe(0);
+    writeFileSync(join(home, "config.json"), JSON.stringify({ messaging: { enabled: false } }));
+    const disabled = fakePi();
+    await loadExtension(disabled.api);
+    expect(disabled.tools).not.toContain("SendMessage");
+    expect(disabled.commands.has("intercom")).toBe(false);
+    expect(disabled.commands.has("famulus")).toBe(true);
+    await disabled.emit("session_start", { reason: "reload" }, fakeCtx().ctx);
+    expect(managers).toHaveLength(1);
+    expect(managers[0].closeCalls).toBe(0);
+    expect(retryTimers.size).toBe(0);
+    expect(eventListeners.size).toBe(0);
+    expect(reconnectListeners.size).toBe(0);
+    expect(messagingOps.mock.calls).toHaveLength(2); // register, unregister only
+    await disabled.emit("session_shutdown", { reason: "quit" });
+    offEventSpy.mockRestore();
+    offReconnectSpy.mockRestore();
+    intervalSpy.mockRestore();
+    clearSpy.mockRestore();
   });
 
   it("does not replay unknown finished shells after a same-version reload", async () => {

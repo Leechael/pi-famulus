@@ -20,6 +20,26 @@ function makeConfig(subagent?: FamulusConfig["subagent"]): FamulusConfig {
   };
 }
 
+describe("messaging opt-in config", () => {
+  it.each([
+    [{}, false],
+    [{ messaging: { server: "https://relay.example", token: "legacy" } }, false],
+    [{ messaging: { enabled: false } }, false],
+    [{ messaging: { enabled: "true" } }, false],
+    [{ messaging: { enabled: 1 } }, false],
+    [{ messaging: { enabled: true } }, true],
+  ])("requires the literal enabled boolean: %j", (raw, enabled) => {
+    const home = mkdtempSync(join(tmpdir(), "famulus-msg-cfg-"));
+    try {
+      expect(loadConfig(home).messaging?.enabled).toBe(false);
+      writeFileSync(join(home, "config.json"), JSON.stringify(raw));
+      expect(loadConfig(home).messaging?.enabled).toBe(enabled);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("resolveSubagentConfig stall retries", () => {
   it("defaults to one auto-resume after a 5s delay", () => {
     const resolved = resolveSubagentConfig(makeConfig());

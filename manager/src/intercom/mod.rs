@@ -29,21 +29,19 @@ const NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Set by test harnesses that run managers without the messaging bridge, so
 /// they never bind the shared default intercom socket.
 pub const DISABLE_ENV: &str = "PI_FAMULUS_NO_INTERCOM";
-/// The messaging bridge every manager runs: Famulus `config.json` only.
-/// An unenrolled device bridges local agents only.
+/// The opt-in manager messaging bridge: Famulus `config.json` only.
 pub fn bridge_config(home: &std::path::Path) -> Result<Config, String> {
-    if cfg!(windows) {
-        return Err("intercom native adapters support Linux/macOS only".into());
-    }
     if std::env::var_os(DISABLE_ENV).is_some() {
         return Err(format!("disabled by {DISABLE_ENV}"));
     }
-    let mut config = Config::load(home, &cli::Options::without_overrides())?;
-    if !config.local_only
-        && config.token.is_empty()
-        && !config.state_dir.join("device.json").exists()
-    {
-        config.local_only = true;
+    let config = Config::load(home, &cli::Options::without_overrides())?;
+    if !config.enabled {
+        return Err(
+            "disabled by messaging.enabled; set messaging.enabled=true to enable messaging".into(),
+        );
+    }
+    if cfg!(windows) {
+        return Err("intercom native adapters support Linux/macOS only".into());
     }
     Ok(config)
 }
@@ -1269,6 +1267,12 @@ mod tests {
         let saved = saved_identity("enrolled-credential", "http://relay.invalid/");
         adopt_identity_credential(&mut cfg, &saved).unwrap();
         assert_eq!(cfg.token, "enrolled-credential");
+    }
+
+    #[test]
+    fn hosted_messaging_defaults_to_disabled() {
+        let cfg = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(cfg["enabled"], false);
     }
 
     #[test]

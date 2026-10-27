@@ -606,6 +606,7 @@ fn enroll_and_device_persist_credentials_without_printing_secrets() {
         )
     });
     let fixture = stable_fixture();
+    fixture.config("enabled = false\n");
     let url = endpoint.url();
     let output = fixture.run(&[
         "enroll",

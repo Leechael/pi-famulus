@@ -15,6 +15,8 @@ export interface FamulusCommandDeps {
   /** Where the binary was looked for, shown when none was found. */
   describeSearch: () => string;
   getClient: () => ManagerClient | null;
+  /** Effective plugin opt-in, including the environment disable override. */
+  messagingEnabled?: boolean;
   /** `<binary> --version`; null when it cannot be run. */
   binaryVersion?: (path: string) => Promise<string | null>;
 }
@@ -32,6 +34,7 @@ export interface FamulusInfo {
 }
 
 const RELAY_STATES: Record<string, string> = {
+  disabled: "disabled",
   connected: "connected",
   disconnected: "disconnected",
   local_only: "local-only",
@@ -97,7 +100,9 @@ export async function collectFamulusInfo(deps: FamulusCommandDeps): Promise<Famu
     binaryVersion: deps.managerPath ? await (deps.binaryVersion ?? readBinaryVersion)(deps.managerPath) : null,
     daemon: connected ? client?.managerInfo() ?? null : null,
     daemonError: connected ? "" : client?.lastError() ?? "",
-    messaging: connected && client ? await readMessaging(client) : null,
+    messaging: deps.messagingEnabled === false
+      ? { state: "disabled", name: "" }
+      : connected && client ? await readMessaging(client) : null,
   };
 }
 

@@ -169,6 +169,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     managerPath: string | null;
     describeSearch: () => string;
     getClient: () => ManagerClient | null;
+    messagingEnabled: boolean;
   } | null = null;
   const nativeRestore: Promise<string | null> = managerPath
     ? Promise.resolve(managerPath)
@@ -622,6 +623,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     managerPath,
     describeSearch: () => describeManagerSearch(config, home),
     getClient: () => client,
+    messagingEnabled: false,
   };
   registerFamulusCommand(pi, famulusInfo);
   monitorRegistry.onChange(() => {
@@ -1244,7 +1246,16 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     }
     ctx = null;
   };
-  const runtime: FamulusRuntime = { attach: (host) => binding.attach(host) };
+  const runtime: FamulusRuntime = {
+    attach: (host) => {
+      const enabled = loadConfig(home).messaging?.enabled === true && process.env.PI_FAMULUS_NO_INTERCOM === undefined;
+      if (famulusInfo) famulusInfo.messagingEnabled = enabled;
+      binding.attach(host);
+      // Messaging is session-scoped, not parked: reload must re-evaluate opt-in
+      // without replacing the manager connection or other background work.
+      registerIntercom(host, { enabled, getClient: () => client });
+    },
+  };
 
   pi.on("session_before_switch", async (event, switchCtx) => {
     const file = event.targetSessionFile;
@@ -1290,12 +1301,6 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     });
     return message ? { message } : undefined;
   });
-
-  // The intercom port (cross-session messaging, absorbed from the
-  // pi-famulus pi plugin) rides the same manager connection. Registered
-  // after the session hooks above so its session_start sees the fresh
-  // client. Hosted children never reach here (child-mode returns early).
-  registerIntercom(pi, { getClient: () => client });
 
   return runtime;
 }

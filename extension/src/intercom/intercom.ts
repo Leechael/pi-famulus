@@ -12,9 +12,9 @@
  * connection (protocol 7 `intercom` request; frames arrive as `intercom`
  * events; the daemon pushes `intercom_reset` when its bridge restarts).
  *
- * Bridge unavailability: `disabled` (PI_FAMULUS_NO_INTERCOM, Windows) stays
- * completely silent — no prompt section, tools answer with an error result,
- * no notice. Any other reason notifies once and retries every 3s.
+ * Messaging is opt-in: disabled configuration or PI_FAMULUS_NO_INTERCOM
+ * registers nothing. Enabled sessions report bridge and relay failures once
+ * per error and probe for recovery every 3s.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -166,6 +166,8 @@ function formatSession(s: SessionRow): string {
 }
 
 export interface IntercomDeps {
+  /** Only literal true enables messaging registration. */
+  enabled?: boolean;
   /** The current session's manager client (null before session_start).
    * Unused when a transport is injected directly. */
   getClient?: () => ManagerClient | null;
@@ -179,9 +181,10 @@ export interface IntercomDeps {
 
 /**
  * Registers everything intercom: tools, commands, hooks, renderers.
- * Call once per famulus runtime with the binding's API (survives /reload).
+ * Call once per extension attachment with the host API; reload recreates it.
  */
 export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
+  if (deps.enabled !== true || process.env.PI_FAMULUS_NO_INTERCOM !== undefined) return;
   const transport = deps.transport ?? createManagerTransport(deps.getClient ?? (() => null));
   const now = deps.now ?? Date.now;
   const extensionDirs = deps.extensionDirs ?? [
