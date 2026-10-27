@@ -2615,29 +2615,29 @@ mod listen_webhook_tests {
 
     #[tokio::test]
     async fn webhook_client_errors_and_ignored_are_final_without_retry() {
-        // Keep the one-time trust store load out of the timed window.
-        let _ = super::tls::native_roots();
+        // No wall-clock bound: the peer answers once and closes, so a retry
+        // (after a >=1s backoff) would end in a connect error, not `expected`.
         for (status, body, expected) in [
             (400, "{}", "HTTP 400"),
             (200, "{\"status\":\"ignored\"}", "ignored"),
         ] {
             let (url, mut posts, http) = http_peer(vec![(status, body)]).await;
-            let result = tokio::time::timeout(
-                Duration::from_millis(300),
-                post_webhook(
-                    &Config::default(),
-                    &url,
-                    "secret",
-                    "hmac",
-                    "hermes",
-                    "sender",
-                    "body",
-                    "fixed-id",
-                ),
+            let result = post_webhook(
+                &Config::default(),
+                &url,
+                "secret",
+                "hmac",
+                "hermes",
+                "sender",
+                "body",
+                "fixed-id",
             )
-            .await
-            .expect("final response scheduled a retry");
-            assert!(result.unwrap_err().contains(expected));
+            .await;
+            let error = result.unwrap_err();
+            assert!(
+                error.contains(expected),
+                "final response scheduled a retry: {error}"
+            );
             assert!(posts.recv().await.is_some());
             http.await.unwrap();
             assert!(posts.try_recv().is_err());
