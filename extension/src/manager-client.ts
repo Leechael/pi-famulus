@@ -177,6 +177,17 @@ export interface ManagerStatusResponse {
   sessions: SessionInfo[];
   generation?: number;
   last_upgrade?: LastUpgrade | null;
+  /** The messaging bridge's relay link; absent from older managers. */
+  messaging?: MessagingStatus;
+}
+
+export interface MessagingStatus {
+  /** `connected`, `disconnected`, `local_only`, or `unavailable` (bridge not running). */
+  state: string;
+  /** `messaging.name`, or the hostname when it is unset. */
+  name: string;
+  /** Why the bridge is not running. */
+  error?: string;
 }
 
 export interface SessionInfo {
@@ -639,6 +650,9 @@ export class ManagerClient {
       ...(typeof res.generation === "number" ? { generation: res.generation } : {}),
       ...(res.last_upgrade && typeof res.last_upgrade === "object"
         ? { last_upgrade: res.last_upgrade as LastUpgrade }
+        : {}),
+      ...(res.messaging && typeof res.messaging === "object"
+        ? { messaging: res.messaging as MessagingStatus }
         : {}),
     };
   }

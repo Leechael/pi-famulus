@@ -83,7 +83,7 @@ pi-famulus events -f
 | 4.4 | Tab | Switches active+recent ↔ all |
 | 4.5 | Enter on a shell | `1` output · `2` stderr · `3` info (status, exit, reason, times, paths); `f` toggles follow |
 | 4.6 | Resize the terminal to 60 and to 40 columns while open | Nothing wraps or overflows; pi does not exit with "Rendered line exceeds terminal width" |
-| 4.7 | `/famulus` → edit valid JSON, save, then reload from the menu | Extension, binary and manager information and the config path are visible; the JSON is written to that path and the extension reloads |
+| 4.7 | `/famulus` → open a settings section, change a value, then edit the whole file and reload from the overview | Extension, binary, manager and messaging status (relay state and device name) and the config path are visible; the changed key is written to that path with other keys kept; the JSON is written and the extension reloads |
 
 ## F5. Fleet line and pills
 
