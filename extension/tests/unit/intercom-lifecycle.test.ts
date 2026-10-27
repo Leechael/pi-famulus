@@ -101,6 +101,51 @@ it("preserves the environment disable override even with opt-in", () => {
   }
 });
 
+it("reports startup relay errors despite a healthy local messaging port", async () => {
+  const h = lifecycleHarness({ messaging: { state: "disconnected", name: "primary", error: "enrollment required: run pi-famulus messaging enroll" } });
+  await h.emit("session_start");
+  expect(h.notices().filter((m) => m.includes("enrollment required"))).toHaveLength(1);
+  expect(h.registrations).toHaveLength(1);
+  await h.emit("session_shutdown");
+});
+
+it("polls relay errors while locally registered, deduplicates, and resets on recovery", async () => {
+  const h = lifecycleHarness();
+  const setStatus = vi.fn();
+  h.ctx.ui.setStatus = setStatus;
+  await h.emit("session_start");
+  const tick = async () => { [...h.intervals][0].callback(); await flush(); };
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay certificate rejected" });
+  await tick();
+  await tick();
+  expect(h.notices().filter((m) => m.includes("relay certificate rejected"))).toHaveLength(1);
+  expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", expect.stringContaining("relay certificate rejected"));
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
+  await tick();
+  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(1);
+  h.setMessaging({ state: "connected", name: "primary" });
+  await tick();
+  expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", undefined);
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
+  await tick();
+  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(2);
+  expect(h.registrations).toHaveLength(1);
+  await h.emit("session_shutdown");
+});
+
+it("ignores a pending relay status response after shutdown", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  let respond!: (value: any) => void;
+  h.status.mockImplementationOnce(() => new Promise((resolve) => { respond = resolve; }));
+  [...h.intervals][0].callback();
+  await flush();
+  await h.emit("session_shutdown");
+  respond({ sessions: [], messaging: { state: "disconnected", name: "primary", error: "late relay error" } });
+  await flush();
+  expect(h.notices().some((m) => m.includes("late relay error"))).toBe(false);
+});
+
 // Regression: a dead extension instance must not be revived by queued hooks,
 // a previously queued retry tick, or a tool retaining its old closure.
 it("shutdown is terminal until an explicit session_start", async () => {
@@ -393,18 +438,18 @@ it("a cold start announces nothing while the first connect is in flight", async 
   await h.emit("session_shutdown", {});
 });
 
-it("a genuinely failed startup connect stays quiet and still retries", async () => {
+it("a genuinely failed startup connect reports once and still retries", async () => {
   const h = lifecycleHarness({ autoUp: false });
   h.fake.markConnectFailed();
   await h.emit("session_start");
-  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(0);
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
   h.fake.beginConnect();
   h.fake.setUp(true);
   const retry = [...h.intervals].at(-1)!;
   retry.callback();
   await flush();
   expect(h.fake.registrations.length).toBe(1);
-  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(0);
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
   await h.emit("session_shutdown", {});
 });
 

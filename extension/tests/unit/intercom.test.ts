@@ -473,7 +473,8 @@ describe("intercom behaviour", () => {
     h.fake.setUp(false);
     h.fake.markConnectFailed();
     await h.emit("session_start", {}, ctx);
-    expect(notices).toEqual([]);
+    expect(notices).toHaveLength(1);
+    expect(notices[0].message).toContain("connect failed");
     h.fake.setUp(true);
     await h.emit("turn_start", {}, ctx);
     expect(h.fake.registrations.length).toBe(1);

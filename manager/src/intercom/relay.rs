@@ -734,6 +734,8 @@ pub async fn run(rt: Shared) {
             if error.is_auth() {
                 wait = AUTH_RETRY_DELAY;
             }
+            let error = error.to_string();
+            rt.state.lock().unwrap().relay_error = error.clone();
             eprintln!("intercom relay: {error}");
         }
         tokio::select! {_=stop.changed()=>break,_=rt.clock.sleep("intercom-relay-reconnect",wait)=>{}}
@@ -1060,6 +1062,7 @@ async fn session(
                 state.relay_generation = state.relay_generation.wrapping_add(1);
                 state.relay_message_ids = welcome["send_message_id_v1"].as_bool() == Some(true);
                 state.relay_tx = Some(tx.clone());
+                state.relay_error.clear();
                 None
             } else {
                 Some(std::mem::take(&mut state.control_outbox))

@@ -688,7 +688,8 @@ pub struct MessagingStatus {
     /// `messaging.name`, or the hostname when it is unset.
     #[serde(default)]
     pub name: String,
-    /// Why the bridge is not running (`unavailable` only).
+    /// Latest relay failure (`disconnected`) or bridge startup failure.
+    /// Empty when connected, deliberately disabled, or explicitly local-only.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
 }

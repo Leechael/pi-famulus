@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { collectFamulusInfo, formatFamulusInfo, registerFamulusCommand } from "../../src/tui/famulus-command";
 import type { ManagerClient, MessagingStatus } from "../../src/manager-client";
+import { visibleWidth } from "../../src/tui/pi-tui-load";
 
 function client(connected: boolean, lastError = "", messaging?: MessagingStatus | Error): ManagerClient {
   return {
@@ -102,6 +103,7 @@ describe("/famulus status", () => {
 
   it.each([
     [{ state: "disabled", name: "" }, "Messaging: disabled"],
+    [{ state: "disconnected", name: "castle", error: "relay TLS certificate rejected" }, "Messaging: disconnected · name castle (relay TLS certificate rejected)"],
     [{ state: "disconnected", name: "castle" }, "Messaging: disconnected · name castle"],
     [{ state: "local_only", name: "castle" }, "Messaging: local-only · name castle"],
     [{ state: "unavailable", name: "", error: "disabled by PI_FAMULUS_NO_INTERCOM" }, "Messaging: unavailable (disabled by PI_FAMULUS_NO_INTERCOM)"],
@@ -184,6 +186,22 @@ describe("/famulus settings", () => {
       expect(shown).toContain(row);
     }
     expect(at("Messaging:")).toBeLessThan(at("Edit config.json"));
+  });
+
+  it("wraps the concrete relay HTTP error at narrow widths without treating body newlines as UI rows", async () => {
+    let lines: string[] = [];
+    await runInteractive(freshConfig(), (screen) => {
+      lines = screen.render(42);
+      press(screen, KEY.esc);
+    }, { messaging: {
+      state: "disconnected", name: "a-device-name-long-enough-to-fill-the-summary",
+      error: 'relay websocket connection failed:\nHTTP 401\r\n{"error":"device credential required"}',
+    } });
+    const shown = lines.join("\n");
+    expect(shown).toContain("Messaging error:");
+    expect(shown).toContain("HTTP 401");
+    expect(shown.replace(/\s+/g, " ")).toContain('"device credential required"');
+    expect(lines.every((line) => visibleWidth(line) <= 42)).toBe(true);
   });
 
   it("edits one number in place, keeping other keys, and says how it applies", async () => {

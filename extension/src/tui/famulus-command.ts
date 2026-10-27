@@ -3,10 +3,11 @@
  * whether messaging reaches its relay, and the settings pages.
  */
 import { execFile } from "node:child_process";
+import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient, MessagingStatus } from "../manager-client";
 import { SETTINGS_SECTIONS, listTheme, readConfigText, sectionPage, writeConfigText } from "./famulus-settings";
-import { loadPiTui, truncateToWidth } from "./pi-tui-load";
+import { loadPiTui, truncateToWidth, wrapTextWithAnsi } from "./pi-tui-load";
 
 export interface FamulusCommandDeps {
   extensionVersion: string;
@@ -40,12 +41,17 @@ const RELAY_STATES: Record<string, string> = {
   local_only: "local-only",
 };
 
+function singleLine(text: string): string {
+  return stripVTControlCharacters(text).replace(/\s+/g, " ").trim();
+}
+
 export function formatMessaging(info: FamulusInfo): string {
   const m = info.messaging;
   if (!m) return info.daemon ? "not reported by this manager" : "unknown (manager not connected)";
-  const state = RELAY_STATES[m.state];
-  if (!state) return `unavailable${m.error ? ` (${m.error})` : ""}`;
-  return m.name ? `${state} · name ${m.name}` : state;
+  const state = RELAY_STATES[m.state] ?? "unavailable";
+  const label = m.name && RELAY_STATES[m.state] ? `${state} · name ${singleLine(m.name)}` : state;
+  const error = singleLine(m.error ?? "");
+  return `${label}${error ? ` (${error})` : ""}`;
 }
 
 export function formatFamulusInfo(info: FamulusInfo): string {
@@ -154,11 +160,17 @@ function showOverview(ctx: ExtensionCommandContext, info: FamulusInfo, configPat
     );
     return {
       render(width: number) {
-        const status = formatFamulusInfo(info).split("\n");
+        const status = formatFamulusInfo({
+          ...info,
+          messaging: info.messaging ? { ...info.messaging, error: "" } : null,
+        }).split("\n");
         const lines = [theme.fg("accent", status[0]), ...status.slice(1).map((line) => {
           const at = line.indexOf(": ");
           return `  ${theme.fg("dim", line.slice(0, at + 1).padEnd(12))}${line.slice(at + 2)}`;
-        }), "", ...list.render(width)];
+        })];
+        const error = singleLine(info.messaging?.error ?? "");
+        if (error) lines.push(...wrapTextWithAnsi(theme.fg("error", `Messaging error: ${error}`), width));
+        lines.push("", ...list.render(width));
         if (notice) lines.push("", notice);
         return lines.map((line) => truncateToWidth(line, width));
       },

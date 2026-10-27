@@ -3734,11 +3734,14 @@ fn messaging_status(state: &Shared) -> MessagingStatus {
     };
     let runtime = rt_slot.lock().unwrap().clone();
     match runtime {
-        Some(rt) => MessagingStatus {
-            state: rt.relay_state().into(),
-            name: rt.cfg.display_name(),
-            error: String::new(),
-        },
+        Some(rt) => {
+            let (state, error) = rt.relay_status();
+            MessagingStatus {
+                state: state.into(),
+                name: rt.cfg.display_name(),
+                error,
+            }
+        }
         None => {
             let error = error_slot.lock().unwrap().clone().unwrap_or_default();
             let disabled = error.starts_with("disabled by");
