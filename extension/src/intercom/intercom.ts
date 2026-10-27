@@ -21,8 +21,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
+import { stripVTControlCharacters } from "node:util";
 import path from "node:path";
-import { ManagerClient } from "../manager-client";
+import { ManagerClient, type MessagingStatus } from "../manager-client";
 import type { IntercomFrame, SessionRow } from "./types";
 import { createManagerTransport, IntercomError, type IntercomTransport } from "./transport";
 import { ChatCard, ChatText, formatTimestamp } from "./widgets";
@@ -207,7 +208,9 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   let lastCtx: ExtensionContext | undefined;
   let retryTimer: ReturnType<typeof setInterval> | undefined;
   let manualCompactionRefresh: ReturnType<typeof setTimeout> | undefined;
-  let lastMessagingError: string | undefined;
+  let lastMessagingFooter: string | undefined;
+  /** The current outage already produced its notice; later texts only update the footer. */
+  let outageNotified = false;
   /** A relay outage was reported, so the next healthy status is a recovery. */
   let relayOutage = false;
   let statusCheckEpoch: number | undefined;
@@ -280,11 +283,32 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     }
   };
 
-  function updateMessagingError(message?: string, level: "warning" | "error" = "error") {
-    if (message === lastMessagingError) return;
-    lastMessagingError = message;
-    lastCtx?.ui.setStatus?.("famulus-messaging", message);
-    if (message) notify(message, level);
+  /** Notify once per outage; `footer` (default: the message) is the live status line. */
+  function updateMessagingError(message?: string, level: "warning" | "error" = "error", footer = message) {
+    if (footer !== lastMessagingFooter) {
+      lastMessagingFooter = footer;
+      lastCtx?.ui.setStatus?.("famulus-messaging", footer);
+    }
+    if (!message) {
+      outageNotified = false;
+      return;
+    }
+    if (outageNotified) return;
+    outageNotified = true;
+    notify(message, level);
+  }
+
+  const FOOTER_ERROR_MAX = 60;
+
+  function messagingFooter(m: MessagingStatus): string {
+    let error = stripVTControlCharacters(m.error || "").replace(/\s+/g, " ").trim();
+    if (error.length > FOOTER_ERROR_MAX) error = `${error.slice(0, FOOTER_ERROR_MAX - 1)}…`;
+    const retry = m.state === "disconnected" && typeof m.retry_at_ms === "number"
+      ? Math.ceil((m.retry_at_ms - Date.now()) / 1000)
+      : undefined;
+    const label = retry === undefined ? m.state : "reconnecting";
+    const when = retry === undefined ? "" : retry > 0 ? ` · retry in ${retry}s` : " · retrying";
+    return `msg: ${label}${when}${error ? ` · ${error}` : ""}`;
   }
 
   async function checkMessagingStatus() {
@@ -300,7 +324,11 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
         updateMessagingError();
       } else if (messaging.error || messaging.state === "disconnected" || messaging.state === "unavailable") {
         relayOutage = true;
-        updateMessagingError(`pi-famulus messaging ${messaging.state}: ${messaging.error || "relay not connected"}`);
+        updateMessagingError(
+          `pi-famulus messaging ${messaging.state}: ${messaging.error || "relay not connected"}`,
+          "error",
+          messagingFooter(messaging),
+        );
       } else {
         updateMessagingError();
         // The outage notice was the only signal; say when it is over.

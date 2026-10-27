@@ -111,7 +111,7 @@ A non-loopback `mcpListen` requires `mcpAllowNonLoopback: true` and a non-empty 
 
 Hosted servers exchange an operator-issued enrollment token for a per-device credential. A legacy shared token such as the old `dev-token` example is not a device credential.
 
-In `/famulus`, open **Messaging**, set **server**, then open **token** and enter the enrollment token. Pressing Enter immediately exchanges it for a device credential; the menu reports success or the server's error. The submitted token is not stored in `config.json`, and a successful exchange removes any old `messaging.token` value. Enrollment works while messaging is disabled and does not enable it.
+In `/famulus`, open **Messaging**, set **server**, then open **token** and enter the enrollment token. Pressing Enter immediately exchanges it for a device credential; the menu reports success or the server's error. The submitted token is not stored in `config.json`, and a successful exchange removes any old `messaging.token` value. Enrollment works while messaging is disabled and does not enable it. Because the token is not kept, the **token** row shows `enrolled · device <first 8 characters of the device id>` once the device is enrolled and `not enrolled` otherwise; entering a token on an enrolled device re-enrolls it.
 
 The CLI remains available for non-interactive registration:
 
@@ -124,7 +124,7 @@ Both paths use the same enrollment implementation. It sends `device_id`, `name` 
 
 For normal use, set `messaging.enabled` to `true` and `messaging.server` to the same server. Leave `messaging.token` empty; the bridge authenticates `/v1/relay` with the saved device credential. A credential saved for a different server is never used. Set `localOnly: true` explicitly if only same-machine messaging is wanted.
 
-`/famulus` distinguishes disabled messaging from connection failures and shows the latest relay error, including HTTP authentication failures. The plugin also reports failures without disabling shell, task or subagent features. Successful reconnection clears the previous connection error.
+`/famulus` distinguishes disabled messaging from connection failures and shows the latest relay error, including HTTP authentication failures. The plugin also reports failures without disabling shell, task or subagent features. Successful reconnection clears the previous connection error. While the relay is `disconnected` or `unavailable`, `/famulus` offers **Reconnect messaging now** (needs a current manager daemon), and the summary line shows a retry countdown. The pi footer shows one short line such as `msg: reconnecting · retry in 12s · <error>`, and a failure produces one notice per outage plus one when it is over, however the error text changes.
 
 ## Environment variables
 

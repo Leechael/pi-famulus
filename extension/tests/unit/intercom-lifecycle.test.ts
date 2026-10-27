@@ -122,14 +122,66 @@ it("polls relay errors while locally registered, deduplicates, and resets on rec
   expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", expect.stringContaining("relay certificate rejected"));
   h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
   await tick();
-  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(1);
+  // Same outage: the new text reaches the footer but does not notify again.
+  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(0);
+  expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", expect.stringContaining("relay authentication failed"));
   h.setMessaging({ state: "connected", name: "primary" });
   await tick();
   expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", undefined);
   h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
   await tick();
-  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(2);
+  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(1);
   expect(h.registrations).toHaveLength(1);
+  await h.emit("session_shutdown");
+});
+
+it("notifies once per outage however the error text changes, and again for the next outage", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  const tick = async () => { [...h.intervals][0].callback(); await flush(); };
+  const outage = () => h.notices().filter((m) => m.includes("messaging disconnected") || m.includes("messaging unavailable"));
+  for (const error of ["os error 104", "dial timeout", "connection refused"]) {
+    h.setMessaging({ state: "disconnected", name: "primary", error });
+    await tick();
+  }
+  h.setMessaging({ state: "unavailable", name: "primary", error: "bridge down" });
+  await tick();
+  expect(outage()).toHaveLength(1);
+  h.setMessaging({ state: "connected", name: "primary" });
+  await tick();
+  h.setMessaging({ state: "disconnected", name: "primary", error: "os error 104" });
+  await tick();
+  expect(outage()).toHaveLength(2);
+  // Disabled is not an outage, and ends the previous one.
+  h.setMessaging({ state: "disabled", name: "" });
+  await tick();
+  h.setMessaging({ state: "disconnected", name: "primary", error: "os error 104" });
+  await tick();
+  expect(outage()).toHaveLength(3);
+  await h.emit("session_shutdown");
+});
+
+it("keeps the footer short and current: state, retry countdown, one-line error", async () => {
+  const h = lifecycleHarness();
+  const setStatus = vi.fn();
+  h.ctx.ui.setStatus = setStatus;
+  vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+  await h.emit("session_start");
+  const tick = async () => { [...h.intervals][0].callback(); await flush(); };
+  const footer = () => setStatus.mock.lastCall![1];
+  h.setMessaging({ state: "disconnected", name: "primary", error: "IO error:\n\x1b[31mConnection reset\x1b[0m by peer", retry_at_ms: 1_012_000 });
+  await tick();
+  expect(footer()).toBe("msg: reconnecting · retry in 12s · IO error: Connection reset by peer");
+  vi.mocked(Date.now).mockReturnValue(1_009_500);
+  await tick();
+  expect(footer()).toBe("msg: reconnecting · retry in 3s · IO error: Connection reset by peer");
+  h.setMessaging({ state: "disconnected", name: "primary", error: "x".repeat(300) });
+  await tick();
+  expect(footer()).toMatch(/^msg: disconnected · x{20,}…$/);
+  expect(footer().length).toBeLessThan(100);
+  h.setMessaging({ state: "connected", name: "primary" });
+  await tick();
+  expect(footer()).toBeUndefined();
   await h.emit("session_shutdown");
 });
 
