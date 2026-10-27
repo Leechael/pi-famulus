@@ -133,6 +133,33 @@ it("polls relay errors while locally registered, deduplicates, and resets on rec
   await h.emit("session_shutdown");
 });
 
+it("announces recovery once after a reported relay outage, and only then", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  const tick = async () => { [...h.intervals][0].callback(); await flush(); };
+  const reconnected = () => h.notices().filter((m) => m.includes("messaging reconnected"));
+  await tick();
+  expect(reconnected()).toHaveLength(0);
+  h.setMessaging({ state: "disconnected", name: "primary", error: "IO error: Connection reset by peer (os error 104)" });
+  await tick();
+  h.setMessaging({ state: "connected", name: "primary" });
+  await tick();
+  await tick();
+  expect(reconnected()).toEqual(["pi-famulus messaging reconnected"]);
+  // Disabling during an outage ends it: turning messaging back on is not a recovery.
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay disconnected" });
+  await tick();
+  h.setMessaging({ state: "disabled", name: "" });
+  await tick();
+  h.setMessaging({ state: "connected", name: "primary" });
+  await tick();
+  expect(reconnected()).toHaveLength(1);
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay disconnected" });
+  await tick();
+  await h.emit("session_shutdown");
+  expect(reconnected()).toHaveLength(1);
+});
+
 it("ignores a pending relay status response after shutdown", async () => {
   const h = lifecycleHarness();
   await h.emit("session_start");

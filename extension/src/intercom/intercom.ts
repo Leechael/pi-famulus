@@ -208,6 +208,8 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   let retryTimer: ReturnType<typeof setInterval> | undefined;
   let manualCompactionRefresh: ReturnType<typeof setTimeout> | undefined;
   let lastMessagingError: string | undefined;
+  /** A relay outage was reported, so the next healthy status is a recovery. */
+  let relayOutage = false;
   let statusCheckEpoch: number | undefined;
   let legacyPluginNotified = false;
   let autocompleteBound = false;
@@ -294,11 +296,16 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
       const { messaging } = await client.status();
       if (stopped || epoch !== expectedEpoch || !lastCtx || !useContext(lastCtx)) return;
       if (!messaging || messaging.state === "disabled") {
+        relayOutage = false;
         updateMessagingError();
       } else if (messaging.error || messaging.state === "disconnected" || messaging.state === "unavailable") {
+        relayOutage = true;
         updateMessagingError(`pi-famulus messaging ${messaging.state}: ${messaging.error || "relay not connected"}`);
       } else {
         updateMessagingError();
+        // The outage notice was the only signal; say when it is over.
+        if (relayOutage) notify("pi-famulus messaging reconnected", "info");
+        relayOutage = false;
       }
     } catch (error) {
       if (!stopped && epoch === expectedEpoch && lastCtx && useContext(lastCtx)) {
@@ -735,6 +742,7 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     readiness = undefined;
     started = false;
     listCache = undefined;
+    relayOutage = false;
     updateMessagingError();
     lastCtx = undefined;
     stopPromise = (async () => {
