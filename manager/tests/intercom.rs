@@ -252,6 +252,8 @@ impl Fixture {
                                 | std::io::ErrorKind::UnexpectedEof
                                 | std::io::ErrorKind::WouldBlock
                                 | std::io::ErrorKind::TimedOut
+                                // macOS: setsockopt on a socket the peer already closed.
+                                | std::io::ErrorKind::InvalidInput
                         ) => {}
                     Err(error) => panic!("bridge readiness RPC failed: {error}"),
                 }

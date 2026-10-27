@@ -130,6 +130,9 @@ fn daemon_whose_spawner_pipes_are_gone_keeps_relaying_and_logs_to_manager_log() 
 fn contention_line_still_reaches_the_spawners_pipe() {
     let home = Home::new_real("contention");
     let _first = home.start_daemon();
+    // A daemon with no connections exits after 5s; on a loaded runner the
+    // second spawn can land after that and become the daemon itself.
+    let _keepalive = status_conn(&home);
     let mut second = command(&home);
     second.env("PI_FAMULUS_NO_INTERCOM", "1");
     let output = second
