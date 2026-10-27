@@ -1,5 +1,42 @@
 use super::*;
 
+#[test]
+fn hosted_relay_uses_only_a_same_server_saved_credential_over_the_bootstrap_token() {
+    for same_server in [true, false] {
+        let relay = WireRelay::with_transport(|_| vec![], false, true);
+        let mut fixture = stable_fixture();
+        let state = fixture.root.join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = state.join("device.json");
+        fs::write(&identity, serde_json::to_vec(&json!({
+            "device_id":uuid::Uuid::new_v4().to_string(),
+            "tenant_id":"fixture-tenant",
+            "credential":"saved-device-credential",
+            "server":if same_server { relay.url() } else { "http://other-server.invalid".into() },
+        })).unwrap()).unwrap();
+        fs::set_permissions(identity, fs::Permissions::from_mode(0o600)).unwrap();
+        start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
+        let request = relay.request("_fixture_upgrade_attempt");
+        let raw = request["request"].as_str().unwrap().to_ascii_lowercase();
+        let credential = if same_server {
+            "saved-device-credential"
+        } else {
+            "fixture-token"
+        };
+        assert!(
+            raw.contains(&format!("authorization: bearer {credential}")),
+            "{raw}"
+        );
+        let unexpected = if same_server {
+            "fixture-token"
+        } else {
+            "saved-device-credential"
+        };
+        assert!(!raw.contains(unexpected), "{raw}");
+    }
+}
+
 #[cfg(feature = "test-clock")]
 fn start_manual_transport(fixture: &mut Fixture, relay: &WireRelay) {
     start_relay_options_env(
@@ -587,6 +624,7 @@ fn enroll_and_device_persist_credentials_without_printing_secrets() {
     assert!(!printed.contains("one-time-enrollment-secret"));
     let request = endpoint.request();
     assert_eq!(request.body["token"], "one-time-enrollment-secret");
+    assert_eq!(request.body["name"], "fixture-host");
     assert!(request.body["client_version"].is_string());
     let saved: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("state/device.json")).unwrap()).unwrap();

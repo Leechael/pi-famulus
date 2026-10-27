@@ -339,25 +339,22 @@ impl Runtime {
         self.native.stop_accepting();
     }
 }
-/// Credential selection for daemon start, mirroring the one-shot and listen
-/// paths: an explicitly configured token always wins; the saved identity
-/// credential is adopted only when no token is configured and it belongs to
-/// the same normalized server. Anything else must enroll for the selected
-/// server or pass a token, so a credential enrolled for another server never
-/// leaks into (or overrides) an explicit selection.
+/// Prefer an enrolled credential over a bootstrap token, but only for the
+/// same server. Never send another server's saved credential.
 pub(crate) fn adopt_identity_credential(
     cfg: &mut Config,
     identity: &Identity,
 ) -> Result<(), String> {
-    if !cfg.token.is_empty() || cfg.local_only {
+    if cfg.local_only {
         return Ok(());
     }
-    if identity.credential.is_empty()
-        || identity.server.trim_end_matches('/') != cfg.server.trim_end_matches('/')
+    if !identity.credential.is_empty()
+        && identity.server.trim_end_matches('/') == cfg.server.trim_end_matches('/')
     {
-        return Err("enroll this device for the selected server or pass a relay token".into());
+        cfg.token = identity.credential.clone();
+    } else if cfg.token.is_empty() {
+        return Err("enroll this device for the selected server with pi-famulus intercom enroll --server <server> --token <enrollment-token>, or pass a device credential".into());
     }
-    cfg.token = identity.credential.clone();
     Ok(())
 }
 pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, String> {
@@ -368,7 +365,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
     }
     if !c.local_only && c.token.is_empty() && !c.state_dir.join("device.json").exists() {
         return Err(
-            "enroll this device or pass a device credential; use --local-only for local messages"
+            "run pi-famulus intercom enroll --server <server> --token <enrollment-token>, or pass a device credential; use --local-only for local messages"
                 .into(),
         );
     }
@@ -1242,6 +1239,18 @@ mod tests {
             server: server.into(),
             ..Identity::default()
         }
+    }
+
+    #[test]
+    fn hosted_runtime_prefers_same_server_saved_credential_over_bootstrap_token() {
+        let mut cfg = Config {
+            server: "http://relay.invalid".into(),
+            token: "bootstrap-token".into(),
+            ..Config::default()
+        };
+        let saved = saved_identity("enrolled-credential", "http://relay.invalid/");
+        adopt_identity_credential(&mut cfg, &saved).unwrap();
+        assert_eq!(cfg.token, "enrolled-credential");
     }
 
     #[test]
