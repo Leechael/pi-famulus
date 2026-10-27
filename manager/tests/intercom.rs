@@ -1113,6 +1113,44 @@ fn shutdown_notifies_a_task_hosted_idle_watcher_before_terminating_it() {
 }
 
 #[test]
+fn manager_status_reports_the_relay_link_and_device_name() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut manager = common::Conn::new(
+        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
+    );
+    manager.hello_ext("status-session");
+    let status = manager.request_ok(json!({"type":"status"}));
+    assert_eq!(
+        status["messaging"],
+        json!({"state":"local_only","name":"fixture-host"}),
+        "{status}"
+    );
+}
+
+#[test]
+fn manager_status_reports_a_bridge_that_did_not_start() {
+    let mut fixture = Fixture::new();
+    fs::write(fixture.root.join("client.toml"), "local_only = [broken\n").unwrap();
+    fixture.spawn_serve(&[], &[]);
+    let deadline = Instant::now() + TIMEOUT;
+    while !fixture.log().contains("intercom unavailable") {
+        assert!(Instant::now() < deadline, "{}", fixture.log());
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut manager = common::Conn::new(
+        UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
+    );
+    manager.hello_ext("status-session");
+    let messaging = manager.request_ok(json!({"type":"status"}))["messaging"].clone();
+    assert_eq!(messaging["state"], "unavailable", "{messaging}");
+    assert!(
+        messaging["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{messaging}"
+    );
+}
+
+#[test]
 fn intercom_and_famulus_tasks_share_foreground_manager_pid_and_shutdown() {
     let mut fixture = Fixture::new();
     fixture.start();
