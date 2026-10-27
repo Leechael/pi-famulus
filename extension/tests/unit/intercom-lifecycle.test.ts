@@ -9,6 +9,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerIntercom } from "../../src/intercom/intercom";
+import type { MessagingStatus } from "../../src/manager-client";
 import {
   createFakeCtx,
   createFakeManager,
@@ -23,7 +24,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function lifecycleHarness(options: { autoUp?: boolean } = {}) {
+function lifecycleHarness(options: { autoUp?: boolean; messaging?: MessagingStatus } = {}) {
   const { autoUp = true } = options;
   const { dir, cleanup } = makeTempDir("fam-ic-life-");
   cleanups.push(cleanup);
@@ -44,8 +45,11 @@ function lifecycleHarness(options: { autoUp?: boolean } = {}) {
   const fake = createFakeManager({ sessionId: state.sessionId });
   if (!autoUp) fake.setUp(false);
   const registrations = fake.registrations;
+  let messaging: MessagingStatus = options.messaging ?? { state: "connected", name: "primary" };
+  const status = vi.fn(async () => ({ sessions: [], messaging }));
   registerIntercom(pi.pi as any, {
-    getClient: () => fake.getClient(),
+    enabled: true,
+    getClient: () => Object.assign(fake.getClient()!, { status }),
     extensionDirs: ["/nonexistent-extensions"],
   });
   const emit = (name: string, event: any = {}, context: any = ctx) => pi.handlers.get(name)?.(event, context);
@@ -67,9 +71,80 @@ function lifecycleHarness(options: { autoUp?: boolean } = {}) {
     emit: (name: string, event: any = {}, context: any = ctxWithNotify) =>
       pi.handlers.get(name)?.(event, context),
     notices: () => [...notices],
+    status,
+    setMessaging: (value: MessagingStatus) => { messaging = value; },
     afterShutdown,
   };
 }
+
+it.each([undefined, false])("does not register any messaging surface without opt-in (%s)", (enabled) => {
+  const pi = createFakePi();
+  const getClient = vi.fn(() => null);
+  registerIntercom(pi.pi as any, { enabled, getClient });
+  expect(pi.tools.size).toBe(0);
+  expect(pi.commands.size).toBe(0);
+  expect(pi.handlers.size).toBe(0);
+  expect(pi.messageRenderers.size).toBe(0);
+  expect(getClient).not.toHaveBeenCalled();
+});
+
+it("preserves the environment disable override even with opt-in", () => {
+  vi.stubEnv("PI_FAMULUS_NO_INTERCOM", "1");
+  try {
+    const pi = createFakePi();
+    registerIntercom(pi.pi as any, { enabled: true });
+    expect(pi.tools.size).toBe(0);
+    expect(pi.commands.size).toBe(0);
+    expect(pi.handlers.size).toBe(0);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+it("reports startup relay errors despite a healthy local messaging port", async () => {
+  const h = lifecycleHarness({ messaging: { state: "disconnected", name: "primary", error: "enrollment required: run pi-famulus messaging enroll" } });
+  await h.emit("session_start");
+  expect(h.notices().filter((m) => m.includes("enrollment required"))).toHaveLength(1);
+  expect(h.registrations).toHaveLength(1);
+  await h.emit("session_shutdown");
+});
+
+it("polls relay errors while locally registered, deduplicates, and resets on recovery", async () => {
+  const h = lifecycleHarness();
+  const setStatus = vi.fn();
+  h.ctx.ui.setStatus = setStatus;
+  await h.emit("session_start");
+  const tick = async () => { [...h.intervals][0].callback(); await flush(); };
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay certificate rejected" });
+  await tick();
+  await tick();
+  expect(h.notices().filter((m) => m.includes("relay certificate rejected"))).toHaveLength(1);
+  expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", expect.stringContaining("relay certificate rejected"));
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
+  await tick();
+  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(1);
+  h.setMessaging({ state: "connected", name: "primary" });
+  await tick();
+  expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", undefined);
+  h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
+  await tick();
+  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(2);
+  expect(h.registrations).toHaveLength(1);
+  await h.emit("session_shutdown");
+});
+
+it("ignores a pending relay status response after shutdown", async () => {
+  const h = lifecycleHarness();
+  await h.emit("session_start");
+  let respond!: (value: any) => void;
+  h.status.mockImplementationOnce(() => new Promise((resolve) => { respond = resolve; }));
+  [...h.intervals][0].callback();
+  await flush();
+  await h.emit("session_shutdown");
+  respond({ sessions: [], messaging: { state: "disconnected", name: "primary", error: "late relay error" } });
+  await flush();
+  expect(h.notices().some((m) => m.includes("late relay error"))).toBe(false);
+});
 
 // Regression: a dead extension instance must not be revived by queued hooks,
 // a previously queued retry tick, or a tool retaining its old closure.
@@ -363,18 +438,18 @@ it("a cold start announces nothing while the first connect is in flight", async 
   await h.emit("session_shutdown", {});
 });
 
-it("a genuinely failed startup connect stays quiet and still retries", async () => {
+it("a genuinely failed startup connect reports once and still retries", async () => {
   const h = lifecycleHarness({ autoUp: false });
   h.fake.markConnectFailed();
   await h.emit("session_start");
-  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(0);
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
   h.fake.beginConnect();
   h.fake.setUp(true);
   const retry = [...h.intervals].at(-1)!;
   retry.callback();
   await flush();
   expect(h.fake.registrations.length).toBe(1);
-  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(0);
+  expect(h.notices().filter((m) => /messaging bridge unavailable/.test(m)).length).toBe(1);
   await h.emit("session_shutdown", {});
 });
 

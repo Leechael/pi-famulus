@@ -96,10 +96,11 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     label: "Messaging",
     applies: RESTART,
     specs: [
+      { path: ["messaging", "enabled"], kind: "bool", default: "false", description: "Opt in to cross-session messaging tools, commands, and connections.", applies: "reload the extension and restart the manager daemon to apply" },
       { path: ["messaging", "name"], kind: "text", default: hostname(), description: "Device name shown to peers; the hostname when unset." },
       { path: ["messaging", "server"], kind: "text", default: "https://127.0.0.1:8443", description: "Relay server URL." },
-      { path: ["messaging", "token"], kind: "secret", default: "not set", description: "Relay or enrollment token." },
-      { path: ["messaging", "localOnly"], kind: "bool", default: "false", description: "Only local sessions, no relay. On automatically without a token or device identity." },
+      { path: ["messaging", "token"], kind: "secret", default: "not set", description: "Relay credential; hosted servers require a device credential. Saved credentials for the same server take precedence. Enrollment tokens are only for messaging enroll." },
+      { path: ["messaging", "localOnly"], kind: "bool", default: "false", description: "Only local sessions, no relay. Enable explicitly for local-only messaging." },
       { path: ["messaging", "remoteMessages"], kind: "enum", values: ["allow", "refuse"], default: "allow", description: "Whether messages from other machines are accepted." },
       { path: ["messaging", "tlsInsecure"], kind: "bool", default: "false", description: "Skip relay TLS certificate verification." },
       { path: ["messaging", "mcpListen"], kind: "text", default: "off", description: "MCP listener address; empty disables it." },

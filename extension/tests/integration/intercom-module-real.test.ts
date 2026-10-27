@@ -9,11 +9,14 @@
  *   PI_FAMULUS_INTEG=1 npx vitest run tests/integration/intercom-real-manager.test.ts
  */
 import { connect as connectStream } from "node:net";
+import { createServer } from "node:http";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { registerIntercom } from "../../src/intercom/intercom";
+import { collectFamulusInfo, formatFamulusInfo } from "../../src/tui/famulus-command";
 import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
 
 const RUN = process.env.PI_FAMULUS_INTEG === "1";
@@ -27,15 +30,16 @@ if (RUN && !existsSync(BIN)) {
 const root = mkdtempSync(join(tmpdir(), "pi-famulus-intercom-integ-"));
 const home = join(root, "manager");
 const bridgeSock = join(root, "bridge", "client.sock");
-mkdirSync(join(root, "bridge"), { recursive: true });
-mkdirSync(join(root, "state"), { recursive: true });
-mkdirSync(home, { recursive: true });
+mkdirSync(join(root, "bridge"), { recursive: true, mode: 0o700 });
+mkdirSync(join(root, "state"), { recursive: true, mode: 0o700 });
+mkdirSync(home, { recursive: true, mode: 0o700 });
 const configPath = join(home, "config.json");
 const writeConfig = (name = "intercom-integ-host") =>
   writeFileSync(
     configPath,
     JSON.stringify({
       messaging: {
+        enabled: true,
         localOnly: true,
         name,
         sock: bridgeSock,
@@ -101,6 +105,7 @@ describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
   const emit = (name: string, event: any = {}, ctx: any = ctxAlice.ctx) => handlers.get(name)?.(event, ctx);
 
   afterAll(async () => {
+    await emit("session_shutdown");
     await alice?.close();
     await bob?.close();
     try {
@@ -113,7 +118,7 @@ describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
   it("registers, delivers, reports receipts, resets, reconnects, and switches sessions", { timeout: 180_000 }, async () => {
     alice = new ManagerClient({ home, sessionId: "alice-session", managerPath: BIN });
     current = alice;
-    registerIntercom(pi as any, { getClient: () => current });
+    registerIntercom(pi as any, { enabled: true, getClient: () => current });
     await alice.connect();
     bob = new ManagerClient({ home, sessionId: "bob-session", managerPath: BIN });
     await bob.connect();
@@ -230,5 +235,57 @@ describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
       return rows.some((row) => row.id === "pi/next-session");
     }, "the new session's registration");
     await alice2.close();
+  });
+
+  it("shows a real relay HTTP 401 body while the local bridge remains healthy", { timeout: 30_000 }, async () => {
+    const body = "fixture relay requires a device credential";
+    const relay = createServer((_request, response) => {
+      response.writeHead(401, { "Content-Length": Buffer.byteLength(body) });
+      response.end(body);
+    });
+    relay.on("upgrade", (_request, socket) => {
+      socket.end(`HTTP/1.1 401 Unauthorized\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    });
+    await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+    const address = relay.address() as { port: number };
+    const relayHome = join(root, "relay-manager");
+    mkdirSync(relayHome, { mode: 0o700 });
+    writeFileSync(join(relayHome, "config.json"), JSON.stringify({ messaging: {
+      enabled: true,
+      localOnly: false,
+      server: `http://127.0.0.1:${address.port}`,
+      token: "invalid-device-credential",
+      sock: join(relayHome, "client.sock"),
+      stateDir: join(relayHome, "state"),
+    } }));
+    const manager = new ManagerClient({ home: relayHome, sessionId: "relay-error-session", managerPath: BIN });
+    const handlers = new Map<string, (event: any, ctx: any) => any>();
+    const notices: string[] = [];
+    const { ctx } = makeCtx("relay-error-session", [], notices);
+    registerIntercom({ ...pi, on: (name: string, handler: any) => handlers.set(name, handler) } as any, {
+      enabled: true, getClient: () => manager,
+    });
+    try {
+      expect(await manager.connect()).toBe(true);
+      await handlers.get("session_start")!({}, ctx);
+      await waitFor(() => notices.some((message) => message.includes("401") && message.includes(body)), "the relay rejection notification");
+      expect(manager.isAvailable()).toBe(true);
+      const local = await manager.intercom({ op: "list" });
+      expect((local.sessions as any[]).some((session) => session.id === "pi/relay-error-session")).toBe(true);
+      const info = await collectFamulusInfo({
+        extensionVersion: "test", configPath: join(relayHome, "config.json"),
+        managerPath: null, describeSearch: () => "", getClient: () => manager, messagingEnabled: true,
+      });
+      expect(info.messaging?.state).toBe("disconnected");
+      expect(formatFamulusInfo(info)).toContain(body);
+      expect(formatFamulusInfo(info)).toContain("401");
+      await delay(3100);
+      expect(notices.filter((message) => message.includes("401") && message.includes(body))).toHaveLength(1);
+    } finally {
+      await handlers.get("session_shutdown")!({}, ctx);
+      await manager.close();
+      spawnSync(BIN, ["--home", relayHome, "shutdown"], { stdio: "ignore", timeout: 10_000 });
+      await new Promise<void>((resolve) => relay.close(() => resolve()));
+    }
   });
 });

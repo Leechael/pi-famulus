@@ -59,13 +59,14 @@ The retention keys take a duration such as `"30m"` or `"0s"` and are read when t
 
 ## Messaging bridge keys
 
-The messaging bridge reads only the `messaging` object in this same file. It has no alternate configuration file or environment overrides.
+The messaging bridge reads only the `messaging` object in this same file. It is disabled by default, including the plugin's messaging tools and hooks. Set `messaging.enabled` to `true` to opt in; a server or token alone does not enable it. `PI_FAMULUS_NO_INTERCOM` also disables it. See [hosted server enrollment](config.md#hosted-server-enrollment) for device registration and error reporting.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `enabled` | `false` | Enable the plugin messaging features and daemon bridge. Reload the extension and restart the daemon after changing it. |
 | `server` | `"https://127.0.0.1:8443"` | Relay server URL. |
-| `token` | `""` | Relay or enrollment token. |
-| `name` | `""` | Device name used during enrollment. |
+| `token` | `""` | Enrollment token for `intercom enroll`, or an explicit device credential. Normal connections prefer the saved credential for the same server. Hosted servers reject old shared tokens. |
+| `name` | `""` | Device name used during enrollment; the hostname when empty. |
 | `tlsInsecure` | `false` | Disable normal relay TLS certificate verification. |
 | `sock` | `$XDG_RUNTIME_DIR/pi-famulus/client.sock`, or `pi-famulus-<uid>/client.sock` under the temporary directory | Local bridge socket. |
 | `stateDir` | `"~/.pi/agent/pi-famulus/messaging"` | Device identity and bridge state directory. |
@@ -73,7 +74,7 @@ The messaging bridge reads only the `messaging` object in this same file. It has
 | `mcpToken` | `""` | MCP bearer token; empty generates a stable private token. |
 | `mcpAllowNonLoopback` | `false` | Permit a non-loopback MCP listener. Also requires a non-empty `mcpToken`. |
 | `remoteMessages` | `"allow"` | Remote message policy: `allow` or `refuse`. |
-| `localOnly` | `false` | Local sessions only; automatically enabled when unenrolled and no token exists. |
+| `localOnly` | `false` | Explicitly use local sessions only, without a relay. Requires `enabled: true`. |
 | `eventLogSize` | `4096` | Maximum retained bridge events. |
 | `endpoints` | `[]` | Webhook objects with required `name` and `url`, optional `secret` (default empty), and `auth` (default `"hmac"`). Secret-bearing webhooks require HTTPS or a loopback URL. |
 

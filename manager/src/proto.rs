@@ -682,13 +682,14 @@ pub struct StatusOk {
 /// Relay link of the messaging bridge, as `status` reports it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessagingStatus {
-    /// `connected`, `disconnected`, `local_only`, or `unavailable` while the
-    /// bridge itself is not running.
+    /// `disabled`, `connected`, `disconnected`, `local_only`, or `unavailable`
+    /// when an enabled bridge could not start.
     pub state: String,
     /// `messaging.name`, or the hostname when it is unset.
     #[serde(default)]
     pub name: String,
-    /// Why the bridge is not running (`unavailable` only).
+    /// Latest relay failure (`disconnected`) or bridge startup failure.
+    /// Empty when connected, deliberately disabled, or explicitly local-only.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
 }

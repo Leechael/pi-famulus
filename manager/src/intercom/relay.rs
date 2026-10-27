@@ -359,7 +359,11 @@ impl std::fmt::Display for TransportError {
             Self::Http { status, reason } => write!(f, "relay handshake HTTP {status}: {reason}"),
             Self::Remote { code, reason } => write!(f, "{code}: {reason}"),
             Self::Io(reason) | Self::TlsRecordHeader { reason, .. } => f.write_str(reason),
+        }?;
+        if self.is_auth() {
+            write!(f, "; run pi-famulus intercom enroll --server <server> --token <enrollment-token> to enroll or renew this device; the relay requires an enrolled device credential")?;
         }
+        Ok(())
     }
 }
 impl From<String> for TransportError {
@@ -730,6 +734,8 @@ pub async fn run(rt: Shared) {
             if error.is_auth() {
                 wait = AUTH_RETRY_DELAY;
             }
+            let error = error.to_string();
+            rt.state.lock().unwrap().relay_error = error.clone();
             eprintln!("intercom relay: {error}");
         }
         tokio::select! {_=stop.changed()=>break,_=rt.clock.sleep("intercom-relay-reconnect",wait)=>{}}
@@ -1056,6 +1062,7 @@ async fn session(
                 state.relay_generation = state.relay_generation.wrapping_add(1);
                 state.relay_message_ids = welcome["send_message_id_v1"].as_bool() == Some(true);
                 state.relay_tx = Some(tx.clone());
+                state.relay_error.clear();
                 None
             } else {
                 Some(std::mem::take(&mut state.control_outbox))
@@ -1204,8 +1211,13 @@ pub async fn enroll(c: &Config, new_identity: bool) -> Result<(), String> {
     } else {
         Identity::load(&c.state_dir)?
     };
-    let mut req=c.http()?.post(format!("{}/v1/enroll",c.server.trim_end_matches('/'))).json(&json!({"token":c.token,"device_id":id.device_id,"name":c.name,"client_version":crate::VERSION}));
-    if !id.credential.is_empty() {
+    let mut req = c
+        .http()?
+        .post(format!("{}/v1/enroll", c.server.trim_end_matches('/')))
+        .json(&json!({"token":c.token,"device_id":id.device_id,"name":c.display_name(),"client_version":crate::VERSION}));
+    if !id.credential.is_empty()
+        && id.server.trim_end_matches('/') == c.server.trim_end_matches('/')
+    {
         req = req.bearer_auth(&id.credential);
     }
     let r = req.send().await.map_err(|e| e.to_string())?;
@@ -1507,9 +1519,7 @@ pub async fn call_once(c: &Config, name: &str, mut frame: Value) -> Result<Value
     tokio::time::timeout(Duration::from_secs(20), async {
         let identity = Identity::load(&c.state_dir)?;
         let mut config = c.clone();
-        if config.token.is_empty() && identity.server.trim_end_matches('/') == config.server.trim_end_matches('/') {
-            config.token = identity.credential;
-        }
+        super::adopt_identity_credential(&mut config, &identity)?;
         let mut ws = Conn::connect(&config,crate::clock::Clock::default()).await.map_err(|error|error.to_string())?;
         let host = super::config::hostname();
         ws.register(json!({"type":"register","device_id":identity.device_id,"machine_id":format!("listen-{name}-{host}-{}-{}",std::process::id(),uuid::Uuid::new_v4()),"machine_name":name})).await.map_err(|error|error.to_string())?;
@@ -1547,14 +1557,7 @@ pub async fn listen(c: Config, name: String, url: String, secret: String) -> Res
     super::config::webhook_url_allowed(&url, &secret)?;
     let identity = Identity::load(&c.state_dir)?;
     let mut c = c;
-    if c.token.is_empty() {
-        if identity.credential.is_empty()
-            || identity.server.trim_end_matches('/') != c.server.trim_end_matches('/')
-        {
-            return Err("enroll this device for the selected server or pass a relay token".into());
-        }
-        c.token = identity.credential.clone();
-    }
+    super::adopt_identity_credential(&mut c, &identity)?;
     let endpoint = super::config::Endpoint {
         name: name.clone(),
         url,
@@ -2206,6 +2209,48 @@ mod listen_webhook_tests {
     }
 
     #[tokio::test]
+    async fn enroll_uses_hostname_and_never_sends_another_servers_saved_credential() {
+        for same_server in [true, false] {
+            let state = StateDir::new();
+            let (url, mut posts, http) = http_peer(vec![(401, "invalid enroll token")]).await;
+            Identity {
+                device_id: uuid::Uuid::new_v4().to_string(),
+                credential: "saved-device-secret".into(),
+                tenant_id: "tenant".into(),
+                server: if same_server {
+                    url.clone()
+                } else {
+                    "http://other-server.invalid".into()
+                },
+            }
+            .save(&state.0)
+            .unwrap();
+            let config = Config {
+                server: url,
+                token: "bootstrap".into(),
+                name: String::new(),
+                state_dir: state.0.clone(),
+                ..Config::default()
+            };
+            assert!(enroll(&config, false)
+                .await
+                .unwrap_err()
+                .contains("invalid enroll token"));
+            let (headers, raw) = posts.recv().await.unwrap();
+            assert_eq!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer saved-device-secret"),
+                same_server
+            );
+            let request: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(request["name"], super::super::config::hostname());
+            assert_eq!(request["token"], "bootstrap");
+            http.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn enroll_new_identity_preserves_the_old_device_identity_on_any_failure() {
         let state = StateDir::new();
         Identity {
@@ -2280,6 +2325,7 @@ mod listen_webhook_tests {
             let mut raw = vec![0; length];
             reader.read_exact(&mut raw).await.unwrap();
             let request: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(request["name"], super::super::config::hostname());
             let body = json!({"device_id":request["device_id"],"credential":"new-credential","tenant_id":"new-tenant"})
                 .to_string();
             reader

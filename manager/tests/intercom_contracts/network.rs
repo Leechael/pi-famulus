@@ -850,6 +850,112 @@ fn relay_queued_ack_is_success_and_early_read_receipt_keeps_exact_message_id() {
 }
 
 #[test]
+fn relay_hosted_endpoints_route_remotely_without_shadowing_local_webhooks() {
+    let relay = WireRelay::new(
+        |request| match request["type"].as_str().unwrap_or_default() {
+            "list" => vec![json!({"type":"list","id":request["id"],"sessions":[
+                {"id":"pi/remote","harness":"pi","machine_id":"other-device"},
+                {"id":"webhook/hosted","name":"hosted","harness":"webhook","status":"online"},
+                {"id":"webhook/local","name":"server duplicate","harness":"webhook","status":"online"}
+            ]})],
+            "send" => vec![
+                json!({"type":"send","id":request["id"],"message_id":request["message_id"],"status":"queued"}),
+                json!({"type":"receipt","session_id":request["reply_to"],"from":request["to"],"message_id":request["message_id"],"status":"read"}),
+            ],
+            _ => relay_basics(request),
+        },
+    );
+    let endpoint = HttpFixture::new(|_| (200, json!({"status":"queued"})));
+    let mut fixture = stable_fixture();
+    start_relay(
+        &mut fixture,
+        &relay,
+        &format!("endpoint=[{{name='local',url='{}'}}]\n", endpoint.url()),
+    );
+    let rows = fixture.sessions();
+    assert!(
+        rows.iter().any(|row| row["id"] == "webhook/hosted"),
+        "hosted endpoint missing from daemon directory: {rows:?}"
+    );
+    let local = rows
+        .iter()
+        .find(|row| row["id"] == "webhook/local")
+        .unwrap();
+    assert_eq!(
+        local["name"], "local",
+        "server endpoint shadowed local configuration"
+    );
+    let mut sender = fixture.plugin("sender", "busy");
+    let sent = sender.ok(json!({"op":"send","to":"hosted","body":"hosted body"}));
+    assert_eq!(sent["status"], "queued");
+    let request = relay.request("send");
+    assert_eq!(request["to"], "webhook/hosted");
+    assert_eq!(request["body"], "hosted body");
+    assert_eq!(request["reply_to"], "pi/sender");
+    assert_eq!(request["message_id"], sent["message_id"]);
+    let receipt = sender.event("receipt");
+    assert_eq!(receipt["message_id"], sent["message_id"]);
+    assert_eq!(receipt["from"], "webhook/hosted");
+    assert_eq!(receipt["status"], "read");
+    sender.ok(json!({"op":"send","to":"webhook/local","body":"local body"}));
+    assert_eq!(endpoint.request().body["message"]["body"], "local body");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let snapshot = relay.request("snapshot");
+        let rows = snapshot["sessions"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| !str_field_or_empty(row, "id").starts_with("webhook/")),
+            "webhook endpoint republished in local snapshot: {snapshot}"
+        );
+        if rows.iter().any(|row| row["id"] == "pi/sender") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "sender never published");
+    }
+    relay.assert_quiet(
+        Duration::from_millis(100),
+        |request| request["type"] == "send",
+        "local webhook send escaped to relay",
+    );
+}
+
+#[test]
+fn relay_hosted_endpoints_obey_remote_refusal_without_blocking_local_webhooks() {
+    let relay = WireRelay::new(|request| {
+        if request["type"] == "list" {
+            vec![json!({"type":"list","id":request["id"],"sessions":[
+                {"id":"pi/remote","harness":"pi","machine_id":"other-device"},
+                {"id":"webhook/hosted","name":"hosted","harness":"webhook","status":"online"}
+            ]})]
+        } else {
+            relay_basics(request)
+        }
+    });
+    let endpoint = HttpFixture::new(|_| (200, json!({"status":"queued"})));
+    let mut fixture = stable_fixture();
+    start_relay(
+        &mut fixture,
+        &relay,
+        &format!(
+            "remote_messages='refuse'\nendpoint=[{{name='local',url='{}'}}]\n",
+            endpoint.url()
+        ),
+    );
+    let mut sender = fixture.plugin("sender", "busy");
+    sender.reject(
+        json!({"op":"send","to":"webhook/hosted","body":"forbidden"}),
+        "remote_messages=refuse",
+    );
+    sender.ok(json!({"op":"send","to":"webhook/local","body":"local allowed"}));
+    assert_eq!(endpoint.request().body["message"]["body"], "local allowed");
+    assert!(!relay
+        .requests
+        .try_iter()
+        .any(|request| request["type"] == "send"));
+}
+
+#[test]
 fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() {
     let relay = WireRelay::new(|request| {
         if request["type"] == "send" {
@@ -1014,7 +1120,9 @@ fn remote_directory_rows_never_shadow_or_impersonate_local_sessions() {
                 {"id":"pi/remote","name":"remote fixture","harness":"pi","machine_id":"other-device","status":"busy"},
                 {"id":"webhook/hook","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
                 {"id":"pi/target","name":"remote impostor","harness":"pi","machine_id":"other-device","status":"busy"},
-                {"id":"pi/machineless","name":"no machine","harness":"pi","status":"busy"},
+                {"id":"pi/machineless","name":"no machine","harness":"pi","status":"busy","_relay_endpoint":true},
+                {"id":"webhook/impostor","name":"wrong harness","harness":"pi","status":"online","_relay_endpoint":true},
+                {"id":"webhook/","name":"invalid endpoint","harness":"webhook","status":"online"},
                 {"id":"pi/self-claimed","name":"this machine","harness":"pi","machine_id":seen.lock().unwrap().clone(),"status":"busy"},
             ]})],
             _ => relay_basics(request),
@@ -1049,6 +1157,10 @@ fn remote_directory_rows_never_shadow_or_impersonate_local_sessions() {
     assert!(
         row("pi/machineless").is_empty(),
         "machineless remote row passed as local: {rows:?}"
+    );
+    assert!(
+        row("webhook/impostor").is_empty() && row("webhook/").is_empty(),
+        "invalid remote endpoint passed as hosted: {rows:?}"
     );
     assert!(
         row("pi/self-claimed").is_empty(),

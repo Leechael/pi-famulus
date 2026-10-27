@@ -1,5 +1,121 @@
 use super::*;
 
+#[test]
+fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
+    let registrations = std::sync::atomic::AtomicUsize::new(0);
+    let relay = WireRelay::new(move |request| {
+        if request["type"] == "register" && registrations.fetch_add(1, Ordering::Relaxed) == 0 {
+            vec![
+                json!({"type":"error","code":"unavailable","message":"fixture relay temporarily offline"}),
+            ]
+        } else {
+            relay_basics(request)
+        }
+    });
+    let mut fixture = stable_fixture();
+    start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
+    let mut manager = manager_status_connection(&fixture);
+    let mut wait_status = |expected: &str, error: Option<&str>| {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let status = manager.request_ok(json!({"type":"status"}))["messaging"].clone();
+            if status["state"] == expected
+                && match error {
+                    Some(error) => status["error"].as_str().unwrap_or("").contains(error),
+                    None => status["error"].as_str().unwrap_or("").is_empty(),
+                }
+            {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unexpected messaging status: {status}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_status("disconnected", Some("fixture relay temporarily offline"));
+    let mut peer = Peer::new(UnixStream::connect(&fixture.sock).unwrap());
+    let report = peer.call(json!({"op":"status"}))["report"].clone();
+    assert!(
+        report["relay_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("fixture relay temporarily offline"),
+        "{report}"
+    );
+    wait_status("connected", None);
+    relay
+        .outgoing
+        .send(json!({"_fixture_disconnect":true}))
+        .unwrap();
+    wait_status("disconnected", Some("relay disconnected"));
+    wait_status("connected", None);
+}
+
+#[test]
+fn hosted_relay_uses_only_a_same_server_saved_credential_over_the_bootstrap_token() {
+    for same_server in [true, false] {
+        let relay = WireRelay::with_transport(|_| vec![], false, true);
+        let mut fixture = stable_fixture();
+        let state = fixture.root.join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = state.join("device.json");
+        fs::write(&identity, serde_json::to_vec(&json!({
+            "device_id":uuid::Uuid::new_v4().to_string(),
+            "tenant_id":"fixture-tenant",
+            "credential":"saved-device-credential",
+            "server":if same_server { relay.url() } else { "http://other-server.invalid".into() },
+        })).unwrap()).unwrap();
+        fs::set_permissions(identity, fs::Permissions::from_mode(0o600)).unwrap();
+        start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
+        let request = relay.request("_fixture_upgrade_attempt");
+        let raw = request["request"].as_str().unwrap().to_ascii_lowercase();
+        let credential = if same_server {
+            "saved-device-credential"
+        } else {
+            "fixture-token"
+        };
+        assert!(
+            raw.contains(&format!("authorization: bearer {credential}")),
+            "{raw}"
+        );
+        let unexpected = if same_server {
+            "fixture-token"
+        } else {
+            "saved-device-credential"
+        };
+        assert!(!raw.contains(unexpected), "{raw}");
+    }
+}
+
+#[test]
+fn hosted_authentication_failure_explains_explicit_enrollment() {
+    let relay = WireRelay::with_transport(|_| vec![], false, true);
+    let mut fixture = stable_fixture();
+    start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
+    relay.request("_fixture_upgrade_attempt");
+    let mut manager = manager_status_connection(&fixture);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = manager.request_ok(json!({"type":"status"}))["messaging"].clone();
+        if status["error"].as_str().unwrap_or("").contains("401") {
+            assert_eq!(status["state"], "disconnected", "{status}");
+            assert!(
+                status["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("intercom enroll"),
+                "{status}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(feature = "test-clock")]
 fn start_manual_transport(fixture: &mut Fixture, relay: &WireRelay) {
     start_relay_options_env(
@@ -569,6 +685,7 @@ fn enroll_and_device_persist_credentials_without_printing_secrets() {
         )
     });
     let fixture = stable_fixture();
+    fixture.config("enabled = false\n");
     let url = endpoint.url();
     let output = fixture.run(&[
         "enroll",
@@ -587,6 +704,7 @@ fn enroll_and_device_persist_credentials_without_printing_secrets() {
     assert!(!printed.contains("one-time-enrollment-secret"));
     let request = endpoint.request();
     assert_eq!(request.body["token"], "one-time-enrollment-secret");
+    assert_eq!(request.body["name"], "fixture-host");
     assert!(request.body["client_version"].is_string());
     let saved: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("state/device.json")).unwrap()).unwrap();

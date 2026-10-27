@@ -17,6 +17,8 @@ export interface FamulusConfig {
   /** Explicit path to the pi-famulus binary, or null for auto-resolution. */
   managerPath: string | null;
   logLevel: "debug" | "info" | "warn" | "error";
+  /** Cross-session messaging requires explicit opt-in. */
+  messaging?: { enabled: boolean };
   /** Optional M3 subagent tuning section (design doc §4.6 limits). */
   subagent?: FamulusSubagentConfig;
 }
@@ -139,6 +141,7 @@ export const DEFAULT_CONFIG: FamulusConfig = {
   subagentBudgetMs: 45000,
   managerPath: null,
   logLevel: "info",
+  messaging: { enabled: false },
 };
 
 /** Resolve the pi-famulus base directory. PI_FAMULUS_HOME overrides the default. */
@@ -210,6 +213,9 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
   if (typeof raw !== "object" || raw === null) return { ...DEFAULT_CONFIG };
   const obj = raw as Record<string, unknown>;
   const config = { ...DEFAULT_CONFIG };
+  if (typeof obj.messaging === "object" && obj.messaging !== null) {
+    config.messaging = { enabled: (obj.messaging as Record<string, unknown>).enabled === true };
+  }
   if (typeof obj.foregroundBudgetMs === "number" && obj.foregroundBudgetMs > 0) {
     config.foregroundBudgetMs = obj.foregroundBudgetMs;
   }

@@ -29,21 +29,19 @@ const NATIVE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Set by test harnesses that run managers without the messaging bridge, so
 /// they never bind the shared default intercom socket.
 pub const DISABLE_ENV: &str = "PI_FAMULUS_NO_INTERCOM";
-/// The messaging bridge every manager runs: Famulus `config.json` only.
-/// An unenrolled device bridges local agents only.
+/// The opt-in manager messaging bridge: Famulus `config.json` only.
 pub fn bridge_config(home: &std::path::Path) -> Result<Config, String> {
-    if cfg!(windows) {
-        return Err("intercom native adapters support Linux/macOS only".into());
-    }
     if std::env::var_os(DISABLE_ENV).is_some() {
         return Err(format!("disabled by {DISABLE_ENV}"));
     }
-    let mut config = Config::load(home, &cli::Options::without_overrides())?;
-    if !config.local_only
-        && config.token.is_empty()
-        && !config.state_dir.join("device.json").exists()
-    {
-        config.local_only = true;
+    let config = Config::load(home, &cli::Options::without_overrides())?;
+    if !config.enabled {
+        return Err(
+            "disabled by messaging.enabled; set messaging.enabled=true to enable messaging".into(),
+        );
+    }
+    if cfg!(windows) {
+        return Err("intercom native adapters support Linux/macOS only".into());
     }
     Ok(config)
 }
@@ -132,6 +130,7 @@ pub struct State {
     pub seq: u64,
     pub remote: Vec<Value>,
     pub relay_tx: Option<mpsc::Sender<Push>>,
+    pub relay_error: String,
     pub control_outbox: VecDeque<Value>,
     /// Bridge-runtime connection ids owned by famulus manager-connection
     /// ports (protocol 7 `intercom`): a legacy client socket refuses to
@@ -321,13 +320,14 @@ impl Running {
 }
 impl Runtime {
     /// Relay link state: `connected`, `disconnected` or `local_only`.
-    pub fn relay_state(&self) -> &'static str {
+    pub fn relay_status(&self) -> (&'static str, String) {
+        let state = self.state.lock().unwrap();
         if self.cfg.local_only {
-            "local_only"
-        } else if self.state.lock().unwrap().relay_tx.is_some() {
-            "connected"
+            ("local_only", String::new())
+        } else if state.relay_tx.is_some() {
+            ("connected", String::new())
         } else {
-            "disconnected"
+            ("disconnected", state.relay_error.clone())
         }
     }
     /// Stop admitting work and settle idle watches as `unavailable` while
@@ -339,25 +339,22 @@ impl Runtime {
         self.native.stop_accepting();
     }
 }
-/// Credential selection for daemon start, mirroring the one-shot and listen
-/// paths: an explicitly configured token always wins; the saved identity
-/// credential is adopted only when no token is configured and it belongs to
-/// the same normalized server. Anything else must enroll for the selected
-/// server or pass a token, so a credential enrolled for another server never
-/// leaks into (or overrides) an explicit selection.
+/// Prefer an enrolled credential over a bootstrap token, but only for the
+/// same server. Never send another server's saved credential.
 pub(crate) fn adopt_identity_credential(
     cfg: &mut Config,
     identity: &Identity,
 ) -> Result<(), String> {
-    if !cfg.token.is_empty() || cfg.local_only {
+    if cfg.local_only {
         return Ok(());
     }
-    if identity.credential.is_empty()
-        || identity.server.trim_end_matches('/') != cfg.server.trim_end_matches('/')
+    if !identity.credential.is_empty()
+        && identity.server.trim_end_matches('/') == cfg.server.trim_end_matches('/')
     {
-        return Err("enroll this device for the selected server or pass a relay token".into());
+        cfg.token = identity.credential.clone();
+    } else if cfg.token.is_empty() {
+        return Err("enroll this device for the selected server with pi-famulus intercom enroll --server <server> --token <enrollment-token>, or pass a device credential".into());
     }
-    cfg.token = identity.credential.clone();
     Ok(())
 }
 pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, String> {
@@ -368,7 +365,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
     }
     if !c.local_only && c.token.is_empty() && !c.state_dir.join("device.json").exists() {
         return Err(
-            "enroll this device or pass a device credential; use --local-only for local messages"
+            "run pi-famulus intercom enroll --server <server> --token <enrollment-token>, or pass a device credential; use --local-only for local messages"
                 .into(),
         );
     }
@@ -433,6 +430,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             seq: 0,
             remote: Vec::new(),
             relay_tx: None,
+            relay_error: String::new(),
             control_outbox: VecDeque::new(),
             port_conns: HashSet::new(),
             relay_message_ids: false,
@@ -618,8 +616,7 @@ impl Runtime {
         }
         let origin = str_field(&source, "id");
         let to = str_field(&target, "id").to_string();
-        let remote = !str_field(&target, "machine_id").is_empty()
-            && str_field(&target, "machine_id") != self.machine;
+        let remote = remote_target(&target, &self.machine);
         let mid = if remote {
             uuid::Uuid::new_v4().to_string()
         } else {
@@ -702,8 +699,7 @@ impl Runtime {
         }
         check_from_mode(mode)?;
         let to = str_field(&target, "id");
-        let remote = !str_field(&target, "machine_id").is_empty()
-            && str_field(&target, "machine_id") != self.machine;
+        let remote = remote_target(&target, &self.machine);
         if remote && self.cfg.remote_messages == "refuse" {
             return Err("cross-machine operation refused: remote_messages=refuse".into());
         }
@@ -883,7 +879,8 @@ impl Runtime {
                 panes += 1;
             }
         }
-        let relay = match self.relay_state() {
+        let (relay, relay_error) = self.relay_status();
+        let relay = match relay {
             "local_only" => "disabled (local_only)",
             state => state,
         };
@@ -901,7 +898,7 @@ impl Runtime {
             )
         };
         legacy.sort();
-        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"name":self.cfg.display_name(),"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
+        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"name":self.cfg.display_name(),"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"relay_error":relay_error,"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
         for (key, count) in [
             ("claude_n", claude),
             ("pi_n", pi),
@@ -1033,16 +1030,36 @@ impl Drop for Forwarding<'_> {
         }
     }
 }
-/// Remote rows never shadow a local session, and a remote row cannot claim
-/// this machine (or no machine) and thereby pass as local.
+fn remote_target(row: &Value, machine: &str) -> bool {
+    let owner = str_field(row, "machine_id");
+    (!owner.is_empty() && owner != machine)
+        || (row["_relay_endpoint"] == true
+            && str_field(row, "id").starts_with("webhook/")
+            && str_field(row, "harness") == "webhook")
+}
+/// Remote rows never shadow local sessions. Only server-hosted webhook
+/// endpoints may omit a machine, and retain internal relay provenance.
 fn merge_remote(rows: &mut Vec<Value>, remote: Vec<Value>, machine: &str) {
     let local: HashSet<String> = rows
         .iter()
         .map(|r| str_field(r, "id").to_string())
         .collect();
-    rows.extend(remote.into_iter().filter(|row| {
-        let owner = str_field(row, "machine_id");
-        !owner.is_empty() && owner != machine && !local.contains(str_field(row, "id"))
+    rows.extend(remote.into_iter().filter_map(|mut row| {
+        let owner = str_field(&row, "machine_id");
+        let id = str_field(&row, "id");
+        let hosted = owner.is_empty()
+            && id.starts_with("webhook/")
+            && valid_intercom_id(id)
+            && str_field(&row, "harness") == "webhook";
+        if local.contains(id) || (!hosted && (owner.is_empty() || owner == machine)) {
+            return None;
+        }
+        let fields = row.as_object_mut()?;
+        fields.remove("_relay_endpoint");
+        if hosted {
+            fields.insert("_relay_endpoint".into(), json!(true));
+        }
+        Some(row)
     }));
 }
 pub fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -1242,6 +1259,24 @@ mod tests {
             server: server.into(),
             ..Identity::default()
         }
+    }
+
+    #[test]
+    fn hosted_runtime_prefers_same_server_saved_credential_over_bootstrap_token() {
+        let mut cfg = Config {
+            server: "http://relay.invalid".into(),
+            token: "bootstrap-token".into(),
+            ..Config::default()
+        };
+        let saved = saved_identity("enrolled-credential", "http://relay.invalid/");
+        adopt_identity_credential(&mut cfg, &saved).unwrap();
+        assert_eq!(cfg.token, "enrolled-credential");
+    }
+
+    #[test]
+    fn hosted_messaging_defaults_to_disabled() {
+        let cfg = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(cfg["enabled"], false);
     }
 
     #[test]

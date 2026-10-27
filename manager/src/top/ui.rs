@@ -329,6 +329,7 @@ fn messaging_spans(m: &crate::proto::MessagingStatus) -> Vec<Span<'static>> {
         "connected" => ("● ", OK, "connected"),
         "disconnected" => ("○ ", ERR, "disconnected"),
         "local_only" => ("◌ ", MUTED, "local-only"),
+        "unavailable" => ("○ ", ERR, "unavailable"),
         _ => ("○ ", DIM, "off"),
     };
     let mut spans = vec![sp(fg(color), dot), sp(fg(DIM), "msg "), sp(fg(color), label)];
@@ -3020,7 +3021,13 @@ mod tests {
             }))
             .unwrap(),
         );
-        let cases = [("connected", "msg connected · castle"), ("disconnected", "msg disconnected · castle"), ("local_only", "msg local-only · castle")];
+        let cases = [
+            ("connected", "msg connected · castle"),
+            ("disconnected", "msg disconnected · castle"),
+            ("local_only", "msg local-only · castle"),
+            ("disabled", "msg off · castle"),
+            ("unavailable", "msg unavailable · castle"),
+        ];
         for (relay, shown) in cases {
             snap.daemon.as_mut().unwrap().messaging.as_mut().unwrap().state = relay.into();
             for (cols, rows) in [(120, 30), (120, 12)] {

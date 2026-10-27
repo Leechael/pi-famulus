@@ -1558,6 +1558,7 @@ mod tests {
                 seq: 0,
                 remote: Vec::new(),
                 relay_tx: None,
+            relay_error: String::new(),
                 control_outbox: std::collections::VecDeque::new(),
                 port_conns: std::collections::HashSet::new(),
                 relay_message_ids: false,

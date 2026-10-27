@@ -12,9 +12,9 @@
  * connection (protocol 7 `intercom` request; frames arrive as `intercom`
  * events; the daemon pushes `intercom_reset` when its bridge restarts).
  *
- * Bridge unavailability: `disabled` (PI_FAMULUS_NO_INTERCOM, Windows) stays
- * completely silent — no prompt section, tools answer with an error result,
- * no notice. Any other reason notifies once and retries every 3s.
+ * Messaging is opt-in: disabled configuration or PI_FAMULUS_NO_INTERCOM
+ * registers nothing. Enabled sessions report bridge and relay failures once
+ * per error and probe for recovery every 3s.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -166,6 +166,8 @@ function formatSession(s: SessionRow): string {
 }
 
 export interface IntercomDeps {
+  /** Only literal true enables messaging registration. */
+  enabled?: boolean;
   /** The current session's manager client (null before session_start).
    * Unused when a transport is injected directly. */
   getClient?: () => ManagerClient | null;
@@ -179,9 +181,10 @@ export interface IntercomDeps {
 
 /**
  * Registers everything intercom: tools, commands, hooks, renderers.
- * Call once per famulus runtime with the binding's API (survives /reload).
+ * Call once per extension attachment with the host API; reload recreates it.
  */
 export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
+  if (deps.enabled !== true || process.env.PI_FAMULUS_NO_INTERCOM !== undefined) return;
   const transport = deps.transport ?? createManagerTransport(deps.getClient ?? (() => null));
   const now = deps.now ?? Date.now;
   const extensionDirs = deps.extensionDirs ?? [
@@ -204,8 +207,8 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   let lastCtx: ExtensionContext | undefined;
   let retryTimer: ReturnType<typeof setInterval> | undefined;
   let manualCompactionRefresh: ReturnType<typeof setTimeout> | undefined;
-  // True once the user has been told the bridge is down; reset on reconnect.
-  let downNotified = false;
+  let lastMessagingError: string | undefined;
+  let statusCheckEpoch: number | undefined;
   let legacyPluginNotified = false;
   let autocompleteBound = false;
   let offFrames: (() => void) | undefined;
@@ -274,6 +277,37 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
       /* no UI */
     }
   };
+
+  function updateMessagingError(message?: string, level: "warning" | "error" = "error") {
+    if (message === lastMessagingError) return;
+    lastMessagingError = message;
+    lastCtx?.ui.setStatus?.("famulus-messaging", message);
+    if (message) notify(message, level);
+  }
+
+  async function checkMessagingStatus() {
+    const client = deps.getClient?.();
+    if (!client?.isAvailable() || !client.status || statusCheckEpoch === epoch) return;
+    const expectedEpoch = epoch;
+    statusCheckEpoch = expectedEpoch;
+    try {
+      const { messaging } = await client.status();
+      if (stopped || epoch !== expectedEpoch || !lastCtx || !useContext(lastCtx)) return;
+      if (!messaging || messaging.state === "disabled") {
+        updateMessagingError();
+      } else if (messaging.error || messaging.state === "disconnected" || messaging.state === "unavailable") {
+        updateMessagingError(`pi-famulus messaging ${messaging.state}: ${messaging.error || "relay not connected"}`);
+      } else {
+        updateMessagingError();
+      }
+    } catch (error) {
+      if (!stopped && epoch === expectedEpoch && lastCtx && useContext(lastCtx)) {
+        updateMessagingError(`pi-famulus messaging status unavailable: ${(error as Error).message}`);
+      }
+    } finally {
+      if (statusCheckEpoch === expectedEpoch) statusCheckEpoch = undefined;
+    }
+  }
 
   const text = (t: string, isError = false) => ({
     content: [{ type: "text" as const, text: t }],
@@ -577,11 +611,8 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
         // The first connect may still be in flight: stay silent. A
         // recorded failure is a genuine outage: say so once. The 3s
         // probe keeps retrying either way.
-        if (!quiet && !downNotified && down !== "disabled" && outageIsReal()) {
-          downNotified = true;
-          notify("pi-famulus: messaging bridge unavailable, cross-session messaging is paused (the rest of this session is unaffected)", "warning");
-        }
-        throw new IntercomError(BRIDGE_DOWN, "E_TRANSPORT", "unavailable");
+        const error = deps.getClient?.()?.lastError();
+        throw new IntercomError(`${BRIDGE_DOWN}${error ? ` (${error})` : ""}`, "E_TRANSPORT", "unavailable");
       }
     }
     return await register(currentStatus(ctx));
@@ -601,6 +632,8 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
         const key = sessionKey(lastCtx);
         if (key !== boundKey || !registered || !transport.isUp()) {
           start(lastCtx, true, false, true).catch(() => {});
+        } else {
+          void checkMessagingStatus();
         }
       } catch {
         void stop();
@@ -657,22 +690,23 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
         if (sid) sessionId = sid;
         registered = true;
         down = undefined;
-        downNotified = false;
+        if (deps.getClient?.()?.status) void checkMessagingStatus();
+        else updateMessagingError();
         notify(`pi-famulus intercom active as "${sessionName}"`, "info");
       } catch (e) {
         if (stopped) return;
         started = false;
         if (e instanceof IntercomError && e.reason) {
           down = e.reason;
-          if (e.reason === "unavailable" && !quiet && !downNotified && outageIsReal()) {
-            downNotified = true;
-            notify(`pi-famulus: messaging bridge unavailable (${e.message}); cross-session messaging is paused`, "warning");
+          if (e.reason === "disabled") updateMessagingError();
+          else if (outageIsReal()) {
+            updateMessagingError(`pi-famulus: messaging bridge unavailable (${e.message}); cross-session messaging is paused`, "warning");
           }
           return;
         }
         const msg = (e as Error).message || String(e);
-        if (!quiet && msg !== BRIDGE_DOWN && msg !== BRIDGE_DISABLED) {
-          notify(`pi-famulus intercom: ${msg}`, "error");
+        if (msg !== BRIDGE_DOWN && msg !== BRIDGE_DISABLED) {
+          updateMessagingError(`pi-famulus intercom: ${msg}`);
         }
       }
     })();
@@ -701,6 +735,7 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     readiness = undefined;
     started = false;
     listCache = undefined;
+    updateMessagingError();
     lastCtx = undefined;
     stopPromise = (async () => {
       try {

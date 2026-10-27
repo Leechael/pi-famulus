@@ -1159,7 +1159,7 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         std::fs::write(
             home.join("config.json"),
-            serde_json::to_string(&json!({"messaging":{"localOnly":true,"sock":sock}})).unwrap(),
+            serde_json::to_string(&json!({"messaging":{"enabled":true,"localOnly":true,"sock":sock}})).unwrap(),
         )
         .unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
