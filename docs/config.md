@@ -111,14 +111,16 @@ A non-loopback `mcpListen` requires `mcpAllowNonLoopback: true` and a non-empty 
 
 Hosted servers exchange an operator-issued enrollment token for a per-device credential. A legacy shared token such as the old `dev-token` example is not a device credential.
 
-Register explicitly (this command works while messaging is disabled):
+In `/famulus`, open **Messaging**, set **server**, then open **token** and enter the enrollment token. Pressing Enter immediately exchanges it for a device credential; the menu reports success or the server's error. The submitted token is not stored in `config.json`, and a successful exchange removes any old `messaging.token` value. Enrollment works while messaging is disabled and does not enable it.
+
+The CLI remains available for non-interactive registration:
 
 ```bash
 pi-famulus intercom enroll --server https://relay.example.com --token <enrollment-token>
 pi-famulus intercom device
 ```
 
-Enrollment sends `device_id`, `name` (the hostname when unset), `token` and `client_version` to `POST /v1/enroll`. The returned device credential is saved privately in `messaging/device.json`, bound to that server, and is not printed. Registration does not enable messaging.
+Both paths use the same enrollment implementation. It sends `device_id`, `name` (the hostname when unset), `token` and `client_version` to `POST /v1/enroll`, using the current messaging configuration, including `stateDir` and `tlsInsecure`. The returned device credential is saved privately in `messaging/device.json` (or the configured state directory), bound to that server, and is not printed. Failed exchanges leave existing configuration and credentials unchanged.
 
 For normal use, set `messaging.enabled` to `true` and `messaging.server` to the same server. Leave `messaging.token` empty; the bridge authenticates `/v1/relay` with the saved device credential. A credential saved for a different server is never used. Set `localOnly: true` explicitly if only same-machine messaging is wanted.
 

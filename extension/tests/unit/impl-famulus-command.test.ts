@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { collectFamulusInfo, formatFamulusInfo, registerFamulusCommand } from "../../src/tui/famulus-command";
+import { collectFamulusInfo, formatFamulusInfo, registerFamulusCommand, type FamulusCommandDeps } from "../../src/tui/famulus-command";
 import type { ManagerClient, MessagingStatus } from "../../src/manager-client";
 import { visibleWidth } from "../../src/tui/pi-tui-load";
 
@@ -29,8 +29,12 @@ interface Component {
 /** Runs /famulus with a TUI: `drive` gets each overview the loop opens. */
 async function runInteractive(
   configPath: string,
-  drive: (screen: Component, round: number) => void,
-  extra: { editor?: (title: string, text: string) => Promise<string | undefined>; messaging?: MessagingStatus } = {},
+  drive: (screen: Component, round: number) => void | Promise<void>,
+  extra: {
+    editor?: (title: string, text: string) => Promise<string | undefined>;
+    messaging?: MessagingStatus;
+    enrollMessagingToken?: FamulusCommandDeps["enrollMessagingToken"];
+  } = {},
 ) {
   let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const pi = {
@@ -44,6 +48,7 @@ async function runInteractive(
     managerPath: null,
     describeSearch: () => "PATH",
     getClient: () => client(true, "", extra.messaging ?? { state: "connected", name: "castle" }),
+    enrollMessagingToken: extra.enrollMessagingToken,
   });
   const notify = vi.fn();
   const reload = vi.fn(async () => {});
@@ -53,9 +58,9 @@ async function runInteractive(
     hasUI: true,
     ui: {
       custom: (factory: Function) =>
-        new Promise((resolve) => {
+        new Promise((resolve, reject) => {
           const screen = factory({ requestRender() {} }, plain, {}, resolve) as Component;
-          drive(screen, round++);
+          Promise.resolve().then(() => drive(screen, round++)).catch(reject);
         }),
       editor,
       notify,
@@ -78,6 +83,12 @@ function press(screen: Component, ...keys: string[]) {
 
 function type(screen: Component, text: string) {
   for (const ch of text) screen.handleInput(ch);
+}
+
+function openMessagingToken(screen: Component) {
+  press(screen, KEY.down, KEY.down, KEY.down, KEY.enter); // Messaging
+  press(screen, KEY.down, KEY.down, KEY.down, KEY.enter); // token
+  expect(screen.render(160).join("\n")).toContain("messaging.token");
 }
 
 describe("/famulus status", () => {
@@ -288,6 +299,107 @@ describe("/famulus settings", () => {
     expect(screens.join("\n")).not.toContain("s3cret-token");
     expect(screens[0]).toMatch(/token\s+set/);
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ messaging: { token: "s3cret-token" } });
+  });
+
+  it("exchanges a token immediately, shows pending state, and ignores duplicate submissions", async () => {
+    const configPath = freshConfig('{"foregroundBudgetMs":12345}\n');
+    const original = readFileSync(configPath, "utf8");
+    const token = "pending-enrollment-secret";
+    let finish!: () => void;
+    const enroll = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const { notify } = await runInteractive(configPath, async (screen) => {
+      openMessagingToken(screen);
+      type(screen, token);
+      press(screen, KEY.enter);
+      await vi.waitFor(() => expect(enroll).toHaveBeenCalledWith(token));
+      expect(screen.render(160).join("\n")).toContain("Exchanging token...");
+      expect(readFileSync(configPath, "utf8")).toBe(original);
+      press(screen, KEY.enter, KEY.enter);
+      expect(enroll).toHaveBeenCalledOnce();
+      finish();
+      await vi.waitFor(() => expect(screen.render(160).join("\n")).toContain("Device enrolled"));
+      const saved = screen.render(160).join("\n");
+      expect(saved).toMatch(/enabled\s+false/);
+      expect(saved).not.toContain(token);
+      expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ foregroundBudgetMs: 12345 });
+      press(screen, KEY.esc, KEY.esc);
+    }, { enrollMessagingToken: enroll });
+    expect(JSON.stringify(notify.mock.calls)).not.toContain(token);
+  });
+
+  it.each([undefined, false, true])("removes a legacy token after enrollment without changing enabled=%s or unrelated settings", async (enabled) => {
+    const messaging = {
+      ...(enabled === undefined ? {} : { enabled }),
+      token: "legacy-device-token",
+      name: "my-device",
+      remoteMessages: "refuse",
+    };
+    const configPath = freshConfig(JSON.stringify({ foregroundBudgetMs: 9000, messaging }));
+    const enroll = vi.fn(async (_token: string) => {});
+    await runInteractive(configPath, async (screen) => {
+      openMessagingToken(screen);
+      type(screen, "new-enrollment-token");
+      press(screen, KEY.enter);
+      await vi.waitFor(() => expect(screen.render(160).join("\n")).toContain("Device enrolled"));
+      expect(enroll).toHaveBeenCalledExactlyOnceWith("new-enrollment-token");
+      expect(screen.render(160).join("\n")).not.toContain("new-enrollment-token");
+      press(screen, KEY.esc, KEY.esc);
+    }, { enrollMessagingToken: enroll });
+    const { token: _legacy, ...remaining } = messaging;
+    expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ foregroundBudgetMs: 9000, messaging: remaining });
+  });
+
+  it("keeps failed enrollment editable, preserves existing files, redacts notices, and allows retry", async () => {
+    const configPath = freshConfig('{"messaging":{"enabled":false,"token":"existing-token"},"logLevel":"debug"}\n');
+    const credentialPath = join(configPath, "..", "device.json");
+    writeFileSync(credentialPath, '{"credential":"existing-private-credential"}\n', { mode: 0o600 });
+    const originalConfig = readFileSync(configPath, "utf8");
+    const originalCredential = readFileSync(credentialPath, "utf8");
+    const token = "rejected-enrollment-secret";
+    const enroll = vi.fn<(token: string) => Promise<void>>()
+      .mockRejectedValueOnce(new Error(`HTTP 401: fixture enrollment rejected for ${token}`))
+      .mockResolvedValueOnce(undefined);
+    const { notify } = await runInteractive(configPath, async (screen) => {
+      openMessagingToken(screen);
+      type(screen, token);
+      press(screen, KEY.enter);
+      await vi.waitFor(() => expect(screen.render(200).join("\n")).toContain("HTTP 401"));
+      const lines = screen.render(200);
+      expect(lines.join("\n")).toContain("fixture enrollment rejected");
+      expect(lines.join("\n")).toContain("messaging.token");
+      expect(lines.filter((line) => line.includes("HTTP 401")).join("\n")).not.toContain(token);
+      expect(readFileSync(configPath, "utf8")).toBe(originalConfig);
+      expect(readFileSync(credentialPath, "utf8")).toBe(originalCredential);
+      press(screen, "\x15"); // Clear the rejected token before retrying.
+      type(screen, "retry-enrollment-token");
+      press(screen, KEY.enter);
+      await vi.waitFor(() => expect(screen.render(160).join("\n")).toContain("Device enrolled"));
+      expect(enroll.mock.calls).toEqual([[token], ["retry-enrollment-token"]]);
+      press(screen, KEY.esc, KEY.esc);
+    }, { enrollMessagingToken: enroll });
+    expect(JSON.stringify(notify.mock.calls)).not.toContain(token);
+    expect(JSON.stringify(notify.mock.calls)).not.toContain("retry-enrollment-token");
+    expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ messaging: { enabled: false }, logLevel: "debug" });
+  });
+
+  it.each(["blank", "cancel"])("does not enroll or write configuration on %s token submission", async (action) => {
+    const configPath = freshConfig('{"messaging":{"token":"existing-token","enabled":false}}\n');
+    const original = readFileSync(configPath, "utf8");
+    const enroll = vi.fn(async (_token: string) => {});
+    await runInteractive(configPath, async (screen) => {
+      openMessagingToken(screen);
+      if (action === "cancel") {
+        type(screen, "cancelled-enrollment-token");
+        press(screen, KEY.esc);
+      } else {
+        type(screen, "   ");
+        press(screen, KEY.enter);
+      }
+      await Promise.resolve();
+      expect(enroll).not.toHaveBeenCalled();
+      expect(readFileSync(configPath, "utf8")).toBe(original);
+      press(screen, KEY.esc, KEY.esc);
+    }, { enrollMessagingToken: enroll });
   });
 
   it("refuses to change a key when config.json is not valid JSON", async () => {

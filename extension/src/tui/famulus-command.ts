@@ -3,6 +3,7 @@
  * whether messaging reaches its relay, and the settings pages.
  */
 import { execFile } from "node:child_process";
+import { dirname } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient, MessagingStatus } from "../manager-client";
@@ -20,6 +21,8 @@ export interface FamulusCommandDeps {
   messagingEnabled?: boolean;
   /** `<binary> --version`; null when it cannot be run. */
   binaryVersion?: (path: string) => Promise<string | null>;
+  /** Exchange an enrollment token using the current messaging configuration. */
+  enrollMessagingToken?: (token: string) => Promise<void>;
 }
 
 export interface FamulusInfo {
@@ -80,6 +83,17 @@ export function readBinaryVersion(path: string): Promise<string | null> {
   });
 }
 
+export function exchangeMessagingToken(managerPath: string | null, configPath: string, token: string): Promise<void> {
+  if (!managerPath) return Promise.reject(new Error("pi-famulus binary is unavailable."));
+  return new Promise((resolve, reject) => {
+    execFile(managerPath, ["--home", dirname(configPath), "intercom", "enroll", "--token", token],
+      { timeout: 25_000, windowsHide: true }, (error, _stdout, stderr) => {
+        if (error) reject(new Error(stderr.trim() || `Device enrollment failed (${error.code ?? "command failed"}).`));
+        else resolve();
+      });
+  });
+}
+
 const STATUS_TIMEOUT_MS = 2000;
 
 async function readMessaging(client: ManagerClient): Promise<MessagingStatus | null> {
@@ -115,7 +129,12 @@ export async function collectFamulusInfo(deps: FamulusCommandDeps): Promise<Famu
 type OverviewChoice = "edit-raw" | "reload" | undefined;
 
 /** Status first, then one row per settings section and the two actions. */
-function showOverview(ctx: ExtensionCommandContext, info: FamulusInfo, configPath: string): Promise<OverviewChoice> {
+function showOverview(
+  ctx: ExtensionCommandContext,
+  info: FamulusInfo,
+  configPath: string,
+  enrollMessagingToken: (token: string) => Promise<void>,
+): Promise<OverviewChoice> {
   const piTui = loadPiTui();
   if (!piTui) {
     ctx.ui.notify(formatFamulusInfo(info), "info");
@@ -127,6 +146,7 @@ function showOverview(ctx: ExtensionCommandContext, info: FamulusInfo, configPat
       tui: piTui,
       theme,
       configPath,
+      enrollMessagingToken,
       requestRender: () => tui.requestRender(),
       notice: (text: string, error = false) => {
         notice = theme.fg(error ? "error" : "success", text);
@@ -171,7 +191,7 @@ function showOverview(ctx: ExtensionCommandContext, info: FamulusInfo, configPat
         const error = singleLine(info.messaging?.error ?? "");
         if (error) lines.push(...wrapTextWithAnsi(theme.fg("error", `Messaging error: ${error}`), width));
         lines.push("", ...list.render(width));
-        if (notice) lines.push("", notice);
+        if (notice) lines.push("", ...wrapTextWithAnsi(notice, width));
         return lines.map((line) => truncateToWidth(line, width));
       },
       invalidate: () => list.invalidate(),
@@ -193,7 +213,8 @@ export function registerFamulusCommand(pi: ExtensionAPI, deps: FamulusCommandDep
         return;
       }
       while (true) {
-        const action = await showOverview(ctx, await collectFamulusInfo(deps), deps.configPath);
+        const action = await showOverview(ctx, await collectFamulusInfo(deps), deps.configPath,
+          deps.enrollMessagingToken ?? ((token) => exchangeMessagingToken(deps.managerPath, deps.configPath, token)));
         if (action === "reload") {
           await ctx.reload();
           return;

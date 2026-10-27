@@ -11,12 +11,12 @@
 import { connect as connectStream } from "node:net";
 import { createServer } from "node:http";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { registerIntercom } from "../../src/intercom/intercom";
-import { collectFamulusInfo, formatFamulusInfo } from "../../src/tui/famulus-command";
+import { collectFamulusInfo, exchangeMessagingToken, formatFamulusInfo } from "../../src/tui/famulus-command";
 import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
 
 const RUN = process.env.PI_FAMULUS_INTEG === "1";
@@ -78,6 +78,101 @@ function makeCtx(sessionId: string, injections: { message: any; options?: any }[
     sendMessage: (message: any, options?: any) => injections.push({ message, options }),
   };
 }
+
+describe.skipIf(!RUN)("menu token exchange over the real pi-famulus binary", () => {
+  it.each([
+    { name: undefined, customStateDir: false },
+    { name: "configured-menu-device", customStateDir: true },
+  ])("honors current config and home, persists private credentials, and never enables messaging: %j", { timeout: 30_000 }, async ({ name, customStateDir }) => {
+    const testRoot = mkdtempSync(join(tmpdir(), "pi-famulus-menu-enroll-"));
+    const managerHome = join(testRoot, "current-home");
+    const stateDir = customStateDir ? join(testRoot, "configured-state") : join(managerHome, "messaging");
+    mkdirSync(managerHome, { mode: 0o700 });
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    const requests: { method: string; url: string; body: Record<string, unknown> }[] = [];
+    let rejectEnrollment = true;
+    const relay = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      requests.push({ method: request.method ?? "", url: request.url ?? "", body });
+      if (request.method !== "POST" || request.url !== "/v1/enroll") {
+        response.writeHead(404).end("unexpected enrollment endpoint");
+      } else if (rejectEnrollment) {
+        response.writeHead(401).end("fixture enrollment refused");
+      } else {
+        response.writeHead(201, { "Content-Type": "application/json" }).end(JSON.stringify({
+          device_id: body.device_id,
+          tenant_id: "fixture-tenant",
+          credential: "private-enrolled-device-credential",
+        }));
+      }
+    });
+    await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+    const address = relay.address() as { port: number };
+    const server = `http://127.0.0.1:${address.port}`;
+    const currentConfigPath = join(managerHome, "config.json");
+    const messaging = {
+      ...(customStateDir ? { enabled: false, stateDir } : {}),
+      ...(name ? { name } : {}),
+      server,
+      token: "legacy-config-token",
+      remoteMessages: "refuse",
+    };
+    const config = { logLevel: "debug", foregroundBudgetMs: 12345, messaging };
+    writeFileSync(currentConfigPath, `${JSON.stringify(config)}\n`);
+    const devicePath = join(stateDir, "device.json");
+    const originalIdentity = {
+      device_id: "6da615df-53da-4d9b-9d02-44ad67b85135",
+      tenant_id: "existing-tenant",
+      credential: "existing-private-device-credential",
+      server,
+    };
+    writeFileSync(devicePath, `${JSON.stringify(originalIdentity)}\n`, { mode: 0o600 });
+    const configBefore = readFileSync(currentConfigPath, "utf8");
+    const identityBefore = readFileSync(devicePath, "utf8");
+    const token = "fixture-one-time-enrollment-token";
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      await expect(exchangeMessagingToken(BIN, currentConfigPath, token)).rejects.toThrow("fixture enrollment refused");
+      expect(readFileSync(currentConfigPath, "utf8")).toBe(configBefore);
+      expect(readFileSync(devicePath, "utf8")).toBe(identityBefore);
+      rejectEnrollment = false;
+      await expect(exchangeMessagingToken(BIN, currentConfigPath, token)).resolves.toBeUndefined();
+      expect(requests).toHaveLength(2);
+      for (const request of requests) {
+        expect(request).toMatchObject({
+          method: "POST", url: "/v1/enroll",
+          body: { token, device_id: originalIdentity.device_id, name: name ?? hostname() },
+        });
+        expect(request.body.client_version).toEqual(expect.any(String));
+      }
+      expect(JSON.parse(readFileSync(devicePath, "utf8"))).toMatchObject({
+        device_id: originalIdentity.device_id, tenant_id: "fixture-tenant",
+        credential: "private-enrolled-device-credential", server,
+      });
+      if (process.platform !== "win32") {
+        expect(statSync(devicePath).mode & 0o777).toBe(0o600);
+        expect(statSync(stateDir).mode & 0o777).toBe(0o700);
+      }
+      expect(readFileSync(currentConfigPath, "utf8")).toBe(configBefore);
+      expect(readFileSync(currentConfigPath, "utf8")).not.toContain(token);
+      expect(readFileSync(currentConfigPath, "utf8")).not.toContain("private-enrolled-device-credential");
+      const output = [...stdout.mock.calls, ...stderr.mock.calls].map((call) => String(call[0])).join("\n");
+      for (const secret of [token, originalIdentity.credential, "private-enrolled-device-credential"]) {
+        expect(output).not.toContain(secret);
+      }
+      if (customStateDir) expect(existsSync(join(managerHome, "messaging", "device.json"))).toBe(false);
+      expect(existsSync(join(managerHome, "manager.pid"))).toBe(false);
+    } finally {
+      stdout.mockRestore();
+      stderr.mockRestore();
+      await new Promise<void>((resolve) => relay.close(() => resolve()));
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  });
+});
 
 describe.skipIf(!RUN)("intercom module over the real pi-famulus binary", () => {
   const injections: { message: any; options?: any }[] = [];
