@@ -615,8 +615,7 @@ impl Runtime {
         }
         let origin = str_field(&source, "id");
         let to = str_field(&target, "id").to_string();
-        let remote = !str_field(&target, "machine_id").is_empty()
-            && str_field(&target, "machine_id") != self.machine;
+        let remote = remote_target(&target, &self.machine);
         let mid = if remote {
             uuid::Uuid::new_v4().to_string()
         } else {
@@ -699,8 +698,7 @@ impl Runtime {
         }
         check_from_mode(mode)?;
         let to = str_field(&target, "id");
-        let remote = !str_field(&target, "machine_id").is_empty()
-            && str_field(&target, "machine_id") != self.machine;
+        let remote = remote_target(&target, &self.machine);
         if remote && self.cfg.remote_messages == "refuse" {
             return Err("cross-machine operation refused: remote_messages=refuse".into());
         }
@@ -1030,16 +1028,36 @@ impl Drop for Forwarding<'_> {
         }
     }
 }
-/// Remote rows never shadow a local session, and a remote row cannot claim
-/// this machine (or no machine) and thereby pass as local.
+fn remote_target(row: &Value, machine: &str) -> bool {
+    let owner = str_field(row, "machine_id");
+    (!owner.is_empty() && owner != machine)
+        || (row["_relay_endpoint"] == true
+            && str_field(row, "id").starts_with("webhook/")
+            && str_field(row, "harness") == "webhook")
+}
+/// Remote rows never shadow local sessions. Only server-hosted webhook
+/// endpoints may omit a machine, and retain internal relay provenance.
 fn merge_remote(rows: &mut Vec<Value>, remote: Vec<Value>, machine: &str) {
     let local: HashSet<String> = rows
         .iter()
         .map(|r| str_field(r, "id").to_string())
         .collect();
-    rows.extend(remote.into_iter().filter(|row| {
-        let owner = str_field(row, "machine_id");
-        !owner.is_empty() && owner != machine && !local.contains(str_field(row, "id"))
+    rows.extend(remote.into_iter().filter_map(|mut row| {
+        let owner = str_field(&row, "machine_id");
+        let id = str_field(&row, "id");
+        let hosted = owner.is_empty()
+            && id.starts_with("webhook/")
+            && valid_intercom_id(id)
+            && str_field(&row, "harness") == "webhook";
+        if local.contains(id) || (!hosted && (owner.is_empty() || owner == machine)) {
+            return None;
+        }
+        let fields = row.as_object_mut()?;
+        fields.remove("_relay_endpoint");
+        if hosted {
+            fields.insert("_relay_endpoint".into(), json!(true));
+        }
+        Some(row)
     }));
 }
 pub fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
