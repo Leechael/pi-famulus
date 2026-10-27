@@ -216,6 +216,7 @@ pi-famulus top [--once] [--interval 1s] [--session PREFIX] [--cwd DIR] [--json]
 - Session rows lead with the working-directory name. Session-owned monitors hang directly under the session (the synthetic `main` bucket is omitted in Active); subagent work shows `Session → Run → Agent → Task`. Live branches expand to the running leaf.
 - Other views: `2` agents leaderboard, `3` flat task table, `4` merged events.
 - Work-kind slot and CPU pressure stay in the header and, in Active scope, count only running work.
+- The header shows the messaging relay link and device name: `● msg connected · <name>`, `○ msg disconnected · <name>`, `◌ msg local-only · <name>`, or `○ msg off` when the bridge is not running.
 - Monitors show their stored `description`, or a short guess from the command (incident folder, ssh host and what it tails). Subagent rows show token I/O on the node and in the TOK I/O column.
 
 **Keys and mouse.** `?` lists every key by screen.

@@ -441,6 +441,8 @@ pub struct Header {
     pub tool_share: Option<u64>,
     pub queue_share: Option<u64>,
     pub work_kinds: Vec<WorkKindRow>,
+    /// Relay link of the messaging bridge; `None` offline or from an older daemon.
+    pub messaging: Option<crate::proto::MessagingStatus>,
 }
 
 impl Default for Header {
@@ -467,6 +469,7 @@ impl Default for Header {
             tool_share: None,
             queue_share: None,
             work_kinds: Vec::new(),
+            messaging: None,
         }
     }
 }
@@ -855,6 +858,7 @@ impl TopState {
             pid: snap.daemon.as_ref().map(|d| d.pid),
             uptime_ms: snap.daemon.as_ref().map(|d| d.uptime_ms),
             live: snap.daemon.is_some(),
+            messaging: snap.daemon.as_ref().and_then(|d| d.messaging.clone()),
             sessions_conn: snap.connected.len(),
             sessions_tot: snap.sessions.len(),
             agents_used,
