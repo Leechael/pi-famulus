@@ -54,11 +54,12 @@ These keys belong in the `subagent` object unless noted otherwise.
 
 ## Messaging bridge settings
 
-These keys belong in the `messaging` object in the same `config.json`. This is the bridge's only running configuration source; there are no environment-variable or alternate-file overrides. Daemon-owned messaging settings are reloaded when supervision starts and otherwise require a daemon restart.
+These keys belong in the `messaging` object in the same `config.json`. Messaging is disabled unless `messaging.enabled` is explicitly `true`; setting a server or token alone does not enable it. While disabled, the plugin registers no messaging tools, commands, prompts or completion, and the daemon starts no bridge. `PI_FAMULUS_NO_INTERCOM` also disables messaging. Other messaging settings have no environment-variable or alternate-file overrides. Reload the extension after changing `enabled`; daemon-owned settings are reloaded when supervision starts and otherwise require a daemon restart.
 
 ```json
 {
   "messaging": {
+    "enabled": false,
     "server": "https://127.0.0.1:8443",
     "token": "",
     "name": "",
@@ -78,8 +79,9 @@ These keys belong in the `messaging` object in the same `config.json`. This is t
 
 | Key | Default | Description |
 |---|---|---|
+| `enabled` | `false` | Opt in to the plugin messaging features and daemon bridge. |
 | `server` | `"https://127.0.0.1:8443"` | Relay server URL. |
-| `token` | `""` | Relay or enrollment token. |
+| `token` | `""` | Enrollment token for `intercom enroll`, or an explicit device credential. A saved device credential for the same server takes precedence during normal bridge connections. Old shared tokens are not accepted by hosted servers. |
 | `name` | `""` | Device name used during enrollment and shown by `/famulus` and `pi-famulus top`; the hostname when empty. |
 | `tlsInsecure` | `false` | Disable normal relay TLS certificate verification. |
 | `sock` | See below | Local bridge socket path. |
@@ -88,7 +90,7 @@ These keys belong in the `messaging` object in the same `config.json`. This is t
 | `mcpToken` | `""` | MCP bearer token. When empty, the daemon generates and privately stores a stable token. |
 | `mcpAllowNonLoopback` | `false` | Explicitly permit a non-loopback MCP listener. |
 | `remoteMessages` | `"allow"` | Remote message policy: `allow` or `refuse`. |
-| `localOnly` | `false` | Use only local sessions without a relay. The daemon enables this automatically when no token or device identity exists. |
+| `localOnly` | `false` | Use only local sessions without a relay. Requires `enabled: true`; without this flag, missing enrollment is reported as an error. |
 | `eventLogSize` | `4096` | Maximum retained bridge event-log entries. |
 | `endpoints` | `[]` | Webhook endpoint objects. |
 
@@ -104,6 +106,23 @@ Each webhook endpoint has:
 The default socket is `$XDG_RUNTIME_DIR/pi-famulus/client.sock` when `XDG_RUNTIME_DIR` is set; otherwise it is `pi-famulus-<uid>/client.sock` under the system temporary directory.
 
 A non-loopback `mcpListen` requires `mcpAllowNonLoopback: true` and a non-empty `mcpToken`. A webhook with a secret must use HTTPS or a loopback URL.
+
+### Hosted server enrollment
+
+Hosted servers exchange an operator-issued enrollment token for a per-device credential. A legacy shared token such as the old `dev-token` example is not a device credential.
+
+Register explicitly (this command works while messaging is disabled):
+
+```bash
+pi-famulus intercom enroll --server https://relay.example.com --token <enrollment-token>
+pi-famulus intercom device
+```
+
+Enrollment sends `device_id`, `name` (the hostname when unset), `token` and `client_version` to `POST /v1/enroll`. The returned device credential is saved privately in `messaging/device.json`, bound to that server, and is not printed. Registration does not enable messaging.
+
+For normal use, set `messaging.enabled` to `true` and `messaging.server` to the same server. Leave `messaging.token` empty; the bridge authenticates `/v1/relay` with the saved device credential. A credential saved for a different server is never used. Set `localOnly: true` explicitly if only same-machine messaging is wanted.
+
+`/famulus` distinguishes disabled messaging from connection failures and shows the latest relay error, including HTTP authentication failures. The plugin also reports failures without disabling shell, task or subagent features. Successful reconnection clears the previous connection error.
 
 ## Environment variables
 
