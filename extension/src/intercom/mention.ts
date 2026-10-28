@@ -8,7 +8,7 @@
 
 import type { SessionRow } from "./types";
 import { hostOf } from "./types";
-import { fuzzyFilter } from "./overlay";
+import { fuzzyFilter } from "./fuzzy";
 
 export type AutocompleteItem = {
   value: string;

@@ -27,12 +27,8 @@ import { ManagerClient, type MessagingStatus } from "../manager-client";
 import type { IntercomFrame, SessionRow } from "./types";
 import { createManagerTransport, IntercomError, type IntercomTransport } from "./transport";
 import { ChatCard, ChatText, formatTimestamp } from "./widgets";
-import {
-  ComposeOverlay,
-  type ComposeResult,
-  fuzzyFilter,
-  SessionListOverlay,
-} from "./overlay";
+import { ComposeOverlay, type ComposeResult, SessionListOverlay } from "./overlay";
+import { fuzzyFilter } from "./fuzzy";
 import type { AutocompleteItem, AutocompleteProvider } from "./mention";
 import { extractAgentMention, filterAgentItems } from "./mention";
 
