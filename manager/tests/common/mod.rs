@@ -517,11 +517,11 @@ impl Drop for Home {
                 }
             }
         }
+        // Not the bare pidfile value: once that daemon exits its pid can be
+        // another test's process. Every daemon a home starts (spawn, client
+        // autostart, handover exec) has `--home <path> daemon` in its argv.
         #[cfg(unix)]
         {
-            if let Some(pid) = self.pidfile_pid() {
-                kill_pid(pid, SIGKILL);
-            }
             for pid in daemon_pids_for(&self.path) {
                 kill_pid(pid, SIGKILL);
             }

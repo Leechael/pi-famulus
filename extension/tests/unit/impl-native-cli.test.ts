@@ -14,6 +14,12 @@ const HAS_NATIVE_PACKAGE = nativePackageName(process.platform, process.arch) !==
 const itNative = it.skipIf(!HAS_NATIVE_PACKAGE);
 
 let root = "";
+function emptyCache(): string {
+  if (!root) root = mkdtempSync(join(tmpdir(), "pi-famulus-native-cli-"));
+  const dir = join(root, "empty-cache");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
 afterEach(() => {
   if (root) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   root = "";
@@ -126,7 +132,8 @@ itPosix("forwards supervisor SIGTERM to a long-running native command without le
 it("missing optional dependencies give an actionable error instead of trying another version", () => {
   const result = spawnSync(process.execPath, [consumer(false), "--version"], {
     encoding: "utf8",
-    env: { ...process.env, PI_FAMULUS_NO_NATIVE_FETCH: "1" },
+    // An empty cache: an installed pi-famulus leaves a binary in the real one.
+    env: { ...process.env, PI_FAMULUS_NO_NATIVE_FETCH: "1", XDG_CACHE_HOME: emptyCache(), LOCALAPPDATA: emptyCache() },
   });
   expect(result.status).toBe(1);
   expect(result.stdout).toBe("");
