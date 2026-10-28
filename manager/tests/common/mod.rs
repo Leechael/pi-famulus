@@ -846,7 +846,7 @@ pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
 mod win {
     use std::collections::HashMap;
     use std::path::Path;
-    use std::process::Command;
+    use super::command;
     use std::sync::{Mutex, OnceLock};
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
