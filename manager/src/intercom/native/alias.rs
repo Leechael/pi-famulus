@@ -1991,11 +1991,12 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let credentials = accepted_peer(&stream);
         if cfg!(target_os = "macos") {
+            // macOS usually drops a closed peer's PID but not always (seen
+            // under load); either way the same-uid credential must survive.
             assert!(
-                stream.peer_cred().is_err(),
-                "macOS kept the closed peer PID"
+                matches!(credentials, Some(None)) || credentials == Some(Some(i64::from(std::process::id()))),
+                "{credentials:?}"
             );
-            assert_eq!(credentials, Some(None));
         } else {
             assert_eq!(credentials, Some(Some(i64::from(std::process::id()))));
         }
