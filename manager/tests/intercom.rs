@@ -252,8 +252,6 @@ impl Fixture {
                                 | std::io::ErrorKind::UnexpectedEof
                                 | std::io::ErrorKind::WouldBlock
                                 | std::io::ErrorKind::TimedOut
-                                // macOS: setsockopt on a socket the peer already closed.
-                                | std::io::ErrorKind::InvalidInput
                         ) => {}
                     Err(error) => panic!("bridge readiness RPC failed: {error}"),
                 }
@@ -485,14 +483,23 @@ impl Peer {
             })
     }
 
+    /// macOS fails setsockopt with EINVAL once the peer has closed, even
+    /// with its last reply still buffered. A closed peer cannot make the
+    /// next read or write block, so go on and let that call report the
+    /// buffered bytes, EOF or EPIPE.
+    fn set_timeout(result: std::io::Result<()>) -> std::io::Result<()> {
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            other => other,
+        }
+    }
+
     fn try_write(&mut self, value: &Value, deadline: Instant) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(value).unwrap();
         bytes.push(b'\n');
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
-            self.reader
-                .get_mut()
-                .set_write_timeout(Some(Self::remaining(deadline)?))?;
+            Self::set_timeout(self.reader.get_mut().set_write_timeout(Some(Self::remaining(deadline)?)))?;
             match self.reader.get_mut().write(remaining) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -516,9 +523,7 @@ impl Peer {
     fn try_read(&mut self, deadline: Instant) -> std::io::Result<Value> {
         let mut line = Vec::new();
         loop {
-            self.reader
-                .get_mut()
-                .set_read_timeout(Some(Self::remaining(deadline)?))?;
+            Self::set_timeout(self.reader.get_mut().set_read_timeout(Some(Self::remaining(deadline)?)))?;
             let available = match self.reader.fill_buf() {
                 Ok(available) => available,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -835,6 +840,25 @@ fn fixture_startup_requires_a_nonregistering_bridge_roundtrip() {
         readiness.recv_timeout(TIMEOUT).unwrap();
         waiter.join().unwrap();
     });
+}
+
+#[test]
+fn peer_reads_a_reply_the_bridge_wrote_before_closing() {
+    let (client, server) = UnixStream::pair().unwrap();
+    let mut peer = Peer::new(client);
+    let mut server = BufReader::new(server);
+    let reply = thread::spawn(move || {
+        let mut line = String::new();
+        server.read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        writeln!(server.get_mut(), "{}", json!({"id":request["id"],"ok":true})).unwrap();
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    peer.try_write(&json!({"id":"r1","op":"list"}), deadline).unwrap();
+    reply.join().unwrap();
+    // The bridge has closed; on macOS its reply is still buffered here.
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(peer.try_read(deadline).unwrap()["id"], "r1");
 }
 
 #[test]
