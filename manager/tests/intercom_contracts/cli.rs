@@ -743,21 +743,32 @@ fn online_status_prefers_connected_desktop_even_with_an_empty_catalog() {
                 .set_write_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
             while !stopping.load(Ordering::Acquire) {
+                // Poll only for a frame's first byte: the daemon writes the
+                // length and the body separately, and a stall between them
+                // must not unframe the stream.
                 let mut header = [0; 4];
-                match stream.read_exact(&mut header) {
-                    Ok(()) => {}
+                match stream.read(&mut header[..1]) {
+                    Ok(0) => break,
+                    Ok(_) => {}
                     Err(e)
                         if matches!(
                             e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
                         ) =>
                     {
                         continue
                     }
                     Err(_) => break,
                 }
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                stream.read_exact(&mut header[1..]).unwrap();
                 let mut bytes = vec![0; u32::from_le_bytes(header) as usize];
                 stream.read_exact(&mut bytes).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
                 let request: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(request["method"], "initialize");
                 let response = serde_json::to_vec(&json!({"type":"response","requestId":request["requestId"],"resultType":"success","method":"initialize","handledByClientId":"status-owner","result":{"clientId":"status-follower"}})).unwrap();
