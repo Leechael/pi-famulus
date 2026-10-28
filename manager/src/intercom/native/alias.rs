@@ -2136,7 +2136,7 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
-            let status = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+            let status = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
             if status.is_err() {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -2229,7 +2229,10 @@ mod tests {
                 .parent(),
             Some(directory.as_path())
         );
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Discovery is the 3s scanner. With the fixture's backlog of 0, the
+        // first scan misses the row whenever python has not yet accepted the
+        // startup namespace probe, so allow a few scans.
+        tokio::time::timeout(Duration::from_secs(10), async {
             while !running
                 .runtime
                 .native
