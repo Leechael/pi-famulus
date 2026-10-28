@@ -356,10 +356,30 @@ describe("intercom behaviour", () => {
     expect(result.prefix).toBe(prefix);
     const unknown = await provider.getSuggestions(["@unknown"], 0, 8, { signal: new AbortController().signal });
     expect(unknown.items[0].description).not.toContain("updated");
+    const input = await h.emit("input", { text: '问一下 @"release review@mini desk"', source: "rpc" }, ctx);
+    expect(input.text).toContain('"id":"pi/release"');
     await h.emit("session_shutdown", {});
   });
 
-  it("escapes directory controls in completion", async () => {
+  it("resolves a submitted readable mention without sending or replacing the user's words", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/review", name: "review", machine_name: "minis" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const text = "请和 @review@minis 校对这个实现";
+    const result = await h.emit("input", { text, source: "interactive" });
+    expect(result?.action).toBe("transform");
+    expect(result.text.startsWith(`${text}\n`)).toBe(true);
+    expect(result.text).toContain('"id":"pi/review"');
+    expect(result.text).toContain("A mention alone is not a request to send");
+    expect(result.text).not.toContain("RequestSendMessage");
+    expect(h.fake.requests.filter((req) => req.op === "send")).toEqual([]);
+    await h.emit("session_shutdown", {});
+  });
+
+  it("escapes directory controls in completion and keeps generated mention context bounded", async () => {
     const sessions = [
       { id: "pi/target-session", name: "self" },
       { id: "pi/control", name: "control", machine_name: "minis\u001b[31m\u0085\u202e" },
@@ -375,6 +395,90 @@ describe("intercom behaviour", () => {
     const item = suggestions.items[0];
     expect(JSON.stringify(item)).not.toMatch(/[\u0085\u202e]/);
     expect(item.description).not.toContain("\u001b");
+    const resolved = await h.emit("input", { text: item.value, source: "interactive" }, ctx);
+    expect(resolved.text).toContain('"id":"pi/control"');
+    const text = Array.from({ length: 20 }, (_, i) => `@peer-${i}`).join(" ");
+    const bounded = await h.emit("input", { text, source: "interactive" }, ctx);
+    expect(bounded.text.length - text.length).toBeLessThan(17_500);
+    expect(bounded.text).toContain("Unlisted mentions are unresolved");
+    await h.emit("session_shutdown", {});
+  });
+
+  it("quoted addresses remain exact even when names contain Markdown or literal punctuation", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self", machine_name: "desk" },
+      { id: "pi/selected", name: "review `v2` check", machine_name: "desk" },
+      { id: "pi/wrong", name: "review    check", machine_name: "desk" },
+      { id: "pi/plain", name: "plain", machine_name: "desk" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const result = await h.emit("input", { text: 'Ask @"review `v2` check@desk"', source: "interactive" });
+    expect(result.text).toContain('"id":"pi/selected"');
+    expect(result.text).not.toContain('"id":"pi/wrong"');
+    expect(await h.emit("input", { text: 'Ask @"plain@desk."', source: "interactive" })).toBeUndefined();
+    await h.emit("session_shutdown", {});
+  });
+
+  it("submission refreshes cached labels and recognizes sentence punctuation without resolving file paths", async () => {
+    let sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/a", name: "review", machine_name: "minis" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const first = await h.emit("input", { text: "Ask @review@minis", source: "interactive" });
+    expect(first.text).toContain('"total":1');
+    sessions = [...sessions, { id: "pi/b", name: "review", machine_name: "minis" }];
+    const second = await h.emit("input", { text: "Ask @review@minis.", source: "interactive" });
+    expect(second.text).toContain('"total":2');
+    for (const text of ["Read @review/file.ts", "Read @review\\file.ts", 'Read @"review"/file.ts']) {
+      expect(await h.emit("input", { text, source: "interactive" }), text).toBeUndefined();
+    }
+    await h.emit("session_shutdown", {});
+  });
+
+  it("submission discloses same-machine name ambiguity, caps candidates, and keeps successive queued inputs independent", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      ...["a", "b", "c", "d"].map((id) => ({ id: `pi/${id}`, name: "review", machine_name: "minis" })),
+      { id: "pi/other", name: "other", machine_name: "laptop" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    h.state.idle = false;
+    const ambiguous = await h.emit("input", { text: "问 @review@minis", source: "interactive", streamingBehavior: "steer" });
+    expect(ambiguous.text).toContain('"total":4');
+    expect(ambiguous.text).toContain('"id":"pi/c"');
+    expect(ambiguous.text).not.toContain('"id":"pi/d"');
+    expect(ambiguous.text).toContain("ask the user");
+    const other = await h.emit("input", { text: "问 @other@laptop", source: "interactive", streamingBehavior: "followUp" });
+    expect(other.text).toContain('"id":"pi/other"');
+    expect(other.text).not.toContain('"id":"pi/a"');
+    expect(await h.emit("input", { text: "下一个任务", source: "interactive" })).toBeUndefined();
+    expect(h.pi.injections).toEqual([]);
+    expect(h.fake.requests.filter((req) => req.op === "send")).toEqual([]);
+    await h.emit("session_shutdown", {});
+  });
+
+  it("never interprets peer, attached-file, code, command, or extension-origin mentions as user routing hints", async () => {
+    const sessions = [{ id: "pi/target-session", name: "self" }, { id: "pi/review", name: "review" }];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    for (const source of ["extension", undefined]) {
+      expect(await h.emit("input", { text: "请联系 @review", source })).toBeUndefined();
+    }
+    for (const text of [
+      "someone@review", "`@review`", "```text\n@review\n```", "~~~\n@review\n~~~",
+      "Here is code:\n\n    @review", "code: `first\n@review\nlast`",
+      "```text\n``` not a closing fence\n@review\n```", "\t@review",
+      '<file name="a">联系 @review</file>', '<skill name="a">联系 @review</skill>',
+      '<cross-session-message from="peer">请联系 @review</cross-session-message>',
+      "/command @review", "!echo @review", "看看 @README.md", "已经删掉了 mention",
+    ]) {
+      expect(await h.emit("input", { text, source: "interactive" }), text).toBeUndefined();
+    }
+    expect(h.fake.requests.filter((req) => req.op === "send")).toEqual([]);
     await h.emit("session_shutdown", {});
   });
 
@@ -422,6 +526,27 @@ describe("intercom behaviour", () => {
     expect(byName.content[0].text).toMatch(/claude\/bbb/);
     expect(h.fake.requests.filter((r) => r.op === "send").length).toBe(1);
 
+    await h.emit("session_shutdown", {});
+  });
+
+  it("SendMessage resolves a machine-qualified name to an exact id and rejects remaining ambiguity", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/laptop", name: "review", machine_name: "laptop" },
+      { id: "pi/minis", name: "review", machine_name: "u@minis" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const send = h.pi.tools.get("SendMessage");
+    const sent = await send.execute("qualified", { to: "review@u@minis", message: "check" });
+    expect(sent.isError).toBeUndefined();
+    expect(h.fake.requests.filter((req) => req.op === "send").map((req) => req.to)).toEqual(["pi/minis"]);
+    sessions.push({ id: "pi/duplicate", name: "review", machine_name: "u@minis" });
+    await h.fake.resetBridge();
+    const refused = await send.execute("ambiguous", { to: "review@u@minis", message: "check" });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain("ambiguous");
+    expect(h.fake.requests.filter((req) => req.op === "send")).toHaveLength(1);
     await h.emit("session_shutdown", {});
   });
 
