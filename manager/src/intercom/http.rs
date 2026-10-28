@@ -1051,7 +1051,7 @@ pub async fn inspect_message(c: &Config, id: &str) -> Result<(), String> {
     url.path_segments_mut()
         .map_err(|_| "invalid URL")?
         .extend(["v1", "messages", id]);
-    let client = reqwest::Client::builder()
+    let client = super::config::http_client()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -1073,7 +1073,7 @@ pub async fn inspect_message(c: &Config, id: &str) -> Result<(), String> {
 pub async fn inspect_events(c: &Config, mut since: u64, follow: bool) -> Result<(), String> {
     loop {
         let (url, token) = inspect_config(c)?;
-        let client = reqwest::Client::builder()
+        let client = super::config::http_client()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()

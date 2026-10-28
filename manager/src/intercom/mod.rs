@@ -1318,6 +1318,20 @@ mod tests {
         }
     }
 
+    /// The tool probe and the Herdr endpoint resolve inside the test
+    /// environment (hermetic.rs): no host tool is found, so none runs, and
+    /// Herdr is looked for under the test's own HOME.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_probe_and_herdr_socket_stay_inside_the_test_environment() {
+        for (tool, probe) in tool_versions().await {
+            assert!(probe.is_none(), "the probe found host {tool}: {probe:?}");
+        }
+        let socket = herdr::socket_path();
+        assert!(socket.starts_with(config::home()), "{}", socket.display());
+        assert!(!socket.exists(), "{}", socket.display());
+    }
+
     #[test]
     fn hosted_runtime_prefers_same_server_saved_credential_over_bootstrap_token() {
         let mut cfg = Config {

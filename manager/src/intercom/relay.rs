@@ -1410,7 +1410,7 @@ fn webhook_client() -> Result<reqwest::Client, String> {
     .map_err(|error| error.to_string())?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    reqwest::Client::builder()
+    super::config::http_client()
         .use_preconfigured_tls(tls)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))

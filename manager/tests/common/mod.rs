@@ -22,6 +22,9 @@
 
 #![allow(dead_code)]
 
+/// The test binary's environment: decided here, not by the host.
+#[path = "../../src/hermetic.rs"]
+pub mod hermetic;
 pub mod kit;
 
 use serde_json::{json, Value};
@@ -1791,7 +1794,9 @@ pub const HOST_TOOLS: [&str; 4] = ["claude", "pi", "herdr", "codex"];
 /// PATH itself: without this, each suite run executed the developer's real
 /// tools hundreds of times, and status assertions depended on what was
 /// installed and how fast it answered. A test that wants host tools sets
-/// PATH from `std::env::var_os("PATH")` explicitly.
+/// PATH from [`hermetic::host_path`] explicitly. On Unix the test binary
+/// already starts with such a PATH (see `src/hermetic.rs`); this keeps
+/// Windows, where it does not, covered.
 ///
 /// A PATH directory holding one of those names is replaced, in place, by a
 /// per-process directory of symlinks to everything else in it. Dropping

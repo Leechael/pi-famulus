@@ -191,9 +191,11 @@ mod tests {
 mod spawn_guard {
     #[test]
     fn every_spawn_goes_through_sys_command() {
-        const ALLOWED: [(&str, &str); 2] = [
-            ("unix.rs", concat!("let mut cmd = std::process::Command", "::new(program);")),
-            ("windows.rs", concat!("std::process::Command", "::new(program)")),
+        // hermetic.rs: the test binary re-executing itself before `main`.
+        const ALLOWED: [(&str, &str); 3] = [
+            ("sys/unix.rs", concat!("let mut cmd = std::process::Command", "::new(program);")),
+            ("sys/windows.rs", concat!("std::process::Command", "::new(program)")),
+            ("src/hermetic.rs", concat!("let mut cmd = std::process::Command", "::new(exe);")),
         ];
         fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
             for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -202,11 +204,9 @@ mod spawn_guard {
                     scan(&p, hits);
                 } else if p.extension().is_some_and(|x| x == "rs") {
                     let text = std::fs::read_to_string(&p).unwrap();
-                    let in_sys = p.parent().is_some_and(|d| d.ends_with("sys"));
                     for (i, line) in text.lines().enumerate() {
                         let line = line.trim();
-                        let allowed = in_sys
-                            && ALLOWED.iter().any(|(f, l)| p.file_name().is_some_and(|n| n == *f) && line == *l);
+                        let allowed = ALLOWED.iter().any(|(f, l)| p.ends_with(f) && line == *l);
                         let spawn = line.contains(concat!("Command", "::new(")) || line.contains(concat!("Command", "::from("));
                         if spawn && !allowed {
                             hits.push(format!("{}:{}: {}", p.display(), i + 1, line));

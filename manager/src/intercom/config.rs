@@ -37,6 +37,7 @@ fn hmac_auth() -> String {
 impl Default for Config {
     fn default() -> Self {
         let home = home();
+        #[cfg(not(test))]
         let sock = std::env::var_os("XDG_RUNTIME_DIR")
             .map(|v| PathBuf::from(v).join("pi-famulus/client.sock"))
             .unwrap_or_else(|| {
@@ -46,6 +47,10 @@ impl Default for Config {
                 let uid = 0;
                 std::env::temp_dir().join(format!("pi-famulus-{uid}/client.sock"))
             });
+        // The default above is where this machine's own client daemon
+        // listens (tests keep TMPDIR); a test's default is in its HOME.
+        #[cfg(test)]
+        let sock = home.join("pi-famulus/client.sock");
         Self {
             enabled: false,
             server: "https://127.0.0.1:8443".into(),
@@ -116,6 +121,18 @@ pub fn hostname() -> String {
         }
     }
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into())
+}
+/// Every HTTP client starts here (guarded by
+/// `every_http_client_starts_at_http_client`). Under test it ignores
+/// `HTTP_PROXY` & co.: the servers tests talk to are local, and a proxy in
+/// the developer's or the runner's environment must not decide whether they
+/// are reached. (Unix test binaries also start without those variables, see
+/// `hermetic.rs`; Windows ones do not.)
+pub fn http_client() -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder
 }
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -241,7 +258,7 @@ impl Config {
         Ok(())
     }
     pub fn http(&self) -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
+        http_client()
             .danger_accept_invalid_certs(self.tls_insecure)
             .min_tls_version(reqwest::tls::Version::TLS_1_3)
             .redirect(reqwest::redirect::Policy::none())
@@ -508,5 +525,81 @@ mod tests {
         let error = generated_mcp_token(&dir).unwrap_err();
         assert!(error.contains("0600"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_http_client_starts_at_http_client() {
+        fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    scan(&p, hits);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    for (i, line) in text.lines().enumerate() {
+                        let line = line.trim();
+                        let allowed = p.ends_with("intercom/config.rs")
+                            && line == concat!("let builder = reqwest::Client", "::builder();");
+                        let client = [
+                            concat!("reqwest::Client", "::builder("),
+                            concat!("reqwest::Client", "::new("),
+                            concat!("ClientBuilder", "::new("),
+                        ]
+                        .iter()
+                        .any(|needle| line.contains(needle));
+                        if client && !allowed {
+                            hits.push(format!("{}:{}: {}", p.display(), i + 1, line));
+                        }
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        scan(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hits);
+        assert!(hits.is_empty(), "build HTTP clients with intercom::config::http_client:\n{}", hits.join("\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_http_clients_ignore_proxy_variables() {
+        // The test process has no proxy variables (hermetic.rs), so the
+        // check runs in a child that has them and skips the re-exec, as a
+        // Windows test binary would.
+        const CHILD: &str = "PI_FAMULUS_TEST_PROXY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let direct = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", direct.local_addr().unwrap());
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut stream, _) = direct.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let reply = b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\ndirect";
+                stream.write_all(reply).await.unwrap();
+            });
+            let response = http_client().build().unwrap().get(&url).send().await;
+            let body = response.unwrap().text().await.unwrap();
+            assert_eq!(body, "direct");
+            return;
+        }
+        // Port 9 refuses connections: a client that took the proxy fails.
+        let proxy = "http://127.0.0.1:9";
+        let output = crate::sys::command_std(std::env::current_exe().unwrap())
+            .args(["--exact", "intercom::config::tests::test_http_clients_ignore_proxy_variables"])
+            .env(CHILD, "1")
+            .env(crate::hermetic::MARKER_ENV, "1")
+            .envs(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"].map(|k| (k, proxy)))
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed"), "the child ran no test:\n{stdout}");
+        assert!(
+            output.status.success(),
+            "an HTTP client under test went through the environment's proxy:\n{}\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
