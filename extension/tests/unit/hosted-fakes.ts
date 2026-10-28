@@ -302,7 +302,12 @@ export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: ()
 
 /**
  * Load the extension on a fake pi and start a session. The calling test file
- * must mock `../../src/manager-client` with FakeHostedManager.
+ * must mock `../../src/manager-client` with FakeHostedManager, and should
+ * also `import "../../src/index"` at top level: the first import of the
+ * extension graph takes seconds on a loaded runner (4.5s locally with every
+ * worker transforming, more on Windows CI), and done here it would land
+ * inside the first test's 5s timeout. Imported at collection time, the
+ * dynamic import below is a cache hit.
  */
 export async function startHostedExtension(opts: { sessionId: string; cwd: string; idle?: () => boolean; reason?: string; mode?: string }) {
   const pi = fakeHostPi();
