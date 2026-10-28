@@ -51,6 +51,10 @@ fn stable_install_survives_rename_delete_and_reinstall() {
     let stable = install_layout(&home, "pi-famulus-linux-x64");
     let daemon = home.start_daemon_from(&stable, &[]);
     let pid = home.pidfile_pid().unwrap();
+    // Copying the binary below can outlast the 5s idle grace on a loaded
+    // runner (real clock): hold the daemon until `start_shell` connects.
+    let mut hold = home.connect();
+    hold.hello_cli();
     let retired = home.path.join("node_modules/.pi-famulus-linux-x64-AWM9wakS");
     fs::rename(stable.parent().unwrap().parent().unwrap(), &retired).unwrap();
     fs::remove_dir_all(&retired).unwrap();
@@ -59,6 +63,7 @@ fn stable_install_survives_rename_delete_and_reinstall() {
     // npm installs the new stable package before the next upgrade attempt.
     let _new = install_layout(&home, "pi-famulus-linux-x64");
     start_shell(&home);
+    drop(hold);
     assert_upgrade(&home);
     drop(daemon);
 }
@@ -119,9 +124,13 @@ fn daemon_started_mid_reinstall_re_resolves_its_executable() {
     let home = Home::new("mid-reinstall");
     let retired = install_layout(&home, ".pi-famulus-linux-x64-AWM9wakS");
     let daemon = home.start_daemon_from(&retired, &[]);
+    // See stable_install_survives_rename_delete_and_reinstall.
+    let mut hold = home.connect();
+    hold.hello_cli();
     fs::remove_dir_all(retired.parent().unwrap().parent().unwrap()).unwrap();
     let stable = install_layout(&home, "pi-famulus-linux-x64");
     start_shell(&home);
+    drop(hold);
     assert_upgrade(&home);
     assert!(stable.is_file());
     drop(daemon);

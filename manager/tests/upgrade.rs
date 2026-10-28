@@ -350,8 +350,13 @@ fn u6_failed_restore_cleans_up_like_a_crash() {
     let mut c = home.connect();
     hello(&mut c, "sess-u6");
     let (task_id, pid) = start(&mut c, "shell", "sleep 300 & sleep 300", json!({}));
-    std::thread::sleep(Duration::from_millis(300));
-    let members = group(pid);
+    // Wait for the whole group to exist: a fixed pause missed the
+    // background sleep on a loaded runner.
+    let mut members = Vec::new();
+    poll_true(s(10), || {
+        members = group(pid);
+        members.len() >= 3
+    });
     assert!(
         members.len() >= 3,
         "runner, sh, sleeps: {members:?}\n{}",
@@ -403,8 +408,13 @@ fn u8_kill_grace_carries_over() {
     let _d = home.start_daemon_from(&bin, &[]);
     let mut c = home.connect();
     hello(&mut c, "sess-u8");
-    let (t, pid) = start(&mut c, "shell", "trap '' TERM; sleep 300 & wait; sleep 300", json!({}));
-    std::thread::sleep(Duration::from_millis(300));
+    let (t, pid) = start(&mut c, "shell", "trap '' TERM; sleep 300 & echo armed; wait; sleep 300", json!({}));
+    // The stop must find the trap installed: a fixed pause could send
+    // SIGTERM to a shell that had not run `trap` yet on a loaded runner.
+    assert!(
+        poll_true(s(10), || c.task(&t).and_then(|r| r["output_size"].as_u64()).unwrap_or(0) > 0),
+        "task never armed its SIGTERM trap"
+    );
     c.request_ok(json!({"type":"stop","task_id":t}));
     assert!(upgrade(&home).status.success());
     let members = group(pid);
