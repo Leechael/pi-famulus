@@ -860,7 +860,12 @@ fn fixture_startup_retries_a_bridge_closed_during_upgrade() {
         for attempt in 0..2 {
             let stream = loop {
                 match listener.accept() {
-                    Ok((stream, _)) => break stream,
+                    // BSD-derived systems inherit O_NONBLOCK from the listener;
+                    // the probe may not have written its request yet.
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        break stream;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             !waiter.is_finished(),
