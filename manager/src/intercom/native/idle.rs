@@ -1073,13 +1073,7 @@ async fn send_physical_idle(
     if committed > 0 {
         // Once any bytes may be committed, cancellation only stops writing.
         // Full peer EOF within the original budget is the ordering fence.
-        let drain = tokio::time::timeout_at(deadline, async {
-            stream.shutdown().await?;
-            tokio::io::copy(&mut stream, &mut tokio::io::sink())
-                .await
-                .map(|_| ())
-        })
-        .await;
+        let drain = tokio::time::timeout_at(deadline, prove_peer_close(&mut stream)).await;
         match drain {
             Ok(Ok(())) => {}
             Ok(Err(cause)) => {
@@ -1104,6 +1098,21 @@ async fn send_physical_idle(
         error = Some("native idle send cancelled".into());
     }
     SendOutcome { error, debt: false }
+}
+
+#[cfg(unix)]
+async fn prove_peer_close(stream: &mut tokio::net::UnixStream) -> std::io::Result<()> {
+    if let Err(error) = stream.shutdown().await {
+        // Darwin returns ENOTCONN if the peer closed after consuming the frame
+        // but before our half-close. Still require read EOF as the fence;
+        // shutdown's error alone is not proof that the peer consumed the frame.
+        if error.kind() != std::io::ErrorKind::NotConnected {
+            return Err(error);
+        }
+    }
+    tokio::io::copy(stream, &mut tokio::io::sink())
+        .await
+        .map(|_| ())
 }
 
 #[cfg(unix)]
@@ -2535,6 +2544,25 @@ mod tests {
             .await
             .unwrap_err()
             .contains("ordering"));
+    }
+
+    // Regression: a native peer may consume the request and close before the
+    // sender gets to half-close; Darwin then reports ENOTCONN from shutdown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn peer_closed_before_half_close_still_proves_idle_write_ordering() {
+        use tokio::io::AsyncReadExt;
+        let (mut sender, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let request = b"{\"type\":\"control\",\"action\":\"notify_when_idle\"}\n";
+        sender.write_all(request).await.unwrap();
+        let mut received = vec![0; request.len()];
+        peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, request);
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), prove_peer_close(&mut sender))
+            .await
+            .expect("an already closed peer must not stall the ordering fence")
+            .expect("peer close before local half-close must provide ordering proof");
     }
 
     #[cfg(unix)]
