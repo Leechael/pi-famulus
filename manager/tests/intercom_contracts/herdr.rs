@@ -716,15 +716,18 @@ impl RoutingRelay {
                 thread::spawn(move || {
                     stream.set_nonblocking(false).unwrap();
                     stream.set_nodelay(true).unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(2)))
-                        .unwrap();
+                    // Poll briefly only after the upgrade: a short timeout
+                    // during it interrupts a request that arrives late.
+                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                     stream
                         .set_write_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
                     let Ok(mut ws) = tokio_tungstenite::tungstenite::accept(stream) else {
                         return;
                     };
+                    ws.get_mut()
+                        .set_read_timeout(Some(Duration::from_millis(2)))
+                        .unwrap();
                     let (outgoing, outbound) = mpsc::channel::<Value>();
                     let mut own_machine = String::new();
                     while !stopped.load(Ordering::Relaxed) {

@@ -482,9 +482,12 @@ impl StatusCodex {
                 }
                 let (state, history, stopping) = (state.clone(), history.clone(), stopping.clone());
                 clients.push(thread::spawn(move || {
-                    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                    // A short read timeout during the upgrade interrupts a
+                    // request that arrives late; poll briefly only afterwards.
+                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                     stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
                     let Ok(mut ws) = tokio_tungstenite::tungstenite::accept(stream) else { return; };
+                    ws.get_mut().set_read_timeout(Some(Duration::from_millis(100))).unwrap();
                     while !stopping.load(Ordering::Acquire) {
                         let message = match ws.read() {
                             Ok(message) => message,
