@@ -14,6 +14,7 @@ const LABEL: &str = "com.pi-famulus.client";
 const BINARY_NAME: &str = "pi-famulus";
 const READY_WAIT: Duration = Duration::from_secs(5);
 const READY_INTERVAL: Duration = Duration::from_millis(200);
+const LOGIN_SHELL_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct Status {
@@ -757,9 +758,9 @@ async fn login_shell_path() -> Vec<PathBuf> {
     let Some(shell) = std::env::var_os("SHELL").filter(|v| !v.is_empty()) else {
         return Vec::new();
     };
-    read_login_shell_path(&shell).await
+    read_login_shell_path(&shell, LOGIN_SHELL_WAIT).await
 }
-async fn read_login_shell_path(shell: &std::ffi::OsStr) -> Vec<PathBuf> {
+async fn read_login_shell_path(shell: &std::ffi::OsStr, wait: Duration) -> Vec<PathBuf> {
     use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new(shell);
     cmd.args(["-lic", "printf '\\n__PI_FAMULUS_PATH__%s\\n' \"$PATH\""])
@@ -779,7 +780,7 @@ async fn read_login_shell_path(shell: &std::ffi::OsStr) -> Vec<PathBuf> {
             let _ = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
         };
         tokio::pin!(read);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + wait;
         tokio::select! {
             _ = &mut read => {
                 if tokio::time::timeout_at(deadline, child.wait()).await.is_err() {
@@ -1740,12 +1741,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let shell = dir.join("shell");
-        std::fs::write(&shell, "#!/bin/sh\nprintf '\\n__PI_FAMULUS_PATH__/from/login:/bin\\n'\nexec /bin/sleep 5\n").unwrap();
+        std::fs::write(&shell, "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nprintf '\\n__PI_FAMULUS_PATH__/from/login:/bin\\n'\nexec /bin/sleep 30\n").unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // macOS checks a new executable on its first run (hundreds of ms, more
+        // under load), so the timed run below must not be the first.
+        assert!(std::process::Command::new(&shell).arg("warm").status().unwrap().success());
+        // The shell prints at once and then outlives the wait, which only has
+        // to be long against starting a shell.
+        let started = std::time::Instant::now();
         assert_eq!(
-            read_login_shell_path(shell.as_os_str()).await,
+            read_login_shell_path(shell.as_os_str(), Duration::from_secs(5)).await,
             vec![PathBuf::from("/from/login"), PathBuf::from("/bin")]
         );
+        assert!(started.elapsed() < Duration::from_secs(30), "the wait must end before the shell does");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
