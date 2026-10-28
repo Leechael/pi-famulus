@@ -494,12 +494,10 @@ impl Drop for Home {
         // Windows reuses a finished task's pid within seconds, so killing
         // recorded pids there can hit another test's live process. Killing
         // the daemon below is enough: its kill-on-close jobs take every task
-        // tree with it.
+        // tree with it. Unix reuses pids too: see `owned_task_groups`.
         #[cfg(unix)]
-        for r in self.records() {
-            if let Some(pid) = r["pid"].as_u64() {
-                kill_group(pid as u32, SIGKILL);
-            }
+        for pid in self.owned_task_groups() {
+            kill_group(pid, SIGKILL);
         }
         for p in &self.extra_pids {
             kill_pid(*p, SIGKILL);
@@ -531,6 +529,79 @@ impl Drop for Home {
         }
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(unix)]
+impl Home {
+    /// The recorded task process groups that are this home's right now,
+    /// with this home's daemons stopped (SIGSTOP) so they stay so until
+    /// [`Home::drop`] has killed them and then the daemons.
+    ///
+    /// A record's `pid` names its task's group only while that group
+    /// exists. Once it has emptied, the kernel may hand the number to a
+    /// concurrently running test's task, which leads a group as well, and
+    /// a group kill would take that test's processes down. The task runner
+    /// leads its group for the group's whole life (it stays as guardian
+    /// while a leftover `cmd &` remains, src/runner.rs), and only its daemon
+    /// reaps it. So a group is this home's exactly when its leader is a
+    /// child of one of this home's daemons, and a stopped daemon cannot
+    /// reap, so that stays true while the groups are killed.
+    ///
+    /// Runners whose daemon is already gone are not reached here: their
+    /// lifeline broke, and they take their own group down (SIGTERM, the 2 s
+    /// grace, SIGKILL; D4/T7/T8).
+    fn owned_task_groups(&self) -> Vec<u32> {
+        let daemons = daemon_pids_for(&self.path);
+        if daemons.is_empty() {
+            return Vec::new();
+        }
+        for &daemon in &daemons {
+            kill_pid(daemon, libc::SIGSTOP);
+        }
+        // SIGSTOP takes effect asynchronously; a daemon that has exited
+        // meanwhile is a zombie or gone, and its children are no longer its.
+        let mut table = process_table();
+        poll_true(Duration::from_secs(1), || {
+            table = process_table();
+            daemons.iter().all(|d| table.iter().all(|p| p.pid != *d || p.stat.starts_with(['T', 'Z'])))
+        });
+        let mut groups: Vec<u32> = self
+            .records()
+            .iter()
+            .filter_map(|r| r["pid"].as_u64().map(|p| p as u32))
+            .filter(|pid| table.iter().any(|p| p.pid == *pid && daemons.contains(&p.ppid)))
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+}
+
+/// One `ps` row: [`process_table`].
+#[cfg(unix)]
+pub struct ProcessRow {
+    pub pid: u32,
+    pub ppid: u32,
+    pub stat: String,
+}
+
+/// Every process's pid, parent and state, in one `ps` snapshot.
+#[cfg(unix)]
+pub fn process_table() -> Vec<ProcessRow> {
+    let Ok(o) = command("ps").args(["-axo", "pid=,ppid=,stat="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut cols = l.split_whitespace();
+            Some(ProcessRow {
+                pid: cols.next()?.parse().ok()?,
+                ppid: cols.next()?.parse().ok()?,
+                stat: cols.next()?.to_string(),
+            })
+        })
+        .collect()
 }
 
 impl Home {
@@ -1709,9 +1780,86 @@ pub fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Comman
     command
 }
 
+/// The host coding tools the manager probes with `--version` on PATH
+/// (`tool_versions` in src/intercom/mod.rs). Tests never run the host's
+/// copies; see [`tool_free_path`].
+pub const HOST_TOOLS: [&str; 4] = ["claude", "pi", "herdr", "codex"];
+
+/// The test process's PATH with no `claude`, `pi`, `herdr` or `codex` on
+/// it, and every other program still where it was. [`command`] gives it to
+/// every child, so the manager's tool probe finds only what a test puts on
+/// PATH itself: without this, each suite run executed the developer's real
+/// tools hundreds of times, and status assertions depended on what was
+/// installed and how fast it answered. A test that wants host tools sets
+/// PATH from `std::env::var_os("PATH")` explicitly.
+///
+/// A PATH directory holding one of those names is replaced, in place, by a
+/// per-process directory of symlinks to everything else in it. Dropping
+/// the directory instead would also drop what the tests and the manager
+/// need beside the tool (`sh`, `python3`, `ps`, `openssl`... in
+/// /usr/bin or /opt/homebrew/bin, where a package may well have put `pi`).
+/// Names match case-insensitively, as on the default macOS file system.
+/// Windows: symlinks need a privilege CI lacks, so such a directory is
+/// dropped; there the tools live in their own install directories.
+pub fn tool_free_path() -> &'static std::ffi::OsStr {
+    static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let host = std::env::var_os("PATH").unwrap_or_default();
+        #[cfg(unix)]
+        let mirrors = std::env::temp_dir().join(format!("pi-famulus-path-{}", std::process::id()));
+        #[cfg(unix)]
+        remove_dead_path_mirrors(&mirrors);
+        let is_tool = |name: &std::ffi::OsStr| {
+            name.to_str().is_some_and(|name| HOST_TOOLS.iter().any(|tool| name.eq_ignore_ascii_case(tool)))
+        };
+        let mut dirs = Vec::new();
+        for (index, dir) in std::env::split_paths(&host).enumerate() {
+            let entries: Vec<std::ffi::OsString> = match fs::read_dir(&dir) {
+                Ok(entries) => entries.flatten().map(|e| e.file_name()).collect(),
+                Err(_) => {
+                    dirs.push(dir);
+                    continue;
+                }
+            };
+            if !entries.iter().any(|name| is_tool(name)) {
+                dirs.push(dir);
+                continue;
+            }
+            #[cfg(unix)]
+            if dir.is_absolute() {
+                let mirror = mirrors.join(index.to_string());
+                fs::create_dir_all(&mirror).expect("create tool-free PATH directory");
+                for name in entries.iter().filter(|name| !is_tool(name)) {
+                    let _ = std::os::unix::fs::symlink(dir.join(name), mirror.join(name));
+                }
+                dirs.push(mirror);
+            }
+            #[cfg(not(unix))]
+            let _ = index;
+        }
+        std::env::join_paths(dirs).expect("rebuild PATH")
+    })
+}
+
+/// Mirrors [`tool_free_path`] left by test processes that have exited.
+#[cfg(unix)]
+fn remove_dead_path_mirrors(own: &Path) {
+    let (Some(parent), Some(own_name)) = (own.parent(), own.file_name()) else { return };
+    let Ok(entries) = fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("pi-famulus-path-")) else { continue };
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        if name != own_name && !pid_alive(pid) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Every process a test spawns goes through here (enforced by
 /// `test_spawns_inherit_only_stdio` in lifecycle_adversarial.rs): the child
-/// inherits only stdin, stdout and stderr.
+/// inherits only stdin, stdout and stderr, and has [`tool_free_path`] for
+/// PATH unless the caller sets another.
 ///
 /// Tests run in parallel threads of one process. On macOS std creates pipes
 /// and sockets close-on-exec in two steps (`pipe()`, then `fcntl`), so a
@@ -1722,8 +1870,8 @@ pub fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Comman
 /// meanwhile. Linux uses `pipe2(O_CLOEXEC)`, so it cannot happen there.
 /// The production spawns guard the same window (`sys::unix::child_setup`).
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut cmd = Command::new(program);
+    cmd.env("PATH", tool_free_path());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

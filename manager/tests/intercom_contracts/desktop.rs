@@ -57,9 +57,7 @@ impl Desktop {
         fs::write(&codex, "#!/bin/sh\nprintf 'codex-fixture 1.0\\n'\n").unwrap();
         fs::set_permissions(codex, fs::Permissions::from_mode(0o755)).unwrap();
         let mut paths = vec![directory.clone()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
+        paths.extend(std::env::split_paths(common::tool_free_path()));
         let search_path = std::env::join_paths(paths).unwrap().into_string().unwrap();
         let path = directory.join("ipc.sock");
         let listener = common::bind_private_unix(&path);

@@ -86,7 +86,7 @@ fn absent_codex_host_never_launches_an_app_server_or_claims_idle_threads() {
     let path = format!(
         "{}:{}",
         bin.display(),
-        std::env::var("PATH").unwrap_or_default()
+        common::tool_free_path().to_str().unwrap()
     );
     fixture.start_with(&[], &[("PATH", &path)]);
     assert!(!fixture.sessions().iter().any(|s| s["harness"] == "codex"));

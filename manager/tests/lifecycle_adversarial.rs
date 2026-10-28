@@ -2293,6 +2293,54 @@ fn h1b_every_test_spawn_goes_through_common_command() {
     assert!(hits.is_empty(), "spawn through common::command instead:\n{}", hits.join("\n"));
 }
 
+/// H2: `Home::drop` kills the process groups its home owns and no other.
+/// A finished task's recorded pid can name another test's group by then:
+/// tasks lead their own groups and tests run in parallel. Here a record
+/// names a live group the home never started, the state pid reuse leaves;
+/// the old drop SIGKILLed it. The home's own groups, a running task and a
+/// finished task's leftover child, are still gone when the drop returns.
+#[test]
+fn h2_home_drop_kills_only_groups_it_owns() {
+    use std::os::unix::process::CommandExt;
+    let home = Home::new("h2");
+    let d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    // Both ignore SIGTERM: a runner whose lifeline breaks (the daemon is
+    // killed last) would take them down only after its 2 s grace.
+    let (_, runner) = c.start("sh -c \"trap '' TERM; exec sleep 300\"");
+    let (left, guardian) = c.start("sh -c \"trap '' TERM; exec sleep 300\" >/dev/null 2>&1 & echo $!");
+    let leftover = wait_for_pids(&mut c, &left, 1)[0];
+    assert_eq!(c.wait_terminal(&left, S(3)).unwrap()["status"], "completed");
+    let mut foreign = KillOnDrop(Some(
+        common::command("/bin/sleep").arg("300").process_group(0).spawn().unwrap(),
+    ));
+    let foreign_pid = foreign.0.as_ref().unwrap().id();
+    let dir = home.path.join("sessions/sess-reused/tasks");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("reused.json"),
+        json!({"task_id":"reused","session_id":"sess-reused","pid":foreign_pid,"status":"completed"}).to_string(),
+    )
+    .unwrap();
+    drop(c);
+    drop(d);
+    drop(home);
+    assert!(
+        foreign.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "Home::drop killed group {foreign_pid}, which it never started"
+    );
+    // Runners first: a failure here kills their groups, leftover included.
+    for pid in [runner, guardian, leftover] {
+        let dead = poll_true(Duration::from_millis(1500), || !pid_running(pid));
+        if !dead {
+            kill_group(pid, libc::SIGKILL);
+            kill_pid(pid, libc::SIGKILL);
+        }
+        assert!(dead, "{pid} outlived Home::drop");
+    }
+}
+
 /// S6: a connection the daemon closes (session rebind) is seen as closed
 /// by its client right away, even while tasks are being spawned around that
 /// moment and keep running. A task that inherited a copy of the connection
