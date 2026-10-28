@@ -271,89 +271,12 @@ describe("intercom behaviour", () => {
     await h.emit("session_shutdown", {}, ctx);
   });
 
-  it("/intercom opens an interactive session overlay and sends to the selected peer", async () => {
-    const dir = makeTempDir("fam-ic-");
-    cleanups.push(dir.cleanup);
-    const sessions = [
-      { id: "pi/self-session", name: "self-pi", harness: "pi", status: "idle", cwd: dir.dir, updated_at: Date.now() },
-      { id: "claude/worker", name: "worker", harness: "claude", status: "busy", cwd: "/repo", updated_at: Date.now() - 2 * 60 * 60 * 1000 },
-      { id: "pi/docs", name: "docs", harness: "pi", status: "idle", cwd: "/docs", updated_at: Date.now() - 30 * 1000 },
-    ];
-    const h = harness({ reply: (req) => (req.op === "list" ? { sessions } : undefined) });
-    const notices: { message: string; level?: string }[] = [];
-    const overlays: any[] = [];
-    const keybindings = {
-      matches: (data: string, id: string) => ({
-        "tui.select.cancel": "\x1b",
-        "tui.select.confirm": "\r",
-        "tui.select.up": "\x1b[A",
-        "tui.select.down": "\x1b[B",
-        "tui.editor.deleteCharBackward": "\x7f",
-      })[id] === data,
-      getKeys: (id: string) => (id === "tui.select.confirm" ? ["Enter"] : ["Esc"]),
-    };
-    const theme = { fg: (_c: string, v: string) => v, bold: (v: string) => v };
-    const tui = { requestRender() {} };
-    const ctx = {
-      ...h.ctx,
-      hasUI: true,
-      mode: "tui",
-      ui: {
-        notify: (message: string, level: string) => notices.push({ message, level }),
-        custom(factory: any, options: any) {
-          let resolveDone: any;
-          const result = new Promise((resolve) => {
-            resolveDone = resolve;
-          });
-          const component = factory(tui, theme, keybindings, (value: any) => resolveDone(value));
-          overlays.push({ component, options });
-          if (overlays.length === 1) {
-            overlays[0].initial = component.render(88).join("\n");
-            component.handleInput("/");
-            component.handleInput("w");
-            component.handleInput("o");
-            overlays[0].rendered = component.render(88).join("\n");
-            component.handleInput("\r");
-          } else {
-            component.handleInput("h");
-            component.handleInput("i");
-            overlays[1].rendered = component.render(72).join("\n");
-            component.handleInput("\r");
-          }
-          return result;
-        },
-      },
-    };
-    h.pi.sessionName = "self-pi";
-    await h.emit("session_start", {}, ctx);
-
-    const intercom = h.pi.commands.get("intercom")!;
-    await intercom.handler("", ctx);
-
-    expect(overlays.length).toBe(2);
-    expect(overlays[0].options.overlay).toBe(true);
-    expect(overlays[0].options.overlayOptions.width).toBe(88);
-    expect(overlays[0].rendered).toMatch(/Current Session/);
-    expect(overlays[0].rendered).toMatch(/Other Sessions/);
-    expect(overlays[0].initial).toMatch(/worker \(claude\/w\)/);
-    expect(overlays[0].initial).toMatch(/docs \(pi\/docs\)/);
-    expect(overlays[0].rendered).toMatch(/Filter: wo/);
-    expect(overlays[0].rendered).toMatch(/worker \(claude\/w\)/);
-    expect(overlays[0].rendered).not.toMatch(/docs \(pi\/docs\)/);
-    expect(overlays[0].rendered).toMatch(/2h ago/);
-    expect(overlays[1].options.overlayOptions.width).toBe(72);
-    expect(overlays[1].rendered).toMatch(/Send to: worker/);
-    expect(overlays[1].rendered).toMatch(/> hi/);
-
-    const sent = h.fake.requests.find((r) => r.op === "send")!;
-    expect(sent.to).toBe("claude/worker");
-    expect(sent.body).toBe("hi");
-    expect(sent.reply_to).toBe("pi/target-session");
-    const listCalls = h.fake.requests.filter((r) => r.op === "list").length;
-    await intercom.handler("", { ...ctx, mode: "print", hasUI: false });
-    expect(h.fake.requests.filter((r) => r.op === "list").length).toBe(listCalls);
-    expect(notices.at(-1)).toEqual({ message: "Message sent to worker", level: "info" });
-    await h.emit("session_shutdown", {}, ctx);
+  it("registers /rename but no /intercom command", async () => {
+    const h = harness();
+    await h.emit("session_start", {}, h.ctx);
+    expect(h.pi.commands.has("rename")).toBe(true);
+    expect(h.pi.commands.has("intercom")).toBe(false);
+    await h.emit("session_shutdown", {}, h.ctx);
   });
 
   it("a reply goes to the sender's session id, not its display name", async () => {

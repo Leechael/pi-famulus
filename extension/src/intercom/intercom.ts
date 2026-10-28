@@ -4,7 +4,7 @@
  *
  * Upstream baseline: pi-famulus @ 98183fb, plugin/pi. Every user-visible
  * behaviour of the plugin is preserved (see the plugin README): SendMessage /
- * ListSessions tools, /rename and /intercom, @name completion, the standing
+ * ListSessions tools, /rename, @name completion, the standing
  * cross-session system-prompt section, <cross-session-message> envelopes,
  * read receipts, busy/idle publication, idle-notice/receipt notes, session
  * switch rebind, and shutdown cleanup. Only the transport changes: instead
@@ -27,7 +27,6 @@ import { ManagerClient, type MessagingStatus } from "../manager-client";
 import type { IntercomFrame, SessionRow } from "./types";
 import { createManagerTransport, IntercomError, type IntercomTransport } from "./transport";
 import { ChatCard, ChatText, formatTimestamp } from "./widgets";
-import { ComposeOverlay, type ComposeResult, SessionListOverlay } from "./overlay";
 import { fuzzyFilter } from "./fuzzy";
 import type { AutocompleteItem, AutocompleteProvider } from "./mention";
 import { extractAgentMention, filterAgentItems } from "./mention";
@@ -1265,70 +1264,5 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
       pi.setSessionName(name);
       ctx.ui.notify(`Session name set: ${name}`, "info");
     },
-  });
-
-  async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
-    if (!useContext(ctx) || !ctx.hasUI || ctx.mode !== "tui") return;
-    const overlayEpoch = epoch;
-    try {
-      const error = await ensureSock();
-      if (error) throw new Error(error);
-      assertActive(overlayEpoch);
-      const rows = await listSessions();
-      if (!rows.length) {
-        ctx.ui.notify("No sessions.", "info");
-        return;
-      }
-
-      const currentSession = rows.find((row) => row.id === sessionId) ?? {
-        id: sessionId,
-        name: sessionName,
-        harness: "pi",
-        status: ctx.isIdle?.() === false ? "busy" : "idle",
-        cwd,
-        updated_at: lastActiveMs(ctx) || undefined,
-      };
-      const otherSessions = rows.filter((row) => row.id !== currentSession.id);
-
-      const selectedSession = await ctx.ui.custom<SessionRow | undefined>(
-        (_tui, theme, keybindings, done) => new SessionListOverlay(theme, keybindings, currentSession, otherSessions, done),
-        { overlay: true, overlayOptions: { width: 88 } },
-      ).catch(() => undefined);
-      if (!selectedSession) return;
-      assertActive(overlayEpoch);
-
-      const targetLabel = selectedSession.name || selectedSession.id || "session";
-      const targetId = selectedSession.id || targetLabel;
-      const result = await ctx.ui.custom<ComposeResult>(
-        (tui, theme, keybindings, done) => new ComposeOverlay(
-          tui,
-          theme,
-          keybindings,
-          selectedSession,
-          targetLabel,
-          (message) => {
-            assertActive(overlayEpoch);
-            return sendToSession(targetId, message);
-          },
-          done,
-        ),
-        { overlay: true, overlayOptions: { width: 72 } },
-      ).catch(() => undefined);
-
-      if (stopped || epoch !== overlayEpoch || !useContext(ctx)) return;
-      if (result?.sent) {
-        noteSent(targetLabel, result.text || "");
-        ctx.ui.notify(`Message sent to ${targetLabel}`, "info");
-      }
-    } catch (e) {
-      if (!stopped && epoch === overlayEpoch && useContext(ctx)) {
-        ctx.ui.notify(`pi-famulus intercom: ${(e as Error).message}`, "error");
-      }
-    }
-  }
-
-  pi.registerCommand("intercom", {
-    description: "Browse pi-famulus sessions and send a message",
-    handler: async (_args, ctx) => openIntercomOverlay(ctx),
   });
 }
