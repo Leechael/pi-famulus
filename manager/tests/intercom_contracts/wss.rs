@@ -19,7 +19,7 @@ fn stable_fixture() -> Fixture {
 }
 
 fn openssl(root: &std::path::Path, args: &[&str]) {
-    let output = Command::new("openssl")
+    let output = common::command("openssl")
         .current_dir(root)
         .args(args)
         .stdin(Stdio::null())

@@ -148,7 +148,7 @@ impl Fixture {
     /// The manager binary with this fixture's isolated environment.
     fn base_command(&self) -> Command {
         self.sync_config();
-        let mut command = Command::new(&self.binary);
+        let mut command = common::command(&self.binary);
         for key in [
             "XDG_RUNTIME_DIR",
             "CODEX_THREAD_ID",
@@ -756,7 +756,7 @@ fn fixture_drop_preserves_failed_logs_but_cleans_successful_homes() {
     for mode in ["success", "panic"] {
         let artifacts = fixture.root.join(format!("{mode}-artifacts"));
         let report = fixture.root.join(format!("{mode}-home"));
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = common::command(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "fixture_drop_preserves_failed_logs_but_cleans_successful_homes",
@@ -848,7 +848,7 @@ fn fixture_startup_retries_a_bridge_closed_during_upgrade() {
     )
     .unwrap();
     fixture.child = Some(
-        Command::new("cat")
+        common::command("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()

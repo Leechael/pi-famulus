@@ -111,7 +111,7 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
     fs::remove_dir(&sessions).unwrap();
     fs::write(&sessions, b"initial base setup obstruction").unwrap();
     let dead_socket = fixture.root.join("previous-incarnation.sock");
-    let mut old=SourceProcess(Command::new("python3").args(["-u","-c","import os,socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1],0o600); s.listen(1); print('ready',flush=True); time.sleep(60)"]).arg(&dead_socket).stdout(Stdio::piped()).spawn().unwrap());
+    let mut old=SourceProcess(common::command("python3").args(["-u","-c","import os,socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1],0o600); s.listen(1); print('ready',flush=True); time.sleep(60)"]).arg(&dead_socket).stdout(Stdio::piped()).spawn().unwrap());
     let mut ready = String::new();
     BufReader::new(old.0.stdout.take().unwrap())
         .read_line(&mut ready)
@@ -123,7 +123,7 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let mut probe = SourceProcess(
-            Command::new("sleep")
+            common::command("sleep")
                 .arg("1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

@@ -52,7 +52,7 @@ fn group(pgid: u32) -> Vec<u32> {
     // pgrep's process enumeration can fail on macOS when sysmond is
     // unavailable, silently hiding live groups behind a nonzero status.
     // ps has the same group information and works independently of sysmond.
-    let out = std::process::Command::new("ps")
+    let out = common::command("ps")
         .args(["-axo", "pid=,pgid="])
         .output()
         .unwrap();
@@ -68,7 +68,7 @@ fn group(pgid: u32) -> Vec<u32> {
 }
 
 fn group_diagnostics(home: &Home, task_id: &str, pgid: u32) -> String {
-    let ps = std::process::Command::new("ps")
+    let ps = common::command("ps")
         .args(["-axo", "pid=,ppid=,pgid=,state=,command="])
         .output()
         .unwrap();
@@ -89,7 +89,7 @@ fn group_diagnostics(home: &Home, task_id: &str, pgid: u32) -> String {
     #[cfg(target_os = "macos")]
     let sample = if pid_alive(pgid) {
         let pid_arg = pgid.to_string();
-        std::process::Command::new("sample")
+        common::command("sample")
             .args([pid_arg.as_str(), "1"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())

@@ -721,7 +721,7 @@ fn a_dead_pi_process_settles_unread_deliveries_as_dropped() {
     fixture.start();
     // The pi process is a real child the test kills: the daemon's crash
     // signal (dead pi_pid) is what makes a close a "session gone".
-    let mut standin = std::process::Command::new("sleep")
+    let mut standin = common::command("sleep")
         .arg("60")
         .spawn()
         .unwrap();

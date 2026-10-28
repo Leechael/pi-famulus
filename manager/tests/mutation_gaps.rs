@@ -258,7 +258,7 @@ fn g9_response_of_exactly_max_frame_is_delivered() {
 
 /// CPU time used by `pid` so far, in milliseconds (`ps -o time=`).
 fn cpu_ms(pid: u32) -> u64 {
-    let o = std::process::Command::new("ps")
+    let o = common::command("ps")
         .args(["-o", "time=", "-p", &pid.to_string()])
         .output()
         .unwrap();

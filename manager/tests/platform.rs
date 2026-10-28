@@ -928,7 +928,7 @@ fn d10_cli_recovers_from_a_killed_daemon() {
 /// D13: manager.pid names a live process that is not a manager.
 fn d12_reused_pid_in_pidfile_does_not_block_startup() {
     let home = Home::new("w-d12");
-    let mut impostor = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut impostor = common::command(std::env::current_exe().unwrap())
         .args(["taskkit", "sleep", "30000"])
         .spawn()
         .unwrap();

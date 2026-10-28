@@ -540,7 +540,7 @@ impl Home {
     /// shows here whether it is blocked writing to a pipe, sleeping, or gone.
     #[cfg(windows)]
     fn dump_processes(&self) {
-        let list = Command::new("tasklist")
+        let list = command("tasklist")
             .args(["/v", "/fo", "csv"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -556,7 +556,7 @@ impl Home {
             .filter_map(|r| r["pid"].as_u64().map(|p| p.to_string()))
             .collect();
         let daemon = self.pidfile_pid().map(|p| p.to_string());
-        let ps = Command::new("ps")
+        let ps = command("ps")
             .args(["-axo", "pid,ppid,pgid,stat,wchan,etime,command"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -575,7 +575,7 @@ impl Home {
             }
         }
         for pid in &pids {
-            let lsof = Command::new("lsof")
+            let lsof = command("lsof")
                 .args(["-a", "-p", pid, "-d", "0-2"])
                 .output()
                 .map(|o| format!("{}\n{}{}", o.status, String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
@@ -647,7 +647,7 @@ pub fn replace_binary(dst: &Path, src: &Path) {
     const ETXTBSY: i32 = -1;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match Command::new(&tmp).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
+        match command(&tmp).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
             Err(e) if e.raw_os_error() == Some(ETXTBSY) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -767,7 +767,7 @@ pub fn pid_running(pid: u32) -> bool {
     if !pid_alive(pid) {
         return false;
     }
-    let out = Command::new("ps")
+    let out = command("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output();
     match out {
@@ -801,7 +801,7 @@ pub fn kill_group(pid: u32, sig: i32) {
 #[cfg(unix)]
 /// Resident set size of `pid` in bytes (via `ps -o rss=`, KiB on Darwin+Linux).
 pub fn rss_bytes(pid: u32) -> Option<u64> {
-    let o = Command::new("ps")
+    let o = command("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
         .ok()?;
@@ -816,7 +816,7 @@ pub fn rss_bytes(pid: u32) -> Option<u64> {
 /// Pids of `pi-famulus ... daemon` processes whose command line names `home`
 /// (i.e. daemons auto-spawned by a CLI client with `--home <home>`).
 pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
-    let Ok(o) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+    let Ok(o) = command("ps").args(["-axo", "pid=,command="]).output() else {
         return Vec::new();
     };
     let home_s = home.to_string_lossy().to_string();
@@ -978,7 +978,7 @@ mod win {
     pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
         let script = "Get-CimInstance Win32_Process -Filter \"Name='pi-famulus.exe'\" | \
                       ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
-        let Ok(o) = Command::new("powershell")
+        let Ok(o) = command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
         else {
@@ -1070,7 +1070,7 @@ pub fn open_handles(pid: u32) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        let o = Command::new("lsof").args(["-n", "-P", "-p", &pid.to_string()]).output().ok()?;
+        let o = command("lsof").args(["-n", "-P", "-p", &pid.to_string()]).output().ok()?;
         let n = String::from_utf8_lossy(&o.stdout)
             .lines()
             .skip(1)
@@ -1100,7 +1100,7 @@ pub fn cpu_time_ms(pid: u32) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         // `ps -o time=`: [[dd-]hh:]mm:ss.cc
-        let o = Command::new("ps").args(["-o", "time=", "-p", &pid.to_string()]).output().ok()?;
+        let o = command("ps").args(["-o", "time=", "-p", &pid.to_string()]).output().ok()?;
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
         let (rest, frac) = s.split_once('.').unwrap_or((&s, "0"));
         let mut secs = 0u64;
@@ -1590,7 +1590,7 @@ pub struct HelperClient {
 impl HelperClient {
     pub fn spawn(home: &Path, session: &str, commands: &[&str]) -> HelperClient {
         let exe = std::env::current_exe().unwrap();
-        let mut child = Command::new(exe)
+        let mut child = command(exe)
             .args([
                 "--exact",
                 "helper_hold_extension_conn",
@@ -1704,7 +1704,52 @@ pub fn wait_for_pids_for(c: &mut Conn, task_id: &str, n: usize, timeout: Duratio
 /// it, and it would bind the shared default intercom socket and publish into
 /// the real `~/.claude/sessions`.
 pub fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    let mut command = std::process::Command::new(bin);
+    let mut command = self::command(bin);
     command.env("PI_FAMULUS_NO_INTERCOM", "1");
     command
+}
+
+/// Every process a test spawns goes through here (enforced by
+/// `test_spawns_inherit_only_stdio` in lifecycle_adversarial.rs): the child
+/// inherits only stdin, stdout and stderr.
+///
+/// Tests run in parallel threads of one process. On macOS std creates pipes
+/// and sockets close-on-exec in two steps (`pipe()`, then `fcntl`), so a
+/// child another thread spawns inside that window keeps a copy. A copied
+/// stdout pipe write end means the reader sees no EOF until that unrelated
+/// child exits: d2's `wait_with_output` on darwin-x64 CI blocked 14s, until
+/// d8c's delayed CLI exited, and the daemon it was about to check idled out
+/// meanwhile. Linux uses `pipe2(O_CLOEXEC)`, so it cannot happen there.
+/// The production spawns guard the same window (`sys::unix::child_setup`).
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Upper bound computed before fork: fds are allocated lowest-first,
+        // so one opened concurrently lands just above the highest one now.
+        let highest = fs::read_dir("/dev/fd")
+            .ok()
+            .and_then(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok()).max())
+            .unwrap_or(1024);
+        let limit = highest + 1 + 256;
+        // SAFETY: the closure runs between fork and exec and calls only
+        // `fcntl`, which is async-signal-safe; it captures an integer and
+        // allocates nothing. Marking (not closing) keeps std's own exec-error
+        // pipe working. Hooks a caller adds later run after this one, so a
+        // descriptor a test passes on purpose (t14's dup2) still reaches
+        // the child.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in 3..limit {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd
 }

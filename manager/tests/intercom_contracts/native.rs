@@ -86,7 +86,7 @@ impl ClaudePeer {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join(socket_name);
         let mut process = SourceProcess(
-            Command::new("python3")
+            common::command("python3")
                 .args(["-u", "-c", CLAUDE_PEER])
                 .arg(&path)
                 .args(flags)
@@ -127,7 +127,7 @@ impl ClaudePeer {
         };
         #[cfg(not(target_os = "linux"))]
         let proc_start = String::from_utf8(
-            Command::new("ps")
+            common::command("ps")
                 .args(["-o", "lstart=", "-p", &pid.to_string()])
                 .env("LC_ALL", "C")
                 .env("TZ", "UTC")

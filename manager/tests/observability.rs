@@ -857,7 +857,7 @@ fn c13_top_reports_live_process_group_cpu() {
 fn cli_on_tty(home: &Home, args: &[&str], env: &[(&str, &str)]) -> Option<String> {
     let mut argv: Vec<String> = vec![BIN.into(), "--home".into(), home.path.to_string_lossy().into_owned()];
     argv.extend(args.iter().map(|a| a.to_string()));
-    let mut cmd = std::process::Command::new("script");
+    let mut cmd = common::command("script");
     cmd.env("PI_FAMULUS_NO_INTERCOM", "1");
     if cfg!(target_os = "macos") {
         cmd.arg("-q").arg("/dev/null").args(&argv);
@@ -1312,7 +1312,7 @@ fn c7_output_max_bytes_sigpipe_and_log_timestamps() {
             "set -o pipefail; '{BIN}' --home '{}' {args} | head -c 1 >/dev/null",
             home.path.display()
         );
-        let o = std::process::Command::new("bash").args(["-c", &script]).output().unwrap();
+        let o = common::command("bash").args(["-c", &script]).output().unwrap();
         assert!(o.status.success(), "{args}: {:?} stderr={}", o.status, String::from_utf8_lossy(&o.stderr));
         assert!(o.stderr.is_empty(), "{args}: {}", String::from_utf8_lossy(&o.stderr));
     }
@@ -1362,7 +1362,7 @@ fn c8_doctor_checks_and_exit_status() {
     assert!(out.stdout.contains("FAIL  config.json: does not parse"), "{}", out.stdout);
     std::fs::write(home.path.join("config.json"), br#"{"managerPath":"/nonexistent/pi-famulus"}"#).unwrap();
     agent_fixture(&home, "sess-c8", json!({"child_id":"ch_0000c801","session_id":"sess-c8","name":"x","agent":"w","status":"running"}));
-    let mut orphan = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+    let mut orphan = common::command("sleep").arg("300").spawn().unwrap();
     record_fixture(&home, "sess-c8", "sh_0000c801", now_ms(), json!({"status":"running","pid":orphan.id(),"exit_code":null,"ended_at":null,"end_reason":null}));
     let out = run_cli(&home.path, &["doctor"], S(15));
     let _ = orphan.kill();
