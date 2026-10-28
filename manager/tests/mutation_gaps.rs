@@ -80,6 +80,10 @@ fn g2_autospawned_daemon_survives_sigint_to_spawning_group() {
         .unwrap();
     let pgid = cli.id();
     assert!(wait_child(&mut cli, S(10)).expect("cli finished").success());
+    // The autostarted daemon runs on real time and would idle out 5s after
+    // the client left; hold it so only the signals can end it.
+    let mut hold = home.connect();
+    hold.hello_cli();
     let daemon = home.pidfile_pid().expect("daemon pid");
     assert!(pid_running(daemon));
     kill_group(pgid, libc::SIGINT);

@@ -164,12 +164,28 @@ fn d1_diagnostics(home: &Home) -> String {
 /// Counting processes right after the clients return (the old check)
 /// flaked twice. A snapshot can catch a redundant daemon before it exits,
 /// and the count is not the invariant.
+/// A daemon the CLI autostarts runs on real time (in d2 without even the
+/// test clock) and exits 5s after its last client disconnects; on a loaded
+/// runner the checks after the clients finish can take longer. Connect from
+/// the moment it binds and keep that connection, answering with its hello.
+fn hold_autostarted_daemon(home: &Home) -> std::thread::JoinHandle<(Conn, serde_json::Value)> {
+    let path = home.path.clone();
+    std::thread::spawn(move || {
+        let stream = poll_until(S(45), || Transport::connect(&path).ok())
+            .expect("connect to the manager socket");
+        let mut conn = Conn::new(stream);
+        let hello = conn.hello_cli();
+        (conn, hello)
+    })
+}
+
 #[test]
 fn d1_concurrent_clients_spawn_exactly_one_daemon() {
     let home = Home::new("d1");
     let clock = if home.manual { "manual" } else { "" };
     for round in 0..3 {
         let sessions: Vec<String> = (0..12).map(|i| format!("d1-r{round}-c{i}")).collect();
+        let holder = hold_autostarted_daemon(&home);
         // `start` auto-spawns like every task command (`status` never does).
         let kids: Vec<_> = sessions
             .iter()
@@ -220,8 +236,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
         };
 
         // The survivor is the daemon on the socket and in the pid file.
-        let mut c = home.connect();
-        let hello = c.hello_cli();
+        let (mut c, hello) = holder.join().unwrap();
         assert_eq!(hello["pid"].as_u64(), Some(daemon as u64), "round {round}: socket owner");
         assert_eq!(home.pidfile_pid(), Some(daemon), "round {round}: pid file");
 
@@ -356,6 +371,7 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
         assert!(poll_true(S(3), || !pid_running(old)));
         assert!(home.sock().exists() && home.pidfile().exists(), "stale files expected");
 
+        let holder = hold_autostarted_daemon(&home);
         let kids: Vec<_> = (0..24)
             .map(|_| {
                 common::famulus_command(BIN)
@@ -382,8 +398,7 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
             "round {round}: clients failed: {failures:?}\n{}",
             d2_diagnostics(&home, old)
         );
-        let mut c = home.connect();
-        let h = c.hello_cli();
+        let (c, h) = holder.join().unwrap();
         // A losing spawn can still be finishing its bounded lifetime-lock
         // retry after every CLI has connected to the winner. Wait for those
         // non-serving contenders to exit before asserting the process count.
