@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_CONFIG,
   MANAGER_FILE_NAME,
@@ -32,23 +32,9 @@ describe("degraded-startup manager search description", () => {
 
 describe("Famulus home and binary lookup", () => {
   let root = "";
-  // The native package lookup reads the user's real cache (an installed
-  // pi-famulus puts a binary there); point it at an empty directory.
-  const cacheEnv = { XDG_CACHE_HOME: process.env.XDG_CACHE_HOME, LOCALAPPDATA: process.env.LOCALAPPDATA };
-  let cache = "";
-  beforeEach(() => {
-    cache = mkdtempSync(join(tmpdir(), "pi-famulus-search-cache-"));
-    process.env.XDG_CACHE_HOME = cache;
-    process.env.LOCALAPPDATA = cache;
-  });
   afterEach(() => {
     if (root) rmSync(root, { recursive: true, force: true });
     root = "";
-    for (const [key, value] of Object.entries(cacheEnv)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-    rmSync(cache, { recursive: true, force: true });
   });
 
   it("uses the new default home and environment override", () => {
