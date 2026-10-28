@@ -347,7 +347,7 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
         .open(lifecycle::log_path(home))
         .map_err(|e| format!("open manager.log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::sys::command_std(exe);
     cmd.arg("--home")
         .arg(home)
         .arg("daemon")

@@ -179,3 +179,44 @@ mod tests {
         assert_eq!(parse_basic_process_id_list(&small).unwrap_err(), 4);
     }
 }
+
+/// Every process this crate starts inherits only stdio (plus descriptors a
+/// spawn passes on purpose) because every spawn is built by `command_std`
+/// or `command_tokio`. The daemon runs many threads, and on macOS std
+/// creates pipes and sockets close-on-exec in two steps (`pipe()`, then
+/// `fcntl`): one bare `Command::new` can carry another spawn's stdin pipe or
+/// a client connection, whose reader then sees no EOF until that unrelated
+/// child exits.
+#[cfg(test)]
+mod spawn_guard {
+    #[test]
+    fn every_spawn_goes_through_sys_command() {
+        const ALLOWED: [(&str, &str); 2] = [
+            ("unix.rs", concat!("let mut cmd = std::process::Command", "::new(program);")),
+            ("windows.rs", concat!("std::process::Command", "::new(program)")),
+        ];
+        fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    scan(&p, hits);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    let in_sys = p.parent().is_some_and(|d| d.ends_with("sys"));
+                    for (i, line) in text.lines().enumerate() {
+                        let line = line.trim();
+                        let allowed = in_sys
+                            && ALLOWED.iter().any(|(f, l)| p.file_name().is_some_and(|n| n == *f) && line == *l);
+                        let spawn = line.contains(concat!("Command", "::new(")) || line.contains(concat!("Command", "::from("));
+                        if spawn && !allowed {
+                            hits.push(format!("{}:{}: {}", p.display(), i + 1, line));
+                        }
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        scan(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hits);
+        assert!(hits.is_empty(), "spawn through crate::sys::command_std or command_tokio instead:\n{}", hits.join("\n"));
+    }
+}

@@ -93,7 +93,7 @@ fn unix_main(command: &OsStr) -> i32 {
     std::thread::spawn(move || watch_lifeline(me));
 
     // Same process group (the runner leads it); fds 0-2 are inherited.
-    let mut sh = std::process::Command::new("/bin/sh");
+    let mut sh = sys::command_std("/bin/sh");
     sh.arg("-c").arg(command);
     sys::unblock_in_child(&mut sh, libc::SIGTERM);
     let mut child = match sh.spawn() {
@@ -191,7 +191,7 @@ fn windows_main(command: &OsStr) -> i32 {
     };
 
     let me = sys::getpid();
-    let mut cmd = std::process::Command::new(&gate.shell.program);
+    let mut cmd = sys::command_std(&gate.shell.program);
     match gate.shell.kind {
         sys::ShellKind::Posix => {
             cmd.arg("-c").arg(command);

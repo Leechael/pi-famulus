@@ -1047,7 +1047,7 @@ async fn spawn_alias(
     ensure_directory(&registry_dir)?;
     let generation = uuid::Uuid::new_v4().to_string();
     let mut child =
-        tokio::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        crate::sys::command_tokio(std::env::current_exe().map_err(|e| e.to_string())?)
             .arg("__intercom_alias")
             .arg(&id)
             .arg(directory)
@@ -1798,7 +1798,7 @@ pub(super) fn process_start(pid: u32) -> String {
 }
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(super) fn process_start(pid: u32) -> String {
-    std::process::Command::new("ps")
+    crate::sys::command_std("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
@@ -2127,7 +2127,7 @@ mod tests {
     async fn namespace_full_backlog_keeps_production_shutdown_cancellable() {
         const CHILD: &str = "FAMULUS_NAMESPACE_BACKLOG_CLOSE";
         if std::env::var_os(CHILD).is_none() {
-            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = crate::sys::command_tokio(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "intercom::native::alias::tests::namespace_full_backlog_keeps_production_shutdown_cancellable",
@@ -2185,7 +2185,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = directory.join("native.sock");
-        let mut native = NativeProcess(std::process::Command::new("python3")
+        let mut native = NativeProcess(crate::sys::command_std("python3")
             .args(["-u", "-c", "import os,socket,sys\ns=socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\nos.chmod(sys.argv[1],0o600)\ns.listen(0)\nprint('ready',flush=True)\nwhile True:\n c,_=s.accept()\n c.close()"])
             .arg(&socket)
             .stdout(std::process::Stdio::piped())
@@ -2329,7 +2329,7 @@ mod tests {
             assert!(f.socket.exists(), "a live listener must not be unlinked");
             return;
         }
-        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = crate::sys::command_tokio(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "intercom::native::alias::tests::cleanup_of_live_full_backlog_is_bounded",
@@ -2711,7 +2711,7 @@ mod tests {
         // its process-global environment or the temporary HOME after cleanup.
         const ISOLATED: &str = "FAMULUS_BASE_SATURATION_ISOLATED";
         if std::env::var_os(ISOLATED).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::sys::command_std(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "intercom::native::alias::tests::base_listener_stops_accepting_while_saturated_and_resumes_on_retire",
@@ -2747,7 +2747,7 @@ mod tests {
         // in-process daemon base socket name.
         let anchor_socket = directory.join("anchor.sock");
         let anchor_ready = directory.join("anchor.ready");
-        let anchor_child = std::process::Command::new(std::env::current_exe().unwrap())
+        let anchor_child = crate::sys::command_std(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "intercom::native::alias::tests::base_listener_stops_accepting_while_saturated_and_resumes_on_retire",

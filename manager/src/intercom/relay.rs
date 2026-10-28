@@ -1858,7 +1858,7 @@ mod listen_webhook_tests {
                 "leaf-key.der",
             ],
         ] {
-            let output = std::process::Command::new("openssl")
+            let output = crate::sys::command_std("openssl")
                 .args(args)
                 .current_dir(&directory.0)
                 .output()
@@ -1955,7 +1955,7 @@ mod listen_webhook_tests {
                 }
                 (accepted, requests)
             });
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::sys::command_std(std::env::current_exe().unwrap())
                 .args(["--exact", "intercom::relay::listen_webhook_tests::webhook_tls_uses_native_roots_and_standard_verification_not_relay_insecure", "--nocapture"])
                 .env("PI_FAMULUS_WEBHOOK_TLS_URL", format!("https://{address}/hook"))
                 .env("PI_FAMULUS_WEBHOOK_TLS_CASE", if trusted { "trusted" } else { "untrusted" })
@@ -1967,7 +1967,7 @@ mod listen_webhook_tests {
             let (accepted, requests) = worker.join().unwrap();
             if !output.status.success() {
                 let describe = |args: &[&str]| {
-                    std::process::Command::new("openssl")
+                    crate::sys::command_std("openssl")
                         .args(args)
                         .current_dir(&directory.0)
                         .output()

@@ -6,7 +6,7 @@
 //! closes and the whole group is stopped, the same way `__run` stops shells.
 
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 #[cfg(unix)]
 use std::time::Duration;
@@ -26,7 +26,7 @@ pub fn main(argv: Vec<String>) -> i32 {
         let me = crate::sys::getpid();
         thread::spawn(move || watch_lifeline(me));
     }
-    let mut child = match Command::new(program)
+    let mut child = match crate::sys::command_std(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

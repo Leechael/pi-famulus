@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 const USER_DRIVER_MS: u64 = 10 * 60 * 1000;
@@ -1111,7 +1110,7 @@ struct Spawned {
 
 async fn spawn_rpc(argv: &[String], cwd: &str, env: &HashMap<String, String>) -> std::io::Result<Spawned> {
     let runner = task::runner_exe()?;
-    let mut cmd = Command::new(runner);
+    let mut cmd = crate::sys::command_tokio(runner);
     cmd.arg("__rpc");
     cmd.args(argv);
     cmd.current_dir(cwd);
@@ -1219,11 +1218,6 @@ mod tests {
     /// If `status_write` is dropped before spawn, that fd number is reused as
     /// the stdin write end and `dup2` copies it onto fd 4, so closing stdin
     /// never reaches the child.
-    ///
-    /// The bound is liveness only: that bug never delivers EOF. On macOS std
-    /// creates the stdin pipe with `pipe()` and sets close-on-exec afterwards,
-    /// so a plain child another test spawns in that window inherits the write
-    /// end and holds EOF back until it exits, which can take seconds.
     #[cfg(unix)]
     #[tokio::test]
     async fn closing_stdin_ends_the_rpc_wrapper() {
@@ -1235,7 +1229,7 @@ mod tests {
         drop(spawned.stdin);
         drop(spawned.stdout);
         drop(spawned.stderr);
-        let status = tokio::time::timeout(Duration::from_secs(30), spawned.child.wait())
+        let status = tokio::time::timeout(Duration::from_secs(3), spawned.child.wait())
             .await
             .expect("the rpc wrapper must exit after stdin is closed")
             .expect("wait");

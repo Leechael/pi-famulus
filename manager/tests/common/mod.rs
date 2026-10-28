@@ -1868,7 +1868,7 @@ fn remove_dead_path_mirrors(own: &Path) {
 /// child exits: d2's `wait_with_output` on darwin-x64 CI blocked 14s, until
 /// d8c's delayed CLI exited, and the daemon it was about to check idled out
 /// meanwhile. Linux uses `pipe2(O_CLOEXEC)`, so it cannot happen there.
-/// The production spawns guard the same window (`sys::unix::child_setup`).
+/// The production spawns guard the same window (`sys::command_std`).
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env("PATH", tool_free_path());

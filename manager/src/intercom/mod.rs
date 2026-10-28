@@ -1274,7 +1274,7 @@ async fn tool_version(name: &str) -> Option<(std::path::PathBuf, String)> {
         }
         #[cfg(unix)]
         let mut command = {
-            let mut command = tokio::process::Command::new("/bin/sh");
+            let mut command = crate::sys::command_tokio("/bin/sh");
             command
                 .arg("-c")
                 .arg("exec \"$1\" --version 2>&1")
@@ -1284,7 +1284,7 @@ async fn tool_version(name: &str) -> Option<(std::path::PathBuf, String)> {
         };
         #[cfg(not(unix))]
         let mut command = {
-            let mut command = tokio::process::Command::new(&path);
+            let mut command = crate::sys::command_tokio(&path);
             command.arg("--version");
             command
         };

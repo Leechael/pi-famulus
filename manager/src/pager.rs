@@ -6,7 +6,7 @@
 //! through to the next choice; `cat` means no pager, so does `--no-pager`.
 
 #[cfg(unix)]
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 #[cfg(windows)]
 use std::process::Child;
 #[cfg(unix)]
@@ -109,7 +109,7 @@ pub fn start() -> Option<Pager> {
     if !program_exists(&cmd) {
         return None;
     }
-    let mut c = Command::new("/bin/sh");
+    let mut c = crate::sys::command_std("/bin/sh");
     c.arg("-c").arg(&cmd).stdin(Stdio::piped());
     let mut child = c.spawn().ok()?;
     let stdin = child.stdin.take()?;
