@@ -430,7 +430,9 @@ fn t6e_leftover_that_exits_leaves_nothing_to_kill() {
     std::thread::sleep(MS(300));
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
-    let exited = wait_child(&mut d, S(3));
+    // Liveness only: on the manual clock a wrongly awaited grace never ends,
+    // and on real time the log line below is what tells.
+    let exited = wait_child(&mut d, S(10));
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
     assert!(exited.is_some(), "shutdown waited on an emptied leftover\n{log}");
     assert!(!log.contains("leftover process group"), "{log}");

@@ -420,22 +420,35 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             .expect("owner hello did not identify the daemon") as u32;
 
         // Five contenders must each finish the production lock-retry cap;
-        // the marker proves actual WouldBlock attempts. The wait is only a
-        // scheduling deadline, not a claim-time contract: a loaded darwin-x64
-        // runner has missed 500 attempts inside 15s while still making progress.
+        // the marker proves actual WouldBlock attempts. Each attempt sleeps
+        // 10ms of real time, so how long the 500 take is the scheduler's
+        // business, not a claim-time contract: a loaded darwin-x64 runner
+        // reached only 471 inside 15s while still making progress. So fail
+        // on a stall, not on a total: no new attempt and no contender exit
+        // for 15s means a stuck contender. The wait stays bounded (at most
+        // 500 attempts and 5 exits can each restart the window).
         let expected_blocked_attempts = 5 * DAEMON_LOCK_RETRY_ATTEMPTS;
         let mut running = Vec::new();
+        let mut progress = (usize::MAX, 0);
+        let mut last_progress = Instant::now();
         assert!(
-            poll_true(S(45), || {
+            poll_true(S(600), || {
                 running = kids
                     .iter_mut()
                     .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
                     .collect();
-                running.len() <= 1
-                    && blocked_lock_attempts(&blocked) == expected_blocked_attempts
-            }),
-            "round {round}: daemons did not converge after bounded lock retries; still running {running:?}, blocked attempts {}, expected {expected_blocked_attempts}",
-            blocked_lock_attempts(&blocked)
+                let attempts = blocked_lock_attempts(&blocked);
+                if (running.len(), attempts) != progress {
+                    progress = (running.len(), attempts);
+                    last_progress = Instant::now();
+                }
+                (running.len() <= 1 && attempts == expected_blocked_attempts)
+                    || attempts > expected_blocked_attempts
+                    || last_progress.elapsed() > S(15)
+            }) && last_progress.elapsed() <= S(15),
+            "round {round}: daemons did not converge after bounded lock retries; still running {running:?}, blocked attempts {}, expected {expected_blocked_attempts} (no progress for {:?})",
+            blocked_lock_attempts(&blocked),
+            last_progress.elapsed()
         );
         for k in kids.iter_mut() {
             let _ = k.kill();
@@ -2131,7 +2144,9 @@ fn t13b_shutdown_skips_leftover_group_that_has_emptied() {
     assert!(poll_true(S(3), || !pid_running(gc)));
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
-    let exited = wait_child(&mut d, S(3));
+    // Liveness only: on the manual clock a wrongly awaited grace never ends,
+    // and on real time the log line below is what tells.
+    let exited = wait_child(&mut d, S(10));
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
     assert!(exited.is_some(), "shutdown waited on an emptied group\n{log}");
     assert!(!log.contains("leftover process group"), "{log}");
