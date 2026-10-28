@@ -14,6 +14,7 @@ const LABEL: &str = "com.pi-famulus.client";
 const BINARY_NAME: &str = "pi-famulus";
 const READY_WAIT: Duration = Duration::from_secs(5);
 const READY_INTERVAL: Duration = Duration::from_millis(200);
+const LOGIN_SHELL_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct Status {
@@ -154,7 +155,7 @@ pub async fn run(
                     e.to_string()
                 }
             })?;
-            let result = tokio::process::Command::new("tail")
+            let result = crate::sys::command_tokio("tail")
                 .arg("-f")
                 .arg(log)
                 .stdin(std::process::Stdio::inherit())
@@ -757,11 +758,11 @@ async fn login_shell_path() -> Vec<PathBuf> {
     let Some(shell) = std::env::var_os("SHELL").filter(|v| !v.is_empty()) else {
         return Vec::new();
     };
-    read_login_shell_path(&shell).await
+    read_login_shell_path(&shell, LOGIN_SHELL_WAIT).await
 }
-async fn read_login_shell_path(shell: &std::ffi::OsStr) -> Vec<PathBuf> {
+async fn read_login_shell_path(shell: &std::ffi::OsStr, wait: Duration) -> Vec<PathBuf> {
     use tokio::io::AsyncReadExt;
-    let mut cmd = tokio::process::Command::new(shell);
+    let mut cmd = crate::sys::command_tokio(shell);
     cmd.args(["-lic", "printf '\\n__PI_FAMULUS_PATH__%s\\n' \"$PATH\""])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -779,7 +780,7 @@ async fn read_login_shell_path(shell: &std::ffi::OsStr) -> Vec<PathBuf> {
             let _ = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
         };
         tokio::pin!(read);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + wait;
         tokio::select! {
             _ = &mut read => {
                 if tokio::time::timeout_at(deadline, child.wait()).await.is_err() {
@@ -867,7 +868,7 @@ fn retryable_bootstrap_error(error: &str) -> bool {
     error.contains("bootstrap failed: 5:") || error.contains("bootstrap failed: 37:")
 }
 async fn launchctl(args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("launchctl")
+    let output = crate::sys::command_tokio("launchctl")
         .args(args)
         .output()
         .await
@@ -1162,7 +1163,7 @@ mod tests {
             serde_json::to_string(&json!({"messaging":{"enabled":true,"localOnly":true,"sock":sock}})).unwrap(),
         )
         .unwrap();
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+        let child = crate::sys::command_std(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "intercom::service::tests::external_manager_process",
@@ -1247,7 +1248,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::sys::command_std(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "intercom::service::tests::restart_stops_the_service_gracefully_instead_of_kickstart_kill",
@@ -1428,7 +1429,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::sys::command_std(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "intercom::service::tests::install_recovers_the_previous_launch_agent_when_bootstrap_fails",
@@ -1734,18 +1735,76 @@ mod tests {
         assert_eq!(comment_value("x--y\nz&\""), "x- -y z&amp;&#34;");
     }
 
+    /// The daemon's login-shell probe inherits only stdio. On macOS every
+    /// pipe std makes for a child's stdin or stdout has no close-on-exec
+    /// between `pipe()` and `fcntl`; the pipe here stays in that state while
+    /// the probe starts. A probe that kept its write end would hold back the
+    /// reader's EOF (a hosted wrapper's stdin, a task's output) until the
+    /// probe exits: here 20s.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn login_shell_probe_does_not_hold_other_pipes() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let started = dir.join("started");
+        let shell = dir.join("shell");
+        std::fs::write(&shell, format!("#!/bin/sh\n: > '{}'\nexec /bin/sleep 30\n", started.display())).unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut fds = [0; 2];
+        // SAFETY: `pipe` fills the array we own; both fds are then owned below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: F_SETFL on an fd we just created.
+        unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) };
+        let (mut rd, wr) = unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) };
+        let probe_shell = shell.clone();
+        let probe = tokio::spawn(async move { read_login_shell_path(probe_shell.as_os_str(), Duration::from_secs(20)).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "the probe shell did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(wr);
+        let eof = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if matches!(rd.read(&mut [0u8; 1]), Ok(0)) {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        })
+        .await
+        .unwrap();
+        probe.abort();
+        let _ = probe.await;
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(eof, "the login-shell probe kept another pipe's write end open");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn login_shell_timeout_keeps_already_emitted_path() {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let shell = dir.join("shell");
-        std::fs::write(&shell, "#!/bin/sh\nprintf '\\n__PI_FAMULUS_PATH__/from/login:/bin\\n'\nexec /bin/sleep 5\n").unwrap();
+        std::fs::write(&shell, "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nprintf '\\n__PI_FAMULUS_PATH__/from/login:/bin\\n'\nexec /bin/sleep 30\n").unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // macOS checks a new executable on its first run (hundreds of ms, more
+        // under load), so the timed run below must not be the first.
+        assert!(crate::sys::command_std(&shell).arg("warm").status().unwrap().success());
+        // The shell prints at once and then outlives the wait, which only has
+        // to be long against starting a shell.
+        let started = std::time::Instant::now();
         assert_eq!(
-            read_login_shell_path(shell.as_os_str()).await,
+            read_login_shell_path(shell.as_os_str(), Duration::from_secs(5)).await,
             vec![PathBuf::from("/from/login"), PathBuf::from("/bin")]
         );
+        assert!(started.elapsed() < Duration::from_secs(30), "the wait must end before the shell does");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

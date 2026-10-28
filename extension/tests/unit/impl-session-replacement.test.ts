@@ -15,6 +15,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { takeParkedRuntime } from "../../src/reload-handoff";
 import { hostedFakeState, resetHostedFakes, until } from "./hosted-fakes";
+// Transform the extension at collection time; tests re-evaluate it after vi.resetModules.
+import "../../src/index";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();
@@ -28,6 +30,9 @@ const home = mkdtempSync(join(tmpdir(), "pi-famulus-replace-"));
 process.env.PI_FAMULUS_HOME = home;
 process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
+// Each test evaluates the whole extension graph; on a loaded runner that
+// takes seconds, so 5s is not a liveness bound.
+vi.setConfig({ testTimeout: 20_000 });
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 

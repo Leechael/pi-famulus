@@ -67,12 +67,17 @@ describe.skipIf(!HOSTED_INTEG)("a hosted child killed while its shell runs", () 
       15_000,
       "the parent to settle the dead child",
     );
-    // Room for a stop (SIGTERM, 2s grace, SIGKILL) or a notice to arrive.
-    await new Promise((resolve) => setTimeout(resolve, 4_000));
+    const stillRunningNow = () => {
+      const now = childShells(h).find((task) => task.task_id === shell.task_id);
+      return now?.status === "running" && alive(shell.pid);
+    };
+    const toldNow = () => h.sent.some((sent) => (sent.message.content ?? "").includes(shell.task_id));
+    // Room for a stop (SIGTERM, 2s grace, SIGKILL) or a notice to arrive; the
+    // assertion below reports what was seen if neither did.
+    await waitUntil(() => !stillRunningNow() || toldNow(), 15_000, "the shell to be stopped or reported").catch(() => {});
 
-    const now = childShells(h).find((task) => task.task_id === shell.task_id);
-    const stillRunning = now?.status === "running" && alive(shell.pid);
-    const told = h.sent.some((sent) => (sent.message.content ?? "").includes(shell.task_id));
+    const stillRunning = stillRunningNow();
+    const told = toldNow();
     // Either outcome is correct: stopped, or left running with the parent told.
     expect({ stillRunning, told, handled: !stillRunning || told }).toEqual({ stillRunning, told, handled: true });
   }, 90_000);

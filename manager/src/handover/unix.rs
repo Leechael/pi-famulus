@@ -106,7 +106,7 @@ impl TaskSnap {
 pub async fn preflight(exe: &Path) -> Result<String, String> {
     let out = tokio::time::timeout(
         Duration::from_secs(20),
-        tokio::process::Command::new(exe)
+        crate::sys::command_tokio(exe)
             .arg(CHECK_ARG)
             .stdin(std::process::Stdio::null())
             .output(),
@@ -241,9 +241,6 @@ pub async fn perform(state: &Shared, listener_fd: RawFd, lock_fd: RawFd, ready: 
         resume(state);
         return fail(state, &from_version, Some(to_version), trigger, format!("write {}: {e}", path.display()));
     }
-    for fd in &fds {
-        let _ = crate::sys::clear_cloexec(*fd);
-    }
     crate::events::emit(
         &home,
         None,
@@ -257,11 +254,14 @@ pub async fn perform(state: &Shared, listener_fd: RawFd, lock_fd: RawFd, ready: 
         Ok(p) if cfg!(debug_assertions) => PathBuf::from(p),
         _ => exe.clone(),
     };
-    let mut cmd = std::process::Command::new(&exec_target);
+    let mut cmd = crate::sys::command_std(&exec_target);
     cmd.arg("--home").arg(&home).arg("daemon").arg("--handover").arg(&path);
     if snap.foreground {
         cmd.arg("--foreground");
     }
+    // The new image gets these and stdio, nothing else: `command_std` marks
+    // every other fd close-on-exec, then this clears the flag on ours.
+    crate::sys::pass_fds(&mut cmd, fds.clone());
     let err = std::os::unix::process::CommandExt::exec(&mut cmd);
 
     // exec returned: the old image keeps running.

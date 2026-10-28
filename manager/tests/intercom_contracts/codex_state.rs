@@ -70,9 +70,9 @@ impl Host {
                     }
                     Err(_) => break,
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(50)))
-                    .unwrap();
+                // Poll briefly only after the upgrade: a short timeout during
+                // it interrupts a request that arrives late.
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                 stream
                     .set_write_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
@@ -84,6 +84,7 @@ impl Host {
                 let (tx, rx) = mpsc::channel();
                 workers.push(thread::spawn(move|| {
                     let Ok(mut ws)=tokio_tungstenite::tungstenite::accept(stream)else{return;};
+                    ws.get_mut().set_read_timeout(Some(Duration::from_millis(50))).unwrap();
                     links.lock().unwrap().insert(id, tx);
                     'connection: while !stop.load(Ordering::Relaxed) {
                         for command in rx.try_iter(){match command{Command::Push(value)=>{if ws.send(tokio_tungstenite::tungstenite::Message::text(value.to_string())).is_err(){break 'connection;}},Command::Disconnect=>{let _=ws.close(None);break 'connection;}}}

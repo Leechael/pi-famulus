@@ -1139,10 +1139,27 @@ pub(crate) fn public_row(mut row: Value) -> Value {
     row
 }
 
+/// Each tool's `(path, --version)` probe, run concurrently so a slow tool
+/// costs one probe budget, not one per tool.
+async fn tool_versions() -> [(&'static str, Option<(std::path::PathBuf, String)>); 4] {
+    let (claude, pi, herdr, codex) = tokio::join!(
+        tool_version("claude"),
+        tool_version("pi"),
+        tool_version("herdr"),
+        tool_version("codex")
+    );
+    [
+        ("claude", claude),
+        ("pi", pi),
+        ("herdr", herdr),
+        ("codex", codex),
+    ]
+}
+
 async fn probe_tool_status() -> Value {
     let mut report = json!({});
-    for tool in ["claude", "pi", "herdr", "codex"] {
-        if let Some((path, version)) = tool_version(tool).await {
+    for (tool, probe) in tool_versions().await {
+        if let Some((path, version)) = probe {
             report[format!("{tool}_path")] = json!(path.to_string_lossy());
             if tool != "herdr" {
                 report[tool] = json!(version);
@@ -1174,8 +1191,9 @@ fn codex_install(path: &std::path::Path) -> &'static str {
 
 pub(super) async fn tool_status_report() -> Value {
     let mut report = json!({"herdr_socket":herdr::socket_path().to_string_lossy()});
-    for tool in ["claude", "pi", "codex"] {
-        if let Some((path, version)) = tool_version(tool).await {
+    let [claude, pi, herdr_probe, codex] = tool_versions().await;
+    for (tool, probe) in [claude, pi, codex] {
+        if let Some((path, version)) = probe {
             report[tool] = json!(version);
             report[format!("{tool}_path")] = json!(path.to_string_lossy());
             if tool == "codex" {
@@ -1225,7 +1243,7 @@ pub(super) async fn tool_status_report() -> Value {
             }
         }
     }
-    if let Some((path, _)) = tool_version("herdr").await {
+    if let Some((path, _)) = herdr_probe.1 {
         report["herdr_path"] = json!(path.to_string_lossy());
         match herdr::call("ping", json!({}), std::time::Duration::from_secs(2)).await {
             Ok(pong) => {
@@ -1241,6 +1259,13 @@ pub(super) async fn tool_status_report() -> Value {
     }
     report
 }
+
+/// A loaded machine can take seconds to answer `--version` (a real
+/// `claude --version` took ~1.9s under test load), and the startup probe is
+/// cached for the daemon's life, so a tight budget pins an empty version.
+/// The probe never blocks startup, and probes run concurrently, so this
+/// bounds only how long the first status waits on a hung tool.
+const TOOL_VERSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn tool_version(name: &str) -> Option<(std::path::PathBuf, String)> {
     for directory in std::env::split_paths(&std::env::var_os("PATH")?) {
@@ -1261,7 +1286,7 @@ async fn tool_version(name: &str) -> Option<(std::path::PathBuf, String)> {
         }
         #[cfg(unix)]
         let mut command = {
-            let mut command = tokio::process::Command::new("/bin/sh");
+            let mut command = crate::sys::command_tokio("/bin/sh");
             command
                 .arg("-c")
                 .arg("exec \"$1\" --version 2>&1")
@@ -1271,23 +1296,22 @@ async fn tool_version(name: &str) -> Option<(std::path::PathBuf, String)> {
         };
         #[cfg(not(unix))]
         let mut command = {
-            let mut command = tokio::process::Command::new(&path);
+            let mut command = crate::sys::command_tokio(&path);
             command.arg("--version");
             command
         };
         command
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        let version =
-            match tokio::time::timeout(std::time::Duration::from_secs(2), command.output()).await {
-                Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
-                _ => String::new(),
-            };
+        let version = match tokio::time::timeout(TOOL_VERSION_BUDGET, command.output()).await {
+            Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        };
         return Some((path, version));
     }
     None
@@ -1304,6 +1328,20 @@ mod tests {
             server: server.into(),
             ..Identity::default()
         }
+    }
+
+    /// The tool probe and the Herdr endpoint resolve inside the test
+    /// environment (hermetic.rs): no host tool is found, so none runs, and
+    /// Herdr is looked for under the test's own HOME.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_probe_and_herdr_socket_stay_inside_the_test_environment() {
+        for (tool, probe) in tool_versions().await {
+            assert!(probe.is_none(), "the probe found host {tool}: {probe:?}");
+        }
+        let socket = herdr::socket_path();
+        assert!(socket.starts_with(config::home()), "{}", socket.display());
+        assert!(!socket.exists(), "{}", socket.display());
     }
 
     #[test]

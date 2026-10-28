@@ -86,7 +86,7 @@ impl ClaudePeer {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join(socket_name);
         let mut process = SourceProcess(
-            Command::new("python3")
+            common::command("python3")
                 .args(["-u", "-c", CLAUDE_PEER])
                 .arg(&path)
                 .args(flags)
@@ -127,7 +127,7 @@ impl ClaudePeer {
         };
         #[cfg(not(target_os = "linux"))]
         let proc_start = String::from_utf8(
-            Command::new("ps")
+            common::command("ps")
                 .args(["-o", "lstart=", "-p", &pid.to_string()])
                 .env("LC_ALL", "C")
                 .env("TZ", "UTC")
@@ -575,15 +575,18 @@ impl CodexPeer {
                     }
                     Err(_) => break,
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(100)))
-                    .unwrap();
+                // Poll briefly only after the upgrade: a short timeout during
+                // it interrupts a request that arrives late.
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                 stream
                     .set_write_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
                 let Ok(mut ws) = tokio_tungstenite::tungstenite::accept(stream) else {
                     continue;
                 };
+                ws.get_mut()
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
                 while !stopped.load(Ordering::Relaxed) {
                     let message = match ws.read() {
                         Ok(message) => message,

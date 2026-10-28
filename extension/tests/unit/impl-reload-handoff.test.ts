@@ -15,6 +15,8 @@ import {
   takeParkedRuntime,
 } from "../../src/reload-handoff";
 import { hostedFakeState, resetHostedFakes, until } from "./hosted-fakes";
+// Transform the extension at collection time; tests re-evaluate it after vi.resetModules.
+import "../../src/index";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();
@@ -29,6 +31,9 @@ process.env.PI_FAMULUS_HOME = home;
 // The daemon is fake, so the hosted child is never started; any argv will do.
 process.env.PI_FAMULUS_PI = JSON.stringify(["pi"]);
 afterAll(() => rmSync(home, { recursive: true, force: true }));
+// Each test evaluates the whole extension graph one to three times; on a
+// loaded runner one evaluation takes seconds, so 5s is not a liveness bound.
+vi.setConfig({ testTimeout: 20_000 });
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 

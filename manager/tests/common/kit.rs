@@ -10,7 +10,7 @@
 
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -184,7 +184,7 @@ pub fn taskkit(args: &[String]) -> i32 {
         }
         "tree" => {
             let ms = num(0);
-            let mut child = Command::new(std::env::current_exe().unwrap())
+            let mut child = super::command(std::env::current_exe().unwrap())
                 .args(["taskkit", "sleep", &ms.to_string()])
                 .stdin(Stdio::null())
                 .spawn()
@@ -199,7 +199,7 @@ pub fn taskkit(args: &[String]) -> i32 {
             // outlive this task program, so it is detached on purpose.
             let ms = num(0).to_string();
             #[allow(clippy::zombie_processes)]
-            let child = Command::new(std::env::current_exe().unwrap())
+            let child = super::command(std::env::current_exe().unwrap())
                 .args(["taskkit", "sleep", &ms])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -252,7 +252,7 @@ impl MsysKeeper {
         // Same resolution the daemon uses for task shells.
         let shell = pi_famulus_task_shell();
         let Some(bash) = shell else { return MsysKeeper { child: None } };
-        let child = Command::new(&bash)
+        let child = super::command(&bash)
             .args(["-c", "echo ready; read _"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -148,7 +148,7 @@ impl Fixture {
     /// The manager binary with this fixture's isolated environment.
     fn base_command(&self) -> Command {
         self.sync_config();
-        let mut command = Command::new(&self.binary);
+        let mut command = common::command(&self.binary);
         for key in [
             "XDG_RUNTIME_DIR",
             "CODEX_THREAD_ID",
@@ -483,14 +483,23 @@ impl Peer {
             })
     }
 
+    /// macOS fails setsockopt with EINVAL once the peer has closed, even
+    /// with its last reply still buffered. A closed peer cannot make the
+    /// next read or write block, so go on and let that call report the
+    /// buffered bytes, EOF or EPIPE.
+    fn set_timeout(result: std::io::Result<()>) -> std::io::Result<()> {
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            other => other,
+        }
+    }
+
     fn try_write(&mut self, value: &Value, deadline: Instant) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec(value).unwrap();
         bytes.push(b'\n');
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
-            self.reader
-                .get_mut()
-                .set_write_timeout(Some(Self::remaining(deadline)?))?;
+            Self::set_timeout(self.reader.get_mut().set_write_timeout(Some(Self::remaining(deadline)?)))?;
             match self.reader.get_mut().write(remaining) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -514,9 +523,7 @@ impl Peer {
     fn try_read(&mut self, deadline: Instant) -> std::io::Result<Value> {
         let mut line = Vec::new();
         loop {
-            self.reader
-                .get_mut()
-                .set_read_timeout(Some(Self::remaining(deadline)?))?;
+            Self::set_timeout(self.reader.get_mut().set_read_timeout(Some(Self::remaining(deadline)?)))?;
             let available = match self.reader.fill_buf() {
                 Ok(available) => available,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -754,7 +761,7 @@ fn fixture_drop_preserves_failed_logs_but_cleans_successful_homes() {
     for mode in ["success", "panic"] {
         let artifacts = fixture.root.join(format!("{mode}-artifacts"));
         let report = fixture.root.join(format!("{mode}-home"));
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = common::command(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "fixture_drop_preserves_failed_logs_but_cleans_successful_homes",
@@ -836,6 +843,25 @@ fn fixture_startup_requires_a_nonregistering_bridge_roundtrip() {
 }
 
 #[test]
+fn peer_reads_a_reply_the_bridge_wrote_before_closing() {
+    let (client, server) = UnixStream::pair().unwrap();
+    let mut peer = Peer::new(client);
+    let mut server = BufReader::new(server);
+    let reply = thread::spawn(move || {
+        let mut line = String::new();
+        server.read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        writeln!(server.get_mut(), "{}", json!({"id":request["id"],"ok":true})).unwrap();
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    peer.try_write(&json!({"id":"r1","op":"list"}), deadline).unwrap();
+    reply.join().unwrap();
+    // The bridge has closed; on macOS its reply is still buffered here.
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(peer.try_read(deadline).unwrap()["id"], "r1");
+}
+
+#[test]
 fn fixture_startup_retries_a_bridge_closed_during_upgrade() {
     let mut fixture = Fixture::new();
     let listener = common::bind_private_unix(&fixture.sock);
@@ -846,7 +872,7 @@ fn fixture_startup_retries_a_bridge_closed_during_upgrade() {
     )
     .unwrap();
     fixture.child = Some(
-        Command::new("cat")
+        common::command("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -858,7 +884,12 @@ fn fixture_startup_retries_a_bridge_closed_during_upgrade() {
         for attempt in 0..2 {
             let stream = loop {
                 match listener.accept() {
-                    Ok((stream, _)) => break stream,
+                    // BSD-derived systems inherit O_NONBLOCK from the listener;
+                    // the probe may not have written its request yet.
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        break stream;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             !waiter.is_finished(),

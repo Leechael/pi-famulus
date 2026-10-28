@@ -297,7 +297,7 @@ async fn mcp_wrong_tokens_on_loopback_cannot_lock_out_the_real_client() {
         .await
         .unwrap();
     let url = rt.mcp_url.lock().unwrap().clone();
-    let client = reqwest::Client::new();
+    let client = super::super::config::http_client().build().unwrap();
     let post = |token: &'static str| {
         client
             .post(&url)
@@ -363,7 +363,7 @@ async fn mcp_rejects_bodies_larger_than_one_relay_frame_at_ingress() {
         .await
         .unwrap();
     let url = rt.mcp_url.lock().unwrap().clone();
-    let response = reqwest::Client::new()
+    let response = super::super::config::http_client().build().unwrap()
         .post(url)
         .bearer_auth("secret")
         .header("content-type", "application/json")

@@ -2,9 +2,13 @@ use super::*;
 
 #[test]
 fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
-    let registrations = std::sync::atomic::AtomicUsize::new(0);
+    // The relay stays offline until the disconnected report has been read: a
+    // report that waits on anything (a tool probe, a loaded scheduler) must
+    // not let the ~1s reconnect backoff erase the state under test.
+    let online = Arc::new(AtomicBool::new(false));
+    let relay_online = online.clone();
     let relay = WireRelay::new(move |request| {
-        if request["type"] == "register" && registrations.fetch_add(1, Ordering::Relaxed) == 0 {
+        if request["type"] == "register" && !relay_online.load(Ordering::Acquire) {
             vec![
                 json!({"type":"error","code":"unavailable","message":"fixture relay temporarily offline"}),
             ]
@@ -13,7 +17,17 @@ fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
         }
     });
     let mut fixture = stable_fixture();
-    start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
+    // No tools on PATH: the report does not wait on probing the host's own
+    // binaries, so the offline window stays within a backoff step or two.
+    let tools = fixture.root.join("empty-bin");
+    fs::create_dir(&tools).unwrap();
+    start_relay_options_env(
+        &mut fixture,
+        &relay,
+        "",
+        &[],
+        &[("PATH", tools.to_str().unwrap())],
+    );
     let mut manager = manager_status_connection(&fixture);
     let mut wait_status = |expected: &str, error: Option<&str>| {
         let deadline = Instant::now() + TIMEOUT;
@@ -36,7 +50,20 @@ fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
     };
     wait_status("disconnected", Some("fixture relay temporarily offline"));
     let mut peer = Peer::new(UnixStream::connect(&fixture.sock).unwrap());
-    let report = peer.call(json!({"op":"status"}))["report"].clone();
+    // Between two refused attempts the report carries the error and the next
+    // attempt; while an attempt is in flight no retry is scheduled.
+    let deadline = Instant::now() + TIMEOUT;
+    let report = loop {
+        let report = peer.call(json!({"op":"status"}))["report"].clone();
+        if report["relay_retry_at"].as_u64().is_some() {
+            break report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no retry was ever scheduled: {report}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
     assert!(
         report["relay_error"]
             .as_str()
@@ -48,6 +75,7 @@ fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
         report["relay_retry_at"].as_u64().is_some_and(|at| at > 0),
         "a disconnected relay reports its next attempt: {report}"
     );
+    online.store(true, Ordering::Release);
     wait_status("connected", None);
     let connected = peer.call(json!({"op":"status"}))["report"].clone();
     assert!(connected["relay_retry_at"].is_null(), "{connected}");

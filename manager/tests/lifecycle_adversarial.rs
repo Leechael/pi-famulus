@@ -123,14 +123,14 @@ fn d1_diagnostics(home: &Home) -> String {
         .iter()
         .map(|pid| {
             let pid_arg = pid.to_string();
-            let ps = std::process::Command::new("ps")
+            let ps = common::command("ps")
                 .args(["-p", pid_arg.as_str(), "-o", "pid=,ppid=,state=,command="])
                 .output();
             let ps = ps
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_else(|e| e.to_string());
             #[cfg(target_os = "macos")]
-            let sample = std::process::Command::new("sample")
+            let sample = common::command("sample")
                 .args([pid_arg.as_str(), "1"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -283,7 +283,7 @@ impl Burners {
         Burners(
             (0..n)
                 .map(|_| {
-                    std::process::Command::new("sh")
+                    common::command("sh")
                         .args(["-c", "while kill -0 $PPID 2>/dev/null; do :; done"])
                         .spawn()
                         .unwrap()
@@ -420,22 +420,35 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
             .expect("owner hello did not identify the daemon") as u32;
 
         // Five contenders must each finish the production lock-retry cap;
-        // the marker proves actual WouldBlock attempts. The wait is only a
-        // scheduling deadline, not a claim-time contract: a loaded darwin-x64
-        // runner has missed 500 attempts inside 15s while still making progress.
+        // the marker proves actual WouldBlock attempts. Each attempt sleeps
+        // 10ms of real time, so how long the 500 take is the scheduler's
+        // business, not a claim-time contract: a loaded darwin-x64 runner
+        // reached only 471 inside 15s while still making progress. So fail
+        // on a stall, not on a total: no new attempt and no contender exit
+        // for 15s means a stuck contender. The wait stays bounded (at most
+        // 500 attempts and 5 exits can each restart the window).
         let expected_blocked_attempts = 5 * DAEMON_LOCK_RETRY_ATTEMPTS;
         let mut running = Vec::new();
+        let mut progress = (usize::MAX, 0);
+        let mut last_progress = Instant::now();
         assert!(
-            poll_true(S(45), || {
+            poll_true(S(600), || {
                 running = kids
                     .iter_mut()
                     .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
                     .collect();
-                running.len() <= 1
-                    && blocked_lock_attempts(&blocked) == expected_blocked_attempts
-            }),
-            "round {round}: daemons did not converge after bounded lock retries; still running {running:?}, blocked attempts {}, expected {expected_blocked_attempts}",
-            blocked_lock_attempts(&blocked)
+                let attempts = blocked_lock_attempts(&blocked);
+                if (running.len(), attempts) != progress {
+                    progress = (running.len(), attempts);
+                    last_progress = Instant::now();
+                }
+                (running.len() <= 1 && attempts == expected_blocked_attempts)
+                    || attempts > expected_blocked_attempts
+                    || last_progress.elapsed() > S(15)
+            }) && last_progress.elapsed() <= S(15),
+            "round {round}: daemons did not converge after bounded lock retries; still running {running:?}, blocked attempts {}, expected {expected_blocked_attempts} (no progress for {:?})",
+            blocked_lock_attempts(&blocked),
+            last_progress.elapsed()
         );
         for k in kids.iter_mut() {
             let _ = k.kill();
@@ -572,7 +585,7 @@ fn d4c_daemon_crash_takes_every_task_down() {
 #[test]
 fn d4d_manual_clock_daemon_exits_when_its_test_owner_is_gone() {
     let home = Home::new("d4d");
-    let mut owner = KillOnDrop(Some(std::process::Command::new("/bin/sleep").arg("300").spawn().unwrap()));
+    let mut owner = KillOnDrop(Some(common::command("/bin/sleep").arg("300").spawn().unwrap()));
     let owner_pid = owner.0.as_ref().unwrap().id().to_string();
     let mut d1 = home.start_daemon_from(std::path::Path::new(BIN), &[("PI_FAMULUS_TEST_OWNER", &owner_pid)]);
     let mut c = home.connect();
@@ -607,7 +620,7 @@ impl Drop for KillOnDrop {
 #[test]
 fn d4b_startup_orphans_leftover_records_without_signalling() {
     let home = Home::new("d4b");
-    let mut bystander = KillOnDrop(Some(std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap()));
+    let mut bystander = KillOnDrop(Some(common::command("/bin/sleep").arg("30").spawn().unwrap()));
     let pid = bystander.0.as_ref().unwrap().id();
     let dir = home.path.join("sessions/sess-a/tasks");
     std::fs::create_dir_all(&dir).unwrap();
@@ -888,7 +901,7 @@ fn d8c_cli_waits_for_slow_shutdown_before_spawning_successor() {
     std::fs::rename(home.sock(), &retiring).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(home.sock()).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut ls = CliGuard(Some(std::process::Command::new("/bin/sh")
+    let mut ls = CliGuard(Some(common::command("/bin/sh")
         .args(["-c", "sleep 7; exec \"$@\"", "delayed-cli", BIN])
         .args(["--home", home.path.to_str().unwrap(), "ls"])
         .env("PI_FAMULUS_TEST_CLOCK", "manual")
@@ -1184,7 +1197,7 @@ fn d11b_client_recovers_from_corrupt_pidfile() {
 #[test]
 fn d12_reused_pid_in_pidfile_does_not_block_startup() {
     let home = Home::new("d12");
-    let mut impostor = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+    let mut impostor = common::command("sleep").arg("300").spawn().unwrap();
     std::fs::write(
         home.pidfile(),
         format!(r#"{{"pid":{},"version":"0.1.0","started_at":0}}"#, impostor.id()),
@@ -2131,7 +2144,9 @@ fn t13b_shutdown_skips_leftover_group_that_has_emptied() {
     assert!(poll_true(S(3), || !pid_running(gc)));
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
-    let exited = wait_child(&mut d, S(3));
+    // Liveness only: on the manual clock a wrongly awaited grace never ends,
+    // and on real time the log line below is what tells.
+    let exited = wait_child(&mut d, S(10));
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
     assert!(exited.is_some(), "shutdown waited on an emptied group\n{log}");
     assert!(!log.contains("leftover process group"), "{log}");
@@ -2221,6 +2236,109 @@ fn t14_tasks_inherit_only_stdio() {
     let (text, _, _) = c.read_all_output(&id, 65536);
     assert_eq!(text, "end\n", "task inherited descriptors beyond stdio");
     drop(other);
+}
+
+/// H1: a child the test harness spawns inherits only stdio, whatever the
+/// test process has open without close-on-exec at that moment. On macOS
+/// every pipe std makes for a child's stdout is in exactly that state
+/// between `pipe()` and `fcntl`; the pipe here stays in it. A child spawned
+/// in that window used to keep the write end, and the reader then saw no
+/// EOF until that unrelated child exited (d2 blocked 14s on darwin-x64).
+#[test]
+fn h1_harness_children_inherit_only_stdio() {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` fills the array we own; both fds are then owned below.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (rd, wr) = unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) };
+    let _carrier = KillOnDrop(Some(
+        common::command("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    drop(wr);
+    // SAFETY: F_SETFL on an fd we own.
+    unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) };
+    let mut rd = rd;
+    let eof = poll_true(S(3), || matches!(rd.read(&mut [0u8; 1]), Ok(0)));
+    assert!(eof, "a harness child kept the pipe's write end open");
+}
+
+/// H1b: the guarantee above holds only if every spawn uses it. Each test
+/// file is one process whose tests run in parallel threads, so a single
+/// bare `Command::new` can carry another test's pipe.
+#[test]
+fn h1b_every_test_spawn_goes_through_common_command() {
+    fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                scan(&p, hits);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let text = std::fs::read_to_string(&p).unwrap();
+                for (i, line) in text.lines().enumerate() {
+                    if line.contains(concat!("Command", "::new(")) && line.trim() != concat!("let mut cmd = Command", "::new(program);") {
+                        hits.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    scan(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"), &mut hits);
+    assert!(hits.is_empty(), "spawn through common::command instead:\n{}", hits.join("\n"));
+}
+
+/// H2: `Home::drop` kills the process groups its home owns and no other.
+/// A finished task's recorded pid can name another test's group by then:
+/// tasks lead their own groups and tests run in parallel. Here a record
+/// names a live group the home never started, the state pid reuse leaves;
+/// the old drop SIGKILLed it. The home's own groups, a running task and a
+/// finished task's leftover child, are still gone when the drop returns.
+#[test]
+fn h2_home_drop_kills_only_groups_it_owns() {
+    use std::os::unix::process::CommandExt;
+    let home = Home::new("h2");
+    let d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    // Both ignore SIGTERM: a runner whose lifeline breaks (the daemon is
+    // killed last) would take them down only after its 2 s grace.
+    let (_, runner) = c.start("sh -c \"trap '' TERM; exec sleep 300\"");
+    let (left, guardian) = c.start("sh -c \"trap '' TERM; exec sleep 300\" >/dev/null 2>&1 & echo $!");
+    let leftover = wait_for_pids(&mut c, &left, 1)[0];
+    assert_eq!(c.wait_terminal(&left, S(3)).unwrap()["status"], "completed");
+    let mut foreign = KillOnDrop(Some(
+        common::command("/bin/sleep").arg("300").process_group(0).spawn().unwrap(),
+    ));
+    let foreign_pid = foreign.0.as_ref().unwrap().id();
+    let dir = home.path.join("sessions/sess-reused/tasks");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("reused.json"),
+        json!({"task_id":"reused","session_id":"sess-reused","pid":foreign_pid,"status":"completed"}).to_string(),
+    )
+    .unwrap();
+    drop(c);
+    drop(d);
+    drop(home);
+    assert!(
+        foreign.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "Home::drop killed group {foreign_pid}, which it never started"
+    );
+    // Runners first: a failure here kills their groups, leftover included.
+    for pid in [runner, guardian, leftover] {
+        let dead = poll_true(Duration::from_millis(1500), || !pid_running(pid));
+        if !dead {
+            kill_group(pid, libc::SIGKILL);
+            kill_pid(pid, libc::SIGKILL);
+        }
+        assert!(dead, "{pid} outlived Home::drop");
+    }
 }
 
 /// S6: a connection the daemon closes (session rebind) is seen as closed

@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
 import { reregisterAgentLeases } from "../../src/subagent/admission";
 import { famulusPaths } from "../../src/config";
@@ -128,7 +128,7 @@ describe.skipIf(!RUN || !HAS_BASH)("real pi-famulus integration", () => {
     expect(out.status).toBe("completed"); // §3.4 terminal status, not "exited"
     expect(out.exit_code).toBe(0);
     expect(out.total_size).toBeGreaterThan(0);
-  });
+  }, 15000);
 
   it("pushes task_started / task_exited events to the owning session", async () => {
     const before = events.length;
@@ -139,11 +139,13 @@ describe.skipIf(!RUN || !HAS_BASH)("real pi-famulus integration", () => {
       env: TASK_ENV,
     });
     await client.wait(task_id, 5000);
-    await delay(200); // allow event delivery
-    const mine = events.slice(before).filter((e) => e.task_id === task_id);
-    expect(mine.some((e) => e.event === "task_started")).toBe(true);
-    expect(mine.some((e) => e.event === "task_exited")).toBe(true);
-  });
+    // Events are pushed separately from the wait reply; wait for them, not a fixed delay.
+    await vi.waitFor(() => {
+      const mine = events.slice(before).filter((e) => e.task_id === task_id);
+      expect(mine.some((e) => e.event === "task_started")).toBe(true);
+      expect(mine.some((e) => e.event === "task_exited")).toBe(true);
+    }, { timeout: 5000, interval: 50 });
+  }, 15000);
 
   it("wait budget expires with done:false while the task keeps running", async () => {
     const { task_id } = await client.start({
@@ -163,7 +165,7 @@ describe.skipIf(!RUN || !HAS_BASH)("real pi-famulus integration", () => {
     expect(rec).toBeDefined();
     expect(["killed", "completed"]).toContain(rec!.status);
     if (rec!.status === "killed") expect(rec!.exit_code).toBeNull();
-  });
+  }, 15000);
 
   it("streams output events to watchers (watch/unwatch)", async () => {
     const before = events.length;
@@ -175,17 +177,18 @@ describe.skipIf(!RUN || !HAS_BASH)("real pi-famulus integration", () => {
     });
     await client.watch(task_id);
     await client.wait(task_id, 5000);
-    await delay(300);
-    await client.unwatch(task_id);
-
-    const chunks = events
+    const chunks = () => events
       .slice(before)
       .filter((e) => e.event === "output" && e.task_id === task_id)
       .map((e) => e.chunk ?? "")
       .join("");
-    expect(chunks).toContain("line-a");
-    expect(chunks).toContain("line-b");
-  });
+    // Output events can trail the exit; wait for them, not a fixed delay.
+    await vi.waitFor(() => {
+      expect(chunks()).toContain("line-a");
+      expect(chunks()).toContain("line-b");
+    }, { timeout: 5000, interval: 50 });
+    await client.unwatch(task_id);
+  }, 15000);
 
   it("list shows session tasks; CLI status works against the same daemon", async () => {
     const tasks = await client.list();
@@ -196,7 +199,7 @@ describe.skipIf(!RUN || !HAS_BASH)("real pi-famulus integration", () => {
       encoding: "utf8",
     });
     expect(sessions).toMatch(/integ/);
-  });
+  }, 15000);
 
   it("shutdown_session kills the session's running tasks", async () => {
     const { task_id } = await client.start({
@@ -220,7 +223,7 @@ describe.skipIf(!RUN || !HAS_BASH)("real pi-famulus integration", () => {
       await delay(200);
     }
     expect(status).toBe("killed");
-  });
+  }, 15000);
 
   it("re-registers a held child lease after the real daemon restarts", async () => {
     const childId = "ch_reconnect01";

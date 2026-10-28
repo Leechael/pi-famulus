@@ -19,41 +19,70 @@ pub const SIGTERM: i32 = libc::SIGTERM;
 /// POSIX SIGKILL — hard kill after grace (§3.2 / §3.4).
 pub const SIGKILL: i32 = libc::SIGKILL;
 
-/// Make the child a session leader (`setsid`) so `pgid == pid` and
-/// [`signal_group`] can address the whole tree with `kill(-pgid, …)`, and
-/// let it inherit only fds 0, 1 and 2 (see [`child_setup`]). Used when
-/// detaching the daemon itself from a short-lived CLI.
+/// A `std::process::Command` whose child inherits only fds 0, 1 and 2
+/// (see [`stdio_only`]). Every process this crate starts is built here or
+/// by [`command_tokio`] (enforced by `sys::spawn_guard`); a spawn that
+/// passes a descriptor on purpose adds it back in a later `pre_exec` hook,
+/// which runs after this one ([`apply_runner_setup_tokio`], [`pass_fds`]).
 ///
 /// # Safety boundary
 /// `pre_exec` is the only `unsafe` call site. The closure calls only
-/// `setsid`, `fcntl` and (Linux) the `close_range` syscall, all
-/// async-signal-safe, and allocates nothing: the fd bound is computed here,
-/// before fork.
-pub fn apply_new_session_std(cmd: &mut std::process::Command) {
+/// `fcntl` and (Linux) the `close_range` syscall, both async-signal-safe,
+/// and allocates nothing: the fd bound is computed here, before fork.
+pub fn command_std(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
     let limit = fd_scan_limit();
     // SAFETY: see above; `limit` is a captured integer.
     unsafe {
-        cmd.pre_exec(move || child_setup(limit));
+        cmd.pre_exec(move || stdio_only(limit));
+    }
+    cmd
+}
+
+/// [`command_std`] for tokio; tokio keeps the std command's hooks.
+pub fn command_tokio(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    command_std(program).into()
+}
+
+/// Make the child a session leader (`setsid`) so `pgid == pid` and
+/// [`signal_group`] can address the whole tree with `kill(-pgid, …)`. Used
+/// when detaching the daemon itself from a short-lived CLI. `cmd` comes
+/// from [`command_std`], so the child inherits only fds 0, 1 and 2.
+///
+/// # Safety boundary
+/// `pre_exec` is the only `unsafe` call site. The closure calls only
+/// `setsid`, which is async-signal-safe.
+pub fn apply_new_session_std(cmd: &mut std::process::Command) {
+    // SAFETY: see above.
+    unsafe {
+        cmd.pre_exec(new_session);
     }
 }
 
-/// Runs in the forked child, before exec.
+fn new_session() -> io::Result<()> {
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Runs in the forked child, before exec (every [`command_std`]).
 ///
 /// Every fd ≥ 3 is marked close-on-exec, so the new program starts with
 /// stdin/stdout/stderr only. Rust sets FD_CLOEXEC on its descriptors, but
-/// on macOS only after `socket()`/`accept()` return. A fork in that window
-/// (a task starting while a client connects) would otherwise give the task
-/// a copy of a client connection. That client would then see no EOF when
-/// the daemon closes the connection, until the task exits. The same applies
-/// to anything the daemon inherited without the flag.
+/// on macOS only after `pipe()`/`socket()`/`accept()` return. A fork in
+/// that window by another thread would otherwise give the child a copy:
+/// of a client connection (a task starting while a client connects), whose
+/// client then sees no EOF when the daemon closes it; or of another
+/// child's stdin/stdout pipe (a hosted wrapper's stdin while a tool probe
+/// starts), whose reader then sees no EOF until this unrelated child exits.
+/// The same applies to anything the process inherited without the flag.
+/// Linux creates them with the flag atomically; only the last case applies.
 ///
 /// The fds are marked, not closed: std's fork path reports exec failures to
 /// the parent over a close-on-exec pipe, which must stay open until exec.
 /// The effect after exec is the same.
-fn child_setup(limit: i32) -> io::Result<()> {
-    if unsafe { libc::setsid() } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+fn stdio_only(limit: i32) -> io::Result<()> {
     // Linux ≥ 5.11: one syscall. Older kernels (ENOSYS / EINVAL) fall back.
     #[cfg(target_os = "linux")]
     {
@@ -71,14 +100,33 @@ fn child_setup(limit: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// Let `fds` survive `cmd`'s exec: clears their close-on-exec flag after
+/// [`command_std`]'s sweep has run (hooks run in the order added). Used by
+/// the in-place upgrade, which hands these descriptors to the new image.
+///
+/// # Safety boundary
+/// The closure calls only `fcntl` (through [`clear_cloexec`]) and reads
+/// the captured vector, which was allocated before; it allocates nothing.
+pub fn pass_fds(cmd: &mut std::process::Command, fds: Vec<RawFd>) {
+    // SAFETY: see above.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &fd in &fds {
+                clear_cloexec(fd)?;
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Fixed descriptor numbers a task runner (`pi-famulus __run`) starts with:
 /// the read end of the daemon's lifeline and the write end of its own status
 /// pipe (see `crate::runner`).
 pub const RUNNER_LIFELINE_FD: i32 = 3;
 pub const RUNNER_STATUS_FD: i32 = 4;
 
-/// Spawn setup for a task runner: session leader and stdio-only fds as in
-/// [`apply_new_session_std`], and then `lifeline` and `status`
+/// Spawn setup for a task runner built with [`command_tokio`]: session
+/// leader as in [`apply_new_session_std`], and then `lifeline` and `status`
 /// at [`RUNNER_LIFELINE_FD`] / [`RUNNER_STATUS_FD`] without close-on-exec.
 /// Both sources must be ≥ 5 (see [`dup_cloexec_high`]) so neither `dup2`
 /// can land on the other's source.
@@ -87,11 +135,10 @@ pub const RUNNER_STATUS_FD: i32 = 4;
 /// As for [`apply_new_session_std`]; the closure adds two `dup2` calls,
 /// which are async-signal-safe.
 pub fn apply_runner_setup_tokio(cmd: &mut tokio::process::Command, lifeline: i32, status: i32) {
-    let limit = fd_scan_limit();
     // SAFETY: see above; only integers are captured.
     unsafe {
         cmd.pre_exec(move || {
-            child_setup(limit)?;
+            new_session()?;
             if libc::dup2(lifeline, RUNNER_LIFELINE_FD) < 0 || libc::dup2(status, RUNNER_STATUS_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -482,7 +529,7 @@ pub fn kill_pid(pid: u32, sig: i32) -> io::Result<()> {
     }
 }
 
-/// Upper bound for the fd scan in [`child_setup`], computed in the parent
+/// Upper bound for the fd scan in [`stdio_only`], computed in the parent
 /// before fork (the child must not allocate).
 ///
 /// The highest fd open right now (from `/dev/fd`), plus slack for fds other
@@ -659,11 +706,92 @@ pub fn max_rss_bytes() -> u64 {
 mod tests {
     use super::*;
 
+    /// A pipe without close-on-exec: the state every pipe std makes for a
+    /// child's stdin or stdout is in on macOS between `pipe()` and `fcntl`.
+    /// Returns (read end, made non-blocking; write end).
+    fn unsafe_window_pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0; 2];
+        // SAFETY: `pipe` fills the array we own; both fds are then owned below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: F_SETFL on an fd we just created.
+        unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) };
+        unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) }
+    }
+
+    fn eof_within(mut rd: std::fs::File, timeout: std::time::Duration) -> bool {
+        use std::io::Read;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if matches!(rd.read(&mut [0u8; 1]), Ok(0)) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// A child built by `command_std` inherits only stdio, whatever the
+    /// process has open without close-on-exec when it forks. A child that
+    /// kept the write end here would hold back the reader's EOF until it
+    /// exits, as a `sleep` started by another thread held a hosted
+    /// wrapper's stdin pipe.
+    #[test]
+    fn command_std_children_inherit_only_stdio() {
+        let (rd, wr) = unsafe_window_pipe();
+        let mut child = command_std("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(wr);
+        let eof = eof_within(rd, std::time::Duration::from_secs(3));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(eof, "a command_std child kept the pipe's write end open");
+    }
+
+    /// As above for `command_tokio`, and through the task runner's setup,
+    /// which hands fds 3 and 4 on after the sweep.
+    #[tokio::test]
+    async fn command_tokio_children_inherit_only_stdio() {
+        let (rd, wr) = unsafe_window_pipe();
+        let (_life_read, life_write) = pipe_cloexec().unwrap();
+        let (_status_read, status_write) = pipe_cloexec().unwrap();
+        let life_write = dup_cloexec_high(&life_write).unwrap();
+        let status_write = dup_cloexec_high(&status_write).unwrap();
+        let mut plain = command_tokio("/bin/sleep");
+        plain.arg("30").kill_on_drop(true);
+        let mut runner = command_tokio("/bin/sh");
+        runner
+            .args(["-c", "[ -e /dev/fd/3 ] && [ -e /dev/fd/4 ] && echo passed; exec /bin/sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        apply_runner_setup_tokio(&mut runner, life_write.as_raw_fd(), status_write.as_raw_fd());
+        let mut plain = plain.spawn().unwrap();
+        let mut runner = runner.spawn().unwrap();
+        drop(wr);
+        let eof = tokio::task::spawn_blocking(move || eof_within(rd, std::time::Duration::from_secs(3)))
+            .await
+            .unwrap();
+        let mut line = String::new();
+        let mut stdout = tokio::io::BufReader::new(runner.stdout.take().unwrap());
+        let read = tokio::io::AsyncBufReadExt::read_line(&mut stdout, &mut line);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), read).await;
+        let _ = plain.kill().await;
+        let _ = runner.kill().await;
+        assert!(eof, "a command_tokio child kept the pipe's write end open");
+        assert_eq!(line, "passed\n", "the runner setup must still pass fds 3 and 4");
+    }
+
     /// A process we start in a fresh group shows up as that group's member
     /// (and only it); once it is gone the group is empty.
     #[test]
     fn group_members_lists_a_real_group() {
-        let mut child = std::process::Command::new("/bin/sleep");
+        let mut child = command_std("/bin/sleep");
         child.arg("30");
         apply_new_session_std(&mut child);
         let mut child = child.spawn().unwrap();
@@ -685,7 +813,7 @@ mod tests {
     #[test]
     fn group_cpu_ticks_grow_for_a_busy_child() {
         assert!(clock_ticks_per_second().is_some());
-        let mut child = std::process::Command::new("/bin/sh");
+        let mut child = command_std("/bin/sh");
         child.args(["-c", "while :; do :; done"]);
         apply_new_session_std(&mut child);
         let mut child = child.spawn().unwrap();

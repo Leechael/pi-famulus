@@ -86,7 +86,7 @@ fn absent_codex_host_never_launches_an_app_server_or_claims_idle_threads() {
     let path = format!(
         "{}:{}",
         bin.display(),
-        std::env::var("PATH").unwrap_or_default()
+        common::tool_free_path().to_str().unwrap()
     );
     fixture.start_with(&[], &[("PATH", &path)]);
     assert!(!fixture.sessions().iter().any(|s| s["harness"] == "codex"));
@@ -482,9 +482,12 @@ impl StatusCodex {
                 }
                 let (state, history, stopping) = (state.clone(), history.clone(), stopping.clone());
                 clients.push(thread::spawn(move || {
-                    stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                    // A short read timeout during the upgrade interrupts a
+                    // request that arrives late; poll briefly only afterwards.
+                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                     stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
                     let Ok(mut ws) = tokio_tungstenite::tungstenite::accept(stream) else { return; };
+                    ws.get_mut().set_read_timeout(Some(Duration::from_millis(100))).unwrap();
                     while !stopping.load(Ordering::Acquire) {
                         let message = match ws.read() {
                             Ok(message) => message,
@@ -743,21 +746,32 @@ fn online_status_prefers_connected_desktop_even_with_an_empty_catalog() {
                 .set_write_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
             while !stopping.load(Ordering::Acquire) {
+                // Poll only for a frame's first byte: the daemon writes the
+                // length and the body separately, and a stall between them
+                // must not unframe the stream.
                 let mut header = [0; 4];
-                match stream.read_exact(&mut header) {
-                    Ok(()) => {}
+                match stream.read(&mut header[..1]) {
+                    Ok(0) => break,
+                    Ok(_) => {}
                     Err(e)
                         if matches!(
                             e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
                         ) =>
                     {
                         continue
                     }
                     Err(_) => break,
                 }
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                stream.read_exact(&mut header[1..]).unwrap();
                 let mut bytes = vec![0; u32::from_le_bytes(header) as usize];
                 stream.read_exact(&mut bytes).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
                 let request: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(request["method"], "initialize");
                 let response = serde_json::to_vec(&json!({"type":"response","requestId":request["requestId"],"resultType":"success","method":"initialize","handledByClientId":"status-owner","result":{"clientId":"status-follower"}})).unwrap();

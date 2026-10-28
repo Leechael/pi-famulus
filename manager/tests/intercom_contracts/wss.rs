@@ -19,7 +19,7 @@ fn stable_fixture() -> Fixture {
 }
 
 fn openssl(root: &std::path::Path, args: &[&str]) {
-    let output = Command::new("openssl")
+    let output = common::command("openssl")
         .current_dir(root)
         .args(args)
         .stdin(Stdio::null())
@@ -128,9 +128,9 @@ impl WssRelay {
                     }
                     Err(_) => break,
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(100)))
-                    .unwrap();
+                // The TLS and WebSocket handshakes take several round trips;
+                // poll briefly only once they have completed.
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                 stream
                     .set_write_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
@@ -139,8 +139,12 @@ impl WssRelay {
                     stream,
                 );
                 let mut ws = match tokio_tungstenite::tungstenite::accept(tls) {
-                    Ok(ws) => {
+                    Ok(mut ws) => {
                         let _ = events.send(true);
+                        ws.get_mut()
+                            .sock
+                            .set_read_timeout(Some(Duration::from_millis(100)))
+                            .unwrap();
                         ws
                     }
                     Err(_) => {

@@ -1473,7 +1473,7 @@ fn webhook_client() -> Result<reqwest::Client, String> {
     .map_err(|error| error.to_string())?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    reqwest::Client::builder()
+    super::config::http_client()
         .use_preconfigured_tls(tls)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
@@ -1921,7 +1921,7 @@ mod listen_webhook_tests {
                 "leaf-key.der",
             ],
         ] {
-            let output = std::process::Command::new("openssl")
+            let output = crate::sys::command_std("openssl")
                 .args(args)
                 .current_dir(&directory.0)
                 .output()
@@ -1977,11 +1977,14 @@ mod listen_webhook_tests {
                     accepted += 1;
                     // BSD-derived systems inherit O_NONBLOCK from the listener.
                     stream.set_nonblocking(false).unwrap();
+                    // Only a wedged-fixture guard, as long as the client's own
+                    // 10s timeout: a shorter one turns a slow client into a
+                    // retry and a second accept.
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .set_read_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
                     stream
-                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .set_write_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
                     let stream = rustls::StreamOwned::new(
                         rustls::ServerConnection::new(tls.clone()).unwrap(),
@@ -2015,7 +2018,7 @@ mod listen_webhook_tests {
                 }
                 (accepted, requests)
             });
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = crate::sys::command_std(std::env::current_exe().unwrap())
                 .args(["--exact", "intercom::relay::listen_webhook_tests::webhook_tls_uses_native_roots_and_standard_verification_not_relay_insecure", "--nocapture"])
                 .env("PI_FAMULUS_WEBHOOK_TLS_URL", format!("https://{address}/hook"))
                 .env("PI_FAMULUS_WEBHOOK_TLS_CASE", if trusted { "trusted" } else { "untrusted" })
@@ -2027,7 +2030,7 @@ mod listen_webhook_tests {
             let (accepted, requests) = worker.join().unwrap();
             if !output.status.success() {
                 let describe = |args: &[&str]| {
-                    std::process::Command::new("openssl")
+                    crate::sys::command_std("openssl")
                         .args(args)
                         .current_dir(&directory.0)
                         .output()
@@ -2577,8 +2580,10 @@ mod listen_webhook_tests {
             state_dir: state.0.clone(),
             ..Config::default()
         };
+        // Liveness only: a dial would park in the listener's backlog, which
+        // the accept probe below catches.
         let error = tokio::time::timeout(
-            Duration::from_millis(200),
+            Duration::from_secs(5),
             listen(
                 config,
                 "hermes".into(),
@@ -2678,29 +2683,29 @@ mod listen_webhook_tests {
 
     #[tokio::test]
     async fn webhook_client_errors_and_ignored_are_final_without_retry() {
-        // Keep the one-time trust store load out of the timed window.
-        let _ = super::tls::native_roots();
+        // No wall-clock bound: the peer answers once and closes, so a retry
+        // (after a >=1s backoff) would end in a connect error, not `expected`.
         for (status, body, expected) in [
             (400, "{}", "HTTP 400"),
             (200, "{\"status\":\"ignored\"}", "ignored"),
         ] {
             let (url, mut posts, http) = http_peer(vec![(status, body)]).await;
-            let result = tokio::time::timeout(
-                Duration::from_millis(300),
-                post_webhook(
-                    &Config::default(),
-                    &url,
-                    "secret",
-                    "hmac",
-                    "hermes",
-                    "sender",
-                    "body",
-                    "fixed-id",
-                ),
+            let result = post_webhook(
+                &Config::default(),
+                &url,
+                "secret",
+                "hmac",
+                "hermes",
+                "sender",
+                "body",
+                "fixed-id",
             )
-            .await
-            .expect("final response scheduled a retry");
-            assert!(result.unwrap_err().contains(expected));
+            .await;
+            let error = result.unwrap_err();
+            assert!(
+                error.contains(expected),
+                "final response scheduled a retry: {error}"
+            );
             assert!(posts.recv().await.is_some());
             http.await.unwrap();
             assert!(posts.try_recv().is_err());

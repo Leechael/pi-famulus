@@ -794,6 +794,7 @@ async fn namespace() -> Result<PathBuf, String> {
     }
     use std::os::unix::fs::MetadataExt;
     let uid = unsafe { libc::getuid() };
+    #[cfg(not(test))]
     let root = ["XDG_RUNTIME_DIR", "TMPDIR"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok())
@@ -820,6 +821,10 @@ async fn namespace() -> Result<PathBuf, String> {
             .contains(path)
         })
         .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // Claude Code's shared namespace is where real sessions on this machine
+    // listen; a test publishes into one under its own HOME instead.
+    #[cfg(test)]
+    let root = super::config::home();
     let primary = root.join("cc-socks");
     let safe = |p: &PathBuf| {
         std::fs::symlink_metadata(p)
@@ -831,7 +836,10 @@ async fn namespace() -> Result<PathBuf, String> {
     {
         return Ok(primary);
     }
+    #[cfg(not(test))]
     let fallback = PathBuf::from(format!("/tmp/cc-socks-{uid}"));
+    #[cfg(test)]
+    let fallback = root.join(format!("cc-socks-{uid}"));
     if !std::fs::symlink_metadata(&fallback)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         && !safe(&fallback)

@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 const USER_DRIVER_MS: u64 = 10 * 60 * 1000;
@@ -1111,7 +1110,7 @@ struct Spawned {
 
 async fn spawn_rpc(argv: &[String], cwd: &str, env: &HashMap<String, String>) -> std::io::Result<Spawned> {
     let runner = task::runner_exe()?;
-    let mut cmd = Command::new(runner);
+    let mut cmd = crate::sys::command_tokio(runner);
     cmd.arg("__rpc");
     cmd.args(argv);
     cmd.current_dir(cwd);

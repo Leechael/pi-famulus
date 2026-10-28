@@ -321,7 +321,7 @@ pub(super) fn check(row: &Value) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let username = std::process::Command::new("/usr/bin/id")
+        let username = crate::sys::command_std("/usr/bin/id")
             .arg("-un")
             .output()
             .map_err(|e| e.to_string())?;
@@ -335,7 +335,7 @@ pub(super) fn check(row: &Value) -> Result<(), String> {
             if read(&path)?.is_none() {
                 continue;
             }
-            let output = std::process::Command::new("/usr/bin/plutil")
+            let output = crate::sys::command_std("/usr/bin/plutil")
                 .args(["-convert", "json", "-o", "-", "--"])
                 .arg(&path)
                 .output()

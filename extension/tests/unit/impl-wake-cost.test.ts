@@ -22,6 +22,8 @@ import { MonitorRegistry } from "../../src/monitor";
 import { NotifyCenter } from "../../src/notify";
 import { InProcessRunner } from "../../src/subagent/runner";
 import { resetHostedFakes, settleAsync, startHostedExtension, until } from "./hosted-fakes";
+// Load the extension at collection time, outside the first test's timeout (see startHostedExtension).
+import "../../src/index";
 import { SessionFactory, WORKER_AGENT } from "./subagent-fakes";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {

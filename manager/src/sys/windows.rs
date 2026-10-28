@@ -88,6 +88,20 @@ fn duplicate_runner(process: RawHandle) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(out as RawHandle) })
 }
 
+/// Every process this crate starts is built here or by [`command_tokio`]
+/// (enforced by `sys::spawn_guard`). Windows needs nothing more here: a
+/// child gets only handles marked inheritable, and std creates the stdio
+/// pipes it passes inheritable only under its own spawn lock (the daemon's
+/// own inherited stdio is handled by [`spawn_detached_std`]).
+pub fn command_std(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    std::process::Command::new(program)
+}
+
+/// [`command_std`] for tokio.
+pub fn command_tokio(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    command_std(program).into()
+}
+
 pub fn apply_new_session_std(cmd: &mut std::process::Command) {
     cmd.creation_flags(DETACH_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
 }

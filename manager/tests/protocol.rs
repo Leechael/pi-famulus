@@ -12,13 +12,15 @@
 //! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
 //! (pi-famulus-test-<pid>-<testname>) and kills its daemon on drop.
 
+mod common;
+
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
@@ -460,7 +462,7 @@ fn wait_child_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus
 
 /// std-only liveness check via the system kill(1) binary (kill -0).
 fn pid_alive(pid: u64) -> bool {
-    Command::new("kill")
+    common::command("kill")
         .args(["-0", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -478,7 +480,7 @@ fn pid_running(pid: u64) -> bool {
     if !pid_alive(pid) {
         return false;
     }
-    let out = Command::new("ps")
+    let out = common::command("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output();
     match out {
@@ -1813,7 +1815,7 @@ fn t13_repeated_start_exit_stress() {
 /// it, and it would bind the shared default intercom socket and publish into
 /// the real `~/.claude/sessions`.
 fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    let mut command = std::process::Command::new(bin);
+    let mut command = common::command(bin);
     command.env("PI_FAMULUS_NO_INTERCOM", "1");
     command
 }

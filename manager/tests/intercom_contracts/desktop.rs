@@ -57,9 +57,7 @@ impl Desktop {
         fs::write(&codex, "#!/bin/sh\nprintf 'codex-fixture 1.0\\n'\n").unwrap();
         fs::set_permissions(codex, fs::Permissions::from_mode(0o755)).unwrap();
         let mut paths = vec![directory.clone()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
+        paths.extend(std::env::split_paths(common::tool_free_path()));
         let search_path = std::env::join_paths(paths).unwrap().into_string().unwrap();
         let path = directory.join("ipc.sock");
         let listener = common::bind_private_unix(&path);
@@ -94,18 +92,29 @@ impl Desktop {
                     if stopped.load(Ordering::Relaxed) {
                         break;
                     }
+                    // Poll only for the first byte of a frame. The daemon
+                    // writes the length and the body in separate syscalls, so
+                    // the short poll timeout must not apply inside a frame: a
+                    // stall between them would drop or unframe the connection.
                     let mut header = [0u8; 4];
-                    match stream.read_exact(&mut header) {
-                        Ok(()) => {}
+                    match stream.read(&mut header[..1]) {
+                        Ok(0) => break,
+                        Ok(_) => {}
                         Err(e)
                             if matches!(
                                 e.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::Interrupted
                             ) =>
                         {
                             continue;
                         }
                         Err(_) => break,
+                    }
+                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                    if stream.read_exact(&mut header[1..]).is_err() {
+                        break;
                     }
                     let size = u32::from_le_bytes(header) as usize;
                     if size > 16 * 1024 * 1024 {
@@ -115,6 +124,9 @@ impl Desktop {
                     if stream.read_exact(&mut raw).is_err() {
                         break;
                     }
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .unwrap();
                     let Ok(request) = serde_json::from_slice::<Value>(&raw) else {
                         continue;
                     };

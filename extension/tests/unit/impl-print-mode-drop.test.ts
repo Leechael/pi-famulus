@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { printModeDropWarning } from "../../src/work-index";
 import { resetHostedFakes, startHostedExtension } from "./hosted-fakes";
+// Load the extension at collection time, outside the first test's timeout (see startHostedExtension).
+import "../../src/index";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();

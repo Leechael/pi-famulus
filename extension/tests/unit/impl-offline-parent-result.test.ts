@@ -21,6 +21,8 @@ import {
   textOf,
   until,
 } from "./hosted-fakes";
+// Load the extension at collection time, outside the first test's timeout (see startHostedExtension).
+import "../../src/index";
 
 vi.mock("../../src/manager-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/manager-client")>();

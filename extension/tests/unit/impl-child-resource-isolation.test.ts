@@ -1,7 +1,7 @@
 import { appendFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Type } from "typebox";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { BEHAVIOR_GUIDELINES, CHILD_BEHAVIOR_GUIDELINES } from "../../src/behavior-guidelines";
@@ -9,6 +9,10 @@ import { createChildBashTool } from "../../src/subagent/child-bash";
 import { createChildResources, childSessionCreateOptions, createPiSessionFn, isFamulusChildSession } from "../../src/subagent/pi-runtime";
 
 const tempDirs: string[] = [];
+// Each session loads src/index.ts through pi's jiti loader, outside vitest's
+// module cache: seconds on a loaded runner (impl-hosted-child-tool-allowlist
+// bounds the same load at 30s).
+vi.setConfig({ testTimeout: 30_000 });
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));

@@ -34,6 +34,8 @@ mod workkind;
 
 #[cfg(test)]
 mod fs_permissions;
+#[cfg(test)]
+mod hermetic;
 
 use cli::{Cli, Sub};
 

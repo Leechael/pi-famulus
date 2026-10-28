@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 #[cfg(unix)]
 use tokio::net::unix::pipe;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::mpsc;
 
 pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
@@ -401,7 +401,7 @@ fn spawn_process_unix(command: &str, cwd: &str, env: &HashMap<String, String>) -
     let (status_read, status_write) = crate::sys::pipe_cloexec()?;
     let status_write = crate::sys::dup_cloexec_high(&status_write)?;
     let runner = runner_exe()?;
-    let mut cmd = Command::new(&runner);
+    let mut cmd = crate::sys::command_tokio(&runner);
     cmd.arg("__run").arg(command);
     cmd.current_dir(cwd);
     // §3.3: env is the complete environment; the client builds it.
@@ -450,7 +450,7 @@ fn spawn_process_windows(command: &str, cwd: &str, env: &HashMap<String, String>
     let status_write = unsafe { OwnedHandle::from_raw_handle(write_h as RawHandle) };
 
     let runner = runner_exe()?;
-    let mut cmd = Command::new(&runner);
+    let mut cmd = crate::sys::command_tokio(&runner);
     cmd.arg("__run").arg(command);
     cmd.current_dir(cwd);
     cmd.env_clear().envs(env);
@@ -1169,7 +1169,7 @@ mod tests {
         assert_eq!(status.signal(), Some(SIGKILL));
         // Reparented zombies may await init's reap; none may still run.
         let pids = descendants.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-        let ps = std::process::Command::new("ps")
+        let ps = crate::sys::command_std("ps")
             .args(["-p", &pids, "-o", "stat="])
             .output()
             .unwrap();

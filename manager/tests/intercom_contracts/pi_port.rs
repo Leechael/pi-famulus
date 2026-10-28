@@ -19,6 +19,26 @@ fn pi_conn(fixture: &Fixture, session: &str) -> common::Conn {
     conn
 }
 
+/// Ends `serve` and waits until the manager has demoted the bridge. `serve`
+/// exiting does not mean the manager has handled its lease connection
+/// closing; a `supervise` before that finds the bridge still supervised and
+/// never restarts it.
+fn release_lease_and_wait_demoted(fixture: &mut Fixture) {
+    fixture.release_lease();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let report = fixture.connect().ok(json!({"op":"status"}))["report"].clone();
+        if report["supervised"] == false {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bridge stayed supervised after the lease ended: {report}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn intercom(conn: &mut common::Conn, op: Value) -> Value {
     conn.request(json!({"type":"intercom","op":op}))
 }
@@ -318,7 +338,7 @@ fn bridge_restart_pushes_intercom_reset_and_the_port_reregisters() {
 
     // The bridge restarts when its configuration changed and a lease is
     // (re)applied: drop the lease, change the config, promote again.
-    fixture.release_lease();
+    release_lease_and_wait_demoted(&mut fixture);
     fixture.config("remote_messages = 'refuse'\n");
     let mut manager =
         common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
@@ -500,7 +520,7 @@ fn a_bridge_reset_finishes_the_in_flight_op_and_answers_queued_ops() {
     alice.stream.write_all(&[op("r2", "busy"), op("r3", "idle")].concat()).unwrap();
 
     // Restart the bridge (config change on promotion).
-    fixture.release_lease();
+    release_lease_and_wait_demoted(&mut fixture);
     fixture.config("remote_messages = 'refuse'\n");
     let mut manager =
         common::Conn::new(UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap());
@@ -701,7 +721,7 @@ fn a_dead_pi_process_settles_unread_deliveries_as_dropped() {
     fixture.start();
     // The pi process is a real child the test kills: the daemon's crash
     // signal (dead pi_pid) is what makes a close a "session gone".
-    let mut standin = std::process::Command::new("sleep")
+    let mut standin = common::command("sleep")
         .arg("60")
         .spawn()
         .unwrap();

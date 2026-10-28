@@ -169,11 +169,29 @@ fn modern(method: &str, mut params: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).unwrap()
 }
 
+/// The daemon binds an ephemeral port and the test reads it back once the
+/// listener runs: a port picked and released here could be taken by another
+/// test before the daemon binds it, and nothing waited for the listener.
 fn start() -> (Fixture, SocketAddr) {
     let mut fixture = Fixture::new();
-    let address = super::network::vacant_address();
-    let listen = address.to_string();
-    fixture.start_with(&["--mcp-listen", &listen, "--mcp-token", TOKEN], &[]);
+    fixture.start_with(&["--mcp-listen", "127.0.0.1:0", "--mcp-token", TOKEN], &[]);
+    let deadline = Instant::now() + TIMEOUT;
+    let url = loop {
+        let output = fixture.run(&["status", "--json"]);
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        if status["mcp_status"] == "running" {
+            break reqwest::Url::parse(status["mcp_url"].as_str().unwrap()).unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "MCP listener never became ready: {status} {}",
+            fixture.log()
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let address = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap())
+        .parse()
+        .unwrap();
     (fixture, address)
 }
 

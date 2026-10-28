@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 use std::process::Output;
 
@@ -305,7 +307,7 @@ fn unknown_flags_remain_errors() {
 /// it, and it would bind the shared default intercom socket and publish into
 /// the real `~/.claude/sessions`.
 fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    let mut command = std::process::Command::new(bin);
+    let mut command = common::command(bin);
     command.env("PI_FAMULUS_NO_INTERCOM", "1");
     command
 }

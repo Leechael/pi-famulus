@@ -22,6 +22,9 @@
 
 #![allow(dead_code)]
 
+/// The test binary's environment: decided here, not by the host.
+#[path = "../../src/hermetic.rs"]
+pub mod hermetic;
 pub mod kit;
 
 use serde_json::{json, Value};
@@ -494,12 +497,10 @@ impl Drop for Home {
         // Windows reuses a finished task's pid within seconds, so killing
         // recorded pids there can hit another test's live process. Killing
         // the daemon below is enough: its kill-on-close jobs take every task
-        // tree with it.
+        // tree with it. Unix reuses pids too: see `owned_task_groups`.
         #[cfg(unix)]
-        for r in self.records() {
-            if let Some(pid) = r["pid"].as_u64() {
-                kill_group(pid as u32, SIGKILL);
-            }
+        for pid in self.owned_task_groups() {
+            kill_group(pid, SIGKILL);
         }
         for p in &self.extra_pids {
             kill_pid(*p, SIGKILL);
@@ -517,11 +518,11 @@ impl Drop for Home {
                 }
             }
         }
+        // Not the bare pidfile value: once that daemon exits its pid can be
+        // another test's process. Every daemon a home starts (spawn, client
+        // autostart, handover exec) has `--home <path> daemon` in its argv.
         #[cfg(unix)]
         {
-            if let Some(pid) = self.pidfile_pid() {
-                kill_pid(pid, SIGKILL);
-            }
             for pid in daemon_pids_for(&self.path) {
                 kill_pid(pid, SIGKILL);
             }
@@ -533,6 +534,79 @@ impl Drop for Home {
     }
 }
 
+#[cfg(unix)]
+impl Home {
+    /// The recorded task process groups that are this home's right now,
+    /// with this home's daemons stopped (SIGSTOP) so they stay so until
+    /// [`Home::drop`] has killed them and then the daemons.
+    ///
+    /// A record's `pid` names its task's group only while that group
+    /// exists. Once it has emptied, the kernel may hand the number to a
+    /// concurrently running test's task, which leads a group as well, and
+    /// a group kill would take that test's processes down. The task runner
+    /// leads its group for the group's whole life (it stays as guardian
+    /// while a leftover `cmd &` remains, src/runner.rs), and only its daemon
+    /// reaps it. So a group is this home's exactly when its leader is a
+    /// child of one of this home's daemons, and a stopped daemon cannot
+    /// reap, so that stays true while the groups are killed.
+    ///
+    /// Runners whose daemon is already gone are not reached here: their
+    /// lifeline broke, and they take their own group down (SIGTERM, the 2 s
+    /// grace, SIGKILL; D4/T7/T8).
+    fn owned_task_groups(&self) -> Vec<u32> {
+        let daemons = daemon_pids_for(&self.path);
+        if daemons.is_empty() {
+            return Vec::new();
+        }
+        for &daemon in &daemons {
+            kill_pid(daemon, libc::SIGSTOP);
+        }
+        // SIGSTOP takes effect asynchronously; a daemon that has exited
+        // meanwhile is a zombie or gone, and its children are no longer its.
+        let mut table = process_table();
+        poll_true(Duration::from_secs(1), || {
+            table = process_table();
+            daemons.iter().all(|d| table.iter().all(|p| p.pid != *d || p.stat.starts_with(['T', 'Z'])))
+        });
+        let mut groups: Vec<u32> = self
+            .records()
+            .iter()
+            .filter_map(|r| r["pid"].as_u64().map(|p| p as u32))
+            .filter(|pid| table.iter().any(|p| p.pid == *pid && daemons.contains(&p.ppid)))
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+}
+
+/// One `ps` row: [`process_table`].
+#[cfg(unix)]
+pub struct ProcessRow {
+    pub pid: u32,
+    pub ppid: u32,
+    pub stat: String,
+}
+
+/// Every process's pid, parent and state, in one `ps` snapshot.
+#[cfg(unix)]
+pub fn process_table() -> Vec<ProcessRow> {
+    let Ok(o) = command("ps").args(["-axo", "pid=,ppid=,stat="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut cols = l.split_whitespace();
+            Some(ProcessRow {
+                pid: cols.next()?.parse().ok()?,
+                ppid: cols.next()?.parse().ok()?,
+                stat: cols.next()?.to_string(),
+            })
+        })
+        .collect()
+}
+
 impl Home {
     /// Before a failed test's processes are killed: what each task and the
     /// daemon are doing (`ps` state and wait channel, stdio descriptors),
@@ -540,7 +614,7 @@ impl Home {
     /// shows here whether it is blocked writing to a pipe, sleeping, or gone.
     #[cfg(windows)]
     fn dump_processes(&self) {
-        let list = Command::new("tasklist")
+        let list = command("tasklist")
             .args(["/v", "/fo", "csv"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -556,7 +630,7 @@ impl Home {
             .filter_map(|r| r["pid"].as_u64().map(|p| p.to_string()))
             .collect();
         let daemon = self.pidfile_pid().map(|p| p.to_string());
-        let ps = Command::new("ps")
+        let ps = command("ps")
             .args(["-axo", "pid,ppid,pgid,stat,wchan,etime,command"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -575,7 +649,7 @@ impl Home {
             }
         }
         for pid in &pids {
-            let lsof = Command::new("lsof")
+            let lsof = command("lsof")
                 .args(["-a", "-p", pid, "-d", "0-2"])
                 .output()
                 .map(|o| format!("{}\n{}{}", o.status, String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
@@ -647,7 +721,7 @@ pub fn replace_binary(dst: &Path, src: &Path) {
     const ETXTBSY: i32 = -1;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match Command::new(&tmp).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
+        match command(&tmp).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
             Err(e) if e.raw_os_error() == Some(ETXTBSY) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -767,7 +841,7 @@ pub fn pid_running(pid: u32) -> bool {
     if !pid_alive(pid) {
         return false;
     }
-    let out = Command::new("ps")
+    let out = command("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output();
     match out {
@@ -801,7 +875,7 @@ pub fn kill_group(pid: u32, sig: i32) {
 #[cfg(unix)]
 /// Resident set size of `pid` in bytes (via `ps -o rss=`, KiB on Darwin+Linux).
 pub fn rss_bytes(pid: u32) -> Option<u64> {
-    let o = Command::new("ps")
+    let o = command("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
         .ok()?;
@@ -816,7 +890,7 @@ pub fn rss_bytes(pid: u32) -> Option<u64> {
 /// Pids of `pi-famulus ... daemon` processes whose command line names `home`
 /// (i.e. daemons auto-spawned by a CLI client with `--home <home>`).
 pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
-    let Ok(o) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+    let Ok(o) = command("ps").args(["-axo", "pid=,command="]).output() else {
         return Vec::new();
     };
     let home_s = home.to_string_lossy().to_string();
@@ -846,7 +920,7 @@ pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
 mod win {
     use std::collections::HashMap;
     use std::path::Path;
-    use std::process::Command;
+    use super::command;
     use std::sync::{Mutex, OnceLock};
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -978,7 +1052,7 @@ mod win {
     pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
         let script = "Get-CimInstance Win32_Process -Filter \"Name='pi-famulus.exe'\" | \
                       ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
-        let Ok(o) = Command::new("powershell")
+        let Ok(o) = command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
         else {
@@ -1070,7 +1144,7 @@ pub fn open_handles(pid: u32) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        let o = Command::new("lsof").args(["-n", "-P", "-p", &pid.to_string()]).output().ok()?;
+        let o = command("lsof").args(["-n", "-P", "-p", &pid.to_string()]).output().ok()?;
         let n = String::from_utf8_lossy(&o.stdout)
             .lines()
             .skip(1)
@@ -1100,7 +1174,7 @@ pub fn cpu_time_ms(pid: u32) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         // `ps -o time=`: [[dd-]hh:]mm:ss.cc
-        let o = Command::new("ps").args(["-o", "time=", "-p", &pid.to_string()]).output().ok()?;
+        let o = command("ps").args(["-o", "time=", "-p", &pid.to_string()]).output().ok()?;
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
         let (rest, frac) = s.split_once('.').unwrap_or((&s, "0"));
         let mut secs = 0u64;
@@ -1590,7 +1664,7 @@ pub struct HelperClient {
 impl HelperClient {
     pub fn spawn(home: &Path, session: &str, commands: &[&str]) -> HelperClient {
         let exe = std::env::current_exe().unwrap();
-        let mut child = Command::new(exe)
+        let mut child = command(exe)
             .args([
                 "--exact",
                 "helper_hold_extension_conn",
@@ -1704,7 +1778,132 @@ pub fn wait_for_pids_for(c: &mut Conn, task_id: &str, n: usize, timeout: Duratio
 /// it, and it would bind the shared default intercom socket and publish into
 /// the real `~/.claude/sessions`.
 pub fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    let mut command = std::process::Command::new(bin);
+    let mut command = self::command(bin);
     command.env("PI_FAMULUS_NO_INTERCOM", "1");
     command
+}
+
+/// The host coding tools the manager probes with `--version` on PATH
+/// (`tool_versions` in src/intercom/mod.rs). Tests never run the host's
+/// copies; see [`tool_free_path`].
+pub const HOST_TOOLS: [&str; 4] = ["claude", "pi", "herdr", "codex"];
+
+/// The test process's PATH with no `claude`, `pi`, `herdr` or `codex` on
+/// it, and every other program still where it was. [`command`] gives it to
+/// every child, so the manager's tool probe finds only what a test puts on
+/// PATH itself: without this, each suite run executed the developer's real
+/// tools hundreds of times, and status assertions depended on what was
+/// installed and how fast it answered. A test that wants host tools sets
+/// PATH from [`hermetic::host_path`] explicitly. On Unix the test binary
+/// already starts with such a PATH (see `src/hermetic.rs`); this keeps
+/// Windows, where it does not, covered.
+///
+/// A PATH directory holding one of those names is replaced, in place, by a
+/// per-process directory of symlinks to everything else in it. Dropping
+/// the directory instead would also drop what the tests and the manager
+/// need beside the tool (`sh`, `python3`, `ps`, `openssl`... in
+/// /usr/bin or /opt/homebrew/bin, where a package may well have put `pi`).
+/// Names match case-insensitively, as on the default macOS file system.
+/// Windows: symlinks need a privilege CI lacks, so such a directory is
+/// dropped; there the tools live in their own install directories.
+pub fn tool_free_path() -> &'static std::ffi::OsStr {
+    static PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let host = std::env::var_os("PATH").unwrap_or_default();
+        #[cfg(unix)]
+        let mirrors = std::env::temp_dir().join(format!("pi-famulus-path-{}", std::process::id()));
+        #[cfg(unix)]
+        remove_dead_path_mirrors(&mirrors);
+        let is_tool = |name: &std::ffi::OsStr| {
+            name.to_str().is_some_and(|name| HOST_TOOLS.iter().any(|tool| name.eq_ignore_ascii_case(tool)))
+        };
+        let mut dirs = Vec::new();
+        for (index, dir) in std::env::split_paths(&host).enumerate() {
+            let entries: Vec<std::ffi::OsString> = match fs::read_dir(&dir) {
+                Ok(entries) => entries.flatten().map(|e| e.file_name()).collect(),
+                Err(_) => {
+                    dirs.push(dir);
+                    continue;
+                }
+            };
+            if !entries.iter().any(|name| is_tool(name)) {
+                dirs.push(dir);
+                continue;
+            }
+            #[cfg(unix)]
+            if dir.is_absolute() {
+                let mirror = mirrors.join(index.to_string());
+                fs::create_dir_all(&mirror).expect("create tool-free PATH directory");
+                for name in entries.iter().filter(|name| !is_tool(name)) {
+                    let _ = std::os::unix::fs::symlink(dir.join(name), mirror.join(name));
+                }
+                dirs.push(mirror);
+            }
+            #[cfg(not(unix))]
+            let _ = index;
+        }
+        std::env::join_paths(dirs).expect("rebuild PATH")
+    })
+}
+
+/// Mirrors [`tool_free_path`] left by test processes that have exited.
+#[cfg(unix)]
+fn remove_dead_path_mirrors(own: &Path) {
+    let (Some(parent), Some(own_name)) = (own.parent(), own.file_name()) else { return };
+    let Ok(entries) = fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("pi-famulus-path-")) else { continue };
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        if name != own_name && !pid_alive(pid) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Every process a test spawns goes through here (enforced by
+/// `test_spawns_inherit_only_stdio` in lifecycle_adversarial.rs): the child
+/// inherits only stdin, stdout and stderr, and has [`tool_free_path`] for
+/// PATH unless the caller sets another.
+///
+/// Tests run in parallel threads of one process. On macOS std creates pipes
+/// and sockets close-on-exec in two steps (`pipe()`, then `fcntl`), so a
+/// child another thread spawns inside that window keeps a copy. A copied
+/// stdout pipe write end means the reader sees no EOF until that unrelated
+/// child exits: d2's `wait_with_output` on darwin-x64 CI blocked 14s, until
+/// d8c's delayed CLI exited, and the daemon it was about to check idled out
+/// meanwhile. Linux uses `pipe2(O_CLOEXEC)`, so it cannot happen there.
+/// The production spawns guard the same window (`sys::command_std`).
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("PATH", tool_free_path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Upper bound computed before fork: fds are allocated lowest-first,
+        // so one opened concurrently lands just above the highest one now.
+        let highest = fs::read_dir("/dev/fd")
+            .ok()
+            .and_then(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok()).max())
+            .unwrap_or(1024);
+        let limit = highest + 1 + 256;
+        // SAFETY: the closure runs between fork and exec and calls only
+        // `fcntl`, which is async-signal-safe; it captures an integer and
+        // allocates nothing. Marking (not closing) keeps std's own exec-error
+        // pipe working. Hooks a caller adds later run after this one, so a
+        // descriptor a test passes on purpose (t14's dup2) still reaches
+        // the child.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in 3..limit {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd
 }
