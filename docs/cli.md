@@ -230,6 +230,7 @@ pi-famulus top [--once] [--interval 1s] [--session PREFIX] [--cwd DIR] [--json]
 - Other views: `2` agents leaderboard, `3` flat task table, `4` merged events.
 - Work-kind slot and CPU pressure stay in the header and, in Active scope, count only running work.
 - The header shows the messaging relay link and device name: `connected`, `disconnected`, or `local-only`. Deliberately disabled messaging shows `msg off`; a bridge startup failure shows `msg unavailable`. `/famulus` and `status --json` include the failure reason.
+- `N unpublished` after the device name counts local sessions the relay assigns to another device, typically sessions an earlier client or enrollment on this host published first. Peers cannot reach them or accept them as idle watchers until they restart with a new id. `/famulus`, `status --json` (`messaging.conflicts`), `intercom status` (`relay_conflicts`) and `manager.log` name them.
 - Monitors show their stored `description`, or a short guess from the command (incident folder, ssh host and what it tails). Subagent rows show token I/O on the node and in the TOK I/O column.
 
 **Keys and mouse.** `?` lists every key by screen.

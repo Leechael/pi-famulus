@@ -87,6 +87,8 @@ fn transport_runtime_on(cfg: Config, clock: crate::clock::Clock) -> Shared {
             relay_tx: None,
             relay_error: String::new(),
             relay_link: Default::default(),
+            relay_sent: VecDeque::new(),
+            relay_conflicts: Vec::new(),
             control_outbox: VecDeque::new(),
             port_conns: std::collections::HashSet::new(),
             relay_message_ids: false,
@@ -1036,4 +1038,104 @@ async fn no_retry_time_is_reported_while_connected() {
     assert_eq!(rt.relay_retry_at(), None);
     rt.stop.send_replace(true);
     tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap();
+}
+
+#[test]
+fn relay_conflicts_are_sent_rows_the_directory_does_not_list_as_ours() {
+    let sent = vec![
+        json!({"id":"claude/accepted","name":"accepted"}),
+        json!({"id":"claude/owned-elsewhere","name":"older"}),
+        json!({"id":"pi/missing","name":"missing"}),
+        json!({"id":"pi/self-hosted","name":"self-hosted"}),
+    ];
+    let directory = vec![
+        json!({"id":"claude/accepted","machine_id":"device-ours"}),
+        json!({"id":"claude/owned-elsewhere","machine_id":"device-old","machine_name":"Cube","status":"offline"}),
+        json!({"id":"pi/self-hosted","machine_id":"me@host"}),
+        json!({"id":"pi/remote-peer","machine_id":"device-castle"}),
+    ];
+    let conflicts = relay_conflicts(&sent, &directory, &["device-ours", "me@host"]);
+    assert_eq!(
+        conflicts,
+        vec![
+            json!({"id":"claude/owned-elsewhere","name":"older","owner":"Cube","owner_id":"device-old"}),
+            json!({"id":"pi/missing","name":"missing","owner":"","owner_id":""}),
+        ]
+    );
+    assert!(relay_conflicts(&sent[..1], &directory, &["device-ours"]).is_empty());
+}
+
+#[tokio::test]
+async fn session_reports_local_sessions_the_relay_assigns_to_another_device() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rt = transport_runtime(Config {
+        server: format!("http://{}", listener.local_addr().unwrap()),
+        token: "fixture".into(),
+        ..Config::default()
+    });
+    for id in ["pi/accepted", "pi/owned-elsewhere"] {
+        rt.state.lock().unwrap().sessions.insert(
+            id.into(),
+            super::super::Session {
+                value: json!({"id":id,"name":id,"harness":"pi","status":"idle"}),
+                owner: 0,
+                epoch: 0,
+                tx: tokio::sync::mpsc::channel(1).0,
+                disconnect: None,
+                caps: Default::default(),
+                idle_since: None,
+            },
+        );
+    }
+    let active = rt.clone();
+    let task = tokio::spawn(async move {
+        session(
+            active.clone(),
+            &mut tokio::task::JoinSet::new(),
+            &mut tokio::task::JoinSet::new(),
+            &delivery_lanes(&active),
+            &mut None,
+        )
+        .await
+    });
+    let mut peer = welcomed_peer(&listener).await;
+    peer_frame(&mut peer, |frame| frame["type"] == "list" && frame["id"] == "directory").await;
+    // The relay keeps the second id with the device that published it first.
+    peer_send(&mut peer, json!({"type":"list","id":"directory","sessions":[
+        {"id":"pi/accepted","machine_id":"transport-fixture"},
+        {"id":"pi/owned-elsewhere","machine_id":"device-old","machine_name":"Cube","status":"offline"},
+    ]})).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while rt.relay_conflicts().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "conflict never reported");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        rt.relay_conflicts(),
+        vec![json!({"id":"pi/owned-elsewhere","name":"pi/owned-elsewhere","owner":"Cube","owner_id":"device-old"})]
+    );
+    let report = rt.status_report().await;
+    assert_eq!(report["relay_conflicts"], "pi/owned-elsewhere (owned by Cube)");
+    // A dropped link must not keep reporting a stale relay view.
+    drop(peer);
+    let _ = tokio::time::timeout(Duration::from_secs(3), task).await.unwrap();
+    assert!(rt.relay_conflicts().is_empty());
+}
+
+#[test]
+fn a_late_directory_reply_is_matched_to_the_snapshot_it_answers() {
+    let rt = transport_runtime(Config::default());
+    // Two snapshots went out before the first reply: the second carries a
+    // session the first did not, so the first reply cannot list it yet.
+    rt.state.lock().unwrap().relay_sent.extend([
+        vec![json!({"id":"pi/old","name":"old"})],
+        vec![json!({"id":"pi/old","name":"old"}), json!({"id":"pi/new","name":"new"})],
+    ]);
+    note_relay_conflicts(&rt, &[json!({"id":"pi/old","machine_id":"transport-fixture"})], "");
+    assert!(rt.relay_conflicts().is_empty(), "{:?}", rt.relay_conflicts());
+    note_relay_conflicts(&rt, &[json!({"id":"pi/old","machine_id":"transport-fixture"})], "");
+    assert_eq!(rt.relay_conflicts().len(), 1, "the reply to the second snapshot omits pi/new");
+    // With nothing outstanding, a stray reply leaves the last view alone.
+    note_relay_conflicts(&rt, &[], "");
+    assert_eq!(rt.relay_conflicts().len(), 1);
 }

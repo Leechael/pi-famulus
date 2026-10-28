@@ -133,6 +133,12 @@ pub struct State {
     pub relay_error: String,
     /// Reconnect schedule and wake-up for the relay supervisor.
     pub relay_link: relay::Link,
+    /// Local session ids (with names) of each snapshot whose directory
+    /// reply is still outstanding, oldest first; the relay answers in order.
+    pub relay_sent: VecDeque<Vec<Value>>,
+    /// Sent sessions the relay directory does not list under this device;
+    /// peers cannot reach or authenticate them. Cleared with the link.
+    pub relay_conflicts: Vec<Value>,
     pub control_outbox: VecDeque<Value>,
     /// Bridge-runtime connection ids owned by famulus manager-connection
     /// ports (protocol 7 `intercom`): a legacy client socket refuses to
@@ -362,6 +368,10 @@ impl Runtime {
         let wake = self.state.lock().unwrap().relay_link.wake.clone();
         wake.notify_one();
     }
+    /// Local sessions the connected relay assigns to another device.
+    pub fn relay_conflicts(&self) -> Vec<Value> {
+        self.state.lock().unwrap().relay_conflicts.clone()
+    }
     /// Stop admitting work and settle idle watches as `unavailable` while
     /// the native bridges and the watching processes are still alive; only
     /// then stop the bridges.
@@ -464,6 +474,8 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             relay_tx: None,
             relay_error: String::new(),
             relay_link: Default::default(),
+            relay_sent: VecDeque::new(),
+            relay_conflicts: Vec::new(),
             control_outbox: VecDeque::new(),
             port_conns: HashSet::new(),
             relay_message_ids: false,
@@ -931,7 +943,7 @@ impl Runtime {
             )
         };
         legacy.sort();
-        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"name":self.cfg.display_name(),"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"relay_error":relay_error,"relay_retry_at":self.relay_retry_at(),"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
+        report.as_object_mut().unwrap().extend(json!({"machine":self.machine,"name":self.cfg.display_name(),"daemon":"running","pid":std::process::id(),"daemon_version":crate::VERSION,"cwd":std::env::current_dir().map(|path|path.to_string_lossy().into_owned()).unwrap_or_default(),"socket":self.cfg.sock,"relay":relay,"relay_error":relay_error,"relay_retry_at":self.relay_retry_at(),"relay_conflicts":relay::describe_conflicts(&self.relay_conflicts()),"server":self.cfg.server,"mcp_listen":self.cfg.mcp_listen,"mcp_status":mcp,"mcp_url":if mcp=="running"{self.mcp_url.lock().unwrap().clone()}else{String::new()},"mcp_token_file":if mcp=="running"{self.generated_mcp_token_file()}else{String::new()},"native_status":native,"supervised":self.state.lock().unwrap().supervised}).as_object().unwrap().clone());
         for (key, count) in [
             ("claude_n", claude),
             ("pi_n", pi),

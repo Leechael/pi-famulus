@@ -192,6 +192,15 @@ export interface MessagingStatus {
   retry_at_ms?: number;
   /** Enrolled device id for the configured server; absent or empty when not enrolled. */
   device_id?: string;
+  /** Local sessions the relay assigns to another device; peers cannot reach them. */
+  conflicts?: RelayConflict[];
+}
+
+export interface RelayConflict {
+  id: string;
+  name: string;
+  /** Owning device name or id; empty when the relay does not list the session. */
+  owner: string;
 }
 
 export interface SessionInfo {

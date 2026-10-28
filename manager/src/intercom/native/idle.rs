@@ -1411,7 +1411,12 @@ pub(super) async fn incoming(
                 let _ = runtime.native.idle_notice(&child, status).await;
             }
         }
-        Err(_) => {
+        Err(error) => {
+            // Claude renders the refusal without a reason; keep it here.
+            eprintln!(
+                "intercom native: idle subscription from {} to {target} refused: {error}",
+                str_field(source, "id")
+            );
             // Reject only this request's endpoint, never the route of an
             // existing subscription with the same control UUID.
             let route = {
@@ -1560,6 +1565,8 @@ mod tests {
                 relay_tx: None,
             relay_error: String::new(),
             relay_link: Default::default(),
+            relay_sent: std::collections::VecDeque::new(),
+            relay_conflicts: Vec::new(),
                 control_outbox: std::collections::VecDeque::new(),
                 port_conns: std::collections::HashSet::new(),
                 relay_message_ids: false,

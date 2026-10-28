@@ -1011,6 +1011,67 @@ fn snapshot_rows(rows: Vec<Value>) -> Vec<Value> {
         .map(super::public_row)
         .collect()
 }
+/// Sent rows the relay directory does not list under one of `ours`. A hosted
+/// relay keeps each session id with the device that published it first, so a
+/// session an earlier device on this host registered (an older client, or a
+/// re-enrollment under a new identity) is refused from our snapshot without
+/// naming it. Peers can then neither reach it nor accept it as a watcher.
+fn relay_conflicts(sent: &[Value], directory: &[Value], ours: &[&str]) -> Vec<Value> {
+    sent.iter()
+        .filter_map(|row| {
+            let id = str_field(row, "id");
+            let listed = directory.iter().find(|v| str_field(v, "id") == id);
+            if listed.is_some_and(|v| ours.contains(&str_field(v, "machine_id"))) {
+                return None;
+            }
+            let owner_id = listed.map_or("", |v| str_field(v, "machine_id"));
+            let owner = listed
+                .map(|v| str_field(v, "machine_name"))
+                .filter(|name| !name.is_empty())
+                .unwrap_or(owner_id);
+            Some(json!({"id":id,"name":str_field(row,"name"),"owner":owner,"owner_id":owner_id}))
+        })
+        .collect()
+}
+/// Snapshots awaiting their directory reply; a relay that never answers
+/// `list` must not grow the queue.
+const RELAY_SENT_PENDING: usize = 8;
+/// Records the relay's view of our snapshot, logging only when the set of
+/// conflicting ids changes so a persistent conflict is not repeated per tick.
+fn note_relay_conflicts(rt: &Shared, directory: &[Value], welcomed_as: &str) {
+    let mut state = rt.state.lock().unwrap();
+    let Some(sent) = state.relay_sent.pop_front() else {
+        return;
+    };
+    let conflicts = relay_conflicts(
+        &sent,
+        directory,
+        &[welcomed_as, rt.machine.as_str(), rt.identity.device_id.as_str()],
+    );
+    let ids = |rows: &[Value]| rows.iter().map(|v| str_field(v, "id").to_string()).collect::<Vec<_>>();
+    if ids(&conflicts) != ids(&state.relay_conflicts) {
+        if conflicts.is_empty() {
+            eprintln!("intercom relay: every local session is published");
+        } else {
+            eprintln!(
+                "intercom relay: {} local session(s) are not published because the relay assigns them to another device; peers cannot reach them or accept them as idle watchers until they restart with a new id: {}",
+                conflicts.len(),
+                describe_conflicts(&conflicts)
+            );
+        }
+    }
+    state.relay_conflicts = conflicts;
+}
+pub(super) fn describe_conflicts(conflicts: &[Value]) -> String {
+    conflicts
+        .iter()
+        .map(|v| match str_field(v, "owner") {
+            "" => format!("{} (not listed)", str_field(v, "id")),
+            owner => format!("{} (owned by {owner})", str_field(v, "id")),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 const DELIVERY_PER_TARGET: usize = 256;
 const DELIVERY_TARGETS: usize = 1024;
 const DELIVERY_ITEMS: usize = 4096;
@@ -1196,7 +1257,7 @@ async fn session(
     let result = loop {
         tokio::select! {
             _=stop.changed()=>break Ok(()),
-            _=tick.tick()=>{let local=snapshot_rows(rt.directory().await);let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
+            _=tick.tick()=>{let local=snapshot_rows(rt.directory().await);{let mut state=rt.state.lock().unwrap();if state.relay_sent.len()>=RELAY_SENT_PENDING{state.relay_sent.pop_front();}state.relay_sent.push_back(local.iter().map(|v|json!({"id":v["id"],"name":v["name"]})).collect());}let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
             if let Err(e)=ws.send(Message::Text(json!({"type":"list","id":"directory"}).to_string().into())).await{break Err(e);}}
             req=rx.recv()=>{if let Some(packet)=req{let v=packet.value;let result=ws.send(Message::Text(v.to_string().into())).await;drop(packet.fence);if let Err(e)=result{if is_control(&v){failed_control=Some(v);}break Err(e);}}}
             msg=ws.next()=>match msg{
@@ -1204,7 +1265,7 @@ async fn session(
                     let v:Value=match serde_json::from_str(&t){Ok(v)=>v,Err(e)=>break Err(TransportError::Io(e.to_string()))};
                     let pending={rt.state.lock().unwrap().pending.remove(str_field(&v,"id"))};if let Some(p)=pending{idle_tx.reply(v,p);continue;}
                     if v["rpc_reply"]==true{continue;}
-                    if str_field(&v,"id")=="directory"{rt.state.lock().unwrap().remote=v["sessions"].as_array().into_iter().flatten().filter(|s|str_field(s,"machine_id")!=rt.machine).cloned().collect();continue;}
+                    if str_field(&v,"id")=="directory"{let listed=v["sessions"].as_array().cloned().unwrap_or_default();note_relay_conflicts(&rt,&listed,str_field(&welcome,"machine_id"));rt.state.lock().unwrap().remote=listed.into_iter().filter(|s|str_field(s,"machine_id")!=rt.machine).collect();continue;}
                     match str_field(&v,"type"){
                         "idle_subscribe"|"idle_cancel"|"idle_notice"=>{if v["rpc_reply"]!=true&&idle_tx.control(v).is_err(){break Err("idle relay control queue capacity reached".into());}}
                         "receipt"=>{
@@ -1283,6 +1344,8 @@ async fn session(
         s.relay_message_ids = false;
         s.pending.clear();
         s.remote.clear();
+        s.relay_sent.clear();
+        s.relay_conflicts.clear();
     }
     result
 }

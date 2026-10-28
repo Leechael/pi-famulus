@@ -337,6 +337,10 @@ fn messaging_spans(m: &crate::proto::MessagingStatus) -> Vec<Span<'static>> {
         spans.push(sp(fg(DIM), " · "));
         spans.push(sp(fg(TEXT), m.name.clone()));
     }
+    if !m.conflicts.is_empty() {
+        spans.push(sp(fg(DIM), " · "));
+        spans.push(sp(fg(WARN), format!("{} unpublished", m.conflicts.len())));
+    }
     spans
 }
 
@@ -3041,6 +3045,32 @@ mod tests {
         let mut state = TopState::new(1_000, None, None);
         state.apply(&snap, &[], &HashMap::new());
         assert!(!render(120, 30, &mut state).contains("msg "), "an older daemon shows no messaging state");
+    }
+
+    #[test]
+    fn the_header_counts_local_sessions_the_relay_assigns_to_another_device() {
+        let mut snap = snap();
+        snap.daemon = Some(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.7", "pid": 42, "uptime_ms": 1, "sessions": [],
+                "task_counts": {"running": 0, "terminal": 0},
+                "messaging": {"state": "connected", "name": "castle", "conflicts": [
+                    {"id": "claude/a", "name": "a", "owner": "Cube"},
+                    {"id": "claude/b", "name": "b", "owner": "Cube"}
+                ]}
+            }))
+            .unwrap(),
+        );
+        for (cols, rows) in [(120, 30), (120, 12)] {
+            let mut state = TopState::new(1_000, None, None);
+            state.apply(&snap, &[], &HashMap::new());
+            let text = render(cols, rows, &mut state);
+            assert!(text.contains("msg connected · castle · 2 unpublished"), "{cols}x{rows}: {text}");
+        }
+        snap.daemon.as_mut().unwrap().messaging.as_mut().unwrap().conflicts.clear();
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        assert!(!render(120, 30, &mut state).contains("unpublished"));
     }
 
     #[test]

@@ -128,6 +128,11 @@ describe("/famulus status", () => {
     [{ state: "disconnected", name: "castle", error: "relay TLS certificate rejected" }, "Messaging: disconnected · name castle (relay TLS certificate rejected)"],
     [{ state: "disconnected", name: "castle" }, "Messaging: disconnected · name castle"],
     [{ state: "local_only", name: "castle" }, "Messaging: local-only · name castle"],
+    [
+      { state: "connected", name: "castle", conflicts: [{ id: "claude/a", name: "a", owner: "Cube" }, { id: "pi/b", name: "", owner: "" }] },
+      "Messaging: connected · name castle · 2 sessions unpublished",
+    ],
+    [{ state: "connected", name: "castle", conflicts: [{ id: "claude/a", name: "a", owner: "Cube" }] }, "Messaging: connected · name castle · 1 session unpublished"],
     [{ state: "unavailable", name: "", error: "disabled by PI_FAMULUS_NO_INTERCOM" }, "Messaging: unavailable (disabled by PI_FAMULUS_NO_INTERCOM)"],
     [undefined, "Messaging: not reported by this manager"],
     [new Error("rejected"), "Messaging: not reported by this manager"],
@@ -208,6 +213,26 @@ describe("/famulus settings", () => {
       expect(shown).toContain(row);
     }
     expect(at("Messaging:")).toBeLessThan(at("Edit config.json"));
+  });
+
+  it("names the sessions the relay assigns to another device", async () => {
+    let lines: string[] = [];
+    let wide = "";
+    await runInteractive(freshConfig(), (screen) => {
+      lines = screen.render(60);
+      wide = screen.render(100).join("\n");
+      press(screen, KEY.esc);
+    }, { messaging: {
+      state: "connected", name: "castle",
+      conflicts: [{ id: "claude/0fe3c5c0", name: "grok\u001b[31m", owner: "Cube" }, { id: "pi/b", name: "", owner: "" }],
+    } });
+    expect(wide).toContain("Messaging:  connected · name castle · 2 sessions unpublished");
+    const shown = lines.join("\n").replace(/\s+/g, " ");
+    expect(shown).toContain("Unpublished: the relay assigns these sessions to another device");
+    expect(shown).toContain("grok (claude/0fe3c5c0) owned by Cube");
+    expect(shown).toContain("pi/b not listed");
+    expect(shown).not.toContain("\u001b[31m");
+    expect(lines.every((line) => visibleWidth(line) <= 60)).toBe(true);
   });
 
   it("wraps the concrete relay HTTP error at narrow widths without treating body newlines as UI rows", async () => {

@@ -711,6 +711,8 @@ mod tests {
                 relay_tx: None,
             relay_error: String::new(),
             relay_link: Default::default(),
+            relay_sent: VecDeque::new(),
+            relay_conflicts: Vec::new(),
                 control_outbox: VecDeque::new(),
                 port_conns: HashSet::new(),
                 relay_message_ids: false,
