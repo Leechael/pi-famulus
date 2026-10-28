@@ -1722,6 +1722,7 @@ pub fn famulus_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Comman
 /// meanwhile. Linux uses `pipe2(O_CLOEXEC)`, so it cannot happen there.
 /// The production spawns guard the same window (`sys::unix::child_setup`).
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut cmd = Command::new(program);
     #[cfg(unix)]
     {
