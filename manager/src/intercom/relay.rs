@@ -1914,11 +1914,14 @@ mod listen_webhook_tests {
                     accepted += 1;
                     // BSD-derived systems inherit O_NONBLOCK from the listener.
                     stream.set_nonblocking(false).unwrap();
+                    // Only a wedged-fixture guard, as long as the client's own
+                    // 10s timeout: a shorter one turns a slow client into a
+                    // retry and a second accept.
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .set_read_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
                     stream
-                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .set_write_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
                     let stream = rustls::StreamOwned::new(
                         rustls::ServerConnection::new(tls.clone()).unwrap(),
@@ -2514,8 +2517,10 @@ mod listen_webhook_tests {
             state_dir: state.0.clone(),
             ..Config::default()
         };
+        // Liveness only: a dial would park in the listener's backlog, which
+        // the accept probe below catches.
         let error = tokio::time::timeout(
-            Duration::from_millis(200),
+            Duration::from_secs(5),
             listen(
                 config,
                 "hermes".into(),
