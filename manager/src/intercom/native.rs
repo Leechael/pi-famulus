@@ -118,11 +118,14 @@ fn envelope_attr(value: &str) -> String {
         .filter(|c| !matches!(c, '"' | '<' | '>' | '&') && !c.is_control())
         .collect()
 }
-fn claude_envelope(origin: &str, mode: &str, body: &str) -> Result<String, String> {
+/// `from` must be an address Claude Code can reply to (the sender's `uds:`
+/// alias identity): Claude copies the envelope's `from` verbatim as the `to` of
+/// its SendMessage, which resolves only names and `uds:` addresses.
+fn claude_envelope(from: &str, mode: &str, body: &str) -> Result<String, String> {
     super::check_from_mode(mode)?;
     Ok(format!(
         "<cross-session-message from=\"{}\"{}>\n{}\n</cross-session-message>",
-        envelope_attr(origin),
+        envelope_attr(from),
         if mode.is_empty() {
             String::new()
         } else {
@@ -417,7 +420,8 @@ impl Native {
         #[cfg(unix)]
         {
             if str_field(row, "harness") == "claude" {
-                let envelope = claude_envelope(origin, mode, body)?;
+                // Refuse a bad mode before touching any socket.
+                super::check_from_mode(mode)?;
                 let sock = str_field(row, "_socket");
                 let reply = self.ready_reply_endpoint(origin).await?;
                 let _guard = alias::alias_guard(self, &reply).await?;
@@ -435,6 +439,7 @@ impl Native {
                 )?;
                 self.cache_sent_endpoint(row);
                 let from = alias::from_identity(str_field(&reply, "_socket"));
+                let envelope = claude_envelope(&from, mode, body)?;
                 let mut frame=json!({"msgV":1,"msg_id":mid,"type":"user","priority":"next","from":from,"message":{"role":"user","content":envelope}}).to_string();
                 frame.push('\n');
                 tokio::time::timeout(Duration::from_secs(5), stream.write_all(frame.as_bytes()))
@@ -1100,6 +1105,28 @@ mod tests {
         let header = text.lines().next().unwrap();
         assert_eq!(header.matches('"').count(), 4, "forged attribute: {header}");
         assert!(header.ends_with(" from-mode=\"prompting\">"), "{header}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_envelope_from_is_the_reply_address_not_a_session_id() {
+        let from = alias::from_identity("/tmp/cc-socks/72583.sock");
+        let text = claude_envelope(&from, "prompting", "body").unwrap();
+        assert!(
+            text.starts_with(
+                "<cross-session-message from=\"uds:/tmp/cc-socks/72583.sock\" from-mode=\"prompting\">"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("pi/"), "{text}");
+        let spaced = alias::from_identity("/tmp/a b\"<>.sock");
+        let text = claude_envelope(&spaced, "", "body").unwrap();
+        one_envelope(&text);
+        assert_eq!(
+            text.lines().next().unwrap().matches('"').count(),
+            2,
+            "{text}"
+        );
     }
 
     #[test]

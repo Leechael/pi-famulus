@@ -272,8 +272,17 @@ fn claude_native_delivery_waits_for_native_held_and_terminal_receipts() {
     assert_eq!(user["msg_id"], sent["message_id"]);
     let content = user["message"]["content"].as_str().unwrap();
     assert!(content.contains("native body"));
-    assert!(content.contains("pi/sender"));
-    assert!(content.contains("from-mode=\"prompting\""));
+    // Claude Code tells its model to copy the envelope's `from` as the reply
+    // `to`, and it only resolves `uds:` addresses (not pi session ids).
+    let frame_from = user["from"].as_str().unwrap();
+    assert!(frame_from.starts_with("uds:"), "{frame_from}");
+    assert!(
+        content.starts_with(&format!(
+            "<cross-session-message from=\"{frame_from}\" from-mode=\"prompting\">"
+        )),
+        "envelope from must equal the frame reply address: {content}"
+    );
+    assert!(!content.contains("pi/sender"), "{content}");
     native.receipt(&user, "held");
     let held = sender.event("receipt");
     assert_eq!(held["status"], "held");

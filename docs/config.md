@@ -54,7 +54,7 @@ These keys belong in the `subagent` object unless noted otherwise.
 
 ## Messaging bridge settings
 
-These keys belong in the `messaging` object in the same `config.json`. Messaging is disabled unless `messaging.enabled` is explicitly `true`; setting a server or token alone does not enable it. While disabled, the plugin registers no messaging tools, commands, prompts or completion, and the daemon starts no bridge. `PI_FAMULUS_NO_INTERCOM` also disables messaging. Other messaging settings have no environment-variable or alternate-file overrides. Reload the extension after changing `enabled`; daemon-owned settings are reloaded when supervision starts and otherwise require a daemon restart.
+These keys belong in the `messaging` object in the same `config.json`. Messaging is disabled unless `messaging.enabled` is explicitly `true`; setting a server or token alone does not enable it. While disabled, the plugin registers no messaging tools (`SendMessage`, `ListSessions`, documented in [tools.md](tools.md)), commands, prompts or completion, and the daemon starts no bridge. `PI_FAMULUS_NO_INTERCOM` also disables messaging. Other messaging settings have no environment-variable or alternate-file overrides. Reload the extension after changing `enabled`; daemon-owned settings are reloaded when supervision starts and otherwise require a daemon restart.
 
 ```json
 {

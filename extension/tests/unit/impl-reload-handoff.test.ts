@@ -196,7 +196,8 @@ describe("extension across /reload", () => {
     const enabled = fakePi();
     await loadExtension(enabled.api);
     expect(enabled.tools).toContain("SendMessage");
-    expect(enabled.commands.has("intercom")).toBe(true);
+    expect(enabled.commands.has("rename")).toBe(true);
+    expect(enabled.commands.has("intercom")).toBe(false);
     await enabled.emit("session_start", { reason: "reload" }, fakeCtx().ctx);
     expect(retryTimers.size).toBe(1);
     expect(eventListeners.size).toBe(2);
@@ -210,6 +211,7 @@ describe("extension across /reload", () => {
     const disabled = fakePi();
     await loadExtension(disabled.api);
     expect(disabled.tools).not.toContain("SendMessage");
+    expect(disabled.commands.has("rename")).toBe(false);
     expect(disabled.commands.has("intercom")).toBe(false);
     expect(disabled.commands.has("famulus")).toBe(true);
     await disabled.emit("session_start", { reason: "reload" }, fakeCtx().ctx);
