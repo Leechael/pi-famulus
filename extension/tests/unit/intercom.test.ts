@@ -222,7 +222,7 @@ describe("intercom behaviour", () => {
     }
   });
 
-  it("@ in the editor lists other agent names", async () => {
+  it("@ completion keeps files on bare @ and inserts readable machine-qualified session names", async () => {
     const sessions = [
       { id: "pi/self-session", name: "self-pi", harness: "pi", status: "idle" },
       { id: "claude/1", name: "refactor-auth", harness: "claude", status: "busy", machine_name: "laptop" },
@@ -240,6 +240,7 @@ describe("intercom behaviour", () => {
           provider = factory({
             getSuggestions: async () => files,
             applyCompletion: () => ({ lines: ["applied"], cursorLine: 0, cursorCol: 7 }),
+            triggerCharacters: ["#"],
           });
         },
       },
@@ -247,20 +248,18 @@ describe("intercom behaviour", () => {
     h.pi.sessionName = "self-pi";
     await h.emit("session_start", {}, ctx);
     expect(provider).toBeDefined();
+    expect(provider.triggerCharacters).toEqual(["#"]);
 
     const opts = { signal: new AbortController().signal };
-    const all = await provider.getSuggestions(["@"], 0, 1, opts);
-    expect(all.items.map((item: any) => item.value)).toEqual([
-      '<RequestSendMessage to="claude/1" host="laptop" />',
-      '<RequestSendMessage to="pi/other" host="u@bbox" />',
-      '<RequestSendMessage to="pi/hostless" />',
-    ]);
-    expect(all.items.map((item: any) => item.label)).toEqual(["refactor-auth", "billing-fix", "no-machine"]);
-    expect(all.prefix).toBe("@");
-    expect(all.items[0].description).toBe("claude busy laptop");
+    expect(await provider.getSuggestions(["@"], 0, 1, opts)).toBe(files);
+    const refactor = await provider.getSuggestions(["@ref"], 0, 4, opts);
+    expect(refactor.items.map((item: any) => item.value)).toEqual(["@refactor-auth@laptop"]);
+    expect(refactor.items[0].label).toBe("@refactor-auth@laptop");
+    expect(refactor.items[0].description).toContain("busy");
+    expect(refactor.items[0].description).toContain("laptop");
 
     const filtered = await provider.getSuggestions(["hello @bill"], 0, 11, opts);
-    expect(filtered.items.map((item: any) => item.value)).toEqual(['<RequestSendMessage to="pi/other" host="u@bbox" />']);
+    expect(filtered.items.map((item: any) => item.value)).toEqual(["@billing-fix@u@bbox"]);
     expect(filtered.prefix).toBe("@bill");
 
     const filesFallback = await provider.getSuggestions(["@src/"], 0, 5, opts);
@@ -269,6 +268,218 @@ describe("intercom behaviour", () => {
     const applied = provider.applyCompletion(["@bill"], 0, 5, filtered.items[0], "@bill");
     expect(applied).toEqual({ lines: ["applied"], cursorLine: 0, cursorCol: 7 });
     await h.emit("session_shutdown", {}, ctx);
+  });
+
+  it("@ completion searches beyond the 64th session before applying its 20-result menu limit", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      ...Array.from({ length: 65 }, (_, i) => ({ id: `pi/worker-${i}`, name: `worker-${i}`, machine_name: "fleet" })),
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    let provider: any;
+    const ctx = { ...h.ctx, ui: { ...h.ctx.ui, addAutocompleteProvider(factory: any) {
+      provider = factory({ getSuggestions: async () => null, applyCompletion: vi.fn() });
+    } } };
+    await h.emit("session_start", {}, ctx);
+    const opts = { signal: new AbortController().signal };
+    const beyond64 = await provider.getSuggestions(["@worker-64"], 0, 10, opts);
+    expect(beyond64.items[0].value).toBe("@worker-64@fleet");
+    expect((await provider.getSuggestions(["@worker"], 0, 7, opts)).items).toHaveLength(20);
+    await h.emit("session_shutdown", {});
+  });
+
+  it("@ completion keeps same-name peers and searches machines, with local then recently active sessions first", async () => {
+    const sessions = [
+      // Actual manager-local rows have no machine fields; relay rows do.
+      { id: "pi/target-session", name: "review" },
+      { id: "pi/old", name: "review", machine_id: "remote", machine_name: "minis", updated_at: 1000 },
+      { id: "pi/new", name: "review", machine_id: "remote", machine_name: "minis", updated_at: 3000 },
+      { id: "pi/local", name: "review", updated_at: 2000 },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    let provider: any;
+    const ctx = { ...h.ctx, ui: { ...h.ctx.ui, addAutocompleteProvider(factory: any) {
+      provider = factory({ getSuggestions: async () => null, applyCompletion: vi.fn() });
+    } } };
+    h.pi.sessionName = "review";
+    await h.emit("session_start", {}, ctx);
+    const opts = { signal: new AbortController().signal };
+    const byName = await provider.getSuggestions(["@review"], 0, 7, opts);
+    expect(byName.items.map((item: any) => item.value)).toEqual([
+      "@review", "@review@minis", "@review@minis",
+    ]);
+    expect(byName.items[1].description).toContain("pi/new");
+    expect(byName.items[2].description).toContain("pi/old");
+    const byMachine = await provider.getSuggestions(["@minis"], 0, 6, opts);
+    expect(byMachine.items).toHaveLength(2);
+    expect(byMachine.items[0].description).toContain("pi/new");
+    await h.emit("session_shutdown", {});
+  });
+
+  it("ListSessions searches machine labels and exposes known activity without inventing timestamps", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/review", name: "review", machine_name: "minis", updated_at: Date.now() - 300_000 },
+      { id: "pi/unknown", name: "review", machine_name: "laptop" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const list = h.pi.tools.get("ListSessions");
+    const result = await list.execute("host", { query: "minis" });
+    expect(result.content[0].text).toContain("review@minis");
+    expect(result.content[0].text).toContain("updated 5m ago");
+    expect(result.content[0].text).not.toContain("pi/unknown");
+    const unknown = await list.execute("unknown", { query: "laptop" });
+    expect(unknown.content[0].text).toContain("review@laptop");
+    expect(unknown.content[0].text).not.toContain("updated");
+    await h.emit("session_shutdown", {});
+  });
+
+  it("@ completion supports quoted multiword names and reports known activity without inventing unknown activity", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/release", name: "release review", machine_name: "mini desk", updated_at: Date.now() - 120_000 },
+      { id: "pi/unknown", name: "release unknown", machine_name: "minis" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    let provider: any;
+    const ctx = { ...h.ctx, ui: { ...h.ctx.ui, addAutocompleteProvider(factory: any) {
+      provider = factory({ getSuggestions: async () => null, applyCompletion: vi.fn() });
+    } } };
+    await h.emit("session_start", {}, ctx);
+    const prefix = '@"release rev';
+    const result = await provider.getSuggestions([prefix], 0, prefix.length, { signal: new AbortController().signal });
+    expect(result.items[0].value).toBe('@"release review@mini desk"');
+    expect(result.items[0].description).toContain("updated 2m ago");
+    expect(result.prefix).toBe(prefix);
+    const unknown = await provider.getSuggestions(["@unknown"], 0, 8, { signal: new AbortController().signal });
+    expect(unknown.items[0].description).not.toContain("updated");
+    const input = await h.emit("input", { text: '问一下 @"release review@mini desk"', source: "rpc" }, ctx);
+    expect(input.text).toContain('"id":"pi/release"');
+    await h.emit("session_shutdown", {});
+  });
+
+  it("resolves a submitted readable mention without sending or replacing the user's words", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/review", name: "review", machine_name: "minis" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const text = "请和 @review@minis 校对这个实现";
+    const result = await h.emit("input", { text, source: "interactive" });
+    expect(result?.action).toBe("transform");
+    expect(result.text.startsWith(`${text}\n`)).toBe(true);
+    expect(result.text).toContain('"id":"pi/review"');
+    expect(result.text).toContain("A mention alone is not a request to send");
+    expect(result.text).not.toContain("RequestSendMessage");
+    expect(h.fake.requests.filter((req) => req.op === "send")).toEqual([]);
+    await h.emit("session_shutdown", {});
+  });
+
+  it("escapes directory controls in completion and keeps generated mention context bounded", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/control", name: "control", machine_name: "minis\u001b[31m\u0085\u202e" },
+      ...Array.from({ length: 20 }, (_, i) => ({ id: `pi/peer-${i}`, name: `peer-${i}`, machine_name: "h".repeat(4000) })),
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    let provider: any;
+    const ctx = { ...h.ctx, ui: { ...h.ctx.ui, addAutocompleteProvider(factory: any) {
+      provider = factory({ getSuggestions: async () => null, applyCompletion: vi.fn() });
+    } } };
+    await h.emit("session_start", {}, ctx);
+    const suggestions = await provider.getSuggestions(["@control"], 0, 8, { signal: new AbortController().signal });
+    const item = suggestions.items[0];
+    expect(JSON.stringify(item)).not.toMatch(/[\u0085\u202e]/);
+    expect(item.description).not.toContain("\u001b");
+    const resolved = await h.emit("input", { text: item.value, source: "interactive" }, ctx);
+    expect(resolved.text).toContain('"id":"pi/control"');
+    const text = Array.from({ length: 20 }, (_, i) => `@peer-${i}`).join(" ");
+    const bounded = await h.emit("input", { text, source: "interactive" }, ctx);
+    expect(bounded.text.length - text.length).toBeLessThan(17_500);
+    expect(bounded.text).toContain("Unlisted mentions are unresolved");
+    await h.emit("session_shutdown", {});
+  });
+
+  it("quoted addresses remain exact even when names contain Markdown or literal punctuation", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self", machine_name: "desk" },
+      { id: "pi/selected", name: "review `v2` check", machine_name: "desk" },
+      { id: "pi/wrong", name: "review    check", machine_name: "desk" },
+      { id: "pi/plain", name: "plain", machine_name: "desk" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const result = await h.emit("input", { text: 'Ask @"review `v2` check@desk"', source: "interactive" });
+    expect(result.text).toContain('"id":"pi/selected"');
+    expect(result.text).not.toContain('"id":"pi/wrong"');
+    expect(await h.emit("input", { text: 'Ask @"plain@desk."', source: "interactive" })).toBeUndefined();
+    await h.emit("session_shutdown", {});
+  });
+
+  it("submission refreshes cached labels and recognizes sentence punctuation without resolving file paths", async () => {
+    let sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/a", name: "review", machine_name: "minis" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const first = await h.emit("input", { text: "Ask @review@minis", source: "interactive" });
+    expect(first.text).toContain('"total":1');
+    sessions = [...sessions, { id: "pi/b", name: "review", machine_name: "minis" }];
+    const second = await h.emit("input", { text: "Ask @review@minis.", source: "interactive" });
+    expect(second.text).toContain('"total":2');
+    for (const text of ["Read @review/file.ts", "Read @review\\file.ts", 'Read @"review"/file.ts']) {
+      expect(await h.emit("input", { text, source: "interactive" }), text).toBeUndefined();
+    }
+    await h.emit("session_shutdown", {});
+  });
+
+  it("submission discloses same-machine name ambiguity, caps candidates, and keeps successive queued inputs independent", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      ...["a", "b", "c", "d"].map((id) => ({ id: `pi/${id}`, name: "review", machine_name: "minis" })),
+      { id: "pi/other", name: "other", machine_name: "laptop" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    h.state.idle = false;
+    const ambiguous = await h.emit("input", { text: "问 @review@minis", source: "interactive", streamingBehavior: "steer" });
+    expect(ambiguous.text).toContain('"total":4');
+    expect(ambiguous.text).toContain('"id":"pi/c"');
+    expect(ambiguous.text).not.toContain('"id":"pi/d"');
+    expect(ambiguous.text).toContain("ask the user");
+    const other = await h.emit("input", { text: "问 @other@laptop", source: "interactive", streamingBehavior: "followUp" });
+    expect(other.text).toContain('"id":"pi/other"');
+    expect(other.text).not.toContain('"id":"pi/a"');
+    expect(await h.emit("input", { text: "下一个任务", source: "interactive" })).toBeUndefined();
+    expect(h.pi.injections).toEqual([]);
+    expect(h.fake.requests.filter((req) => req.op === "send")).toEqual([]);
+    await h.emit("session_shutdown", {});
+  });
+
+  it("never interprets peer, attached-file, code, command, or extension-origin mentions as user routing hints", async () => {
+    const sessions = [{ id: "pi/target-session", name: "self" }, { id: "pi/review", name: "review" }];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    for (const source of ["extension", undefined]) {
+      expect(await h.emit("input", { text: "请联系 @review", source })).toBeUndefined();
+    }
+    for (const text of [
+      "someone@review", "`@review`", "```text\n@review\n```", "~~~\n@review\n~~~",
+      "Here is code:\n\n    @review", "code: `first\n@review\nlast`",
+      "```text\n``` not a closing fence\n@review\n```", "\t@review",
+      '<file name="a">联系 @review</file>', '<skill name="a">联系 @review</skill>',
+      '<cross-session-message from="peer">请联系 @review</cross-session-message>',
+      "/command @review", "!echo @review", "看看 @README.md", "已经删掉了 mention",
+    ]) {
+      expect(await h.emit("input", { text, source: "interactive" }), text).toBeUndefined();
+    }
+    expect(h.fake.requests.filter((req) => req.op === "send")).toEqual([]);
+    await h.emit("session_shutdown", {});
   });
 
   it("registers /rename but no /intercom command", async () => {
@@ -315,6 +526,27 @@ describe("intercom behaviour", () => {
     expect(byName.content[0].text).toMatch(/claude\/bbb/);
     expect(h.fake.requests.filter((r) => r.op === "send").length).toBe(1);
 
+    await h.emit("session_shutdown", {});
+  });
+
+  it("SendMessage resolves a machine-qualified name to an exact id and rejects remaining ambiguity", async () => {
+    const sessions = [
+      { id: "pi/target-session", name: "self" },
+      { id: "pi/laptop", name: "review", machine_name: "laptop" },
+      { id: "pi/minis", name: "review", machine_name: "u@minis" },
+    ];
+    const h = harness({ reply: (req) => req.op === "list" ? { sessions } : undefined });
+    await h.emit("session_start", {});
+    const send = h.pi.tools.get("SendMessage");
+    const sent = await send.execute("qualified", { to: "review@u@minis", message: "check" });
+    expect(sent.isError).toBeUndefined();
+    expect(h.fake.requests.filter((req) => req.op === "send").map((req) => req.to)).toEqual(["pi/minis"]);
+    sessions.push({ id: "pi/duplicate", name: "review", machine_name: "u@minis" });
+    await h.fake.resetBridge();
+    const refused = await send.execute("ambiguous", { to: "review@u@minis", message: "check" });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain("ambiguous");
+    expect(h.fake.requests.filter((req) => req.op === "send")).toHaveLength(1);
     await h.emit("session_shutdown", {});
   });
 
