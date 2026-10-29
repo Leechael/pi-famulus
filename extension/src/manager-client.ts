@@ -18,7 +18,7 @@ import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
-const EXTENSION_VERSION = "0.2.1";
+const EXTENSION_VERSION = "0.2.2";
 export { EXTENSION_VERSION };
 // 6: hosted subagents. 7: the extension's messaging bridge (`intercom`
 // request plus `intercom`/`intercom_reset` events).
