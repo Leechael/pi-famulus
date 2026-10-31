@@ -13,8 +13,9 @@
  * events; the daemon pushes `intercom_reset` when its bridge restarts).
  *
  * Messaging is opt-in: disabled configuration or PI_FAMULUS_NO_INTERCOM
- * registers nothing. Enabled sessions report bridge and relay failures once
- * per error and probe for recovery every 3s.
+ * registers nothing. Enabled sessions report local bridge failures once per
+ * error and probe for recovery every 3s; relay outages flap with the
+ * network, so they update the status footer only, never a notification.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -206,8 +207,6 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
   let lastMessagingFooter: string | undefined;
   /** The current outage already produced its notice; later texts only update the footer. */
   let outageNotified = false;
-  /** A relay outage was reported, so the next healthy status is a recovery. */
-  let relayOutage = false;
   let statusCheckEpoch: number | undefined;
   let legacyPluginNotified = false;
   let autocompleteBound = false;
@@ -280,10 +279,7 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
 
   /** Notify once per outage; `footer` (default: the message) is the live status line. */
   function updateMessagingError(message?: string, level: "warning" | "error" = "error", footer = message) {
-    if (footer !== lastMessagingFooter) {
-      lastMessagingFooter = footer;
-      lastCtx?.ui.setStatus?.("famulus-messaging", footer);
-    }
+    setMessagingFooter(footer);
     if (!message) {
       outageNotified = false;
       return;
@@ -291,6 +287,15 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     if (outageNotified) return;
     outageNotified = true;
     notify(message, level);
+  }
+
+  /** Footer-only update for transient relay states: an unstable network
+   * flaps disconnected/connected and a notification per flap is noise. */
+  function setMessagingFooter(footer?: string) {
+    if (footer !== lastMessagingFooter) {
+      lastMessagingFooter = footer;
+      lastCtx?.ui.setStatus?.("famulus-messaging", footer);
+    }
   }
 
   const FOOTER_ERROR_MAX = 60;
@@ -315,20 +320,13 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
       const { messaging } = await client.status();
       if (stopped || epoch !== expectedEpoch || !lastCtx || !useContext(lastCtx)) return;
       if (!messaging || messaging.state === "disabled") {
-        relayOutage = false;
         updateMessagingError();
       } else if (messaging.error || messaging.state === "disconnected" || messaging.state === "unavailable") {
-        relayOutage = true;
-        updateMessagingError(
-          `pi-famulus messaging ${messaging.state}: ${messaging.error || "relay not connected"}`,
-          "error",
-          messagingFooter(messaging),
-        );
+        // The relay is remote: its outages follow the network, so they get
+        // the live footer, not a notification per flap.
+        setMessagingFooter(messagingFooter(messaging));
       } else {
         updateMessagingError();
-        // The outage notice was the only signal; say when it is over.
-        if (relayOutage) notify("pi-famulus messaging reconnected", "info");
-        relayOutage = false;
       }
     } catch (error) {
       if (!stopped && epoch === expectedEpoch && lastCtx && useContext(lastCtx)) {
@@ -765,7 +763,6 @@ export function registerIntercom(pi: ExtensionAPI, deps: IntercomDeps): void {
     readiness = undefined;
     started = false;
     listCache = undefined;
-    relayOutage = false;
     updateMessagingError();
     lastCtx = undefined;
     stopPromise = (async () => {
