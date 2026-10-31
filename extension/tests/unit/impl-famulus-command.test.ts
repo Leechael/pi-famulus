@@ -37,7 +37,6 @@ async function runInteractive(
   configPath: string,
   drive: (screen: Component, round: number) => void | Promise<void>,
   extra: {
-    editor?: (title: string, text: string) => Promise<string | undefined>;
     messaging?: MessagingStatus | (() => MessagingStatus);
     messagingReconnect?: () => Promise<void>;
     enrollMessagingToken?: FamulusCommandDeps["enrollMessagingToken"];
@@ -63,7 +62,6 @@ async function runInteractive(
   });
   const notify = vi.fn();
   const reload = vi.fn(async () => {});
-  const editor = vi.fn(extra.editor ?? (async () => undefined));
   let round = 0;
   const ctx = {
     hasUI: true,
@@ -73,13 +71,12 @@ async function runInteractive(
           const screen = factory({ requestRender() {} }, plain, {}, resolve) as Component;
           Promise.resolve().then(() => drive(screen, round++)).catch(reject);
         }),
-      editor,
       notify,
     },
     reload,
   };
   await handler!("", ctx);
-  return { notify, reload, editor };
+  return { notify, reload };
 }
 
 function freshConfig(content?: string): string {
@@ -117,7 +114,7 @@ describe("/famulus status", () => {
         "pi-famulus extension 0.1.6",
         "CLI binary: /opt/bin/pi-famulus (0.1.6+def)",
         "Manager: 0.1.6+abc (pid 4242)",
-        "Messaging: connected · name castle",
+        "Messaging: connected · castle",
         "Config: /home/user/.pi/agent/pi-famulus/config.json",
       ].join("\n"),
     );
@@ -125,14 +122,14 @@ describe("/famulus status", () => {
 
   it.each([
     [{ state: "disabled", name: "" }, "Messaging: disabled"],
-    [{ state: "disconnected", name: "castle", error: "relay TLS certificate rejected" }, "Messaging: disconnected · name castle (relay TLS certificate rejected)"],
-    [{ state: "disconnected", name: "castle" }, "Messaging: disconnected · name castle"],
-    [{ state: "local_only", name: "castle" }, "Messaging: local-only · name castle"],
+    [{ state: "disconnected", name: "castle", error: "relay TLS certificate rejected" }, "Messaging: disconnected · castle (relay TLS certificate rejected)"],
+    [{ state: "disconnected", name: "castle" }, "Messaging: disconnected · castle"],
+    [{ state: "local_only", name: "castle" }, "Messaging: local-only · castle"],
     [
       { state: "connected", name: "castle", conflicts: [{ id: "claude/a", name: "a", owner: "Cube" }, { id: "pi/b", name: "", owner: "" }] },
-      "Messaging: connected · name castle · 2 sessions unpublished",
+      "Messaging: connected · castle · 2 sessions unpublished",
     ],
-    [{ state: "connected", name: "castle", conflicts: [{ id: "claude/a", name: "a", owner: "Cube" }] }, "Messaging: connected · name castle · 1 session unpublished"],
+    [{ state: "connected", name: "castle", conflicts: [{ id: "claude/a", name: "a", owner: "Cube" }] }, "Messaging: connected · castle · 1 session unpublished"],
     [{ state: "unavailable", name: "", error: "disabled by PI_FAMULUS_NO_INTERCOM" }, "Messaging: unavailable (disabled by PI_FAMULUS_NO_INTERCOM)"],
     [undefined, "Messaging: not reported by this manager"],
     [new Error("rejected"), "Messaging: not reported by this manager"],
@@ -208,11 +205,11 @@ describe("/famulus settings", () => {
       press(screen, KEY.esc);
     });
     const at = (text: string) => shown.indexOf(text);
-    expect(at("Messaging:  connected · name castle")).toBeGreaterThan(0);
-    for (const row of ["Extension", "Subagents", "Manager daemon", "Messaging", "Edit config.json", "Reload extension"]) {
+    expect(at("Messaging:  connected · castle")).toBeGreaterThan(0);
+    for (const row of ["Extension", "Subagents", "Manager daemon", "Messaging", "Reload extension"]) {
       expect(shown).toContain(row);
     }
-    expect(at("Messaging:")).toBeLessThan(at("Edit config.json"));
+    expect(at("Messaging:")).toBeLessThan(at("Reload extension"));
   });
 
   it("names the sessions the relay assigns to another device", async () => {
@@ -226,7 +223,7 @@ describe("/famulus settings", () => {
       state: "connected", name: "castle",
       conflicts: [{ id: "claude/0fe3c5c0", name: "grok\u001b[31m", owner: "Cube" }, { id: "pi/b", name: "", owner: "" }],
     } });
-    expect(wide).toContain("Messaging:  connected · name castle · 2 sessions unpublished");
+    expect(wide).toContain("Messaging:  connected · castle · 2 sessions unpublished");
     const shown = lines.join("\n").replace(/\s+/g, " ");
     expect(shown).toContain("Unpublished: the relay assigns these sessions to another device");
     expect(shown).toContain("grok (claude/0fe3c5c0) owned by Cube");
@@ -475,35 +472,6 @@ describe("/famulus settings", () => {
     expect(readFileSync(configPath, "utf8")).toBe("{broken");
   });
 
-  it("edits the whole file from the overview and comes back to it", async () => {
-    const configPath = freshConfig();
-    const { editor, notify } = await runInteractive(
-      configPath,
-      (screen, round) => {
-        if (round === 0) press(screen, KEY.down, KEY.down, KEY.down, KEY.down, KEY.enter);
-        else press(screen, KEY.esc);
-      },
-      { editor: async () => '{"messaging":{"endpoints":[]}}' },
-    );
-    expect(editor).toHaveBeenCalledWith(`Edit ${configPath}`, "{}\n");
-    expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ messaging: { endpoints: [] } });
-    expect(notify.mock.calls[0][0]).toContain("restart the manager daemon for messaging settings");
-  });
-
-  it("rejects invalid JSON from the whole-file editor without writing", async () => {
-    const configPath = freshConfig();
-    const { notify } = await runInteractive(
-      configPath,
-      (screen, round) => {
-        if (round === 0) press(screen, KEY.down, KEY.down, KEY.down, KEY.down, KEY.enter);
-        else press(screen, KEY.esc);
-      },
-      { editor: async () => "not json" },
-    );
-    expect(notify.mock.calls[0][0]).toContain("Configuration was not saved:");
-    expect(existsSync(configPath)).toBe(false);
-  });
-
   it("reloads the extension from the overview", async () => {
     const { reload } = await runInteractive(freshConfig(), (screen) => press(screen, KEY.up, KEY.enter));
     expect(reload).toHaveBeenCalledOnce();
@@ -523,7 +491,7 @@ describe("/famulus messaging status and reconnect", () => {
       press(screen, KEY.esc);
     }, { messaging: down({ retry_at_ms: 5_012_000 }) });
     vi.restoreAllMocks();
-    expect(shown).toContain("Messaging:  disconnected · name castle · retry in 12s");
+    expect(shown).toContain("Messaging:  disconnected · castle · retry in 12s");
     expect(shown.match(/os error 104/g)).toHaveLength(1);
     expect(shown).toContain("Messaging error: IO error");
   });

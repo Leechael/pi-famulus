@@ -7,7 +7,7 @@ import { dirname } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { ManagerError, type ManagerClient, type MessagingStatus } from "../manager-client";
-import { SETTINGS_SECTIONS, listTheme, readConfigText, sectionPage, writeConfigText } from "./famulus-settings";
+import { SETTINGS_SECTIONS, listTheme, sectionPage } from "./famulus-settings";
 import { loadPiTui, truncateToWidth, wrapTextWithAnsi } from "./pi-tui-load";
 
 export interface FamulusCommandDeps {
@@ -52,7 +52,7 @@ export function formatMessaging(info: FamulusInfo): string {
   const m = info.messaging;
   if (!m) return info.daemon ? "not reported by this manager" : "unknown (manager not connected)";
   const state = RELAY_STATES[m.state] ?? "unavailable";
-  let label = m.name && RELAY_STATES[m.state] ? `${state} · name ${singleLine(m.name)}` : state;
+  let label = m.name && RELAY_STATES[m.state] ? `${state} · ${singleLine(m.name)}` : state;
   if (m.state === "disconnected" && typeof m.retry_at_ms === "number") {
     const seconds = Math.ceil((m.retry_at_ms - Date.now()) / 1000);
     label += seconds > 0 ? ` · retry in ${seconds}s` : " · retrying";
@@ -145,7 +145,7 @@ export async function collectFamulusInfo(deps: FamulusCommandDeps): Promise<Famu
   };
 }
 
-type OverviewChoice = "edit-raw" | "reload" | "reconnect" | undefined;
+type OverviewChoice = "reload" | "reconnect" | undefined;
 
 /** Whether "Reconnect messaging now" makes sense for what the manager reported. */
 const canReconnect = (m: MessagingStatus | null) => m?.state === "disconnected" || m?.state === "unavailable";
@@ -206,13 +206,6 @@ function showOverview(
         currentValue: "",
         values: [""],
       }] : []),
-      {
-        id: "edit-raw",
-        label: "Edit config.json",
-        description: "The whole file in the editor, for webhook endpoints and anything not listed",
-        currentValue: "",
-        values: [""],
-      },
       { id: "reload", label: "Reload extension", description: "Apply extension settings now", currentValue: "", values: [""] },
     ];
     const list = new piTui.SettingsList(
@@ -220,7 +213,7 @@ function showOverview(
       10,
       listTheme(theme),
       (id) => {
-        if (id === "edit-raw" || id === "reload" || id === "reconnect") done(id);
+        if (id === "reload" || id === "reconnect") done(id);
       },
       () => done(undefined),
     );
@@ -272,25 +265,7 @@ export function registerFamulusCommand(pi: ExtensionAPI, deps: FamulusCommandDep
           await ctx.reload();
           return;
         }
-        if (action !== "edit-raw") return;
-        let current: string;
-        try {
-          current = readConfigText(deps.configPath);
-        } catch (error) {
-          ctx.ui.notify(`Cannot read ${deps.configPath}: ${(error as Error).message}`, "error");
-          continue;
-        }
-        const edited = await ctx.ui.editor(`Edit ${deps.configPath}`, current);
-        if (edited === undefined) continue;
-        try {
-          writeConfigText(deps.configPath, edited);
-          ctx.ui.notify(
-            `Saved ${deps.configPath}. Reload the extension for extension settings; restart the manager daemon for messaging settings.`,
-            "info",
-          );
-        } catch (error) {
-          ctx.ui.notify(`Configuration was not saved: ${(error as Error).message}`, "error");
-        }
+        return;
       }
     },
   });

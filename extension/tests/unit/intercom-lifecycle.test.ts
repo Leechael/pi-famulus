@@ -101,15 +101,18 @@ it("preserves the environment disable override even with opt-in", () => {
   }
 });
 
-it("reports startup relay errors despite a healthy local messaging port", async () => {
+it("shows startup relay errors in the footer without notifying, despite a healthy local messaging port", async () => {
   const h = lifecycleHarness({ messaging: { state: "disconnected", name: "primary", error: "enrollment required: run pi-famulus messaging enroll" } });
+  const setStatus = vi.fn();
+  h.ctx.ui.setStatus = setStatus;
   await h.emit("session_start");
-  expect(h.notices().filter((m) => m.includes("enrollment required"))).toHaveLength(1);
+  expect(h.notices().filter((m) => m.includes("enrollment required"))).toHaveLength(0);
+  expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", expect.stringContaining("enrollment required"));
   expect(h.registrations).toHaveLength(1);
   await h.emit("session_shutdown");
 });
 
-it("polls relay errors while locally registered, deduplicates, and resets on recovery", async () => {
+it("polls relay errors while locally registered: the footer follows, no notification ever fires", async () => {
   const h = lifecycleHarness();
   const setStatus = vi.fn();
   h.ctx.ui.setStatus = setStatus;
@@ -118,11 +121,11 @@ it("polls relay errors while locally registered, deduplicates, and resets on rec
   h.setMessaging({ state: "disconnected", name: "primary", error: "relay certificate rejected" });
   await tick();
   await tick();
-  expect(h.notices().filter((m) => m.includes("relay certificate rejected"))).toHaveLength(1);
+  expect(h.notices().filter((m) => m.includes("relay certificate rejected"))).toHaveLength(0);
   expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", expect.stringContaining("relay certificate rejected"));
   h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
   await tick();
-  // Same outage: the new text reaches the footer but does not notify again.
+  // Same outage: the new text reaches the footer.
   expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(0);
   expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", expect.stringContaining("relay authentication failed"));
   h.setMessaging({ state: "connected", name: "primary" });
@@ -130,12 +133,12 @@ it("polls relay errors while locally registered, deduplicates, and resets on rec
   expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", undefined);
   h.setMessaging({ state: "disconnected", name: "primary", error: "relay authentication failed" });
   await tick();
-  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(1);
+  expect(h.notices().filter((m) => m.includes("relay authentication failed"))).toHaveLength(0);
   expect(h.registrations).toHaveLength(1);
   await h.emit("session_shutdown");
 });
 
-it("notifies once per outage however the error text changes, and again for the next outage", async () => {
+it("flapping relay states never notify, however the error text changes", async () => {
   const h = lifecycleHarness();
   await h.emit("session_start");
   const tick = async () => { [...h.intervals][0].callback(); await flush(); };
@@ -143,21 +146,16 @@ it("notifies once per outage however the error text changes, and again for the n
   for (const error of ["os error 104", "dial timeout", "connection refused"]) {
     h.setMessaging({ state: "disconnected", name: "primary", error });
     await tick();
+    h.setMessaging({ state: "connected", name: "primary" });
+    await tick();
   }
   h.setMessaging({ state: "unavailable", name: "primary", error: "bridge down" });
   await tick();
-  expect(outage()).toHaveLength(1);
-  h.setMessaging({ state: "connected", name: "primary" });
-  await tick();
-  h.setMessaging({ state: "disconnected", name: "primary", error: "os error 104" });
-  await tick();
-  expect(outage()).toHaveLength(2);
-  // Disabled is not an outage, and ends the previous one.
   h.setMessaging({ state: "disabled", name: "" });
   await tick();
   h.setMessaging({ state: "disconnected", name: "primary", error: "os error 104" });
   await tick();
-  expect(outage()).toHaveLength(3);
+  expect(outage()).toHaveLength(0);
   await h.emit("session_shutdown");
 });
 
@@ -185,8 +183,10 @@ it("keeps the footer short and current: state, retry countdown, one-line error",
   await h.emit("session_shutdown");
 });
 
-it("announces recovery once after a reported relay outage, and only then", async () => {
+it("relay recovery clears the footer without a reconnected notification", async () => {
   const h = lifecycleHarness();
+  const setStatus = vi.fn();
+  h.ctx.ui.setStatus = setStatus;
   await h.emit("session_start");
   const tick = async () => { [...h.intervals][0].callback(); await flush(); };
   const reconnected = () => h.notices().filter((m) => m.includes("messaging reconnected"));
@@ -197,19 +197,20 @@ it("announces recovery once after a reported relay outage, and only then", async
   h.setMessaging({ state: "connected", name: "primary" });
   await tick();
   await tick();
-  expect(reconnected()).toEqual(["pi-famulus messaging reconnected"]);
-  // Disabling during an outage ends it: turning messaging back on is not a recovery.
+  expect(reconnected()).toHaveLength(0);
+  expect(setStatus).toHaveBeenLastCalledWith("famulus-messaging", undefined);
+  // Disabling and re-enabling during an outage is not a recovery either.
   h.setMessaging({ state: "disconnected", name: "primary", error: "relay disconnected" });
   await tick();
   h.setMessaging({ state: "disabled", name: "" });
   await tick();
   h.setMessaging({ state: "connected", name: "primary" });
   await tick();
-  expect(reconnected()).toHaveLength(1);
+  expect(reconnected()).toHaveLength(0);
   h.setMessaging({ state: "disconnected", name: "primary", error: "relay disconnected" });
   await tick();
   await h.emit("session_shutdown");
-  expect(reconnected()).toHaveLength(1);
+  expect(reconnected()).toHaveLength(0);
 });
 
 it("ignores a pending relay status response after shutdown", async () => {
