@@ -1,0 +1,17 @@
+lane,pair,runner,seconds,passed,tests,ignored
+darwin-x64-manual,1,cargo,396.897,true,891,2
+darwin-x64-manual,1,nextest,383.346,true,891,2
+darwin-x64-manual,2,nextest,341.014,true,891,2
+darwin-x64-manual,2,cargo,370.525,true,891,2
+darwin-x64-real,1,cargo,432.268,true,868,2
+darwin-x64-real,1,nextest,373.446,true,868,2
+darwin-x64-real,2,nextest,358.960,true,868,2
+darwin-x64-real,2,cargo,378.949,true,868,2
+linux-x64-manual,1,cargo,257.229,true,897,2
+linux-x64-manual,1,nextest,247.731,true,897,2
+linux-x64-manual,2,nextest,247.988,true,897,2
+linux-x64-manual,2,cargo,257.713,true,897,2
+linux-x64-real,1,cargo,252.190,true,874,2
+linux-x64-real,1,nextest,228.704,true,874,2
+linux-x64-real,2,nextest,229.320,true,874,2
+linux-x64-real,2,cargo,252.311,true,874,2

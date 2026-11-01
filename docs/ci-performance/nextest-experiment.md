@@ -7,7 +7,9 @@ or alter the six-platform release/packaging matrix.
 
 ## Boundaries
 
-- Branch: `perf/nextest-cost`; workflow: `nextest-experiment.yml`.
+- Branch: `perf/nextest-cost`; measured commit: `9231f2dfc28591b957347913c016babcec084544`.
+- The completed workflow is archived at `.github/experiments/nextest-cost.yml`
+  to prevent further report-only pushes from repeating this expensive experiment.
 - Ubuntu x64 and Intel macOS, each with real and manual clocks: four jobs.
 - Prebuilt, version-pinned **cargo-nextest 0.9.150**, installed by a SHA-pinned
   action. No `cargo install`, sccache change, or library refactor.
@@ -102,4 +104,66 @@ substantial developer-machine startup overhead, not the root cause of the
 original test failures or proof of GitHub speedup. The experiment records PATH
 mirror counts on hosted runners without changing their test environment.
 
-Remote results remain pending. Normal CI has not been switched to nextest.
+## Remote result and decision
+
+[Run 41328307787](https://github.com/Leechael/pi-famulus/actions/runs/41328307787)
+completed successfully: **4/4 jobs and all 16 full-suite arms passed**, with no
+retries, leak warnings or inventory mismatches. The experiment itself consumed
+**98m29s summed runner-active time**, with **31m57s wall time**. This is one-off
+measurement cost, not the cost of a proposed production pipeline.
+
+The table uses the mean of each arm's two measurements; the candidate includes
+both its nextest and retained-Cargo phases. Individual observations are preserved
+in [`nextest-abba.csv`](nextest-abba.csv).
+
+| Lane | Cargo mean | Candidate mean | Saved | Test-command reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x64, real | 252.25s | 229.01s | 23.24s | 9.2% |
+| Linux x64, manual | 257.47s | 247.86s | 9.61s | 3.7% |
+| Intel macOS, real | 405.61s | 366.20s | 39.41s | 9.7% |
+| Intel macOS, manual | 383.71s | 362.18s | 21.53s | 5.6% |
+| **Sum of four lane means** | **1299.04s** | **1205.25s** | **93.79s** | **7.2%** |
+
+The installer steps total **3 seconds at GitHub's whole-second resolution**.
+Subtracting those gives about **91 seconds potential savings across these four
+lanes**, before any additional production orchestration cost. That is only about
+**1.2% of the previous 125m55s complete-CI total**. It is **not** a measured new
+complete-CI total: this experiment deliberately reused one compilation for both
+arms, and both arms include the new harness regression target. No six-platform
+or whole-pipeline extrapolation is claimed.
+
+Coverage by lane:
+
+| Lane | Targets | Discovered tests | Existing ignored | Completed nonignored per arm |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x64, real | 20 | 874 | 2 | 872 |
+| Linux x64, manual | 20 | 897 | 2 | 895 |
+| Intel macOS, real | 20 | 868 | 2 | 866 |
+| Intel macOS, manual | 20 | 891 | 2 | 889 |
+
+Every candidate nonignored name has exactly one successful runner outcome in
+both observations. Baseline names all appear as successful too; on Linux the
+native-alias cancellation test deliberately re-executes a libtest child, which
+prints an additional nested result for the same name. This is existing test
+implementation behavior, not a runner retry.
+
+All hosted runners reported **zero PATH mirror directories**, unlike the local
+developer machine. They used Rust **1.99.1** and four logical CPUs. Intel macOS
+showed appreciable within-job variation (for example, its real-clock Cargo runs
+were 432.27s and 378.95s); two observations are not a tight confidence interval.
+Full compile/discovery logs, tool/image metadata, exact inventories and command
+exit codes are attached to the Actions run. Cache usage remained unchanged at
+**9,226,810,614 bytes / 8.593 GiB**, with **40 cache entries**.
+
+**Decision: do not expand or promote this experiment now.** The measured
+Unix x64 hybrid is compatible with the audited coverage and modestly faster,
+but it is not the main answer to the 125-minute total. Windows and ARM adoption
+remain unvalidated. Normal CI, PR #103, release validation and main are unchanged.
+The next separate investigation should target compilation structure and actual
+cacheability (thin binary/library boundary and Git-SHA invalidation), rather
+than claiming that adding sccache alone will cache the current binary crate.
+
+To deliberately repeat the experiment, restore the archived YAML under
+`.github/workflows/nextest-experiment.yml` on `perf/nextest-cost`, inspect its
+branch trigger and pinned tool versions, then push. It is not left automatically
+running on documentation updates.
