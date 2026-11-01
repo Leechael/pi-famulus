@@ -1,7 +1,7 @@
 //! Resource-usage benchmark of the real daemon, on every CI platform.
 //!
-//! Opt-in (`PI_FAMULUS_BENCH=1`); without it the binary reports nothing to
-//! do, so plain `cargo test` stays fast. CI runs it on a release build:
+//! Opt-in (`PI_FAMULUS_BENCH=1`); without it the test registry is empty,
+//! so plain `cargo test` stays fast. CI runs it on a release build:
 //!
 //! ```bash
 //! PI_FAMULUS_BENCH=1 cargo test --release --test resource_bench
@@ -29,12 +29,13 @@ const MS: fn(u64) -> Duration = Duration::from_millis;
 const MIB: f64 = 1024.0 * 1024.0;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) != Some("taskkit") && std::env::var_os("PI_FAMULUS_BENCH").is_none() {
-        println!("resource_bench: set PI_FAMULUS_BENCH=1 to run");
-        return;
+    // Always dispatch taskkit/helper invocations, even without benchmark opt-in.
+    // An empty registry also gives nextest valid (empty) discovery output.
+    if std::env::var_os("PI_FAMULUS_BENCH").is_some() {
+        kit::main(&[("resource_usage", resource_usage)]);
+    } else {
+        kit::main(&[]);
     }
-    kit::main(&[("resource_usage", resource_usage)]);
 }
 
 struct Sample {

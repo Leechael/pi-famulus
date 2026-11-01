@@ -54,11 +54,16 @@ fn run_tests(tests: &[(&'static str, TestFn)], args: &[String]) -> i32 {
     let mut filters = Vec::new();
     let mut skips = Vec::new();
     let mut threads = std::env::var("RUST_TEST_THREADS").ok().and_then(|v| v.parse().ok());
-    let (mut exact, mut list) = (false, false);
+    let (mut exact, mut list, mut ignored_only) = (false, false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--test-threads" => threads = it.next().and_then(|v| v.parse().ok()),
+            "--format" => {
+                // nextest discovers tests with `--list --format terse`.
+                // The format value is an option argument, not a name filter.
+                let _ = it.next();
+            }
             "--exact" => exact = true,
             "--list" => list = true,
             "--skip" => {
@@ -66,7 +71,8 @@ fn run_tests(tests: &[(&'static str, TestFn)], args: &[String]) -> i32 {
                     skips.push(v.to_string());
                 }
             }
-            "--ignored" | "--include-ignored" => {}
+            "--ignored" => ignored_only = true,
+            "--include-ignored" => {}
             s if s.starts_with("--test-threads=") => threads = s["--test-threads=".len()..].parse().ok(),
             s if s.starts_with("--skip=") => skips.push(s["--skip=".len()..].to_string()),
             s if s.starts_with('-') => {}
@@ -78,7 +84,9 @@ fn run_tests(tests: &[(&'static str, TestFn)], args: &[String]) -> i32 {
         .filter(|(name, _)| {
             let pass = filters.is_empty() || filters.iter().any(|f| if exact { name == f } else { name.contains(f.as_str()) });
             let skipped = skips.iter().any(|s| if exact { name == s } else { name.contains(s.as_str()) });
-            pass && !skipped
+            // This runner's registry contains no ignored tests. In particular,
+            // nextest's separate ignored inventory must not relabel every test.
+            pass && !skipped && !ignored_only
         })
         .collect();
     if list {

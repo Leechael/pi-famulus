@@ -1,0 +1,61 @@
+name: Nextest cost experiment
+
+# Isolated experiment branch only: this does not replace any required CI check.
+on:
+  push:
+    branches: [perf/nextest-cost]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nextest-experiment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: compare (${{ matrix.platform }}, ${{ matrix.clock }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x64, darwin-x64]
+        clock: [real, manual]
+        include:
+          - platform: linux-x64
+            os: ubuntu-24.04
+          - platform: darwin-x64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: manager
+          shared-key: manager-tests-${{ matrix.platform }}
+          # Experiments must not fill the repository's 10 GiB cache budget.
+          save-if: false
+          cache-bin: false
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+      - name: Test the inventory checker
+        run: python3 -m unittest discover -s scripts -p 'test_ci_nextest_benchmark.py'
+      - name: Compile once, prove inventory equality, compare AB then BA
+        env:
+          CLOCK: ${{ matrix.clock }}
+        run: python3 scripts/ci-nextest-benchmark.py --clock "$CLOCK" --pairs 2 --output "$RUNNER_TEMP/comparison"
+      - uses: actions/upload-artifact@v5
+        if: ${{ !cancelled() }}
+        with:
+          name: nextest-comparison-${{ matrix.platform }}-${{ matrix.clock }}
+          path: |
+            ${{ runner.temp }}/comparison
+            pi-famulus-test-artifacts
+          if-no-files-found: error
+          retention-days: 7
