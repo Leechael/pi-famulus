@@ -25,13 +25,18 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
+# Only PR updates share a group. A unique group for every other run also
+# prevents GitHub's single pending slot from replacing an older main commit.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'release' && github.event_name != 'workflow_dispatch' }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/main' }}
 
 jobs:
   native-packages:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.code == 'true'
     uses: ./.github/workflows/native-packages.yml
     with:
       ref: ${{ inputs.ref || '' }}
@@ -41,6 +46,8 @@ jobs:
   # branches (Unix handover, macOS proc_pidinfo, Windows job objects), so a
   # Linux-only run would miss most of the platform code.
   clippy:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.code == 'true'
     name: clippy (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -69,10 +76,15 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.read.outputs.matrix }}
+      code: ${{ steps.scope.outputs.code }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || '' }}
+      - uses: ./.github/actions/ci-scope
+        id: scope
+        with:
+          force: ${{ inputs.ref != '' || inputs.version != '' }}
       - id: read
         run: echo "matrix=$(jq -c . .github/pi-compat.json)" >> "$GITHUB_OUTPUT"
 
@@ -82,6 +94,7 @@ jobs:
   extension-compat:
     name: extension (pi ${{ matrix.pi-version }})
     needs: pi-matrix
+    if: needs.pi-matrix.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.pi-matrix.outputs.matrix) }}
@@ -119,6 +132,8 @@ jobs:
       - run: npm run test:compat
 
   extension-windows:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.code == 'true'
     name: extension (windows-latest)
     runs-on: windows-latest
     defaults:
@@ -142,16 +157,29 @@ jobs:
   # Preserve the historical required check name while the compatibility matrix
   # reports its individual versioned checks.
   extension:
-    needs: extension-compat
+    needs: [pi-matrix, extension-compat]
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: Require the compatibility matrix to pass
-        run: test "${{ needs.extension-compat.result }}" = success
+      - name: Require compatibility success or an explicit docs-only decision
+        env:
+          SCOPE_RESULT: ${{ needs.pi-matrix.result }}
+          CODE: ${{ needs.pi-matrix.outputs.code }}
+          COMPAT_RESULT: ${{ needs.extension-compat.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          if [[ "$CODE" == false ]]; then
+            test "$COMPAT_RESULT" = skipped
+          else
+            test "$CODE" = true
+            test "$COMPAT_RESULT" = success
+          fi
 
   # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.
   e2e:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.code == 'true'
     name: e2e (${{ matrix.os }})
     strategy:
       fail-fast: false

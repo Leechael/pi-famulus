@@ -1,0 +1,39 @@
+name: CI scope
+description: Skip expensive checks only for reviewed documentation paths, retaining README checks
+# Caller must check out the repository first and grant pull-requests: read.
+inputs:
+  force:
+    description: Set to 'true' to require code checks regardless of changed paths
+    required: false
+    default: 'false'
+outputs:
+  code:
+    description: Whether code checks must run ('true' or 'false')
+    value: ${{ (inputs.force == 'true' || (github.event_name != 'push' && github.event_name != 'pull_request')) && 'true' || steps.changes.outputs.code }}
+runs:
+  using: composite
+  steps:
+    - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+      id: changes
+      if: ${{ inputs.force != 'true' && (github.event_name == 'push' || github.event_name == 'pull_request') }}
+      with:
+        # PRs use the API's full PR diff, not just the latest commit. Pushes
+        # compare the entire pushed range, including multi-commit pushes.
+        base: ${{ github.event_name == 'push' && github.event.before || '' }}
+        predicate-quantifier: every
+        filters: |
+          code:
+            - '!README.md'
+            - '!README_CN.md'
+            - '!docs/**'
+            - '!extension/README.md'
+            - '!npm/**/README.md'
+            - '!npm/CONTEXT.md'
+            - '!manager/TESTING.md'
+            - '!manager/MONITOR_OUTPUT.md'
+            - '!eval/*.md'
+            - '!eval/ablation/fixtures/README.md'
+    - name: Check README synchronization and links on docs-only changes
+      if: ${{ steps.changes.outputs.code == 'false' }}
+      shell: bash
+      run: node --test scripts/readme-sync.test.mjs
