@@ -3,15 +3,26 @@
 //! Uses tiny dependency-free Cargo fixtures, never this checkout's Git state.
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod common;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture(PathBuf);
 
 fn run(dir: &Path, program: &str, args: &[&str]) -> Output {
-    let output = Command::new(program)
+    // common makes HOME hermetic. Use Cargo's actual toolchain binaries,
+    // not rustup's PATH shims, which need the developer's ~/.rustup settings.
+    let cargo = Path::new(env!("CARGO"));
+    let executable = if program == "cargo" {
+        cargo
+    } else {
+        Path::new(program)
+    };
+    let output = common::command(executable)
+        .env("RUSTC", cargo.with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX)))
         .args(args)
         .current_dir(dir)
         .env_remove("PI_FAMULUS_GIT_SHA")

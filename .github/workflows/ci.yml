@@ -154,26 +154,31 @@ jobs:
       - run: npx tsc --noEmit
       - run: npx vitest run
 
-  # Preserve the historical required check name while the compatibility matrix
-  # reports its individual versioned checks.
+  # Keep the historical required check name, now covering the entire pipeline.
+  # Require this stable aggregate, not conditional matrix names: docs-only
+  # matrix jobs are skipped before their individual check names are expanded.
   extension:
-    needs: [pi-matrix, extension-compat]
-    if: always()
+    needs: [pi-matrix, native-packages, clippy, extension-compat, extension-windows, e2e]
+    # Unlike always(), this does not keep superseded runs alive just to report
+    # a failed aggregate. Ordinary upstream failures still reach this gate.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Require compatibility success or an explicit docs-only decision
+      - name: Require every CI family or an explicit docs-only decision
         env:
-          SCOPE_RESULT: ${{ needs.pi-matrix.result }}
-          CODE: ${{ needs.pi-matrix.outputs.code }}
-          COMPAT_RESULT: ${{ needs.extension-compat.result }}
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          test "$SCOPE_RESULT" = success
-          if [[ "$CODE" == false ]]; then
-            test "$COMPAT_RESULT" = skipped
-          else
-            test "$CODE" = true
-            test "$COMPAT_RESULT" = success
-          fi
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          const results = JSON.parse(process.env.RESULTS);
+          const scope = results['pi-matrix'];
+          assert.equal(scope.result, 'success', 'scope classification must succeed');
+          assert.ok(['true', 'false'].includes(scope.outputs.code), 'scope decision must be explicit');
+          const expected = scope.outputs.code === 'true' ? 'success' : 'skipped';
+          for (const name of ['native-packages', 'clippy', 'extension-compat', 'extension-windows', 'e2e']) {
+            assert.equal(results[name].result, expected, `${name} must be ${expected}`);
+          }
+          NODE
 
   # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.

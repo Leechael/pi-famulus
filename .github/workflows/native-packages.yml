@@ -116,6 +116,9 @@ jobs:
           # writer per host avoids duplicate cache uploads and key contention.
           shared-key: manager-tests-${{ matrix.platform }}
           save-if: ${{ matrix.clock == 'real' }}
+          # A failing regression must not force the next run to recompile all
+          # dependencies. Workspace test outputs are still excluded by default.
+          cache-on-failure: true
           cache-bin: false
       - run: cargo test --locked
         if: matrix.clock == 'real'
@@ -214,7 +217,7 @@ jobs:
           fi
         working-directory: manager
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: resource-bench-${{ matrix.platform }}
           path: ${{ runner.temp }}/bench-${{ matrix.platform }}.json
@@ -260,6 +263,10 @@ jobs:
       - name: Install tarballs and verify automatic CLI and extension resolution
         shell: bash
         run: |
+          # HOME is isolated below, but downloads must still use the directory
+          # restored/saved by setup-node rather than a throwaway sandbox cache.
+          npm_config_cache=$(npm config get cache)
+          export npm_config_cache
           sandbox=$(mktemp -d "$RUNNER_TEMP/npm-smoke.XXXXXX")
           export HOME="$sandbox/home" USERPROFILE="$sandbox/home"
           mkdir -p "$HOME" "$sandbox/project"

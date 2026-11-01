@@ -162,28 +162,68 @@ test('CI shares scope, forces explicit build inputs, and gates all expensive job
   }
 });
 
-test('required extension check accepts docs-only but rejects failed scope or missing compatibility', () => {
+test('required extension check gates every CI family and does not prolong cancelled runs', () => {
   const block = job(read('.github/workflows/ci.yml'), 'extension');
-  assert.match(block, /needs: \[pi-matrix, extension-compat\]/);
-  assert.match(block, /if: always\(\)/);
-  const script = block.match(/        run: \|\n((?:          [^\n]*\n)+)/)?.[1];
+  const families = ['native-packages', 'clippy', 'extension-compat', 'extension-windows', 'e2e'];
+  const dependencies = block.match(/^    needs: \[([^\]]+)\]/m)?.[1].split(/,\s*/);
+  assert.deepEqual(dependencies, ['pi-matrix', ...families]);
+  assert.match(block, /RESULTS: \$\{\{ toJSON\(needs\) \}\}/);
+  const gate = expression(block, 'if');
+  for (const status of ['success', 'failure', 'cancelled']) {
+    assert.equal(evaluate(gate, {
+      cancelled: () => status === 'cancelled',
+      failure: () => status === 'failure',
+      success: () => status === 'success',
+      always: () => true,
+    }), status !== 'cancelled', `aggregate scheduling after ${status}`);
+  }
+  // Remove YAML block indentation so the actual inline Node heredoc closes at
+  // column zero, exactly as it does when Actions executes the run step.
+  const script = block.match(/        run: \|\n((?:          [^\n]*\n)+)/)?.[1].replace(/^          /gm, '');
   assert.ok(script, 'missing required-check shell script');
-  for (const [scope, code, compat, success] of [
-    ['success', 'false', 'skipped', true],
-    ['success', 'true', 'success', true],
-    ['failure', 'false', 'skipped', false],
-    ['cancelled', '', 'skipped', false],
-    ['success', '', 'skipped', false],
-    ['success', 'true', 'skipped', false],
-    ['success', 'true', 'failure', false],
-    ['success', 'true', 'cancelled', false],
-    ['success', 'false', 'failure', false],
+  const fixture = (code, result) => ({
+    'pi-matrix': { result: 'success', outputs: { code } },
+    ...Object.fromEntries(families.map(name => [name, { result }])),
+  });
+  const cases = [
+    ['docs-only: all families skipped', fixture('false', 'skipped'), true],
+    ['code: all families succeeded', fixture('true', 'success'), true],
+  ];
+  for (const [code, expected, rejected] of [
+    ['true', 'success', ['failure', 'cancelled', 'skipped']],
+    ['false', 'skipped', ['failure', 'cancelled', 'success']],
   ]) {
+    for (const name of families) {
+      for (const result of rejected) {
+        const results = fixture(code, expected);
+        results[name].result = result;
+        cases.push([`code=${code}: ${name} ${result}`, results, false]);
+      }
+      const missing = fixture(code, expected);
+      delete missing[name];
+      cases.push([`code=${code}: missing ${name}`, missing, false]);
+    }
+    for (const scope of [
+      undefined,
+      { result: 'failure', outputs: { code } },
+      { result: 'cancelled', outputs: { code } },
+      { result: 'skipped', outputs: { code } },
+      { result: 'success' },
+      { result: 'success', outputs: {} },
+      { result: 'success', outputs: { code: '' } },
+      { result: 'success', outputs: { code: true } },
+    ]) {
+      const results = fixture(code, expected);
+      results['pi-matrix'] = scope;
+      cases.push([`code=${code}: invalid scope ${JSON.stringify(scope)}`, results, false]);
+    }
+  }
+  for (const [label, results, success] of cases) {
     const result = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], {
-      env: { ...process.env, SCOPE_RESULT: scope, CODE: code, COMPAT_RESULT: compat },
+      env: { ...process.env, RESULTS: JSON.stringify(results) },
       encoding: 'utf8',
     });
     assert.ifError(result.error);
-    assert.equal(result.status === 0, success, `${scope}/${code}/${compat}: ${result.stderr}`);
+    assert.equal(result.status === 0, success, `${label}: ${result.stderr}`);
   }
 });

@@ -202,10 +202,10 @@ test('publication guards cannot be satisfied by comments or other jobs', () => {
 function assertExtensionSourceInstall(ci) {
   const job = ci.match(/^  extension-compat:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
   assert.ok(job.includes('      - run: npm ci\n      - run: npx tsc --noEmit\n'), 'extension source job (extension-compat) must install full dependencies before typecheck');
-  assert.match(ci, /^  extension:\n    needs: \[pi-matrix, extension-compat\]$/m, 'historical extension check must aggregate scope and compatibility results');
-  assert.match(ci, /test "\$SCOPE_RESULT" = success/);
-  assert.match(ci, /test "\$COMPAT_RESULT" = skipped/);
-  assert.match(ci, /test "\$COMPAT_RESULT" = success/);
+  assert.match(ci, /^  extension:\n    needs: \[pi-matrix, native-packages, clippy, extension-compat, extension-windows, e2e\]$/m, 'historical extension check must aggregate scope and all CI families');
+  assert.match(ci, /assert.equal\(scope.result, 'success'/);
+  assert.match(ci, /scope.outputs.code === 'true' \? 'success' : 'skipped'/);
+  assert.match(ci, /assert.equal\(results\[name\].result, expected/);
 }
 
 test('extension source install guard cannot be satisfied by other jobs', () => {
