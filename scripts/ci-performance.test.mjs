@@ -31,6 +31,17 @@ test('clock lanes preserve every platform and both full Cargo suites independent
   assert.match(tests, /CARGO_PROFILE_DEV_DEBUG: line-tables-only/);
 });
 
+test('portable typechecks are not repeated but every installed pi version is checked', () => {
+  const ci = workflow('ci');
+  const compat = job(ci, 'extension-compat');
+  const checks = compat.split(/(?=^      - )/m).filter(step => step.startsWith('      - run: npx tsc --noEmit'));
+  assert.equal(checks.length, 2, 'locked source and installed compatibility phases');
+  assert.match(checks[0], /if: matrix.pi-version == '1.0.0'/);
+  assert.doesNotMatch(checks[1], /\n        if:/, 'every selected pi version must be typechecked');
+  assert.match(job(ci, 'e2e'), /- run: npm run typecheck\n        working-directory: eval\n        if: matrix.os == 'ubuntu-latest'/);
+  assert.match(job(ci, 'extension-windows'), /- run: npx tsc --noEmit/);
+});
+
 test('native smoke isolation still uses the npm cache restored by setup-node', t => {
   const packs = job(workflow('native-packages'), 'native');
   const smoke = packs.slice(packs.indexOf('- name: Install tarballs'));

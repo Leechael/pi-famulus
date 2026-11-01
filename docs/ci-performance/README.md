@@ -67,7 +67,8 @@ scope + compatibility matrix
 
 - Split the **two complete** Cargo suites into separate clock lanes, with no test-name filters or omitted test binaries. Package builds have no dependency on debug tests. Their results still gate the reusable workflow and publication.
 - On macOS/Windows, run release benchmarks in the same explicit target directory as packaging. Keep Linux host/glibc benchmarks **and** musl/static package validation.
-- Retain all original grader and eval tests. In particular, grader tests exercise BSD `tail` and real process-group cleanup on macOS; clippy checks platform `cfg` branches and release-only code. Moving those entire checks to Ubuntu would reduce coverage.
+- Run the identical locked-source compatibility typecheck once, while retaining typechecks after **every** selected pi-version install. Run the OS-independent eval TypeScript check once on Ubuntu, without adding another job.
+- Retain all original grader and eval runtime tests. In particular, grader tests exercise BSD `tail` and real process-group cleanup on macOS; clippy checks platform `cfg` branches and release-only code. Moving those entire checks to Ubuntu would reduce coverage.
 - Only PR runs share a cancellable concurrency group. Main, dispatch and schedule runs have a unique run-ID group; `cancel-in-progress: false` alone would still allow GitHub to replace an older pending run in a shared group.
 - Use job-level path filtering rather than suppressing the required-check workflow. Pure documentation runs retain README synchronization/link checks and the historical `extension` completion check. Classification errors fail closed.
 - The reviewed docs allowlist excludes executable Markdown such as `extension/prompts/**` and `eval/scenarios/**`.
@@ -98,6 +99,14 @@ All 18 new Rust job instances missed cache. Non-Linux package `Build release bin
 
 Cache inventory after this run was 9,630,137,237 bytes / 43 entries. Six caches belonging exclusively to already-merged PRs #94/#101 were verified and removed, reclaiming **1,213,281,958 bytes**. No main or active PR #103 cache was deleted. Four Unix manager caches had not yet been saved because those tests failed; a fixed green run is required before a fully warm comparison.
 
+### Round 2: complete manager/package coverage, Windows readiness failure
+
+[Run 41318188194](https://github.com/Leechael/pi-famulus/actions/runs/41318188194) took **17m04s**, with **132m28s** summed job-active time. All 12 complete manager clock lanes and all six package jobs passed. The existing Windows E2E observer test hit its unchanged 8-second readiness deadline; the new aggregate correctly failed the workflow rather than accepting partial success. This is another **failed-run diagnostic**, not a successful speedup measurement.
+
+The observer test and implementation are unchanged from main, and no timeout, skip or automatic retry was added. Its prior run passed, but the Windows runner image and Node patch version changed between runs (`20261021.278.1` / Node `24.22.1` → `20261030.294.1` / `24.22.2`). Startup/scheduling sensitivity is a hypothesis, not a proven root cause or an established historical flake. The final full run is required to verify all checks together.
+
+All four Unix manager cache families were still cold during round 2; afterward all six host cache families existed. Post-run cache inventory was **9,226,810,614 bytes / 8.593 GiB**, leaving **1.407 GiB** below the 10 GiB budget. The third run is the first fully cache-warmed experiment; it also removes the redundant portable typechecks described above.
+
 ### Live docs-only / cancellation probe
 
 A separate draft [PR #104](https://github.com/Leechael/pi-famulus/pull/104), based on the optimization branch, changed only `docs/ci-scope-probe.md`. A second push superseded queued CI/upstream runs:
@@ -107,5 +116,7 @@ A separate draft [PR #104](https://github.com/Leechael/pi-famulus/pull/104), bas
 - Latest upstream [41316431512](https://github.com/Leechael/pi-famulus/actions/runs/41316431512): success, 111s wall, **5s active**, drift matrix skipped.
 
 This proves queued supersession, not interruption of a running heavy test. The probe also exposed `always()` keeping an obsolete aggregate alive after cancellation; round 2 changes that condition to `!cancelled()`. The stable historical `extension` gate now checks **all** CI families, not just compatibility. Tests execute the actual inline gate against every failed/cancelled/missing/skipped dependency combination.
+
+A final-version repeat in [PR #105](https://github.com/Leechael/pi-famulus/pull/105) verified both newest workflows succeed and superseded workflows cancel: [CI 41318405122](https://github.com/Leechael/pi-famulus/actions/runs/41318405122) took **50s wall / 9s active**; [upstream 41318405094](https://github.com/Leechael/pi-famulus/actions/runs/41318405094) took **46s wall / 10s active**. Its old aggregate was reported as `cancelled` with **no runner and no steps**, not literally `skipped`; it no longer kept the old workflow alive. The temporary PR/remote branch/worktree were cleaned up without merging.
 
 Skipped matrices report literal names such as `clippy (${{ matrix.os }})`, not every expanded platform name. Branch protection should require the stable **`extension`** aggregate rather than a conditional matrix name. PR #104 was closed without merging and its remote branch/worktree removed.

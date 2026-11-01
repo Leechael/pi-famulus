@@ -113,8 +113,11 @@ jobs:
           cache-dependency-path: extension/package-lock.json
       # First-party natives use local lock links before registry bootstrap.
       # Do not omit all optionals: TypeScript and Rollup need native bindings.
+      # The locked source tree is identical in every compatibility lane. Check
+      # it once here; each selected pi version is still typechecked below.
       - run: npm ci
       - run: npx tsc --noEmit
+        if: matrix.pi-version == '1.0.0'
       # Run the full suite with the locked local native package links once.
       - run: npx vitest run
         if: matrix.pi-version == '1.0.0'
@@ -232,8 +235,11 @@ jobs:
         working-directory: extension
         env:
           PI_FAMULUS_INTEG: "1"
+      # This pure TypeScript check has the same inputs on every host. Runtime
+      # integration, Unix unit tests and graders retain their OS coverage.
       - run: npm run typecheck
         working-directory: eval
+        if: matrix.os == 'ubuntu-latest'
       # Eval-internal unit and grader tests drive /bin/sh fixtures; the
       # product scenarios (integration + faux e2e) run on every OS.
       - run: npm run test:unit
