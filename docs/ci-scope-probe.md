@@ -2,4 +2,4 @@
 
 Temporary documentation-only smoke test for CI scope detection and pull-request supersession.
 
-Probe revision: 1.
+Probe revision: 2. This documentation update supersedes the initial workflow runs.
