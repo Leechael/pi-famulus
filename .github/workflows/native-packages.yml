@@ -88,8 +88,8 @@ jobs:
   # the normal build's tokio::time path, and the release build itself is
   # exercised by the package jobs below and by e2e on every OS.
   manager-tests:
-    # format(): a boolean passed through workflow_call can arrive as the
-    # string 'false', which is truthy; compare the text in every case.
+    # Compared as text so the switch behaves the same whether the input
+    # arrives as a boolean or as the string 'true'/'false'.
     if: format('{0}', inputs.manager-tests) == 'true'
     name: manager (${{ matrix.platform }})
     strategy:
@@ -100,26 +100,9 @@ jobs:
         # (process groups, proc_pidinfo, job objects), not by CPU. Pushes to
         # main and releases run all six; packages always build all six.
         exclude: ${{ fromJSON(format('{0}', inputs.all-architectures) == 'true' && '[]' || '[{"platform":"linux-arm64"},{"platform":"darwin-x64"},{"platform":"win32-arm64"}]') }}
-        include:
-          - platform: linux-x64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - platform: darwin-x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - platform: darwin-arm64
-            runner: macos-15
-            target: aarch64-apple-darwin
-          - platform: win32-x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          - platform: win32-arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.runner }}
+    # A lookup, not matrix include entries: GitHub applies include after
+    # exclude and would add the excluded platforms straight back.
+    runs-on: ${{ fromJSON('{"linux-x64":"ubuntu-24.04","linux-arm64":"ubuntu-24.04-arm","darwin-x64":"macos-15-intel","darwin-arm64":"macos-15","win32-x64":"windows-latest","win32-arm64":"windows-11-arm"}')[matrix.platform] }}
     # The slowest lane takes ~11 minutes. A hung test must not hold a scarce
     # macOS runner for GitHub's 6-hour default; the driver's per-binary
     # timeout reports first, and this is the backstop.

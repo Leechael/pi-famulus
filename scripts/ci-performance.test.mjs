@@ -11,9 +11,16 @@ const job = (text, name) => text.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=
 test('one complete simulated-clock suite per platform, independent of packaging', () => {
   const native = workflow('native-packages');
   const tests = job(native, 'manager-tests');
-  for (const platform of ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64', 'win32-x64', 'win32-arm64']) {
-    assert.ok(tests.includes(`platform: ${platform}\n`), platform);
-  }
+  const platforms = ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64', 'win32-x64', 'win32-arm64'];
+  assert.ok(tests.includes(`platform: [${platforms.join(', ')}]\n`));
+  // GitHub applies matrix include after exclude, re-adding excluded entries:
+  // the runner comes from a lookup, which must match the package job's hosts.
+  assert.doesNotMatch(tests, /^\s+include:/m);
+  const lookup = JSON.parse(tests.match(/runs-on: \$\{\{ fromJSON\('(\{[^']+\})'\)\[matrix\.platform\] \}\}/)[1]);
+  const packs0 = job(native, 'native');
+  const hosts = Object.fromEntries([...packs0.matchAll(/- platform: ([\w-]+)\n\s+runner: ([\w.-]+)\n/g)].map(m => [m[1], m[2]]));
+  assert.deepEqual(Object.keys(lookup).sort(), [...platforms].sort());
+  assert.deepEqual(lookup, hosts);
   // The real-clock rerun of the whole suite is gone: waits are simulated,
   // and the real-time canaries (Home::new_real) run inside this suite.
   assert.doesNotMatch(tests, /clock: \[|matrix\.clock/);
