@@ -45,6 +45,7 @@ jobs:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
       manager-tests: ${{ needs.pi-matrix.outputs.rust == 'true' }}
+      all-architectures: ${{ github.event_name != 'pull_request' }}
       packages: ${{ needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true' }}
 
   # Lint gate: clippy warnings fail the build. Each OS compiles its own cfg
@@ -220,6 +221,8 @@ jobs:
       # for real-world compatibility coverage; other Ubuntu jobs are pinned.
       matrix:
         os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+        # One architecture per OS on PRs; main pushes and releases run all.
+        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-24.04-arm"}]' || '[]') }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:

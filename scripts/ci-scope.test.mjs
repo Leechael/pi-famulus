@@ -347,3 +347,27 @@ test('required extension check gates every CI family and does not prolong cancel
     assert.equal(result.status === 0, success, `${label}: ${result.stderr}`);
   }
 });
+
+test('PRs run one architecture per OS; main pushes, dispatches and releases run every platform', () => {
+  const ci = read('.github/workflows/ci.yml');
+  const native = read('.github/workflows/native-packages.yml');
+  const all = expression(job(ci, 'native-packages'), 'all-architectures');
+  const managerExclude = expression(job(native, 'manager-tests'), 'exclude');
+  const e2eExclude = expression(job(ci, 'e2e'), 'exclude');
+  const fromJSON = text => JSON.parse(text);
+  const platforms = ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64', 'win32-x64', 'win32-arm64'];
+  const oses = ['macos-latest', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-latest'];
+  for (const event of ['pull_request', 'push', 'workflow_dispatch', 'workflow_call', 'schedule']) {
+    const pr = event === 'pull_request';
+    const allArchitectures = evaluate(all, { github: { event_name: event } });
+    assert.equal(allArchitectures, !pr, event);
+    const excluded = evaluate(managerExclude, { fromJSON, inputs: { 'all-architectures': allArchitectures } }).map(e => e.platform);
+    const ran = platforms.filter(p => !excluded.includes(p));
+    assert.deepEqual(ran, pr ? ['linux-x64', 'darwin-arm64', 'win32-x64'] : platforms, `manager ${event}`);
+    const e2eRan = oses.filter(os => !evaluate(e2eExclude, { fromJSON, github: { event_name: event } }).some(e => e.os === os));
+    assert.deepEqual(e2eRan, pr ? ['macos-latest', 'ubuntu-latest', 'windows-latest'] : oses, `e2e ${event}`);
+  }
+  // Every OS keeps one manager suite and one e2e on PRs; packages are never excluded.
+  assert.doesNotMatch(job(native, 'native'), /exclude:/);
+  assert.doesNotMatch(job(native, 'root-package'), /exclude:/);
+});

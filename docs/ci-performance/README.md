@@ -216,3 +216,11 @@ Remaining real-time waits, deliberately kept:
 | `lifecycle_adversarial` o3c (2s) | Lets a concurrently dispatched OS-level reply be attempted first; a real race. |
 | `observability` status (1.1s) | Record timestamps and uptime are real time by design (`clock.rs`). |
 | intercom `IDLE_QUIET`/`RESEND_QUIET` (1.5s/3.5s, 12 uses) | Bounded by **production** timers still on raw tokio time: relay snapshot, Desktop reconnect and native scan intervals (3s each). Moving those onto the labelled `Clock` is the next step for simulating these windows. It changes production timer code, so it belongs in its own reviewed change. |
+
+### One architecture per OS on pull requests
+
+The manager's platform code differs by **OS** (Unix process groups and handover, macOS `proc_pidinfo`, Windows job objects), not by CPU architecture. On `pull_request` events, the manager suites therefore run on **linux-x64, darwin-arm64 and win32-x64**, and e2e on ubuntu-latest, macos-latest and windows-latest. The second architectures (linux-arm64, **darwin-x64**, win32-arm64, and e2e on ubuntu-24.04-arm) still run on every push to main, every dispatch and every release (`publish.yml` calls CI, which is not a PR event). Native package build, release benchmark and install smoke test still run for **all six targets** on PRs, so every shipped binary is still built and exercised before merge. A regression specific to the second architecture is therefore caught on main rather than on the PR. This is the price of taking the slowest and flakiest lane (darwin-x64, 573s in run 41442682140) off the PR critical path. Excluding linux-arm64, darwin-x64 and win32-arm64 manager lanes plus arm e2e saves 251 + 573 + 194 + 257 = **1,275 job-seconds per PR run** at round-4 timings. It is a single matrix `exclude` driven by `all-architectures`, and easy to revert.
+
+### Expected cost of a full code PR run
+
+Round-4 run 41442682140 used 7,320 job-seconds (122 runner-minutes). Removing the six real-clock lanes (1,975s) and the PR-only exclusions above (1,275s) leaves about **4,070 job-seconds (~68 runner-minutes) per full PR run, −44%**, with macOS job time falling from 3,483s to 1,647s. PRs that touch only one component skip further families, as described above. These are projections from one run's job times, to be replaced by measured runs.
