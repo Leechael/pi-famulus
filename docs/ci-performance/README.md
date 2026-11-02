@@ -120,3 +120,29 @@ This proves queued supersession, not interruption of a running heavy test. The p
 A final-version repeat in [PR #105](https://github.com/Leechael/pi-famulus/pull/105) verified both newest workflows succeed and superseded workflows cancel: [CI 41318405122](https://github.com/Leechael/pi-famulus/actions/runs/41318405122) took **50s wall / 9s active**; [upstream 41318405094](https://github.com/Leechael/pi-famulus/actions/runs/41318405094) took **46s wall / 10s active**. Its old aggregate was reported as `cancelled` with **no runner and no steps**, not literally `skipped`; it no longer kept the old workflow alive. The temporary PR/remote branch/worktree were cleaned up without merging.
 
 Skipped matrices report literal names such as `clippy (${{ matrix.os }})`, not every expanded platform name. Branch protection should require the stable **`extension`** aggregate rather than a conditional matrix name. PR #104 was closed without merging and its remote branch/worktree removed.
+
+## Round 4: overlap whole Cargo test binaries on Unix
+
+After round 3 the critical path was still a macOS manager clock lane, and the test interval dominated it: `cargo test` runs its ~19 test binaries **one after another**, and `intercom` alone took 100–180s. The suite is wait-bound, not CPU-bound. A local 4-core Linux run of the complete real-clock suite took **6m03s wall for 1m22s user CPU**. `intercom` used **~8s of CPU over 80–104s** at 8 or 16 libtest threads.
+
+`scripts/cargo-test-parallel.mjs` keeps coverage identical and changes only the scheduling:
+
+- One `cargo test --no-run --message-format=json` with the lane's exact arguments builds every test target. Each executable cargo reports is run from the package root with no filters or skips. There are no doctests because the crate has no library target. Any non-zero exit, signal or spawn error fails the step.
+- Binaries start longest-first, at most `min(4, max(2, cores))` at a time. `intercom` gets `--test-threads=8`, unless `RUST_TEST_THREADS` is set explicitly.
+- The real-time `timing_canary` runs **alone afterwards**, so its wall-clock bounds never compete with other suites.
+- Each binary's output is printed whole when it finishes: collapsed on success and expanded on failure. A per-binary duration table goes to the log and the job summary.
+- Windows keeps plain `cargo test`: its suites take ~77s, and Git Bash start-up is racy under concurrent first launches (`tests/platform.rs`).
+
+Local A/B on the same build and the same 4-core container (seconds of wall time):
+
+| Lane | `cargo test` | Parallel driver | Parallel driver, intercom ×8 threads |
+|---|---:|---:|---:|
+| real clock | 363 | 185 | **113 / 112** (two runs) |
+| manual clock (`--features test-clock`) | 361 | — | **119** |
+
+CPU time was unchanged (user 1m20–1m27s in every run). The same pre-existing failures appeared with and without the driver. These were process-reaping assertions in `lifecycle_adversarial`/`platform`/`timing_canary`, and they fail in this sandbox container, which has no init subreaper, but pass on every CI host. The driver introduced no new failure.
+
+### Considered and not adopted
+
+- **cargo-nextest**: it needs a downloaded tool, and the custom `harness = false` binaries (`platform`, `resource_bench`) would need `--list --format terse`/`--ignored` support. It also runs one process per test, which changes the semantics of the shared MSYS keeper on Windows.
+- **[mr-boxington](https://mr-boxington.jdx.dev/) (`mbx`)**: this is a shared, self-pruning local Cargo target cache. Its author notes that its remote cache does not yet consistently beat `Swatinem/rust-cache` on GitHub-hosted runners, and round 3 already had 25/25 exact Rust cache hits. The CI cost is compiling the workspace crate itself and running tests, not dependency restore. It is a reasonable developer-workstation tool, but not a CI change here.

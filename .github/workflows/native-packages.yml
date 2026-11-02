@@ -97,8 +97,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
+      # Node runs the release bump and, on Unix, the parallel test driver.
       - uses: actions/setup-node@v6
-        if: inputs.version != ''
+        if: inputs.version != '' || runner.os != 'Windows'
         with:
           node-version: 24
       - name: Apply computed release version
@@ -120,10 +121,18 @@ jobs:
           # dependencies. Workspace test outputs are still excluded by default.
           cache-on-failure: true
           cache-bin: false
+      # Unix: the same complete suite, with test binaries overlapping instead
+      # of cargo running them one after another (intercom alone is 100-180s).
+      # Real-time canaries still run alone afterwards. Windows suites are
+      # short and Git Bash start-up is racy under concurrency: plain cargo.
+      - run: node ../scripts/cargo-test-parallel.mjs --locked
+        if: matrix.clock == 'real' && runner.os != 'Windows'
+      - run: node ../scripts/cargo-test-parallel.mjs --locked --features test-clock
+        if: matrix.clock == 'manual' && runner.os != 'Windows'
       - run: cargo test --locked
-        if: matrix.clock == 'real'
+        if: matrix.clock == 'real' && runner.os == 'Windows'
       - run: cargo test --locked --features test-clock
-        if: matrix.clock == 'manual'
+        if: matrix.clock == 'manual' && runner.os == 'Windows'
       - uses: actions/upload-artifact@v5
         if: failure()
         with:
