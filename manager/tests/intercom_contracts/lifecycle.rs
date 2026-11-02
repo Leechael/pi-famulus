@@ -45,7 +45,7 @@ fn wait_for(what: &str, fixture: &Fixture, budget: Duration, ready: impl Fn() ->
 /// Wait for the manager `pid` to exit after its last client left: past the
 /// 5s idle grace on either clock.
 fn wait_idle_exit(what: &str, fixture: &Fixture, pid: u32) {
-    if !common::MANUAL_CLOCK {
+    if !fixture.manual {
         return wait_for(what, fixture, Duration::from_secs(10), || !alive(pid));
     }
     let deadline = Instant::now() + TIMEOUT;

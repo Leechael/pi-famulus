@@ -748,7 +748,7 @@ fn a_dead_pi_process_settles_unread_deliveries_as_dropped() {
 #[test]
 fn a_reconnect_gap_does_not_settle_unread_deliveries() {
     let mut fixture = Fixture::new();
-    fixture.start();
+    fixture.start_clocked();
     // pi_pid is this (alive) test process: a plain disconnect with a gap
     // must NOT settle unread deliveries as dropped.
     let mut alice = pi_conn(&fixture, "alice-session");
@@ -761,7 +761,9 @@ fn a_reconnect_gap_does_not_settle_unread_deliveries() {
     drop(alice);
 
     // The gap: no dropped receipt even though the connection is gone.
-    legacy.no_event_for(Duration::from_millis(700));
+    // Daemon time: stepped on the manual clock, so every maintenance tick
+    // that could settle the delivery runs inside the gap.
+    legacy.quiet_for(&fixture, 700);
 
     // The same session reconnects and re-registers; its late read receipt
     // for the pre-gap delivery is accepted, not settled over.

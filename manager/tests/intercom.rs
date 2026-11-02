@@ -397,23 +397,21 @@ impl Fixture {
         }
     }
 
-    /// Let `ms` of daemon time pass. Manual clock: step it in 250ms
-    /// maintenance ticks, each settled before the next, so every timer due in
-    /// the window fires in order. Real clock: sleep.
+    /// Let at least `ms` of daemon time pass. Manual clock: step it in whole
+    /// 250ms maintenance ticks (rounded up, so the maintenance timer stays in
+    /// phase), each settled before the next, so every timer due in the window
+    /// fires in order. Real clock: sleep.
     fn let_pass(&self, ms: u64) {
-        if !common::MANUAL_CLOCK {
+        if !self.manual {
             thread::sleep(Duration::from_millis(ms));
             return;
         }
-        let mut left = ms;
-        while left > 0 {
-            let step = left.min(250);
+        for _ in 0..ms.div_ceil(250) {
             common::clock_request(
                 &self.root.join("manager"),
-                json!({"type":"clock_advance","ms":step}),
+                json!({"type":"clock_advance","ms":250}),
             );
             self.maintenance_settled();
-            left -= step;
         }
     }
 
@@ -716,7 +714,7 @@ impl Peer {
     /// could push fires inside it; then whatever was written is drained.
     /// Real clock: the window is waited out.
     fn quiet_for(&mut self, fixture: &Fixture, ms: u64) {
-        if common::MANUAL_CLOCK {
+        if fixture.manual {
             fixture.let_pass(ms);
             self.no_event();
         } else {
