@@ -815,9 +815,14 @@ fn d8_hello_during_shutdown_is_refused_and_does_not_cancel() {
     let (id, pid) = a.start("trap '' TERM; echo armed; sleep 300");
     wait_output_contains(&mut a, &id, "armed");
 
-    // Accepted before shutdown, hello after.
+    // Accepted before shutdown, hello after. On the manual clock a pre-hello
+    // debug round trip proves the daemon accepted and serves the connection.
     let mut late = home.connect();
-    std::thread::sleep(MS(200));
+    if home.manual {
+        assert_eq!(late.request(json!({"type":"clock_status"}))["ok"], true);
+    } else {
+        std::thread::sleep(MS(200));
+    }
     let out = home.cli(&["shutdown"], S(10));
     assert!(out.status.success(), "shutdown: {}", out.stderr);
     assert!(out.stdout.contains("shutting down"));
@@ -855,9 +860,13 @@ fn d8b_cli_during_shutdown_reaches_a_successor() {
     let (id, _) = a.start("trap '' TERM; echo armed; sleep 300");
     wait_output_contains(&mut a, &id, "armed");
     assert!(home.cli(&["shutdown"], S(10)).status.success());
-    // The TERM-ignoring task holds shutdown in its 2s kill grace. (The
-    // pause lets the daemon act on the shutdown it just acknowledged.)
-    std::thread::sleep(MS(200));
+    // The TERM-ignoring task holds shutdown in its 2s kill grace. The daemon
+    // has acted on the shutdown it just acknowledged once that grace is armed.
+    if home.manual {
+        home.wait_timer("shutdown-grace", 2000);
+    } else {
+        std::thread::sleep(MS(200));
+    }
     let path = home.path.clone();
     let clock = if home.manual { "manual" } else { "" };
     let ls = std::thread::spawn(move || run_cli_env(&path, &["ls"], S(20), &[("PI_FAMULUS_TEST_CLOCK", clock)]));

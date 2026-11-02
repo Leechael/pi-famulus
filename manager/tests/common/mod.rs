@@ -266,6 +266,12 @@ impl Home {
         let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
         assert_eq!(r["ok"], true, "clock_advance: {r}");
     }
+    /// Manual clock: wait until the daemon has armed a fresh `label` timer
+    /// (at least `min_due_ms` left), i.e. it has acted on whatever arms it.
+    pub fn wait_timer(&self, label: &str, min_due_ms: u64) {
+        assert!(self.manual, "wait_timer needs the manual clock");
+        self.wait_armed(label, min_due_ms);
+    }
     /// Wait for a `label` timer with at least `min_due_ms` left.
     ///
     /// "Any timer with that label" is not enough. A cancelled timer (e.g. the
