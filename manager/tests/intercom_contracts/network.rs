@@ -709,6 +709,38 @@ impl WireRelay {
             }
         }
     }
+    /// No forbidden frame reaches the relay while `ms` of daemon time passes.
+    /// Manual clock: the window plus two snapshot periods is stepped, then
+    /// frames are read until three snapshots have arrived. Frames on the
+    /// relay socket are ordered and the clock stops after the step, so the
+    /// last of those snapshots was sent after the window, and every frame
+    /// sent inside the window arrived before it. Whether or not the snapshot
+    /// sent at start-up was already read, the barrier lands past the window.
+    /// Real clock: the window is waited out.
+    fn assert_quiet_for(
+        &self,
+        fixture: &Fixture,
+        ms: u64,
+        forbidden: impl Fn(&Value) -> bool,
+        why: &str,
+    ) {
+        if !fixture.manual {
+            return self.assert_quiet(Duration::from_millis(ms), forbidden, why);
+        }
+        fixture.let_pass(ms + 2 * RELAY_SNAPSHOT_MS);
+        let mut snapshots = 0;
+        while snapshots < 3 {
+            let frame = self
+                .requests
+                .recv_timeout(TIMEOUT)
+                .expect("relay snapshot after the simulated window");
+            assert!(!forbidden(&frame), "{why}: {frame}");
+            if frame["type"] == "snapshot" {
+                snapshots += 1;
+            }
+        }
+    }
+
     fn assert_quiet(&self, window: Duration, forbidden: impl Fn(&Value) -> bool, why: &str) {
         let deadline = Instant::now() + window;
         while let Ok(frame) = self
@@ -793,6 +825,13 @@ pub(super) fn relay_basics(request: &Value) -> Vec<Value> {
 
 fn start_relay(fixture: &mut Fixture, relay: &WireRelay, extra: &str) {
     start_relay_options(fixture, relay, extra, &[]);
+}
+
+/// `start_relay` on the test clock (see `Fixture::start_clocked`).
+fn start_relay_clocked(fixture: &mut Fixture, relay: &WireRelay, extra: &str) {
+    start_relay_options_env(fixture, relay, extra, &[], Fixture::clock_env());
+    relay.request("register");
+    fixture.wait_session("pi/remote");
 }
 
 fn start_relay_options(fixture: &mut Fixture, relay: &WireRelay, extra: &str, args: &[&str]) {
@@ -967,7 +1006,7 @@ fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() 
         }
     });
     let mut fixture = stable_fixture();
-    start_relay(&mut fixture, &relay, "");
+    start_relay_clocked(&mut fixture, &relay, "");
     let mut sender = fixture.plugin("sender", "busy");
     let failed = sender.call(json!({"op":"send","to":"pi/remote","body":"do not resend"}));
     assert_ne!(failed["ok"], true);
@@ -977,8 +1016,9 @@ fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() 
         "invalid ACK outcome: {failed}"
     );
     relay.request("send");
-    relay.assert_quiet(
-        RESEND_QUIET,
+    relay.assert_quiet_for(
+        &fixture,
+        RESEND_QUIET_MS,
         |request| request["type"] == "send",
         "invalid ACK replayed body",
     );

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 /// A self-managed manager as pi spawns it: no lease, only its own env.
 fn spawn_self_managed(fixture: &mut Fixture, env: &[(&str, &str)]) {
+    fixture.note_clock(env);
     let log = fs::File::create(fixture.root.join("daemon.log")).unwrap();
     let child = fixture
         .base_command()
@@ -38,57 +39,6 @@ fn wait_for(what: &str, fixture: &Fixture, budget: Duration, ready: impl Fn() ->
     while !ready() {
         assert!(Instant::now() < deadline, "{what}: {}", fixture.manager_log());
         thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// The daemon's timer clock for these lifecycle contracts: simulated under
-/// `--features test-clock` (the CI suite), real otherwise. Every wait below
-/// is bounded by a daemon timer on that clock: the 5s `idle` grace and the
-/// Codex adapter's 1s `codex_cache` maintenance (its 5s retry is measured in
-/// the same clock's time).
-fn clock_env() -> &'static [(&'static str, &'static str)] {
-    if common::MANUAL_CLOCK {
-        &[("PI_FAMULUS_TEST_CLOCK", "manual")]
-    } else {
-        &[]
-    }
-}
-
-fn with_clock<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-    env.iter().copied().chain(clock_env().iter().copied()).collect()
-}
-
-/// Wait until intercom's 250ms maintenance timer is armed again on the
-/// manual clock, i.e. the daemon has finished reacting to the last step.
-fn maintenance_settled(fixture: &Fixture) {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let state = common::clock_request(&fixture.root.join("manager"), json!({"type":"clock_status"}));
-        if state["pending"].as_array().is_some_and(|timers| {
-            timers.iter().any(|t| t["label"] == "intercom_maintenance" && t["due_in_ms"] == 250)
-        }) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "intercom maintenance did not re-arm: {state}");
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Let `ms` of daemon time pass. Manual clock: step it in 250ms
-/// maintenance ticks, each settled before the next, so every timer due in
-/// the window fires in order and its effects (real I/O) can land. Real
-/// clock: sleep.
-fn let_pass(fixture: &Fixture, ms: u64) {
-    if !common::MANUAL_CLOCK {
-        thread::sleep(Duration::from_millis(ms));
-        return;
-    }
-    let mut left = ms;
-    while left > 0 {
-        let step = left.min(250);
-        common::clock_request(&fixture.root.join("manager"), json!({"type":"clock_advance","ms":step}));
-        maintenance_settled(fixture);
-        left -= step;
     }
 }
 
@@ -157,7 +107,7 @@ fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() 
     let mcp = network::vacant_address().to_string();
     let codex = codex_host(&fixture);
     fixture.config(&format!("mcp_listen = '{mcp}'\n"));
-    spawn_self_managed(&mut fixture, &with_clock(&[("CODEX_APP_SERVER_SOCK", &codex.path)]));
+    spawn_self_managed(&mut fixture, &Fixture::with_clock(&[("CODEX_APP_SERVER_SOCK", &codex.path)]));
     let pi = pi_session(&fixture, "pi-session");
     wait_for("the bridge runs without any lease", &fixture, TIMEOUT, || {
         UnixStream::connect(&fixture.sock).is_ok()
@@ -165,7 +115,7 @@ fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() 
     let pid = fixture.daemon_pid();
     // Two Codex maintenance periods in which a self-managed manager must not
     // start MCP or attach to the app-server.
-    let_pass(&fixture, 2000);
+    fixture.let_pass(2000);
     assert!(!mcp_up(&mcp), "a self-managed manager served MCP");
     assert_eq!(
         codex.accepted.load(Ordering::SeqCst),
@@ -196,7 +146,7 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
     let mut fixture = Fixture::new();
     let mcp = network::vacant_address().to_string();
     let codex = codex_host(&fixture);
-    let env = with_clock(&[("CODEX_APP_SERVER_SOCK", codex.path.as_str())]);
+    let env = Fixture::with_clock(&[("CODEX_APP_SERVER_SOCK", codex.path.as_str())]);
     fixture.start_with(&["--mcp-listen", &mcp], &env);
     let pid = fixture.daemon_pid();
     wait_for("Supervised MCP listens", &fixture, TIMEOUT, || mcp_up(&mcp));
@@ -204,7 +154,7 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
         codex.open.load(Ordering::SeqCst) > 0
     });
     // Past the 5s idle grace with no pi: supervision alone keeps it alive.
-    let_pass(&fixture, 7000);
+    fixture.let_pass(7000);
     assert!(alive(pid), "a supervised manager idled out without pi");
     let pi = pi_session(&fixture, "pi-session");
     let mut serve = fixture.child.take().unwrap();
@@ -216,7 +166,7 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
     });
     let demoted = codex.accepted.load(Ordering::SeqCst);
     // Seven Codex maintenance periods (and past its 5s retry) after demotion.
-    let_pass(&fixture, 7000);
+    fixture.let_pass(7000);
     assert_eq!(
         codex.accepted.load(Ordering::SeqCst),
         demoted,

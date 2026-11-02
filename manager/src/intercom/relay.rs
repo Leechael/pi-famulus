@@ -18,6 +18,8 @@ enum OrderedIncoming {
     Control(Value),
     Reply(Value, oneshot::Sender<Value>),
 }
+/// Period of the relay directory snapshot.
+const RELAY_SNAPSHOT_MS: u64 = 3_000;
 const IDLE_CONTROL_QUEUE: usize = 128;
 /// Keeps replies ordered behind earlier idle controls without letting a
 /// control backlog reject them: only controls count against the cap, and
@@ -1253,11 +1255,19 @@ async fn session(
     if *stop.borrow() {
         return Ok(());
     }
-    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    // Snapshot cadence on the daemon clock (simulated under the test clock).
+    // A deadline rather than a fresh sleep per pass, so frames handled by the
+    // other branches never postpone it; the first snapshot goes out at once,
+    // as an interval's first tick did. Capped at one period so a wall-clock
+    // step back cannot delay a snapshot beyond it.
+    let mut snapshot_at = rt.clock.now_ms();
     let result = loop {
+        let snapshot_in = Duration::from_millis(
+            snapshot_at.saturating_sub(rt.clock.now_ms()).min(RELAY_SNAPSHOT_MS),
+        );
         tokio::select! {
             _=stop.changed()=>break Ok(()),
-            _=tick.tick()=>{let local=snapshot_rows(rt.directory().await);{let mut state=rt.state.lock().unwrap();if state.relay_sent.len()>=RELAY_SENT_PENDING{state.relay_sent.pop_front();}state.relay_sent.push_back(local.iter().map(|v|json!({"id":v["id"],"name":v["name"]})).collect());}let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
+            _=rt.clock.sleep("intercom-relay-snapshot", snapshot_in)=>{snapshot_at=rt.clock.now_ms().saturating_add(RELAY_SNAPSHOT_MS);let local=snapshot_rows(rt.directory().await);{let mut state=rt.state.lock().unwrap();if state.relay_sent.len()>=RELAY_SENT_PENDING{state.relay_sent.pop_front();}state.relay_sent.push_back(local.iter().map(|v|json!({"id":v["id"],"name":v["name"]})).collect());}let frame=json!({"type":"snapshot","machine_id":rt.machine,"sessions":local});if let Err(e)=ws.send(Message::Text(frame.to_string().into())).await{break Err(e);}
             if let Err(e)=ws.send(Message::Text(json!({"type":"list","id":"directory"}).to_string().into())).await{break Err(e);}}
             req=rx.recv()=>{if let Some(packet)=req{let v=packet.value;let result=ws.send(Message::Text(v.to_string().into())).await;drop(packet.fence);if let Err(e)=result{if is_control(&v){failed_control=Some(v);}break Err(e);}}}
             msg=ws.next()=>match msg{

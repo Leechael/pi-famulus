@@ -42,10 +42,17 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 const TIMEOUT: Duration = Duration::from_secs(8);
-/// Outlasts the 750ms idle settle plus two 250ms maintenance ticks.
-const IDLE_QUIET: Duration = Duration::from_millis(1500);
-/// Outlasts the daemon's 3s relay snapshot, Desktop reconnect and webhook retry cadence.
-const RESEND_QUIET: Duration = Duration::from_millis(3500);
+/// Outlasts the 750ms idle settle plus two 250ms maintenance ticks (daemon
+/// time: stepped on the manual clock, see `Peer::quiet_for`).
+const IDLE_QUIET_MS: u64 = 1500;
+/// Past the 750ms idle settle and the maintenance tick that reports it.
+const IDLE_SETTLED_MS: u64 = 1000;
+/// Outlasts the daemon's 3s relay snapshot, Desktop reconnect and webhook
+/// retry cadence (daemon time on the manual clock).
+const RESEND_QUIET_MS: u64 = 3500;
+const RESEND_QUIET: Duration = Duration::from_millis(RESEND_QUIET_MS);
+/// The daemon's relay directory snapshot period (`RELAY_SNAPSHOT_MS`).
+const RELAY_SNAPSHOT_MS: u64 = 3000;
 static NEXT_HOME: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
@@ -53,6 +60,9 @@ struct Fixture {
     root: PathBuf,
     sock: PathBuf,
     child: Option<Child>,
+    /// The daemon was started on the manual test clock: its timers move only
+    /// when the test advances them, so peers can flush deterministically.
+    manual: bool,
 }
 
 impl Fixture {
@@ -74,6 +84,7 @@ impl Fixture {
             root,
             sock,
             child: None,
+            manual: false,
         };
         fixture.config("");
         fixture
@@ -180,6 +191,7 @@ impl Fixture {
     /// `pi-famulus serve`, which spawns this fixture's manager and keeps it
     /// supervised. Former flags are materialized into the fixture JSON.
     fn spawn_serve(&mut self, args: &[&str], env: &[(&str, &str)]) {
+        self.note_clock(env);
         let log = fs::File::create(self.root.join("serve.log")).unwrap();
         if !args.is_empty() {
             let path = self.root.join("client.toml");
@@ -339,6 +351,72 @@ impl Fixture {
         self.start_with(&[], &[]);
     }
 
+    /// Start the daemon on the test clock: simulated under `--features
+    /// test-clock` (the CI suite), real otherwise. Waits bounded by daemon
+    /// timers (idle settle, maintenance, Codex cache, idle grace) then use
+    /// `let_pass` instead of sleeping.
+    /// Record whether a daemon started with `env` runs on the manual clock.
+    fn note_clock(&mut self, env: &[(&str, &str)]) {
+        if env.iter().any(|(k, v)| *k == "PI_FAMULUS_TEST_CLOCK" && *v == "manual") {
+            self.manual = true;
+        }
+    }
+
+    fn start_clocked(&mut self) {
+        self.start_with(&[], Self::clock_env());
+    }
+
+    fn clock_env() -> &'static [(&'static str, &'static str)] {
+        if common::MANUAL_CLOCK {
+            &[("PI_FAMULUS_TEST_CLOCK", "manual")]
+        } else {
+            &[]
+        }
+    }
+
+    fn with_clock<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        env.iter().copied().chain(Self::clock_env().iter().copied()).collect()
+    }
+
+    /// Wait until intercom's 250ms maintenance timer is armed again on the
+    /// manual clock: the daemon has finished reacting to the last step.
+    fn maintenance_settled(&self) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state =
+                common::clock_request(&self.root.join("manager"), json!({"type":"clock_status"}));
+            if state["pending"].as_array().is_some_and(|timers| {
+                timers
+                    .iter()
+                    .any(|t| t["label"] == "intercom_maintenance" && t["due_in_ms"] == 250)
+            }) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "intercom maintenance did not re-arm: {state}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Let `ms` of daemon time pass. Manual clock: step it in 250ms
+    /// maintenance ticks, each settled before the next, so every timer due in
+    /// the window fires in order. Real clock: sleep.
+    fn let_pass(&self, ms: u64) {
+        if !common::MANUAL_CLOCK {
+            thread::sleep(Duration::from_millis(ms));
+            return;
+        }
+        let mut left = ms;
+        while left > 0 {
+            let step = left.min(250);
+            common::clock_request(
+                &self.root.join("manager"),
+                json!({"type":"clock_advance","ms":step}),
+            );
+            self.maintenance_settled();
+            left -= step;
+        }
+    }
+
     /// The MCP bearer token the daemon generated because none was configured.
     fn mcp_token(&self) -> String {
         fs::read_to_string(self.root.join("state/mcp-token")).unwrap()
@@ -390,7 +468,9 @@ impl Fixture {
     }
 
     fn connect(&self) -> Peer {
-        Peer::new(UnixStream::connect(&self.sock).unwrap())
+        let mut peer = Peer::new(UnixStream::connect(&self.sock).unwrap());
+        peer.manual = self.manual;
+        peer
     }
 
     fn plugin(&self, id: &str, status: &str) -> Peer {
@@ -458,6 +538,8 @@ struct Peer {
     reader: BufReader<UnixStream>,
     pushed: VecDeque<Value>,
     sequence: u64,
+    /// Its daemon runs on the manual clock (see `no_event`).
+    manual: bool,
 }
 
 impl Peer {
@@ -468,6 +550,7 @@ impl Peer {
             reader: BufReader::new(stream),
             pushed: VecDeque::new(),
             sequence: 0,
+            manual: false,
         }
     }
 
@@ -613,8 +696,32 @@ impl Peer {
         event
     }
 
+    /// Nothing has been pushed to this peer. On the manual clock this is a
+    /// deterministic flush, not a wait: each connection has one ordered
+    /// writer for pushes and replies, so a round trip returns only after
+    /// everything already queued for this peer, and no daemon timer can fire
+    /// meanwhile. On the real clock, a short window is waited out.
     fn no_event(&mut self) {
-        self.no_event_for(Duration::from_millis(150));
+        if self.manual {
+            assert!(self.pushed.is_empty(), "unexpected buffered events: {:?}", self.pushed);
+            self.ok(json!({"op":"list"}));
+            assert!(self.pushed.is_empty(), "unexpected pushed events: {:?}", self.pushed);
+        } else {
+            self.no_event_for(Duration::from_millis(150));
+        }
+    }
+
+    /// Nothing reaches this peer while `ms` of daemon time passes. Manual
+    /// clock: the window is stepped (`Fixture::let_pass`), so every timer that
+    /// could push fires inside it; then whatever was written is drained.
+    /// Real clock: the window is waited out.
+    fn quiet_for(&mut self, fixture: &Fixture, ms: u64) {
+        if common::MANUAL_CLOCK {
+            fixture.let_pass(ms);
+            self.no_event();
+        } else {
+            self.no_event_for(Duration::from_millis(ms));
+        }
     }
 
     fn no_event_for(&mut self, window: Duration) {
@@ -1196,7 +1303,7 @@ fn cli_exact_send_and_agents_use_the_same_local_directory() {
 #[test]
 fn idle_is_one_shot_bound_to_watcher_and_not_a_message_receipt() {
     let mut fixture = Fixture::new();
-    fixture.start();
+    fixture.start_clocked();
     let mut watcher = fixture.plugin("watcher", "busy");
     let mut target = fixture.plugin("target", "busy");
     let mut stranger = fixture.plugin("stranger", "busy");
@@ -1209,8 +1316,9 @@ fn idle_is_one_shot_bound_to_watcher_and_not_a_message_receipt() {
     let id = subscribed["subscription_id"].clone();
     assert!(id.as_str().is_some_and(|s| !s.is_empty()));
     target.register("target", "waiting", &["read_receipts", "idle_state_v1"]);
-    watcher.no_event_for(IDLE_QUIET);
+    watcher.quiet_for(&fixture, IDLE_QUIET_MS);
     target.register("target", "idle", &["read_receipts", "idle_state_v1"]);
+    fixture.let_pass(IDLE_SETTLED_MS);
     let notice = watcher.event("idle_notice");
     assert_eq!(notice["subscription_id"], id);
     assert_eq!(notice["status"], "idle");
@@ -1225,7 +1333,7 @@ fn idle_is_one_shot_bound_to_watcher_and_not_a_message_receipt() {
     );
     target.register("target", "busy", &["read_receipts", "idle_state_v1"]);
     target.register("target", "idle", &["read_receipts", "idle_state_v1"]);
-    watcher.no_event_for(IDLE_QUIET);
+    watcher.quiet_for(&fixture, IDLE_QUIET_MS);
 }
 
 #[test]
@@ -1248,25 +1356,27 @@ fn idle_requires_capability_and_explicit_local_watcher() {
 #[test]
 fn idle_explicit_unregister_is_exit_but_transport_loss_is_not() {
     let mut fixture = Fixture::new();
-    fixture.start();
+    fixture.start_clocked();
     let mut watcher = fixture.plugin("watcher", "busy");
     let mut target = fixture.plugin("target", "busy");
     let subscription = watcher.ok(json!({"op":"subscribe_idle","to":"pi/target"}));
     drop(target);
     fixture.wait_absent("pi/target");
-    watcher.no_event_for(IDLE_QUIET);
+    watcher.quiet_for(&fixture, IDLE_QUIET_MS);
     let status =
         watcher.ok(json!({"op":"idle_status","subscription_id":subscription["subscription_id"]}));
     assert_eq!(status["status"], "subscribed");
     target = fixture.plugin("target", "busy");
     target.ok(json!({"op":"unregister"}));
+    // The exit notice goes out on the next maintenance tick.
+    fixture.let_pass(IDLE_SETTLED_MS);
     assert_eq!(watcher.event("idle_notice")["status"], "exited");
 }
 
 #[test]
 fn watcher_replacement_cancels_old_subscription_without_notifying_new_owner() {
     let mut fixture = Fixture::new();
-    fixture.start();
+    fixture.start_clocked();
     let mut watcher = fixture.plugin("watcher", "busy");
     let mut target = fixture.plugin("target", "busy");
     let subscription = watcher.ok(json!({"op":"subscribe_idle","to":"pi/target"}));
@@ -1276,7 +1386,7 @@ fn watcher_replacement_cancels_old_subscription_without_notifying_new_owner() {
         .connect()
         .ok(json!({"op":"idle_status","subscription_id":subscription["subscription_id"]}));
     assert_ne!(status["status"], "subscribed");
-    replacement.no_event_for(IDLE_QUIET);
+    replacement.quiet_for(&fixture, IDLE_QUIET_MS);
 }
 
 #[test]
@@ -1734,7 +1844,7 @@ fn shutdown_with_live_task_and_idle_watch_reports_unavailable_and_exits() {
 #[test]
 fn mixed_version_watchers_share_one_target_without_pushing_to_legacy_plugin() {
     let mut fixture = Fixture::new();
-    fixture.start();
+    fixture.start_clocked();
     let mut modern = fixture.plugin("modern-watcher", "busy");
     let mut legacy = fixture.connect();
     legacy.register("legacy-watcher", "busy", &["read_receipts"]);
@@ -1744,6 +1854,7 @@ fn mixed_version_watchers_share_one_target_without_pushing_to_legacy_plugin() {
     assert_eq!(pushed["delivery_mode"], "pi_push");
     assert_eq!(polled["delivery_mode"], "query_only");
     target.register("mixed-target", "idle", &["read_receipts", "idle_state_v1"]);
+    fixture.let_pass(IDLE_SETTLED_MS);
     let notice = modern.event("idle_notice");
     assert_eq!(notice["subscription_id"], pushed["subscription_id"]);
     assert_eq!(notice["status"], "idle");
@@ -1752,7 +1863,7 @@ fn mixed_version_watchers_share_one_target_without_pushing_to_legacy_plugin() {
             ["status"],
         "idle"
     );
-    legacy.no_event_for(IDLE_QUIET);
+    legacy.quiet_for(&fixture, IDLE_QUIET_MS);
     let sent = legacy.ok(json!({"op":"send","to":"pi/modern-watcher","body":"from legacy"}));
     assert_eq!(modern.event("deliver")["message_id"], sent["message_id"]);
     let reply = modern.ok(json!({"op":"send","to":"pi/legacy-watcher","body":"to legacy"}));
