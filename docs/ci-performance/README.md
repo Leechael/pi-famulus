@@ -221,9 +221,19 @@ Remaining real-time waits, deliberately kept:
 
 The manager's platform code differs by **OS** (Unix process groups and handover, macOS `proc_pidinfo`, Windows job objects), not by CPU architecture. On `pull_request` events, the manager suites therefore run on **linux-x64, darwin-arm64 and win32-x64**, and e2e on ubuntu-latest, macos-latest and windows-latest. The second architectures (linux-arm64, **darwin-x64**, win32-arm64, and e2e on ubuntu-24.04-arm) still run on every push to main, every dispatch and every release (`publish.yml` calls CI, which is not a PR event). Native package build, release benchmark and install smoke test follow the same rule. Every shipped binary is still built, benchmarked and smoke-tested on main and for every release (`publish.yml` calls CI as a non-PR event, so all six artifacts exist). A regression specific to the second architecture is therefore caught on main rather than on the PR. This is the price of taking the slowest and flakiest lane (darwin-x64, 573s in run 41442682140) off the PR critical path. Excluding linux-arm64, darwin-x64 and win32-arm64 manager lanes plus arm e2e saves 251 + 573 + 194 + 257 = **1,275 job-seconds per PR run** at round-4 timings. It is a single matrix `exclude` driven by `all-architectures`, and easy to revert.
 
-### Expected cost of a full code PR run
+### Measured cost of a full code PR run
 
-Round-4 run 41442682140 used 7,320 job-seconds (122 runner-minutes). Removing the six real-clock lanes (1,975s) and the PR-only exclusions above (1,275s) leaves about **4,070 job-seconds (~68 runner-minutes) per full PR run, −44%**, with macOS job time falling from 3,483s to 1,647s. PRs that touch only one component skip further families, as described above. These are projections from one run's job times, to be replaced by measured runs.
+Runs that select every family (this PR changes workflows, so it does):
+
+| Run | Commit | Jobs | Job time | macOS job time | Wall |
+|---|---|---:|---:|---:|---:|
+| [41442682140](https://github.com/Leechael/pi-famulus/actions/runs/41442682140) (round 4) | `35c466a` | 32 | 7,320s (122 min) | 3,163s | 19m43s |
+| [41448884272](https://github.com/Leechael/pi-famulus/actions/runs/41448884272) (simulated clock, path selection, one arch per OS for suites/e2e) | `3093de2` | 22 | 4,109s (68 min) | 1,423s | 10m20s |
+| [41451109656](https://github.com/Leechael/pi-famulus/actions/runs/41451109656) (plus one arch per OS for packages) | `9eb0a71` | 20 | **2,975s (50 min)** | **1,039s** | see below |
+
+That is **−59% job time and −67% macOS job time** for a full PR run. The last run's first attempt had both darwin-arm64 jobs cancelled with "The job was not acquired by Runner of type hosted even after multiple attempts … capacity constraints … macOS arm64", so no code ran. Re-running only those jobs passed, which is why its wall time is not comparable. A PR touching one component runs less: the eval-only probe [#106](https://github.com/Leechael/pi-famulus/pull/106) used 872s of job time and 6.5 minutes of wall time.
+
+On PRs, the remaining exposure is macOS runner **acquisition**: clippy, e2e, the manager suite and the package still need four macOS jobs. Folding macOS clippy into the manager job would save one acquisition, but it would add clippy's check and release artifacts to the Rust cache, which is at about 8.6/10 GiB. It needs a cache measurement first.
 
 ### Single platform list
 
