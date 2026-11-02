@@ -154,6 +154,14 @@ The run was cancelled. GitHub publishes no logs for a step cancelled mid-run (th
 
 Manager lanes also get `timeout-minutes: 45`, so a hang can no longer hold a scarce macOS runner for GitHub's 6-hour default.
 
+### Decision: overlap on Linux only
+
+In [run 41436762617](https://github.com/Leechael/pi-famulus/actions/runs/41436762617), darwin-arm64 passed with overlap (real 404s → 235s, manual 352s → 265s), and so did darwin-x64 real (343s → 314s). darwin-x64 manual clock **hung again**: it was still in its test step after 26 minutes, so the 15-minute per-binary timeout had not ended it either. That points outside the per-binary guard (the build phase, or a killed process that is never reaped), and its cause is still unknown. That makes two hangs in three runs, on the slowest and most constrained host, which is also the critical path.
+
+The driver therefore runs only on **Linux**, where it passed all four lanes in three runs (real 273s → ~158s, manual ~250s → ~197s). macOS and Windows run plain `cargo test`, exactly as in round 3. The driver now prints a timed-out binary's diagnostics immediately and stops waiting 30s after the kill, so a future occurrence leaves evidence. Re-enabling macOS should wait for a diagnosed, fixed cause.
+
+The Windows E2E observer readiness timeout (`observes the captured process exiting after readiness`) recurred in [run 41440852802](https://github.com/Leechael/pi-famulus/actions/runs/41440852802). It is the same failure seen in round 2, in a job and code path this change does not touch. It is a pre-existing flake that needs its own fix, not a timeout increase.
+
 ### Local measurements are distorted in the authoring sandbox
 
 The local container's PID 1 reaps orphaned processes ~1.7s late: a forked orphan stayed a zombie for 1.73s. Every `intercom` fixture waits for its orphaned daemon to disappear, so locally most tests show a fixed ~2s teardown that CI hosts do not have. The same delay causes the local-only process-reaping failures in `lifecycle_adversarial`, `platform` and `timing_canary`, which pass on every CI host. Local timings are therefore not used as evidence of the CI gain. Only CI runs are.

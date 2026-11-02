@@ -15,12 +15,13 @@ test('clock lanes preserve every platform and both full Cargo suites independent
     assert.ok(tests.includes(`platform: ${platform}\n`), platform);
   }
   assert.match(tests, /clock: \[real, manual\]/);
-  // Unix overlaps whole test binaries; Windows keeps cargo's sequential loop.
-  // Either way both lanes run the complete suite with no filters.
-  assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked\n\s+if: matrix.clock == 'real' && runner.os != 'Windows'/);
-  assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked --features test-clock\n\s+if: matrix.clock == 'manual' && runner.os != 'Windows'/);
-  assert.match(tests, /- run: cargo test --locked\n\s+if: matrix.clock == 'real' && runner.os == 'Windows'/);
-  assert.match(tests, /- run: cargo test --locked --features test-clock\n\s+if: matrix.clock == 'manual' && runner.os == 'Windows'/);
+  // Linux overlaps whole test binaries; macOS and Windows keep cargo's
+  // sequential loop. Either way both lanes run the complete suite unfiltered.
+  assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked\n\s+if: matrix.clock == 'real' && runner.os == 'Linux'/);
+  assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked --features test-clock\n\s+if: matrix.clock == 'manual' && runner.os == 'Linux'/);
+  assert.match(tests, /- run: cargo test --locked\n\s+if: matrix.clock == 'real' && runner.os != 'Linux'/);
+  assert.match(tests, /- run: cargo test --locked --features test-clock\n\s+if: matrix.clock == 'manual' && runner.os != 'Linux'/);
+  assert.match(tests, /timeout-minutes: 45/);
   assert.doesNotMatch(tests, /--skip|continue-on-error|needs:/);
   const packs = job(native, 'native');
   assert.doesNotMatch(packs, /needs:/, 'release builds must not wait for debug tests');
