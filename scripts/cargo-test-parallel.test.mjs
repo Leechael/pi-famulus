@@ -36,7 +36,7 @@ test('schedules every binary once: longest first, load-sensitive suites alone at
 test('every suite that documents a wall-clock or CPU-saturation contract runs alone', () => {
   // backpressure was split from lifecycle_adversarial so its latency bound
   // never measures the CPU burners; timing_canary pins real durations.
-  const header = readFileSync(new URL('../manager/tests/backpressure.rs', import.meta.url), 'utf8');
+  const header = readFileSync(new URL('../manager/tests/backpressure.rs', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
   assert.match(header, /lifecycle_adversarial deliberately\n\/\/! saturates every CPU/);
   for (const name of ['lifecycle_adversarial', 'backpressure', 'timing_canary']) assert.ok(SOLO.includes(name), name);
 });
