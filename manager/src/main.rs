@@ -65,10 +65,18 @@ fn main() {
         }
         _ => {}
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // Resource benchmarks only: how long idle blocking threads linger (tokio's
+    // default is 10s), so a handle measurement need not wait that out to tell
+    // a leak from a pooled thread. Unset in normal use.
+    if let Some(ms) = std::env::var("PI_FAMULUS_BLOCKING_KEEP_ALIVE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        builder.thread_keep_alive(std::time::Duration::from_millis(ms));
+    }
+    let rt = builder.build().expect("tokio runtime");
     rt.block_on(async_main());
 }
 
