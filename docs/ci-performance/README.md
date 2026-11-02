@@ -201,3 +201,18 @@ Manager lanes drop from **12 to 6**. In round 3, the real-clock lanes accounted 
 "Anything else" is a negated every-quantifier filter, so an unclassified path **fails closed** and selects every family. Forced runs (dispatch with a ref, releases via `publish.yml`) and non-diff events select everything. The root package job (release metadata and Node tooling tests) runs on every code change. The required `extension` aggregate now checks each family against **its own** decision: a selected family must succeed and an unselected one must be skipped. It rejects a missing or non-string decision, or a docs-only scope that names a component. `scripts/ci-scope.test.mjs` evaluates the real expressions, filters and inline gate script for every scope combination.
 
 A manager-only PR no longer runs the four extension compatibility jobs or drift. An extension-only PR no longer runs clippy or the six manager suites. An eval-only PR runs only e2e. This PR itself changes workflows and `scripts/`, so it still runs everything.
+
+### Real-time waits inside the suite
+
+Daemon timers that run on the test clock (`idle`, `gc`, `codex_cache`, `intercom_maintenance`, `native_idle_expiry`, `intercom_listen_reconnect`) are stepped with `clock_advance` instead of slept. The intercom lifecycle contracts were the largest remaining wall-clock sleeps bounded by such timers. They now step the manual clock in 250ms maintenance ticks and settle each step before the next, while plain `cargo test` still sleeps, as `Home::advance` does. `serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime` went from **20.5s to 1.7s** and `self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi` from **7.3s to 0.6s**. Both pass on either clock, and all 215 intercom tests pass on the manual one. The run is also evidence that virtual time drives the real timer: the manager exits only after its 5s idle grace, and it exited 1.7s into the test.
+
+Remaining real-time waits, deliberately kept:
+
+| Wait | Why it stays real |
+|---|---|
+| `timing_canary` (5s idle grace, 2s kill grace) | Pins the real durations, which is the canary's job. |
+| `mutation_gaps` g10/g14 (1.5s windows) | Measure **CPU used per real second** to catch busy loops; simulated time cannot burn CPU. |
+| `backpressure` c6 (latency < 2s, 90s bound) | Wall-clock service latency under a stuck watcher is the contract. |
+| `lifecycle_adversarial` o3c (2s) | Lets a concurrently dispatched OS-level reply be attempted first; a real race. |
+| `observability` status (1.1s) | Record timestamps and uptime are real time by design (`clock.rs`). |
+| intercom `IDLE_QUIET`/`RESEND_QUIET` (1.5s/3.5s, 12 uses) | Bounded by **production** timers still on raw tokio time: relay snapshot, Desktop reconnect and native scan intervals (3s each). Moving those onto the labelled `Clock` is the next step for simulating these windows. It changes production timer code, so it belongs in its own reviewed change. |
