@@ -30,6 +30,11 @@ hmac = "0.12"
 sha2 = "0.10"
 percent-encoding = "2"
 
+# Tests only: paused tokio time proves the real clock's timers without
+# waiting for them (see clock.rs).
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

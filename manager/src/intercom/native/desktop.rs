@@ -19,6 +19,8 @@ struct Command {
     body: String,
     mid: String,
     observe: bool,
+    /// Test-clock only: answered in queue order and does nothing else.
+    flush: bool,
     fence: Option<tokio::sync::OwnedMutexGuard<()>>,
     reply: oneshot::Sender<Result<(String, String), String>>,
 }
@@ -48,6 +50,7 @@ impl Client {
                 body: String::new(),
                 mid: String::new(),
                 observe: true,
+                flush: false,
                 fence: None,
                 reply: tx,
             })
@@ -55,6 +58,28 @@ impl Client {
             .map_err(|_| "Desktop IPC not connected".to_string())?;
         rx.await
             .map_err(|_| "Desktop idle observation connection closed".to_string())?
+    }
+    /// Test-clock only: resolves once every command queued before it has
+    /// been handled. Commands are handled one at a time, each to completion
+    /// (its IPC request written), so this orders after all of them.
+    #[cfg(feature = "test-clock")]
+    pub async fn flush(&self) {
+        let (tx, rx) = oneshot::channel();
+        let queued = self
+            .tx
+            .send(Command {
+                thread: String::new(),
+                body: String::new(),
+                mid: String::new(),
+                observe: false,
+                flush: true,
+                fence: None,
+                reply: tx,
+            })
+            .await;
+        if queued.is_ok() {
+            let _ = rx.await;
+        }
     }
     pub fn list(&self) -> Vec<Value> {
         self.catalog.lock().unwrap().values().cloned().collect()
@@ -73,6 +98,7 @@ impl Client {
                 body,
                 mid: mid.into(),
                 observe: false,
+                flush: false,
                 fence,
                 reply: tx,
             })
@@ -132,6 +158,9 @@ pub(super) async fn start(
         let owner = Arc::downgrade(rt);
         let attached = connected;
         let mut stop = stop;
+        // Reconnect cadence on the daemon clock (simulated under the test
+        // clock; tokio's sleep otherwise).
+        let clock = rt.clock.clone();
         let task = tokio::spawn(async move {
             loop {
                 let path = std::env::var_os("CODEX_DESKTOP_IPC_SOCK")
@@ -154,7 +183,7 @@ pub(super) async fn start(
                     while !connection.broken {
                         tokio::select! {
                             _=stop.changed()=>return,
-                            command=rx.recv()=>{let Some(mut command)=command else{return};let result=if command.observe{tokio::select!{_ = command.reply.closed()=>continue,result=connection.idle_observation(&command.thread)=>result}}else{connection.send(&mut command).await.map(|state|(state,String::new()))};let _=command.reply.send(result);},
+                            command=rx.recv()=>{let Some(mut command)=command else{return};let result=if command.flush{Ok((String::new(),String::new()))}else if command.observe{tokio::select!{_ = command.reply.closed()=>continue,result=connection.idle_observation(&command.thread)=>result}}else{connection.send(&mut command).await.map(|state|(state,String::new()))};let _=command.reply.send(result);},
                             frame=connection.frames.recv()=>{match frame{Some(Ok(value))=>{if connection.broadcast(&value).await.is_err(){break;}},_=>break}},
                             _=cleanup.tick()=>{
                                 let expired_waits = connection.prune_correlation(crate::proto::now_ms());
@@ -169,7 +198,7 @@ pub(super) async fn start(
                     }
                     drop(connection);
                 }
-                tokio::select! {_=stop.changed()=>return,_=tokio::time::sleep(Duration::from_secs(3))=>{},command=rx.recv()=>{if let Some(command)=command{let _=command.reply.send(Err("Desktop IPC not connected".into()));}else{return;}}}
+                tokio::select! {_=stop.changed()=>return,_=clock.sleep("intercom_desktop_reconnect",Duration::from_secs(3))=>{},command=rx.recv()=>{if let Some(command)=command{let _=command.reply.send(Err("Desktop IPC not connected".into()));}else{return;}}}
             }
         });
         Some(task)

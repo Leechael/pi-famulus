@@ -5402,6 +5402,25 @@ fn admit_agent(
 
 #[cfg(test)]
 mod tests {
+    /// The daemon's real timers, proven on paused tokio time instead of
+    /// waiting for them. `Clock::default()` is the clock a daemon gets
+    /// without `PI_FAMULUS_TEST_CLOCK=manual` (always, in a normal build);
+    /// paused time auto-advances only when every task is idle, so the
+    /// elapsed time is exactly what each timer slept. The manual-clock
+    /// boundaries (alive 1ms before, acted on at the constant) are pinned by
+    /// tests/timing_canary.rs.
+    #[tokio::test(start_paused = true)]
+    async fn real_clock_idle_and_kill_graces_sleep_exactly_their_constants() {
+        assert_eq!(IDLE_SHUTDOWN, Duration::from_secs(5));
+        assert_eq!(KILL_GRACE, Duration::from_secs(2));
+        let clock = crate::clock::Clock::default();
+        for (label, grace) in [("idle", IDLE_SHUTDOWN), ("kill-grace", KILL_GRACE), ("shutdown-grace", KILL_GRACE)] {
+            let started = tokio::time::Instant::now();
+            clock.sleep(label, grace).await;
+            assert_eq!(started.elapsed(), grace, "{label}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

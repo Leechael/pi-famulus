@@ -378,6 +378,13 @@ impl Port {
                     )
                     .await
             }
+            // Test-clock only: an ordered barrier through Desktop's command
+            // queue, so tests can check "nothing was sent" without waiting.
+            #[cfg(feature = "test-clock")]
+            "debug_desktop_flush" => {
+                self.rt.native.desktop_flush().await;
+                Ok(json!({}))
+            }
             "idle_status" => {
                 let mut s = self.rt.state.lock().unwrap();
                 s.subscriptions.retain(|_, w| {

@@ -622,6 +622,14 @@ pub async fn start_codex(
     desktop.into_iter().chain(codex).collect()
 }
 impl Native {
+    /// Test-clock only: see `desktop::Client::flush`. No-op without Desktop.
+    #[cfg(feature = "test-clock")]
+    pub async fn desktop_flush(&self) {
+        let client = self.desktop.lock().unwrap().clone();
+        if let Some(client) = client {
+            client.flush().await;
+        }
+    }
     pub fn stop_codex(&self) {
         self.codex.lock().unwrap().take();
         self.desktop.lock().unwrap().take();
