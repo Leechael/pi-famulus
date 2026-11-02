@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { describe, it } from "node:test";
-import { observeProcessExit } from "../lib/process-exit-observer.ts";
+import { before, describe, it } from "node:test";
+import { observeProcessExit, warmProcessObserver } from "../lib/process-exit-observer.ts";
 
 const scriptedObserver = (script: string) => () => spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -13,6 +13,9 @@ async function target() {
 }
 
 describe("process exit observer", () => {
+  // The readiness bound is about attaching, not the runtime's cold start.
+  before(() => warmProcessObserver());
+
   it("observes the captured process exiting after readiness", async () => {
     const child = await target();
     let observer;
