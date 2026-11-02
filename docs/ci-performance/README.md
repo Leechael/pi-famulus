@@ -202,20 +202,22 @@ Manager lanes drop from **12 to 6**. In round 3, the real-clock lanes accounted 
 
 A manager-only PR no longer runs the four extension compatibility jobs or drift. An extension-only PR no longer runs clippy or the six manager suites. An eval-only PR runs only e2e. This PR itself changes workflows and `scripts/`, so it still runs everything.
 
-### Real-time waits inside the suite
+### Waits on simulated time and exact conditions, not wall time
 
-Daemon timers that run on the test clock (`idle`, `gc`, `codex_cache`, `intercom_maintenance`, `native_idle_expiry`, `intercom_listen_reconnect`) are stepped with `clock_advance` instead of slept. The intercom lifecycle contracts were the largest remaining wall-clock sleeps bounded by such timers. They now step the manual clock in 250ms maintenance ticks and settle each step before the next, while plain `cargo test` still sleeps, as `Home::advance` does. `serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime` went from **20.5s to 1.7s** and `self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi` from **7.3s to 0.6s**. Both pass on either clock, and all 215 intercom tests pass on the manual one. The run is also evidence that virtual time drives the real timer: the manager exits only after its 5s idle grace, and it exited 1.7s into the test.
+The CI suite runs with `--features test-clock`, and every daemon a test starts, intercom fixtures included, now runs on the manual clock. Waits fall into four kinds, and none is a fixed wall-clock sleep in CI:
 
-Remaining real-time waits, deliberately kept:
+1. **Daemon timers are stepped, not slept.** Idle grace, kill and shutdown graces, intercom maintenance, the idle settle, `codex_cache`, relay snapshot, reconnect and write-ack timers, the Desktop reconnect and the native session scan are all on the daemon's labelled `Clock`. The relay snapshot, Desktop reconnect and native scan moved there from raw `tokio::time`; without the test clock `Clock::sleep` is tokio's, so production timing is unchanged. Tests step them with `clock_advance`. A post-step settle waits until intercom maintenance is re-armed and the native scan is not mid-scan, or until every timer the step fired has returned from its sleep (`Home::settle`). Polling loops take a `Deadline` that caps the daemon time stepped at the original budget, so bounds such as "within one second" keep their meaning.
+2. **Ordered barriers instead of "nothing happened for N ms".** Each intercom connection has one ordered writer, so a round trip is a flush. Relay quiet windows end at a snapshot that lists a marker session registered after the window. Desktop gets a test-only `debug_desktop_flush` that answers in its command queue. A connection's requests are read in order, so a later reply proves an earlier request was dispatched.
+3. **Test-clock-only observability, absent from release builds.** `clock_status` reports oversized frames dropped, queued agent acquisitions, client connections accepted and live output fanouts, and `debug_native_base` reports native base connections accepted and busy. Tests wait for these exact conditions instead of pausing.
+4. **Structural checks instead of watching for death.** Detachment is asserted with `getsid`/`getpgid`. A parked deliver is detected by its bytes in the capped peer buffer. The busy-loop canaries became exact: g10 waits for every output fanout to finish (a spinning fanout never does; a mutation that spins after EOF fails it), and g14 samples the guardian's scheduler state back to back (a spinning shell is runnable in 40/40 samples, a sleeping one in 0/40).
 
-| Wait | Why it stays real |
-|---|---|
-| `timing_canary` (5s idle grace, 2s kill grace) | Pins the real durations, which is the canary's job. |
-| `mutation_gaps` g10/g14 (1.5s windows) | Measure **CPU used per real second** to catch busy loops; simulated time cannot burn CPU. |
-| `backpressure` c6 (latency < 2s, 90s bound) | Wall-clock service latency under a stuck watcher is the contract. |
-| `lifecycle_adversarial` o3c (2s) | Lets a concurrently dispatched OS-level reply be attempted first; a real race. |
-| `observability` status (1.1s) | Record timestamps and uptime are real time by design (`clock.rs`). |
-| intercom `IDLE_QUIET`/`RESEND_QUIET` (1.5s/3.5s, 12 uses) | Bounded by **production** timers still on raw tokio time: relay snapshot, Desktop reconnect and native scan intervals (3s each). Moving those onto the labelled `Clock` is the next step for simulating these windows. It changes production timer code, so it belongs in its own reviewed change. |
+The timing canary pins the 5s/2s boundaries exactly on the manual clock: alive at 4,999ms and acted on at 5,000ms, so a 6s idle grace fails it. That the normal build's clock sleeps those durations is a daemon unit test on paused tokio time (9s of timers in 0s). Examples: `serve_supervises…` 20.5s → 1.7s; the Desktop resend contracts 5–7s → 2s each; o3c 2s → 0.5s; the intercom binary 186s → 139s locally.
+
+What remains on wall time, by design:
+
+- **Measurements.** The resource benchmark samples CPU over 3s windows. It no longer waits out tokio's 10s blocking keep-alive (twice 11s): its daemon uses a 200ms keep-alive, and the handle count waits for growth to fall within budget. 39s → 17s, same final growth. `backpressure` measures real service latency, paced by a `wait` long-poll instead of a client sleep.
+- **Condition polls.** Short intervals inside loops that wait for real work (a process exit, an upgrade, a 256 MiB transfer).
+- **Real-clock fallbacks.** Non-feature builds keep the previous bounded pauses; CI never takes those branches. One Windows-only pause remains where detachment is through job objects and no structural check applies.
 
 ### One architecture per OS on pull requests
 
@@ -238,3 +240,7 @@ On PRs, the remaining exposure is macOS runner **acquisition**: clippy, e2e, the
 ### Single platform list
 
 Both matrices (manager suites and native packages) take their rows from `.github/native-platforms.json` through a small `platforms` job (`scripts/native-matrix.mjs`), instead of duplicated `include` lists. The first PR exclusion attempt used a matrix `exclude` next to per-platform `include` entries. GitHub applies `include` **after** `exclude` and adds back an entry that no longer matches, so all six lanes still ran. With one list, the selection is plain data and unit-tested: one primary architecture per OS, and anything but the literal text `true`/`false` is rejected. `release.test.mjs` checks that the list names exactly the released `PLATFORMS` and targets. In run 41448884272, the second-architecture package jobs took darwin-x64 441s, win32-arm64 421s and linux-arm64 ~214s, about **1,076 job-seconds** saved per PR run in addition to the manager lanes.
+
+### Measured: final full-code PR run
+
+[Run 41492793454](https://github.com/Leechael/pi-famulus/actions/runs/41492793454) (`1582f67`) passed 20/20 jobs on its first attempt: **8m04s wall, 3,219 job-seconds (54 runner-minutes), 1,102s on macOS**. Against round 4 ([41442682140](https://github.com/Leechael/pi-famulus/actions/runs/41442682140): 19m43s, 122 runner-minutes, 3,163s macOS) that is **−59% wall, −56% job time and −65% macOS**. darwin-arm64 ran intercom 214/214 and the resource benchmark in 21s. Two earlier runs that day lost darwin-arm64 jobs to "not acquired by Runner … capacity constraints … macOS arm64" (no code ran); those were re-run, never counted as code results.

@@ -141,6 +141,11 @@ mod manual {
         /// so tests can wait for a client to connect instead of pausing.
         #[serde(default)]
         pub accepted_connections: u64,
+        /// Tasks whose output fanout has not finished (set by the daemon): a
+        /// fanout ends at its task's EOF, so a test waits for zero instead of
+        /// measuring CPU over a wall-clock window.
+        #[serde(default)]
+        pub live_fanouts: u64,
     }
 
     /// Removes the sleeper when the sleeping future completes or is dropped
@@ -228,6 +233,7 @@ mod manual {
                 dropped_oversized_frames: 0,
                 pending_agents: 0,
                 accepted_connections: 0,
+                live_fanouts: 0,
             }
         }
     }

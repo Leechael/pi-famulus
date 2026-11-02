@@ -434,8 +434,9 @@ fn t6e_leftover_that_exits_leaves_nothing_to_kill() {
     let (id, _) = c.start(&kit(&["leave", "300"]));
     let left = wait_for_pids(&mut c, &id, 1)[0];
     c.wait_terminal(&id, S(10)).unwrap();
+    // Once the leftover is gone there is nothing to wait for: shutdown
+    // re-checks each leftover group's members itself.
     assert!(poll_true(S(5), || !pid_running(left)));
-    std::thread::sleep(MS(300));
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
     // Liveness only: on the manual clock a wrongly awaited grace never ends,

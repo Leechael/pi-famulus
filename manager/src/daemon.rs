@@ -2278,7 +2278,16 @@ fn handle_clock(
         _ => m.status(),
     };
     status.dropped_oversized_frames = OVERSIZED_DROPPED.load(std::sync::atomic::Ordering::SeqCst);
-    status.pending_agents = state.lock().unwrap().pending_agents.len() as u64;
+    {
+        let st = state.lock().unwrap();
+        status.pending_agents = st.pending_agents.len() as u64;
+        status.live_fanouts = st
+            .registry
+            .tasks
+            .values()
+            .filter(|e| e.fanout.as_ref().is_some_and(|h| !h.is_finished()))
+            .count() as u64;
+    }
     status.accepted_connections = ACCEPTED_CONNECTIONS.load(std::sync::atomic::Ordering::SeqCst);
     Ok(status)
 }

@@ -126,10 +126,10 @@ fn resource_usage() {
     r.json.insert("os".into(), json!(std::env::consts::OS));
     r.json.insert("arch".into(), json!(std::env::consts::ARCH));
 
-    // Idle: a connected client, no tasks.
-    std::thread::sleep(S(1));
-    let idle = sample(pid);
+    // Idle: a connected client, no tasks. Sampled once the handle count is
+    // stable (a condition, not a fixed pause).
     let base_handles = settled_handles(pid);
+    let idle = sample(pid);
     r.metric("idle.rss", idle.rss as f64 / MIB, "MiB", Some(48.0));
     r.metric("idle.handles", base_handles as f64, "", None);
     r.metric("idle.cpu_3s", cpu_over(pid, S(3)) as f64, "ms", Some(60.0));
@@ -154,7 +154,8 @@ fn resource_usage() {
     for _ in 0..n {
         running.push(c.start(&kit(&["sleep", "120000"])));
     }
-    std::thread::sleep(S(1));
+    // Every runner is up and the daemon's handles are stable before sampling.
+    settled_handles(pid);
     let busy = sample(pid);
     let runner_rss: u64 = running.iter().map(|(_, p)| rss_bytes(*p).expect("runner rss probe failed")).sum::<u64>() / n;
     r.metric("running20.daemon_rss", busy.rss as f64 / MIB, "MiB", Some(64.0));
@@ -193,7 +194,7 @@ fn resource_usage() {
     for id in &ids {
         assert!(c.wait_terminal(id, S(20)).is_some(), "{id} did not finish");
     }
-    std::thread::sleep(S(2));
+    // The leftovers exit on their own; the count below waits for that.
     let after_leftovers = handles_after_pool_idle(pid, base_handles, 24);
     r.metric("leftovers20.handle_growth", after_leftovers.saturating_sub(base_handles) as f64, "", Some(24.0));
     r.metric("churn.rss_after", sample(pid).rss as f64 / MIB, "MiB", Some(64.0));
