@@ -23,7 +23,7 @@
 // Windows defaults to one binary at a time: Git Bash start-up is racy under
 // concurrent first launches (see tests/platform.rs), and its suites are short.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -93,7 +93,27 @@ function build(args) {
 const logs = mkdtempSync(join(tmpdir(), 'cargo-test-parallel-'));
 process.on('exit', () => rmSync(logs, { recursive: true, force: true }));
 
-export function run(binary, args = []) {
+// A binary that outlives this (the slowest takes ~3 minutes today) is
+// reported with its output so far plus a process snapshot, then killed, so
+// the step fails with logs instead of hanging the job until it is cancelled
+// (GitHub publishes no logs for a step cancelled mid-run).
+export const TIMEOUT_S = Number(process.env.PI_FAMULUS_TEST_TIMEOUT_S) || 900;
+const running = new Map();
+
+function snapshot(pid) {
+  const out = [];
+  const capture = (title, cmd, args) => {
+    const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 << 20 });
+    if (r.error) return;
+    out.push(`--- ${title}`, (r.stdout + r.stderr).split('\n').slice(0, 400).join('\n'));
+  };
+  if (process.platform !== 'win32') capture('processes', 'ps', ['-axo', 'pid,ppid,pgid,etime,stat,command']);
+  // Stacks of every thread of the hung test process; needs no ptrace grant.
+  if (process.platform === 'darwin') capture(`sample ${pid}`, 'sample', [String(pid), '3']);
+  return out.join('\n');
+}
+
+export function run(binary, args = [], timeoutS = TIMEOUT_S) {
   return new Promise(resolve => {
     const started = Date.now();
     const path = join(logs, `${binary.name}-${binary.kind}.log`);
@@ -101,12 +121,19 @@ export function run(binary, args = []) {
     // The environment cargo itself gives a test process at run time.
     const env = { ...process.env, CARGO_MANIFEST_DIR: manager, CARGO_PKG_NAME: 'pi-famulus' };
     let child;
+    let timer;
+    let timedOut = false;
+    let diagnostics = '';
     let done = false;
     const finish = (code, signal, error) => {
       if (done) return;
       done = true;
+      clearTimeout(timer);
+      running.delete(binary);
       closeSync(fd);
-      resolve({ ...binary, code, signal, error, seconds: (Date.now() - started) / 1000, output: readFileSync(path, 'utf8') });
+      let output = readFileSync(path, 'utf8');
+      if (timedOut) output += `\n===== timed out after ${timeoutS}s; state before the kill:\n${diagnostics}\n`;
+      resolve({ ...binary, code, signal, error, timedOut, seconds: (Date.now() - started) / 1000, output });
     };
     try {
       child = spawn(binary.executable, args, { cwd: manager, env, stdio: ['ignore', fd, fd] });
@@ -114,6 +141,12 @@ export function run(binary, args = []) {
       finish(null, null, error);
       return;
     }
+    running.set(binary, started);
+    timer = setTimeout(() => {
+      timedOut = true;
+      diagnostics = snapshot(child.pid);
+      child.kill('SIGKILL');
+    }, timeoutS * 1000);
     child.once('error', error => finish(null, null, error));
     child.once('exit', (code, signal) => finish(code, signal));
   });
@@ -121,10 +154,11 @@ export function run(binary, args = []) {
 
 const actions = process.env.GITHUB_ACTIONS === 'true';
 const label = b => `${b.kind === 'bin' ? 'unittests' : 'tests'} ${relative(manager, b.src).replaceAll('\\', '/')}`;
-const passed = r => r.code === 0 && !r.signal && !r.error;
+const passed = r => r.code === 0 && !r.signal && !r.error && !r.timedOut;
 
 function report(r) {
-  const status = passed(r) ? 'ok' : `FAILED (${r.error?.message ?? (r.signal ? `signal ${r.signal}` : `exit ${r.code}`)})`;
+  const why = r.timedOut ? `timed out after ${TIMEOUT_S}s` : r.error?.message ?? (r.signal ? `signal ${r.signal}` : `exit ${r.code}`);
+  const status = passed(r) ? 'ok' : `FAILED (${why})`;
   const title = `${label(r)}: ${status} in ${r.seconds.toFixed(1)}s`;
   // Failures stay expanded so the log opens on them.
   if (actions && passed(r)) process.stdout.write(`::group::${title}\n${r.output}\n::endgroup::\n`);
@@ -151,7 +185,14 @@ async function main(args) {
   const { parallel, solo } = schedule(binaries);
   console.log(`Running ${parallel.length} test binaries, ${jobs} at a time; then ${solo.map(b => b.name).join(', ') || 'nothing'} alone, one by one.`);
   const started = Date.now();
-  const results = [...await pool(parallel, jobs, run), ...await pool(solo, 1, run)];
+  // Output is printed per binary on completion; say what is still running.
+  const heartbeat = setInterval(() => {
+    const now = Date.now();
+    const busy = [...running].map(([b, t]) => `${b.name} ${Math.round((now - t) / 1000)}s`).join(', ');
+    console.log(`[${Math.round((now - started) / 1000)}s] still running: ${busy}`);
+  }, 120_000);
+  const results = [...await pool(parallel, jobs, b => run(b)), ...await pool(solo, 1, b => run(b))];
+  clearInterval(heartbeat);
   const wall = (Date.now() - started) / 1000;
   const failed = results.filter(r => !passed(r));
 

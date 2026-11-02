@@ -143,6 +143,17 @@ The test was right and the scheduler was wrong. It had violated the documented i
 
 In the same run, the three remaining macOS clock lanes sat in the test step for 29–36 minutes (sequential runs take ~7) until the run was cancelled. The first driver read each binary's output through pipes and finished on `close`, so it waited for **every** holder of the pipe to exit. `cargo test` lets a test inherit its stdio and waits only for the process. A daemon or task a test leaves behind can therefore hold the pipe open without affecting cargo. A reproduction (a binary that exits 0 at once and leaves `sleep 30 &` holding stdout) hangs the first driver past a 12s timeout. The driver now gives each binary an inherited temp-file descriptor and finishes on `exit`, exactly like cargo. A unit test pins the reproduction. Logs of the cancelled jobs had not been published when this was written, so which binary left the descendant is not yet identified.
 
+### Third run: a macOS test process that never exited
+
+[Run 41432012989](https://github.com/Leechael/pi-famulus/actions/runs/41432012989) used the revised driver. Every Linux and Windows lane passed, and so did darwin-x64 real clock (test time 343s → **272s**) and darwin-arm64 real clock. Linux lanes went 273s → **158s** (real) and 234–258s → **196–197s** (manual). But darwin-x64 manual clock stayed in its test step for 27+ minutes. Its round-3 job took 11 minutes in total. The driver was now waiting for process **exit**, so a test process itself had not exited. darwin-arm64 manual clock never got a runner, and GitHub cancelled it after ~20 minutes in the macOS queue.
+
+The run was cancelled. GitHub publishes no logs for a step cancelled mid-run (the earlier run's cancelled jobs still return `BlobNotFound`), so the hung binary is **not identified**. The baseline's cancelled native jobs all stopped at ≤15 minutes, consistent with superseded runs, so there is no evidence of earlier hangs under sequential `cargo test`. Overlap therefore remains the prime suspect until a diagnosed occurrence says otherwise. No machine-global resources (fixed ports, shared temp names) were found by inspection. The driver now:
+
+- kills a binary after 15 minutes (`PI_FAMULUS_TEST_TIMEOUT_S`), and first records its output so far, a `ps` snapshot and, on macOS, `sample` stacks of the test process. libtest's own "has been running for over 60 seconds" lines name the stuck test, and the step fails with logs instead of hanging;
+- prints the binaries still running every 2 minutes.
+
+Manager lanes also get `timeout-minutes: 45`, so a hang can no longer hold a scarce macOS runner for GitHub's 6-hour default.
+
 ### Local measurements are distorted in the authoring sandbox
 
 The local container's PID 1 reaps orphaned processes ~1.7s late: a forked orphan stayed a zombie for 1.73s. Every `intercom` fixture waits for its orphaned daemon to disappear, so locally most tests show a fixed ~2s teardown that CI hosts do not have. The same delay causes the local-only process-reaping failures in `lifecycle_adversarial`, `platform` and `timing_canary`, which pass on every CI host. Local timings are therefore not used as evidence of the CI gain. Only CI runs are.

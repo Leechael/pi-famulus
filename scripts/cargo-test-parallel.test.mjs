@@ -65,3 +65,12 @@ test('a failing or missing binary fails without hanging', async () => {
   const missing = await run({ name: 'm', kind: 'test', src: 'x', executable: '/nonexistent/test-binary' });
   assert.ok(missing.error);
 });
+
+test('a hung binary is killed and reported with its output and a process snapshot', { skip: process.platform === 'win32' }, async () => {
+  const result = await run({ name: 'hung', kind: 'test', src: 'x', executable: '/bin/sh' }, ['-c', 'echo test slow ... has been running for over 60 seconds; exec sleep 60'], 1);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.signal, 'SIGKILL');
+  assert.ok(result.seconds < 30, `took ${result.seconds}s`);
+  assert.match(result.output, /has been running for over 60 seconds/);
+  assert.match(result.output, /timed out after 1s; state before the kill:\n--- processes\n/);
+});

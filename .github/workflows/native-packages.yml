@@ -85,6 +85,10 @@ jobs:
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
+    # The slowest lane takes ~11 minutes. A hung test must not hold a scarce
+    # macOS runner for GitHub's 6-hour default; the driver's per-binary
+    # timeout reports first, and this is the backstop.
+    timeout-minutes: 45
     env:
       PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
       MACOSX_DEPLOYMENT_TARGET: '13.0'
