@@ -121,28 +121,33 @@ A final-version repeat in [PR #105](https://github.com/Leechael/pi-famulus/pull/
 
 Skipped matrices report literal names such as `clippy (${{ matrix.os }})`, not every expanded platform name. Branch protection should require the stable **`extension`** aggregate rather than a conditional matrix name. PR #104 was closed without merging and its remote branch/worktree removed.
 
-## Round 4: overlap whole Cargo test binaries on Unix
+## Round 4: overlap Cargo test binaries on Unix, without overlapping load-sensitive suites
 
-After round 3 the critical path was still a macOS manager clock lane, and the test interval dominated it: `cargo test` runs its ~19 test binaries **one after another**, and `intercom` alone took 100–180s. The suite is wait-bound, not CPU-bound. A local 4-core Linux run of the complete real-clock suite took **6m03s wall for 1m22s user CPU**. `intercom` used **~8s of CPU over 80–104s** at 8 or 16 libtest threads.
+After round 3 the critical path was still a macOS manager clock lane, and the test interval dominated it. `cargo test` runs its ~19 test binaries **one after another**; `intercom` alone took 100–180s. Most binaries are wait-bound, not CPU-bound.
 
 `scripts/cargo-test-parallel.mjs` keeps coverage identical and changes only the scheduling:
 
 - One `cargo test --no-run --message-format=json` with the lane's exact arguments builds every test target. Each executable cargo reports is run from the package root with no filters or skips. There are no doctests because the crate has no library target. Any non-zero exit, signal or spawn error fails the step.
-- Binaries start longest-first, at most `min(4, max(2, cores))` at a time. `intercom` gets `--test-threads=8`, unless `RUST_TEST_THREADS` is set explicitly.
-- The real-time `timing_canary` runs **alone afterwards**, so its wall-clock bounds never compete with other suites.
+- Ordinary binaries start longest-first, at most `min(3, max(2, cores))` at a time, each with libtest's default thread count.
+- **SOLO binaries then run one by one, with nothing else running.** `lifecycle_adversarial` deliberately saturates every CPU. `backpressure` and `timing_canary` assert wall-clock bounds. `tests/backpressure.rs` documents that it was split out of `lifecycle_adversarial` so its latency bound never measures that load. A unit test pins this list to that header.
 - Each binary's output is printed whole when it finishes: collapsed on success and expanded on failure. A per-binary duration table goes to the log and the job summary.
 - Windows keeps plain `cargo test`: its suites take ~77s, and Git Bash start-up is racy under concurrent first launches (`tests/platform.rs`).
 
-Local A/B on the same build and the same 4-core container (seconds of wall time):
+### First attempt failed on darwin-x64, and why
 
-| Lane | `cargo test` | Parallel driver | Parallel driver, intercom ×8 threads |
-|---|---:|---:|---:|
-| real clock | 363 | 185 | **113 / 112** (two runs) |
-| manual clock (`--features test-clock`) | 361 | — | **119** |
+The first version overlapped **every** binary (except `timing_canary`), 4 at a time, and gave `intercom` 8 threads. In [run 41425532771](https://github.com/Leechael/pi-famulus/actions/runs/41425532771), the Linux lanes went from ~272s to **77–87s** of test time and were green. darwin-x64 manual clock went from ~410s to 152s, but **failed** `backpressure::c6_never_reading_watcher_is_bounded_and_isolated` ("big task stalled behind a slow watcher"): 256 MiB had to pass through the daemon within 90s, and it took 92s while sharing 4 slow cores with `lifecycle_adversarial`'s CPU burners and `intercom`.
 
-CPU time was unchanged (user 1m20–1m27s in every run). The same pre-existing failures appeared with and without the driver. These were process-reaping assertions in `lifecycle_adversarial`/`platform`/`timing_canary`, and they fail in this sandbox container, which has no init subreaper, but pass on every CI host. The driver introduced no new failure.
+The test was right and the scheduler was wrong. It had violated the documented isolation contract, so the deadline was not relaxed. History supports the same conclusion. In the 50-run baseline, darwin-x64 package jobs had **3 test failures in 30 runs**, all deadline/readiness assertions (`lifecycle_adversarial` connect, two `intercom` readiness/RPC). darwin-arm64 and Linux had none. darwin-x64 already has the least headroom, so the revised driver puts every CPU-saturating or wall-clock-bounded suite in SOLO and drops the `intercom` thread override. That override barely helped on darwin-x64 (178s → 144s), which shows the host was already CPU-bound.
+
+### Second defect: waiting for EOF instead of process exit
+
+In the same run, the three remaining macOS clock lanes sat in the test step for 29–36 minutes (sequential runs take ~7) until the run was cancelled. The first driver read each binary's output through pipes and finished on `close`, so it waited for **every** holder of the pipe to exit. `cargo test` lets a test inherit its stdio and waits only for the process. A daemon or task a test leaves behind can therefore hold the pipe open without affecting cargo. A reproduction (a binary that exits 0 at once and leaves `sleep 30 &` holding stdout) hangs the first driver past a 12s timeout. The driver now gives each binary an inherited temp-file descriptor and finishes on `exit`, exactly like cargo. A unit test pins the reproduction. Logs of the cancelled jobs had not been published when this was written, so which binary left the descendant is not yet identified.
+
+### Local measurements are distorted in the authoring sandbox
+
+The local container's PID 1 reaps orphaned processes ~1.7s late: a forked orphan stayed a zombie for 1.73s. Every `intercom` fixture waits for its orphaned daemon to disappear, so locally most tests show a fixed ~2s teardown that CI hosts do not have. The same delay causes the local-only process-reaping failures in `lifecycle_adversarial`, `platform` and `timing_canary`, which pass on every CI host. Local timings are therefore not used as evidence of the CI gain. Only CI runs are.
 
 ### Considered and not adopted
 
-- **cargo-nextest**: it needs a downloaded tool, and the custom `harness = false` binaries (`platform`, `resource_bench`) would need `--list --format terse`/`--ignored` support. It also runs one process per test, which changes the semantics of the shared MSYS keeper on Windows.
+- **cargo-nextest**: it needs a downloaded tool, and the custom `harness = false` binaries (`platform`, `resource_bench`) would need `--list --format terse`/`--ignored` support. It runs one process per test, which changes the semantics of the shared MSYS keeper on Windows. It would also need the same SOLO grouping.
 - **[mr-boxington](https://mr-boxington.jdx.dev/) (`mbx`)**: this is a shared, self-pruning local Cargo target cache. Its author notes that its remote cache does not yet consistently beat `Swatinem/rust-cache` on GitHub-hosted runners, and round 3 already had 25/25 exact Rust cache hits. The CI cost is compiling the workspace crate itself and running tests, not dependency restore. It is a reasonable developer-workstation tool, but not a CI change here.

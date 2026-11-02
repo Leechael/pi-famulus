@@ -10,10 +10,13 @@
 // the run. The crate has no library target, so there are no doctests.
 //
 // Coverage is identical to `cargo test`; only scheduling differs:
-// - binaries start longest-first, at most PI_FAMULUS_TEST_JOBS at a time;
-// - intercom (wait-bound, see THREADS) gets more libtest threads;
-// - real-time canaries (SERIAL) run afterwards with the machine to
-//   themselves, so wall-clock assertions never compete with other suites;
+// - ordinary binaries start longest-first, at most PI_FAMULUS_TEST_JOBS at a
+//   time, each with libtest's own default thread count;
+// - SOLO binaries then run one by one with the machine to themselves. They
+//   either load every CPU on purpose (lifecycle_adversarial) or assert
+//   wall-clock bounds that must not measure other suites' load (backpressure,
+//   timing_canary). tests/backpressure.rs was split out for exactly that
+//   reason; overlapping it with anything reintroduces the problem;
 // - each binary's output is buffered and printed whole when it finishes, in
 //   a collapsible group on GitHub Actions, followed by a duration table.
 //
@@ -21,8 +24,8 @@
 // concurrent first launches (see tests/platform.rs), and its suites are short.
 
 import { spawn } from 'node:child_process';
-import { appendFileSync } from 'node:fs';
-import { availableParallelism } from 'node:os';
+import { appendFileSync, closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,15 +46,12 @@ const WEIGHT = {
   build_script: 17,
   startup_retry: 10,
 };
-export const SERIAL = new Set(['timing_canary']);
-// intercom's 200+ tests mostly wait on daemons and deadlines (~8s of CPU
-// over 100-180s of wall clock at libtest's default of one thread per core).
-// More threads overlap those waits. An explicit RUST_TEST_THREADS wins.
-export const THREADS = { intercom: 8 };
+// Never overlapped with anything; see the header.
+export const SOLO = ['lifecycle_adversarial', 'backpressure', 'timing_canary'];
 
 export function defaultJobs(platform = process.platform, cpus = availableParallelism()) {
   if (platform === 'win32') return 1;
-  return Math.max(2, Math.min(4, cpus));
+  return Math.max(2, Math.min(3, cpus));
 }
 
 /** Test executables from `cargo --message-format=json` stdout lines. */
@@ -66,12 +66,12 @@ export function testBinaries(lines) {
   return out;
 }
 
-/** Longest-first parallel batch, then the serial canaries in a stable order. */
+/** Longest-first overlapping batch, then the SOLO binaries in SOLO order. */
 export function schedule(binaries) {
   const weight = b => WEIGHT[b.name] ?? 0;
-  const parallel = binaries.filter(b => !SERIAL.has(b.name)).sort((a, b) => weight(b) - weight(a) || a.name.localeCompare(b.name));
-  const serial = binaries.filter(b => SERIAL.has(b.name)).sort((a, b) => a.name.localeCompare(b.name));
-  return { parallel, serial };
+  const parallel = binaries.filter(b => !SOLO.includes(b.name)).sort((a, b) => weight(b) - weight(a) || a.name.localeCompare(b.name));
+  const solo = SOLO.flatMap(name => binaries.filter(b => b.name === name));
+  return { parallel, solo };
 }
 
 function build(args) {
@@ -87,21 +87,35 @@ function build(args) {
   });
 }
 
-function run(binary) {
+// Like cargo, give each test process inherited file descriptors and wait for
+// the process itself, never for EOF: a daemon or task a test leaves behind
+// can hold its stdout open indefinitely, and must not hang the run.
+const logs = mkdtempSync(join(tmpdir(), 'cargo-test-parallel-'));
+process.on('exit', () => rmSync(logs, { recursive: true, force: true }));
+
+export function run(binary, args = []) {
   return new Promise(resolve => {
     const started = Date.now();
+    const path = join(logs, `${binary.name}-${binary.kind}.log`);
+    const fd = openSync(path, 'w');
     // The environment cargo itself gives a test process at run time.
     const env = { ...process.env, CARGO_MANIFEST_DIR: manager, CARGO_PKG_NAME: 'pi-famulus' };
-    const args = THREADS[binary.name] && !process.env.RUST_TEST_THREADS ? [`--test-threads=${THREADS[binary.name]}`] : [];
-    const child = spawn(binary.executable, args, { cwd: manager, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    const chunks = [];
-    child.stdout.on('data', c => chunks.push(c));
-    child.stderr.on('data', c => chunks.push(c));
-    const finish = (code, signal, error) => resolve({
-      ...binary, code, signal, error, seconds: (Date.now() - started) / 1000, output: Buffer.concat(chunks).toString('utf8'),
-    });
-    child.on('error', error => finish(null, null, error));
-    child.on('close', (code, signal) => finish(code, signal));
+    let child;
+    let done = false;
+    const finish = (code, signal, error) => {
+      if (done) return;
+      done = true;
+      closeSync(fd);
+      resolve({ ...binary, code, signal, error, seconds: (Date.now() - started) / 1000, output: readFileSync(path, 'utf8') });
+    };
+    try {
+      child = spawn(binary.executable, args, { cwd: manager, env, stdio: ['ignore', fd, fd] });
+    } catch (error) {
+      finish(null, null, error);
+      return;
+    }
+    child.once('error', error => finish(null, null, error));
+    child.once('exit', (code, signal) => finish(code, signal));
   });
 }
 
@@ -134,10 +148,10 @@ async function main(args) {
   const jobs = Number(process.env.PI_FAMULUS_TEST_JOBS) || defaultJobs();
   const binaries = await build(args);
   if (binaries.length === 0) throw new Error('cargo reported no test binaries');
-  const { parallel, serial } = schedule(binaries);
-  console.log(`Running ${parallel.length} test binaries, ${jobs} at a time; then ${serial.map(b => b.name).join(', ') || 'nothing'} alone.`);
+  const { parallel, solo } = schedule(binaries);
+  console.log(`Running ${parallel.length} test binaries, ${jobs} at a time; then ${solo.map(b => b.name).join(', ') || 'nothing'} alone, one by one.`);
   const started = Date.now();
-  const results = [...await pool(parallel, jobs, run), ...await pool(serial, 1, run)];
+  const results = [...await pool(parallel, jobs, run), ...await pool(solo, 1, run)];
   const wall = (Date.now() - started) / 1000;
   const failed = results.filter(r => !passed(r));
 
