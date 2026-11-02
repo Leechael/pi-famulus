@@ -130,3 +130,5 @@ export async function observeProcessExit(
     throw error;
   }
 }
+
+// CI scope probe: eval-only change (temporary, not for merge).
