@@ -10,6 +10,27 @@ use crate::common;
 use std::path::Path;
 
 /// An extension (parent) connection on the manager socket.
+/// `Conn::wait_id`, for an answer that needs daemon time to pass (a
+/// write-ack timeout). Manual clock: step the clock 250ms at a time while
+/// waiting, at most 30s of daemon time; the bridge may be restarting, so the
+/// steps are not tied to its maintenance timer. Real clock: plain wait.
+fn wait_id_stepping(fixture: &Fixture, conn: &mut common::Conn, id: &str, real: Duration) -> Option<Value> {
+    if !fixture.manual {
+        return conn.wait_id(id, real);
+    }
+    let mut stepped = 0;
+    loop {
+        if let Some(frame) = conn.wait_id(id, Duration::from_millis(20)) {
+            return Some(frame);
+        }
+        if stepped >= 30_000 {
+            return None;
+        }
+        common::clock_request(&fixture.root.join("manager"), json!({"type":"clock_advance","ms":250}));
+        stepped += 250;
+    }
+}
+
 fn pi_conn(fixture: &Fixture, session: &str) -> common::Conn {
     let mut conn = common::Conn::new(
         UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
@@ -529,17 +550,14 @@ fn a_bridge_reset_finishes_the_in_flight_op_and_answers_queued_ops() {
 
     // The in-flight send finishes (the old runtime's write-ack times out
     // against the undrained carol) and is answered on the same connection.
-    let send = alice
-        .wait_id("s1", Duration::from_secs(20))
+    let send = wait_id_stepping(&fixture, &mut alice, "s1", Duration::from_secs(20))
         .expect("in-flight send answered");
     assert_eq!(send["ok"], true, "{send}");
     // Then every queued op gets a deterministic, ordered reset answer.
-    let r2 = alice
-        .wait_id("r2", Duration::from_secs(15))
+    let r2 = wait_id_stepping(&fixture, &mut alice, "r2", Duration::from_secs(15))
         .expect("queued op r2 answered promptly");
     assert_eq!(r2["error"]["code"], "E_INTERCOM_RESET", "{r2}");
-    let r3 = alice
-        .wait_id("r3", Duration::from_secs(15))
+    let r3 = wait_id_stepping(&fixture, &mut alice, "r3", Duration::from_secs(15))
         .expect("queued op r3 answered promptly");
     assert_eq!(r3["error"]["code"], "E_INTERCOM_RESET", "{r3}");
     // Wire order across the reset: r2's answer precedes r3's (wait_id

@@ -178,7 +178,7 @@ impl Drop for Host {
 }
 
 fn wait_row(fixture: &Fixture, id: &str, predicate: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         if let Some(row) = fixture
             .sessions()
@@ -188,10 +188,10 @@ fn wait_row(fixture: &Fixture, id: &str, predicate: impl Fn(&Value) -> bool) -> 
             return row;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "Codex cached row {id} never reflected host event"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -339,7 +339,7 @@ fn codex_new_connection_completion_cannot_read_an_old_generation_route() {
         .unwrap();
     let mut observer = fixture.plugin("reconnect-observer", "busy");
     observer.ok(json!({"op":"subscribe_idle","to":"codex/thread-first"}));
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         if host
             .log
@@ -351,10 +351,10 @@ fn codex_new_connection_completion_cannot_read_an_old_generation_route() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "persistent host never reconnected for fresh idle observation"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     }
     host.notice(
         "turn/completed",
@@ -387,16 +387,14 @@ fn codex_fresh_busy_blocks_cached_idle_until_a_real_fresh_idle_observation() {
     host.start(&mut fixture);
     let mut watcher = fixture.plugin("watcher", "busy");
     let subscribed = watcher.ok(json!({"op":"subscribe_idle","to":"codex/thread-first"}));
-    let deadline = Instant::now() + Duration::from_millis(1100);
-    while Instant::now() < deadline {
+    fixture.during(1100, || {
         assert_eq!(
             watcher.ok(json!({"op":"idle_status","subscription_id":subscribed["subscription_id"]}))
                 ["status"],
             "subscribed",
             "cached idle overrode fresh active native turn"
         );
-        thread::sleep(Duration::from_millis(20));
-    }
+    });
     host.model.lock().unwrap().reads.insert(
         "thread-first".into(),
         fresh("thread-first", "idle", json!([])),
@@ -405,6 +403,7 @@ fn codex_fresh_busy_blocks_cached_idle_until_a_real_fresh_idle_observation() {
         "thread/status/changed",
         json!({"threadId":"thread-first","status":{"type":"idle"}}),
     );
+    fixture.let_pass(IDLE_SETTLED_MS);
     let notice = watcher.event("idle_notice");
     assert_eq!(notice["status"], "idle");
     assert_eq!(notice["subscription_id"], subscribed["subscription_id"]);
@@ -427,16 +426,14 @@ fn codex_approval_requests_are_passive_needs_user_until_resolved() {
             .any(|(_, r)| r["id"] == "approval-1"),
         "native approval was automatically answered"
     );
-    let deadline = Instant::now() + Duration::from_millis(1100);
-    while Instant::now() < deadline {
+    fixture.during(1100, || {
         assert_eq!(
             watcher.ok(json!({"op":"idle_status","subscription_id":subscribed["subscription_id"]}))
                 ["status"],
             "subscribed",
             "fresh idle thread/read ignored outstanding approval"
         );
-        thread::sleep(Duration::from_millis(20));
-    }
+    });
     host.notice(
         "serverRequest/resolved",
         json!({"threadId":"thread-first","requestId":"approval-1"}),
@@ -444,6 +441,7 @@ fn codex_approval_requests_are_passive_needs_user_until_resolved() {
     wait_row(&fixture, "codex/thread-first", |row| {
         row["status"] == "idle"
     });
+    fixture.let_pass(IDLE_SETTLED_MS);
     assert_eq!(watcher.event("idle_notice")["status"], "idle");
 }
 
@@ -458,16 +456,14 @@ fn codex_fresh_read_identity_mismatch_cannot_complete_idle_watch_or_claim_exit()
     host.start(&mut fixture);
     let mut watcher = fixture.plugin("watcher", "busy");
     let subscribed = watcher.ok(json!({"op":"subscribe_idle","to":"codex/thread-first"}));
-    let deadline = Instant::now() + Duration::from_millis(1100);
-    while Instant::now() < deadline {
+    fixture.during(1100, || {
         assert_eq!(
             watcher.ok(json!({"op":"idle_status","subscription_id":subscribed["subscription_id"]}))
                 ["status"],
             "subscribed",
             "unavailable identity observation completed an idle watch"
         );
-        thread::sleep(Duration::from_millis(20));
-    }
+    });
     watcher.no_event();
     assert!(
         host.log
@@ -482,7 +478,8 @@ fn codex_fresh_read_identity_mismatch_cannot_complete_idle_watch_or_claim_exit()
         "thread-first".into(),
         fresh("thread-first", "idle", json!([])),
     );
-    let notice = watcher.event("idle_notice");
+    // A fresh re-observation, then the settle, on the daemon clock.
+    let notice = watcher.event_stepping(&fixture, "idle_notice", 30_000);
     assert_eq!(notice["subscription_id"], subscribed["subscription_id"]);
     assert_eq!(notice["status"], "idle");
 }

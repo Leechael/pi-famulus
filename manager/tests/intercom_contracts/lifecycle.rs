@@ -43,21 +43,9 @@ fn wait_for(what: &str, fixture: &Fixture, budget: Duration, ready: impl Fn() ->
 }
 
 /// Wait for the manager `pid` to exit after its last client left: past the
-/// 5s idle grace on either clock.
+/// 5s idle grace (and the shutdown grace) on either clock.
 fn wait_idle_exit(what: &str, fixture: &Fixture, pid: u32) {
-    if !fixture.manual {
-        return wait_for(what, fixture, Duration::from_secs(10), || !alive(pid));
-    }
-    let deadline = Instant::now() + TIMEOUT;
-    while alive(pid) {
-        assert!(Instant::now() < deadline, "{what}: {}", fixture.manager_log());
-        // The socket disappears with the manager; a failed step means it left.
-        if let Ok(stream) = UnixStream::connect(fixture.root.join("manager/manager.sock")) {
-            let mut conn = common::Conn::new(stream);
-            let _ = conn.try_request(json!({"type":"clock_advance","ms":250}), Duration::from_secs(1));
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    fixture.wait_exit(pid, Duration::from_secs(10), what);
 }
 
 fn alive(pid: u32) -> bool {

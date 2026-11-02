@@ -644,9 +644,17 @@ pub async fn start(rt: &Shared) -> Result<(), String> {
         let rt2 = rt.clone();
         let task = tokio::spawn(async move {
             let mut stop = rt2.stop.subscribe();
-            let mut tick = tokio::time::interval(Duration::from_secs(3));
+            // Scan cadence on the daemon clock (simulated under the test
+            // clock; tokio's sleep otherwise). First scan at once, as an
+            // interval's first tick; then every period after the last.
+            let mut first = true;
             loop {
-                tokio::select! {_=stop.changed()=>break,_=tick.tick()=>{}}
+                if !first {
+                    tokio::select! {_=stop.changed()=>break,_=rt2.clock.sleep("intercom_native_scan",Duration::from_secs(3))=>{}}
+                } else if *stop.borrow() {
+                    break;
+                }
+                first = false;
                 let mut rows = Vec::new();
                 if let Ok(files) = std::fs::read_dir(&dir) {
                     for entry in files.take(4096).flatten() {

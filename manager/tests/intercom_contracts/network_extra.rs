@@ -30,7 +30,7 @@ fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
     );
     let mut manager = manager_status_connection(&fixture);
     let mut wait_status = |expected: &str, error: Option<&str>| {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = fixture.deadline(TIMEOUT);
         loop {
             let status = manager.request_ok(json!({"type":"status"}))["messaging"].clone();
             if status["state"] == expected
@@ -42,27 +42,27 @@ fn hosted_manager_reports_latest_relay_error_and_clears_it_after_reconnect() {
                 return status;
             }
             assert!(
-                Instant::now() < deadline,
+                deadline.alive(),
                 "unexpected messaging status: {status}"
             );
-            thread::sleep(Duration::from_millis(10));
+            fixture.tick_within(&deadline);
         }
     };
     wait_status("disconnected", Some("fixture relay temporarily offline"));
     let mut peer = Peer::new(UnixStream::connect(&fixture.sock).unwrap());
     // Between two refused attempts the report carries the error and the next
     // attempt; while an attempt is in flight no retry is scheduled.
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     let report = loop {
         let report = peer.call(json!({"op":"status"}))["report"].clone();
         if report["relay_retry_at"].as_u64().is_some() {
             break report;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "no retry was ever scheduled: {report}"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     };
     assert!(
         report["relay_error"]
@@ -131,7 +131,7 @@ fn hosted_authentication_failure_explains_explicit_enrollment() {
     start_relay_options_env(&mut fixture, &relay, "", &[], &[]);
     relay.request("_fixture_upgrade_attempt");
     let mut manager = manager_status_connection(&fixture);
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let status = manager.request_ok(json!({"type":"status"}))["messaging"].clone();
         if status["error"].as_str().unwrap_or("").contains("401") {
@@ -145,8 +145,8 @@ fn hosted_authentication_failure_explains_explicit_enrollment() {
             );
             break;
         }
-        assert!(Instant::now() < deadline, "{status}");
-        thread::sleep(Duration::from_millis(10));
+        assert!(deadline.alive(), "{status}");
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -380,17 +380,17 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
     );
     fixture.wait_session("claude/namespace-anchor");
     target.remove_registry(&fixture);
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let rows = fixture.sessions();
         if !rows.iter().any(|row| row["id"] == "claude/native-fixture") {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "removed native registry entry remained in the actual directory cache"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
     assert!(target.is_alive());
     let metadata = fs::symlink_metadata(&target.path).unwrap();
@@ -646,7 +646,7 @@ fn uncertain_incoming_injection_late_read_proves_delivery_and_dedup_survives_ret
     relay.outgoing.send(frame.clone()).unwrap();
     let mut prefix = [0u8; 1];
     target.reader.get_mut().read_exact(&mut prefix).unwrap();
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let state = common::clock_request(
             &fixture.root.join("manager"),
@@ -660,10 +660,10 @@ fn uncertain_incoming_injection_late_read_proves_delivery_and_dedup_survives_ret
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "injection write acknowledgement timer never armed: {state}"
         );
-        thread::sleep(Duration::from_millis(5));
+        fixture.tick_within(&deadline);
     }
     // Expire only the caller's acknowledgement wait. The transport's physical
     // write deadline stays on real time so it can finish the complete frame.
@@ -1346,17 +1346,17 @@ fn native_remote_alias_policy_refuses_before_body_and_directory_withdrawal_retir
         .root
         .join(".claude/sessions")
         .join(format!("{}.json", alias["pid"].as_u64().unwrap()));
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     while socket.exists()
         || registry.exists()
         || common::pid_alive(alias["pid"].as_u64().unwrap() as u32)
     {
         fixture.sessions();
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "withdrawn remote session retained its native alias publication/helper"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
 }
 

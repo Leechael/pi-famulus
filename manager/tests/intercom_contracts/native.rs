@@ -177,6 +177,25 @@ impl ClaudePeer {
             .unwrap_or_else(|error| panic!("native Claude frame {phase}: {error:?}"))
     }
 
+    /// `frame`, for one that needs daemon time to pass (scan, settle).
+    /// Manual clock: step 250ms ticks while waiting, at most 30s of daemon
+    /// time. Real clock: plain `frame`.
+    pub(super) fn frame_stepping(&self, fixture: &Fixture) -> Value {
+        if !fixture.manual {
+            return self.frame();
+        }
+        let mut stepped = 0;
+        loop {
+            assert!(common::pid_alive(self.process.0.id()));
+            if let Ok(frame) = self.frames.recv_timeout(Duration::from_millis(20)) {
+                return frame;
+            }
+            assert!(stepped < 30_000, "no native Claude frame within {stepped}ms of daemon time");
+            fixture.let_pass(250);
+            stepped += 250;
+        }
+    }
+
     pub(super) fn no_frame(&self) {
         match self.frames.recv_timeout(Duration::from_millis(150)) {
             Err(mpsc::RecvTimeoutError::Timeout) => (),
@@ -244,14 +263,14 @@ pub(super) fn native_user(peer: &ClaudePeer, id: &str, body: &str) -> Value {
 }
 
 fn await_session(fixture: &Fixture, id: &str) {
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     while !fixture.sessions().iter().any(|s| s["id"] == id) {
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "{id} not discovered: {}",
             fixture.log()
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -301,7 +320,7 @@ fn native_aliases_for_two_pi_sessions_with_one_source_pid_have_distinct_live_pro
     let _one = fixture.plugin("one", "busy");
     let _two = fixture.plugin("two", "busy");
     let directory = fixture.root.join(".claude/sessions");
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     let entries = loop {
         let entries: Vec<Value> = fs::read_dir(&directory)
             .into_iter()
@@ -315,11 +334,11 @@ fn native_aliases_for_two_pi_sessions_with_one_source_pid_have_distinct_live_pro
             break entries;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "two Pi native aliases not published: {}",
             fixture.log()
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     };
     assert_ne!(
         entries[0]["pid"], entries[1]["pid"],
@@ -362,7 +381,7 @@ fn native_terminal_receipt_retries_after_pi_origin_reconnect() {
     drop(sender);
     fixture.wait_absent("pi/sender");
     native.receipt(&user, "denied");
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let status = super::network::tool(
             address,
@@ -374,10 +393,10 @@ fn native_terminal_receipt_retries_after_pi_origin_reconnect() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "native terminal not observed before origin reconnect"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     }
     let mut sender = fixture.plugin("sender", "busy");
     native.receipt(&user, "denied");
@@ -395,7 +414,7 @@ fn exec_upgrade_restarts_the_bridge_from_its_configuration_and_reaps_predecessor
     let pid = fixture.daemon_pid();
     let _plugin = fixture.plugin("before-upgrade", "busy");
     let directory = fixture.root.join(".claude/sessions");
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     let old_alias = loop {
         let aliases: Vec<Value> = fs::read_dir(&directory)
             .into_iter()
@@ -409,10 +428,10 @@ fn exec_upgrade_restarts_the_bridge_from_its_configuration_and_reaps_predecessor
             break alias;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "alias before upgrade not published"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     };
     let output = common::run_cli(
         &fixture.root.join("manager"),
@@ -432,22 +451,22 @@ fn exec_upgrade_restarts_the_bridge_from_its_configuration_and_reaps_predecessor
     );
     assert_eq!(fixture.daemon_pid(), pid);
     let old_pid = old_alias["pid"].as_u64().unwrap() as u32;
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     while common::pid_alive(old_pid) {
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "old alias process survived exec upgrade: {old_alias}"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     while UnixStream::connect(&fixture.sock).is_err() {
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "intercom socket did not return after exec upgrade: {}",
             fixture.log()
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
     let mut sender = fixture.plugin("post-upgrade-sender", "busy");
     let mut target = fixture.plugin("post-upgrade-target", "busy");

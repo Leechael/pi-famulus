@@ -107,7 +107,7 @@ fn remote_idle_watches_survive_reconnect_and_notices_keep_original_subscription_
         "subscribed",
         "relay loss must not terminate an already acknowledged remote watch"
     );
-    relay.request("register");
+    relay.request_stepping(&fixture, "register");
     fixture.wait_session("pi/remote");
     let fresh = watcher.ok(json!({"op":"subscribe_idle","to":"pi/remote"}));
     let current = relay.request("idle_subscribe");
@@ -205,18 +205,33 @@ fn remote_forwarded_idle_subscribe_and_cancel_require_matching_authenticated_ori
     assert_eq!(relay.request("idle_subscribe")["id"], "control-subscribe");
     target.register("local-target", "idle", &["read_receipts", "idle_state_v1"]);
     let deadline = Instant::now() + TIMEOUT;
+    let check = |message: &Value| {
+        if message["type"] != "idle_notice" {
+            return false;
+        }
+        assert_ne!(
+            message["subscription_id"], id,
+            "cancelled remote watch later notified its former owner"
+        );
+        if message["subscription_id"] == control {
+            assert_eq!(message["status"], "idle");
+            return true;
+        }
+        false
+    };
+    if fixture.manual {
+        // The settle plus the 500ms quiet window, stepped; every frame sent
+        // in it is checked up to the ordered snapshot barrier.
+        let frames = relay.frames_through(&fixture, IDLE_SETTLED_MS + 500);
+        let settled = frames.iter().filter(|frame| check(frame)).count();
+        assert!(settled > 0, "uncancelled control watch on the same target never settled");
+        return;
+    }
     let mut settled_at = None;
     while settled_at.is_none_or(|at: Instant| at.elapsed() < Duration::from_millis(500)) {
         let message = relay.requests.recv_timeout(Duration::from_millis(50)).ok();
-        if let Some(message) = message.filter(|message| message["type"] == "idle_notice") {
-            assert_ne!(
-                message["subscription_id"], id,
-                "cancelled remote watch later notified its former owner"
-            );
-            if message["subscription_id"] == control {
-                assert_eq!(message["status"], "idle");
-                settled_at = Some(Instant::now());
-            }
+        if message.is_some_and(|message| check(&message)) {
+            settled_at = Some(Instant::now());
         }
         assert!(
             settled_at.is_some() || Instant::now() < deadline,
