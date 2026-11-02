@@ -145,7 +145,11 @@ export function run(binary, args = [], timeoutS = TIMEOUT_S) {
     timer = setTimeout(() => {
       timedOut = true;
       diagnostics = snapshot(child.pid);
+      // Print now: if the process cannot be reaped, finish() may come late.
+      process.stdout.write(`\n===== ${binary.name}: timed out after ${timeoutS}s; output so far:\n${readFileSync(path, 'utf8')}\n${diagnostics}\n`);
       child.kill('SIGKILL');
+      // A process stuck in the kernel may never report exit; do not wait on it.
+      setTimeout(() => finish(null, 'SIGKILL'), 30_000).unref();
     }, timeoutS * 1000);
     child.once('error', error => finish(null, null, error));
     child.once('exit', (code, signal) => finish(code, signal));
