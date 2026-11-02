@@ -41,6 +41,75 @@ fn wait_for(what: &str, fixture: &Fixture, budget: Duration, ready: impl Fn() ->
     }
 }
 
+/// The daemon's timer clock for these lifecycle contracts: simulated under
+/// `--features test-clock` (the CI suite), real otherwise. Every wait below
+/// is bounded by a daemon timer on that clock: the 5s `idle` grace and the
+/// Codex adapter's 1s `codex_cache` maintenance (its 5s retry is measured in
+/// the same clock's time).
+fn clock_env() -> &'static [(&'static str, &'static str)] {
+    if common::MANUAL_CLOCK {
+        &[("PI_FAMULUS_TEST_CLOCK", "manual")]
+    } else {
+        &[]
+    }
+}
+
+fn with_clock<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    env.iter().copied().chain(clock_env().iter().copied()).collect()
+}
+
+/// Wait until intercom's 250ms maintenance timer is armed again on the
+/// manual clock, i.e. the daemon has finished reacting to the last step.
+fn maintenance_settled(fixture: &Fixture) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let state = common::clock_request(&fixture.root.join("manager"), json!({"type":"clock_status"}));
+        if state["pending"].as_array().is_some_and(|timers| {
+            timers.iter().any(|t| t["label"] == "intercom_maintenance" && t["due_in_ms"] == 250)
+        }) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "intercom maintenance did not re-arm: {state}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Let `ms` of daemon time pass. Manual clock: step it in 250ms
+/// maintenance ticks, each settled before the next, so every timer due in
+/// the window fires in order and its effects (real I/O) can land. Real
+/// clock: sleep.
+fn let_pass(fixture: &Fixture, ms: u64) {
+    if !common::MANUAL_CLOCK {
+        thread::sleep(Duration::from_millis(ms));
+        return;
+    }
+    let mut left = ms;
+    while left > 0 {
+        let step = left.min(250);
+        common::clock_request(&fixture.root.join("manager"), json!({"type":"clock_advance","ms":step}));
+        maintenance_settled(fixture);
+        left -= step;
+    }
+}
+
+/// Wait for the manager `pid` to exit after its last client left: past the
+/// 5s idle grace on either clock.
+fn wait_idle_exit(what: &str, fixture: &Fixture, pid: u32) {
+    if !common::MANUAL_CLOCK {
+        return wait_for(what, fixture, Duration::from_secs(10), || !alive(pid));
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "{what}: {}", fixture.manager_log());
+        // The socket disappears with the manager; a failed step means it left.
+        if let Ok(stream) = UnixStream::connect(fixture.root.join("manager/manager.sock")) {
+            let mut conn = common::Conn::new(stream);
+            let _ = conn.try_request(json!({"type":"clock_advance","ms":250}), Duration::from_secs(1));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
@@ -88,13 +157,15 @@ fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() 
     let mcp = network::vacant_address().to_string();
     let codex = codex_host(&fixture);
     fixture.config(&format!("mcp_listen = '{mcp}'\n"));
-    spawn_self_managed(&mut fixture, &[("CODEX_APP_SERVER_SOCK", &codex.path)]);
+    spawn_self_managed(&mut fixture, &with_clock(&[("CODEX_APP_SERVER_SOCK", &codex.path)]));
     let pi = pi_session(&fixture, "pi-session");
     wait_for("the bridge runs without any lease", &fixture, TIMEOUT, || {
         UnixStream::connect(&fixture.sock).is_ok()
     });
     let pid = fixture.daemon_pid();
-    thread::sleep(Duration::from_secs(2));
+    // Two Codex maintenance periods in which a self-managed manager must not
+    // start MCP or attach to the app-server.
+    let_pass(&fixture, 2000);
     assert!(!mcp_up(&mcp), "a self-managed manager served MCP");
     assert_eq!(
         codex.accepted.load(Ordering::SeqCst),
@@ -104,15 +175,16 @@ fn self_managed_manager_bridges_pi_without_mcp_or_codex_and_lives_only_for_pi() 
     drop(pi);
     let mut daemon = fixture.child.take().unwrap();
     assert_eq!(daemon.id(), pid);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while daemon.try_wait().unwrap().is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the self-managed manager outlived its last pi session: {}",
-            fixture.manager_log()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    // Reap our own child as it exits, so a zombie never reads as alive.
+    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = reaped.clone();
+    let reaper = thread::spawn(move || {
+        let _ = daemon.wait();
+        flag.store(true, Ordering::SeqCst);
+    });
+    wait_idle_exit("the self-managed manager outlived its last pi session", &fixture, pid);
+    reaper.join().unwrap();
+    assert!(reaped.load(Ordering::SeqCst));
     assert!(
         UnixStream::connect(&fixture.sock).is_err(),
         "the bridge outlived its manager"
@@ -124,14 +196,15 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
     let mut fixture = Fixture::new();
     let mcp = network::vacant_address().to_string();
     let codex = codex_host(&fixture);
-    let env = [("CODEX_APP_SERVER_SOCK", codex.path.as_str())];
+    let env = with_clock(&[("CODEX_APP_SERVER_SOCK", codex.path.as_str())]);
     fixture.start_with(&["--mcp-listen", &mcp], &env);
     let pid = fixture.daemon_pid();
     wait_for("Supervised MCP listens", &fixture, TIMEOUT, || mcp_up(&mcp));
     wait_for("Supervised Codex adapter attaches", &fixture, TIMEOUT, || {
         codex.open.load(Ordering::SeqCst) > 0
     });
-    thread::sleep(Duration::from_secs(7));
+    // Past the 5s idle grace with no pi: supervision alone keeps it alive.
+    let_pass(&fixture, 7000);
     assert!(alive(pid), "a supervised manager idled out without pi");
     let pi = pi_session(&fixture, "pi-session");
     let mut serve = fixture.child.take().unwrap();
@@ -142,7 +215,8 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
         codex.open.load(Ordering::SeqCst) == 0
     });
     let demoted = codex.accepted.load(Ordering::SeqCst);
-    thread::sleep(Duration::from_secs(7));
+    // Seven Codex maintenance periods (and past its 5s retry) after demotion.
+    let_pass(&fixture, 7000);
     assert_eq!(
         codex.accepted.load(Ordering::SeqCst),
         demoted,
@@ -162,12 +236,7 @@ fn serve_supervises_until_it_exits_then_the_manager_returns_to_pi_lifetime() {
     fixture.release_lease();
     wait_for("the second lease demotes again", &fixture, TIMEOUT, || !mcp_up(&mcp));
     drop(pi);
-    wait_for(
-        "the manager outlived its last pi after the lease ended",
-        &fixture,
-        Duration::from_secs(10),
-        || !alive(pid),
-    );
+    wait_idle_exit("the manager outlived its last pi after the lease ended", &fixture, pid);
 }
 
 #[test]
