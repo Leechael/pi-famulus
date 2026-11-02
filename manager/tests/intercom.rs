@@ -67,12 +67,16 @@ struct Fixture {
     stepped_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// A wait budget, the same on both clocks: the condition must hold within
-/// `budget` of wall time, and the daemon clock may move by at most `budget`
-/// while waiting (see `Fixture::tick_within`). On the real clock the two are
-/// one; on the manual clock a timer longer than the budget never fires, and
-/// real work (processes, I/O) still gets the wall time it always had.
+/// A wait budget, the same on both clocks. The condition may take up to
+/// `budget` of daemon time and up to `budget` of wall time: the daemon clock
+/// is stepped (`Fixture::tick_within`) only while its budget lasts, so a
+/// timer longer than the budget never fires, and the wait goes on while
+/// either budget has room, so slow hosts (each stepped tick costs real round
+/// trips) and real work (processes, I/O) both get their time. A 60s wall
+/// backstop ends a wait that can never finish. On the real clock the two
+/// budgets are one.
 struct Deadline {
+    manual: bool,
     stepped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     start_virtual: u64,
     start: Instant,
@@ -81,7 +85,9 @@ struct Deadline {
 
 impl Deadline {
     fn alive(&self) -> bool {
-        self.start.elapsed() < self.budget
+        let wall = self.start.elapsed();
+        wall < self.budget
+            || (self.manual && self.virtual_left() && wall < Duration::from_secs(60))
     }
 
     fn virtual_left(&self) -> bool {
@@ -429,6 +435,7 @@ impl Fixture {
     /// A wait budget in daemon time (see `Deadline`).
     fn deadline(&self, budget: Duration) -> Deadline {
         Deadline {
+            manual: self.manual,
             stepped: self.stepped_ms.clone(),
             start_virtual: self.stepped_ms.load(Ordering::Relaxed),
             start: Instant::now(),
