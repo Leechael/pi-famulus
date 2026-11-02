@@ -751,7 +751,7 @@ fn d6_connection_inside_grace_cancels_shutdown() {
     assert_eq!(b.hello_cli()["ok"], true);
     // Well past the original deadline (5s) plus the 2s kill grace.
     home.advance_now(5000);
-    settle();
+    home.settle();
     assert!(daemon.try_wait().unwrap().is_none(), "shutdown was not cancelled");
     assert!(pid_running(pid), "task killed although a client reconnected");
     assert_eq!(b.status_of(&id).as_deref(), Some("running"));
@@ -1655,7 +1655,7 @@ fn s3_session_survives_crash_while_others_connected_and_reattaches() {
     );
     drop(cli);
     home.advance_now(6000); // longer than the 5s idle grace
-    settle();
+    home.settle();
     assert!(pid_running(pid), "task of a crashed session killed while another pi is connected");
 
     let mut resumed = home.connect();
@@ -2075,7 +2075,13 @@ fn t12_stop_terminal_task_is_noop() {
     let (id, _) = c.start("exit 4");
     assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "failed");
     c.request_ok(json!({"type":"stop","task_id":id}));
-    std::thread::sleep(MS(300));
+    // Past the kill grace a stop could have armed: the record must not move.
+    if home.manual {
+        home.advance_now(3000);
+        home.settle();
+    } else {
+        std::thread::sleep(MS(300));
+    }
     let t = c.task(&id).unwrap();
     assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("failed"), Some(4)));
     let r = c.request(json!({"type":"stop","task_id":"sh_00000000"}));
@@ -2187,7 +2193,13 @@ fn d16_extension_cannot_shutdown() {
     let r = c.request_ok(json!({"type":"status"}));
     let s = &r["sessions"][0];
     assert_eq!((s["session_id"].as_str(), s["cwd"].as_str()), (Some("sess-a"), Some("/tmp/d16-cwd")), "{r}");
-    std::thread::sleep(MS(500));
+    // Past any shutdown grace a refused request could still have armed.
+    if home.manual {
+        home.advance_now(3000);
+        home.settle();
+    } else {
+        std::thread::sleep(MS(500));
+    }
     assert!(d.try_wait().unwrap().is_none(), "extension shut the manager down");
 }
 

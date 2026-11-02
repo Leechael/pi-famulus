@@ -98,9 +98,9 @@ fn a_warm_agent_keeps_the_daemon_alive_after_its_parent_disconnects() {
     drop(conn);
     // Past the 5s idle grace on the daemon's own clock: a real sleep never
     // moves the manual clock, so under test-clock it proved nothing.
-    settle();
+    home.settle();
     home.advance_now(6_000);
-    settle();
+    home.settle();
     let mut again = home.connect();
     let hello = again.hello_cli();
     assert_eq!(hello["ok"], json!(true), "daemon exited while a subagent was warm: {hello}");

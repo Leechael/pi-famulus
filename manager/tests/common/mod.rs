@@ -97,9 +97,8 @@ pub fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Opt
     }
 }
 
-/// A short real pause after a manual-clock step: timers that fired have
-/// their effects (signals, exits, records) under way by the time it returns,
-/// so a negative assertion that follows is meaningful.
+/// Real clock: a short pause, so effects of whatever just happened are under
+/// way before a negative assertion. (On the manual clock use `Home::settle`.)
 pub fn settle() {
     std::thread::sleep(Duration::from_millis(150));
 }
@@ -237,6 +236,24 @@ impl Home {
             ""
         }
     }
+    /// After a clock step: every timer the step made due has returned from
+    /// its sleep (a sleeper is listed until its future completes), so the
+    /// code that follows each timer is running before a negative assertion.
+    /// A condition, not a duration. Real clock: the short `settle` pause.
+    pub fn settle(&self) {
+        if !self.manual {
+            return settle();
+        }
+        let done = poll_true(Duration::from_secs(10), || {
+            clock_request(&self.path, json!({"type":"clock_status"}))["pending"]
+                .as_array()
+                .is_some_and(|p| p.iter().all(|t| t["due_in_ms"].as_u64().unwrap_or(0) > 0))
+        });
+        assert!(done, "fired timers never returned after a clock step");
+        // One more round trip: the code right after each timer runs on.
+        let _ = clock_request(&self.path, json!({"type":"clock_status"}));
+    }
+
     /// Advance the daemon's `label` timer by `ms`. Manual clock: wait until
     /// a timer with that label is armed (so the step cannot race ahead of
     /// the daemon), then advance. Real clock: just sleep `ms`.

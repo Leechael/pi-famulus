@@ -192,7 +192,7 @@ fn g7_staggered_disconnects_still_reach_idle_shutdown() {
     drop(a);
     // Longer than the 5s grace while b is still connected.
     home.advance_now(6000);
-    settle();
+    home.settle();
     assert!(d.try_wait().unwrap().is_none(), "shut down while a client was connected");
     drop(b);
     home.advance("idle", 5000);

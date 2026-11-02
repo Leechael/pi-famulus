@@ -547,7 +547,7 @@ fn u12_idle_rule_waits_for_clients_after_an_upgrade() {
     drop(c);
     // No client for longer than the idle grace.
     home.advance_now(6_000);
-    settle();
+    home.settle();
     assert!(pid_alive(pid), "task killed by the idle rule during the handover grace");
     assert!(wait_child(&mut d, Duration::from_millis(10)).is_none(), "daemon exited during the handover grace");
     if home.manual {

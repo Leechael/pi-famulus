@@ -243,7 +243,7 @@ fn s3_crashed_session_survives_and_reattaches() {
     });
     assert!(ok, "crashed session must show disconnected");
     home.advance_now(6000);
-    settle();
+    home.settle();
     assert!(pid_running(pid), "task of a crashed session killed while another client is connected");
     let r = keeper.request(json!({"type":"stop","task_id":id}));
     assert_eq!(r["error"]["code"], "E_FORBIDDEN", "{r}");
@@ -381,10 +381,18 @@ fn t6c_leftover_outlives_its_command_until_shutdown() {
     let left = wait_for_pids(&mut c, &id, 1)[0];
     let t = c.wait_terminal(&id, S(10)).unwrap();
     assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("completed"), Some(0)), "{t}");
-    let deadline = Instant::now() + MS(1500);
-    while Instant::now() < deadline {
+    if home.manual {
+        // Step the daemon's leftover-group polls through the same window
+        // instead of waiting it out; then every fired timer has run.
+        home.advance_now(1500);
+        home.settle();
         assert!(pid_running(left), "the leftover child died with its command");
-        std::thread::sleep(MS(100));
+    } else {
+        let deadline = Instant::now() + MS(1500);
+        while Instant::now() < deadline {
+            assert!(pid_running(left), "the leftover child died with its command");
+            std::thread::sleep(MS(100));
+        }
     }
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
@@ -483,7 +491,13 @@ fn t12_stop_terminal_task_is_noop() {
     let (id, _) = c.start(&kit(&["exit", "4"]));
     assert_eq!(c.wait_terminal(&id, S(10)).unwrap()["status"], "failed");
     c.request_ok(json!({"type":"stop","task_id":id}));
-    std::thread::sleep(MS(300));
+    // Past the kill grace a stop could have armed: the record must not move.
+    if home.manual {
+        home.advance_now(3000);
+        home.settle();
+    } else {
+        std::thread::sleep(MS(300));
+    }
     let t = c.task(&id).unwrap();
     assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("failed"), Some(4)));
     let r = c.request(json!({"type":"stop","task_id":"sh_00000000"}));
@@ -885,7 +899,7 @@ fn d6_hello_inside_grace_cancels_shutdown() {
     let mut b = home.connect();
     assert_eq!(b.hello_cli()["ok"], true);
     home.advance_now(5000);
-    settle();
+    home.settle();
     assert!(daemon.try_wait().unwrap().is_none(), "shutdown was not cancelled");
     assert!(pid_running(pid));
     assert_eq!(b.status_of(&id).as_deref(), Some("running"));
@@ -948,7 +962,13 @@ fn d16_extension_cannot_shutdown() {
     let mut c = ext(&home, "sess-a");
     assert_eq!(c.request(json!({"type":"shutdown"}))["error"]["code"], "E_FORBIDDEN");
     assert_eq!(c.request(json!({"type":"status"}))["ok"], true);
-    std::thread::sleep(MS(300));
+    // Past any shutdown grace a refused request could still have armed.
+    if home.manual {
+        home.advance_now(3000);
+        home.settle();
+    } else {
+        std::thread::sleep(MS(300));
+    }
     assert!(d.try_wait().unwrap().is_none(), "extension shut the manager down");
 }
 
