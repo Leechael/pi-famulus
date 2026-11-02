@@ -520,12 +520,14 @@ test('Windows dependency guard rejects VC and Universal CRT imports', () => {
 
 test('workflow literal security, release graph and host/target contracts', () => {
   const native = workflow('native-packages');
-  for (const p of PLATFORMS) {
-    assert.ok(native.includes(`platform: ${p.id}`), p.id);
-    assert.ok(native.includes(`target: ${p.target}`), p.target);
-  }
-  for (const runner of ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15', 'windows-latest']) {
-    assert.ok(native.includes(`runner: ${runner}\n`), runner);
+  // Matrix rows come from one list; it must name exactly the released targets.
+  const rows = JSON.parse(readFileSync(new URL('../.github/native-platforms.json', import.meta.url), 'utf8'));
+  assert.deepEqual(rows.map(r => [r.platform, r.target]), PLATFORMS.map(p => [p.id, p.target]));
+  assert.deepEqual(rows.map(r => r.runner), ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15', 'windows-latest', 'windows-11-arm']);
+  for (const name of ['manager-tests', 'native']) {
+    const block = native.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [\\w-]+:|(?![\\s\\S]))`, 'm'))[1];
+    assert.match(block, /matrix: \$\{\{ fromJSON\(needs\.platforms\.outputs\.matrix\) \}\}/, name);
+    assert.match(block, /runs-on: \$\{\{ matrix\.runner \}\}/, name);
   }
   // One complete suite per platform on the simulated clock (no real-clock rerun).
   assert.ok(native.includes('cargo test --locked --features test-clock\n'));

@@ -21,7 +21,7 @@ on:
         type: boolean
         default: true
       all-architectures:
-        description: Run the manager suites on both architectures of every OS (false runs one per OS)
+        description: Run manager suites and packages on both architectures of every OS (false runs one per OS)
         type: boolean
         default: true
   workflow_call:
@@ -43,7 +43,7 @@ on:
         type: boolean
         default: true
       all-architectures:
-        description: Run the manager suites on both architectures of every OS (false runs one per OS)
+        description: Run manager suites and packages on both architectures of every OS (false runs one per OS)
         type: boolean
         default: true
 
@@ -51,6 +51,21 @@ permissions:
   contents: read
 
 jobs:
+  # Rows for both matrices, from .github/native-platforms.json: one
+  # architecture per OS unless all-architectures (see scripts/native-matrix.mjs).
+  platforms:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - id: select
+        env:
+          ALL: ${{ format('{0}', inputs.all-architectures) == 'true' }}
+        run: node scripts/native-matrix.mjs "$ALL" >> "$GITHUB_OUTPUT"
+
   root-package:
     runs-on: ubuntu-24.04
     steps:
@@ -92,17 +107,11 @@ jobs:
     # arrives as a boolean or as the string 'true'/'false'.
     if: format('{0}', inputs.manager-tests) == 'true'
     name: manager (${{ matrix.platform }})
+    needs: platforms
     strategy:
       fail-fast: false
-      matrix:
-        platform: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64, win32-arm64]
-        # PRs run one architecture per OS: the platform code differs by OS
-        # (process groups, proc_pidinfo, job objects), not by CPU. Pushes to
-        # main and releases run all six; packages always build all six.
-        exclude: ${{ fromJSON(format('{0}', inputs.all-architectures) == 'true' && '[]' || '[{"platform":"linux-arm64"},{"platform":"darwin-x64"},{"platform":"win32-arm64"}]') }}
-    # A lookup, not matrix include entries: GitHub applies include after
-    # exclude and would add the excluded platforms straight back.
-    runs-on: ${{ fromJSON('{"linux-x64":"ubuntu-24.04","linux-arm64":"ubuntu-24.04-arm","darwin-x64":"macos-15-intel","darwin-arm64":"macos-15","win32-x64":"windows-latest","win32-arm64":"windows-11-arm"}')[matrix.platform] }}
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     # The slowest lane takes ~11 minutes. A hung test must not hold a scarce
     # macOS runner for GitHub's 6-hour default; the driver's per-binary
     # timeout reports first, and this is the backstop.
@@ -159,28 +168,11 @@ jobs:
   native:
     if: format('{0}', inputs.packages) == 'true'
     name: native (${{ matrix.platform }})
+    # Only the platform list; release builds never wait for the debug suites.
+    needs: platforms
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - platform: darwin-x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - platform: darwin-arm64
-            runner: macos-15
-            target: aarch64-apple-darwin
-          - platform: win32-x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          - platform: win32-arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     env:
       PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts

@@ -11,16 +11,11 @@ const job = (text, name) => text.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=
 test('one complete simulated-clock suite per platform, independent of packaging', () => {
   const native = workflow('native-packages');
   const tests = job(native, 'manager-tests');
-  const platforms = ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64', 'win32-x64', 'win32-arm64'];
-  assert.ok(tests.includes(`platform: [${platforms.join(', ')}]\n`));
-  // GitHub applies matrix include after exclude, re-adding excluded entries:
-  // the runner comes from a lookup, which must match the package job's hosts.
+  // Rows (runner, target) come from .github/native-platforms.json via the
+  // platforms job; no include entries can re-add excluded platforms.
+  assert.match(tests, /needs: platforms\n/);
+  assert.match(tests, /matrix: \$\{\{ fromJSON\(needs\.platforms\.outputs\.matrix\) \}\}/);
   assert.doesNotMatch(tests, /^\s+include:/m);
-  const lookup = JSON.parse(tests.match(/runs-on: \$\{\{ fromJSON\('(\{[^']+\})'\)\[matrix\.platform\] \}\}/)[1]);
-  const packs0 = job(native, 'native');
-  const hosts = Object.fromEntries([...packs0.matchAll(/- platform: ([\w-]+)\n\s+runner: ([\w.-]+)\n/g)].map(m => [m[1], m[2]]));
-  assert.deepEqual(Object.keys(lookup).sort(), [...platforms].sort());
-  assert.deepEqual(lookup, hosts);
   // The real-clock rerun of the whole suite is gone: waits are simulated,
   // and the real-time canaries (Home::new_real) run inside this suite.
   assert.doesNotMatch(tests, /clock: \[|matrix\.clock/);
@@ -29,9 +24,10 @@ test('one complete simulated-clock suite per platform, independent of packaging'
   assert.equal((tests.match(/(cargo test|cargo-test-parallel\.mjs) --locked/g) ?? []).length, 2, 'exactly one suite command per OS family');
   assert.match(tests, /if: format\('\{0\}', inputs.manager-tests\) == 'true'/);
   assert.match(tests, /timeout-minutes: 45/);
-  assert.doesNotMatch(tests, /--skip|continue-on-error|needs:/);
+  assert.doesNotMatch(tests, /--skip|continue-on-error/);
+  assert.deepEqual([...tests.matchAll(/needs: (.+)/g)].map(m => m[1]), ['platforms'], 'suites wait only for the platform list');
   const packs = job(native, 'native');
-  assert.doesNotMatch(packs, /needs:/, 'release builds must not wait for debug tests');
+  assert.deepEqual([...packs.matchAll(/needs: (.+)/g)].map(m => m[1]), ['platforms'], 'release builds must not wait for debug tests');
   assert.match(packs, /cargo test --locked --release --test resource_bench/);
   assert.match(packs, /cargo test --locked --release --target "\$TARGET" --test resource_bench/);
   assert.match(packs, /cargo build --locked --release --target "\$TARGET"/);
