@@ -63,6 +63,8 @@ struct Fixture {
     /// The daemon was started on the manual test clock: its timers move only
     /// when the test advances them, so peers can flush deterministically.
     manual: bool,
+    /// The native session scan's timer has been seen (see `maintenance_settled`).
+    native_scan_seen: std::sync::atomic::AtomicBool,
     /// Daemon time this fixture has stepped (manual clock), for `deadline`.
     stepped_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -88,6 +90,16 @@ impl Deadline {
         let wall = self.start.elapsed();
         wall < self.budget
             || (self.manual && self.virtual_left() && wall < Duration::from_secs(60))
+    }
+
+    /// Daemon time stepped since the deadline was taken (diagnostics).
+    fn stepped_ms(&self) -> u64 {
+        self.stepped.load(Ordering::Relaxed) - self.start_virtual
+    }
+
+    /// Wall time since the deadline was taken (diagnostics).
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
     }
 
     fn virtual_left(&self) -> bool {
@@ -116,6 +128,7 @@ impl Fixture {
             child: None,
             manual: false,
             stepped_ms: Default::default(),
+            native_scan_seen: Default::default(),
         };
         fixture.config("");
         fixture
@@ -489,21 +502,32 @@ impl Fixture {
         env.iter().copied().chain(Self::clock_env().iter().copied()).collect()
     }
 
-    /// Wait until intercom's 250ms maintenance timer is armed again on the
-    /// manual clock: the daemon has finished reacting to the last step.
+    /// Wait until the daemon has finished reacting to the last clock step:
+    /// intercom's 250ms maintenance timer is armed again, and the native
+    /// session scan, once this fixture has seen it, is armed with time left,
+    /// i.e. not mid-scan. A scan takes real time (it probes every registered
+    /// socket); stepping while it runs would move daemon time that nothing
+    /// is sleeping on, and could use up a wait's budget before the scan that
+    /// matters is due.
     fn maintenance_settled(&self) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let state =
                 common::clock_request(&self.root.join("manager"), json!({"type":"clock_status"}));
-            if state["pending"].as_array().is_some_and(|timers| {
-                timers
-                    .iter()
-                    .any(|t| t["label"] == "intercom_maintenance" && t["due_in_ms"] == 250)
-            }) {
+            let pending = state["pending"].as_array().cloned().unwrap_or_default();
+            let maintenance = pending
+                .iter()
+                .any(|t| t["label"] == "intercom_maintenance" && t["due_in_ms"] == 250);
+            let scan_armed = pending
+                .iter()
+                .any(|t| t["label"] == "intercom_native_scan" && t["due_in_ms"].as_u64().unwrap_or(0) > 0);
+            if scan_armed {
+                self.native_scan_seen.store(true, Ordering::Relaxed);
+            }
+            if maintenance && (scan_armed || !self.native_scan_seen.load(Ordering::Relaxed)) {
                 return;
             }
-            assert!(Instant::now() < deadline, "intercom maintenance did not re-arm: {state}");
+            assert!(Instant::now() < deadline, "the daemon did not settle after a clock step: {state}");
             thread::sleep(Duration::from_millis(5));
         }
     }

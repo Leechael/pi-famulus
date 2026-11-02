@@ -388,7 +388,11 @@ fn relay_incoming_native_1025_physical_deliveries_do_not_consume_outgoing_native
         }
         assert!(
             deadline.alive(),
-            "removed native registry entry remained in the actual directory cache"
+            "removed native registry entry remained in the actual directory cache \
+             ({}ms of daemon time stepped, {:?} wall; clock: {}; rows: {rows:?})",
+            deadline.stepped_ms(),
+            deadline.elapsed(),
+            common::clock_request(&fixture.root.join("manager"), json!({"type":"clock_status"})),
         );
         fixture.tick_within(&deadline);
     }
