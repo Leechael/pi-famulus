@@ -170,3 +170,34 @@ The local container's PID 1 reaps orphaned processes ~1.7s late: a forked orphan
 
 - **cargo-nextest**: it needs a downloaded tool, and the custom `harness = false` binaries (`platform`, `resource_bench`) would need `--list --format terse`/`--ignored` support. It runs one process per test, which changes the semantics of the shared MSYS keeper on Windows. It would also need the same SOLO grouping.
 - **[mr-boxington](https://mr-boxington.jdx.dev/) (`mbx`)**: this is a shared, self-pruning local Cargo target cache. Its author notes that its remote cache does not yet consistently beat `Swatinem/rust-cache` on GitHub-hosted runners, and round 3 already had 25/25 exact Rust cache hits. The CI cost is compiling the workspace crate itself and running tests, not dependency restore. It is a reasonable developer-workstation tool, but not a CI change here.
+
+## Round 5: simulated clock only, and run only what a change can affect
+
+### One manager suite per platform, on the simulated clock
+
+The manager suite ran **twice on every platform**: once with `--features test-clock`, where daemons started by tests use a manual clock that `Home::advance` steps with `clock_advance`, and once more on the real clock, where the same tests **sleep in wall-clock time**. That made 12 lanes.
+
+The real-clock lane added no unique coverage:
+
+- With the feature compiled in, a daemon started without `PI_FAMULUS_TEST_CLOCK=manual` uses `Clock::default()`, exactly the normal build's `tokio::time::sleep` path (`manager/src/clock.rs`).
+- Real time is still pinned where it is the contract. `Home::new_real` homes in `timing_canary` (the 5s idle grace, the 2s kill grace), `resource_bench`, and parts of `messaging_relay`/`observability` run inside the simulated-clock suite.
+- No test is compiled only without the feature: there are no `not(feature = "test-clock")` or `!MANUAL_CLOCK` branches in `tests/` or `src/`.
+- The feature-off build is still compiled and exercised by the release package jobs (benchmark plus install smoke test on all six targets), by e2e's release build and real-manager integration on four OSes, and by `cargo clippy --release`.
+
+Manager lanes drop from **12 to 6**. In round 3, the real-clock lanes accounted for 2,034s of job time (sum of the six real-clock jobs), about 34 runner-minutes per full CI run, of which 939s was macOS.
+
+### Path-based family selection
+
+`ci-scope` now reports, besides `code`, whether each component changed:
+
+| Changed paths | clippy + manager suites | native package build/bench/smoke | extension compat + Windows | e2e | Upstream drift |
+|---|:-:|:-:|:-:|:-:|:-:|
+| `manager/**` | ✓ | ✓ | – | ✓ | – |
+| `extension/**` | – | ✓ | ✓ | ✓ | ✓ |
+| `eval/**` | – | – | – | ✓ | – |
+| anything else (workflows, `scripts/`, `npm/`, root files) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| docs allowlist only | – | – | – | – | – |
+
+"Anything else" is a negated every-quantifier filter, so an unclassified path **fails closed** and selects every family. Forced runs (dispatch with a ref, releases via `publish.yml`) and non-diff events select everything. The root package job (release metadata and Node tooling tests) runs on every code change. The required `extension` aggregate now checks each family against **its own** decision: a selected family must succeed and an unselected one must be skipped. It rejects a missing or non-string decision, or a docs-only scope that names a component. `scripts/ci-scope.test.mjs` evaluates the real expressions, filters and inline gate script for every scope combination.
+
+A manager-only PR no longer runs the four extension compatibility jobs or drift. An extension-only PR no longer runs clippy or the six manager suites. An eval-only PR runs only e2e. This PR itself changes workflows and `scripts/`, so it still runs everything.

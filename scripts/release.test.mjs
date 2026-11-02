@@ -204,8 +204,9 @@ function assertExtensionSourceInstall(ci) {
   assert.ok(job.includes('      - run: npm ci\n      - run: npx tsc --noEmit\n'), 'extension source job (extension-compat) must install full dependencies before typecheck');
   assert.match(ci, /^  extension:\n    needs: \[pi-matrix, native-packages, clippy, extension-compat, extension-windows, e2e\]$/m, 'historical extension check must aggregate scope and all CI families');
   assert.match(ci, /assert.equal\(scope.result, 'success'/);
-  assert.match(ci, /scope.outputs.code === 'true' \? 'success' : 'skipped'/);
-  assert.match(ci, /assert.equal\(results\[name\].result, expected/);
+  // Each family is required exactly when the scope selected it (see ci-scope.test.mjs).
+  assert.match(ci, /const expected = run \? 'success' : 'skipped';/);
+  assert.match(ci, /assert.equal\(results\[name\]\?\.result, expected/);
 }
 
 test('extension source install guard cannot be satisfied by other jobs', () => {
@@ -526,7 +527,9 @@ test('workflow literal security, release graph and host/target contracts', () =>
   for (const runner of ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15', 'windows-latest']) {
     assert.ok(native.includes(`runner: ${runner}\n`), runner);
   }
-  assert.ok(native.includes('cargo test --locked\n'));
+  // One complete suite per platform on the simulated clock (no real-clock rerun).
+  assert.ok(native.includes('cargo test --locked --features test-clock\n'));
+  assert.ok(!/cargo test --locked\n/.test(native), 'the full suite must not rerun on the real clock');
   assert.equal(
     (native.match(/shell: bash\n        run: node scripts\/bump-release\.mjs "\$RELEASE_VERSION"/g) ?? []).length,
     2,

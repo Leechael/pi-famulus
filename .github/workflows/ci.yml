@@ -34,6 +34,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/main' }}
 
 jobs:
+  # Package validation always runs for code changes; the expensive manager
+  # suites only when the manager changed, release packaging only when a
+  # packaged component (manager or extension) changed.
   native-packages:
     needs: pi-matrix
     if: needs.pi-matrix.outputs.code == 'true'
@@ -41,13 +44,15 @@ jobs:
     with:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
+      manager-tests: ${{ needs.pi-matrix.outputs.rust == 'true' }}
+      packages: ${{ needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true' }}
 
   # Lint gate: clippy warnings fail the build. Each OS compiles its own cfg
   # branches (Unix handover, macOS proc_pidinfo, Windows job objects), so a
   # Linux-only run would miss most of the platform code.
   clippy:
     needs: pi-matrix
-    if: needs.pi-matrix.outputs.code == 'true'
+    if: needs.pi-matrix.outputs.rust == 'true'
     name: clippy (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -77,6 +82,9 @@ jobs:
     outputs:
       matrix: ${{ steps.read.outputs.matrix }}
       code: ${{ steps.scope.outputs.code }}
+      rust: ${{ steps.scope.outputs.rust }}
+      extension: ${{ steps.scope.outputs.extension }}
+      eval: ${{ steps.scope.outputs.eval }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -94,7 +102,7 @@ jobs:
   extension-compat:
     name: extension (pi ${{ matrix.pi-version }})
     needs: pi-matrix
-    if: needs.pi-matrix.outputs.code == 'true'
+    if: needs.pi-matrix.outputs.extension == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.pi-matrix.outputs.matrix) }}
@@ -136,7 +144,7 @@ jobs:
 
   extension-windows:
     needs: pi-matrix
-    if: needs.pi-matrix.outputs.code == 'true'
+    if: needs.pi-matrix.outputs.extension == 'true'
     name: extension (windows-latest)
     runs-on: windows-latest
     defaults:
@@ -167,7 +175,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Require every CI family or an explicit docs-only decision
+      - name: Require every CI family the scope selected, and only those
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
@@ -176,18 +184,35 @@ jobs:
           const results = JSON.parse(process.env.RESULTS);
           const scope = results['pi-matrix'];
           assert.equal(scope.result, 'success', 'scope classification must succeed');
-          assert.ok(['true', 'false'].includes(scope.outputs.code), 'scope decision must be explicit');
-          const expected = scope.outputs.code === 'true' ? 'success' : 'skipped';
-          for (const name of ['native-packages', 'clippy', 'extension-compat', 'extension-windows', 'e2e']) {
-            assert.equal(results[name].result, expected, `${name} must be ${expected}`);
+          const decision = name => {
+            const value = scope.outputs?.[name];
+            assert.ok(['true', 'false'].includes(value), `scope decision ${name} must be explicit`);
+            return value === 'true';
+          };
+          const code = decision('code');
+          const rust = decision('rust');
+          const extension = decision('extension');
+          const evalHarness = decision('eval');
+          assert.ok(code || !(rust || extension || evalHarness), 'docs-only scope cannot select a component');
+          const wanted = {
+            'native-packages': code,
+            clippy: rust,
+            'extension-compat': extension,
+            'extension-windows': extension,
+            e2e: rust || extension || evalHarness,
+          };
+          for (const [name, run] of Object.entries(wanted)) {
+            const expected = run ? 'success' : 'skipped';
+            assert.equal(results[name]?.result, expected, `${name} must be ${expected}`);
           }
           NODE
 
   # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.
+  # Drives the real manager, the extension and the eval harness together.
   e2e:
     needs: pi-matrix
-    if: needs.pi-matrix.outputs.code == 'true'
+    if: needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true' || needs.pi-matrix.outputs.eval == 'true'
     name: e2e (${{ matrix.os }})
     strategy:
       fail-fast: false

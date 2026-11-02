@@ -8,19 +8,19 @@ import { spawnSync } from 'node:child_process';
 const workflow = name => readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const job = (text, name) => text.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [\\w-]+:|(?![\\s\\S]))`, 'm'))?.[1] ?? '';
 
-test('clock lanes preserve every platform and both full Cargo suites independently of packaging', () => {
+test('one complete simulated-clock suite per platform, independent of packaging', () => {
   const native = workflow('native-packages');
   const tests = job(native, 'manager-tests');
   for (const platform of ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64', 'win32-x64', 'win32-arm64']) {
     assert.ok(tests.includes(`platform: ${platform}\n`), platform);
   }
-  assert.match(tests, /clock: \[real, manual\]/);
-  // Linux overlaps whole test binaries; macOS and Windows keep cargo's
-  // sequential loop. Either way both lanes run the complete suite unfiltered.
-  assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked\n\s+if: matrix.clock == 'real' && runner.os == 'Linux'/);
-  assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked --features test-clock\n\s+if: matrix.clock == 'manual' && runner.os == 'Linux'/);
-  assert.match(tests, /- run: cargo test --locked\n\s+if: matrix.clock == 'real' && runner.os != 'Linux'/);
-  assert.match(tests, /- run: cargo test --locked --features test-clock\n\s+if: matrix.clock == 'manual' && runner.os != 'Linux'/);
+  // The real-clock rerun of the whole suite is gone: waits are simulated,
+  // and the real-time canaries (Home::new_real) run inside this suite.
+  assert.doesNotMatch(tests, /clock: \[|matrix\.clock/);
+  assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked --features test-clock\n\s+if: runner.os == 'Linux'/);
+  assert.match(tests, /- run: cargo test --locked --features test-clock\n\s+if: runner.os != 'Linux'/);
+  assert.equal((tests.match(/(cargo test|cargo-test-parallel\.mjs) --locked/g) ?? []).length, 2, 'exactly one suite command per OS family');
+  assert.match(tests, /if: inputs.manager-tests/);
   assert.match(tests, /timeout-minutes: 45/);
   assert.doesNotMatch(tests, /--skip|continue-on-error|needs:/);
   const packs = job(native, 'native');
@@ -32,7 +32,6 @@ test('clock lanes preserve every platform and both full Cargo suites independent
   assert.ok(smoke.indexOf('npm_config_cache=$(npm config get cache)') >= 0);
   assert.ok(smoke.indexOf('export npm_config_cache\n') < smoke.indexOf('export HOME='), 'npm cache path must be captured before HOME isolation');
   assert.match(tests, /shared-key: manager-tests-\$\{\{ matrix.platform \}\}/);
-  assert.match(tests, /save-if: \$\{\{ matrix.clock == 'real' \}\}/);
   assert.match(tests, /CARGO_PROFILE_DEV_DEBUG: line-tables-only/);
 });
 
@@ -60,16 +59,23 @@ test('native smoke isolation still uses the npm cache restored by setup-node', t
   assert.equal(result.status, 0, result.stderr);
 });
 
-test('docs-only gating never skips the workflow or masks failed scope classification', () => {
+test('scope gating never skips the workflow and routes each family by its own area', () => {
   const ci = workflow('ci');
   assert.doesNotMatch(ci, /paths-ignore:|\n    paths:/);
-  for (const name of ['native-packages', 'clippy', 'extension-compat', 'extension-windows', 'e2e']) {
-    assert.match(job(ci, name), /if: needs.pi-matrix.outputs.code == 'true'/, name);
-  }
+  const gates = {
+    'native-packages': "if: needs.pi-matrix.outputs.code == 'true'",
+    clippy: "if: needs.pi-matrix.outputs.rust == 'true'",
+    'extension-compat': "if: needs.pi-matrix.outputs.extension == 'true'",
+    'extension-windows': "if: needs.pi-matrix.outputs.extension == 'true'",
+    e2e: "if: needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true' || needs.pi-matrix.outputs.eval == 'true'",
+  };
+  for (const [name, gate] of Object.entries(gates)) assert.ok(job(ci, name).includes(`    ${gate}\n`), name);
+  const packages = job(ci, 'native-packages');
+  assert.match(packages, /manager-tests: \$\{\{ needs.pi-matrix.outputs.rust == 'true' \}\}/);
+  assert.match(packages, /packages: \$\{\{ needs.pi-matrix.outputs.rust == 'true' \|\| needs.pi-matrix.outputs.extension == 'true' \}\}/);
   const aggregate = job(ci, 'extension');
   assert.match(aggregate, /if: \$\{\{ !cancelled\(\) \}\}/);
   assert.match(aggregate, /needs: \[pi-matrix, native-packages, clippy, extension-compat, extension-windows, e2e\]/);
   assert.match(aggregate, /RESULTS: \$\{\{ toJSON\(needs\) \}\}/);
   assert.match(aggregate, /assert.equal\(scope.result, 'success'/);
-  assert.match(aggregate, /scope.outputs.code === 'true' \? 'success' : 'skipped'/);
 });

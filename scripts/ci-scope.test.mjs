@@ -19,12 +19,19 @@ const evaluate = (source, context) => runInNewContext(
   source.replace(/\.([A-Za-z_]\w*(?:-\w+)+)/g, "['$1']"), context, { timeout: 100 },
 );
 
+// Patterns of one paths-filter filter, e.g. `code:` or `rust:`.
+function filterPatterns(action, name) {
+  const block = action.match(new RegExp(`^ {10}${name}:\\n((?: {12}- '[^']+'\\n)+)`, 'm'))?.[1];
+  assert.ok(block, `missing filter: ${name}`);
+  return [...block.matchAll(/'([^']+)'/g)].map(match => match[1]);
+}
+
 // Replay the declared filter against literal boundary cases. These patterns use
 // only portable *, **, and literal paths; no picomatch-only syntax is needed.
 // The exact allowlist assertion also prevents an untested new skip category.
 test('only the reviewed documentation allowlist can skip code checks', () => {
   const action = read(actionPath);
-  const patterns = [...action.matchAll(/^\s+- '(![^']+)'$/gm)].map(match => match[1]);
+  const patterns = filterPatterns(action, 'code');
   assert.deepEqual(patterns, [
     '!README.md',
     '!README_CN.md',
@@ -89,6 +96,80 @@ test('force and non-diff events always require code checks; PRs use their full d
   }
 });
 
+test('component areas select only their own families; anything else is shared and selects all', () => {
+  const action = read(actionPath);
+  const code = filterPatterns(action, 'code');
+  const shared = filterPatterns(action, 'shared');
+  const areas = Object.fromEntries(['rust', 'extension', 'eval'].map(name => [name, filterPatterns(action, name)]));
+  assert.deepEqual(areas, { rust: ['manager/**'], extension: ['extension/**'], eval: ['eval/**'] });
+  // `changes` uses every-quantifier negations; `areas` the default some-quantifier.
+  const every = (patterns, files) => files.some(file => patterns.every(pattern => !matchesGlob(file, pattern.slice(1))));
+  const some = (patterns, files) => files.some(file => patterns.some(pattern => matchesGlob(file, pattern)));
+  const classify = files => {
+    const isCode = every(code, files);
+    const isShared = every(shared, files);
+    const pick = name => isCode && (some(areas[name], files) || isShared);
+    return { code: isCode, rust: pick('rust'), extension: pick('extension'), eval: pick('eval') };
+  };
+  const none = { code: true, rust: false, extension: false, eval: false };
+  const all = { code: true, rust: true, extension: true, eval: true };
+  const cases = [
+    [['manager/src/main.rs'], { ...none, rust: true }],
+    [['manager/tests/intercom.rs', 'manager/Cargo.lock'], { ...none, rust: true }],
+    [['extension/src/index.ts'], { ...none, extension: true }],
+    [['extension/prompts/default.md'], { ...none, extension: true }],
+    [['eval/lib/process-exit-observer.ts'], { ...none, eval: true }],
+    [['eval/scenarios/scenario.md'], { ...none, eval: true }],
+    [['manager/src/main.rs', 'eval/e2e/faux.test.ts'], { ...none, rust: true, eval: true }],
+    // Shared infrastructure fails closed: every family runs.
+    [['.github/workflows/ci.yml'], all],
+    [['.github/pi-compat.json'], all],
+    [['.github/actions/ci-scope/action.yml'], all],
+    [['scripts/install-pi-compat.sh'], all],
+    [['scripts/cargo-test-parallel.mjs'], all],
+    [['npm/linux-x64/package.json'], all],
+    [['LICENSE'], all],
+    [['.gitignore'], all],
+    [['assets/logo.png'], all],
+    [['extension/src/index.ts', 'README.md'], { ...none, extension: true }],
+    [['docs/guide.md', 'manager/src/main.rs'], { ...none, rust: true }],
+    // Docs-only: nothing.
+    [['README.md', 'docs/x.md', 'manager/TESTING.md'], { code: false, rust: false, extension: false, eval: false }],
+  ];
+  for (const [files, expected] of cases) assert.deepEqual(classify(files), expected, files.join(', '));
+});
+
+test('component outputs are explicit strings, forced for non-diff events and docs-only aware', () => {
+  const action = read(actionPath);
+  for (const area of ['rust', 'extension', 'eval']) {
+    const block = action.slice(action.indexOf(`  ${area}:\n    description:`));
+    const output = expression(block, 'value');
+    for (const event of ['push', 'pull_request', 'workflow_dispatch', 'schedule', 'workflow_call']) {
+      for (const force of ['false', 'true']) {
+        const filtered = force === 'false' && ['push', 'pull_request'].includes(event);
+        for (const code of ['false', 'true']) {
+          for (const own of ['false', 'true']) {
+            for (const shared of ['false', 'true']) {
+              const context = {
+                inputs: { force },
+                github: { event_name: event },
+                steps: filtered
+                  ? { changes: { outputs: { code, shared } }, areas: { outputs: { [area]: own } } }
+                  : { changes: { outputs: {} }, areas: { outputs: {} } },
+              };
+              const expected = !filtered || (code === 'true' && (own === 'true' || shared === 'true')) ? 'true' : 'false';
+              assert.equal(evaluate(output, context), expected, `${area} ${event} force=${force} code=${code} own=${own} shared=${shared}`);
+            }
+          }
+        }
+      }
+    }
+  }
+  const areasStep = action.slice(action.indexOf('      id: areas'));
+  assert.equal(expression(areasStep, 'if'), expression(action, 'if'), 'both filter steps run under the same condition');
+  assert.doesNotMatch(areasStep.slice(0, areasStep.indexOf('filters:')), /predicate-quantifier/);
+});
+
 test('docs-only changes still validate README synchronization and links', () => {
   const action = read(actionPath);
   const docsStep = action.slice(action.indexOf('    - name: Check README'));
@@ -103,13 +184,14 @@ test('upstream drift passes scope through pi-matrix and gates only the expensive
   const workflow = read('.github/workflows/upstream-drift.yml');
   assert.match(workflow, /permissions:\n  contents: read\n  pull-requests: read/);
   const matrix = workflow.slice(workflow.indexOf('  pi-matrix:'), workflow.indexOf('\n  drift:'));
-  assert.match(matrix, /code: \$\{\{ steps\.scope\.outputs\.code \}\}/);
+  assert.match(matrix, /extension: \$\{\{ steps\.scope\.outputs\.extension \}\}/);
   assert.ok(matrix.indexOf('uses: actions/checkout@') < matrix.indexOf('uses: ./.github/actions/ci-scope'));
   assert.match(matrix, /- id: scope\n        uses: \.\/\.github\/actions\/ci-scope/);
   const drift = workflow.slice(workflow.indexOf('\n  drift:'));
   assert.match(drift, /needs: pi-matrix/);
-  for (const code of ['false', 'true', undefined]) {
-    assert.equal(evaluate(expression(drift, 'if'), { needs: { 'pi-matrix': { outputs: { code } } } }), code === 'true');
+  // Drift concerns pi and the extension only (shared changes select it too).
+  for (const extension of ['false', 'true', undefined]) {
+    assert.equal(evaluate(expression(drift, 'if'), { needs: { 'pi-matrix': { outputs: { code: 'true', extension } } } }), extension === 'true');
   }
 });
 
@@ -151,14 +233,39 @@ test('CI shares scope, forces explicit build inputs, and gates all expensive job
   for (const [ref, version, expected] of [['', '', false], ['release-ref', '', true], ['', '1.2.3', true]]) {
     assert.equal(evaluate(expression(matrix, 'force'), { inputs: { ref, version } }), expected);
   }
-  for (const name of ['native-packages', 'clippy', 'extension-compat', 'extension-windows', 'e2e']) {
+  for (const area of ['rust', 'extension', 'eval']) {
+    assert.match(matrix, new RegExp(`${area}: \\$\\{\\{ steps\\.scope\\.outputs\\.${area} \\}\\}`));
+  }
+  const wants = {
+    'native-packages': o => o.code,
+    clippy: o => o.rust,
+    'extension-compat': o => o.extension,
+    'extension-windows': o => o.extension,
+    e2e: o => o.rust || o.extension || o.eval,
+  };
+  const combos = [];
+  for (const code of [false, true]) for (const rust of [false, true]) for (const extension of [false, true]) for (const evalArea of [false, true]) {
+    if (!code && (rust || extension || evalArea)) continue;
+    combos.push({ code, rust, extension, eval: evalArea });
+  }
+  for (const [name, want] of Object.entries(wants)) {
     const block = job(workflow, name);
     assert.match(block, /needs: pi-matrix/);
     const gate = block.match(/^    if: (.+)$/m)?.[1]?.replace(/^\$\{\{ (.+) \}\}$/, '$1');
     assert.ok(gate, `missing gate: ${name}`);
-    for (const code of ['false', 'true', undefined]) {
-      assert.equal(evaluate(gate, { needs: { 'pi-matrix': { outputs: { code } } } }), code === 'true', name);
+    for (const combo of combos) {
+      const outputs = Object.fromEntries(Object.entries(combo).map(([k, v]) => [k, String(v)]));
+      assert.equal(evaluate(gate, { needs: { 'pi-matrix': { outputs } } }), want(combo), `${name} ${JSON.stringify(combo)}`);
     }
+    // A missing output never selects a family.
+    assert.equal(evaluate(gate, { needs: { 'pi-matrix': { outputs: {} } } }), false, `${name} with no outputs`);
+  }
+  const packages = job(workflow, 'native-packages');
+  for (const combo of combos) {
+    const outputs = Object.fromEntries(Object.entries(combo).map(([k, v]) => [k, String(v)]));
+    const ctx = { needs: { 'pi-matrix': { outputs } } };
+    assert.equal(evaluate(expression(packages, 'manager-tests'), ctx), combo.rust, `manager-tests ${JSON.stringify(combo)}`);
+    assert.equal(evaluate(expression(packages, 'packages'), ctx), combo.rust || combo.extension, `packages ${JSON.stringify(combo)}`);
   }
 });
 
@@ -181,42 +288,55 @@ test('required extension check gates every CI family and does not prolong cancel
   // column zero, exactly as it does when Actions executes the run step.
   const script = block.match(/        run: \|\n((?:          [^\n]*\n)+)/)?.[1].replace(/^          /gm, '');
   assert.ok(script, 'missing required-check shell script');
-  const fixture = (code, result) => ({
-    'pi-matrix': { result: 'success', outputs: { code } },
-    ...Object.fromEntries(families.map(name => [name, { result }])),
+  const want = o => ({
+    'native-packages': o.code,
+    clippy: o.rust,
+    'extension-compat': o.extension,
+    'extension-windows': o.extension,
+    e2e: o.rust || o.extension || o.eval,
   });
-  const cases = [
-    ['docs-only: all families skipped', fixture('false', 'skipped'), true],
-    ['code: all families succeeded', fixture('true', 'success'), true],
-  ];
-  for (const [code, expected, rejected] of [
-    ['true', 'success', ['failure', 'cancelled', 'skipped']],
-    ['false', 'skipped', ['failure', 'cancelled', 'success']],
-  ]) {
-    for (const name of families) {
+  const fixture = scope => ({
+    'pi-matrix': { result: 'success', outputs: Object.fromEntries(Object.entries(scope).map(([k, v]) => [k, String(v)])) },
+    ...Object.fromEntries(Object.entries(want(scope)).map(([name, run]) => [name, { result: run ? 'success' : 'skipped' }])),
+  });
+  const scopes = [];
+  for (const code of [false, true]) for (const rust of [false, true]) for (const extension of [false, true]) for (const evalArea of [false, true]) {
+    if (!code && (rust || extension || evalArea)) continue;
+    scopes.push({ code, rust, extension, eval: evalArea });
+  }
+  const cases = [];
+  for (const scope of scopes) {
+    const label = JSON.stringify(scope);
+    cases.push([`${label}: exactly the selected families ran`, fixture(scope), true]);
+    for (const [name, run] of Object.entries(want(scope))) {
+      const rejected = run ? ['failure', 'cancelled', 'skipped'] : ['failure', 'cancelled', 'success'];
       for (const result of rejected) {
-        const results = fixture(code, expected);
+        const results = fixture(scope);
         results[name].result = result;
-        cases.push([`code=${code}: ${name} ${result}`, results, false]);
+        cases.push([`${label}: ${name} ${result}`, results, false]);
       }
-      const missing = fixture(code, expected);
+      const missing = fixture(scope);
       delete missing[name];
-      cases.push([`code=${code}: missing ${name}`, missing, false]);
+      cases.push([`${label}: missing ${name}`, missing, false]);
     }
-    for (const scope of [
-      undefined,
-      { result: 'failure', outputs: { code } },
-      { result: 'cancelled', outputs: { code } },
-      { result: 'skipped', outputs: { code } },
-      { result: 'success' },
-      { result: 'success', outputs: {} },
-      { result: 'success', outputs: { code: '' } },
-      { result: 'success', outputs: { code: true } },
-    ]) {
-      const results = fixture(code, expected);
-      results['pi-matrix'] = scope;
-      cases.push([`code=${code}: invalid scope ${JSON.stringify(scope)}`, results, false]);
-    }
+  }
+  const base = { code: true, rust: true, extension: false, eval: false };
+  for (const bad of [
+    undefined,
+    { result: 'failure', outputs: fixture(base)['pi-matrix'].outputs },
+    { result: 'cancelled', outputs: fixture(base)['pi-matrix'].outputs },
+    { result: 'skipped', outputs: fixture(base)['pi-matrix'].outputs },
+    { result: 'success' },
+    { result: 'success', outputs: {} },
+    { result: 'success', outputs: { code: 'true' } },
+    { result: 'success', outputs: { ...fixture(base)['pi-matrix'].outputs, rust: '' } },
+    { result: 'success', outputs: { ...fixture(base)['pi-matrix'].outputs, eval: true } },
+    // A docs-only scope that still names a component is contradictory.
+    { result: 'success', outputs: { code: 'false', rust: 'true', extension: 'false', eval: 'false' } },
+  ]) {
+    const results = fixture(base);
+    results['pi-matrix'] = bad;
+    cases.push([`invalid scope ${JSON.stringify(bad)}`, results, false]);
   }
   for (const [label, results, success] of cases) {
     const result = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], {

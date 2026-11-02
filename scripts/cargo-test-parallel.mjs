@@ -99,6 +99,8 @@ process.on('exit', () => rmSync(logs, { recursive: true, force: true }));
 // (GitHub publishes no logs for a step cancelled mid-run).
 export const TIMEOUT_S = Number(process.env.PI_FAMULUS_TEST_TIMEOUT_S) || 900;
 const running = new Map();
+// Set by main(): stream a timeout's diagnostics as soon as it fires.
+let live = false;
 
 function snapshot(pid) {
   const out = [];
@@ -146,7 +148,7 @@ export function run(binary, args = [], timeoutS = TIMEOUT_S) {
       timedOut = true;
       diagnostics = snapshot(child.pid);
       // Print now: if the process cannot be reaped, finish() may come late.
-      process.stdout.write(`\n===== ${binary.name}: timed out after ${timeoutS}s; output so far:\n${readFileSync(path, 'utf8')}\n${diagnostics}\n`);
+      if (live) process.stdout.write(`\n===== ${binary.name}: timed out after ${timeoutS}s; output so far:\n${readFileSync(path, 'utf8')}\n${diagnostics}\n`);
       child.kill('SIGKILL');
       // A process stuck in the kernel may never report exit; do not wait on it.
       setTimeout(() => finish(null, 'SIGKILL'), 30_000).unref();
@@ -183,6 +185,7 @@ async function pool(items, jobs, each) {
 }
 
 async function main(args) {
+  live = true;
   const jobs = Number(process.env.PI_FAMULUS_TEST_JOBS) || defaultJobs();
   const binaries = await build(args);
   if (binaries.length === 0) throw new Error('cargo reported no test binaries');
