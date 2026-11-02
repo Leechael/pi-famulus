@@ -355,19 +355,35 @@ test('PRs run one architecture per OS; main pushes, dispatches and releases run 
   const managerExclude = expression(job(native, 'manager-tests'), 'exclude');
   const e2eExclude = expression(job(ci, 'e2e'), 'exclude');
   const fromJSON = text => JSON.parse(text);
+  const format = (template, ...args) => template.replace(/\{(\d+)\}/g, (_, i) => String(args[i]));
   const platforms = ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64', 'win32-x64', 'win32-arm64'];
   const oses = ['macos-latest', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-latest'];
   for (const event of ['pull_request', 'push', 'workflow_dispatch', 'workflow_call', 'schedule']) {
     const pr = event === 'pull_request';
     const allArchitectures = evaluate(all, { github: { event_name: event } });
     assert.equal(allArchitectures, !pr, event);
-    const excluded = evaluate(managerExclude, { fromJSON, inputs: { 'all-architectures': allArchitectures } }).map(e => e.platform);
-    const ran = platforms.filter(p => !excluded.includes(p));
-    assert.deepEqual(ran, pr ? ['linux-x64', 'darwin-arm64', 'win32-x64'] : platforms, `manager ${event}`);
+    // workflow_call may deliver the boolean as a string; both must work.
+    for (const delivered of [allArchitectures, String(allArchitectures)]) {
+      const excluded = evaluate(managerExclude, { fromJSON, format, inputs: { 'all-architectures': delivered } }).map(e => e.platform);
+      const ran = platforms.filter(p => !excluded.includes(p));
+      assert.deepEqual(ran, pr ? ['linux-x64', 'darwin-arm64', 'win32-x64'] : platforms, `manager ${event} (${typeof delivered})`);
+    }
     const e2eRan = oses.filter(os => !evaluate(e2eExclude, { fromJSON, github: { event_name: event } }).some(e => e.os === os));
     assert.deepEqual(e2eRan, pr ? ['macos-latest', 'ubuntu-latest', 'windows-latest'] : oses, `e2e ${event}`);
   }
   // Every OS keeps one manager suite and one e2e on PRs; packages are never excluded.
   assert.doesNotMatch(job(native, 'native'), /exclude:/);
   assert.doesNotMatch(job(native, 'root-package'), /exclude:/);
+});
+
+test('package and manager-suite switches honor false whether delivered as a boolean or a string', () => {
+  const native = read('.github/workflows/native-packages.yml');
+  const format = (template, ...args) => template.replace(/\{(\d+)\}/g, (_, i) => String(args[i]));
+  for (const [name, input] of [['manager-tests', 'manager-tests'], ['native', 'packages']]) {
+    const gate = job(native, name).match(/^    if: (.+)$/m)?.[1];
+    assert.ok(gate, `missing gate: ${name}`);
+    for (const value of [true, false, 'true', 'false']) {
+      assert.equal(evaluate(gate, { format, inputs: { [input]: value } }), String(value) === 'true', `${name} with ${JSON.stringify(value)}`);
+    }
+  }
 });

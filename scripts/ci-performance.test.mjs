@@ -20,7 +20,7 @@ test('one complete simulated-clock suite per platform, independent of packaging'
   assert.match(tests, /- run: node \.\.\/scripts\/cargo-test-parallel\.mjs --locked --features test-clock\n\s+if: runner.os == 'Linux'/);
   assert.match(tests, /- run: cargo test --locked --features test-clock\n\s+if: runner.os != 'Linux'/);
   assert.equal((tests.match(/(cargo test|cargo-test-parallel\.mjs) --locked/g) ?? []).length, 2, 'exactly one suite command per OS family');
-  assert.match(tests, /if: inputs.manager-tests/);
+  assert.match(tests, /if: format\('\{0\}', inputs.manager-tests\) == 'true'/);
   assert.match(tests, /timeout-minutes: 45/);
   assert.doesNotMatch(tests, /--skip|continue-on-error|needs:/);
   const packs = job(native, 'native');

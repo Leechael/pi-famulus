@@ -88,7 +88,9 @@ jobs:
   # the normal build's tokio::time path, and the release build itself is
   # exercised by the package jobs below and by e2e on every OS.
   manager-tests:
-    if: inputs.manager-tests
+    # format(): a boolean passed through workflow_call can arrive as the
+    # string 'false', which is truthy; compare the text in every case.
+    if: format('{0}', inputs.manager-tests) == 'true'
     name: manager (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -97,7 +99,7 @@ jobs:
         # PRs run one architecture per OS: the platform code differs by OS
         # (process groups, proc_pidinfo, job objects), not by CPU. Pushes to
         # main and releases run all six; packages always build all six.
-        exclude: ${{ fromJSON(inputs.all-architectures && '[]' || '[{"platform":"linux-arm64"},{"platform":"darwin-x64"},{"platform":"win32-arm64"}]') }}
+        exclude: ${{ fromJSON(format('{0}', inputs.all-architectures) == 'true' && '[]' || '[{"platform":"linux-arm64"},{"platform":"darwin-x64"},{"platform":"win32-arm64"}]') }}
         include:
           - platform: linux-x64
             runner: ubuntu-24.04
@@ -172,7 +174,7 @@ jobs:
           if-no-files-found: ignore
 
   native:
-    if: inputs.packages
+    if: format('{0}', inputs.packages) == 'true'
     name: native (${{ matrix.platform }})
     strategy:
       fail-fast: false
