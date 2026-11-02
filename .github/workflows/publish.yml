@@ -24,6 +24,8 @@ on:
 
 permissions:
   contents: read
+  # Required by the reusable CI's path classifier (forced full for releases).
+  pull-requests: read
 
 # Serialize publication, retaining up to 100 pending runs (not just the latest).
 # GitHub cancels arrivals beyond that queue limit; retry them explicitly.

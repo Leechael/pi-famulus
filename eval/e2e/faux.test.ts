@@ -8,11 +8,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import { type FauxEpisode, runFaux } from "./run-faux.ts";
 import { followedByAssistant, type Item, toolResults, wakes } from "../lib/transcript.ts";
 import { FAMULUS_WAKE_LEAD_IN } from "../lib/wake-adapter.ts";
-import { observeProcessExit, type ProcessExitObserver } from "../lib/process-exit-observer.ts";
+import { observeProcessExit, type ProcessExitObserver, warmProcessObserver } from "../lib/process-exit-observer.ts";
 
 const episodes: FauxEpisode[] = [];
 after(() => {
@@ -57,6 +57,8 @@ function extensionEvents(ep: FauxEpisode): Array<Record<string, unknown> & { typ
 }
 
 describe("faux e2e", { concurrency: true }, () => {
+  // (e2) arms a process observer; keep its cold start out of the readiness bound.
+  before(() => warmProcessObserver());
   it("(a) command over the foreground budget is backgrounded and notifies exactly once", async () => {
     const ep = await runFaux({
       script: "bg-once.ts",

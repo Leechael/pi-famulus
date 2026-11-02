@@ -11,6 +11,33 @@ export interface ProcessExitObserver {
 
 type SpawnObserver = (pid: number, timeoutMs: number) => ChildProcess;
 
+function powershellPath(): string {
+  return join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+/**
+ * Start the platform observer's runtime once, outside any readiness window.
+ * A cold Windows PowerShell start (loading .NET) on a loaded CI runner can
+ * alone exceed the 8s readiness bound, which exists to catch an observer
+ * that never attaches, not to time the runtime's first launch. Call it
+ * before the first observeProcessExit; POSIX observers need no warm-up.
+ */
+export async function warmProcessObserver(): Promise<void> {
+  if (process.platform !== "win32") return;
+  const child = spawn(powershellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    "$null = [System.Diagnostics.Process]::GetCurrentProcess().StartTime; [Console]::Out.WriteLine('warm')"],
+  { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  child.stdout!.on("data", (chunk) => { output += String(chunk); });
+  child.stderr!.on("data", (chunk) => { output += String(chunk); });
+  const timer = setTimeout(() => child.kill(), 120_000);
+  const [code] = await new Promise<[number | null]>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exit) => resolve([exit]));
+  }).finally(() => clearTimeout(timer));
+  if (code !== 0 || !output.includes("warm")) throw new Error(`PowerShell warm-up failed: exit=${code} ${output.slice(-2000)}`);
+}
+
 function spawnObserver(pid: number, timeoutMs: number): ChildProcess {
   if (process.platform === "win32") {
     // GetProcessById alone is lazy: force Handle before acknowledging readiness.
@@ -25,8 +52,7 @@ try {
   if ($target.WaitForExit(${timeoutMs})) { exit 0 } else { exit 2 }
 } finally { $target.Dispose() }
 `;
-    const powershell = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    return spawn(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    return spawn(powershellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   }
   // POSIX keeps the existing ESRCH-based oracle, in a bounded observer process.
   const script = `

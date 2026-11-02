@@ -30,6 +30,11 @@ hmac = "0.12"
 sha2 = "0.10"
 percent-encoding = "2"
 
+# Tests only: paused tokio time proves the real clock's timers without
+# waiting for them (see clock.rs).
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -52,6 +57,46 @@ windows-sys = { version = "0.59", features = [
 [[test]]
 name = "platform"
 harness = false
+required-features = ["test-clock"]
+
+# Suites that step the daemon's manual clock instead of sleeping: they need
+# `--features test-clock` (as CI always passes) and are skipped without it.
+[[test]]
+name = "hosted_agents"
+required-features = ["test-clock"]
+
+[[test]]
+name = "intercom"
+required-features = ["test-clock"]
+
+[[test]]
+name = "lifecycle_adversarial"
+required-features = ["test-clock"]
+
+[[test]]
+name = "mutation_gaps"
+required-features = ["test-clock"]
+
+[[test]]
+name = "observability"
+required-features = ["test-clock"]
+
+[[test]]
+name = "protocol"
+required-features = ["test-clock"]
+
+[[test]]
+name = "startup_retry"
+required-features = ["test-clock"]
+
+[[test]]
+name = "timing_canary"
+required-features = ["test-clock"]
+
+[[test]]
+name = "upgrade"
+required-features = ["test-clock"]
+
 
 [[test]]
 name = "resource_bench"

@@ -1232,7 +1232,8 @@ fn c6_status_counts_uptime_and_not_running() {
     let (t, _) = start(&mut c, "true", json!({}));
     c.wait_terminal(&t, S(15)).unwrap();
     start(&mut c, "sleep 300", json!({}));
-    std::thread::sleep(MS(1100));
+    // Uptime may be under a second: "850ms" satisfies the format check below
+    // as well as "1s", and fmt.rs unit-tests every human_duration branch.
     let out = cli_ok(&home, &["status"]);
     let s = &out.stdout;
     // The version names the commit the binary was built from ("0.1.0" alone
@@ -1513,7 +1514,8 @@ fn g15b_finished_task_survives_a_failed_delete_for_retry() {
     std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let _restore = RestorePerms(tasks_dir.clone());
     home.advance("gc", 1_000);
-    std::thread::sleep(MS(300));
+    // The sweep the step fired has run (manual clock), or had a moment to.
+    home.settle();
     // Assert survival *before* the dir goes writable again: once it does,
     // the background sweep (polling at least once a second) can delete the
     // record at any moment, racing these checks against the assertion below

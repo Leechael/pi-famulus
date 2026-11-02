@@ -1,60 +1,87 @@
-#![cfg(unix)]
-//! Real-time canaries for the daemon's two lifecycle constants.
+#![cfg(all(unix, feature = "test-clock"))]
+//! Canaries for the daemon's two lifecycle constants, on simulated time.
 //!
-//! Under `--features test-clock` the other suites step these timers on the
-//! manual clock, so they never see real durations. These tests always run the
-//! daemon on real time (`Home::new_real`) and pin the actual values:
 //! - the idle grace: the last client leaves, and 5s later tasks are SIGTERMed;
 //! - the kill grace: a stopped task that ignores SIGTERM is SIGKILLed 2s later.
 //!
-//! The lower bound is the contract (never early). The upper bound is loose so
-//! a loaded machine does not fail it, but tight enough to catch a doubled
-//! constant.
+//! Each boundary is exact and deterministic: the timer is armed with exactly
+//! the constant left, the task survives 1ms before it, and is acted on at it.
+//! That catches a changed constant in either direction without sleeping.
+//! That the normal build's clock really sleeps those durations is proven on
+//! paused tokio time by the daemon's unit test
+//! `real_clock_idle_and_kill_graces_sleep_exactly_their_constants`.
 
 mod common;
 
 use common::*;
 use serde_json::json;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Wait for `pid` to die and return when it happened, relative to `t0`.
-fn death_after(t0: Instant, pid: u32, timeout: Duration) -> Option<Duration> {
-    poll_until(timeout, || (!pid_running(pid)).then(|| t0.elapsed()))
+/// The single pending `label` timer, armed and not yet stepped: its full
+/// duration is left.
+fn armed_ms(home: &Home, label: &str) -> u64 {
+    let mut due = None;
+    assert!(
+        poll_true(Duration::from_secs(10), || {
+            let status = clock_request(&home.path, json!({"type":"clock_status"}));
+            due = status["pending"]
+                .as_array()
+                .and_then(|p| p.iter().find(|t| t["label"] == label))
+                .and_then(|t| t["due_in_ms"].as_u64());
+            due.is_some()
+        }),
+        "no {label} timer was armed"
+    );
+    due.unwrap()
+}
+
+fn step(home: &Home, ms: u64) {
+    let r = clock_request(&home.path, json!({"type":"clock_advance","ms":ms}));
+    assert_eq!(r["ok"], true, "clock_advance: {r}");
 }
 
 #[test]
 fn canary_idle_grace_is_5s() {
-    let home = Home::new_real("canary-idle");
+    let home = Home::new("canary-idle");
     let mut d = home.start_daemon();
     let mut c = home.connect();
     c.hello_ext("sess-a");
     let (_, pid) = c.start("sleep 300");
     drop(c);
-    let t0 = Instant::now();
-    let died = death_after(t0, pid, Duration::from_secs(10)).expect("task never killed after the idle grace");
+    assert_eq!(armed_ms(&home, "idle"), 5000, "idle grace armed with the wrong duration");
+    step(&home, 4999);
+    assert!(pid_running(pid), "task killed before the 5s idle grace");
+    step(&home, 1);
     assert!(
-        died >= Duration::from_millis(4900),
-        "task killed {died:?} after the last client left, before the 5s grace"
+        poll_true(Duration::from_secs(10), || !pid_running(pid)),
+        "task survived the 5s idle grace"
     );
-    assert!(died <= Duration::from_millis(6500), "idle grace took {died:?}, expected ~5s");
-    assert!(wait_child(&mut d, Duration::from_secs(5)).is_some());
+    // Graceful shutdown then holds the TERM grace on the same clock.
+    if pid_running(d.id()) {
+        home.advance("shutdown-grace", 2000);
+    }
+    assert!(wait_child(&mut d, Duration::from_secs(10)).is_some());
 }
 
 #[test]
 fn canary_kill_grace_is_2s() {
-    let home = Home::new_real("canary-kill");
+    let home = Home::new("canary-kill");
     let _d = home.start_daemon();
     let mut c = home.connect();
     c.hello_ext("sess-a");
     let (id, pid) = c.start("trap '' TERM; echo armed; sleep 300");
-    assert!(poll_true(Duration::from_secs(5), || {
+    assert!(poll_true(Duration::from_secs(10), || {
         let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":64}));
         r["chunk"].as_str().unwrap_or("").contains("armed")
     }));
-    let t0 = Instant::now();
     c.request_ok(json!({"type":"stop","task_id":id}));
-    let died = death_after(t0, pid, Duration::from_secs(6)).expect("TERM-ignoring task never SIGKILLed");
-    assert!(died >= Duration::from_millis(1900), "SIGKILL after {died:?}, before the 2s grace");
-    assert!(died <= Duration::from_millis(3500), "kill grace took {died:?}, expected ~2s");
-    assert_eq!(c.wait_terminal(&id, Duration::from_secs(3)).unwrap()["status"], "killed");
+    assert_eq!(armed_ms(&home, "kill-grace"), 2000, "kill grace armed with the wrong duration");
+    step(&home, 1999);
+    assert!(pid_running(pid), "SIGKILL before the 2s grace");
+    step(&home, 1);
+    assert!(
+        poll_true(Duration::from_secs(10), || !pid_running(pid)),
+        "TERM-ignoring task never SIGKILLed after the 2s grace"
+    );
+    assert_eq!(c.wait_terminal(&id, Duration::from_secs(10)).unwrap()["status"], "killed");
 }

@@ -5,7 +5,7 @@ name: Upstream drift
 # with no pins, the way a new user would, and reports what upstream changed:
 #   - an unpinned version fails: pi plus its newest dependencies broke;
 #   - a pinned version now passes: the pin is no longer needed, remove it.
-# It runs on every PR and daily, so drift shows up even when nothing is merged.
+# It runs on extension-changing PRs and daily, so drift shows up even when nothing is merged.
 # It is a separate workflow so a red result here says "upstream", not "this PR".
 
 on:
@@ -18,24 +18,34 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
+# Non-PR runs need unique groups: even cancel-in-progress: false would replace
+# an older pending run sharing the group.
 concurrency:
-  group: upstream-drift-${{ github.ref }}
-  cancel-in-progress: true
+  group: upstream-drift-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/main' }}
 
 jobs:
   pi-matrix:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.read.outputs.matrix }}
+      code: ${{ steps.scope.outputs.code }}
+      extension: ${{ steps.scope.outputs.extension }}
     steps:
       - uses: actions/checkout@v5
+      - id: scope
+        uses: ./.github/actions/ci-scope
       - id: read
         run: echo "matrix=$(jq -c . .github/pi-compat.json)" >> "$GITHUB_OUTPUT"
 
   drift:
     name: drift (pi ${{ matrix.pi-version }})
     needs: pi-matrix
+    # Drift is about pi and the extension; manager-only or eval-only changes
+    # cannot change its result (the daily schedule still runs it).
+    if: ${{ needs.pi-matrix.outputs.extension == 'true' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.pi-matrix.outputs.matrix) }}

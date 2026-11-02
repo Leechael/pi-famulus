@@ -73,14 +73,24 @@ fn settled_handles(pid: u32) -> u64 {
     last
 }
 
-/// Handles the daemon keeps once its idle tokio blocking threads have exited
-/// (10 s keep-alive). On Windows every pipe read of a running task holds a
-/// blocking thread, and every thread holds handles: right after a burst the
-/// count reflects the pool, not a leak.
-fn handles_after_pool_idle(pid: u32) -> u64 {
-    std::thread::sleep(S(11));
+/// Handles the daemon keeps once it has released what a burst held: idle
+/// tokio blocking threads (on Windows every pipe read of a running task holds
+/// one, and every thread holds handles) and other asynchronously released
+/// handles. Polls until growth over `base` is within `budget`, then returns
+/// the stable count; a leak never drops, so it is still reported after the
+/// 15s ceiling (the previous fixed wait was 11s). The bench daemon's 200ms
+/// blocking keep-alive (`BLOCKING_KEEP_ALIVE_MS`, tokio's default is 10s)
+/// lets a healthy daemon get there in well under a second.
+fn handles_after_pool_idle(pid: u32, base: u64, budget: u64) -> u64 {
+    let deadline = Instant::now() + S(15);
+    while open_handles(pid).expect("handle probe failed").saturating_sub(base) > budget && Instant::now() < deadline {
+        std::thread::sleep(MS(100));
+    }
     settled_handles(pid)
 }
+
+/// The bench daemon's blocking-thread keep-alive (see `handles_after_pool_idle`).
+const BLOCKING_KEEP_ALIVE_MS: &str = "200";
 
 fn percentile(v: &mut [u64], p: f64) -> u64 {
     v.sort_unstable();
@@ -105,7 +115,10 @@ impl Report {
 
 fn resource_usage() {
     let home = Home::new_real("bench");
-    let _d = home.start_daemon();
+    let _d = home.start_daemon_from(
+        std::path::Path::new(BIN),
+        &[("PI_FAMULUS_BLOCKING_KEEP_ALIVE_MS", BLOCKING_KEEP_ALIVE_MS)],
+    );
     let pid = home.pidfile_pid().unwrap();
     let mut c = home.connect();
     assert_eq!(c.hello_ext("bench")["ok"], true);
@@ -113,10 +126,10 @@ fn resource_usage() {
     r.json.insert("os".into(), json!(std::env::consts::OS));
     r.json.insert("arch".into(), json!(std::env::consts::ARCH));
 
-    // Idle: a connected client, no tasks.
-    std::thread::sleep(S(1));
-    let idle = sample(pid);
+    // Idle: a connected client, no tasks. Sampled once the handle count is
+    // stable (a condition, not a fixed pause).
     let base_handles = settled_handles(pid);
+    let idle = sample(pid);
     r.metric("idle.rss", idle.rss as f64 / MIB, "MiB", Some(48.0));
     r.metric("idle.handles", base_handles as f64, "", None);
     r.metric("idle.cpu_3s", cpu_over(pid, S(3)) as f64, "ms", Some(60.0));
@@ -141,7 +154,8 @@ fn resource_usage() {
     for _ in 0..n {
         running.push(c.start(&kit(&["sleep", "120000"])));
     }
-    std::thread::sleep(S(1));
+    // Every runner is up and the daemon's handles are stable before sampling.
+    settled_handles(pid);
     let busy = sample(pid);
     let runner_rss: u64 = running.iter().map(|(_, p)| rss_bytes(*p).expect("runner rss probe failed")).sum::<u64>() / n;
     r.metric("running20.daemon_rss", busy.rss as f64 / MIB, "MiB", Some(64.0));
@@ -174,14 +188,14 @@ fn resource_usage() {
     }
     let warm = settled_handles(pid);
     r.metric("churn200.handle_growth_warm", warm.saturating_sub(base_handles) as f64, "", None);
-    let after_churn = handles_after_pool_idle(pid);
+    let after_churn = handles_after_pool_idle(pid, base_handles, 24);
     r.metric("churn200.handle_growth", after_churn.saturating_sub(base_handles) as f64, "", Some(24.0));
     let ids: Vec<String> = (0..20).map(|_| c.start(&kit(&["leave", "300"])).0).collect();
     for id in &ids {
         assert!(c.wait_terminal(id, S(20)).is_some(), "{id} did not finish");
     }
-    std::thread::sleep(S(2));
-    let after_leftovers = handles_after_pool_idle(pid);
+    // The leftovers exit on their own; the count below waits for that.
+    let after_leftovers = handles_after_pool_idle(pid, base_handles, 24);
     r.metric("leftovers20.handle_growth", after_leftovers.saturating_sub(base_handles) as f64, "", Some(24.0));
     r.metric("churn.rss_after", sample(pid).rss as f64 / MIB, "MiB", Some(64.0));
 

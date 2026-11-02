@@ -12,6 +12,18 @@ on:
         description: If set, rewrite release metadata to this version before packing
         type: string
         default: ''
+      manager-tests:
+        description: Run the manager's Cargo suites (CI skips them when manager/ is unchanged)
+        type: boolean
+        default: true
+      packages:
+        description: Build, benchmark, pack and install-test the native packages
+        type: boolean
+        default: true
+      all-architectures:
+        description: Run manager suites and packages on both architectures of every OS (false runs one per OS)
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       ref:
@@ -22,11 +34,38 @@ on:
         description: If set, rewrite release metadata to this version before packing
         type: string
         default: ''
+      manager-tests:
+        description: Run the manager's Cargo suites (CI skips them when manager/ is unchanged)
+        type: boolean
+        default: true
+      packages:
+        description: Build, benchmark, pack and install-test the native packages
+        type: boolean
+        default: true
+      all-architectures:
+        description: Run manager suites and packages on both architectures of every OS (false runs one per OS)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
+  # Rows for both matrices, from .github/native-platforms.json: one
+  # architecture per OS unless all-architectures (see scripts/native-matrix.mjs).
+  platforms:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - id: select
+        env:
+          ALL: ${{ format('{0}', inputs.all-architectures) == 'true' }}
+        run: node scripts/native-matrix.mjs "$ALL" >> "$GITHUB_OUTPUT"
+
   root-package:
     runs-on: ubuntu-24.04
     steps:
@@ -55,30 +94,85 @@ jobs:
           path: ${{ runner.temp }}/packages/*.tgz
           if-no-files-found: error
 
-  native:
-    name: native (${{ matrix.platform }})
+  # One complete suite per platform, on the simulated clock: daemons started
+  # by the tests step their timers (idle grace, kill escalation, polls) with
+  # clock_advance instead of sleeping. Real time is still pinned where it is
+  # the contract: Home::new_real canaries (timing_canary, parts of
+  # messaging_relay/observability) run in this same suite. The feature only
+  # adds the manual clock; without PI_FAMULUS_TEST_CLOCK=manual a daemon takes
+  # the normal build's tokio::time path, and the release build itself is
+  # exercised by the package jobs below and by e2e on every OS.
+  manager-tests:
+    # Compared as text so the switch behaves the same whether the input
+    # arrives as a boolean or as the string 'true'/'false'.
+    if: format('{0}', inputs.manager-tests) == 'true'
+    name: manager (${{ matrix.platform }})
+    needs: platforms
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - platform: darwin-x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - platform: darwin-arm64
-            runner: macos-15
-            target: aarch64-apple-darwin
-          - platform: win32-x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          - platform: win32-arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    # The slowest lane takes ~11 minutes. A hung test must not hold a scarce
+    # macOS runner for GitHub's 6-hour default; the driver's per-binary
+    # timeout reports first, and this is the backstop.
+    timeout-minutes: 45
+    env:
+      PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      # Keep file/line backtraces, not the large variable/type debug sections.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        working-directory: manager
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      # Node runs the release bump and, on Linux, the parallel test driver.
+      - uses: actions/setup-node@v6
+        if: inputs.version != '' || runner.os == 'Linux'
+        with:
+          node-version: 24
+      - name: Apply computed release version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        working-directory: .
+        run: node scripts/bump-release.mjs "$RELEASE_VERSION"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: manager
+          shared-key: manager-tests-${{ matrix.platform }}
+          # A failing regression must not force the next run to recompile all
+          # dependencies. Workspace test outputs are still excluded by default.
+          cache-on-failure: true
+          cache-bin: false
+      # Linux: the complete suite, with ordinary test binaries overlapping
+      # instead of cargo running them one after another; CPU-saturating and
+      # wall-clock suites still run alone. macOS and Windows keep plain cargo
+      # test: with overlap, darwin-x64 twice left a test process that never
+      # exited, and Windows suites are short with racy Git Bash start-up.
+      - run: node ../scripts/cargo-test-parallel.mjs --locked --features test-clock
+        if: runner.os == 'Linux'
+      - run: cargo test --locked --features test-clock
+        if: runner.os != 'Linux'
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: manager-logs-${{ matrix.platform }}
+          path: pi-famulus-test-artifacts
+          if-no-files-found: ignore
+
+  native:
+    if: format('{0}', inputs.packages) == 'true'
+    name: native (${{ matrix.platform }})
+    # Only the platform list; release builds never wait for the debug suites.
+    needs: platforms
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     env:
       PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
@@ -93,6 +187,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
       - name: Capture source commit for release build
         shell: bash
         run: echo "PI_FAMULUS_GIT_SHA=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_ENV"
@@ -111,7 +207,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: manager
-          key: ${{ matrix.target }}
+          key: package-${{ matrix.target }}
+          cache-bin: false
       # musl-gcc links on the runner's own architecture; no cross linker needed.
       - name: Install native musl linker
         if: runner.os == 'Linux'
@@ -120,22 +217,25 @@ jobs:
           sudo apt-get install -y musl-tools
           echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
-      # Keep real-time timing canaries AND manually stepped daemon clock coverage.
-      # tests/platform.rs is the portable lifecycle suite (named pipes, Job
-      # Objects and the task shell on Windows); the sh-based suites are Unix-only.
-      - run: cargo test --locked
-        working-directory: manager
-      - run: cargo test --locked --features test-clock
-        working-directory: manager
+      # Debug tests run independently in manager-tests. Benchmark the release
+      # profile here; do not make package builds wait for unrelated debug tests.
       - name: Resource usage benchmark
         shell: bash
         env:
           PI_FAMULUS_BENCH: '1'
           PI_FAMULUS_BENCH_OUT: ${{ runner.temp }}/bench-${{ matrix.platform }}.json
-        run: cargo test --locked --release --test resource_bench
+        run: |
+          # Linux keeps its existing host/glibc benchmark plus musl package
+          # smoke coverage. On macOS/Windows the package target IS the host:
+          # use its target directory so the following build reuses this binary.
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            cargo test --locked --release --test resource_bench
+          else
+            cargo test --locked --release --target "$TARGET" --test resource_bench
+          fi
         working-directory: manager
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: resource-bench-${{ matrix.platform }}
           path: ${{ runner.temp }}/bench-${{ matrix.platform }}.json
@@ -181,6 +281,10 @@ jobs:
       - name: Install tarballs and verify automatic CLI and extension resolution
         shell: bash
         run: |
+          # HOME is isolated below, but downloads must still use the directory
+          # restored/saved by setup-node rather than a throwaway sandbox cache.
+          npm_config_cache=$(npm config get cache)
+          export npm_config_cache
           sandbox=$(mktemp -d "$RUNNER_TEMP/npm-smoke.XXXXXX")
           export HOME="$sandbox/home" USERPROFILE="$sandbox/home"
           mkdir -p "$HOME" "$sandbox/project"

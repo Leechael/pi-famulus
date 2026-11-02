@@ -378,6 +378,20 @@ impl Port {
                     )
                     .await
             }
+            // Test-clock only: an ordered barrier through Desktop's command
+            // queue, so tests can check "nothing was sent" without waiting.
+            #[cfg(feature = "test-clock")]
+            "debug_desktop_flush" => {
+                self.rt.native.desktop_flush().await;
+                Ok(json!({}))
+            }
+            // Test-clock only: native base-socket connections accepted and
+            // still being handled (an exact "frame processed" barrier).
+            #[cfg(all(unix, feature = "test-clock"))]
+            "debug_native_base" => Ok(json!({
+                "accepted": self.rt.native.base_accepted.load(std::sync::atomic::Ordering::SeqCst),
+                "busy": self.rt.native.base_busy.load(std::sync::atomic::Ordering::SeqCst),
+            })),
             "idle_status" => {
                 let mut s = self.rt.state.lock().unwrap();
                 s.subscriptions.retain(|_, w| {

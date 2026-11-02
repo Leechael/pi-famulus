@@ -157,7 +157,9 @@ fn u1_upgrade_keeps_every_task_running() {
     );
     // A wait in flight when the upgrade starts.
     c.send(&json!({"v":1,"id":"inflight-wait","type":"wait","task_id":sleeper,"budget_ms":20000}));
-    std::thread::sleep(Duration::from_millis(300));
+    // The daemon reads a connection's requests in order: once a later
+    // request is answered, the wait was read and dispatched (in flight).
+    c.request_ok(json!({"type":"list"}));
 
     let out = upgrade(&home);
     assert!(out.status.success(), "upgrade failed: {} {}", out.stdout, out.stderr);
@@ -289,10 +291,15 @@ fn u4_bad_binary_is_refused_before_anything_changes() {
     assert!(human.contains("upgrades: 0 (last attempt failed") && human.contains("not an upgrade target"), "{human}");
     // The same connection still works and still streams.
     let before = event_text(&c.events, &t).len();
-    c.request_ok(json!({"type":"list"}));
-    std::thread::sleep(Duration::from_millis(400));
-    c.request_ok(json!({"type":"list"}));
-    assert!(event_text(&c.events, &t).len() > before, "monitor kept streaming on the same connection");
+    // More output arrives on the same connection (each round trip reads the
+    // events pushed before its reply).
+    assert!(
+        poll_true(s(10), || {
+            c.request_ok(json!({"type":"list"}));
+            event_text(&c.events, &t).len() > before
+        }),
+        "monitor kept streaming on the same connection"
+    );
     assert!(pid_alive(pid));
     // A successful check with a foreign marker is not an upgrade target.
     std::fs::write(&bad, "#!/bin/sh\necho foreign-handover 1 0.1.0\n").unwrap();
@@ -321,7 +328,14 @@ fn u5_failed_exec_rolls_back() {
     hello(&mut c, "sess-u5");
     let (t, pid) = start(&mut c, "monitor",
         "i=0; while [ $i -lt 150 ]; do echo m-$i; i=$((i+1)); if [ $((i % 5)) -eq 0 ]; then sleep 0.1; fi; done", json!({}));
-    std::thread::sleep(Duration::from_millis(500));
+    // The monitor is streaming when the upgrade starts.
+    assert!(
+        poll_true(s(10), || {
+            c.request_ok(json!({"type":"list"}));
+            !event_text(&c.events, &t).is_empty()
+        }),
+        "monitor never streamed before the upgrade"
+    );
     let out = upgrade(&home);
     assert!(!out.status.success(), "{}", out.stdout);
     assert!(out.stderr.contains("exec /nonexistent"), "{}", out.stderr);
@@ -451,9 +465,12 @@ fn u9_cli_wait_and_follow_survive_an_upgrade() {
         "i=0; while [ $i -lt 60 ]; do echo f-$i; i=$((i+1)); if [ $((i % 2)) -eq 0 ]; then sleep 0.1; fi; done; exit 3", json!({}));
     let (h1, h2) = (home.path.clone(), home.path.clone());
     let (t1, t2) = (t.clone(), t.clone());
+    let seen = if home.manual { home.accepted_connections() } else { 0 };
     let wait = std::thread::spawn(move || run_cli(&h1, &["wait", &t1, "--budget-ms", "20000"], s(30)));
     let follow = std::thread::spawn(move || run_cli(&h2, &["output", &t2, "-f"], s(30)));
-    std::thread::sleep(Duration::from_millis(700));
+    // Both CLIs are attached when the upgrade starts: manual-clock builds
+    // wait until they connected.
+    home.wait_accepted(seen, 2);
     assert!(upgrade(&home).status.success());
     let w = wait.join().unwrap();
     assert!(w.status.success() && w.stdout.contains("done exit_code=3"), "wait: {} {}", w.stdout, w.stderr);
@@ -547,7 +564,7 @@ fn u12_idle_rule_waits_for_clients_after_an_upgrade() {
     drop(c);
     // No client for longer than the idle grace.
     home.advance_now(6_000);
-    settle();
+    home.settle();
     assert!(pid_alive(pid), "task killed by the idle rule during the handover grace");
     assert!(wait_child(&mut d, Duration::from_millis(10)).is_none(), "daemon exited during the handover grace");
     if home.manual {

@@ -129,6 +129,23 @@ mod manual {
     pub struct ClockStatus {
         pub now_ms: u64,
         pub pending: Vec<PendingTimer>,
+        /// Frames the daemon's writers dropped as oversized (set by the
+        /// daemon), so tests can wait for a drop instead of pausing.
+        #[serde(default)]
+        pub dropped_oversized_frames: u64,
+        /// Queued agent acquisitions (set by the daemon), so tests can wait
+        /// for a queue to fill instead of pausing.
+        #[serde(default)]
+        pub pending_agents: u64,
+        /// Client connections the daemon accepted so far (set by the daemon),
+        /// so tests can wait for a client to connect instead of pausing.
+        #[serde(default)]
+        pub accepted_connections: u64,
+        /// Tasks whose output fanout has not finished (set by the daemon): a
+        /// fanout ends at its task's EOF, so a test waits for zero instead of
+        /// measuring CPU over a wall-clock window.
+        #[serde(default)]
+        pub live_fanouts: u64,
     }
 
     /// Removes the sleeper when the sleeping future completes or is dropped
@@ -213,6 +230,10 @@ mod manual {
                         due_in_ms: s.deadline_ms.saturating_sub(st.now_ms),
                     })
                     .collect(),
+                dropped_oversized_frames: 0,
+                pending_agents: 0,
+                accepted_connections: 0,
+                live_fanouts: 0,
             }
         }
     }

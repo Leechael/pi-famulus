@@ -698,6 +698,8 @@ async fn serve(
         tokio::select! {
             res = listener.accept() => match res {
                 Ok(stream) => {
+                    #[cfg(feature = "test-clock")]
+                    ACCEPTED_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let s = state.clone();
                     tokio::spawn(async move { handle_conn(s, stream).await });
                 }
@@ -972,6 +974,14 @@ impl Drop for CountGuard {
     }
 }
 
+/// Test-clock only: client connections accepted (`clock_status`).
+#[cfg(feature = "test-clock")]
+static ACCEPTED_CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test-clock only: oversized frames the writers dropped (`clock_status`).
+#[cfg(feature = "test-clock")]
+static OVERSIZED_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
     mut w: W,
     mut rx: mpsc::Receiver<OutFrame>,
@@ -988,6 +998,8 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
         // substitutes an error for oversized responses, so this is a last
         // line of defence.
         if payload.len() > MAX_FRAME_SIZE as usize {
+            #[cfg(feature = "test-clock")]
+            OVERSIZED_DROPPED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(ack) = frame.ack {
                 let _ = ack.send(Err("frame exceeds the 4 MiB limit".to_string()));
             }
@@ -2261,10 +2273,23 @@ fn handle_clock(
             "manual clock not enabled (start the daemon with PI_FAMULUS_TEST_CLOCK=manual)",
         ));
     };
-    Ok(match req {
+    let mut status = match req {
         RequestKind::ClockAdvance { ms } => m.advance(*ms),
         _ => m.status(),
-    })
+    };
+    status.dropped_oversized_frames = OVERSIZED_DROPPED.load(std::sync::atomic::Ordering::SeqCst);
+    {
+        let st = state.lock().unwrap();
+        status.pending_agents = st.pending_agents.len() as u64;
+        status.live_fanouts = st
+            .registry
+            .tasks
+            .values()
+            .filter(|e| e.fanout.as_ref().is_some_and(|h| !h.is_finished()))
+            .count() as u64;
+    }
+    status.accepted_connections = ACCEPTED_CONNECTIONS.load(std::sync::atomic::Ordering::SeqCst);
+    Ok(status)
 }
 
 fn authorize_agent(
@@ -5402,6 +5427,25 @@ fn admit_agent(
 
 #[cfg(test)]
 mod tests {
+    /// The daemon's real timers, proven on paused tokio time instead of
+    /// waiting for them. `Clock::default()` is the clock a daemon gets
+    /// without `PI_FAMULUS_TEST_CLOCK=manual` (always, in a normal build);
+    /// paused time auto-advances only when every task is idle, so the
+    /// elapsed time is exactly what each timer slept. The manual-clock
+    /// boundaries (alive 1ms before, acted on at the constant) are pinned by
+    /// tests/timing_canary.rs.
+    #[tokio::test(start_paused = true)]
+    async fn real_clock_idle_and_kill_graces_sleep_exactly_their_constants() {
+        assert_eq!(IDLE_SHUTDOWN, Duration::from_secs(5));
+        assert_eq!(KILL_GRACE, Duration::from_secs(2));
+        let clock = crate::clock::Clock::default();
+        for (label, grace) in [("idle", IDLE_SHUTDOWN), ("kill-grace", KILL_GRACE), ("shutdown-grace", KILL_GRACE)] {
+            let started = tokio::time::Instant::now();
+            clock.sleep(label, grace).await;
+            assert_eq!(started.elapsed(), grace, "{label}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -697,6 +697,25 @@ impl WireRelay {
     pub(super) fn push(&self, frame: Value) {
         self.outgoing.send(frame).unwrap();
     }
+    /// `request`, for a frame that needs daemon time to pass (the next
+    /// snapshot, a re-register after the reconnect backoff). Manual clock:
+    /// step 250ms ticks while waiting, at most `RELAY_WAIT_MS` of daemon
+    /// time. Real clock: plain `request`.
+    pub(super) fn request_stepping(&self, fixture: &Fixture, kind: &str) -> Value {
+        assert!(fixture.manual, "request_stepping needs the manual clock");
+        let mut stepped = 0;
+        loop {
+            while let Ok(frame) = self.requests.recv_timeout(Duration::from_millis(20)) {
+                if frame["type"] == kind {
+                    return frame;
+                }
+            }
+            assert!(stepped < RELAY_WAIT_MS, "no relay {kind} frame within {stepped}ms of daemon time");
+            fixture.let_pass(250);
+            stepped += 250;
+        }
+    }
+
     pub(super) fn request(&self, kind: &str) -> Value {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -709,15 +728,54 @@ impl WireRelay {
             }
         }
     }
-    fn assert_quiet(&self, window: Duration, forbidden: impl Fn(&Value) -> bool, why: &str) {
-        let deadline = Instant::now() + window;
-        while let Ok(frame) = self
-            .requests
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
+    /// Every frame the daemon sends while `ms` of daemon time passes
+    /// (manual clock only). The window is stepped; then a marker session is
+    /// registered and one more snapshot period stepped, and frames are read
+    /// until a snapshot lists the marker. That snapshot was built after the
+    /// window, and frames on the relay socket are ordered, so every frame
+    /// sent inside the window arrived before it. No snapshot counting, so an
+    /// earlier snapshot that was or was not read cannot shift the barrier.
+    pub(super) fn frames_through(&self, fixture: &Fixture, ms: u64) -> Vec<Value> {
+        assert!(fixture.manual, "frames_through needs the manual clock");
+        fixture.let_pass(ms);
+        let _marker = fixture.plugin("relay-window-marker", "busy");
+        fixture.let_pass(RELAY_SNAPSHOT_MS);
+        let mut frames = Vec::new();
+        loop {
+            let frame = self
+                .requests
+                .recv_timeout(TIMEOUT)
+                .expect("relay snapshot listing the window marker");
+            let marked = frame["type"] == "snapshot"
+                && frame["sessions"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        row["id"] == "pi/relay-window-marker" || row["name"] == "name-relay-window-marker"
+                    })
+                });
+            frames.push(frame);
+            if marked {
+                return frames;
+            }
+        }
+    }
+
+    /// No forbidden frame reaches the relay while `ms` of daemon time passes:
+    /// stepped and checked through the snapshot barrier on the manual clock
+    /// (`frames_through`), waited out on the real clock.
+    fn assert_quiet_for(
+        &self,
+        fixture: &Fixture,
+        ms: u64,
+        forbidden: impl Fn(&Value) -> bool,
+        why: &str,
+    ) {
+        assert!(fixture.manual, "assert_quiet_for needs the manual clock");
+        for frame in self.frames_through(fixture, ms) {
             assert!(!forbidden(&frame), "{why}: {frame}");
         }
     }
+
+
 }
 
 impl Drop for WireRelay {
@@ -791,8 +849,19 @@ pub(super) fn relay_basics(request: &Value) -> Vec<Value> {
     }
 }
 
+/// Daemon time a stepped relay wait may take: past the 60s read timeout and
+/// the reconnect backoff.
+const RELAY_WAIT_MS: u64 = 120_000;
+
 fn start_relay(fixture: &mut Fixture, relay: &WireRelay, extra: &str) {
     start_relay_options(fixture, relay, extra, &[]);
+}
+
+/// `start_relay` on the test clock (see `Fixture::start_clocked`).
+fn start_relay_clocked(fixture: &mut Fixture, relay: &WireRelay, extra: &str) {
+    start_relay_options_env(fixture, relay, extra, &[], Fixture::clock_env());
+    relay.request("register");
+    fixture.wait_session("pi/remote");
 }
 
 fn start_relay_options(fixture: &mut Fixture, relay: &WireRelay, extra: &str, args: &[&str]) {
@@ -901,7 +970,7 @@ fn relay_hosted_endpoints_route_remotely_without_shadowing_local_webhooks() {
     assert_eq!(endpoint.request().body["message"]["body"], "local body");
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let snapshot = relay.request("snapshot");
+        let snapshot = relay.request_stepping(&fixture, "snapshot");
         let rows = snapshot["sessions"].as_array().unwrap();
         assert!(
             rows.iter()
@@ -913,8 +982,9 @@ fn relay_hosted_endpoints_route_remotely_without_shadowing_local_webhooks() {
         }
         assert!(Instant::now() < deadline, "sender never published");
     }
-    relay.assert_quiet(
-        Duration::from_millis(100),
+    relay.assert_quiet_for(
+        &fixture,
+        100,
         |request| request["type"] == "send",
         "local webhook send escaped to relay",
     );
@@ -967,7 +1037,7 @@ fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() 
         }
     });
     let mut fixture = stable_fixture();
-    start_relay(&mut fixture, &relay, "");
+    start_relay_clocked(&mut fixture, &relay, "");
     let mut sender = fixture.plugin("sender", "busy");
     let failed = sender.call(json!({"op":"send","to":"pi/remote","body":"do not resend"}));
     assert_ne!(failed["ok"], true);
@@ -977,8 +1047,9 @@ fn relay_invalid_ack_is_protocol_error_not_unavailable_and_never_resends_body() 
         "invalid ACK outcome: {failed}"
     );
     relay.request("send");
-    relay.assert_quiet(
-        RESEND_QUIET,
+    relay.assert_quiet_for(
+        &fixture,
+        RESEND_QUIET_MS,
         |request| request["type"] == "send",
         "invalid ACK replayed body",
     );
@@ -1207,7 +1278,7 @@ fn mcp_list_sessions_and_relay_snapshot_omit_internal_fields() {
     assert_eq!(listed["cwd"], "/fixture/leaky");
     let deadline = Instant::now() + TIMEOUT;
     let published = loop {
-        let snapshot = relay.request("snapshot");
+        let snapshot = relay.request_stepping(&fixture, "snapshot");
         if let Some(row) = snapshot["sessions"]
             .as_array()
             .into_iter()

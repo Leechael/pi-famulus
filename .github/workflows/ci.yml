@@ -25,22 +25,35 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
+# Only PR updates share a group. A unique group for every other run also
+# prevents GitHub's single pending slot from replacing an older main commit.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'release' && github.event_name != 'workflow_dispatch' }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/main' }}
 
 jobs:
+  # Package validation always runs for code changes; the expensive manager
+  # suites only when the manager changed, release packaging only when a
+  # packaged component (manager or extension) changed.
   native-packages:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.code == 'true'
     uses: ./.github/workflows/native-packages.yml
     with:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
+      manager-tests: ${{ needs.pi-matrix.outputs.rust == 'true' }}
+      all-architectures: ${{ github.event_name != 'pull_request' }}
+      packages: ${{ needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true' }}
 
   # Lint gate: clippy warnings fail the build. Each OS compiles its own cfg
   # branches (Unix handover, macOS proc_pidinfo, Windows job objects), so a
   # Linux-only run would miss most of the platform code.
   clippy:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.rust == 'true'
     name: clippy (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -69,10 +82,18 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.read.outputs.matrix }}
+      code: ${{ steps.scope.outputs.code }}
+      rust: ${{ steps.scope.outputs.rust }}
+      extension: ${{ steps.scope.outputs.extension }}
+      eval: ${{ steps.scope.outputs.eval }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || '' }}
+      - uses: ./.github/actions/ci-scope
+        id: scope
+        with:
+          force: ${{ inputs.ref != '' || inputs.version != '' }}
       - id: read
         run: echo "matrix=$(jq -c . .github/pi-compat.json)" >> "$GITHUB_OUTPUT"
 
@@ -82,6 +103,7 @@ jobs:
   extension-compat:
     name: extension (pi ${{ matrix.pi-version }})
     needs: pi-matrix
+    if: needs.pi-matrix.outputs.extension == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.pi-matrix.outputs.matrix) }}
@@ -100,8 +122,11 @@ jobs:
           cache-dependency-path: extension/package-lock.json
       # First-party natives use local lock links before registry bootstrap.
       # Do not omit all optionals: TypeScript and Rollup need native bindings.
+      # The locked source tree is identical in every compatibility lane. Check
+      # it once here; each selected pi version is still typechecked below.
       - run: npm ci
       - run: npx tsc --noEmit
+        if: matrix.pi-version == '1.0.0'
       # Run the full suite with the locked local native package links once.
       - run: npx vitest run
         if: matrix.pi-version == '1.0.0'
@@ -119,6 +144,8 @@ jobs:
       - run: npm run test:compat
 
   extension-windows:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.extension == 'true'
     name: extension (windows-latest)
     runs-on: windows-latest
     defaults:
@@ -139,19 +166,54 @@ jobs:
       - run: npx tsc --noEmit
       - run: npx vitest run
 
-  # Preserve the historical required check name while the compatibility matrix
-  # reports its individual versioned checks.
+  # Keep the historical required check name, now covering the entire pipeline.
+  # Require this stable aggregate, not conditional matrix names: docs-only
+  # matrix jobs are skipped before their individual check names are expanded.
   extension:
-    needs: extension-compat
-    if: always()
+    needs: [pi-matrix, native-packages, clippy, extension-compat, extension-windows, e2e]
+    # Unlike always(), this does not keep superseded runs alive just to report
+    # a failed aggregate. Ordinary upstream failures still reach this gate.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Require the compatibility matrix to pass
-        run: test "${{ needs.extension-compat.result }}" = success
+      - name: Require every CI family the scope selected, and only those
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          const results = JSON.parse(process.env.RESULTS);
+          const scope = results['pi-matrix'];
+          assert.equal(scope.result, 'success', 'scope classification must succeed');
+          const decision = name => {
+            const value = scope.outputs?.[name];
+            assert.ok(['true', 'false'].includes(value), `scope decision ${name} must be explicit`);
+            return value === 'true';
+          };
+          const code = decision('code');
+          const rust = decision('rust');
+          const extension = decision('extension');
+          const evalHarness = decision('eval');
+          assert.ok(code || !(rust || extension || evalHarness), 'docs-only scope cannot select a component');
+          const wanted = {
+            'native-packages': code,
+            clippy: rust,
+            'extension-compat': extension,
+            'extension-windows': extension,
+            e2e: rust || extension || evalHarness,
+          };
+          for (const [name, run] of Object.entries(wanted)) {
+            const expected = run ? 'success' : 'skipped';
+            assert.equal(results[name]?.result, expected, `${name} must be ${expected}`);
+          }
+          NODE
 
   # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.
+  # Drives the real manager, the extension and the eval harness together.
   e2e:
+    needs: pi-matrix
+    if: needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true' || needs.pi-matrix.outputs.eval == 'true'
     name: e2e (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -159,6 +221,8 @@ jobs:
       # for real-world compatibility coverage; other Ubuntu jobs are pinned.
       matrix:
         os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+        # One architecture per OS on PRs; main pushes and releases run all.
+        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-24.04-arm"}]' || '[]') }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -199,8 +263,11 @@ jobs:
         working-directory: extension
         env:
           PI_FAMULUS_INTEG: "1"
+      # This pure TypeScript check has the same inputs on every host. Runtime
+      # integration, Unix unit tests and graders retain their OS coverage.
       - run: npm run typecheck
         working-directory: eval
+        if: matrix.os == 'ubuntu-latest'
       # Eval-internal unit and grader tests drive /bin/sh fixtures; the
       # product scenarios (integration + faux e2e) run on every OS.
       - run: npm run test:unit

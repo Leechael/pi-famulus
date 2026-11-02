@@ -34,17 +34,17 @@ fn killed_alias_publication_is_reaped_within_one_second_and_recovers_latest_desi
     let cwd = fixture.root.join("reap-marker-cwd");
     fs::create_dir(&cwd).unwrap();
     plugin.ok(json!({"op":"register","session":{"id":"fast-reap","name":marker,"cwd":cwd,"pid":std::process::id(),"status":"waiting","caps":["read_receipts","idle_state_v1"]}}));
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     let old = loop {
         let row = alias_record(&fixture, "pi/fast-reap");
         if row["name"] == marker && row["status"] == "waiting" && row["cwd"] == json!(cwd) {
             break row;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "registry never reflected the fresh reconciliation marker"
         );
-        thread::sleep(Duration::from_millis(5));
+        fixture.tick_within(&deadline);
     };
     let pid = old["pid"].as_u64().unwrap() as u32;
     let (_, start) = kernel_process_fields(pid).expect("old alias must be a real live child");
@@ -55,7 +55,7 @@ fn killed_alias_publication_is_reaped_within_one_second_and_recovers_latest_desi
         .join(format!("{pid}.json"));
     let socket = PathBuf::from(old["messagingSocketPath"].as_str().unwrap());
     common::kill_pid(pid, libc::SIGKILL);
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = fixture.deadline(Duration::from_secs(1));
     let mut listener_dead = false;
     loop {
         let state = kernel_process_fields(pid);
@@ -70,12 +70,12 @@ fn killed_alias_publication_is_reaped_within_one_second_and_recovers_latest_desi
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "dead alias publication survived the cmd.Wait cleanup window: listener_dead={listener_dead}, registry={}, socket={}, kernel={state:?}",
             registry.exists(),
             socket.exists()
         );
-        thread::sleep(Duration::from_millis(5));
+        fixture.tick_within(&deadline);
     }
     let next = alias_record_in_phase(&fixture, "pi/fast-reap", "event-driven child recovery");
     assert_ne!(next["pid"], old["pid"]);
@@ -120,7 +120,7 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
     let (_, old_start) = kernel_process_fields(old.0.id()).unwrap();
     old.0.kill().unwrap();
     old.0.wait().unwrap();
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let mut probe = SourceProcess(
             common::command("sleep")
@@ -138,7 +138,7 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "kernel start-time tick never advanced beyond the old process incarnation"
         );
     }
@@ -158,6 +158,8 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
     );
     common::kill_pid(pid, libc::SIGSTOP);
     let resume = ResumeManager(pid);
+    // An OS state, not a daemon timer, and a stopped daemon cannot answer a
+    // clock step: poll the process state.
     let deadline = Instant::now() + TIMEOUT;
     while !kernel_process_fields(pid).is_some_and(|(state, _)| state == "T" || state == "t") {
         assert!(
@@ -179,17 +181,17 @@ fn initially_degraded_base_recovers_owned_previous_kernel_incarnation_without_an
     fs::write(&registry, serde_json::to_vec(&row).unwrap()).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).unwrap();
     drop(resume);
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     let recovered = loop {
         let row: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
         if row["procStart"] == current_start && row["intercomGeneration"] != generation {
             break row;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "base with no in-memory predecessor never reclaimed a proven prior kernel incarnation: {row}"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     };
     assert_eq!(recovered["pid"], pid);
     let socket = recovered["messagingSocketPath"].as_str().unwrap();
@@ -224,7 +226,7 @@ fn native_pi_read_before_physical_write_ack_keeps_read_ledger_and_still_acknowle
     target.write(
         &json!({"id":"read-before-physical-ack","op":"receipt","message_id":id,"status":"read"}),
     );
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let state = super::super::network::tool(
             address,
@@ -236,10 +238,10 @@ fn native_pi_read_before_physical_write_ack_keeps_read_ledger_and_still_acknowle
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "read was not recorded while the body writer was still blocked"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     }
     let mut line = String::from_utf8(prefix.to_vec()).unwrap();
     target.reader.read_line(&mut line).unwrap();
@@ -273,7 +275,7 @@ pub(super) fn alias_record(fixture: &Fixture, id: &str) -> Value {
 }
 
 fn alias_record_in_phase(fixture: &Fixture, id: &str, phase: &str) -> Value {
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         if let Some(entry) = fs::read_dir(fixture.root.join(".claude/sessions"))
             .into_iter()
@@ -286,10 +288,11 @@ fn alias_record_in_phase(fixture: &Fixture, id: &str, phase: &str) -> Value {
             return entry;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "native alias {id} never published during {phase}"
         );
-        thread::sleep(Duration::from_millis(20));
+        // Publication follows the native scan, on the daemon clock.
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -335,7 +338,8 @@ fn native_watcher_observes_pi_alias_with_correlated_peer_idle_notice_not_user_te
     let id = "223bfe8d-0039-4cbd-b1f9-a892a2773d26";
     native.send_control(alias["messagingSocketPath"].as_str().unwrap(),json!({"type":"control","action":"notify_when_idle","from":format!("uds:{}",native.path.display()),"msg_id":id}));
     target.register("target", "idle", &["read_receipts", "idle_state_v1"]);
-    let notice = native.frame();
+    // Native scan and the idle settle, on the daemon clock.
+    let notice = native.frame_stepping(&fixture);
     assert_eq!(notice["type"], "control");
     assert_eq!(notice["action"], "peer_idle_notice");
     assert_eq!(notice["orig_msg_id"], id);
@@ -362,7 +366,7 @@ fn native_alias_namespace_co_locates_with_verified_peer_and_revokes_idle_capabil
         .iter()
         .any(|v| v == "notify_idle"));
     plugin.register("namespace", "busy", &["read_receipts"]);
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let alias = alias_record(&fixture, "pi/namespace");
         if !alias["peerFeatures"]
@@ -372,10 +376,10 @@ fn native_alias_namespace_co_locates_with_verified_peer_and_revokes_idle_capabil
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "revoked Pi capability still advertised to native peers"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -387,7 +391,7 @@ fn crashed_native_alias_is_republished_by_regular_sync_without_user_repair() {
     let original = alias_record(&fixture, "pi/recover");
     let pid = original["pid"].as_u64().unwrap() as u32;
     common::kill_pid(pid, libc::SIGKILL);
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let replacement = alias_record(&fixture, "pi/recover");
         if replacement["pid"] != original["pid"] {
@@ -407,10 +411,10 @@ fn crashed_native_alias_is_republished_by_regular_sync_without_user_repair() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "regular sync did not recover crashed alias"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -557,7 +561,7 @@ fn native_user_to_local_codex_alias_keeps_original_uuid_through_real_host_read_r
         .as_str()
         .unwrap()
         .contains("native through Codex alias"));
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         let status = super::super::network::tool(
             address,
@@ -569,10 +573,10 @@ fn native_user_to_local_codex_alias_keeps_original_uuid_through_real_host_read_r
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "native Codex completion did not update read ledger"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     }
     let receipt =
         native.frame_for("local Codex delivered ACK while canonical ledger is already read");
@@ -625,7 +629,7 @@ fn failed_namespace_bind_preserves_old_alias_and_revokes_idle_before_retry() {
     common::kill_pid(old_pid, libc::SIGSTOP);
     let resume = ResumeAlias(old_pid);
     plugin.register("migrating", "busy", &["read_receipts"]);
-    let deadline = Instant::now() + Duration::from_millis(4500);
+    let deadline = fixture.deadline(Duration::from_millis(4500));
     loop {
         let current = alias_record(&fixture, "pi/migrating");
         assert_eq!(current["pid"], old["pid"]);
@@ -637,10 +641,10 @@ fn failed_namespace_bind_preserves_old_alias_and_revokes_idle_before_retry() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "failed migration kept advertising revoked notify_idle on the working predecessor"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
     drop(resume);
     native.send_control(
@@ -661,8 +665,8 @@ fn failed_namespace_bind_preserves_old_alias_and_revokes_idle_before_retry() {
         initial["orig_msg_id"],
         "223bfe8d-0039-4cbd-b1f9-a892a2773d33"
     );
-    let deadline = Instant::now() + Duration::from_millis(800);
-    while Instant::now() < deadline {
+    let deadline = fixture.deadline(Duration::from_millis(800));
+    while deadline.alive() {
         fixture.sessions();
         let retained = alias_record(&fixture, "pi/migrating");
         assert_eq!(
@@ -690,7 +694,7 @@ fn failed_namespace_bind_preserves_old_alias_and_revokes_idle_before_retry() {
     row["messagingSocketPath"] = json!(native.path);
     fs::write(&registry, serde_json::to_vec(&row).unwrap()).unwrap();
     let blocked = preferred.join(format!("{pid}.sock"));
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     let current = loop {
         fixture.sessions();
         let entry = alias_record(&fixture, "pi/migrating");
@@ -700,21 +704,21 @@ fn failed_namespace_bind_preserves_old_alias_and_revokes_idle_before_retry() {
             break entry;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "native discovery never migrated alias after moving the verified peer to a bindable namespace"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     };
     let current_socket = current["messagingSocketPath"].as_str().unwrap();
     assert!(UnixStream::connect(current_socket).is_ok());
     assert!(UnixStream::connect(&blocked).is_ok());
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     while old_socket.exists() || old_base.exists() {
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "successful migration retained retired namespace endpoints"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     }
     let sent = plugin
         .ok(json!({"op":"send","to":"claude/later-native","body":"outbound after migration"}));
@@ -725,14 +729,14 @@ fn failed_namespace_bind_preserves_old_alias_and_revokes_idle_before_retry() {
     native.send_control(current_socket,json!({"type":"user","from":format!("uds:{}",native.path.display()),"from_name":"native","from_mode":"prompting","msg_id":"223bfe8d-0039-4cbd-b1f9-a892a2773d29","message":{"role":"user","content":"inbound after migration"}}));
     assert_eq!(plugin.event("deliver")["body"], "inbound after migration");
     fs::remove_file(&blocked).unwrap();
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     while UnixStream::connect(&blocked).is_err() {
         fixture.sessions();
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "base socket unlink was not repaired in its selected namespace"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
     let report = fixture.run(&["status", "--json"]);
     assert_cli_ok(&report);
@@ -786,8 +790,8 @@ fn same_inode_successor_generation_is_not_reclaimed_until_unpublish_and_survives
         identity: (metadata.dev(), metadata.ino()),
         bytes: bytes.clone(),
     };
-    let deadline = Instant::now() + Duration::from_millis(800);
-    while Instant::now() < deadline {
+    let deadline = fixture.deadline(Duration::from_millis(800));
+    while deadline.alive() {
         plugin.register("owned", "waiting", &["read_receipts", "idle_state_v1"]);
         fixture.sessions();
         assert_eq!(
@@ -842,7 +846,7 @@ fn unlinked_alias_socket_without_successor_recovers_with_a_new_live_child_pid() 
     let original = alias_record(&fixture, "pi/unlink");
     let old_pid = original["pid"].as_u64().unwrap() as u32;
     fs::remove_file(original["messagingSocketPath"].as_str().unwrap()).unwrap();
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         fixture.sessions();
         let current = alias_record(&fixture, "pi/unlink");
@@ -856,10 +860,10 @@ fn unlinked_alias_socket_without_successor_recovers_with_a_new_live_child_pid() 
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "socket unlink did not trigger fresh real helper publication"
         );
-        thread::sleep(Duration::from_millis(20));
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -1045,16 +1049,16 @@ fn late_receipt_after_discovery_removal_verifies_against_send_time_identity() {
         &daemon_socket,
         json!({"type":"control","action":"peer_message_status","from":format!("uds:{}", native.path.display()),"orig_msg_id":late_mid,"status":"delivered"}),
     );
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     loop {
         if plugin_message_status(&mut fixture, &json!(late_mid)) == "delivered" {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "late receipt never verified against the send-time identity"
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     }
 }
 
@@ -1068,7 +1072,7 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
         .root
         .join(".claude/sessions")
         .join(format!("{daemon_pid}.json"));
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = fixture.deadline(TIMEOUT);
     let base_socket = loop {
         if let Ok(entry) = fs::read(&registry) {
             if let Ok(entry) = serde_json::from_slice::<Value>(&entry) {
@@ -1078,11 +1082,11 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
             }
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.alive(),
             "daemon base registry never appeared: {}",
             fixture.log()
         );
-        thread::sleep(Duration::from_millis(10));
+        fixture.tick_within(&deadline);
     };
     // A bare stranger socket: no registry row and no send-time cached
     // identity, so its receipts are unverifiable.
@@ -1092,6 +1096,8 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
     let path = dir.join("stranger.sock");
     let _listener = common::bind_private_unix(&path);
     let fabricated = uuid::Uuid::new_v4().to_string();
+    let base_state = |fixture: &Fixture| fixture.connect().ok(json!({"op":"debug_native_base"}));
+    let accepted_before = fixture.manual.then(|| base_state(&fixture)["accepted"].as_u64().unwrap());
     let mut link = UnixStream::connect(&base_socket).unwrap();
     link.write_all(
         format!(
@@ -1102,8 +1108,20 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
     )
     .unwrap();
     drop(link);
-    // The unverifiable receipt must not be recorded at all.
-    thread::sleep(Duration::from_millis(400));
+    // The unverifiable receipt must not be recorded at all. Manual-clock
+    // builds wait until the daemon accepted this link and finished handling
+    // every base connection (each handles its frames in order, to EOF):
+    // the receipt was then processed. Otherwise allow a moment.
+    let before = accepted_before.expect("manual clock");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let state = base_state(&fixture);
+        if state["accepted"].as_u64().unwrap() > before && state["busy"] == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the receipt link was never handled: {state}");
+        thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(
         plugin_message_status(&mut fixture, &json!(fabricated)),
         "unknown",

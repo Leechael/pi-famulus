@@ -10,6 +10,41 @@ use crate::common;
 use std::path::Path;
 
 /// An extension (parent) connection on the manager socket.
+/// Wait until the daemon has started writing a parked deliver: the body's
+/// bytes are in `peer`'s capped, undrained receive buffer, so the write is
+/// under way and blocked. A condition, instead of a fixed pause.
+fn wait_delivery_started(peer: &mut common::Conn) {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = peer.stream.peek_timeout(&mut buf, Duration::from_millis(20)).unwrap_or(0);
+        if buf[..n].windows(64).any(|w| w.iter().all(|b| *b == b'x')) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the parked deliver never started");
+    }
+}
+
+/// `Conn::wait_id`, for an answer that needs daemon time to pass (a
+/// write-ack timeout). Manual clock: step the clock 250ms at a time while
+/// waiting, at most 30s of daemon time; the bridge may be restarting, so the
+/// steps are not tied to its maintenance timer. Real clock: plain wait.
+fn wait_id_stepping(fixture: &Fixture, conn: &mut common::Conn, id: &str, real: Duration) -> Option<Value> {
+    let _ = real;
+    assert!(fixture.manual, "wait_id_stepping needs the manual clock");
+    let mut stepped = 0;
+    loop {
+        if let Some(frame) = conn.wait_id(id, Duration::from_millis(20)) {
+            return Some(frame);
+        }
+        if stepped >= 30_000 {
+            return None;
+        }
+        common::clock_request(&fixture.root.join("manager"), json!({"type":"clock_advance","ms":250}));
+        stepped += 250;
+    }
+}
+
 fn pi_conn(fixture: &Fixture, session: &str) -> common::Conn {
     let mut conn = common::Conn::new(
         UnixStream::connect(fixture.root.join("manager/manager.sock")).unwrap(),
@@ -379,7 +414,7 @@ fn a_slow_op_on_one_connection_does_not_block_other_sessions_or_close() {
     bob.stream.set_recv_buffer_size(8192).unwrap();
     let body = "x".repeat(3 * 1024 * 1024);
     alice.send(&json!({"v":1,"id":"blocked","type":"intercom","op":{"op":"send","to":"pi/bob-session","body":body,"reply_to":"pi/alice-session"}}));
-    thread::sleep(Duration::from_millis(300));
+    wait_delivery_started(&mut bob);
     // The op must really be blocked: no answer yet.
     let mut probe = [0u8; 1];
     let readable = alice
@@ -506,7 +541,7 @@ fn a_bridge_reset_finishes_the_in_flight_op_and_answers_queued_ops() {
     carol.stream.set_recv_buffer_size(8192).unwrap();
     let body = "x".repeat(3 * 1024 * 1024);
     alice.send(&json!({"v":1,"id":"s1","type":"intercom","op":{"op":"send","to":"pi/carol-session","body":body,"reply_to":"pi/alice-session"}}));
-    thread::sleep(Duration::from_millis(300));
+    wait_delivery_started(&mut carol);
 
     // Two ops queue behind the blocked send (registers, reapplied in
     // order once the bridge is back).
@@ -529,17 +564,14 @@ fn a_bridge_reset_finishes_the_in_flight_op_and_answers_queued_ops() {
 
     // The in-flight send finishes (the old runtime's write-ack times out
     // against the undrained carol) and is answered on the same connection.
-    let send = alice
-        .wait_id("s1", Duration::from_secs(20))
+    let send = wait_id_stepping(&fixture, &mut alice, "s1", Duration::from_secs(20))
         .expect("in-flight send answered");
     assert_eq!(send["ok"], true, "{send}");
     // Then every queued op gets a deterministic, ordered reset answer.
-    let r2 = alice
-        .wait_id("r2", Duration::from_secs(15))
+    let r2 = wait_id_stepping(&fixture, &mut alice, "r2", Duration::from_secs(15))
         .expect("queued op r2 answered promptly");
     assert_eq!(r2["error"]["code"], "E_INTERCOM_RESET", "{r2}");
-    let r3 = alice
-        .wait_id("r3", Duration::from_secs(15))
+    let r3 = wait_id_stepping(&fixture, &mut alice, "r3", Duration::from_secs(15))
         .expect("queued op r3 answered promptly");
     assert_eq!(r3["error"]["code"], "E_INTERCOM_RESET", "{r3}");
     // Wire order across the reset: r2's answer precedes r3's (wait_id
@@ -691,7 +723,7 @@ fn an_unpublish_during_an_in_flight_op_still_reaches_the_extension() {
     carol.stream.set_recv_buffer_size(8192).unwrap();
     let body = "x".repeat(3 * 1024 * 1024);
     alice.send(&json!({"v":1,"id":"s1","type":"intercom","op":{"op":"send","to":"pi/carol-session","body":body,"reply_to":"pi/alice-session"}}));
-    thread::sleep(Duration::from_millis(300));
+    wait_delivery_started(&mut carol);
     let mut cli = fixture.connect();
     cli.ok(json!({"op":"session_unpublish","args":["pi/alice-session"]}));
 
@@ -748,7 +780,7 @@ fn a_dead_pi_process_settles_unread_deliveries_as_dropped() {
 #[test]
 fn a_reconnect_gap_does_not_settle_unread_deliveries() {
     let mut fixture = Fixture::new();
-    fixture.start();
+    fixture.start_clocked();
     // pi_pid is this (alive) test process: a plain disconnect with a gap
     // must NOT settle unread deliveries as dropped.
     let mut alice = pi_conn(&fixture, "alice-session");
@@ -761,7 +793,9 @@ fn a_reconnect_gap_does_not_settle_unread_deliveries() {
     drop(alice);
 
     // The gap: no dropped receipt even though the connection is gone.
-    legacy.no_event_for(Duration::from_millis(700));
+    // Daemon time: stepped on the manual clock, so every maintenance tick
+    // that could settle the delivery runs inside the gap.
+    legacy.quiet_for(&fixture, 700);
 
     // The same session reconnects and re-registers; its late read receipt
     // for the pre-gap delivery is accepted, not settled over.

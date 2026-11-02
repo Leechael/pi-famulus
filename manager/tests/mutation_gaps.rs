@@ -82,9 +82,13 @@ fn g2_autospawned_daemon_survives_sigint_to_spawning_group() {
     assert!(wait_child(&mut cli, S(10)).expect("cli finished").success());
     let daemon = home.pidfile_pid().expect("daemon pid");
     assert!(pid_running(daemon));
+    // Structural, not a wait: the daemon leads its own session and process
+    // group, so no signal to the spawning client's group can reach it.
+    assert_eq!(unsafe { libc::getsid(daemon as i32) }, daemon as i32, "daemon is not a session leader");
+    assert_eq!(unsafe { libc::getpgid(daemon as i32) }, daemon as i32, "daemon shares a process group");
+    assert_ne!(daemon, pgid, "daemon is the spawning client's group");
     kill_group(pgid, libc::SIGINT);
     kill_group(pgid, libc::SIGHUP);
-    std::thread::sleep(Duration::from_millis(500));
     assert!(pid_running(daemon), "daemon died with the spawning client's process group");
 }
 
@@ -192,7 +196,7 @@ fn g7_staggered_disconnects_still_reach_idle_shutdown() {
     drop(a);
     // Longer than the 5s grace while b is still connected.
     home.advance_now(6000);
-    settle();
+    home.settle();
     assert!(d.try_wait().unwrap().is_none(), "shut down while a client was connected");
     drop(b);
     home.advance("idle", 5000);
@@ -253,19 +257,18 @@ fn g9_response_of_exactly_max_frame_is_delivered() {
 }
 
 /// CPU time used by `pid` so far, in milliseconds (`ps -o time=`).
-fn cpu_ms(pid: u32) -> u64 {
-    let o = common::command("ps")
-        .args(["-o", "time=", "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    // [[dd-]hh:]mm:ss[.cc]
-    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    let (rest, frac) = s.split_once('.').unwrap_or((s.as_str(), "0"));
-    let secs = rest
-        .split(':')
-        .fold(0u64, |acc, p| acc * 60 + p.trim_start_matches('-').parse::<u64>().unwrap_or(0));
-    let frac_ms = format!("{frac:0<3}")[..3].parse::<u64>().unwrap_or(0);
-    secs * 1000 + frac_ms
+/// How many of `n` back-to-back scheduler-state samples (`ps -o stat=`,
+/// Linux and macOS) found `pid` runnable (`R`).
+fn runnable_samples(pid: u32, n: usize) -> usize {
+    (0..n)
+        .filter(|_| {
+            let o = common::command("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim_start().starts_with('R')
+        })
+        .count()
 }
 
 /// Kills: daemon.rs spawn_output_fanout EOF handling (a busy loop after the
@@ -281,11 +284,11 @@ fn g10_daemon_is_idle_after_watched_tasks_finish() {
         c.request_ok(json!({"type":"watch","task_id":id}));
         c.wait_terminal(&id, S(5)).unwrap();
     }
-    std::thread::sleep(Duration::from_millis(300));
-    let before = cpu_ms(d.id());
-    std::thread::sleep(Duration::from_millis(1500));
-    let used = cpu_ms(d.id()) - before;
-    assert!(used < 300, "idle daemon used {used}ms CPU in 1.5s");
+    // Exact, not a CPU window: every task's output fanout ends at its EOF; a
+    // fanout spinning after the tee channel closes never finishes.
+    let live = || clock_request(&home.path, json!({"type":"clock_status"}))["live_fanouts"].as_u64().unwrap();
+    assert!(poll_true(S(10), || live() == 0), "an output fanout kept running after its task's EOF");
+    assert!(pid_running(d.id()));
 }
 
 /// A leftover process group stops being tracked once it empties (its
@@ -303,9 +306,10 @@ fn g11_shutdown_counts_only_live_leftover_groups() {
     c.wait_terminal(&live, S(3)).unwrap();
     let gone_gc = wait_for_pids(&mut c, &gone, 1)[0];
     let gc = wait_for_pids(&mut c, &live, 1)[0];
-    // The first group empties; its guardian runner then exits.
+    // The first group empties; its guardian runner then exits. Shutdown
+    // re-checks each leftover group's members itself, so once both are gone
+    // there is nothing left to wait for.
     assert!(poll_true(S(3), || !pid_running(gone_gc) && !pid_running(gone_runner)));
-    settle();
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
     home.advance("shutdown-grace", 2000);
@@ -428,11 +432,11 @@ fn g14_guardian_runner_does_not_spin() {
     let gc = wait_for_pids(&mut c, &id, 1)[0];
     assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "completed");
     assert!(pid_running(runner), "the runner guards the leftover child");
-    std::thread::sleep(Duration::from_millis(300));
-    let before = cpu_ms(runner);
-    std::thread::sleep(Duration::from_millis(1500));
-    let used = cpu_ms(runner) - before;
+    // Sampled, not timed: a spinning runner is runnable (R) whenever it is
+    // looked at, a guarding one is blocked (S). Back-to-back samples, no
+    // measurement window.
+    let running = runnable_samples(runner, 40);
     // gc is the background child's pid, not a process-group id.
     kill_pid(gc, libc::SIGKILL);
-    assert!(used < 150, "guardian runner used {used}ms CPU in 1.5s");
+    assert!(running <= 4, "guardian runner was runnable in {running}/40 samples: it spins");
 }

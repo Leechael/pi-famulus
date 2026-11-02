@@ -14,7 +14,6 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 const S: fn(u64) -> Duration = Duration::from_secs;
-const MS: fn(u64) -> Duration = Duration::from_millis;
 
 /// Invariant (C6): a watcher that never reads its socket must not stall the
 /// task, other clients, or grow the daemon's memory with the output volume.
@@ -39,6 +38,8 @@ fn c6_never_reading_watcher_is_bounded_and_isolated() {
     let mut peak = base_rss;
     let mut worst_latency = Duration::ZERO;
     let deadline = Instant::now() + S(90);
+    let mut cli = home.connect();
+    cli.hello_cli();
     loop {
         let t = Instant::now();
         let r = other
@@ -47,18 +48,18 @@ fn c6_never_reading_watcher_is_bounded_and_isolated() {
         worst_latency = worst_latency.max(t.elapsed());
         peak = peak.max(rss_bytes(daemon_pid).unwrap_or(0));
         let _ = r;
-        let mut cli = home.connect();
-        cli.hello_cli();
-        if let Some(rec) = cli.task(&id) {
-            if rec["status"] != "running" {
-                assert_eq!(rec["status"], "completed", "producer failed: {rec}");
-                assert_eq!(rec["exit_code"], 0, "producer failed: {rec}");
-                assert_eq!(rec["output_size"], TOTAL, "incomplete backpressure workload: {rec}");
-                break;
-            }
+        // A long-poll, not a client-side sleep: `wait` returns the moment the
+        // producer ends, otherwise after its budget, which paces the latency
+        // and RSS probes.
+        let w = cli.request(json!({"type":"wait","task_id":id,"budget_ms":100}));
+        if w["done"] == true {
+            let rec = cli.task(&id).expect("producer record");
+            assert_eq!(rec["status"], "completed", "producer failed: {rec}");
+            assert_eq!(rec["exit_code"], 0, "producer failed: {rec}");
+            assert_eq!(rec["output_size"], TOTAL, "incomplete backpressure workload: {rec}");
+            break;
         }
         assert!(Instant::now() < deadline, "big task stalled behind a slow watcher");
-        std::thread::sleep(MS(100));
     }
     let growth = peak.saturating_sub(base_rss);
     eprintln!(

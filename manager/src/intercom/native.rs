@@ -34,6 +34,12 @@ pub struct Native {
     /// Endpoint identities cached at send time so late receipts survive
     /// discovery removal (see alias receipt verification).
     sent_endpoints: Mutex<std::collections::VecDeque<Value>>,
+    /// Test-clock only: base-socket connections accepted, and still being
+    /// handled, so tests can wait for a frame to be processed exactly.
+    #[cfg(all(unix, feature = "test-clock"))]
+    pub(crate) base_accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(all(unix, feature = "test-clock"))]
+    pub(crate) base_busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 const SENT_ENDPOINT_LIMIT: usize = 64;
 const SENT_ENDPOINT_TTL_MS: u64 = 600_000;
@@ -152,6 +158,10 @@ impl Native {
             idle_returns: Mutex::new(HashMap::new()),
             desktop: Mutex::new(None),
             sent_endpoints: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(all(unix, feature = "test-clock"))]
+            base_accepted: Default::default(),
+            #[cfg(all(unix, feature = "test-clock"))]
+            base_busy: Default::default(),
         }
     }
     #[cfg(unix)]
@@ -622,6 +632,14 @@ pub async fn start_codex(
     desktop.into_iter().chain(codex).collect()
 }
 impl Native {
+    /// Test-clock only: see `desktop::Client::flush`. No-op without Desktop.
+    #[cfg(feature = "test-clock")]
+    pub async fn desktop_flush(&self) {
+        let client = self.desktop.lock().unwrap().clone();
+        if let Some(client) = client {
+            client.flush().await;
+        }
+    }
     pub fn stop_codex(&self) {
         self.codex.lock().unwrap().take();
         self.desktop.lock().unwrap().take();
@@ -636,9 +654,17 @@ pub async fn start(rt: &Shared) -> Result<(), String> {
         let rt2 = rt.clone();
         let task = tokio::spawn(async move {
             let mut stop = rt2.stop.subscribe();
-            let mut tick = tokio::time::interval(Duration::from_secs(3));
+            // Scan cadence on the daemon clock (simulated under the test
+            // clock; tokio's sleep otherwise). First scan at once, as an
+            // interval's first tick; then every period after the last.
+            let mut first = true;
             loop {
-                tokio::select! {_=stop.changed()=>break,_=tick.tick()=>{}}
+                if !first {
+                    tokio::select! {_=stop.changed()=>break,_=rt2.clock.sleep("intercom_native_scan",Duration::from_secs(3))=>{}}
+                } else if *stop.borrow() {
+                    break;
+                }
+                first = false;
                 let mut rows = Vec::new();
                 if let Ok(files) = std::fs::read_dir(&dir) {
                     for entry in files.take(4096).flatten() {

@@ -202,7 +202,11 @@ test('publication guards cannot be satisfied by comments or other jobs', () => {
 function assertExtensionSourceInstall(ci) {
   const job = ci.match(/^  extension-compat:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
   assert.ok(job.includes('      - run: npm ci\n      - run: npx tsc --noEmit\n'), 'extension source job (extension-compat) must install full dependencies before typecheck');
-  assert.match(ci, /^  extension:\n    needs: extension-compat$/m, 'historical extension check must aggregate compatibility results');
+  assert.match(ci, /^  extension:\n    needs: \[pi-matrix, native-packages, clippy, extension-compat, extension-windows, e2e\]$/m, 'historical extension check must aggregate scope and all CI families');
+  assert.match(ci, /assert.equal\(scope.result, 'success'/);
+  // Each family is required exactly when the scope selected it (see ci-scope.test.mjs).
+  assert.match(ci, /const expected = run \? 'success' : 'skipped';/);
+  assert.match(ci, /assert.equal\(results\[name\]\?\.result, expected/);
 }
 
 test('extension source install guard cannot be satisfied by other jobs', () => {
@@ -516,14 +520,18 @@ test('Windows dependency guard rejects VC and Universal CRT imports', () => {
 
 test('workflow literal security, release graph and host/target contracts', () => {
   const native = workflow('native-packages');
-  for (const p of PLATFORMS) {
-    assert.ok(native.includes(`platform: ${p.id}`), p.id);
-    assert.ok(native.includes(`target: ${p.target}`), p.target);
+  // Matrix rows come from one list; it must name exactly the released targets.
+  const rows = JSON.parse(readFileSync(new URL('../.github/native-platforms.json', import.meta.url), 'utf8'));
+  assert.deepEqual(rows.map(r => [r.platform, r.target]), PLATFORMS.map(p => [p.id, p.target]));
+  assert.deepEqual(rows.map(r => r.runner), ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15', 'windows-latest', 'windows-11-arm']);
+  for (const name of ['manager-tests', 'native']) {
+    const block = native.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [\\w-]+:|(?![\\s\\S]))`, 'm'))[1];
+    assert.match(block, /matrix: \$\{\{ fromJSON\(needs\.platforms\.outputs\.matrix\) \}\}/, name);
+    assert.match(block, /runs-on: \$\{\{ matrix\.runner \}\}/, name);
   }
-  for (const runner of ['ubuntu-24.04', 'ubuntu-24.04-arm', 'macos-15-intel', 'macos-15', 'windows-latest']) {
-    assert.ok(native.includes(`runner: ${runner}\n`), runner);
-  }
-  assert.ok(native.includes('cargo test --locked\n'));
+  // One complete suite per platform on the simulated clock (no real-clock rerun).
+  assert.ok(native.includes('cargo test --locked --features test-clock\n'));
+  assert.ok(!/cargo test --locked\n/.test(native), 'the full suite must not rerun on the real clock');
   assert.equal(
     (native.match(/shell: bash\n        run: node scripts\/bump-release\.mjs "\$RELEASE_VERSION"/g) ?? []).length,
     2,

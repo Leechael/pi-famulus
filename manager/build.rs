@@ -40,12 +40,20 @@ fn main() {
     ) {
         let (dir, common) = (PathBuf::from(dir), PathBuf::from(common));
         println!("cargo:rerun-if-changed={}", dir.join("HEAD").display());
-        println!(
-            "cargo:rerun-if-changed={}",
-            common.join("packed-refs").display()
-        );
+        // Cargo treats a missing watched file as perpetually stale. Fresh
+        // repositories have no packed-refs; packing removes loose refs.
+        let packed = common.join("packed-refs");
+        if packed.exists() {
+            println!("cargo:rerun-if-changed={}", packed.display());
+        }
         if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
-            println!("cargo:rerun-if-changed={}", common.join(r).display());
+            let mut reference = common.join(r);
+            // A packed-only branch can become loose via update-ref without
+            // changing HEAD or packed-refs. Watch its nearest existing parent
+            // until the loose ref exists, rather than silently missing that
+            // transition. Packing a watched loose ref invalidates it as well.
+            while !reference.exists() && reference.pop() {}
+            println!("cargo:rerun-if-changed={}", reference.display());
         }
     }
 }
