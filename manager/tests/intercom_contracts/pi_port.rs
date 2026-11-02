@@ -10,6 +10,21 @@ use crate::common;
 use std::path::Path;
 
 /// An extension (parent) connection on the manager socket.
+/// Wait until the daemon has started writing a parked deliver: the body's
+/// bytes are in `peer`'s capped, undrained receive buffer, so the write is
+/// under way and blocked. A condition, instead of a fixed pause.
+fn wait_delivery_started(peer: &mut common::Conn) {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = peer.stream.peek_timeout(&mut buf, Duration::from_millis(20)).unwrap_or(0);
+        if buf[..n].windows(64).any(|w| w.iter().all(|b| *b == b'x')) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the parked deliver never started");
+    }
+}
+
 /// `Conn::wait_id`, for an answer that needs daemon time to pass (a
 /// write-ack timeout). Manual clock: step the clock 250ms at a time while
 /// waiting, at most 30s of daemon time; the bridge may be restarting, so the
@@ -400,7 +415,7 @@ fn a_slow_op_on_one_connection_does_not_block_other_sessions_or_close() {
     bob.stream.set_recv_buffer_size(8192).unwrap();
     let body = "x".repeat(3 * 1024 * 1024);
     alice.send(&json!({"v":1,"id":"blocked","type":"intercom","op":{"op":"send","to":"pi/bob-session","body":body,"reply_to":"pi/alice-session"}}));
-    thread::sleep(Duration::from_millis(300));
+    wait_delivery_started(&mut bob);
     // The op must really be blocked: no answer yet.
     let mut probe = [0u8; 1];
     let readable = alice
@@ -527,7 +542,7 @@ fn a_bridge_reset_finishes_the_in_flight_op_and_answers_queued_ops() {
     carol.stream.set_recv_buffer_size(8192).unwrap();
     let body = "x".repeat(3 * 1024 * 1024);
     alice.send(&json!({"v":1,"id":"s1","type":"intercom","op":{"op":"send","to":"pi/carol-session","body":body,"reply_to":"pi/alice-session"}}));
-    thread::sleep(Duration::from_millis(300));
+    wait_delivery_started(&mut carol);
 
     // Two ops queue behind the blocked send (registers, reapplied in
     // order once the bridge is back).
@@ -709,7 +724,7 @@ fn an_unpublish_during_an_in_flight_op_still_reaches_the_extension() {
     carol.stream.set_recv_buffer_size(8192).unwrap();
     let body = "x".repeat(3 * 1024 * 1024);
     alice.send(&json!({"v":1,"id":"s1","type":"intercom","op":{"op":"send","to":"pi/carol-session","body":body,"reply_to":"pi/alice-session"}}));
-    thread::sleep(Duration::from_millis(300));
+    wait_delivery_started(&mut carol);
     let mut cli = fixture.connect();
     cli.ok(json!({"op":"session_unpublish","args":["pi/alice-session"]}));
 

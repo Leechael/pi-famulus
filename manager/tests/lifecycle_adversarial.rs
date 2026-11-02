@@ -869,9 +869,15 @@ fn d8b_cli_during_shutdown_reaches_a_successor() {
     }
     let path = home.path.clone();
     let clock = if home.manual { "manual" } else { "" };
+    let seen = if home.manual { home.accepted_connections() } else { 0 };
     let ls = std::thread::spawn(move || run_cli_env(&path, &["ls"], S(20), &[("PI_FAMULUS_TEST_CLOCK", clock)]));
-    // Let `ls` meet the shutting-down manager before the grace ends.
-    std::thread::sleep(MS(500));
+    // `ls` must meet the shutting-down manager before the grace ends:
+    // manual-clock builds wait until it has connected.
+    if home.manual {
+        home.wait_accepted(seen, 1);
+    } else {
+        std::thread::sleep(MS(500));
+    }
     home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(8)).is_some());
     let out = ls.join().unwrap();
@@ -1774,11 +1780,18 @@ fn o3c_unanswerable_request_does_not_mute_connection() {
     let mut req = json!({"v":1,"id":"","type":"stop","task_id":"x"});
     let base = serde_json::to_vec(&req).unwrap().len();
     req["id"] = json!("i".repeat(MAX_FRAME - base));
+    let dropped = || clock_request(&home.path, json!({"type":"clock_status"}))["dropped_oversized_frames"].as_u64().unwrap_or(0);
+    let before = if home.manual { dropped() } else { 0 };
     c.send(&req);
-    // Requests are dispatched concurrently; let the doomed reply be attempted
+    // Requests are dispatched concurrently; the doomed reply must be dropped
     // before probing, or the probe could be answered first and prove nothing.
-    // The 4 MiB id needs a longer bound under the full parallel stress suite.
-    std::thread::sleep(S(2));
+    // Manual-clock builds count the drop exactly; otherwise allow a bound
+    // (the 4 MiB id needs a longer one under the full parallel suite).
+    if home.manual {
+        assert!(poll_true(S(15), || dropped() > before), "the unanswerable reply was never dropped");
+    } else {
+        std::thread::sleep(S(2));
+    }
     let r = c.try_request(json!({"type":"list"}), S(15));
     assert!(
         r.is_some(),

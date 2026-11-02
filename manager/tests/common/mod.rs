@@ -266,6 +266,26 @@ impl Home {
         let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
         assert_eq!(r["ok"], true, "clock_advance: {r}");
     }
+    /// Manual clock: client connections the daemon has accepted so far.
+    pub fn accepted_connections(&self) -> u64 {
+        assert!(self.manual, "accepted_connections needs the manual clock");
+        clock_request(&self.path, json!({"type":"clock_status"}))["accepted_connections"].as_u64().unwrap()
+    }
+    /// Manual clock: wait until `clients` more client processes have
+    /// connected since `seen` (an `accepted_connections` reading). Each probe
+    /// is itself a connection, counted before it reads the total: the k-th
+    /// probe after `seen` reads `seen + k + clients` once they are in.
+    pub fn wait_accepted(&self, seen: u64, clients: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for k in 1.. {
+            if self.accepted_connections() >= seen + k + clients {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{clients} client(s) never connected");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Manual clock: wait until the daemon has armed a fresh `label` timer
     /// (at least `min_due_ms` left), i.e. it has acted on whatever arms it.
     pub fn wait_timer(&self, label: &str, min_due_ms: u64) {

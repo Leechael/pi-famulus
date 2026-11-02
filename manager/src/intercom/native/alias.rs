@@ -516,6 +516,8 @@ pub(super) async fn reconcile_base(rt: &Shared) -> Result<(), String> {
     }
     let weak = std::sync::Arc::downgrade(rt);
     let target_generation = generation.clone();
+    #[cfg(feature = "test-clock")]
+    let (accepted_count, busy_count) = (rt.native.base_accepted.clone(), rt.native.base_busy.clone());
     let task = tokio::spawn(async move {
         let Some(runtime) = weak.upgrade() else {
             return;
@@ -531,7 +533,15 @@ pub(super) async fn reconcile_base(rt: &Shared) -> Result<(), String> {
                     let weak = weak.clone();
                     let generation = target_generation.clone();
                     let Some(peer) = accepted_peer(&stream) else { continue };
+                    #[cfg(feature = "test-clock")]
+                    let busy = {
+                        busy_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        accepted_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        BusyGuard(busy_count.clone())
+                    };
                     connections.spawn(async move {
+                        #[cfg(feature = "test-clock")]
+                        let _busy = busy;
                         read_frames(stream, |frame| {
                             let weak = weak.clone();
                             let generation = generation.clone();
@@ -1807,6 +1817,17 @@ pub(super) fn process_start(pid: u32) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().into())
         .unwrap_or_default()
+}
+
+/// Test-clock only: counts a base-socket connection as busy until its
+/// handler task ends (see `Native::base_busy`).
+#[cfg(feature = "test-clock")]
+struct BusyGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+#[cfg(feature = "test-clock")]
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(all(test, unix))]

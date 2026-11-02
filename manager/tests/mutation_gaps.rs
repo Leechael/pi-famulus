@@ -82,9 +82,13 @@ fn g2_autospawned_daemon_survives_sigint_to_spawning_group() {
     assert!(wait_child(&mut cli, S(10)).expect("cli finished").success());
     let daemon = home.pidfile_pid().expect("daemon pid");
     assert!(pid_running(daemon));
+    // Structural, not a wait: the daemon leads its own session and process
+    // group, so no signal to the spawning client's group can reach it.
+    assert_eq!(unsafe { libc::getsid(daemon as i32) }, daemon as i32, "daemon is not a session leader");
+    assert_eq!(unsafe { libc::getpgid(daemon as i32) }, daemon as i32, "daemon shares a process group");
+    assert_ne!(daemon, pgid, "daemon is the spawning client's group");
     kill_group(pgid, libc::SIGINT);
     kill_group(pgid, libc::SIGHUP);
-    std::thread::sleep(Duration::from_millis(500));
     assert!(pid_running(daemon), "daemon died with the spawning client's process group");
 }
 
@@ -303,9 +307,10 @@ fn g11_shutdown_counts_only_live_leftover_groups() {
     c.wait_terminal(&live, S(3)).unwrap();
     let gone_gc = wait_for_pids(&mut c, &gone, 1)[0];
     let gc = wait_for_pids(&mut c, &live, 1)[0];
-    // The first group empties; its guardian runner then exits.
+    // The first group empties; its guardian runner then exits. Shutdown
+    // re-checks each leftover group's members itself, so once both are gone
+    // there is nothing left to wait for.
     assert!(poll_true(S(3), || !pid_running(gone_gc) && !pid_running(gone_runner)));
-    settle();
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
     home.advance("shutdown-grace", 2000);

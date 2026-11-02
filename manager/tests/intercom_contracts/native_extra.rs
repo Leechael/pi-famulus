@@ -1096,6 +1096,8 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
     let path = dir.join("stranger.sock");
     let _listener = common::bind_private_unix(&path);
     let fabricated = uuid::Uuid::new_v4().to_string();
+    let base_state = |fixture: &Fixture| fixture.connect().ok(json!({"op":"debug_native_base"}));
+    let accepted_before = fixture.manual.then(|| base_state(&fixture)["accepted"].as_u64().unwrap());
     let mut link = UnixStream::connect(&base_socket).unwrap();
     link.write_all(
         format!(
@@ -1106,8 +1108,23 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
     )
     .unwrap();
     drop(link);
-    // The unverifiable receipt must not be recorded at all.
-    thread::sleep(Duration::from_millis(400));
+    // The unverifiable receipt must not be recorded at all. Manual-clock
+    // builds wait until the daemon accepted this link and finished handling
+    // every base connection (each handles its frames in order, to EOF):
+    // the receipt was then processed. Otherwise allow a moment.
+    if let Some(before) = accepted_before {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = base_state(&fixture);
+            if state["accepted"].as_u64().unwrap() > before && state["busy"] == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the receipt link was never handled: {state}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    } else {
+        thread::sleep(Duration::from_millis(400));
+    }
     assert_eq!(
         plugin_message_status(&mut fixture, &json!(fabricated)),
         "unknown",

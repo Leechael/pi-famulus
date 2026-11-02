@@ -14,6 +14,8 @@
 
 mod common;
 
+use common::{clock_request, poll_true, test_owner, MANUAL_CLOCK};
+
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -113,6 +115,26 @@ fn spawn_daemon(home: &Path) -> ReapedChild {
         famulus_command(BIN)
             .arg("daemon")
             .env("PI_FAMULUS_HOME", home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pi-famulus daemon"),
+    ))
+}
+
+/// `spawn_daemon` on the manual test clock when the suite has the feature,
+/// so the test can read daemon state through `clock_status`.
+fn spawn_daemon_clocked(home: &Path) -> ReapedChild {
+    let mut command = famulus_command(BIN);
+    command.arg("daemon").env("PI_FAMULUS_HOME", home);
+    if MANUAL_CLOCK {
+        command
+            .env("PI_FAMULUS_TEST_CLOCK", "manual")
+            .env("PI_FAMULUS_TEST_OWNER", test_owner());
+    }
+    ReapedChild(Some(
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1644,7 +1666,7 @@ fn p12_wake_scans_for_eligible_kind_and_keeps_same_kind_fifo() {
 fn p13_pending_queue_enforces_per_session_cap_and_child_deduplication() {
     let home = test_home("p13-sess-cap");
     fs::write(home.join("config.json"), r#"{"maxAgents":1000,"maxTest":1}"#).unwrap();
-    let _daemon = spawn_daemon(&home);
+    let _daemon = spawn_daemon_clocked(&home);
     wait_for_socket(&home, CONNECT_TIMEOUT);
     let mut holder = connect(&home, CONNECT_TIMEOUT);
     let mut waiter = connect(&home, CONNECT_TIMEOUT);
@@ -1659,7 +1681,14 @@ fn p13_pending_queue_enforces_per_session_cap_and_child_deduplication() {
             r#"{{"id":"p13-q{n:02}","type":"acquire_agent","child_id":"ch_{n:02}","work_kind":"test"}}"#
         ));
     }
-    std::thread::sleep(Duration::from_millis(200));
+    // Requests run concurrently: all 64 must be queued before the overflow.
+    // Manual-clock builds read the queue length; otherwise allow a moment.
+    if MANUAL_CLOCK {
+        let queued = || clock_request(&home, serde_json::json!({"type":"clock_status"}))["pending_agents"].as_u64().unwrap_or(0);
+        assert!(poll_true(Duration::from_secs(10), || queued() >= 64), "the 64 acquisitions never queued");
+    } else {
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let overflow = waiter.request(
         r#"{"id":"p13-overflow","type":"acquire_agent","child_id":"ch_overflow","work_kind":"test"}"#,
         "p13-overflow",

@@ -1058,6 +1058,12 @@ fn cli2_auto_spawned_daemon_outlives_the_cli() {
     assert!(out.status.success(), "{}{}", out.stdout, out.stderr);
     assert!(t0.elapsed() < S(4), "the CLI's output stayed open for {:?}", t0.elapsed());
     let pid = home.pidfile_pid().expect("spawned daemon");
+    // Unix, structural: the daemon leads its own session, so its CLI's exit
+    // (and that CLI's process group or terminal) cannot take it down.
+    #[cfg(unix)]
+    assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32, "the spawned daemon is not detached from its CLI");
+    // Windows detaches through job objects: allow a moment for a wrong kill.
+    #[cfg(windows)]
     std::thread::sleep(MS(500));
     assert!(pid_running(pid), "the spawned daemon died with its CLI");
     let mut c = ext(&home, "sess-a");

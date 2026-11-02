@@ -34,6 +34,12 @@ pub struct Native {
     /// Endpoint identities cached at send time so late receipts survive
     /// discovery removal (see alias receipt verification).
     sent_endpoints: Mutex<std::collections::VecDeque<Value>>,
+    /// Test-clock only: base-socket connections accepted, and still being
+    /// handled, so tests can wait for a frame to be processed exactly.
+    #[cfg(all(unix, feature = "test-clock"))]
+    pub(crate) base_accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(all(unix, feature = "test-clock"))]
+    pub(crate) base_busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 const SENT_ENDPOINT_LIMIT: usize = 64;
 const SENT_ENDPOINT_TTL_MS: u64 = 600_000;
@@ -152,6 +158,10 @@ impl Native {
             idle_returns: Mutex::new(HashMap::new()),
             desktop: Mutex::new(None),
             sent_endpoints: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(all(unix, feature = "test-clock"))]
+            base_accepted: Default::default(),
+            #[cfg(all(unix, feature = "test-clock"))]
+            base_busy: Default::default(),
         }
     }
     #[cfg(unix)]
