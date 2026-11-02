@@ -97,11 +97,6 @@ pub fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Opt
     }
 }
 
-/// Real clock: a short pause, so effects of whatever just happened are under
-/// way before a negative assertion. (On the manual clock use `Home::settle`.)
-pub fn settle() {
-    std::thread::sleep(Duration::from_millis(150));
-}
 
 pub fn poll_true(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     poll_until(timeout, || if f() { Some(()) } else { None }).is_some()
@@ -239,11 +234,9 @@ impl Home {
     /// After a clock step: every timer the step made due has returned from
     /// its sleep (a sleeper is listed until its future completes), so the
     /// code that follows each timer is running before a negative assertion.
-    /// A condition, not a duration. Real clock: the short `settle` pause.
+    /// A condition, not a duration (manual clock only).
     pub fn settle(&self) {
-        if !self.manual {
-            return settle();
-        }
+        assert!(self.manual, "settle needs the manual clock");
         let done = poll_true(Duration::from_secs(10), || {
             clock_request(&self.path, json!({"type":"clock_status"}))["pending"]
                 .as_array()
@@ -256,12 +249,10 @@ impl Home {
 
     /// Advance the daemon's `label` timer by `ms`. Manual clock: wait until
     /// a timer with that label is armed (so the step cannot race ahead of
-    /// the daemon), then advance. Real clock: just sleep `ms`.
+    /// the daemon), then advance (manual clock only: the suites that step
+    /// time require `--features test-clock`).
     pub fn advance(&self, label: &str, ms: u64) {
-        if !self.manual {
-            std::thread::sleep(Duration::from_millis(ms));
-            return;
-        }
+        assert!(self.manual, "advance needs the manual clock");
         self.wait_armed(label, ms);
         let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
         assert_eq!(r["ok"], true, "clock_advance: {r}");
@@ -317,48 +308,36 @@ impl Home {
     }
     /// Advance by `ms` once a `label` timer is armed with any time left (a
     /// timer re-armed with what remained of it, e.g. after an in-place
-    /// upgrade). Real clock: sleep `ms`.
+    /// upgrade). Manual clock only.
     pub fn advance_partial(&self, label: &str, ms: u64) {
-        if !self.manual {
-            std::thread::sleep(Duration::from_millis(ms));
-            return;
-        }
+        assert!(self.manual, "advance_partial needs the manual clock");
         self.wait_armed(label, 1);
         let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
         assert_eq!(r["ok"], true, "clock_advance: {r}");
     }
     /// Advance time without waiting for a particular timer (e.g. to show a
-    /// cancelled countdown does not fire). Real clock: sleep `ms`.
+    /// cancelled countdown does not fire). Manual clock only.
     pub fn advance_now(&self, ms: u64) {
-        if !self.manual {
-            std::thread::sleep(Duration::from_millis(ms));
-            return;
-        }
+        assert!(self.manual, "advance_now needs the manual clock");
         let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
         assert_eq!(r["ok"], true, "clock_advance: {r}");
     }
     /// Bring the armed `label` timer of `total_ms` to just short of its
-    /// deadline, so the caller can assert nothing has fired yet.
-    /// Manual clock: exactly 1 ms short; the timer must still be pending
-    /// with 1 ms left (a shorter constant fails here, deterministically),
-    /// then a short real pause so a wrongly early effect would show. Real
-    /// clock: 60% of `total_ms`, leaving margin for scheduling (the boundary
-    /// itself is the timing canaries' job).
+    /// deadline, so the caller can assert nothing has fired yet: exactly 1 ms
+    /// short; the timer must still be pending with 1 ms left (a shorter
+    /// constant fails here, deterministically), then the step settles.
     pub fn advance_almost(&self, label: &str, total_ms: u64) {
-        if self.manual {
-            // A freshly armed timer: exactly `total_ms` left.
-            self.wait_armed(label, total_ms);
-            self.advance(label, total_ms - 1);
-            let st = clock_request(&self.path, json!({"type":"clock_status"}));
-            let armed = st["pending"]
-                .as_array()
-                .is_some_and(|p| p.iter().any(|t| t["label"] == label && t["due_in_ms"] == 1));
-            assert!(armed, "{label:?} timer is not {total_ms} ms long: {st}");
-            settle();
-        } else {
-            std::thread::sleep(Duration::from_millis(total_ms * 6 / 10));
-        }
+        // A freshly armed timer: exactly `total_ms` left.
+        self.wait_armed(label, total_ms);
+        self.advance(label, total_ms - 1);
+        let st = clock_request(&self.path, json!({"type":"clock_status"}));
+        let armed = st["pending"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|t| t["label"] == label && t["due_in_ms"] == 1));
+        assert!(armed, "{label:?} timer is not {total_ms} ms long: {st}");
+        self.settle();
     }
+
     /// Take a timer brought to `advance_almost` over its deadline. Manual
     /// clock: the last millisecond. Real clock: nothing; the caller then
     /// waits for the effect with a real timeout.

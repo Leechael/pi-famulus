@@ -50,7 +50,6 @@ const IDLE_SETTLED_MS: u64 = 1000;
 /// Outlasts the daemon's 3s relay snapshot, Desktop reconnect and webhook
 /// retry cadence (daemon time on the manual clock).
 const RESEND_QUIET_MS: u64 = 3500;
-const RESEND_QUIET: Duration = Duration::from_millis(RESEND_QUIET_MS);
 /// The daemon's relay directory snapshot period (`RELAY_SNAPSHOT_MS`).
 const RELAY_SNAPSHOT_MS: u64 = 3000;
 static NEXT_HOME: AtomicU64 = AtomicU64::new(0);
@@ -239,9 +238,7 @@ impl Fixture {
         // unless the test chose a clock explicitly: waits bounded by daemon
         // timers are then stepped, never slept.
         let clocked;
-        let env = if common::MANUAL_CLOCK
-            && !env.iter().any(|(k, _)| *k == "PI_FAMULUS_TEST_CLOCK")
-        {
+        let env = if !env.iter().any(|(k, _)| *k == "PI_FAMULUS_TEST_CLOCK") {
             clocked = Self::with_clock(env);
             clocked.as_slice()
         } else {
@@ -360,17 +357,9 @@ impl Fixture {
     /// the clock is stepped 250ms at a time while waiting, never past the
     /// budget, so a timer-held exit (shutdown or idle grace) completes, and
     /// one held longer than the budget still fails, as on the real clock.
-    /// Real clock: the budget is wall time.
     fn wait_exit(&self, pid: u32, budget: Duration, why: &str) {
+        assert!(self.manual, "wait_exit needs the manual clock");
         let alive = || unsafe { libc::kill(pid as i32, 0) } == 0;
-        if !self.manual {
-            let deadline = Instant::now() + budget;
-            while alive() {
-                assert!(Instant::now() < deadline, "{why}: {}", self.manager_log());
-                thread::sleep(Duration::from_millis(5));
-            }
-            return;
-        }
         let mut stepped = 0;
         let deadline = Instant::now() + TIMEOUT;
         while alive() {
@@ -460,7 +449,8 @@ impl Fixture {
     /// 250ms maintenance tick of daemon time on the manual clock while its
     /// budget lasts, otherwise a short real pause.
     fn tick_within(&self, deadline: &Deadline) {
-        if self.manual && deadline.virtual_left() {
+        assert!(self.manual, "tick_within needs the manual clock");
+        if deadline.virtual_left() {
             self.let_pass(250);
         } else {
             thread::sleep(Duration::from_millis(10));
@@ -468,22 +458,16 @@ impl Fixture {
     }
 
     /// `check` holds throughout `ms` of daemon time: run at every stepped
-    /// maintenance tick on the manual clock, every 20ms on the real clock.
+    /// maintenance tick.
     fn during(&self, ms: u64, mut check: impl FnMut()) {
-        if self.manual {
-            for _ in 0..ms.div_ceil(250) {
-                check();
-                self.let_pass(250);
-            }
-        } else {
-            let deadline = Instant::now() + Duration::from_millis(ms);
-            while Instant::now() < deadline {
-                check();
-                thread::sleep(Duration::from_millis(20));
-            }
+        assert!(self.manual, "during needs the manual clock");
+        for _ in 0..ms.div_ceil(250) {
+            check();
+            self.let_pass(250);
         }
         check();
     }
+
 
 
     fn start_clocked(&mut self) {
@@ -491,11 +475,7 @@ impl Fixture {
     }
 
     fn clock_env() -> &'static [(&'static str, &'static str)] {
-        if common::MANUAL_CLOCK {
-            &[("PI_FAMULUS_TEST_CLOCK", "manual")]
-        } else {
-            &[]
-        }
+        &[("PI_FAMULUS_TEST_CLOCK", "manual")]
     }
 
     fn with_clock<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
@@ -535,12 +515,9 @@ impl Fixture {
     /// Let at least `ms` of daemon time pass. Manual clock: step it in whole
     /// 250ms maintenance ticks (rounded up, so the maintenance timer stays in
     /// phase), each settled before the next, so every timer due in the window
-    /// fires in order. Real clock: sleep.
+    /// fires in order.
     fn let_pass(&self, ms: u64) {
-        if !self.manual {
-            thread::sleep(Duration::from_millis(ms));
-            return;
-        }
+        assert!(self.manual, "let_pass needs the manual clock");
         for _ in 0..ms.div_ceil(250) {
             common::clock_request(
                 &self.root.join("manager"),
@@ -834,31 +811,30 @@ impl Peer {
     /// settles, retries). Manual clock: step 250ms ticks while waiting, at
     /// most `max_ms` of daemon time. Real clock: plain `event`.
     fn event_stepping(&mut self, fixture: &Fixture, kind: &str, max_ms: u64) -> Value {
-        if fixture.manual {
-            let mut stepped = 0;
-            while self.pushed.is_empty() {
-                self.reader
-                    .get_mut()
-                    .set_read_timeout(Some(Duration::from_millis(20)))
-                    .unwrap();
-                let mut line = String::new();
-                match self.reader.read_line(&mut line) {
-                    Ok(n) if n > 0 => self.pushed.push_back(serde_json::from_str(&line).unwrap()),
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        assert!(stepped < max_ms, "no {kind} within {stepped}ms of daemon time");
-                        fixture.let_pass(250);
-                        stepped += 250;
-                    }
-                    other => panic!("peer read failed waiting for {kind}: {other:?}"),
+        assert!(fixture.manual, "event_stepping needs the manual clock");
+        let mut stepped = 0;
+        while self.pushed.is_empty() {
+            self.reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(n) if n > 0 => self.pushed.push_back(serde_json::from_str(&line).unwrap()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(stepped < max_ms, "no {kind} within {stepped}ms of daemon time");
+                    fixture.let_pass(250);
+                    stepped += 250;
                 }
+                other => panic!("peer read failed waiting for {kind}: {other:?}"),
             }
-            self.reader.get_mut().set_read_timeout(Some(TIMEOUT)).unwrap();
         }
+        self.reader.get_mut().set_read_timeout(Some(TIMEOUT)).unwrap();
         self.event(kind)
     }
 
@@ -868,13 +844,10 @@ impl Peer {
     /// everything already queued for this peer, and no daemon timer can fire
     /// meanwhile. On the real clock, a short window is waited out.
     fn no_event(&mut self) {
-        if self.manual {
-            assert!(self.pushed.is_empty(), "unexpected buffered events: {:?}", self.pushed);
-            self.ok(json!({"op":"list"}));
-            assert!(self.pushed.is_empty(), "unexpected pushed events: {:?}", self.pushed);
-        } else {
-            self.no_event_for(Duration::from_millis(150));
-        }
+        assert!(self.manual, "no_event needs a manual-clock daemon");
+        assert!(self.pushed.is_empty(), "unexpected buffered events: {:?}", self.pushed);
+        self.ok(json!({"op":"list"}));
+        assert!(self.pushed.is_empty(), "unexpected pushed events: {:?}", self.pushed);
     }
 
     /// Nothing reaches this peer while `ms` of daemon time passes. Manual
@@ -882,38 +855,11 @@ impl Peer {
     /// could push fires inside it; then whatever was written is drained.
     /// Real clock: the window is waited out.
     fn quiet_for(&mut self, fixture: &Fixture, ms: u64) {
-        if fixture.manual {
-            fixture.let_pass(ms);
-            self.no_event();
-        } else {
-            self.no_event_for(Duration::from_millis(ms));
-        }
+        fixture.let_pass(ms);
+        self.no_event();
     }
 
-    fn no_event_for(&mut self, window: Duration) {
-        assert!(
-            self.pushed.is_empty(),
-            "unexpected buffered events: {:?}",
-            self.pushed
-        );
-        self.reader
-            .get_mut()
-            .set_read_timeout(Some(window))
-            .unwrap();
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            result => panic!("unexpected socket activity: {result:?}, {line:?}"),
-        }
-        self.reader
-            .get_mut()
-            .set_read_timeout(Some(TIMEOUT))
-            .unwrap();
-    }
+
 
     fn register(&mut self, id: &str, status: &str, caps: &[&str]) -> Value {
         let response = self.ok(json!({

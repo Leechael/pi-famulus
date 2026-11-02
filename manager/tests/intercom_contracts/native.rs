@@ -181,9 +181,7 @@ impl ClaudePeer {
     /// Manual clock: step 250ms ticks while waiting, at most 30s of daemon
     /// time. Real clock: plain `frame`.
     pub(super) fn frame_stepping(&self, fixture: &Fixture) -> Value {
-        if !fixture.manual {
-            return self.frame();
-        }
+        assert!(fixture.manual, "frame_stepping needs the manual clock");
         let mut stepped = 0;
         loop {
             assert!(common::pid_alive(self.process.0.id()));

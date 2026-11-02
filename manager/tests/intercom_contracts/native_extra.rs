@@ -1112,18 +1112,15 @@ fn receipt_from_never_seen_socket_is_dropped_unrecorded() {
     // builds wait until the daemon accepted this link and finished handling
     // every base connection (each handles its frames in order, to EOF):
     // the receipt was then processed. Otherwise allow a moment.
-    if let Some(before) = accepted_before {
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let state = base_state(&fixture);
-            if state["accepted"].as_u64().unwrap() > before && state["busy"] == 0 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the receipt link was never handled: {state}");
-            thread::sleep(Duration::from_millis(5));
+    let before = accepted_before.expect("manual clock");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let state = base_state(&fixture);
+        if state["accepted"].as_u64().unwrap() > before && state["busy"] == 0 {
+            break;
         }
-    } else {
-        thread::sleep(Duration::from_millis(400));
+        assert!(Instant::now() < deadline, "the receipt link was never handled: {state}");
+        thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
         plugin_message_status(&mut fixture, &json!(fabricated)),

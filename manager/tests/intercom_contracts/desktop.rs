@@ -252,19 +252,10 @@ impl Desktop {
                 Some("thread-follower-start-turn" | "thread-follower-steer-turn")
             )
         };
-        if fixture.manual {
-            fixture.let_pass(RESEND_QUIET_MS);
-            fixture.connect().ok(json!({"op":"debug_desktop_flush"}));
-            for request in self.requests.try_iter() {
-                assert!(!mutation(&request), "{why}: {request}");
-            }
-            return;
-        }
-        let deadline = Instant::now() + RESEND_QUIET;
-        while let Ok(request) = self
-            .requests
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
+        assert!(fixture.manual, "assert_no_turn_mutation needs the manual clock");
+        fixture.let_pass(RESEND_QUIET_MS);
+        fixture.connect().ok(json!({"op":"debug_desktop_flush"}));
+        for request in self.requests.try_iter() {
             assert!(!mutation(&request), "{why}: {request}");
         }
     }

@@ -213,11 +213,13 @@ The CI suite runs with `--features test-clock`, and every daemon a test starts, 
 
 The timing canary pins the 5s/2s boundaries exactly on the manual clock: alive at 4,999ms and acted on at 5,000ms, so a 6s idle grace fails it. That the normal build's clock sleeps those durations is a daemon unit test on paused tokio time (9s of timers in 0s). Examples: `serve_supervises…` 20.5s → 1.7s; the Desktop resend contracts 5–7s → 2s each; o3c 2s → 0.5s; the intercom binary 186s → 139s locally.
 
-What remains on wall time, by design:
+The suites that step time now declare `required-features = ["test-clock"]` (`Cargo.toml`), so they have **no real-clock fallback at all**: every former `else { sleep(..) }` branch is gone, and a helper reached without a manual-clock daemon fails loudly instead of sleeping. Plain `cargo test` runs the remaining suites (build script, CLI, daemon survival, monitor records, messaging relay, backpressure, unit tests) and reports the clock suites as needing the feature. The Windows detachment check observes instead of pausing: a process being terminated runs no more code, so a daemon that answers a hello after its CLI exited was not killed with it.
 
-- **Measurements.** The resource benchmark samples CPU over 3s windows. It no longer waits out tokio's 10s blocking keep-alive (twice 11s): its daemon uses a 200ms keep-alive, and the handle count waits for growth to fall within budget. 39s → 17s, same final growth. `backpressure` measures real service latency, paced by a `wait` long-poll instead of a client sleep.
-- **Condition polls.** Short intervals inside loops that wait for real work (a process exit, an upgrade, a 256 MiB transfer).
-- **Real-clock fallbacks.** Non-feature builds keep the previous bounded pauses; CI never takes those branches. One Windows-only pause remains where detachment is through job objects and no structural check applies.
+What remains on wall time is measurement, kept by decision:
+
+- **Resource benchmark:** CPU per real second over 3s windows (on Windows too, where no scheduler-state sampling exists). It no longer waits out tokio's 10s blocking keep-alive (twice 11s): 39s → 17s with the same final handle growth.
+- **`backpressure`:** real service latency under a stuck watcher, paced by a `wait` long-poll that returns the moment the transfer ends.
+- **Polling intervals** (5–100ms) inside loops that wait for real work to finish: a process exit, an upgrade, a transfer.
 
 ### One architecture per OS on pull requests
 

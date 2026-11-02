@@ -702,9 +702,7 @@ impl WireRelay {
     /// step 250ms ticks while waiting, at most `RELAY_WAIT_MS` of daemon
     /// time. Real clock: plain `request`.
     pub(super) fn request_stepping(&self, fixture: &Fixture, kind: &str) -> Value {
-        if !fixture.manual {
-            return self.request(kind);
-        }
+        assert!(fixture.manual, "request_stepping needs the manual clock");
         let mut stepped = 0;
         loop {
             while let Ok(frame) = self.requests.recv_timeout(Duration::from_millis(20)) {
@@ -771,23 +769,13 @@ impl WireRelay {
         forbidden: impl Fn(&Value) -> bool,
         why: &str,
     ) {
-        if !fixture.manual {
-            return self.assert_quiet(Duration::from_millis(ms), forbidden, why);
-        }
+        assert!(fixture.manual, "assert_quiet_for needs the manual clock");
         for frame in self.frames_through(fixture, ms) {
             assert!(!forbidden(&frame), "{why}: {frame}");
         }
     }
 
-    fn assert_quiet(&self, window: Duration, forbidden: impl Fn(&Value) -> bool, why: &str) {
-        let deadline = Instant::now() + window;
-        while let Ok(frame) = self
-            .requests
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
-            assert!(!forbidden(&frame), "{why}: {frame}");
-        }
-    }
+
 }
 
 impl Drop for WireRelay {
@@ -994,8 +982,9 @@ fn relay_hosted_endpoints_route_remotely_without_shadowing_local_webhooks() {
         }
         assert!(Instant::now() < deadline, "sender never published");
     }
-    relay.assert_quiet(
-        Duration::from_millis(100),
+    relay.assert_quiet_for(
+        &fixture,
+        100,
         |request| request["type"] == "send",
         "local webhook send escaped to relay",
     );

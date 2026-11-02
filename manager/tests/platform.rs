@@ -381,19 +381,11 @@ fn t6c_leftover_outlives_its_command_until_shutdown() {
     let left = wait_for_pids(&mut c, &id, 1)[0];
     let t = c.wait_terminal(&id, S(10)).unwrap();
     assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("completed"), Some(0)), "{t}");
-    if home.manual {
-        // Step the daemon's leftover-group polls through the same window
-        // instead of waiting it out; then every fired timer has run.
-        home.advance_now(1500);
-        home.settle();
-        assert!(pid_running(left), "the leftover child died with its command");
-    } else {
-        let deadline = Instant::now() + MS(1500);
-        while Instant::now() < deadline {
-            assert!(pid_running(left), "the leftover child died with its command");
-            std::thread::sleep(MS(100));
-        }
-    }
+    // Step the daemon's leftover-group polls through the same window
+    // instead of waiting it out; then every fired timer has run.
+    home.advance_now(1500);
+    home.settle();
+    assert!(pid_running(left), "the leftover child died with its command");
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
     home.advance("shutdown-grace", 2000);
@@ -493,12 +485,8 @@ fn t12_stop_terminal_task_is_noop() {
     assert_eq!(c.wait_terminal(&id, S(10)).unwrap()["status"], "failed");
     c.request_ok(json!({"type":"stop","task_id":id}));
     // Past the kill grace a stop could have armed: the record must not move.
-    if home.manual {
-        home.advance_now(3000);
-        home.settle();
-    } else {
-        std::thread::sleep(MS(300));
-    }
+    home.advance_now(3000);
+    home.settle();
     let t = c.task(&id).unwrap();
     assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("failed"), Some(4)));
     let r = c.request(json!({"type":"stop","task_id":"sh_00000000"}));
@@ -964,12 +952,8 @@ fn d16_extension_cannot_shutdown() {
     assert_eq!(c.request(json!({"type":"shutdown"}))["error"]["code"], "E_FORBIDDEN");
     assert_eq!(c.request(json!({"type":"status"}))["ok"], true);
     // Past any shutdown grace a refused request could still have armed.
-    if home.manual {
-        home.advance_now(3000);
-        home.settle();
-    } else {
-        std::thread::sleep(MS(300));
-    }
+    home.advance_now(3000);
+    home.settle();
     assert!(d.try_wait().unwrap().is_none(), "extension shut the manager down");
 }
 
@@ -1063,9 +1047,11 @@ fn cli2_auto_spawned_daemon_outlives_the_cli() {
     // (and that CLI's process group or terminal) cannot take it down.
     #[cfg(unix)]
     assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32, "the spawned daemon is not detached from its CLI");
-    // Windows detaches through job objects: allow a moment for a wrong kill.
+    // Windows, observed: a process being terminated runs no more code, so a
+    // daemon that answers after its CLI exited was not killed with it (a
+    // kill-on-close job is torn down as the CLI exits, before we return).
     #[cfg(windows)]
-    std::thread::sleep(MS(500));
+    assert_eq!(home.connect().hello_cli()["ok"], true, "the spawned daemon died with its CLI");
     assert!(pid_running(pid), "the spawned daemon died with its CLI");
     let mut c = ext(&home, "sess-a");
     let (id, _) = c.start(&kit(&["echo", "after"]));

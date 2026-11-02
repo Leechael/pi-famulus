@@ -470,11 +470,7 @@ fn u9_cli_wait_and_follow_survive_an_upgrade() {
     let follow = std::thread::spawn(move || run_cli(&h2, &["output", &t2, "-f"], s(30)));
     // Both CLIs are attached when the upgrade starts: manual-clock builds
     // wait until they connected.
-    if home.manual {
-        home.wait_accepted(seen, 2);
-    } else {
-        std::thread::sleep(Duration::from_millis(700));
-    }
+    home.wait_accepted(seen, 2);
     assert!(upgrade(&home).status.success());
     let w = wait.join().unwrap();
     assert!(w.status.success() && w.stdout.contains("done exit_code=3"), "wait: {} {}", w.stdout, w.stderr);

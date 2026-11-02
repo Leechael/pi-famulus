@@ -818,11 +818,7 @@ fn d8_hello_during_shutdown_is_refused_and_does_not_cancel() {
     // Accepted before shutdown, hello after. On the manual clock a pre-hello
     // debug round trip proves the daemon accepted and serves the connection.
     let mut late = home.connect();
-    if home.manual {
-        assert_eq!(late.request(json!({"type":"clock_status"}))["ok"], true);
-    } else {
-        std::thread::sleep(MS(200));
-    }
+    assert_eq!(late.request(json!({"type":"clock_status"}))["ok"], true);
     let out = home.cli(&["shutdown"], S(10));
     assert!(out.status.success(), "shutdown: {}", out.stderr);
     assert!(out.stdout.contains("shutting down"));
@@ -862,22 +858,14 @@ fn d8b_cli_during_shutdown_reaches_a_successor() {
     assert!(home.cli(&["shutdown"], S(10)).status.success());
     // The TERM-ignoring task holds shutdown in its 2s kill grace. The daemon
     // has acted on the shutdown it just acknowledged once that grace is armed.
-    if home.manual {
-        home.wait_timer("shutdown-grace", 2000);
-    } else {
-        std::thread::sleep(MS(200));
-    }
+    home.wait_timer("shutdown-grace", 2000);
     let path = home.path.clone();
     let clock = if home.manual { "manual" } else { "" };
     let seen = if home.manual { home.accepted_connections() } else { 0 };
     let ls = std::thread::spawn(move || run_cli_env(&path, &["ls"], S(20), &[("PI_FAMULUS_TEST_CLOCK", clock)]));
     // `ls` must meet the shutting-down manager before the grace ends:
     // manual-clock builds wait until it has connected.
-    if home.manual {
-        home.wait_accepted(seen, 1);
-    } else {
-        std::thread::sleep(MS(500));
-    }
+    home.wait_accepted(seen, 1);
     home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(8)).is_some());
     let out = ls.join().unwrap();
@@ -1787,11 +1775,7 @@ fn o3c_unanswerable_request_does_not_mute_connection() {
     // before probing, or the probe could be answered first and prove nothing.
     // Manual-clock builds count the drop exactly; otherwise allow a bound
     // (the 4 MiB id needs a longer one under the full parallel suite).
-    if home.manual {
-        assert!(poll_true(S(15), || dropped() > before), "the unanswerable reply was never dropped");
-    } else {
-        std::thread::sleep(S(2));
-    }
+    assert!(poll_true(S(15), || dropped() > before), "the unanswerable reply was never dropped");
     let r = c.try_request(json!({"type":"list"}), S(15));
     assert!(
         r.is_some(),
@@ -2098,12 +2082,8 @@ fn t12_stop_terminal_task_is_noop() {
     assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "failed");
     c.request_ok(json!({"type":"stop","task_id":id}));
     // Past the kill grace a stop could have armed: the record must not move.
-    if home.manual {
-        home.advance_now(3000);
-        home.settle();
-    } else {
-        std::thread::sleep(MS(300));
-    }
+    home.advance_now(3000);
+    home.settle();
     let t = c.task(&id).unwrap();
     assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("failed"), Some(4)));
     let r = c.request(json!({"type":"stop","task_id":"sh_00000000"}));
@@ -2216,12 +2196,8 @@ fn d16_extension_cannot_shutdown() {
     let s = &r["sessions"][0];
     assert_eq!((s["session_id"].as_str(), s["cwd"].as_str()), (Some("sess-a"), Some("/tmp/d16-cwd")), "{r}");
     // Past any shutdown grace a refused request could still have armed.
-    if home.manual {
-        home.advance_now(3000);
-        home.settle();
-    } else {
-        std::thread::sleep(MS(500));
-    }
+    home.advance_now(3000);
+    home.settle();
     assert!(d.try_wait().unwrap().is_none(), "extension shut the manager down");
 }
 

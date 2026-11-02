@@ -30,9 +30,8 @@ fn wait_delivery_started(peer: &mut common::Conn) {
 /// waiting, at most 30s of daemon time; the bridge may be restarting, so the
 /// steps are not tied to its maintenance timer. Real clock: plain wait.
 fn wait_id_stepping(fixture: &Fixture, conn: &mut common::Conn, id: &str, real: Duration) -> Option<Value> {
-    if !fixture.manual {
-        return conn.wait_id(id, real);
-    }
+    let _ = real;
+    assert!(fixture.manual, "wait_id_stepping needs the manual clock");
     let mut stepped = 0;
     loop {
         if let Some(frame) = conn.wait_id(id, Duration::from_millis(20)) {

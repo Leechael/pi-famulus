@@ -1515,11 +1515,7 @@ fn g15b_finished_task_survives_a_failed_delete_for_retry() {
     let _restore = RestorePerms(tasks_dir.clone());
     home.advance("gc", 1_000);
     // The sweep the step fired has run (manual clock), or had a moment to.
-    if home.manual {
-        home.settle();
-    } else {
-        std::thread::sleep(MS(300));
-    }
+    home.settle();
     // Assert survival *before* the dir goes writable again: once it does,
     // the background sweep (polling at least once a second) can delete the
     // record at any moment, racing these checks against the assertion below

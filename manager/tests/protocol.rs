@@ -1683,12 +1683,8 @@ fn p13_pending_queue_enforces_per_session_cap_and_child_deduplication() {
     }
     // Requests run concurrently: all 64 must be queued before the overflow.
     // Manual-clock builds read the queue length; otherwise allow a moment.
-    if MANUAL_CLOCK {
-        let queued = || clock_request(&home, serde_json::json!({"type":"clock_status"}))["pending_agents"].as_u64().unwrap_or(0);
-        assert!(poll_true(Duration::from_secs(10), || queued() >= 64), "the 64 acquisitions never queued");
-    } else {
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let queued = || clock_request(&home, serde_json::json!({"type":"clock_status"}))["pending_agents"].as_u64().unwrap_or(0);
+    assert!(poll_true(Duration::from_secs(10), || queued() >= 64), "the 64 acquisitions never queued");
     let overflow = waiter.request(
         r#"{"id":"p13-overflow","type":"acquire_agent","child_id":"ch_overflow","work_kind":"test"}"#,
         "p13-overflow",
