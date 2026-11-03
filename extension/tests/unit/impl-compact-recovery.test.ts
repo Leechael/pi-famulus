@@ -100,13 +100,14 @@ describe("NotifyCenter compact hold and one-turn flush", () => {
     // The passive list precedes the final active wake, so the whole batch is
     // appended before one turn and the list itself never triggers it.
     const kinds = sent.map((entry) => (entry.details as FamulusWake).kind);
-    expect(kinds).toEqual(["monitor", "running-monitors", "monitor"]);
+    expect(kinds).toEqual(["monitor", "running-monitors", "monitor-terminal"]);
     expect(sent.map((entry) => entry.options.triggerTurn === true)).toEqual([false, false, true]);
     expect(sent.filter((entry) => entry.options.triggerTurn === true)).toHaveLength(1);
     const event = sent[0].details as Extract<FamulusWake, { kind: "monitor" }>;
     expect(event.event).toBe("noop");
-    const terminal = sent[2].details as Extract<FamulusWake, { kind: "monitor" }>;
-    expect(terminal.status).toBe("exited");
+    const terminal = sent[2].details as Extract<FamulusWake, { kind: "monitor-terminal" }>;
+    expect(terminal.monitors.map((monitor) => monitor.status)).toEqual(["exited"]);
+    expect(wakeIds(terminal)).toEqual(["mon_1"]);
     const list = sent[1].details as Extract<FamulusWake, { kind: "running-monitors" }>;
     expect(list.monitors.map((item) => item.id)).toEqual(["mon_2"]);
     expect(wakeIds(list)).toEqual(["mon_2"]);
@@ -172,13 +173,76 @@ describe("NotifyCenter compact hold and one-turn flush", () => {
       clock: new ManualClock(),
     });
     center.beginHold();
-    center.notify(terminalNotice());
+    center.notifyMonitorEvent("watcher", "mon_1", "noop");
     center.endHold();
     expect(sent).toHaveLength(0);
     center.settled();
     expect(sent).toHaveLength(1);
     expect(sent[0].options).toEqual({ triggerTurn: true });
     center.dispose();
+  });
+
+  it("active timeout during holdAll stays in the terminal queue; compact idle flushes output then terminal once", () => {
+    const sent: { details?: unknown; options: { triggerTurn?: boolean } }[] = [];
+    const clock = new ManualClock();
+    const center = new NotifyCenter({
+      sendMessage: (message, options) => sent.push({ details: message.details, options }),
+      isIdle: () => true,
+      clock,
+    });
+    center.beginHold();
+    center.notifyMonitorEvent("watcher", "mon_1", "tick-line");
+    const timeout = formatMonitorEvent("watcher", "mon_1", "[Monitor timed out — re-arm if needed.]", "timeout");
+    center.notify({ customType: timeout.customType, content: timeout.content, details: timeout.details });
+    clock.advanceBy(10_000);
+    expect(sent).toHaveLength(0);
+    center.settledAfterCompact();
+    expect(sent.map((entry) => (entry.details as FamulusWake).kind)).toEqual(["monitor", "monitor-terminal"]);
+    const output = sent[0].details as Extract<FamulusWake, { kind: "monitor" }>;
+    expect(output.event).toContain("tick-line");
+    const terminal = sent[1].details as Extract<FamulusWake, { kind: "monitor-terminal" }>;
+    expect(wakeIds(terminal)).toEqual(["mon_1"]);
+    expect(terminal.monitors.map((monitor) => monitor.status)).toEqual(["timeout"]);
+    expect(JSON.stringify(terminal)).not.toMatch(/re-arm if needed/);
+    expect(sent.map((entry) => entry.options.triggerTurn === true)).toEqual([false, true]);
+    expect(sent.filter((entry) => (entry.details as FamulusWake).kind === "monitor-terminal")).toHaveLength(1);
+    center.dispose();
+    expect(sent.filter((entry) => (entry.details as FamulusWake).kind === "monitor-terminal")).toHaveLength(1);
+  });
+
+  it("passive timeout during holdAll flushes output then terminal once with no turn", () => {
+    const sent: { details?: unknown; options: { triggerTurn?: boolean } }[] = [];
+    const clock = new ManualClock();
+    const center = new NotifyCenter({
+      sendMessage: (message, options) => sent.push({ details: message.details, options }),
+      isIdle: () => true,
+      clock,
+    });
+    center.beginHold();
+    center.notifyMonitorEvent("watcher", "mon_1", "tick-line", 0, { quiet: true });
+    const timeout = formatMonitorEvent("watcher", "mon_1", "[Monitor timed out — re-arm if needed.]", "timeout");
+    center.notify(
+      { customType: timeout.customType, content: timeout.content, details: timeout.details },
+      { passive: true, quietEvents: true },
+    );
+    clock.advanceBy(10_000);
+    expect(sent).toHaveLength(0);
+    const extra = formatRunningMonitorList([{ id: "mon_2", description: "ticker", remaining: "persistent" }]);
+    center.settledAfterCompact({ customType: extra.customType, content: extra.content, details: extra.details });
+    expect(sent.map((entry) => (entry.details as FamulusWake).kind)).toEqual([
+      "monitor",
+      "monitor-terminal",
+      "running-monitors",
+    ]);
+    const output = sent[0].details as Extract<FamulusWake, { kind: "monitor" }>;
+    expect(output.event).toContain("tick-line");
+    const terminal = sent[1].details as Extract<FamulusWake, { kind: "monitor-terminal" }>;
+    expect(wakeIds(terminal)).toEqual(["mon_1"]);
+    expect(terminal.monitors.map((monitor) => monitor.status)).toEqual(["timeout"]);
+    expect(sent.every((entry) => entry.options.triggerTurn !== true)).toBe(true);
+    expect(sent.filter((entry) => (entry.details as FamulusWake).kind === "monitor-terminal")).toHaveLength(1);
+    center.dispose();
+    expect(sent.filter((entry) => (entry.details as FamulusWake).kind === "monitor-terminal")).toHaveLength(1);
   });
 });
 
