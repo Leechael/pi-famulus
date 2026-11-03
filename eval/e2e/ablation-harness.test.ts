@@ -27,7 +27,7 @@ const childOnly = textSegments.filter((s) => s.scope === "child");
 /** Every ablatable text segment at once (mechanisms are checked separately). */
 const ablateAll = reachable.map((s) => s.id).join(",");
 
-const WAKE_KINDS: WakeKind[] = ["task", "monitor", "subagent-handover", "subagent-done", "supervisor-request"];
+const WAKE_KINDS: WakeKind[] = ["task", "monitor", "monitor-terminal", "subagent-handover", "subagent-done", "supervisor-request"];
 const allWakesSeen = (items: Item[]) => {
   const kinds = new Set(wakes(items).map((w) => w.wake.kind));
   return (
