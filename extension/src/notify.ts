@@ -13,7 +13,7 @@
  *   <pi-famulus-wake kind="task"> payload, and the same task/event pair is only
  *   ever delivered once.
  */
-import { formatMonitorEvent, formatTaskNotification, type TaskExitInfo } from "./format";
+import { formatMonitorEvent, formatRunningMonitorList, formatTaskNotification, type TaskExitInfo } from "./format";
 import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, wakeIds, type MonitorOutputInfo, type WakeItem } from "./wake";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
@@ -116,7 +116,8 @@ export class NotifyCenter {
   private disposed = false;
   /** A wake started or steered a run that has not settled yet. */
   private runPending = false;
-  private held: { message: NotifyMessage; onDelivered?: MonitorDeliveryAck; sourcePreview?: string }[] = [];
+  private holdAll = false;
+  private held: { message: NotifyMessage; onDelivered?: MonitorDeliveryAck; sourcePreview?: string; passive?: boolean }[] = [];
 
   constructor(deps: NotifyCenterDeps) {
     this.deps = deps;
@@ -161,7 +162,7 @@ export class NotifyCenter {
 
   private deliverPassive(message: NotifyMessage, onDelivered?: MonitorDeliveryAck, sourcePreview?: string): void {
     message = stampWakeAsOf(message, this.clock.now());
-    if (this.runPending || !this.deps.isIdle()) this.held.push({ message, onDelivered, sourcePreview });
+    if (this.holdAll || this.runPending || !this.deps.isIdle()) this.held.push({ message, onDelivered, sourcePreview, passive: true });
     else this.deliver(message, true, onDelivered, sourcePreview);
   }
 
@@ -175,7 +176,48 @@ export class NotifyCenter {
     this.runPending = false;
     this.flushMonitorEvents();
     if (this.runPending) return;
-    for (const { message, onDelivered, sourcePreview } of this.held.splice(0)) this.deliver(message, true, onDelivered, sourcePreview);
+    for (const item of this.held.splice(0)) {
+      this.deliver(item.message, item.passive === true, item.onDelivered, item.sourcePreview);
+    }
+  }
+
+  /** Compaction is in progress: do not send; coalesced/held wakes wait for {@link settledAfterCompact}. */
+  beginHold(): void {
+    if (this.disposed) return;
+    this.holdAll = true;
+  }
+
+  endHold(): void {
+    this.holdAll = false;
+  }
+
+  /**
+   * After compaction has actually gone idle: drain held/pending wakes and an
+   * optional passive running-monitor list. If any active wake exists, append
+   * the entire batch before the final message starts one turn.
+   */
+  settledAfterCompact(extra?: NotifyMessage): void {
+    if (this.disposed) return;
+    this.holdAll = false;
+    this.runPending = false;
+    const batch: { message: NotifyMessage; onDelivered?: MonitorDeliveryAck; sourcePreview?: string; passive?: boolean }[] = [];
+    for (const taskId of [...this.pendingMonitors.keys()]) {
+      const item = this.takeMonitor(taskId);
+      if (item) batch.push(item);
+    }
+    batch.push(...this.held.splice(0));
+    if (extra) batch.push({ message: extra, passive: true });
+    if (batch.length === 0) return;
+    const anyActive = batch.some((item) => !item.passive);
+    if (extra && anyActive) {
+      const list = batch.pop()!;
+      let lastActive = batch.length - 1;
+      while (lastActive >= 0 && batch[lastActive].passive) lastActive--;
+      batch.splice(lastActive, 0, list);
+    }
+    for (let i = 0; i < batch.length; i++) {
+      this.sendCompactFlush(batch[i], anyActive && i === batch.length - 1);
+    }
   }
 
   /**
@@ -194,7 +236,7 @@ export class NotifyCenter {
     if (pending?.onDelivered && opts.onDelivered && pending.onDelivered !== opts.onDelivered) {
       throw new Error(`Monitor ${taskId} requires a stable onDelivered callback while pending`);
     }
-    if (this.deps.isIdle() && !pending && !opts.quiet) {
+    if (this.deps.isIdle() && !this.holdAll && !pending && !opts.quiet) {
       const wake = formatMonitorEvent(description, taskId, event, undefined, { droppedLines, output: opts.output });
       this.deliver({ customType: wake.customType, content: wake.content, details: wake.details }, false, opts.onDelivered);
       return;
@@ -219,8 +261,15 @@ export class NotifyCenter {
 
   /** Deliver one monitor's coalesced events, if any, in the current mode. */
   private flushMonitor(taskId: string, quiet = false): void {
-    const item = this.pendingMonitors.get(taskId);
+    const item = this.takeMonitor(taskId, quiet);
     if (!item) return;
+    if (item.passive) this.deliverPassive(item.message, item.onDelivered, item.sourcePreview);
+    else this.deliver(item.message, false, item.onDelivered, item.sourcePreview);
+  }
+
+  private takeMonitor(taskId: string, quiet = false): { message: NotifyMessage; onDelivered?: MonitorDeliveryAck; sourcePreview?: string; passive?: boolean } | undefined {
+    const item = this.pendingMonitors.get(taskId);
+    if (!item) return undefined;
     this.pendingMonitors.delete(taskId);
     const { head, tail, omittedChars } = item.preview;
     const preview = omittedChars > 0 ? `${head}\n[... ${omittedChars} characters omitted ...]\n${tail}` : head;
@@ -239,8 +288,7 @@ export class NotifyCenter {
         tail.includes("\n") ? tail.slice(tail.indexOf("\n") + 1) : "",
       ].filter(Boolean).join("\n")
       : head;
-    if (quiet || item.quiet) this.deliverPassive(message, item.onDelivered, sourcePreview);
-    else this.deliver(message, false, item.onDelivered, sourcePreview);
+    return { message, onDelivered: item.onDelivered, sourcePreview, passive: quiet || item.quiet };
   }
 
   /** Flush any pending task exit notifications now. */
@@ -286,9 +334,35 @@ export class NotifyCenter {
     });
   }
 
+  private sendCompactFlush(
+    item: { message: NotifyMessage; onDelivered?: MonitorDeliveryAck; sourcePreview?: string; passive?: boolean },
+    triggerTurn: boolean,
+  ): void {
+    const message = stampWakeAsOf(item.message, this.clock.now());
+    const msg = { ...message, display: true };
+    const details = message.details as { kind?: string; eventCount?: number; event?: string } | undefined;
+    if (details?.kind) {
+      const ids = wakeIds(details);
+      this.deps.logEvent?.("wake.emit", {
+        kind: details.kind,
+        ids,
+        batch: ids.length > 1 || (details.kind === "monitor" && (details.eventCount ?? 0) > 1),
+      });
+    }
+    const mode = triggerTurn ? "trigger" : item.passive ? "passive" : "append";
+    this.deps.logEvent?.("wake.deliver", { kind: details?.kind ?? "unknown", mode });
+    if (triggerTurn) this.runPending = true;
+    this.deps.sendMessage(msg, { triggerTurn });
+    item.onDelivered?.(item.sourcePreview ?? (details?.kind === "monitor" ? details.event : undefined));
+  }
+
   private deliver(message: NotifyMessage, passive = false, onDelivered?: MonitorDeliveryAck, sourcePreview?: string): void {
     // Wakes built here (task batches, monitor events) are stamped now.
     message = stampWakeAsOf(message, this.clock.now());
+    if (this.holdAll) {
+      this.held.push({ message, onDelivered, sourcePreview, passive });
+      return;
+    }
     const msg = { ...message, display: true };
     const details = message.details as { kind?: string; eventCount?: number } | undefined;
     if (details?.kind) {
@@ -312,4 +386,148 @@ export class NotifyCenter {
     onDelivered?.(sourcePreview ?? (details?.kind === "monitor" ? (message.details as { event?: string }).event : undefined));
   }
 
+}
+
+/** Next-tick idle check with 25ms retry; new run/compaction callers cancel. */
+export function scheduleIdleCheck(opts: {
+  isReady: () => boolean;
+  onReady: () => void;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
+}): { cancel: () => void } {
+  const start = opts.setTimeout ?? setTimeout;
+  const stop = opts.clearTimeout ?? clearTimeout;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+  const tick = (delayMs: number) => {
+    timer = start(() => {
+      timer = undefined;
+      if (cancelled) return;
+      if (!opts.isReady()) {
+        tick(25);
+        return;
+      }
+      opts.onReady();
+    }, delayMs);
+    timer.unref?.();
+  };
+  tick(0);
+  return {
+    cancel() {
+      cancelled = true;
+      if (timer !== undefined) stop(timer);
+      timer = undefined;
+    },
+  };
+}
+
+export function attachCompactRecovery(
+  pi: { on(event: string, handler: (event: unknown, ctx: { isIdle(): boolean; hasPendingMessages?: () => boolean }) => unknown): unknown },
+  deps: {
+    getCenter: () => NotifyCenter | null;
+    getCtx: () => { isIdle(): boolean; hasPendingMessages?: () => boolean } | null;
+    listRunningMonitors: () => { id: string; description: string; remaining: string }[];
+    now?: () => number;
+    setTimeout?: typeof setTimeout;
+    clearTimeout?: typeof clearTimeout;
+    idleHoldMs?: number;
+    maxHoldMs?: number;
+  },
+): { dispose: () => void } {
+  const idleHoldMs = deps.idleHoldMs ?? 1_000;
+  const maxHoldMs = deps.maxHoldMs ?? 600_000;
+  const now = deps.now ?? Date.now;
+  const startTimer = deps.setTimeout ?? setTimeout;
+  const stopTimer = deps.clearTimeout ?? clearTimeout;
+  let handle: { cancel: () => void } | undefined;
+  let watchdog: { cancel: () => void } | undefined;
+  const cancel = () => {
+    handle?.cancel();
+    handle = undefined;
+    watchdog?.cancel();
+    watchdog = undefined;
+  };
+  const flushHeld = () => {
+    cancel();
+    const center = deps.getCenter();
+    if (!center) return;
+    const running = deps.listRunningMonitors();
+    const extra = running.length > 0 ? formatRunningMonitorList(running) : undefined;
+    center.settledAfterCompact(extra);
+  };
+  const startWatchdog = () => {
+    watchdog?.cancel();
+    const holdStarted = now();
+    let idleSince: number | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    const tick = () => {
+      timer = startTimer(() => {
+        timer = undefined;
+        if (cancelled) return;
+        const t = now();
+        if (t - holdStarted >= maxHoldMs) {
+          flushHeld();
+          return;
+        }
+        const ctx = deps.getCtx();
+        const idle = !!ctx && ctx.isIdle() && ctx.hasPendingMessages?.() !== true;
+        if (idle) {
+          idleSince ??= t;
+          if (t - idleSince >= idleHoldMs) {
+            flushHeld();
+            return;
+          }
+        } else {
+          idleSince = undefined;
+        }
+        tick();
+      }, 25);
+      timer.unref?.();
+    };
+    tick();
+    watchdog = {
+      cancel() {
+        cancelled = true;
+        if (timer !== undefined) stopTimer(timer);
+        timer = undefined;
+      },
+    };
+  };
+  const afterCompact = () => {
+    cancel();
+    handle = scheduleIdleCheck({
+      isReady: () => {
+        const ctx = deps.getCtx();
+        return !!ctx && ctx.isIdle() && ctx.hasPendingMessages?.() !== true;
+      },
+      onReady: () => {
+        handle = undefined;
+        flushHeld();
+      },
+      setTimeout: startTimer,
+      clearTimeout: stopTimer,
+    });
+  };
+  pi.on("session_before_compact", () => {
+    cancel();
+    deps.getCenter()?.beginHold();
+    startWatchdog();
+  });
+  pi.on("session_compact", afterCompact);
+  pi.on("session_compact_failed", afterCompact);
+  pi.on("before_agent_start", () => {
+    cancel();
+    deps.getCenter()?.endHold();
+  });
+  pi.on("agent_start", () => {
+    cancel();
+    deps.getCenter()?.endHold();
+  });
+  return {
+    dispose() {
+      cancel();
+      deps.getCenter()?.endHold();
+    },
+  };
 }

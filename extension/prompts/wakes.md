@@ -8,6 +8,10 @@
 
 Read original bytes with task_output using this monitor id and cursor-start, with a bounded max_bytes (for example 8192); next_cursor continues the read. The range may include interleaved events. A preview is not the full log.
 
+# running-monitors: guidance
+
+This is an informational list of monitors still running after compaction, not an event. No response is needed; do not use it to poll.
+
 # handover: changed-active
 
 Its result arrives as a new wake when it finishes.

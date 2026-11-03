@@ -86,6 +86,7 @@ export const PROMPTS = {
   "tools.task_stop.param.task_id": "Task id to stop, e.g. sh_a1b2c3d4",
   "wakes.lead-in": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.",
   "wakes.monitor.output-hint": "Read original bytes with task_output using this monitor id and cursor-start, with a bounded max_bytes (for example 8192); next_cursor continues the read. The range may include interleaved events. A preview is not the full log.",
+  "wakes.running-monitors.guidance": "This is an informational list of monitors still running after compaction, not an event. No response is needed; do not use it to poll.",
   "wakes.handover.changed-active": "Its result arrives as a new wake when it finishes.",
   "wakes.done.changed-active": "The run is active again; another subagent-done arrives when it finishes.",
   "wakes.overrun.summary": "{{name}} has run {{elapsed}} in this turn, past its {{budget}} budget, and is still running{{shell}}.",

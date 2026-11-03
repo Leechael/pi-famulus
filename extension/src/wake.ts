@@ -172,6 +172,10 @@ type FamulusWakeBody =
       reason: "new" | "resumed" | "forked" | "handoff-ended" | "session-mismatch";
       ids: string[];
       monitors: Array<{ id: string; description: string; elapsedMs: number; outputPath: string }>;
+    }
+  | {
+      kind: "running-monitors";
+      monitors: { id: string; description: string; remaining: string }[];
     };
 
 export interface FormattedWake {
@@ -213,6 +217,9 @@ export function wakeIds(details: { kind?: string }): string[] {
     from?: string;
   };
   if (d.kind === "task") return (d.tasks ?? []).map((task) => task.id);
+  if (d.kind === "running-monitors") {
+    return ((details as { monitors?: { id: string }[] }).monitors ?? []).map((monitor) => monitor.id);
+  }
   if (d.kind === "subagent-done") return (d.children ?? []).map((child) => child.childId);
   if (d.kind === "subagent-overrun") return [d.childId, ...((d as { additional?: { childId: string }[] }).additional ?? []).map((child) => child.childId)].filter((id): id is string => Boolean(id));
   if (d.kind === "monitor-session-end") {
@@ -297,6 +304,8 @@ function renderWakeBody(details: FamulusWake): string {
       return renderUpdate(details);
     case "monitor-session-end":
       return renderMonitorSessionEnd(details);
+    case "running-monitors":
+      return renderRunningMonitors(details);
   }
 }
 
@@ -510,6 +519,20 @@ function renderRequest(details: Extract<FamulusWake, { kind: "supervisor-request
     `  <reply-with>${escapeXml(recipe)}</reply-with>`,
     "</pi-famulus-wake>",
   ].join("\n");
+}
+
+function renderRunningMonitors(details: Extract<FamulusWake, { kind: "running-monitors" }>): string {
+  const parts = [
+    '<pi-famulus-wake kind="running-monitors">',
+    PROMPTS["wakes.running-monitors.guidance"],
+  ];
+  for (const monitor of details.monitors) {
+    parts.push(
+      `  <monitor id="${escapeXmlAttr(monitor.id)}" remaining="${escapeXmlAttr(monitor.remaining)}">${escapeXml(monitor.description)}</monitor>`,
+    );
+  }
+  parts.push("</pi-famulus-wake>");
+  return parts.join("\n");
 }
 
 function renderUpdate(details: Extract<FamulusWake, { kind: "supervisor-update" }>): string {

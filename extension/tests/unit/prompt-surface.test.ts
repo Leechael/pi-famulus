@@ -12,6 +12,7 @@ import { createAgentMessageTool, createContactSupervisorTool } from "../../src/c
 import {
   formatBackgroundNotice,
   formatMonitorEvent,
+  formatRunningMonitorList,
   formatSubagentHandover,
   formatSubagentNotification,
   formatSubagentOverrun,
@@ -99,6 +100,7 @@ describe("model-visible prompt surface", () => {
       leadIn: FAMULUS_WAKE_LEAD_IN,
       task: task.content,
       monitor: monitor.content,
+      runningMonitors: formatRunningMonitorList([{ id: "mon_2", description: "worker", remaining: "persistent" }]).content,
       done: done.content,
       handover: handover.content,
       overrun: overrun.content,

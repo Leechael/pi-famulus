@@ -87,6 +87,8 @@ interface MonitorEntry {
   saturation: SaturationWindow;
   droppedLinesPending: number;
   timeoutTimer: ClockTimer | null;
+  /** Epoch ms when the extension-side timeout fires; null when persistent. */
+  timeoutDeadlineAt: number | null;
   stopped: boolean;
   cursor: number;
   recovering: boolean;
@@ -117,10 +119,17 @@ export class MonitorRegistry {
   }
 
   /** Active monitors for the fleet status surface. */
-  listActive(): { taskId: string; description: string; startedAt: number }[] {
+  listActive(): { taskId: string; description: string; startedAt: number; remainingMs: number | null; persistent: boolean }[] {
+    const now = this.clock.now();
     return [...this.entries.values()]
       .filter((e) => !e.stopped)
-      .map((e) => ({ taskId: e.taskId, description: e.description, startedAt: e.startedAt }))
+      .map((e) => ({
+        taskId: e.taskId,
+        description: e.description,
+        startedAt: e.startedAt,
+        persistent: e.timeoutDeadlineAt === null,
+        remainingMs: e.timeoutDeadlineAt === null ? null : Math.max(0, e.timeoutDeadlineAt - now),
+      }))
       .sort((a, b) => a.startedAt - b.startedAt);
   }
 
@@ -190,6 +199,7 @@ export class MonitorRegistry {
       }),
       droppedLinesPending: 0,
       timeoutTimer: null,
+      timeoutDeadlineAt: timeoutMs === null ? null : this.clock.now() + timeoutMs,
       stopped: false,
       cursor: 0,
       recovering: false,

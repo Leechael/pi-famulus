@@ -26,12 +26,12 @@ import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
 import { ensureNativeManagerInstalled } from "./native-manager.js";
-import type { TaskExitInfo } from "./format";
+import { formatDuration, type TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { registerIntercom } from "./intercom/intercom";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
-import { NotifyCenter } from "./notify";
+import { attachCompactRecovery, NotifyCenter } from "./notify";
 import { onWakeMessageEnd, registryStatusLookup } from "./wake-delivery";
 import { ChildShellTracker, createOverrunNotifier } from "./subagent/overrun";
 import {
@@ -629,6 +629,17 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     },
     onExited: (taskId, event) => patchExited(taskId, event),
     afterStop: () => void syncWithManager(),
+  });
+
+  const compactRecovery = attachCompactRecovery(pi, {
+    getCenter: () => notifyCenter,
+    getCtx: () => ctx,
+    listRunningMonitors: () =>
+      (monitorRegistry?.listActive() ?? []).map((mon) => ({
+        id: mon.taskId,
+        description: mon.description,
+        remaining: mon.persistent ? "persistent" : `${formatDuration(mon.remainingMs ?? 0)} remaining`,
+      })),
   });
 
   pi.registerTool(createBashOverride(deps));
@@ -1335,6 +1346,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
 
   const teardown = async (notice?: { reason: MonitorTeardownReason; dest: "live" | "file" }): Promise<void> => {
     if (notice) await emitMonitorTeardownNotice(notice.reason, notice.dest);
+    compactRecovery.dispose();
     exitWatchdog.dispose();
     fleetWidget?.dispose();
     fleetWidget = null;

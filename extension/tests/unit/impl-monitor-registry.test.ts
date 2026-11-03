@@ -429,3 +429,48 @@ describe("MonitorRegistry stop handling, from review", () => {
     expect(turns()).toHaveLength(2);
   });
 });
+
+describe("MonitorRegistry running-monitor remaining time", () => {
+  it("stores a deadline for timed monitors and marks persistent ones", async () => {
+    const clock = new ManualClock(1_000);
+    let nextId = 1;
+    const manager = {
+      ensureAvailable: async () => true,
+      start: async () => ({ task_id: `mon_${nextId++}`, pid: nextId }),
+      watch: async () => {},
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => null,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start(
+      { command: "tick", description: "ticker", timeout_ms: 120_000 },
+      { cwd: "/tmp" } as ExtensionContext,
+    );
+    await registry.start(
+      { command: "watch", description: "watcher", persistent: true },
+      { cwd: "/tmp" } as ExtensionContext,
+    );
+    clock.advanceBy(30_000);
+    const active = registry.listActive();
+    expect(active).toEqual([
+      expect.objectContaining({
+        taskId: "mon_1",
+        description: "ticker",
+        remainingMs: 90_000,
+        persistent: false,
+      }),
+      expect.objectContaining({
+        taskId: "mon_2",
+        description: "watcher",
+        remainingMs: null,
+        persistent: true,
+      }),
+    ]);
+    registry.disposeAll();
+  });
+});

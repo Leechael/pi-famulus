@@ -666,6 +666,12 @@ exports[`model-visible prompt surface > wakes 1`] = `
   <message>JSON or YAML?</message>
   <reply-with>agent_message { action: "reply", to: "ch_1", message: "&lt;your decision&gt;" }</reply-with>
 </pi-famulus-wake>",
+  "runningMonitors": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
+
+<pi-famulus-wake kind="running-monitors">
+This is an informational list of monitors still running after compaction, not an event. No response is needed; do not use it to poll.
+  <monitor id="mon_2" remaining="persistent">worker</monitor>
+</pi-famulus-wake>",
   "task": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.
 
 <pi-famulus-wake kind="task">
