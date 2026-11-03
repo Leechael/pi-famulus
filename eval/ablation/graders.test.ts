@@ -260,7 +260,10 @@ describe("tail-grep timing regressions", () => {
   });
 });
 
-describe("graders on scripted behaviors", { concurrency: true }, () => {
+// Each episode boots a real pi process and some boot a hosted child as well.
+// Bound fan-out so cold child startup is not starved by all 23 cases at once.
+// Scenario deadlines and the production child-startup watchdog stay unchanged.
+describe("graders on scripted behaviors", { concurrency: 2 }, () => {
   for (const [scenario, behavior, pass, reason] of CASES) {
     it(`${scenario}/${behavior} → ${pass ? "PASS" : "FAIL"}`, async () => {
       await withDiagnostics(async (diagnostics) => {
