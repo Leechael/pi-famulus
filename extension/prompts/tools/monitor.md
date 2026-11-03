@@ -2,7 +2,7 @@
 
 # description
 
-Start a background monitor process whose stdout lines are injected back to you as <pi-famulus-wake kind="monitor"> messages (batched over 200ms, rate-limited). The command must be line-buffered: each event must be a single line. <!--seg:tooldesc.monitor-follow-->It must keep running and follow its source, e.g. `tail -n +1 -F file | grep --line-buffered PATTERN`; a command that reads once and exits (a plain grep or cat) only reports what is there now. Add `-m1` to grep to stop after the first match. <!--/seg--><!--seg:tooldesc.monitor-silence-->Silence is not success: print explicit success and terminal failures. Routine unchanged retries may stay silent; do not print a heartbeat on every check. <!--/seg--><!--seg:tooldesc.monitor-wake-->Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind="monitor"> before other work. Do not poll.<!--/seg--> Repeated Rust-framed lines are suppressed within dedup_window_ms (default 60000); exact matching is the default. Enable ignore-timestamps only when edge ISO timestamps are incidental. Wakes contain bounded head/tail previews and original-byte references; use task_output for missing details, not polling. {{monitorIdle}}
+Start a background monitor process whose stdout lines are injected back to you as <pi-famulus-wake kind="monitor"> messages (batched over 200ms, rate-limited). The command must be line-buffered: each event must be a single line. <!--seg:tooldesc.monitor-follow-->It must keep running and follow its source, e.g. `tail -n +1 -F file | grep --line-buffered PATTERN`; a command that reads once and exits (a plain grep or cat) only reports what is there now. Add `-m1` to grep to stop after the first match. <!--/seg--><!--seg:tooldesc.monitor-silence-->Silence is not success: print explicit success and terminal failures. Routine unchanged retries may stay silent; do not print a heartbeat on every check. <!--/seg--><!--seg:tooldesc.monitor-wake-->Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind="monitor"> before other work. Do not poll.<!--/seg--> Repeated Rust-framed lines are suppressed within dedup_window_ms (default 60000); exact matching is the default. Enable ignore-timestamps only when edge ISO timestamps are incidental. Wakes contain bounded head/tail previews and original-byte references; use task_output for missing details, not polling. <!--seg:tooldesc.monitor-timeout-->timeout_ms defaults to 5 minutes (max 1 hour). Expiry ends the monitor; nothing watches the source afterwards, and the timeout notice can arrive late while you are busy. <!--/seg--><!--seg:tooldesc.monitor-persistent-->Use persistent:true for long monitoring. <!--/seg--><!--seg:tooldesc.monitor-stagger-->If you use timeouts for several monitors, stagger them. <!--/seg-->Prefer `tail -F` / `journalctl -f` over polling. <!--seg:tooldesc.monitor-edge-->Write edge-triggered commands: normally zero output, one line only for a new problem signature, and one recovery line. <!--/seg--><!--seg:tooldesc.monitor-sampling-->Sampling windows must not overlap and must not leave gaps (window = interval), or keep a cursor/last-seen state in the script and report only new items. <!--/seg-->{{monitorIdle}}
 
 # snippet
 
@@ -13,6 +13,7 @@ Watch a command's line stream and get injected events
 - <!--seg:rules.monitor-use-->Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.<!--/seg-->
 - {{monitorIdle}}
 - <!--seg:rules.monitor-wake-->When woken by a <pi-famulus-wake kind="monitor">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.<!--/seg-->
+- Use persistent:true for long monitoring.
 
 # param: command
 
@@ -24,11 +25,11 @@ Short human-readable description of what is being watched
 
 # param: timeout_ms
 
-Stop the monitor after this many milliseconds (default {{defaultMs}}, min {{minMs}}, max {{maxMs}})
+Stop the monitor after this many milliseconds (default {{defaultMs}} / 5 minutes, min {{minMs}}, max {{maxMs}} / 1 hour).
 
 # param: persistent
 
-Keep the monitor alive until the session ends (no timeout). Default false.
+Keep the monitor alive until the session ends (no timeout). Default false. Use persistent:true for long monitoring.
 # param: dedup_window_ms
 
 Deduplication window for Rust-framed complete lines (default 60000ms; 0 disables dedup; maximum 3600000). Starts when a surviving preview is delivered; repeats do not extend it. Missing metadata, capacity eviction, and omitted representatives fail open rather than hiding unseen output.
