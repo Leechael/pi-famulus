@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/clock";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ManagerClient } from "../../src/manager-client";
+import type { ManagerClient, MonitorOutputRecord } from "../../src/manager-client";
 import { MonitorRegistry } from "../../src/monitor";
+import type { OverloadControllerOptions } from "../../src/monitor-batching";
 import { NotifyCenter } from "../../src/notify";
 import { createTaskStopTool } from "../../src/task-tools";
 import type { FamulusWake } from "../../src/wake";
@@ -16,7 +17,7 @@ function terminalStatus(details: unknown): string | undefined {
 }
 
 describe("MonitorRegistry saturation", () => {
-  it("stops on sustained drops even when accepted batches interrupt them", async () => {
+  async function setup(overload?: Partial<OverloadControllerOptions>, start: { dedup_window_ms?: number } = { dedup_window_ms: 0 }) {
     const clock = new ManualClock();
     const stopped: string[] = [];
     const sent: { details?: unknown }[] = [];
@@ -25,7 +26,7 @@ describe("MonitorRegistry saturation", () => {
       ensureAvailable: async () => true,
       start: async () => ({ task_id: "mon_1", pid: 123 }),
       watch: async () => {},
-      stop: async (taskId: string) => { stopped.push(taskId); },
+      stop: async (taskId: string, reason?: string) => { stopped.push(reason ? `${taskId}:${reason}` : taskId); },
     } as unknown as ManagerClient;
     const center = new NotifyCenter({
       sendMessage: (message) => sent.push(message),
@@ -39,29 +40,312 @@ describe("MonitorRegistry saturation", () => {
       trackTask: () => {},
       clock,
       logEvent: (type, fields) => events.push({ type, fields }),
+      ...(overload !== undefined ? { overload } : {}),
     });
-
     const { taskId } = await registry.start(
-      { command: "ticker", description: "ticker", persistent: true },
+      { command: "ticker", description: "ticker", persistent: true, ...start },
       { cwd: "/tmp" } as ExtensionContext,
     );
+    const wakes = () => sent.map((item) => item.details as FamulusWake | undefined).filter(
+      (details): details is Extract<FamulusWake, { kind: "monitor" }> => details?.kind === "monitor",
+    );
+    const terminals = () => sent.map((item) => item.details as FamulusWake | undefined).filter(
+      (details): details is Extract<FamulusWake, { kind: "monitor-terminal" }> => details?.kind === "monitor-terminal",
+    );
+    return { clock, registry, center, stopped, events, taskId, wakes, sent, terminals };
+  }
+
+  it("enters summary on sustained drops even when accepted batches interrupt them, and does not stop", async () => {
+    const { clock, registry, center, stopped, events, taskId, wakes } = await setup();
     for (let i = 0; i < 151; i++) {
       registry.handleOutput(taskId, `line ${i}\n`);
       clock.advanceBy(200);
       await Promise.resolve();
       await Promise.resolve();
     }
-
-    expect(stopped).toEqual(["mon_1"]);
-    expect(registry.has("mon_1")).toBe(false);
-    clock.advanceBy(TERMINAL_MS);
-    const stopWake = sent.map((item) => item.details as FamulusWake | undefined).find(
-      (details): details is Extract<FamulusWake, { kind: "monitor-terminal" }> =>
-        details?.kind === "monitor-terminal" && details.monitors.some((monitor) => monitor.status === "stopped"),
-    );
-    expect(stopWake?.monitors[0]?.droppedLines).toBeGreaterThan(0);
+    expect(stopped).toEqual([]);
+    expect(registry.has("mon_1")).toBe(true);
     expect(events.some((event) => event.type === "monitor.drop" && event.fields?.id === "mon_1")).toBe(true);
+    expect(events.some((event) => event.type === "monitor.stop")).toBe(false);
+    for (let i = 0; i < 150; i++) {
+      registry.handleOutput(taskId, `line extra ${i}\n`);
+      clock.advanceBy(200);
+      await Promise.resolve();
+    }
+    const summary = wakes().find((w) => w.event.includes("overload summary"));
+    expect(summary).toBeDefined();
+    expect(summary?.status).not.toBe("stopped");
+    expect(stopped).toEqual([]);
+    expect(registry.has("mon_1")).toBe(true);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("flushes a pending summary before the terminal exit notice", async () => {
+    const { clock, registry, center, taskId, wakes, sent } = await setup({
+      exitQuietMs: 3_600_000,
+      windowMs: 1_000,
+      summaryLinesPerSec: 2,
+      cadenceMs: [60_000, 60_000, 60_000, 60_000],
+    });
+    registry.handleOutput(taskId, `${"HTTP 500\n".repeat(10)}`);
+    clock.advanceBy(1_000);
+    await Promise.resolve();
+    registry.handleOutput(taskId, `${"HTTP 500\n".repeat(10)}`);
+    clock.advanceBy(200);
+    await Promise.resolve();
+    expect(wakes().some((w) => w.event.includes("overload summary"))).toBe(false);
+    registry.handleExit(taskId, { event: "task_exited", task_id: taskId, exit_code: 0, duration_ms: 50 });
+    center.settled();
+    clock.advanceBy(TERMINAL_MS);
+    const order = sent.map((item) => {
+      const details = item.details as FamulusWake;
+      if (details.kind === "monitor" && details.event.includes("overload summary")) return "summary";
+      if (details.kind === "monitor-terminal") return "terminal";
+      return details.kind;
+    });
+    expect(order.indexOf("summary")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("terminal")).toBeGreaterThan(order.indexOf("summary"));
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("stops only after sustained extreme input line rate, with a clear backstop notice", async () => {
+    const { clock, registry, center, stopped, events, taskId, wakes, terminals } = await setup({
+      stopLinesPerSec: 20,
+      stopSustainMs: 2_000,
+      windowMs: 1_000,
+      summaryLinesPerSec: 100,
+    });
+    for (let s = 0; s < 3; s++) {
+      registry.handleOutput(taskId, `${"flood\n".repeat(20)}`);
+      clock.advanceBy(1_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(stopped.length).toBeGreaterThan(0);
+    expect(stopped.some((s) => s.includes("rate-limit"))).toBe(true);
+    clock.advanceBy(TERMINAL_MS);
+    const stopWake = terminals().find((wake) => wake.monitors.some((monitor) => monitor.status === "stopped"));
+    expect(stopWake?.monitors[0]?.detail).toMatch(/1000 lines\/s|lines\/s for 60s|safety backstop/i);
     expect(events).toContainEqual({ type: "monitor.stop", fields: { id: "mon_1", reason: "rate-limit" } });
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("steady distinct 2 lines/s for 30s enters summary via drop-ratio; 1 line/s does not enter in the first 30s", async () => {
+    const two = await setup();
+    for (let i = 0; i < 61; i++) {
+      two.registry.handleOutput(two.taskId, `line ${i}\n`);
+      two.clock.advanceBy(500);
+      await Promise.resolve();
+    }
+    const twoEvents = two.wakes().map((w) => w.event);
+    expect(two.stopped).toEqual([]);
+    expect(two.registry.has("mon_1")).toBe(true);
+    expect(twoEvents.filter((e) => e.includes("entering summary"))).toHaveLength(1);
+    expect(twoEvents.some((e) => e.includes("drop-ratio"))).toBe(true);
+    expect(twoEvents.find((e) => e.includes("entering summary"))).not.toMatch(/\d+ lines\/s/);
+    expect(twoEvents.filter((e) => e.includes("leaving summary"))).toHaveLength(0);
+    two.center.dispose();
+    two.registry.disposeAll();
+
+    const one = await setup();
+    for (let i = 0; i < 32; i++) {
+      one.registry.handleOutput(one.taskId, `line ${i}\n`);
+      one.clock.advanceBy(1000);
+      await Promise.resolve();
+    }
+    expect(one.wakes().some((w) => w.event.includes("entering summary"))).toBe(false);
+    expect(one.stopped).toEqual([]);
+    one.center.dispose();
+    one.registry.disposeAll();
+  });
+
+  it("duplicate 5 lines/s with Rust records does not consume the drop budget; INPUT stays pre-dedup so =5/s does not enter", async () => {
+    const { clock, registry, center, stopped, events, taskId, wakes } = await setup(undefined, {});
+    let cursor = 0;
+    const rec = (at: number): MonitorOutputRecord => {
+      const text = "dup";
+      const chunk = `${text}\n`;
+      cursor += Buffer.byteLength(chunk);
+      return {
+        version: 1,
+        kind: "line",
+        observed_at: at,
+        cursor_start: cursor - Buffer.byteLength(chunk),
+        cursor_end: cursor,
+        preview: text,
+        truncated: false,
+        fingerprint: "blake3:v1:dup",
+        timestamp_fingerprint: "blake3:iso-edge-v1:dup",
+      };
+    };
+    for (let s = 0; s <= 30; s++) {
+      clock.advanceTo(s * 1000);
+      for (let k = 0; k < 5; k++) {
+        const record = rec(s);
+        registry.handleOutput(taskId, "dup\n", record.cursor_end, [record]);
+      }
+      clock.advanceBy(200);
+      await Promise.resolve();
+    }
+    expect(events.some((e) => e.type === "monitor.drop")).toBe(false);
+    expect(wakes().some((w) => w.event.includes("entering summary"))).toBe(false);
+    expect(stopped).toEqual([]);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("duplicate 6 lines/s with Rust records enters via pre-dedup line-rate without consuming drop budget", async () => {
+    const { clock, registry, center, stopped, events, taskId, wakes } = await setup(undefined, {});
+    let cursor = 0;
+    const rec = (at: number): MonitorOutputRecord => {
+      cursor += 4;
+      return {
+        version: 1,
+        kind: "line",
+        observed_at: at,
+        cursor_start: cursor - 4,
+        cursor_end: cursor,
+        preview: "dup",
+        truncated: false,
+        fingerprint: "blake3:v1:dup",
+        timestamp_fingerprint: "blake3:iso-edge-v1:dup",
+      };
+    };
+    for (let s = 0; s <= 30; s++) {
+      clock.advanceTo(s * 1000);
+      for (let k = 0; k < 6; k++) {
+        const record = rec(s);
+        registry.handleOutput(taskId, "dup\n", record.cursor_end, [record]);
+      }
+      clock.advanceBy(200);
+      await Promise.resolve();
+    }
+    const enter = wakes().filter((w) => w.event.includes("entering summary"));
+    expect(enter).toHaveLength(1);
+    expect(enter[0].event).toMatch(/line-rate|lines\/s/);
+    expect(events.some((e) => e.type === "monitor.drop")).toBe(false);
+    expect(stopped).toEqual([]);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("emits exactly one ENTER (bypassing RateLimiter) then one EXIT, keeping event-before-terminal", async () => {
+    const { clock, registry, center, taskId, wakes, sent } = await setup({
+      exitQuietMs: 3_600_000,
+      windowMs: 1_000,
+      summaryLinesPerSec: 2,
+    });
+    registry.handleOutput(taskId, `${"HTTP 500\n".repeat(10)}`);
+    clock.advanceBy(1_000);
+    await Promise.resolve();
+    registry.handleOutput(taskId, `${"HTTP 500\n".repeat(10)}`);
+    clock.advanceBy(200);
+    await Promise.resolve();
+    const afterEnter = wakes().map((w) => w.event);
+    expect(afterEnter.filter((e) => e.includes("entering summary"))).toHaveLength(1);
+    expect(afterEnter.some((e) => e.includes("Individual lines are suppressed"))).toBe(true);
+    expect(afterEnter.some((e) => e.includes("task_output"))).toBe(true);
+    expect(afterEnter.some((e) => e.includes("overload summary"))).toBe(false);
+    clock.advanceBy(30_000);
+    expect(wakes().filter((w) => w.event.includes("overload summary"))).toHaveLength(1);
+    expect(wakes().filter((w) => w.event.includes("entering summary"))).toHaveLength(1);
+    registry.handleExit(taskId, { event: "task_exited", task_id: taskId, exit_code: 0, duration_ms: 50 });
+    center.settled();
+    clock.advanceBy(TERMINAL_MS);
+    const order = sent.map((item) => {
+      const details = item.details as FamulusWake;
+      if (details.kind === "monitor" && details.event.includes("entering summary")) return "enter";
+      if (details.kind === "monitor" && details.event.includes("overload summary")) return "summary";
+      if (details.kind === "monitor-terminal") return "terminal";
+      return details.kind;
+    });
+    expect(order.indexOf("summary")).toBeGreaterThan(order.indexOf("enter"));
+    expect(order.indexOf("terminal")).toBeGreaterThan(order.indexOf("summary"));
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("does not join a raw partial across metadata takeover", async () => {
+    const { clock, registry, center, taskId, wakes } = await setup({
+      windowMs: 1_000,
+      summaryLinesPerSec: 0.5,
+      exitQuietMs: 3_600_000,
+    });
+    registry.handleOutput(taskId, "HTTP ", 5);
+    const record: MonitorOutputRecord = {
+      version: 1,
+      kind: "line",
+      observed_at: clock.now(),
+      cursor_start: 0,
+      cursor_end: 9,
+      preview: "HTTP 500",
+      truncated: false,
+    };
+    registry.handleOutput(taskId, "HTTP 500\n", 9, [record]);
+    clock.advanceBy(1_000);
+    await Promise.resolve();
+    registry.handleOutput(taskId, "next\n", 14);
+    clock.advanceBy(200);
+    await Promise.resolve();
+    expect(wakes().some((w) => w.event.includes("entering summary"))).toBe(true);
+    clock.advanceBy(30_000);
+    const summary = wakes().find((w) => w.event.includes("overload summary"));
+    expect(summary?.event).toMatch(/lines=1/);
+    expect(summary?.event).toMatch(/bytes=5/);
+    expect(summary?.event).toMatch(/cursor=9-14/);
+    expect(summary?.event).toMatch(/next x1/);
+    expect(summary?.event).not.toMatch(/HTTP next/);
+    expect(summary?.event).not.toMatch(/bytes=10/);
+    expect(summary?.event).not.toMatch(/cursor=0-14/);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("legacy split HTTP + 500\\n counts one HTTP 500 line of 9 bytes", async () => {
+    const { clock, registry, center, taskId, wakes } = await setup({
+      windowMs: 1_000,
+      summaryLinesPerSec: 0.5,
+      exitQuietMs: 3_600_000,
+    });
+    registry.handleOutput(taskId, "HTTP ");
+    clock.advanceBy(50);
+    registry.handleOutput(taskId, "500\n");
+    clock.advanceBy(1_000);
+    await Promise.resolve();
+    registry.handleOutput(taskId, "HTTP 500\n");
+    clock.advanceBy(200);
+    await Promise.resolve();
+    expect(wakes().some((w) => w.event.includes("entering summary"))).toBe(true);
+    clock.advanceBy(30_000);
+    const summary = wakes().find((w) => w.event.includes("overload summary"));
+    expect(summary?.event).toMatch(/HTTP 500/);
+    expect(summary?.event).not.toMatch(/(^|\n)500 x/);
+    expect(summary?.event).toMatch(/raw via task_output cursor=/);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("emits exactly one EXIT notice on quiet exit", async () => {
+    const { clock, registry, center, taskId, wakes } = await setup({
+      windowMs: 1_000,
+      summaryLinesPerSec: 2,
+      exitQuietMs: 5_000,
+    });
+    registry.handleOutput(taskId, `${"HTTP 500\n".repeat(10)}`);
+    clock.advanceBy(1_000);
+    await Promise.resolve();
+    registry.handleOutput(taskId, `${"HTTP 500\n".repeat(10)}`);
+    clock.advanceBy(200);
+    await Promise.resolve();
+    expect(wakes().filter((w) => w.event.includes("entering summary"))).toHaveLength(1);
+    clock.advanceBy(2_000 + 5_000);
+    expect(wakes().filter((w) => w.event.includes("leaving summary"))).toHaveLength(1);
+    expect(wakes().filter((w) => w.event.includes("entering summary"))).toHaveLength(1);
     center.dispose();
     registry.disposeAll();
   });

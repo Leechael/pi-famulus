@@ -3,9 +3,9 @@
  *
  * Starts a long-lived `kind:"monitor"` process via pi-famulus, watches its
  * output stream, and injects line batches as <pi-famulus-wake kind="monitor"> messages.
- * Batching (LineBatcher) and throttling (RateLimiter) happen extension-side;
- * a monitor is stopped when at least half its batches are dropped in a rolling
- * 30-second window.
+ * Batching (LineBatcher) and throttling (RateLimiter) happen extension-side.
+ * Sustained drop-ratio or a rolling input line-rate enters summary mode (not stop).
+ * Auto-stop is only the unverified ~1000 lines/s for 60s safety backstop.
  */
 import { Type } from "typebox";
 import { shellStartStatus } from "./shell-start";
@@ -17,7 +17,18 @@ import { realClock, type Clock, type ClockTimer } from "./clock";
 import type { ManagerClient, ManagerEvent, MonitorOutputRecord, TaskRecord } from "./manager-client";
 import { DEFAULT_DEDUP_WINDOW_MS, MonitorOutputBuffer, mergeOutputInfo, type FingerprintMode } from "./monitor-output";
 import type { MonitorOutputInfo } from "./wake";
-import { LineBatcher, RateLimiter, SaturationWindow } from "./monitor-batching";
+import {
+  LineBatcher,
+  RateLimiter,
+  OverloadController,
+  LegacyLineAssembler,
+  OVERLOAD_SUMMARY_LINES_PER_SEC,
+  OVERLOAD_WINDOW_MS,
+  SUMMARY_CADENCE_MS,
+  type OverloadControllerOptions,
+  type OverloadEnterReason,
+  type OverloadSummaryOutput,
+} from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
 import { fill, fillList, PROMPTS } from "./prompts.generated";
 import { statusGlyph, toolComponent } from "./tui/tool-component";
@@ -27,10 +38,6 @@ import type { WorkIndex } from "./work-index";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 3_600_000;
-/** Rolling-window drop ratio required before a monitor is auto-stopped. */
-const SATURATION_WINDOW_MS = 30_000;
-const SATURATION_DROP_RATIO = 0.5;
-const SATURATION_MIN_BATCHES = 10;
 /**
  * A clean exit this soon after an event was caused by it (`grep -m1`). Its
  * notice is appended without starting a turn: as a wake it cost every such monitor a
@@ -72,6 +79,8 @@ export interface MonitorDeps {
    * with its exit event lost, in which case no further event will settle it.
    */
   afterStop?: () => void;
+  /** Optional overload-policy overrides for tests. Production uses draft constants. */
+  overload?: Partial<OverloadControllerOptions>;
 }
 
 interface MonitorEntry {
@@ -84,7 +93,8 @@ interface MonitorEntry {
   recordCursor: number;
   lastRecordKind?: "line" | "progress";
   limiter: RateLimiter;
-  saturation: SaturationWindow;
+  overload: OverloadController;
+  legacyLines: LegacyLineAssembler;
   droppedLinesPending: number;
   timeoutTimer: ClockTimer | null;
   /** Epoch ms when the extension-side timeout fires; null when persistent. */
@@ -197,11 +207,8 @@ export class MonitorRegistry {
       legacyOutput: {},
       recordCursor: -1,
       limiter: new RateLimiter({ clock: this.clock }),
-      saturation: new SaturationWindow({
-        windowMs: SATURATION_WINDOW_MS,
-        dropRatio: SATURATION_DROP_RATIO,
-        minimumBatches: SATURATION_MIN_BATCHES,
-      }),
+      overload: null as unknown as OverloadController,
+      legacyLines: new LegacyLineAssembler(),
       droppedLinesPending: 0,
       timeoutTimer: null,
       timeoutDeadlineAt: timeoutMs === null ? null : now + timeoutMs,
@@ -210,6 +217,13 @@ export class MonitorRegistry {
       recovering: false,
       queuedOutput: [],
     };
+    entry.overload = new OverloadController({
+      clock: this.clock,
+      ...this.deps.overload,
+      onSummary: (text, output) => this.emitOverloadNotice(entry, text, output),
+      onEnter: (reason) => this.emitOverloadNotice(entry, this.enterNotice(reason)),
+      onExit: () => this.emitOverloadNotice(entry, "[Monitor overload: leaving summary mode. Individual lines resume.]"),
+    });
     entry.batcher = new LineBatcher({
       onFlush: (text, info) => {
         const output = mergeOutputInfo(entry.legacyOutput, info);
@@ -282,25 +296,56 @@ export class MonitorRegistry {
     if (records !== undefined) {
       // Empty metadata arrays deliberately hold raw fragments for Rust framing.
       entry.batcher.flush();
+      const accepted: MonitorOutputRecord[] = [];
+      let metadataTookOver = false;
       for (const record of records) {
         if (!validRecord(record, entry.cursor)) continue;
         if (record.cursor_end < entry.recordCursor || (record.cursor_end === entry.recordCursor && !(entry.lastRecordKind === "progress" && record.kind === "line"))) continue;
+        metadataTookOver = true;
         entry.recordCursor = record.cursor_end;
         entry.lastRecordKind = record.kind;
         if (record.kind === "line") entry.lastOutputAt = this.clock.now();
         entry.output.push(record);
+        if (record.kind === "line") accepted.push(record);
+      }
+      if (metadataTookOver) entry.legacyLines.reset();
+      if (accepted.length > 0) {
+        this.noteInput(entry, {
+          lines: accepted.length,
+          bytes: accepted.reduce((n, r) => n + (r.cursor_end - r.cursor_start), 0),
+          text: accepted.map((r) => r.preview).join("\n"),
+          cursorStart: Math.min(...accepted.map((r) => r.cursor_start)),
+          cursorEnd: Math.max(...accepted.map((r) => r.cursor_end)),
+        });
       }
     } else if (deliver.byteLength > 0) {
       // Legacy manager or unavailable replay metadata: fail open, never hash in JS.
       entry.output.flush();
+      const cursorStart = Math.max(previousCursor, entry.cursor - deliver.byteLength);
       const text = deliver.toString("utf8");
       if (text.includes("\n")) entry.lastOutputAt = this.clock.now();
       entry.legacyOutput = mergeOutputInfo(entry.legacyOutput, {
         firstObservedAt: this.clock.now(), lastObservedAt: this.clock.now(),
-        cursorStart: Math.max(previousCursor, entry.cursor - deliver.byteLength), cursorEnd: entry.cursor,
+        cursorStart, cursorEnd: entry.cursor,
       });
+      const assembled = entry.legacyLines.push(text, deliver.byteLength, cursorStart, entry.cursor);
+      if (assembled) {
+        this.noteInput(entry, {
+          lines: assembled.lines,
+          bytes: assembled.bytes,
+          text: assembled.text ?? "",
+          cursorStart: assembled.cursorStart ?? cursorStart,
+          cursorEnd: assembled.cursorEnd ?? entry.cursor,
+        });
+      }
       entry.batcher.push(text);
     }
+  }
+
+  /** Count complete raw lines/chunks before limiter (includes later-deduped lines). */
+  private noteInput(entry: MonitorEntry, input: { lines: number; bytes: number; text: string; cursorStart: number; cursorEnd: number }): void {
+    entry.overload.recordInput(input);
+    if (entry.overload.shouldStop() && !entry.stopRequested && !entry.stopping) void this.autoStop(entry);
   }
 
   /**
@@ -332,6 +377,7 @@ export class MonitorRegistry {
     entry.batcher.flush();
     entry.output.flush();
     const alreadyStopped = entry.stopped;
+    if (!alreadyStopped && !entry.stopRequested) entry.overload.flushSummary();
     this.cleanup(entry);
     this.deps.onExited?.(taskId, event);
     if (alreadyStopped) return true; // timeout/saturation owns the pending summary
@@ -413,22 +459,49 @@ export class MonitorRegistry {
     this.early.clear();
   }
 
+  private enterNotice(reason: OverloadEnterReason): string {
+    const windowMs = this.deps.overload?.windowMs ?? OVERLOAD_WINDOW_MS;
+    const cadenceMs = this.deps.overload?.cadenceMs?.[0] ?? SUMMARY_CADENCE_MS[0];
+    const linesPerSec = this.deps.overload?.summaryLinesPerSec ?? OVERLOAD_SUMMARY_LINES_PER_SEC;
+    const windowSecs = Math.round(windowMs / 1000);
+    const why = reason === "drop-ratio"
+      ? `drop-ratio ≥50% over ${windowSecs}s`
+      : reason === "line-rate"
+        ? `input >${linesPerSec} lines/s over ${windowSecs}s`
+        : `drop-ratio ≥50% over ${windowSecs}s and input >${linesPerSec} lines/s`;
+    return `[Monitor overload: entering summary mode (${why}). Individual lines are suppressed. First summary after ${Math.round(cadenceMs / 1000)}s. Raw output via task_output.]`;
+  }
+
+  private emitOverloadNotice(entry: MonitorEntry, text: string, output?: OverloadSummaryOutput): void {
+    if (entry.stopped || entry.stopRequested) return;
+    const center = this.deps.getNotifyCenter();
+    if (!center) return;
+    center.notifyMonitorEvent(entry.description, entry.taskId, text, 0, output ? { output } : {});
+    entry.lastEventAt = this.clock.now();
+  }
+
   private onBatch(entry: MonitorEntry, text: string, output?: MonitorOutputInfo, onDelivered?: () => void): boolean {
     if (entry.stopped) return false;
     const center = this.deps.getNotifyCenter();
     if (!center) return false;
     const now = this.clock.now();
+    if (entry.overload.shouldStop() && !entry.stopRequested && !entry.stopping) {
+      void this.autoStop(entry);
+      return false;
+    }
     const accepted = entry.limiter.tryConsume();
-    entry.saturation.record(!accepted, now);
+    entry.overload.recordBatch(!accepted);
+    if (entry.overload.shouldStop() && !entry.stopRequested && !entry.stopping) {
+      void this.autoStop(entry);
+      return false;
+    }
     if (!accepted) {
       const droppedLines = text.split("\n").length;
       this.deps.logEvent?.("monitor.drop", { id: entry.taskId, lines: droppedLines });
       entry.droppedLinesPending += droppedLines;
-      // Already stopping at the model's request, or draining for autoStop:
-      // no nested rate-limit stop or wake.
-      if (entry.saturation.isSaturated(now) && !entry.stopRequested && !entry.stopping) void this.autoStop(entry);
-      return false;
     }
+    if (entry.overload.inSummary()) return false;
+    if (!accepted) return false;
     const droppedLines = entry.droppedLinesPending;
     entry.droppedLinesPending = 0;
     entry.lastEventAt = now;
@@ -448,6 +521,7 @@ export class MonitorRegistry {
     entry.batcher.flush();
     entry.output.flush();
     if (entry.stopped) return; // A flush may already have tripped overload protection.
+    entry.overload.flushSummary();
     entry.stopped = true;
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "timeout" });
     const client = this.deps.getClient();
@@ -466,13 +540,14 @@ export class MonitorRegistry {
     this.deps.afterStop?.();
   }
 
-  /** Rate limiter saturated for too long: stop and notify (§4.4). */
+  /** Extreme sustained input rate: stop and notify (unverified safety backstop). */
   private async autoStop(entry: MonitorEntry): Promise<void> {
     if (entry.stopped || entry.stopping) return;
     entry.stopping = true;
     entry.batcher.flush();
     entry.output.flush();
     if (entry.stopped) return;
+    entry.overload.flushSummary();
     entry.stopped = true;
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "rate-limit" });
     const client = this.deps.getClient();
@@ -481,14 +556,13 @@ export class MonitorRegistry {
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        "[Monitor stopped: at least half of output batches were dropped in the last 30s.]",
-
+        entry.overload.stopNotice(),
         "stopped",
         { droppedLines: entry.droppedLinesPending, output: entry.output.takeSummary() },
       ),
     );
     this.deps.toast?.(
-      `Monitor "${entry.description}" stopped — too much output (rate limit).`,
+      `Monitor "${entry.description}" stopped — input rate safety backstop.`,
       "warning",
     );
     this.cleanup(entry);
@@ -500,6 +574,7 @@ export class MonitorRegistry {
     entry.batcher.dispose();
     entry.output.dispose();
     entry.limiter.dispose();
+    entry.overload.dispose();
     if (entry.timeoutTimer !== null) {
       this.clock.clearTimeout(entry.timeoutTimer);
       entry.timeoutTimer = null;
