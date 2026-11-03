@@ -833,6 +833,29 @@ describe("monitor teardown notice for handoff expiry and session mismatch", () =
     expect(String(fileCustoms[0]?.content)).toContain("while the log is retained");
   });
 
+  it("times out a never-settling live send and falls back without hanging teardown", async () => {
+    vi.useFakeTimers();
+    const persisted = persistSessionFile("live-never-settles");
+    sessionDirs.push(persisted.dir);
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx("sess-1", { sessionFile: persisted.file });
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_never", "never-settling watch");
+    (pi.api as unknown as { sendMessage: (message: unknown, options?: unknown) => Promise<void> }).sendMessage = () =>
+      new Promise<void>(() => {});
+    let completed = false;
+    const shutdown = pi.emit("session_shutdown", { reason: "new" }).then(() => { completed = true; });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(completed).toBe(true);
+    await shutdown;
+    expect(managers[0].shutdownCalls).toBe(1);
+    expect(customMessages(persisted.file).map((entry) => entry.details)).toEqual([
+      expect.objectContaining({ kind: "monitor-session-end", reason: "new", ids: ["mon_never"] }),
+    ]);
+    expect(readFileSync(join(home, "sessions", "sess-1", "events.jsonl"), "utf8")).toContain("monitor.teardown-fallback");
+  });
+
   it("parkRuntime replacing a parked runtime notices handoff-ended", async () => {
     const persisted = persistSessionFile("replaced");
     sessionDirs.push(persisted.dir);

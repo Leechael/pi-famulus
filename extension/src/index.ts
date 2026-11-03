@@ -774,6 +774,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   /** Old session identity for teardown notices after detach / attach. */
   let noticeSessionId: string | undefined;
   let noticeSessionFile: string | undefined;
+  const MONITOR_TEARDOWN_SEND_TIMEOUT_MS = 2_000;
   type MonitorTeardownReason = "new" | "resumed" | "forked" | "handoff-ended" | "session-mismatch";
   const mappedTeardownReason = (reason: string | undefined): MonitorTeardownReason | null => {
     if (reason === "new") return "new";
@@ -814,13 +815,26 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       }
     };
     if (dest === "live") {
+      let timeout: unknown = null;
       try {
-        await Promise.resolve(pi.sendMessage(
-          { customType: message.customType, content: message.content, display: true, details: message.details },
-          { triggerTurn: false },
-        ));
-      } catch {
+        await Promise.race([
+          Promise.resolve(pi.sendMessage(
+            { customType: message.customType, content: message.content, display: true, details: message.details },
+            { triggerTurn: false },
+          )),
+          new Promise<never>((_resolve, reject) => {
+            timeout = clock.setTimeout(() => reject(new Error("live send timed out")), MONITOR_TEARDOWN_SEND_TIMEOUT_MS);
+            if (timeout) clock.unref?.(timeout);
+          }),
+        ]);
+      } catch (error) {
+        logEvent("monitor.teardown-fallback", {
+          reason: mapped,
+          error: error instanceof Error ? error.message : String(error),
+        });
         appendToOldSessionFile();
+      } finally {
+        if (timeout !== null) clock.clearTimeout(timeout);
       }
       return;
     }
