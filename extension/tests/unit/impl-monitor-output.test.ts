@@ -60,8 +60,9 @@ describe("Rust records through monitor registry (regression)", () => {
     registry.handleOutput("mon_1", "ssh_login_fail\n", 30, [record("ssh_login_fail", 30)]);
     clock.advanceBy(1000);
     await Promise.resolve(); await Promise.resolve();
-    const terminal = sent.map((m) => m.details as { status?: string; output?: MonitorOutputInfo }).find((w) => w.status === "timeout");
-    expect(terminal?.output?.suppressedCount).toBe(1);
+    clock.advanceBy(10_000);
+    const terminal = sent.map((m) => m.details as { kind?: string; monitors?: { status: string; output?: MonitorOutputInfo }[] }).find((w) => w.kind === "monitor-terminal");
+    expect(terminal?.monitors?.[0]?.output?.suppressedCount).toBe(1);
     expect(sent).toHaveLength(2);
     registry.disposeAll(); center.dispose();
   });

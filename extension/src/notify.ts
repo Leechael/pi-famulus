@@ -13,12 +13,60 @@
  *   <pi-famulus-wake kind="task"> payload, and the same task/event pair is only
  *   ever delivered once.
  */
-import { formatMonitorEvent, formatRunningMonitorList, formatTaskNotification, type TaskExitInfo } from "./format";
+import { formatMonitorEvent, formatMonitorTerminal, formatRunningMonitorList, formatTaskNotification, type MonitorTerminalStatus, type TaskExitInfo } from "./format";
 import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, wakeIds, type MonitorOutputInfo, type WakeItem } from "./wake";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
+/**
+ * Fixed, non-resetting window that coalesces timeout/exited/stopped monitor notices.
+ * Nearby expiries share one wake for completeness. A busy agent is already turn-bound,
+ * so this adds no extra delay before the next turn. An idle agent with a single exit
+ * may wake up to 10s later. The window starts on the first notice and does not reset;
+ * NotifyCenter.flush() and session teardown release pending terminals immediately.
+ */
+export const MONITOR_TERMINAL_BATCH_MS = 10_000;
+
+const TERMINAL_STATUS_RANK: Record<MonitorTerminalStatus, number> = {
+  exited: 1,
+  stopped: 2,
+  timeout: 3,
+};
+
 
 type MonitorDeliveryAck = (visiblePreview?: string) => void;
+
+const MONITOR_TERMINAL_STATUSES = new Set<string>(["timeout", "exited", "stopped"]);
+
+function isMonitorTerminalStatus(status: string | undefined): status is MonitorTerminalStatus {
+  return status !== undefined && MONITOR_TERMINAL_STATUSES.has(status);
+}
+
+interface PendingMonitorTerminal {
+  id: string;
+  description: string;
+  status: MonitorTerminalStatus;
+  event: string;
+  droppedLines?: number;
+  output?: MonitorOutputInfo;
+  passive: boolean;
+}
+
+function mergeTerminal(previous: PendingMonitorTerminal, next: PendingMonitorTerminal): PendingMonitorTerminal {
+  const status =
+    TERMINAL_STATUS_RANK[next.status] > TERMINAL_STATUS_RANK[previous.status] ? next.status : previous.status;
+  const event = (next.event?.length ?? 0) > (previous.event?.length ?? 0) ? next.event : previous.event;
+  const description = next.description.length > previous.description.length ? next.description : previous.description;
+  const droppedLines = Math.max(previous.droppedLines ?? 0, next.droppedLines ?? 0);
+  return {
+    id: previous.id,
+    description,
+    status,
+    event,
+    ...(droppedLines > 0 ? { droppedLines } : {}),
+    output: mergeMonitorOutput(previous.output, next.output),
+    passive: previous.passive && next.passive,
+  };
+}
 
 export interface NotifyMessage {
   customType: string;
@@ -113,6 +161,10 @@ export class NotifyCenter {
   >();
   private readonly seen = new Set<string>();
   private timer: ClockTimer | null = null;
+  private pendingTerminals: PendingMonitorTerminal[] = [];
+  private terminalTimer: ClockTimer | null = null;
+  /** Ids already delivered in a monitor-terminal wake; late duplicates do not open another window. */
+  private readonly seenTerminalIds = new Set<string>();
   private disposed = false;
   /** A wake started or steered a run that has not settled yet. */
   private runPending = false;
@@ -145,14 +197,37 @@ export class NotifyCenter {
    * Send a notification immediately, routed by idle/busy state. A monitor's
    * own notice (exit, timeout, stop) first delivers that monitor's coalesced
    * events: they happened before it, and the model must not hear "exited"
-   * ahead of the lines the command printed.
+   * ahead of the lines the command printed. timeout/exited/stopped notices then
+   * join one fixed 10s window rather than each starting a turn.
    */
   notify(message: NotifyMessage, opts: { passive?: boolean; quietEvents?: boolean } = {}): void {
     if (this.disposed) return;
+    const wake = message.details as {
+      kind?: string;
+      id?: string;
+      description?: string;
+      status?: string;
+      event?: string;
+      droppedLines?: number;
+      output?: MonitorOutputInfo;
+    } | undefined;
+    if (wake?.kind === "monitor" && typeof wake.id === "string") {
+      this.flushMonitor(wake.id, opts.quietEvents);
+      if (isMonitorTerminalStatus(wake.status)) {
+        this.queueTerminal({
+          id: wake.id,
+          description: wake.description ?? wake.id,
+          status: wake.status,
+          event: wake.event ?? "",
+          droppedLines: wake.droppedLines,
+          output: wake.output,
+          passive: opts.passive === true,
+        });
+        return;
+      }
+    }
     // Stamped on arrival: a held passive notice keeps the time it was built.
     message = stampWakeAsOf(message, this.clock.now());
-    const wake = message.details as { kind?: string; id?: string } | undefined;
-    if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id, opts.quietEvents);
     if (!opts.passive) {
       this.deliver(message);
     } else {
@@ -204,6 +279,16 @@ export class NotifyCenter {
     for (const taskId of [...this.pendingMonitors.keys()]) {
       const item = this.takeMonitor(taskId);
       if (item) batch.push(item);
+    }
+    const terminals = this.takePendingTerminals();
+    if (terminals.length > 0) {
+      const ids = new Set(terminals.map((item) => item.id));
+      batch.push(...this.takeHeldMonitorEvents(ids));
+      const wake = formatMonitorTerminal(terminals);
+      batch.push({
+        message: { customType: wake.customType, content: wake.content, details: wake.details },
+        passive: terminals.every((item) => item.passive),
+      });
     }
     batch.push(...this.held.splice(0));
     if (extra) batch.push({ message: extra, passive: true });
@@ -291,19 +376,130 @@ export class NotifyCenter {
     return { message, onDelivered: item.onDelivered, sourcePreview, passive: quiet || item.quiet };
   }
 
-  /** Flush any pending task exit notifications now. */
+  /** Flush any pending task exit notifications and monitor-terminal notices now. */
   flush(): void {
     this.clearTimer();
     this.flushExits();
+    this.flushAllTerminals();
     this.flushMonitorEvents();
   }
 
+  /**
+   * Take pending monitor-terminal items without sending through pi.
+   * File teardown appends each returned message to the old session file instead.
+   * Held output for those terminal ids comes first, in held order; the terminal wake is last.
+   * Taking a held output message counts as delivery for its acknowledgement.
+   */
+  drainPendingMonitorTerminals(): NotifyMessage[] {
+    const items = this.takePendingTerminals();
+    const ids = new Set(items.map((item) => item.id));
+    for (const item of this.held) {
+      const details = item.message.details as { kind?: string } | undefined;
+      if (details?.kind === "monitor-terminal") {
+        for (const id of wakeIds(details)) ids.add(id);
+      }
+    }
+    if (items.length === 0 && ids.size === 0) return [];
+    const held = this.takeHeldMonitorEvents(ids, true);
+    const messages: NotifyMessage[] = [];
+    for (const item of held) {
+      messages.push(item.message);
+      this.acknowledgeHeld(item);
+    }
+    if (items.length > 0) {
+      const wake = formatMonitorTerminal(items);
+      messages.push({ customType: wake.customType, content: wake.content, details: wake.details });
+    }
+    return messages;
+  }
+
   dispose(): void {
-    this.disposed = true;
+    if (this.disposed) return;
     this.clearTimer();
+    this.flushAllTerminals();
+    const leftover = this.held.splice(0);
+    this.disposed = true;
+    this.clearTerminalTimer();
     this.pendingExits = [];
     this.pendingMonitors.clear();
-    this.held = [];
+    this.pendingTerminals = [];
+    for (const { message, onDelivered, sourcePreview } of leftover) {
+      this.deliver(message, true, onDelivered, sourcePreview);
+    }
+  }
+
+  private queueTerminal(item: PendingMonitorTerminal): void {
+    if (this.seenTerminalIds.has(item.id)) return;
+    const existing = this.pendingTerminals.findIndex((pending) => pending.id === item.id);
+    if (existing >= 0) {
+      this.pendingTerminals[existing] = mergeTerminal(this.pendingTerminals[existing], item);
+      return;
+    }
+    this.pendingTerminals.push(item);
+    if (this.terminalTimer !== null) return;
+    this.terminalTimer = this.clock.setTimeout(() => {
+      this.terminalTimer = null;
+      this.flushAllTerminals();
+    }, MONITOR_TERMINAL_BATCH_MS);
+    this.clock.unref?.(this.terminalTimer);
+  }
+
+  private takePendingTerminals(): PendingMonitorTerminal[] {
+    this.clearTerminalTimer();
+    const items = this.pendingTerminals;
+    this.pendingTerminals = [];
+    for (const item of items) this.seenTerminalIds.add(item.id);
+    return items;
+  }
+
+  private takeHeldMonitorEvents(ids: Set<string>, includeTerminals = false): typeof this.held {
+    if (this.held.length === 0) return [];
+    if (ids.size === 0 && !includeTerminals) return [];
+    const rest: typeof this.held = [];
+    const drain: typeof this.held = [];
+    for (const item of this.held) {
+      const details = item.message.details as { kind?: string; id?: string } | undefined;
+      if (details?.kind === "monitor" && typeof details.id === "string" && ids.has(details.id)) drain.push(item);
+      else if (includeTerminals && details?.kind === "monitor-terminal" && wakeIds(details).some((id) => ids.has(id))) drain.push(item);
+      else rest.push(item);
+    }
+    this.held = rest;
+    return drain;
+  }
+
+  private acknowledgeHeld(item: (typeof this.held)[number]): void {
+    const details = item.message.details as { kind?: string; event?: string } | undefined;
+    item.onDelivered?.(item.sourcePreview ?? (details?.kind === "monitor" ? details.event : undefined));
+  }
+
+  private drainHeldMonitorEvents(ids: Set<string>): void {
+    for (const { message, onDelivered, sourcePreview } of this.takeHeldMonitorEvents(ids)) {
+      this.deliver(message, true, onDelivered, sourcePreview);
+    }
+  }
+
+  private flushAllTerminals(): void {
+    const items = this.takePendingTerminals();
+    if (items.length === 0) return;
+    const ids = new Set(items.map((item) => item.id));
+    const allPassive = items.every((item) => item.passive);
+    const hold = this.runPending || !this.deps.isIdle();
+    const wake = formatMonitorTerminal(items);
+    const message = { customType: wake.customType, content: wake.content, details: wake.details };
+    if (allPassive && hold) {
+      this.deliverPassive(message);
+      return;
+    }
+    this.drainHeldMonitorEvents(ids);
+    if (allPassive) this.deliverPassive(message);
+    else this.deliver(message);
+  }
+
+  private clearTerminalTimer(): void {
+    if (this.terminalTimer !== null) {
+      this.clock.clearTimeout(this.terminalTimer);
+      this.terminalTimer = null;
+    }
   }
 
   private scheduleFlush(): void {

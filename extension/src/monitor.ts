@@ -94,6 +94,8 @@ interface MonitorEntry {
   recovering: boolean;
   queuedOutput: { chunk: string; cursor?: number; records?: MonitorOutputRecord[] }[];
   lastEventAt?: number;
+  /** Last accepted line or newline-completed raw chunk, including later-deduped/rate-limited output. */
+  lastOutputAt?: number;
   /** The model asked to stop it (task_stop): what is left is not news. */
   stopRequested?: boolean;
   /** Prevents autoStop from re-entering while it drains the 200ms batcher. */
@@ -118,8 +120,8 @@ export class MonitorRegistry {
     return () => this.changeListeners.delete(cb);
   }
 
-  /** Active monitors for the fleet status surface. */
-  listActive(): { taskId: string; description: string; startedAt: number; remainingMs: number | null; persistent: boolean }[] {
+  /** Active monitors for the fleet status surface and task_list extras. */
+  listActive(): { taskId: string; description: string; startedAt: number; remainingMs: number | null; persistent: boolean; lastEventAt?: number; lastOutputAt?: number }[] {
     const now = this.clock.now();
     return [...this.entries.values()]
       .filter((e) => !e.stopped)
@@ -129,6 +131,8 @@ export class MonitorRegistry {
         startedAt: e.startedAt,
         persistent: e.timeoutDeadlineAt === null,
         remainingMs: e.timeoutDeadlineAt === null ? null : Math.max(0, e.timeoutDeadlineAt - now),
+        lastEventAt: e.lastEventAt,
+        lastOutputAt: e.lastOutputAt,
       }))
       .sort((a, b) => a.startedAt - b.startedAt);
   }
@@ -183,10 +187,11 @@ export class MonitorRegistry {
     this.deps.trackTask(task_id, { kind: "monitor", command: params.command, cwd: ctx.cwd });
     this.deps.logEvent?.("monitor.start", { id: task_id, description: params.description });
 
+    const now = this.clock.now();
     const entry: MonitorEntry = {
       taskId: task_id,
       description: params.description,
-      startedAt: this.clock.now(),
+      startedAt: now,
       batcher: null as unknown as LineBatcher, // assigned below (self-reference in callback)
       output: null as unknown as MonitorOutputBuffer,
       legacyOutput: {},
@@ -199,7 +204,7 @@ export class MonitorRegistry {
       }),
       droppedLinesPending: 0,
       timeoutTimer: null,
-      timeoutDeadlineAt: timeoutMs === null ? null : this.clock.now() + timeoutMs,
+      timeoutDeadlineAt: timeoutMs === null ? null : now + timeoutMs,
       stopped: false,
       cursor: 0,
       recovering: false,
@@ -282,16 +287,19 @@ export class MonitorRegistry {
         if (record.cursor_end < entry.recordCursor || (record.cursor_end === entry.recordCursor && !(entry.lastRecordKind === "progress" && record.kind === "line"))) continue;
         entry.recordCursor = record.cursor_end;
         entry.lastRecordKind = record.kind;
+        if (record.kind === "line") entry.lastOutputAt = this.clock.now();
         entry.output.push(record);
       }
     } else if (deliver.byteLength > 0) {
       // Legacy manager or unavailable replay metadata: fail open, never hash in JS.
       entry.output.flush();
+      const text = deliver.toString("utf8");
+      if (text.includes("\n")) entry.lastOutputAt = this.clock.now();
       entry.legacyOutput = mergeOutputInfo(entry.legacyOutput, {
         firstObservedAt: this.clock.now(), lastObservedAt: this.clock.now(),
         cursorStart: Math.max(previousCursor, entry.cursor - deliver.byteLength), cursorEnd: entry.cursor,
       });
-      entry.batcher.push(deliver.toString("utf8"));
+      entry.batcher.push(text);
     }
   }
 
@@ -448,13 +456,12 @@ export class MonitorRegistry {
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        "[Monitor timed out — re-arm if needed.]",
-
+        "Timed out.",
         "timeout",
         { droppedLines: entry.droppedLinesPending, output: entry.output.takeSummary() },
       ),
     );
-    this.deps.toast?.(`Monitor "${entry.description}" timed out — re-arm if needed.`, "warning");
+    this.deps.toast?.(`Monitor "${entry.description}" timed out; nothing watches this source now.`, "warning");
     this.cleanup(entry);
     this.deps.afterStop?.();
   }

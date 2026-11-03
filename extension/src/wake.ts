@@ -176,6 +176,19 @@ type FamulusWakeBody =
   | {
       kind: "running-monitors";
       monitors: { id: string; description: string; remaining: string }[];
+    }
+  | {
+      kind: "monitor-terminal";
+      ids: string[];
+      summary: string;
+      monitors: Array<{
+        id: string;
+        description: string;
+        status: "timeout" | "exited" | "stopped";
+        detail: string;
+        droppedLines?: number;
+        output?: MonitorOutputInfo;
+      }>;
     };
 
 export interface FormattedWake {
@@ -222,7 +235,7 @@ export function wakeIds(details: { kind?: string }): string[] {
   }
   if (d.kind === "subagent-done") return (d.children ?? []).map((child) => child.childId);
   if (d.kind === "subagent-overrun") return [d.childId, ...((d as { additional?: { childId: string }[] }).additional ?? []).map((child) => child.childId)].filter((id): id is string => Boolean(id));
-  if (d.kind === "monitor-session-end") {
+  if (d.kind === "monitor-session-end" || d.kind === "monitor-terminal") {
     const ids = (d as { ids?: string[] }).ids;
     if (ids && ids.length > 0) return ids;
     return ((d as { monitors?: { id: string }[] }).monitors ?? []).map((monitor) => monitor.id);
@@ -306,6 +319,8 @@ function renderWakeBody(details: FamulusWake): string {
       return renderMonitorSessionEnd(details);
     case "running-monitors":
       return renderRunningMonitors(details);
+    case "monitor-terminal":
+      return renderMonitorTerminal(details);
   }
 }
 
@@ -339,6 +354,19 @@ function renderTask(details: Extract<FamulusWake, { kind: "task" }>): string {
   return parts.join("\n");
 }
 
+function renderMonitorOutputElement(output: MonitorOutputInfo | undefined, indent: string): string | undefined {
+  if (output?.cursorStart === undefined) return undefined;
+  const fields: string[] = [];
+  if (output.firstObservedAt !== undefined) fields.push(`first-observed-at="${wakeTimestamp(output.firstObservedAt)}"`);
+  if (output.lastObservedAt !== undefined) fields.push(`last-observed-at="${wakeTimestamp(output.lastObservedAt)}"`);
+  fields.push(`cursor-start="${output.cursorStart}"`);
+  if (output.cursorEnd !== undefined) fields.push(`cursor-end="${output.cursorEnd}"`);
+  if (output.truncated) fields.push('truncated="true"');
+  if (output.suppressedCount) fields.push(`duplicates-suppressed="${output.suppressedCount}"`);
+  if (output.omittedChars) fields.push(`omitted-chars="${output.omittedChars}"`);
+  return `${indent}<output ${fields.join(" ")}>${escapeXml(PROMPTS["wakes.monitor.output-hint"])}</output>`;
+}
+
 function renderMonitor(details: Extract<FamulusWake, { kind: "monitor" }>): string {
   const attrs = [
     'kind="monitor"',
@@ -350,19 +378,9 @@ function renderMonitor(details: Extract<FamulusWake, { kind: "monitor" }>): stri
   if (details.droppedLines !== undefined && details.droppedLines > 0) {
     attrs.push(`dropped-lines="${details.droppedLines}"`);
   }
-  const output = details.output;
   const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <event>${escapeXml(details.event)}</event>`];
-  if (output?.cursorStart !== undefined) {
-    const fields: string[] = [];
-    if (output.firstObservedAt !== undefined) fields.push(`first-observed-at="${wakeTimestamp(output.firstObservedAt)}"`);
-    if (output.lastObservedAt !== undefined) fields.push(`last-observed-at="${wakeTimestamp(output.lastObservedAt)}"`);
-    fields.push(`cursor-start="${output.cursorStart}"`);
-    if (output.cursorEnd !== undefined) fields.push(`cursor-end="${output.cursorEnd}"`);
-    if (output.truncated) fields.push('truncated="true"');
-    if (output.suppressedCount) fields.push(`duplicates-suppressed="${output.suppressedCount}"`);
-    if (output.omittedChars) fields.push(`omitted-chars="${output.omittedChars}"`);
-    parts.push(`  <output ${fields.join(" ")}>${escapeXml(PROMPTS["wakes.monitor.output-hint"])}</output>`);
-  }
+  const outputXml = renderMonitorOutputElement(details.output, "  ");
+  if (outputXml) parts.push(outputXml);
   parts.push("</pi-famulus-wake>");
   return parts.join("\n");
 }
@@ -541,6 +559,34 @@ function renderUpdate(details: Extract<FamulusWake, { kind: "supervisor-update" 
     `  <message>${escapeXml(details.message)}</message>`,
     "</pi-famulus-wake>",
   ].join("\n");
+}
+
+function renderMonitorTerminal(details: Extract<FamulusWake, { kind: "monitor-terminal" }>): string {
+  const parts = [
+    `<pi-famulus-wake kind="monitor-terminal">`,
+    `  <summary>${escapeXml(details.summary)}</summary>`,
+  ];
+  for (const monitor of details.monitors) {
+    const attrs = [
+      `id="${escapeXmlAttr(monitor.id)}"`,
+      `description="${escapeXmlAttr(monitor.description)}"`,
+      `status="${escapeXmlAttr(monitor.status)}"`,
+    ];
+    if (monitor.droppedLines !== undefined && monitor.droppedLines > 0) {
+      attrs.push(`dropped-lines="${monitor.droppedLines}"`);
+    }
+    const outputXml = renderMonitorOutputElement(monitor.output, "    ");
+    if (outputXml) {
+      parts.push(`  <monitor ${attrs.join(" ")}>`);
+      if (monitor.detail) parts.push(`    ${escapeXml(monitor.detail)}`);
+      parts.push(outputXml);
+      parts.push("  </monitor>");
+    } else {
+      parts.push(`  <monitor ${attrs.join(" ")}>${escapeXml(monitor.detail)}</monitor>`);
+    }
+  }
+  parts.push("</pi-famulus-wake>");
+  return parts.join("\n");
 }
 
 function renderMonitorSessionEnd(details: Extract<FamulusWake, { kind: "monitor-session-end" }>): string {

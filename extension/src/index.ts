@@ -643,7 +643,11 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   });
 
   pi.registerTool(createBashOverride(deps));
-  pi.registerTool(createTaskListTool({ ...deps, getIndex: () => workIndex }));
+  pi.registerTool(createTaskListTool({
+    ...deps,
+    getIndex: () => workIndex,
+    getMonitorLive: () => monitorRegistry?.listActive() ?? [],
+  }));
   pi.registerTool(createTaskOutputTool({ ...deps, getIndex: () => workIndex }));
   pi.registerTool(
     createTaskStopTool({
@@ -816,15 +820,6 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       { customType: formatted.customType, content: formatted.content, details: formatted.details, display: true },
       now,
     );
-    const appendToOldSessionFile = (): void => {
-      const file = noticeSessionFile;
-      if (!file) return;
-      try {
-        SessionManager.open(file).appendCustomMessageEntry(FAMULUS_WAKE_CUSTOM_TYPE, message.content, true, message.details);
-      } catch {
-        // Missing or unreadable session file: teardown still proceeds.
-      }
-    };
     if (dest === "live") {
       let timeout: unknown = null;
       try {
@@ -843,13 +838,37 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
           reason: mapped,
           error: error instanceof Error ? error.message : String(error),
         });
-        appendToOldSessionFile();
+        appendWakeToOldSessionFile(message);
       } finally {
         if (timeout !== null) clock.clearTimeout(timeout);
       }
       return;
     }
-    appendToOldSessionFile();
+    appendWakeToOldSessionFile(message);
+  };
+  const appendWakeToOldSessionFile = (message: { content: string; details?: unknown }): void => {
+    const file = noticeSessionFile;
+    if (!file) return;
+    try {
+      SessionManager.open(file).appendCustomMessageEntry(FAMULUS_WAKE_CUSTOM_TYPE, message.content, true, message.details);
+    } catch {
+      // Missing or unreadable session file: teardown still proceeds.
+    }
+  };
+  const deliverPendingMonitorTerminals = (dest: "live" | "file"): void => {
+    const center = notifyCenter;
+    if (!center) return;
+    if (dest === "live") {
+      center.flush();
+      return;
+    }
+    const messages = center.drainPendingMonitorTerminals();
+    for (const message of messages) {
+      appendWakeToOldSessionFile(stampWakeAsOf(
+        { customType: message.customType, content: message.content, details: message.details, display: true },
+        clock.now(),
+      ));
+    }
   };
   const startFleetWidget = (startCtx: ExtensionContext) => {
     if (!startCtx.hasUI) return;
@@ -1347,6 +1366,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   const teardown = async (notice?: { reason: MonitorTeardownReason; dest: "live" | "file" }): Promise<void> => {
     if (notice) await emitMonitorTeardownNotice(notice.reason, notice.dest);
     compactRecovery.dispose();
+    deliverPendingMonitorTerminals(notice?.dest ?? "live");
     exitWatchdog.dispose();
     fleetWidget?.dispose();
     fleetWidget = null;

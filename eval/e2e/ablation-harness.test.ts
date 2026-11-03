@@ -79,7 +79,7 @@ const exercise = (env: Record<string, string>) =>
     extensions: [ABLATION_EXT],
     env,
     until: allWakesSeen,
-    untilTimeoutMs: 20_000,
+    untilTimeoutMs: 30_000,
     quietMs: 1500,
   });
 

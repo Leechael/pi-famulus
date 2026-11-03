@@ -7,6 +7,14 @@ import { NotifyCenter } from "../../src/notify";
 import { createTaskStopTool } from "../../src/task-tools";
 import type { FamulusWake } from "../../src/wake";
 
+const TERMINAL_MS = 10_000;
+
+function terminalStatus(details: unknown): string | undefined {
+  const d = details as { kind?: string; status?: string; monitors?: { status: string }[] } | undefined;
+  if (d?.kind === "monitor-terminal") return d.monitors?.[0]?.status;
+  return d?.status;
+}
+
 describe("MonitorRegistry saturation", () => {
   it("stops on sustained drops even when accepted batches interrupt them", async () => {
     const clock = new ManualClock();
@@ -46,11 +54,12 @@ describe("MonitorRegistry saturation", () => {
 
     expect(stopped).toEqual(["mon_1"]);
     expect(registry.has("mon_1")).toBe(false);
+    clock.advanceBy(TERMINAL_MS);
     const stopWake = sent.map((item) => item.details as FamulusWake | undefined).find(
-      (details): details is Extract<FamulusWake, { kind: "monitor" }> =>
-        details?.kind === "monitor" && details.status === "stopped",
+      (details): details is Extract<FamulusWake, { kind: "monitor-terminal" }> =>
+        details?.kind === "monitor-terminal" && details.monitors.some((monitor) => monitor.status === "stopped"),
     );
-    expect(stopWake?.droppedLines).toBeGreaterThan(0);
+    expect(stopWake?.monitors[0]?.droppedLines).toBeGreaterThan(0);
     expect(events.some((event) => event.type === "monitor.drop" && event.fields?.id === "mon_1")).toBe(true);
     expect(events).toContainEqual({ type: "monitor.stop", fields: { id: "mon_1", reason: "rate-limit" } });
     center.dispose();
@@ -144,7 +153,7 @@ describe("MonitorRegistry early exit (manual testing, 2026-09-24)", () => {
       clock,
       onExited: (id) => exited.push(id),
     });
-    const wakes = () => sent.map((m) => m.details as FamulusWake | undefined).filter((d) => d?.kind === "monitor");
+    const wakes = () => sent.map((m) => m.details as FamulusWake | undefined).filter((d) => d?.kind === "monitor" || d?.kind === "monitor-terminal");
     return { clock, registry, center, exited, wakes };
   }
 
@@ -153,14 +162,15 @@ describe("MonitorRegistry early exit (manual testing, 2026-09-24)", () => {
     await registry.start({ command: "echo noop", description: "noop" }, { cwd: "/tmp" } as ExtensionContext);
     clock.advanceBy(1_000);
     center.settled(); // the run the "noop" event started is over; the exit notice follows it
+    clock.advanceBy(TERMINAL_MS);
     expect(registry.has("mon_fast")).toBe(false);
     expect(registry.listActive()).toEqual([]);
     expect(exited).toEqual(["mon_fast"]);
-    const statuses = wakes().map((w) => (w as { status?: string }).status);
+    const statuses = wakes().map((w) => terminalStatus(w));
     expect(statuses).toContain("exited");
     expect(JSON.stringify(wakes())).toContain("noop");
     clock.advanceBy(400_000); // past the default timeout: no false "timed out"
-    expect(wakes().map((w) => (w as { status?: string }).status)).not.toContain("timeout");
+    expect(wakes().map((w) => terminalStatus(w))).not.toContain("timeout");
     center.dispose();
     registry.disposeAll();
   });
@@ -226,7 +236,7 @@ describe("MonitorRegistry exit right after an event", () => {
     const exit = (code: number) =>
       registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: code, duration_ms: 10 });
     const turns = () => sent.filter((m) => m.opts.triggerTurn !== false);
-    const exitMsg = () => sent.find((m) => (m.details as { status?: string }).status === "exited");
+    const exitMsg = () => sent.find((m) => terminalStatus(m.details) === "exited");
     return { center, clock, registry, exit, sent, turns, exitMsg };
   }
 
@@ -234,13 +244,15 @@ describe("MonitorRegistry exit right after an event", () => {
   // writing, the exit was appended at that turn's end, ahead of the event
   // steered in at the next turn's start (25 of 125 monitors).
   it("a clean exit inside the batch window: one wake, exit held until that run settles", async () => {
-    const { center, registry, exit, turns, exitMsg, sent } = await setup();
+    const { center, clock, registry, exit, turns, exitMsg, sent } = await setup();
     registry.handleOutput("mon_1", "READY token=AB12\n");
     exit(0);
     expect(turns()).toHaveLength(1);
     expect(JSON.stringify(turns()[0].details)).toContain("READY token=AB12");
     expect(exitMsg()).toBeUndefined();
     center.settled();
+    expect(exitMsg()).toBeUndefined();
+    clock.advanceBy(TERMINAL_MS);
     expect(exitMsg()?.opts).toEqual({ triggerTurn: false });
     expect(sent.indexOf(exitMsg()!)).toBeGreaterThan(sent.indexOf(turns()[0]));
   });
@@ -253,6 +265,7 @@ describe("MonitorRegistry exit right after an event", () => {
     exit(0);
     expect(exitMsg()).toBeUndefined();
     center.settled();
+    clock.advanceBy(TERMINAL_MS);
     expect(turns()).toHaveLength(1);
     expect(exitMsg()?.opts).toEqual({ triggerTurn: false });
   });
@@ -264,14 +277,16 @@ describe("MonitorRegistry exit right after an event", () => {
     center.settled();
     clock.advanceBy(1_000);
     exit(0);
+    clock.advanceBy(TERMINAL_MS);
     expect(turns()).toHaveLength(1);
     expect(exitMsg()?.opts).toEqual({ triggerTurn: false });
   });
 
   it("a failed exit still wakes", async () => {
-    const { registry, exit, turns, exitMsg } = await setup();
+    const { clock, registry, exit, turns, exitMsg } = await setup();
     registry.handleOutput("mon_1", "READY token=AB12\n");
     exit(1);
+    clock.advanceBy(TERMINAL_MS);
     expect(turns()).toHaveLength(2);
     expect(exitMsg()?.opts.triggerTurn).toBe(true);
   });
@@ -281,12 +296,14 @@ describe("MonitorRegistry exit right after an event", () => {
     registry.handleOutput("mon_1", "tick\n");
     clock.advanceBy(10_000);
     exit(0);
+    clock.advanceBy(TERMINAL_MS);
     expect(turns()).toHaveLength(2);
   });
 
   it("a clean exit with no event at all still wakes", async () => {
-    const { exit, turns } = await setup();
+    const { clock, exit, turns } = await setup();
     exit(0);
+    clock.advanceBy(TERMINAL_MS);
     expect(turns()).toHaveLength(1);
   });
 });
@@ -317,8 +334,9 @@ describe("MonitorRegistry monitor stopped by the model", () => {
     registry.noteStopRequested("mon_1");
     registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: null, signal: "SIGTERM", duration_ms: 10 });
     center.settled();
+    clock.advanceBy(TERMINAL_MS);
     expect(sent.filter((m) => m.opts.triggerTurn !== false)).toHaveLength(0);
-    const statuses = sent.map((m) => (m.details as { status?: string }).status ?? "event");
+    const statuses = sent.map((m) => terminalStatus(m.details) ?? "event");
     expect(statuses).toEqual(["event", "exited"]);
   });
 
@@ -358,7 +376,7 @@ describe("MonitorRegistry stop handling, from review", () => {
     });
     await registry.start({ command: "tail -F out | grep --line-buffered .", description: "watch", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
     const turns = () => sent.filter((m) => m.opts.triggerTurn !== false);
-    const statuses = () => sent.map((m) => (m.details as { status?: string }).status ?? "event");
+    const statuses = () => sent.map((m) => terminalStatus(m.details) ?? "event");
     return { clock, center, registry, sent, stops, turns, statuses };
   }
 
@@ -378,6 +396,7 @@ describe("MonitorRegistry stop handling, from review", () => {
     registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: null, signal: "SIGTERM", duration_ms: 10 });
     idle = true;
     center.settled();
+    clock.advanceBy(TERMINAL_MS);
     expect(turns()).toHaveLength(0);
     expect(statuses()).toEqual(["event", "exited"]);
     expect(JSON.stringify(sent[0].details)).toContain("line c");
@@ -425,12 +444,39 @@ describe("MonitorRegistry stop handling, from review", () => {
     clock.advanceBy(300);
     center.settled();
     registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: 0, end_reason: "tui", duration_ms: 10 });
+    clock.advanceBy(TERMINAL_MS);
     expect(statuses()).toEqual(["event", "exited"]);
     expect(turns()).toHaveLength(2);
   });
 });
 
-describe("MonitorRegistry running-monitor remaining time", () => {
+describe("MonitorRegistry stores deadline and last output", () => {
+  async function start(params: { timeout_ms?: number; persistent?: boolean }) {
+    const clock = new ManualClock(1_000);
+    const sent: { details?: unknown; content?: string }[] = [];
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_1", pid: 1 }),
+      watch: async () => {},
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const center = new NotifyCenter({
+      sendMessage: (message) => sent.push(message),
+      isIdle: () => true,
+      clock,
+    });
+    const registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "tail -F x", description: "watch", ...params }, { cwd: "/tmp" } as ExtensionContext);
+    return { clock, registry, center, sent };
+  }
+
   it("stores a deadline for timed monitors and marks persistent ones", async () => {
     const clock = new ManualClock(1_000);
     let nextId = 1;
@@ -471,6 +517,84 @@ describe("MonitorRegistry running-monitor remaining time", () => {
         persistent: true,
       }),
     ]);
+    registry.disposeAll();
+  });
+
+  it("stores remainingMs, persistent, and lastEventAt after output", async () => {
+    const { clock, registry, center } = await start({ timeout_ms: 60_000 });
+    expect(registry.listActive()).toEqual([
+      expect.objectContaining({
+        taskId: "mon_1",
+        description: "watch",
+        startedAt: 1_000,
+        remainingMs: 60_000,
+        persistent: false,
+      }),
+    ]);
+    expect(registry.listActive()[0].lastEventAt).toBeUndefined();
+    expect(registry.listActive()[0].lastOutputAt).toBeUndefined();
+    registry.handleOutput("mon_1", "tick\n");
+    expect(registry.listActive()[0].lastOutputAt).toBe(1_000);
+    expect(registry.listActive()[0].lastEventAt).toBeUndefined();
+    clock.advanceBy(200);
+    expect(registry.listActive()[0].lastEventAt).toBe(1_200);
+    expect(registry.listActive()[0].lastOutputAt).toBe(1_000);
+    expect(registry.listActive()[0].remainingMs).toBe(59_800);
+    expect(registry.listActive()[0].persistent).toBe(false);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("updates lastOutputAt on deduped line records without changing lastEventAt", async () => {
+    const { clock, registry, center } = await start({ persistent: true });
+    const line = (text: string, end: number, at: number): import("../../src/manager-client").MonitorOutputRecord => ({
+      version: 1, kind: "line", observed_at: at, cursor_start: end - Buffer.byteLength(text + "\n"), cursor_end: end,
+      preview: text, truncated: false, fingerprint: `blake3:v1:${text}`, timestamp_fingerprint: `blake3:iso-edge-v1:${text}`,
+    });
+    registry.handleOutput("mon_1", "fail\n", 5, [line("fail", 5, 1)]);
+    clock.advanceBy(200);
+    expect(registry.listActive()[0].lastEventAt).toBe(1_200);
+    expect(registry.listActive()[0].lastOutputAt).toBe(1_000);
+    clock.advanceBy(300);
+    registry.handleOutput("mon_1", "fail\n", 10, [line("fail", 10, 2)]);
+    expect(registry.listActive()[0].lastOutputAt).toBe(1_500);
+    expect(registry.listActive()[0].lastEventAt).toBe(1_200);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("does not set lastOutputAt on a raw fragment without a newline", async () => {
+    const { registry, center } = await start({ persistent: true });
+    registry.handleOutput("mon_1", "partial");
+    expect(registry.listActive()[0].lastOutputAt).toBeUndefined();
+    registry.handleOutput("mon_1", "done\n");
+    expect(registry.listActive()[0].lastOutputAt).toBe(1_000);
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("stores remainingMs null and persistent true", async () => {
+    const { registry, center } = await start({ persistent: true });
+    expect(registry.listActive()[0].remainingMs).toBeNull();
+    expect(registry.listActive()[0].persistent).toBe(true);
+    expect(registry.listActive()[0].lastOutputAt).toBeUndefined();
+    center.dispose();
+    registry.disposeAll();
+  });
+
+  it("timeout notice uses unwatched wording after the terminal window", async () => {
+    const { clock, registry, center, sent } = await start({ timeout_ms: 5_000 });
+    clock.advanceBy(5_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    const beforeWindow = sent.filter((entry) => (entry.details as { kind?: string } | undefined)?.kind === "monitor-terminal");
+    expect(beforeWindow).toHaveLength(0);
+    clock.advanceBy(10_000);
+    const timeout = sent.find((entry) => (entry.details as { kind?: string } | undefined)?.kind === "monitor-terminal");
+    expect(timeout?.content).toMatch(/These monitors have stopped; nothing watches their sources now/);
+    expect(timeout?.content).not.toMatch(/re-arm if needed/);
+    expect(JSON.stringify(timeout?.details)).not.toMatch(/re-arm if needed/);
+    center.dispose();
     registry.disposeAll();
   });
 });

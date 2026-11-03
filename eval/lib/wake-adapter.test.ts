@@ -65,6 +65,22 @@ it("monitor without status reads as a plain event", () => {
   assert.equal(w.body, "tick-1\ntick-2");
 });
 
+it("monitor-terminal: summary body, ids, and single status", () => {
+  const [w] = both({
+    kind: "monitor-terminal",
+    ids: ["mon_a", "mon_b"],
+    summary: "These monitors have stopped; nothing watches their sources now.",
+    monitors: [
+      { id: "mon_a", description: "alpha", status: "timeout", detail: "Timed out." },
+      { id: "mon_b", description: "beta", status: "timeout", detail: "Timed out." },
+    ],
+  });
+  assert.equal(w.kind, "monitor-terminal");
+  assert.deepEqual(w.taskIds, ["mon_a", "mon_b"]);
+  assert.equal(w.status, "timeout");
+  assert.equal(w.body, "These monitors have stopped; nothing watches their sources now.");
+});
+
 it("subagent-handover", () => {
   const [w] = both({ kind: "subagent-handover", runId: "run_1", childId: "ch_1", name: "one", status: "completed", stillRunning: [{ id: "ch_2", title: "two" }], summary: "s", prompt: "p", result: "ALPHA" });
   assert.equal(w.kind, "subagent-handover");

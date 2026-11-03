@@ -77,7 +77,7 @@ function fakePi(options?: { stale?: { current: boolean } }) {
   return { api: api as unknown as ExtensionAPI, tools, toolByName, commands, sent, sentWithOptions, emit };
 }
 
-function fakeCtx(sessionId = "sess-1", options?: { hasUI?: boolean; throwOnWidgetClear?: boolean; sessionFile?: string }) {
+function fakeCtx(sessionId = "sess-1", options?: { hasUI?: boolean; throwOnWidgetClear?: boolean; sessionFile?: string; isIdle?: () => boolean }) {
   const notices: string[] = [];
   let widgetMounted = false;
   const ui = {
@@ -107,7 +107,7 @@ function fakeCtx(sessionId = "sess-1", options?: { hasUI?: boolean; throwOnWidge
       cwd: tmpdir(),
       hasUI: options?.hasUI === true,
       ui,
-      isIdle: () => true,
+      isIdle: options?.isIdle ?? (() => true),
       sessionManager: { getSessionId: () => sessionId, getSessionFile: () => options?.sessionFile },
       modelRegistry: null,
       scopedModels: [],
@@ -509,18 +509,77 @@ async function startMonitor(
   ctx: unknown,
   taskId: string,
   description: string,
+  params?: { timeout_ms?: number; persistent?: boolean },
 ): Promise<void> {
   const manager = managers[managers.length - 1];
   manager.start = async () => ({ task_id: taskId, pid: 1 });
   const tool = pi.toolByName.get("monitor");
   if (!tool) throw new Error("monitor tool was not registered");
+  const persistent = params?.persistent ?? params?.timeout_ms === undefined;
   await tool.execute(
     "mon-call",
-    { command: "tail -F /tmp/x", description, persistent: true },
+    {
+      command: "tail -F /tmp/x",
+      description,
+      persistent,
+      ...(params?.timeout_ms !== undefined ? { timeout_ms: params.timeout_ms } : {}),
+    },
     undefined,
     undefined,
     ctx,
   );
+}
+
+function terminalNotices(sent: unknown[]): Array<{ content: string; details: Record<string, unknown> }> {
+  return sent.flatMap((entry) => {
+    const message = entry as { customType?: string; content?: string; details?: Record<string, unknown> };
+    if (message.customType !== "pi-famulus-wake") return [];
+    const details = message.details ?? {};
+    if (details.kind !== "monitor-terminal") return [];
+    return [{ content: message.content ?? "", details }];
+  });
+}
+
+function monitorEventNotices(sent: unknown[]): Array<{ content: string; details: Record<string, unknown> }> {
+  return sent.flatMap((entry) => {
+    const message = entry as { customType?: string; content?: string; details?: Record<string, unknown> };
+    if (message.customType !== "pi-famulus-wake") return [];
+    const details = message.details ?? {};
+    if (details.kind !== "monitor") return [];
+    return [{ content: message.content ?? "", details }];
+  });
+}
+
+function monitorFileWakes(file: string | undefined) {
+  return customMessages(file).filter((entry) => {
+    const kind = (entry.details as { kind?: string } | undefined)?.kind;
+    return kind === "monitor" || kind === "monitor-terminal";
+  });
+}
+
+async function stopMonitorWithOutput(
+  pi: { toolByName: Map<string, ExecutableTool> },
+  ctx: unknown,
+  taskId: string,
+  chunk: string,
+  opts?: { quiet?: boolean },
+): Promise<void> {
+  if (opts?.quiet !== false) {
+    const tool = pi.toolByName.get("task_stop");
+    if (!tool) throw new Error("task_stop was not registered");
+    await tool.execute("stop-call", { task_id: taskId }, undefined, undefined, ctx);
+  }
+  const manager = managers[managers.length - 1];
+  manager.emit({ event: "output", task_id: taskId, chunk });
+  manager.emit({
+    event: "task_exited",
+    task_id: taskId,
+    exit_code: opts?.quiet === false ? 0 : null,
+    ...(opts?.quiet === false ? {} : { signal: "SIGTERM" }),
+    duration_ms: 10,
+  });
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 const REASON_MAP = { new: "new", resume: "resumed", fork: "forked" } as const;
@@ -570,6 +629,38 @@ describe("monitor teardown notices", () => {
     expect(teardownNotices(pi.sent)).toEqual([]);
     expect(managers[0].shutdownCalls).toBe(1);
   });
+
+  it.each(["new", "resume", "quit"] as const)(
+    "timeout then shutdown %s flushes monitor-terminal to the old session once",
+    async (reason) => {
+      const pi = fakePi();
+      await loadExtension(pi.api);
+      const host = fakeCtx("sess-before");
+      await pi.emit("session_start", { reason: "startup" }, host.ctx);
+      await startMonitor(pi, host.ctx, "mon_live", "live watch");
+      await startMonitor(pi, host.ctx, "mon_to", "timeout watch", { timeout_ms: 1000 });
+      await until(() => managers[0].stops.some((stop) => stop.taskId === "mon_to" && stop.reason === "timeout"), "monitor timeout", 3000);
+      await Promise.resolve();
+      await Promise.resolve();
+      await pi.emit("session_shutdown", { reason });
+      const terminals = terminalNotices(pi.sent);
+      const sessionEnd = teardownNotices(pi.sent);
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0]?.details).toMatchObject({ kind: "monitor-terminal", ids: ["mon_to"] });
+      expect(terminals[0]?.content).toMatch(/These monitors have stopped; nothing watches their sources now/);
+      expect(JSON.stringify(sessionEnd)).not.toContain("mon_to");
+      if (reason === "quit") {
+        expect(sessionEnd).toEqual([]);
+      } else {
+        expect(sessionEnd).toHaveLength(1);
+        expect(sessionEnd[0]?.details.ids).toEqual(["mon_live"]);
+      }
+      await pi.emit("session_start", { reason: reason === "quit" ? "new" : reason }, fakeCtx(`sess-${reason}`).ctx);
+      expect(terminalNotices(pi.sent)).toHaveLength(1);
+      expect(teardownNotices(pi.sent)).toHaveLength(reason === "quit" ? 0 : 1);
+      await pi.emit("session_shutdown", { reason: "quit" });
+    },
+  );
 
   it("does not notify when new has no running monitor", async () => {
     const pi = fakePi();
@@ -737,6 +828,163 @@ describe("monitor teardown notice for handoff expiry and session mismatch", () =
       expect(String(fileCustoms[0]?.content)).toContain("session-mismatch");
       expect(String(fileCustoms[0]?.content)).toMatch(/task_output/);
       expect(String(fileCustoms[0]?.content)).toContain("while the log is retained");
+    } finally {
+      try {
+        await after.emit("session_shutdown", { reason: "quit" });
+      } catch {
+        // already torn down
+      }
+    }
+  });
+
+  it("appends a pending monitor-terminal to the old session file on mismatch, not the new pi", async () => {
+    const persisted = persistSessionFile("term-file");
+    sessionDirs.push(persisted.dir);
+    const before = fakePi();
+    await loadExtension(before.api);
+    const host = fakeCtx("sess-old", { sessionFile: persisted.file });
+    await before.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(before, host.ctx, "mon_to", "timeout watch", { timeout_ms: 1000 });
+    await until(() => managers[0].stops.some((stop) => stop.taskId === "mon_to" && stop.reason === "timeout"), "monitor timeout", 3000);
+    await Promise.resolve();
+    await Promise.resolve();
+    await before.emit("session_shutdown", { reason: "reload" });
+    expect(terminalNotices(before.sent)).toEqual([]);
+    const after = fakePi();
+    await loadExtension(after.api);
+    await after.emit("session_start", { reason: "reload" }, fakeCtx("sess-new").ctx);
+    const fileCustoms = customMessages(persisted.file);
+    const fileTerminals = fileCustoms.filter((entry) => (entry.details as { kind?: string } | undefined)?.kind === "monitor-terminal");
+    try {
+      expect(terminalNotices(before.sent)).toEqual([]);
+      expect(terminalNotices(after.sent)).toEqual([]);
+      expect(fileTerminals).toHaveLength(1);
+      expect(fileTerminals[0]?.details).toMatchObject({ kind: "monitor-terminal", ids: ["mon_to"] });
+      expect(String(fileTerminals[0]?.content)).toMatch(/These monitors have stopped; nothing watches their sources now/);
+    } finally {
+      try {
+        await after.emit("session_shutdown", { reason: "quit" });
+      } catch {
+        // already torn down
+      }
+    }
+  });
+
+  it("mismatch file keeps quiet pending output then monitor-terminal once, not the new pi", async () => {
+    const persisted = persistSessionFile("quiet-mismatch");
+    sessionDirs.push(persisted.dir);
+    let idle = false;
+    const before = fakePi();
+    await loadExtension(before.api);
+    const host = fakeCtx("sess-old", { sessionFile: persisted.file, isIdle: () => idle });
+    await before.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(before, host.ctx, "mon_q", "quiet watch");
+    await stopMonitorWithOutput(before, host.ctx, "mon_q", "line-q\n");
+    await before.emit("session_shutdown", { reason: "reload" });
+    const after = fakePi();
+    await loadExtension(after.api);
+    await after.emit("session_start", { reason: "reload" }, fakeCtx("sess-new").ctx);
+    const fileWakes = monitorFileWakes(persisted.file);
+    try {
+      expect(monitorEventNotices(before.sent)).toEqual([]);
+      expect(terminalNotices(before.sent)).toEqual([]);
+      expect(after.sent).toEqual([]);
+      expect(fileWakes.map((entry) => (entry.details as { kind?: string }).kind)).toEqual(["monitor", "monitor-terminal"]);
+      expect(fileWakes).toHaveLength(2);
+      expect(String(fileWakes[0]?.content)).toContain("line-q");
+      expect(fileWakes[1]?.details).toMatchObject({ kind: "monitor-terminal", ids: ["mon_q"] });
+    } finally {
+      try {
+        await after.emit("session_shutdown", { reason: "quit" });
+      } catch {
+        // already torn down
+      }
+    }
+  });
+
+  it("mismatch file keeps a timer-flushed busy terminal once, not the new pi", async () => {
+    vi.useFakeTimers();
+    const persisted = persistSessionFile("timer-mismatch");
+    sessionDirs.push(persisted.dir);
+    let idle = false;
+    const before = fakePi();
+    await loadExtension(before.api);
+    const host = fakeCtx("sess-old", { sessionFile: persisted.file, isIdle: () => idle });
+    await before.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(before, host.ctx, "mon_q", "timer watch");
+    await stopMonitorWithOutput(before, host.ctx, "mon_q", "line-q\n");
+    await vi.advanceTimersByTimeAsync(10_000);
+    await before.emit("session_shutdown", { reason: "reload" });
+    const after = fakePi();
+    await loadExtension(after.api);
+    await after.emit("session_start", { reason: "reload" }, fakeCtx("sess-new").ctx);
+    const fileWakes = monitorFileWakes(persisted.file);
+    try {
+      expect(terminalNotices(before.sent)).toEqual([]);
+      expect(after.sent).toEqual([]);
+      expect(fileWakes.map((entry) => (entry.details as { kind?: string }).kind)).toContain("monitor-terminal");
+      expect(fileWakes.filter((entry) => (entry.details as { kind?: string }).kind === "monitor-terminal")).toHaveLength(1);
+      expect(fileWakes.find((entry) => (entry.details as { kind?: string }).kind === "monitor-terminal")?.details).toMatchObject({
+        kind: "monitor-terminal",
+        ids: ["mon_q"],
+      });
+    } finally {
+      try {
+        await after.emit("session_shutdown", { reason: "quit" });
+      } catch {
+        // already torn down
+      }
+    }
+  });
+
+  it("handoff-ended file keeps quiet pending output then monitor-terminal once, not via pi", async () => {
+    const persisted = persistSessionFile("quiet-handoff");
+    sessionDirs.push(persisted.dir);
+    let idle = false;
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx("sess-1", { sessionFile: persisted.file, isIdle: () => idle });
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_q", "quiet handoff watch");
+    await stopMonitorWithOutput(pi, host.ctx, "mon_q", "line-q\n");
+    await pi.emit("session_shutdown", { reason: "reload" });
+    parkRuntime({
+      version: "0.0.0-other",
+      runtime: { attach() {} },
+      dispose: async () => {},
+    });
+    await until(() => monitorFileWakes(persisted.file).length > 0, "handoff file wakes", 1000);
+    const fileWakes = monitorFileWakes(persisted.file);
+    expect(monitorEventNotices(pi.sent)).toEqual([]);
+    expect(terminalNotices(pi.sent)).toEqual([]);
+    expect(fileWakes.map((entry) => (entry.details as { kind?: string }).kind)).toEqual(["monitor", "monitor-terminal"]);
+    expect(fileWakes).toHaveLength(2);
+    expect(String(fileWakes[0]?.content)).toContain("line-q");
+    expect(fileWakes[1]?.details).toMatchObject({ kind: "monitor-terminal", ids: ["mon_q"] });
+  });
+
+  it("mismatch file does not rewrite nonquiet output already steered on the old pi", async () => {
+    const persisted = persistSessionFile("nonquiet-mismatch");
+    sessionDirs.push(persisted.dir);
+    let idle = false;
+    const before = fakePi();
+    await loadExtension(before.api);
+    const host = fakeCtx("sess-old", { sessionFile: persisted.file, isIdle: () => idle });
+    await before.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(before, host.ctx, "mon_n", "live watch");
+    await stopMonitorWithOutput(before, host.ctx, "mon_n", "line-n\n", { quiet: false });
+    await before.emit("session_shutdown", { reason: "reload" });
+    const after = fakePi();
+    await loadExtension(after.api);
+    await after.emit("session_start", { reason: "reload" }, fakeCtx("sess-new").ctx);
+    const fileWakes = monitorFileWakes(persisted.file);
+    try {
+      expect(monitorEventNotices(before.sent).map((entry) => entry.content).join("\n")).toContain("line-n");
+      expect(after.sent).toEqual([]);
+      expect(fileWakes.map((entry) => (entry.details as { kind?: string }).kind)).toEqual(["monitor-terminal"]);
+      expect(fileWakes).toHaveLength(1);
+      expect(fileWakes[0]?.details).toMatchObject({ kind: "monitor-terminal", ids: ["mon_n"] });
+      expect(String(fileWakes[0]?.content)).not.toContain("line-n");
     } finally {
       try {
         await after.emit("session_shutdown", { reason: "quit" });

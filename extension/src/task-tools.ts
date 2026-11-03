@@ -29,6 +29,8 @@ export interface TaskToolsDeps {
   syncWithManager?: () => Promise<unknown>;
   /** task_stop on a monitor: its leftover lines and exit should not wake the model. */
   noteStopRequested?: (taskId: string) => (() => void) | void;
+  /** Live monitor remaining timeout and last output, from the in-session registry. */
+  getMonitorLive?: () => Iterable<{ taskId: string; remainingMs: number | null; persistent: boolean; lastOutputAt?: number }>;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -69,6 +71,16 @@ function formatDuration(startedAt: number, endedAt: number | null, now: number):
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+function formatMonitorLive(
+  live: { remainingMs: number | null; persistent: boolean; lastOutputAt?: number },
+  now: number,
+): string {
+  const timeout = live.persistent ? "persistent" : `timeout in ${formatAge(now, now + (live.remainingMs ?? 0), now)}`;
+  const last =
+    live.lastOutputAt === undefined ? "no output yet" : `last output ${formatAge(live.lastOutputAt, undefined, now)} ago`;
+  return ` ${timeout}; ${last}`;
 }
 
 function formatTaskLine(task: TaskRecord, now: number): string {
@@ -114,6 +126,8 @@ export function createTaskListTool(
       const lines: string[] = [];
       const seen = new Set<string>();
       let running = false;
+      const monitorLive = new Map<string, { remainingMs: number | null; persistent: boolean; lastOutputAt?: number }>();
+      for (const live of deps.getMonitorLive?.() ?? []) monitorLive.set(live.taskId, live);
 
       const pushItem = (item: WorkItem) => {
         if (seen.has(item.id)) return;
@@ -121,7 +135,12 @@ export function createTaskListTool(
         seen.add(item.id);
         const age = formatAge(item.startedAt, item.endedAt, now);
         running ||= item.status === "running" || item.status === "pending";
-        lines.push(`${item.id} [${item.kind}] ${item.status} (${age}) "${item.title}"`);
+        let line = `${item.id} [${item.kind}] ${item.status} (${age}) "${item.title}"`;
+        if (item.kind === "monitor") {
+          const live = monitorLive.get(item.id);
+          if (live) line += formatMonitorLive(live, now);
+        }
+        lines.push(line);
       };
 
       if (index) {

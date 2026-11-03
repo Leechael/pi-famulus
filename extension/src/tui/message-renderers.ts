@@ -123,6 +123,11 @@ function collapsedText(details: FamulusWake, theme: Theme): string {
     }
     case "running-monitors":
       return `${theme.fg("accent", "›")} ${theme.fg("muted", "running")} ${details.monitors.length} monitor${details.monitors.length === 1 ? "" : "s"}`;
+    case "monitor-terminal": {
+      const n = details.ids.length || details.monitors.length;
+      const statuses = countStatuses(details.monitors.map((monitor) => monitor.status));
+      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "monitors")} ${n} stopped · ${statuses}`;
+    }
   }
 }
 
@@ -212,6 +217,13 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
       return [
         `Still running after compaction (${details.monitors.length})`,
         ...details.monitors.map((monitor) => `${monitor.id} — ${monitor.description} — ${monitor.remaining}`),
+      ].join("\n");
+    case "monitor-terminal":
+      return [
+        details.summary,
+        ...details.monitors.map((monitor) =>
+          `${monitor.id} "${monitor.description}" · ${monitor.status}${monitor.detail ? `: ${monitor.detail}` : ""}`,
+        ),
       ].join("\n");
   }
 }

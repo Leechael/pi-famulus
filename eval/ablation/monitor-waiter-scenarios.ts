@@ -124,7 +124,7 @@ function negative(long: boolean, rearm: boolean): Scenario {
       const initialTask = String(starts[0]?.details?.task_id ?? "");
       const activeTask = String(starts.at(-1)?.details?.task_id ?? "");
       const events = monitorEvents(ep.items).filter((w) => w.wake.taskIds.includes(activeTask));
-      const timeout = wakes(ep.items).find((w) => w.wake.kind === "monitor" && w.wake.status === "timeout" &&
+      const timeout = wakes(ep.items).find((w) => (w.wake.kind === "monitor" || w.wake.kind === "monitor-terminal") && w.wake.status === "timeout" &&
         w.wake.taskIds.includes(initialTask) && !!starts[0] && w.seq > starts[0].seq);
       const rearmed = !rearm || (correctStarts && !!timeout && !!starts[1] && starts[1].seq > timeout.seq &&
         !!startCalls[1] && startCalls[1].seq > timeout.seq);

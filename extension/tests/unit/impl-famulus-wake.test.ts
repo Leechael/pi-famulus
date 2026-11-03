@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { formatSupervisorRequest } from "../../src/comms/comms";
 import {
   formatMonitorEvent,
+  formatMonitorTerminal,
   formatSubagentHandover,
   formatSubagentNotification,
   formatTaskNotification,
+  MONITOR_UNWATCHED_SUMMARY,
   type TaskExitInfo,
 } from "../../src/format";
 import { formatFamulusWake, stampWakeAsOf, wakeIds, FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
@@ -648,5 +650,105 @@ describe("monitor-session-end wake", () => {
     expect(expanded.join("")).toContain("mon_a");
     expect(expanded.join("")).toContain("mon_b");
     expect(expanded.join("")).toContain("while the log is retained");
+  });
+});
+
+describe("monitor-terminal wake", () => {
+  const summaryFirst = `<pi-famulus-wake kind="monitor-terminal">\n  <summary>${MONITOR_UNWATCHED_SUMMARY}</summary>`;
+  function assertSummaryFirst(content: string) {
+    const xml = content.slice(content.indexOf('<pi-famulus-wake kind="monitor-terminal">'));
+    expect(xml.startsWith(summaryFirst)).toBe(true);
+  }
+
+  it("is one envelope listing every monitor id, never a single monitor id", () => {
+    const wake = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout", event: "[Monitor timed out — re-arm if needed.]" },
+      { id: "mon_b", description: "beta", status: "timeout" },
+    ]);
+    expect(wake.customType).toBe(FAMULUS_WAKE_CUSTOM_TYPE);
+    expect(wake.content.match(/<pi-famulus-wake /g)).toHaveLength(1);
+    expect(wake.content).toContain('kind="monitor-terminal"');
+    assertSummaryFirst(wake.content);
+    expect(wake.content).not.toMatch(/re-arm if needed/);
+    expect(wake.content).toContain("mon_a");
+    expect(wake.content).toContain("mon_b");
+    expect((wake.details as { id?: string }).id).toBeUndefined();
+    expect(wakeIds(wake.details)).toEqual(["mon_a", "mon_b"]);
+    const idsFromMonitors = {
+      kind: "monitor-terminal",
+      ids: [] as string[],
+      monitors: [{ id: "mon_a" }, { id: "mon_b" }],
+    };
+    expect(wakeIds(idsFromMonitors)).toEqual(["mon_a", "mon_b"]);
+  });
+
+  it("single-monitor content also starts with the shared unwatched summary", () => {
+    const wake = formatMonitorTerminal([{ id: "mon_a", description: "alpha", status: "timeout" }]);
+    assertSummaryFirst(wake.content);
+    expect(wake.content).toContain("mon_a");
+    expect(wake.content).not.toContain("mon_b");
+  });
+
+  it("renders output metadata in model-visible XML for single and multiple monitors", () => {
+    const output = {
+      firstObservedAt: Date.UTC(2026, 9, 5, 12, 27, 26),
+      lastObservedAt: Date.UTC(2026, 9, 5, 12, 27, 27),
+      cursorStart: 10,
+      cursorEnd: 40,
+      truncated: true,
+      suppressedCount: 2,
+      omittedChars: 7,
+    };
+    const single = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout", output },
+    ]);
+    const multi = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout", output },
+      { id: "mon_b", description: "beta", status: "exited", event: "Monitor process exited" },
+    ]);
+    for (const wake of [single, multi]) {
+      assertSummaryFirst(wake.content);
+      expect(wake.content).toContain('first-observed-at="2026-10-05T12:27:26Z"');
+      expect(wake.content).toContain('last-observed-at="2026-10-05T12:27:27Z"');
+      expect(wake.content).toContain('cursor-start="10"');
+      expect(wake.content).toContain('cursor-end="40"');
+      expect(wake.content).toContain('truncated="true"');
+      expect(wake.content).toContain('duplicates-suppressed="2"');
+      expect(wake.content).toContain('omitted-chars="7"');
+      expect(wake.content).toContain("Read original bytes with task_output");
+    }
+    expect(multi.content).toContain("mon_b");
+  });
+
+  it("renders a pill without throwing and names the stopped monitors when expanded", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerFamulusMessageRenderers({
+      registerMessageRenderer(type: string, fn: unknown) {
+        map.set(type, fn as never);
+      },
+    } as never);
+    const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text };
+    const wake = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout" },
+      { id: "mon_b", description: "beta", status: "timeout" },
+    ]);
+    const collapsed = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: false, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    const expanded = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: true, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    expect(collapsed.join("")).not.toContain("undefined");
+    expect(collapsed.join("")).toContain("2 stopped");
+    const expandedText = expanded.join("\n");
+    expect(expandedText.indexOf(MONITOR_UNWATCHED_SUMMARY)).toBeGreaterThanOrEqual(0);
+    expect(expandedText.indexOf(MONITOR_UNWATCHED_SUMMARY)).toBeLessThan(expandedText.indexOf("mon_a"));
+    expect(expanded.join("")).toContain("mon_a");
+    expect(expanded.join("")).toContain("mon_b");
   });
 });
