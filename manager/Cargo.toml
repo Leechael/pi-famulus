@@ -74,6 +74,10 @@ name = "lifecycle_adversarial"
 required-features = ["test-clock"]
 
 [[test]]
+name = "lifecycle_stress"
+required-features = ["test-clock"]
+
+[[test]]
 name = "mutation_gaps"
 required-features = ["test-clock"]
 

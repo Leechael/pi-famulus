@@ -225,7 +225,7 @@ impl Desktop {
     }
 
     fn request(&self, method: &str) -> Value {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
         loop {
             let request = self
                 .requests

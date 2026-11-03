@@ -1,6 +1,6 @@
 //! Real-time backpressure canary (C6).
 //!
-//! Keep this test in its own harness: lifecycle_adversarial deliberately
+//! Keep this test in its own harness: lifecycle_stress deliberately
 //! saturates every CPU with burners and concurrent CLI startup races. A
 //! wall-clock latency bound must not measure those unrelated tests' load.
 //! Plain cargo test and cargo test --features test-clock both run this

@@ -1778,8 +1778,11 @@ pub fn pids_in(text: &str) -> Vec<u32> {
 }
 
 /// Poll a task's output until it contains at least `n` integers (pids).
+/// The bound only detects a task that never prints: 5s failed whole Windows
+/// jobs at once while Git Bash was slow to start, and a passing run returns
+/// as soon as the pids appear.
 pub fn wait_for_pids(c: &mut Conn, task_id: &str, n: usize) -> Vec<u32> {
-    wait_for_pids_for(c, task_id, n, Duration::from_secs(5))
+    wait_for_pids_for(c, task_id, n, Duration::from_secs(30))
 }
 
 /// Like `wait_for_pids`, with an explicit deadline.
@@ -1928,4 +1931,38 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         }
     }
     cmd
+}
+
+#[cfg(unix)]
+/// Everything the diagnostics of a failed daemon-race round need. Capture a sample
+/// before `Home::drop` cleans up a still-live daemon; substring matches on the
+/// home path are unsafe (`...-d1` also matches `...-d15`).
+pub fn daemon_diagnostics(home: &Home) -> String {
+    let pids = daemon_pids_for(&home.path);
+    let processes: Vec<String> = pids
+        .iter()
+        .map(|pid| {
+            let pid_arg = pid.to_string();
+            let ps = command("ps")
+                .args(["-p", pid_arg.as_str(), "-o", "pid=,ppid=,state=,command="])
+                .output();
+            let ps = ps
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_else(|e| e.to_string());
+            #[cfg(target_os = "macos")]
+            let sample = command("sample")
+                .args([pid_arg.as_str(), "1"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_else(|e| e.to_string());
+            #[cfg(not(target_os = "macos"))]
+            let sample = "sample unavailable on this platform".to_string();
+            format!("pid={pid}: ps={ps}\nsample:\n{sample}")
+        })
+        .collect();
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    format!(
+        "pidfile={:?}; live daemon pids={pids:?}; processes={processes:#?}\nmanager.log:\n{log}",
+        home.pidfile_pid()
+    )
 }
