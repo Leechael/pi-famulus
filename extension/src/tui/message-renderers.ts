@@ -117,6 +117,10 @@ function collapsedText(details: FamulusWake, theme: Theme): string {
       ].join("\n");
     case "supervisor-update":
       return `${theme.fg("muted", "↑")} ${theme.fg("muted", "supervisor update")} ${details.message.slice(0, 100)}`;
+    case "monitor-session-end": {
+      const n = details.ids.length || details.monitors.length;
+      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "session monitors")} ${n} stopped · ${details.reason}`;
+    }
   }
 }
 
@@ -195,6 +199,13 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
       return [`Decision requested by ${details.name} (${details.from})`, `Request: ${details.message}`, `Reply with /reply ${details.from} <decision>`].join("\n");
     case "supervisor-update":
       return [`Update from ${details.name} (${details.from})`, details.message].join("\n");
+    case "monitor-session-end":
+      return [
+        `Session monitors stopped (${details.reason}). They are no longer watched.`,
+        ...details.monitors.map((monitor) =>
+          `${monitor.id} "${monitor.description}" elapsed ${formatDuration(monitor.elapsedMs)}; original output: task_output({task_id: "${monitor.id}"}) ${monitor.outputPath} while the log is retained`,
+        ),
+      ].join("\n");
   }
 }
 

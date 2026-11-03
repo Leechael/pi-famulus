@@ -205,3 +205,63 @@ describe.each(REPLACE_REASONS)("session replacement reason %s while background w
     await lateWakesAfterReplacement(reason);
   });
 });
+
+const REPLACE_REASON_MAP = { new: "new", resume: "resumed", fork: "forked" } as const;
+
+describe.each(REPLACE_REASONS)("monitor teardown notice on session replacement %s", (reason) => {
+  beforeEach(() => {
+    resetHostedFakes();
+    takeParkedRuntime();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("notifies the old session once and does not send a second notice after the next session starts", async () => {
+    const pi = fakePi();
+    const before = fakeCtx("sess-before");
+    await loadExtension(pi.api);
+    await pi.emit("session_start", { reason: "startup" }, before);
+    managers[0].start = async () => ({ task_id: "mon_replace", pid: 1 });
+    const monitor = pi.toolByName.get("monitor");
+    if (!monitor) throw new Error("monitor tool was not registered");
+    await monitor.execute(
+      "mon-call",
+      { command: "tail -F /tmp/x", description: "replace watch", persistent: true },
+      undefined,
+      undefined,
+      before,
+    );
+    await pi.emit("session_shutdown", { reason });
+    const afterShutdown = pi.sent.filter((entry) => {
+      const details = (entry as { details?: { kind?: string } }).details;
+      return details?.kind === "monitor-session-end";
+    });
+    await pi.emit("session_start", { reason }, fakeCtx(`sess-${reason}`));
+    const afterStart = pi.sent.filter((entry) => {
+      const details = (entry as { details?: { kind?: string } }).details;
+      return details?.kind === "monitor-session-end";
+    });
+    try {
+      expect({
+        afterShutdownCount: afterShutdown.length,
+        afterStartCount: afterStart.length,
+        reason: (afterShutdown[0] as { details?: { reason?: string } } | undefined)?.details?.reason,
+        content: (afterShutdown[0] as { content?: string } | undefined)?.content,
+      }).toEqual({
+        afterShutdownCount: 1,
+        afterStartCount: 1,
+        reason: REPLACE_REASON_MAP[reason],
+        content: (afterShutdown[0] as { content?: string } | undefined)?.content,
+      });
+      expect(String((afterShutdown[0] as { content?: string })?.content)).toContain("mon_replace");
+      expect(String((afterShutdown[0] as { content?: string })?.content)).toContain("replace watch");
+      expect(String((afterShutdown[0] as { content?: string })?.content)).toContain(REPLACE_REASON_MAP[reason]);
+      expect(String((afterShutdown[0] as { content?: string })?.content)).toMatch(/task_output/);
+      expect(String((afterShutdown[0] as { content?: string })?.content)).toContain("while the log is retained");
+    } finally {
+      await pi.emit("session_shutdown", { reason: "quit" });
+    }
+  });
+});

@@ -166,7 +166,13 @@ type FamulusWakeBody =
       additional?: SubagentOverrunChild[];
     }
   | { kind: "supervisor-request"; from: string; name: string; message: string }
-  | { kind: "supervisor-update"; from: string; name: string; message: string };
+  | { kind: "supervisor-update"; from: string; name: string; message: string }
+  | {
+      kind: "monitor-session-end";
+      reason: "new" | "resumed" | "forked" | "handoff-ended" | "session-mismatch";
+      ids: string[];
+      monitors: Array<{ id: string; description: string; elapsedMs: number; outputPath: string }>;
+    };
 
 export interface FormattedWake {
   customType: typeof FAMULUS_WAKE_CUSTOM_TYPE;
@@ -209,6 +215,11 @@ export function wakeIds(details: { kind?: string }): string[] {
   if (d.kind === "task") return (d.tasks ?? []).map((task) => task.id);
   if (d.kind === "subagent-done") return (d.children ?? []).map((child) => child.childId);
   if (d.kind === "subagent-overrun") return [d.childId, ...((d as { additional?: { childId: string }[] }).additional ?? []).map((child) => child.childId)].filter((id): id is string => Boolean(id));
+  if (d.kind === "monitor-session-end") {
+    const ids = (d as { ids?: string[] }).ids;
+    if (ids && ids.length > 0) return ids;
+    return ((d as { monitors?: { id: string }[] }).monitors ?? []).map((monitor) => monitor.id);
+  }
   return [d.id ?? d.taskId ?? d.childId ?? d.from].filter((id): id is string => Boolean(id));
 }
 
@@ -284,6 +295,8 @@ function renderWakeBody(details: FamulusWake): string {
       return renderRequest(details);
     case "supervisor-update":
       return renderUpdate(details);
+    case "monitor-session-end":
+      return renderMonitorSessionEnd(details);
   }
 }
 
@@ -505,4 +518,19 @@ function renderUpdate(details: Extract<FamulusWake, { kind: "supervisor-update" 
     `  <message>${escapeXml(details.message)}</message>`,
     "</pi-famulus-wake>",
   ].join("\n");
+}
+
+function renderMonitorSessionEnd(details: Extract<FamulusWake, { kind: "monitor-session-end" }>): string {
+  const parts = [
+    `<pi-famulus-wake kind="monitor-session-end" reason="${escapeXmlAttr(details.reason)}">`,
+    `  <summary>${escapeXml(`These monitors stopped (${details.reason}). They are no longer watched.`)}</summary>`,
+  ];
+  for (const monitor of details.monitors) {
+    const pointer = `task_output({task_id: "${monitor.id}"}) ${monitor.outputPath} while the log is retained`;
+    parts.push(
+      `  <monitor id="${escapeXmlAttr(monitor.id)}" description="${escapeXmlAttr(monitor.description)}" elapsed-ms="${Math.round(monitor.elapsedMs)}">${escapeXml(pointer)}</monitor>`,
+    );
+  }
+  parts.push("</pi-famulus-wake>");
+  return parts.join("\n");
 }

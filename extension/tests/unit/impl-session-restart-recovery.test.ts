@@ -15,8 +15,10 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { agentRecordPath, writeAgentChildRecord } from "../../src/subagent/agent-records";
-import { fakeHostCtx, fakeHostPi, hostedFakeState, resetHostedFakes, settleAsync, startHostedExtension, textOf, until } from "./hosted-fakes";
+import { FAMULUS_WAKE_CUSTOM_TYPE } from "../../src/wake";
+import { fakeHostCtx, fakeHostPi, hostedFakeState, resetHostedFakes, settleAsync, startHostedExtension, textOf, until, type SentMessage } from "./hosted-fakes";
 // Load the extension at collection time, outside the first test's timeout (see startHostedExtension).
 import "../../src/index";
 
@@ -231,6 +233,311 @@ describe("the same session reopened after pi crashed", () => {
       }).toEqual({ namesSubagent: true, namesCommand: true, recordStatus: "interrupted" });
     } finally {
       await ext.shutdown();
+    }
+  });
+
+  it("wakes for this session's monitors ended with session-end and still recovers shells", async () => {
+    hostedFakeState().tasks = [
+      {
+        task_id: "mon_ended",
+        session_id: SESSION,
+        kind: "monitor",
+        status: "killed",
+        end_reason: "session-end",
+      },
+      {
+        task_id: "sh_crash",
+        session_id: SESSION,
+        kind: "shell",
+        status: "killed",
+        end_reason: "manager-crash",
+      },
+    ];
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home });
+    try {
+      await settleAsync();
+      await until(() => ext.pi.sent.length > 0, "a recovery notice", 1000).catch(() => {});
+      const recovery = ext.pi.sent.filter((entry) => (entry.message.details as { kind?: string })?.kind === "session-recovery");
+      const text = recovery.map((entry) => entry.message.content ?? "").join("\n");
+      expect({
+        count: recovery.length,
+        text,
+        namesMonitor: text.includes("mon_ended"),
+        namesShell: text.includes("sh_crash"),
+        mentionsSessionEnd: text.includes("session-end"),
+      }).toEqual({
+        count: 1,
+        text,
+        namesMonitor: true,
+        namesShell: true,
+        mentionsSessionEnd: true,
+      });
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
+  it("does not recover another session's session-end monitor or a monitor that exited", async () => {
+    hostedFakeState().tasks = [
+      {
+        task_id: "mon_other",
+        session_id: "sess-other",
+        kind: "monitor",
+        status: "killed",
+        end_reason: "session-end",
+      },
+      {
+        task_id: "mon_exited",
+        session_id: SESSION,
+        kind: "monitor",
+        status: "completed",
+        end_reason: "exited",
+      },
+    ];
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home });
+    try {
+      await settleAsync();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const recovery = ext.pi.sent.filter((entry) => (entry.message.details as { kind?: string })?.kind === "session-recovery");
+      const text = recovery.map((entry) => entry.message.content ?? "").join("\n");
+      expect({
+        recovery,
+        text,
+        namesOther: text.includes("mon_other"),
+        namesExited: text.includes("mon_exited"),
+      }).toEqual({
+        recovery: [],
+        text: "",
+        namesOther: false,
+        namesExited: false,
+      });
+    } finally {
+      await ext.shutdown();
+    }
+  });
+
+  function persistSession(): { dir: string; file: string } {
+    const dir = mkdtempSync(join(tmpdir(), "famulus-recover-sess-"));
+    const sm = SessionManager.create(dir, join(dir, "sessions"));
+    sm.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+    const file = sm.getSessionFile();
+    if (!file) throw new Error("session file missing");
+    return { dir, file };
+  }
+
+  function persistWakes(file: string, sent: SentMessage[]): void {
+    const sm = SessionManager.open(file);
+    for (const entry of sent) {
+      if (entry.message.customType !== FAMULUS_WAKE_CUSTOM_TYPE) continue;
+      sm.appendCustomMessageEntry(
+        FAMULUS_WAKE_CUSTOM_TYPE,
+        entry.message.content ?? "",
+        true,
+        entry.message.details,
+      );
+    }
+  }
+
+  function recoveryOf(sent: SentMessage[]) {
+    return sent.filter((entry) => (entry.message.details as { kind?: string })?.kind === "session-recovery");
+  }
+
+  it("second resume omits a monitor id already in session-recovery details", async () => {
+    const persisted = persistSession();
+    hostedFakeState().tasks = [
+      { task_id: "mon_ended", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+      { task_id: "sh_crash", session_id: SESSION, kind: "shell", status: "killed", end_reason: "manager-crash" },
+    ];
+    const first = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file });
+    try {
+      await settleAsync();
+      await until(() => first.pi.sent.length > 0, "first recovery", 1000).catch(() => {});
+      persistWakes(persisted.file, first.pi.sent);
+      await first.shutdown();
+      resetHostedFakes();
+      hostedFakeState().tasks = [
+        { task_id: "mon_ended", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+        { task_id: "sh_crash", session_id: SESSION, kind: "shell", status: "killed", end_reason: "manager-crash" },
+      ];
+      const second = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file, reason: "resume" });
+      try {
+        await settleAsync();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const recovery = recoveryOf(second.pi.sent);
+        const text = recovery.map((entry) => entry.message.content ?? "").join("\n");
+        expect({
+          monitorAgain: text.includes("mon_ended"),
+          shellAgain: text.includes("sh_crash"),
+        }).toEqual({ monitorAgain: false, shellAgain: true });
+      } finally {
+        await second.shutdown();
+      }
+    } finally {
+      rmSync(persisted.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("live teardown notice then resume does not send a second monitor notice", async () => {
+    const persisted = persistSession();
+    const first = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file });
+    try {
+      first.manager.start = async () => ({ task_id: "mon_live", pid: 1 });
+      await first.pi.tool("monitor").execute(
+        "m",
+        { command: "tail -F x", description: "live watch", persistent: true },
+        undefined,
+        undefined,
+        first.ctx,
+      );
+      await first.pi.emit("session_shutdown", { reason: "new" }, first.ctx);
+      persistWakes(persisted.file, first.pi.sent);
+      resetHostedFakes();
+      hostedFakeState().tasks = [
+        { task_id: "mon_live", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+      ];
+      const second = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file, reason: "resume" });
+      try {
+        await settleAsync();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const text = second.pi.sent.map((entry) => entry.message.content ?? "").join("\n");
+        expect(text).not.toContain("mon_live");
+      } finally {
+        await second.shutdown();
+      }
+    } finally {
+      rmSync(persisted.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("quit then first resume recovers the monitor and the second resume is quiet", async () => {
+    const persisted = persistSession();
+    hostedFakeState().tasks = [
+      { task_id: "mon_ended", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+    ];
+    const first = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file });
+    try {
+      await settleAsync();
+      await until(() => first.pi.sent.length > 0, "first recovery", 1000).catch(() => {});
+      const firstText = recoveryOf(first.pi.sent).map((entry) => entry.message.content ?? "").join("\n");
+      expect(firstText).toContain("mon_ended");
+      persistWakes(persisted.file, first.pi.sent);
+      await first.shutdown();
+      resetHostedFakes();
+      hostedFakeState().tasks = [
+        { task_id: "mon_ended", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+      ];
+      const second = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file, reason: "resume" });
+      try {
+        await settleAsync();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        expect(recoveryOf(second.pi.sent).some((entry) => (entry.message.content ?? "").includes("mon_ended"))).toBe(false);
+      } finally {
+        await second.shutdown();
+      }
+    } finally {
+      rmSync(persisted.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still reports an unrelated monitor id and preserves shell recovery", async () => {
+    const persisted = persistSession();
+    const sm = SessionManager.open(persisted.file);
+    sm.appendCustomMessageEntry(
+      FAMULUS_WAKE_CUSTOM_TYPE,
+      "prior",
+      true,
+      { kind: "monitor-session-end", reason: "new", ids: ["mon_old"], monitors: [{ id: "mon_old", description: "old", elapsedMs: 1, outputPath: "/tmp/old" }] },
+    );
+    hostedFakeState().tasks = [
+      { task_id: "mon_old", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+      { task_id: "mon_new", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+      { task_id: "sh_crash", session_id: SESSION, kind: "shell", status: "killed", end_reason: "manager-crash" },
+    ];
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file });
+    try {
+      await settleAsync();
+      await until(() => ext.pi.sent.length > 0, "recovery", 1000).catch(() => {});
+      const recovery = recoveryOf(ext.pi.sent);
+      const text = recovery.map((entry) => entry.message.content ?? "").join("\n");
+      const details = recovery[0]?.message.details as { monitors?: string[]; tasks?: string[] } | undefined;
+      expect({
+        text,
+        namesOld: text.includes("mon_old"),
+        namesNew: text.includes("mon_new"),
+        namesShell: text.includes("sh_crash"),
+        monitors: details?.monitors,
+      }).toEqual({
+        text,
+        namesOld: false,
+        namesNew: true,
+        namesShell: true,
+        monitors: ["mon_new"],
+      });
+    } finally {
+      await ext.shutdown();
+      rmSync(persisted.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits a monitor id listed only on monitor-session-end monitors", async () => {
+    const persisted = persistSession();
+    const sm = SessionManager.open(persisted.file);
+    sm.appendCustomMessageEntry(
+      FAMULUS_WAKE_CUSTOM_TYPE,
+      "prior end",
+      true,
+      {
+        kind: "monitor-session-end",
+        reason: "new",
+        ids: [],
+        monitors: [{ id: "mon_old", description: "old", elapsedMs: 1, outputPath: "/tmp/old" }],
+      },
+    );
+    hostedFakeState().tasks = [
+      { task_id: "mon_old", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+      { task_id: "mon_new", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+    ];
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file });
+    try {
+      await settleAsync();
+      await until(() => ext.pi.sent.length > 0, "recovery", 1000).catch(() => {});
+      const text = recoveryOf(ext.pi.sent).map((entry) => entry.message.content ?? "").join("\n");
+      expect({
+        namesOld: text.includes("mon_old"),
+        namesNew: text.includes("mon_new"),
+      }).toEqual({ namesOld: false, namesNew: true });
+    } finally {
+      await ext.shutdown();
+      rmSync(persisted.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits a monitor id listed only in a previous session-recovery tasks array", async () => {
+    const persisted = persistSession();
+    const sm = SessionManager.open(persisted.file);
+    sm.appendCustomMessageEntry(
+      FAMULUS_WAKE_CUSTOM_TYPE,
+      "prior recovery",
+      true,
+      { kind: "session-recovery", children: [], tasks: ["mon_old"] },
+    );
+    hostedFakeState().tasks = [
+      { task_id: "mon_old", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+      { task_id: "mon_new", session_id: SESSION, kind: "monitor", status: "killed", end_reason: "session-end" },
+    ];
+    const ext = await startHostedExtension({ sessionId: SESSION, cwd: home, sessionFile: persisted.file });
+    try {
+      await settleAsync();
+      await until(() => ext.pi.sent.length > 0, "recovery", 1000).catch(() => {});
+      const recovery = recoveryOf(ext.pi.sent);
+      const text = recovery.map((entry) => entry.message.content ?? "").join("\n");
+      expect({
+        namesOld: text.includes("mon_old"),
+        namesNew: text.includes("mon_new"),
+      }).toEqual({ namesOld: false, namesNew: true });
+    } finally {
+      await ext.shutdown();
+      rmSync(persisted.dir, { recursive: true, force: true });
     }
   });
 });

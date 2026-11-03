@@ -3,11 +3,11 @@
  * instance adopts the runtime (manager connection, subagents, monitors) the
  * old one parked, while quit and session replacement still tear it down.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createPiBinding,
   HANDOFF_EXPIRY_MS,
@@ -54,6 +54,7 @@ function fakePi(options?: { stale?: { current: boolean } }) {
   const toolByName = new Map<string, ExecutableTool>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
   const sent: unknown[] = [];
+  const sentWithOptions: Array<{ message: unknown; options: unknown }> = [];
   const api = {
     events: { emit: () => {}, on: () => () => {} },
     on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
@@ -64,18 +65,19 @@ function fakePi(options?: { stale?: { current: boolean } }) {
     registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
       commands.set(name, command),
     registerMessageRenderer: () => {},
-    sendMessage: (msg: unknown) => {
+    sendMessage: (msg: unknown, sendOpts?: unknown) => {
       if (options?.stale?.current) throw new Error("stale pi instance");
       sent.push(msg);
+      sentWithOptions.push({ message: msg, options: sendOpts });
     },
   };
   const emit = async (name: string, event: Record<string, unknown>, ctx: unknown = {}) => {
     for (const handler of handlers.get(name) ?? []) await handler({ type: name, ...event }, ctx);
   };
-  return { api: api as unknown as ExtensionAPI, tools, toolByName, commands, sent, emit };
+  return { api: api as unknown as ExtensionAPI, tools, toolByName, commands, sent, sentWithOptions, emit };
 }
 
-function fakeCtx(sessionId = "sess-1", options?: { hasUI?: boolean; throwOnWidgetClear?: boolean }) {
+function fakeCtx(sessionId = "sess-1", options?: { hasUI?: boolean; throwOnWidgetClear?: boolean; sessionFile?: string }) {
   const notices: string[] = [];
   let widgetMounted = false;
   const ui = {
@@ -106,7 +108,7 @@ function fakeCtx(sessionId = "sess-1", options?: { hasUI?: boolean; throwOnWidge
       hasUI: options?.hasUI === true,
       ui,
       isIdle: () => true,
-      sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined },
+      sessionManager: { getSessionId: () => sessionId, getSessionFile: () => options?.sessionFile },
       modelRegistry: null,
       scopedModels: [],
       isProjectTrusted: () => false,
@@ -461,5 +463,440 @@ describe.each(SHUTDOWN_REASONS)("session_shutdown reason %s while background wor
 
   it.fails("still drops them when teardown throws before the notification centre is disposed", async () => {
     await lateWakesAfterShutdown(reason, true);
+  });
+});
+
+function persistSessionFile(label: string): { dir: string; file: string } {
+  const dir = mkdtempSync(join(tmpdir(), `famulus-old-sess-${label}-`));
+  const sm = SessionManager.create(dir, join(dir, "sessions"));
+  sm.appendMessage({ role: "user", content: `seed ${label}`, timestamp: Date.now() });
+  const file = sm.getSessionFile();
+  if (!file) throw new Error("session file was not created");
+  return { dir, file };
+}
+
+function customMessages(file: string | undefined): Array<Record<string, unknown>> {
+  if (!file || !existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((entry) => entry.type === "custom_message");
+}
+
+function teardownNotices(sent: unknown[]): Array<{ content: string; details: Record<string, unknown>; options?: unknown }> {
+  return sent.flatMap((entry) => {
+    const message = entry as { customType?: string; content?: string; details?: Record<string, unknown> };
+    if (message.customType !== "pi-famulus-wake") return [];
+    const details = message.details ?? {};
+    if (details.kind !== "monitor-session-end") return [];
+    return [{ content: message.content ?? "", details, options: undefined }];
+  });
+}
+
+function noticesWithOptions(pi: { sentWithOptions: Array<{ message: unknown; options: unknown }> }) {
+  return pi.sentWithOptions.flatMap((entry) => {
+    const message = entry.message as { customType?: string; content?: string; details?: Record<string, unknown> };
+    if (message.customType !== "pi-famulus-wake") return [];
+    const details = message.details ?? {};
+    if (details.kind !== "monitor-session-end") return [];
+    return [{ content: message.content ?? "", details, options: entry.options }];
+  });
+}
+
+async function startMonitor(
+  pi: { toolByName: Map<string, ExecutableTool> },
+  ctx: unknown,
+  taskId: string,
+  description: string,
+): Promise<void> {
+  const manager = managers[managers.length - 1];
+  manager.start = async () => ({ task_id: taskId, pid: 1 });
+  const tool = pi.toolByName.get("monitor");
+  if (!tool) throw new Error("monitor tool was not registered");
+  await tool.execute(
+    "mon-call",
+    { command: "tail -F /tmp/x", description, persistent: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+}
+
+const REASON_MAP = { new: "new", resume: "resumed", fork: "forked" } as const;
+
+describe("monitor teardown notices", () => {
+  const sessionDirs: string[] = [];
+  beforeEach(() => {
+    resetHostedFakes();
+    takeParkedRuntime();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    while (sessionDirs.length > 0) {
+      const dir = sessionDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not notify on a same-version reload while a monitor keeps running", async () => {
+    const before = fakePi();
+    await loadExtension(before.api);
+    const host = fakeCtx();
+    await before.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(before, host.ctx, "mon_reload", "deploy watch");
+    await before.emit("session_shutdown", { reason: "reload" });
+    const after = fakePi();
+    await loadExtension(after.api);
+    await after.emit("session_start", { reason: "reload" }, fakeCtx().ctx);
+    try {
+      expect({
+        shutdownCalls: managers[0].shutdownCalls,
+        beforeNotices: teardownNotices(before.sent),
+        afterNotices: teardownNotices(after.sent),
+      }).toEqual({ shutdownCalls: 0, beforeNotices: [], afterNotices: [] });
+    } finally {
+      await after.emit("session_shutdown", { reason: "quit" });
+    }
+  });
+
+  it("does not notify on quit even with a running monitor", async () => {
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx();
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_quit", "quit watch");
+    await pi.emit("session_shutdown", { reason: "quit" });
+    expect(teardownNotices(pi.sent)).toEqual([]);
+    expect(managers[0].shutdownCalls).toBe(1);
+  });
+
+  it("does not notify when new has no running monitor", async () => {
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    await pi.emit("session_start", { reason: "startup" }, fakeCtx().ctx);
+    await pi.emit("session_shutdown", { reason: "new" });
+    expect(teardownNotices(pi.sent)).toEqual([]);
+    expect(pi.sent).toEqual([]);
+  });
+});
+
+describe.each(SHUTDOWN_REASONS)("monitor teardown notice for shutdown reason %s", (reason) => {
+  beforeEach(() => {
+    resetHostedFakes();
+    takeParkedRuntime();
+  });
+
+  it("sends one passive old-session message listing running monitors before shutdownSession", async () => {
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx();
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    const order: string[] = [];
+    const manager = managers[0];
+    const origShutdown = manager.shutdownSession.bind(manager);
+    manager.shutdownSession = async () => {
+      order.push("shutdownSession");
+      return origShutdown();
+    };
+    const origSend = pi.api.sendMessage.bind(pi.api);
+    (pi.api as { sendMessage: typeof origSend }).sendMessage = (msg, sendOpts) => {
+      order.push("sendMessage");
+      return origSend(msg, sendOpts);
+    };
+    await startMonitor(pi, host.ctx, "mon_alpha", "alpha logs");
+    manager.start = async () => ({ task_id: "mon_beta", pid: 2 });
+    await pi.toolByName.get("monitor")!.execute(
+      "mon-call-2",
+      { command: "tail -F /tmp/y", description: "beta logs", persistent: true },
+      undefined,
+      undefined,
+      host.ctx,
+    );
+    await pi.emit("session_shutdown", { reason });
+    const mapped = REASON_MAP[reason];
+    const notices = noticesWithOptions(pi);
+    expect({
+      count: notices.length,
+      reason: notices[0]?.details.reason,
+      ids: notices[0]?.details.ids,
+      options: notices[0]?.options,
+      order,
+      content: notices[0]?.content,
+    }).toEqual({
+      count: 1,
+      reason: mapped,
+      ids: ["mon_alpha", "mon_beta"],
+      options: { triggerTurn: false },
+      order: ["sendMessage", "shutdownSession"],
+      content: notices[0]?.content,
+    });
+    expect(notices[0]?.content).toContain("mon_alpha");
+    expect(notices[0]?.content).toContain("alpha logs");
+    expect(notices[0]?.content).toContain("mon_beta");
+    expect(notices[0]?.content).toContain("beta logs");
+    expect(notices[0]?.content).toContain(mapped);
+    expect(notices[0]?.content).toMatch(/elapsed/i);
+    expect(notices[0]?.content).toMatch(/task_output/);
+    expect(notices[0]?.content).toContain("while the log is retained");
+  });
+});
+
+describe("monitor teardown notice for handoff expiry and session mismatch", () => {
+  const sessionDirs: string[] = [];
+  beforeEach(() => {
+    resetHostedFakes();
+    takeParkedRuntime();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    while (sessionDirs.length > 0) {
+      const dir = sessionDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("appends one handoff-ended notice to the old session file, not via the detached pi", async () => {
+    vi.useFakeTimers();
+    const persisted = persistSessionFile("expiry");
+    sessionDirs.push(persisted.dir);
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx("sess-1", { sessionFile: persisted.file });
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_expiry", "expiry watch");
+    await pi.emit("session_shutdown", { reason: "reload" });
+    expect(managers[0].shutdownCalls).toBe(0);
+    await vi.advanceTimersByTimeAsync(HANDOFF_EXPIRY_MS);
+    const fileCustoms = customMessages(persisted.file);
+    expect({
+      piNotices: teardownNotices(pi.sent),
+      shutdownCalls: managers[0].shutdownCalls,
+      fileCustomTypes: fileCustoms.map((entry) => entry.customType),
+      fileContents: fileCustoms.map((entry) => entry.content),
+      fileDetails: fileCustoms.map((entry) => entry.details),
+    }).toEqual({
+      piNotices: [],
+      shutdownCalls: 1,
+      fileCustomTypes: ["pi-famulus-wake"],
+      fileContents: fileCustoms.map((entry) => entry.content),
+      fileDetails: [
+        expect.objectContaining({
+          kind: "monitor-session-end",
+          reason: "handoff-ended",
+          ids: ["mon_expiry"],
+        }),
+      ],
+    });
+    expect(String(fileCustoms[0]?.content)).toContain("mon_expiry");
+    expect(String(fileCustoms[0]?.content)).toContain("expiry watch");
+    expect(String(fileCustoms[0]?.content)).toContain("handoff-ended");
+    expect(String(fileCustoms[0]?.content)).toMatch(/elapsed/i);
+    expect(String(fileCustoms[0]?.content)).toMatch(/task_output/);
+    expect(String(fileCustoms[0]?.content)).toContain("while the log is retained");
+  });
+
+  it("writes session-mismatch to the old session file and not the new pi", async () => {
+    const persisted = persistSessionFile("mismatch");
+    sessionDirs.push(persisted.dir);
+    const before = fakePi();
+    await loadExtension(before.api);
+    const host = fakeCtx("sess-old", { sessionFile: persisted.file });
+    await before.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(before, host.ctx, "mon_mis", "mismatch watch");
+    await before.emit("session_shutdown", { reason: "reload" });
+    const after = fakePi();
+    await loadExtension(after.api);
+    const next = fakeCtx("sess-new");
+    await after.emit("session_start", { reason: "reload" }, next.ctx);
+    const fileCustoms = customMessages(persisted.file);
+    try {
+      expect({
+        beforeNotices: teardownNotices(before.sent),
+        afterNotices: teardownNotices(after.sent),
+        afterSent: after.sent,
+        fileCustomTypes: fileCustoms.map((entry) => entry.customType),
+        fileDetails: fileCustoms.map((entry) => entry.details),
+        shutdownCalls: managers[0].shutdownCalls,
+      }).toEqual({
+        beforeNotices: [],
+        afterNotices: [],
+        afterSent: [],
+        fileCustomTypes: ["pi-famulus-wake"],
+        fileDetails: [
+          expect.objectContaining({
+            kind: "monitor-session-end",
+            reason: "session-mismatch",
+            ids: ["mon_mis"],
+          }),
+        ],
+        shutdownCalls: 1,
+      });
+      expect(String(fileCustoms[0]?.content)).toContain("mon_mis");
+      expect(String(fileCustoms[0]?.content)).toContain("mismatch watch");
+      expect(String(fileCustoms[0]?.content)).toContain("session-mismatch");
+      expect(String(fileCustoms[0]?.content)).toMatch(/task_output/);
+      expect(String(fileCustoms[0]?.content)).toContain("while the log is retained");
+    } finally {
+      try {
+        await after.emit("session_shutdown", { reason: "quit" });
+      } catch {
+        // already torn down
+      }
+    }
+  });
+
+  it("does not write handoff-expiry to a previous session after a file-less session starts", async () => {
+    vi.useFakeTimers();
+    const persisted = persistSessionFile("stale-file");
+    sessionDirs.push(persisted.dir);
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const first = fakeCtx("sess-a", { sessionFile: persisted.file });
+    await pi.emit("session_start", { reason: "startup" }, first.ctx);
+    await startMonitor(pi, first.ctx, "mon_a", "first watch");
+    await pi.emit("session_shutdown", { reason: "new" });
+    const second = fakeCtx("sess-b");
+    await pi.emit("session_start", { reason: "new" }, second.ctx);
+    await startMonitor(pi, second.ctx, "mon_b", "fileless watch");
+    await pi.emit("session_shutdown", { reason: "reload" });
+    await vi.advanceTimersByTimeAsync(HANDOFF_EXPIRY_MS);
+    const fileCustoms = customMessages(persisted.file);
+    const expiryOnPrevious = fileCustoms.filter((entry) => {
+      const details = entry.details as { reason?: string; ids?: string[] } | undefined;
+      return details?.reason === "handoff-ended" || (details?.ids ?? []).includes("mon_b");
+    });
+    expect({
+      expiryOnPrevious,
+      contents: fileCustoms.map((entry) => entry.content),
+      details: fileCustoms.map((entry) => entry.details),
+    }).toEqual({
+      expiryOnPrevious: [],
+      contents: fileCustoms.map((entry) => entry.content),
+      details: fileCustoms.map((entry) => entry.details),
+    });
+    expect(String(fileCustoms.map((entry) => entry.content).join("\n"))).not.toContain("mon_b");
+  });
+
+  it("falls back to the old session file when live sendMessage throws", async () => {
+    const persisted = persistSessionFile("live-fail");
+    sessionDirs.push(persisted.dir);
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx("sess-1", { sessionFile: persisted.file });
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_fail", "fallback watch");
+    (pi.api as { sendMessage: (message: unknown, options?: unknown) => void }).sendMessage = () => {
+      throw new Error("stale pi instance");
+    };
+    await pi.emit("session_shutdown", { reason: "new" });
+    const fileCustoms = customMessages(persisted.file);
+    expect({
+      piNotices: teardownNotices(pi.sent),
+      fileCustomTypes: fileCustoms.map((entry) => entry.customType),
+      fileDetails: fileCustoms.map((entry) => entry.details),
+      content: fileCustoms[0]?.content,
+    }).toEqual({
+      piNotices: [],
+      fileCustomTypes: ["pi-famulus-wake"],
+      fileDetails: [
+        expect.objectContaining({
+          kind: "monitor-session-end",
+          reason: "new",
+          ids: ["mon_fail"],
+        }),
+      ],
+      content: fileCustoms[0]?.content,
+    });
+    expect(String(fileCustoms[0]?.content)).toContain("mon_fail");
+    expect(String(fileCustoms[0]?.content)).toContain("fallback watch");
+    expect(String(fileCustoms[0]?.content)).toMatch(/task_output/);
+    expect(String(fileCustoms[0]?.content)).toContain("while the log is retained");
+  });
+
+  it("falls back to the old session file when live sendMessage returns a rejected promise", async () => {
+    const persisted = persistSessionFile("live-reject");
+    sessionDirs.push(persisted.dir);
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx("sess-1", { sessionFile: persisted.file });
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_reject", "rejected fallback watch");
+    (pi.api as unknown as { sendMessage: (message: unknown, options?: unknown) => Promise<void> }).sendMessage = () =>
+      Promise.reject(new Error("async stale pi instance"));
+    await pi.emit("session_shutdown", { reason: "new" });
+    const fileCustoms = customMessages(persisted.file);
+    expect(fileCustoms.map((entry) => entry.details)).toEqual([
+      expect.objectContaining({ kind: "monitor-session-end", reason: "new", ids: ["mon_reject"] }),
+    ]);
+    expect(String(fileCustoms[0]?.content)).toContain("rejected fallback watch");
+    expect(String(fileCustoms[0]?.content)).toContain("while the log is retained");
+  });
+
+  it("parkRuntime replacing a parked runtime notices handoff-ended", async () => {
+    const persisted = persistSessionFile("replaced");
+    sessionDirs.push(persisted.dir);
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx("sess-1", { sessionFile: persisted.file });
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_rep", "replaced watch");
+    await pi.emit("session_shutdown", { reason: "reload" });
+    parkRuntime({
+      version: "0.0.0-other",
+      runtime: { attach() {} },
+      dispose: async () => {},
+    });
+    const fileCustoms = customMessages(persisted.file);
+    expect(fileCustoms.map((entry) => entry.details)).toEqual([
+      expect.objectContaining({
+        kind: "monitor-session-end",
+        reason: "handoff-ended",
+        ids: ["mon_rep"],
+      }),
+    ]);
+    expect(String(fileCustoms[0]?.content)).toContain("mon_rep");
+    expect(teardownNotices(pi.sent)).toEqual([]);
+  });
+
+  it("version rejection of a parked runtime notices handoff-ended", async () => {
+    const persisted = persistSessionFile("version");
+    sessionDirs.push(persisted.dir);
+    const pi = fakePi();
+    await loadExtension(pi.api);
+    const host = fakeCtx("sess-1", { sessionFile: persisted.file });
+    await pi.emit("session_start", { reason: "startup" }, host.ctx);
+    await startMonitor(pi, host.ctx, "mon_ver", "version watch");
+    await pi.emit("session_shutdown", { reason: "reload" });
+    const key = Symbol.for("pi-famulus.reload-handoff");
+    const slot = (globalThis as Record<symbol, { parked?: { version: string } } | undefined>)[key];
+    expect(slot?.parked).toBeTruthy();
+    slot!.parked!.version = "0.0.0-other";
+    const after = fakePi();
+    await loadExtension(after.api);
+    await after.emit("session_start", { reason: "reload" }, fakeCtx("sess-1").ctx);
+    const fileCustoms = customMessages(persisted.file);
+    try {
+      expect({
+        afterNotices: teardownNotices(after.sent),
+        fileDetails: fileCustoms.map((entry) => entry.details),
+      }).toEqual({
+        afterNotices: [],
+        fileDetails: [
+          expect.objectContaining({
+            kind: "monitor-session-end",
+            reason: "handoff-ended",
+            ids: ["mon_ver"],
+          }),
+        ],
+      });
+      expect(String(fileCustoms[0]?.content)).toContain("mon_ver");
+    } finally {
+      try {
+        await after.emit("session_shutdown", { reason: "quit" }, fakeCtx().ctx);
+      } catch {
+        // torn down by version reject
+      }
+    }
   });
 });

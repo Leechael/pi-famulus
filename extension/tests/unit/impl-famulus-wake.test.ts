@@ -7,7 +7,8 @@ import {
   formatTaskNotification,
   type TaskExitInfo,
 } from "../../src/format";
-import { formatFamulusWake, stampWakeAsOf, FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
+import { formatFamulusWake, stampWakeAsOf, wakeIds, FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
+import { onWakeMessageEnd } from "../../src/wake-delivery";
 import { registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests, visibleWidth } from "../../src/tui/pi-tui-load";
 
@@ -576,5 +577,76 @@ describe("pi-famulus-wake pill", () => {
     ).render(40) as string[];
     expect(lines.length).toBeGreaterThan(0);
     for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+  });
+});
+
+describe("monitor-session-end wake", () => {
+  const details = {
+    kind: "monitor-session-end" as const,
+    reason: "new" as const,
+    ids: ["mon_a", "mon_b"],
+    monitors: [
+      { id: "mon_a", description: "alpha logs", elapsedMs: 1500, outputPath: "/tmp/a.output" },
+      { id: "mon_b", description: "beta logs", elapsedMs: 2000, outputPath: "/tmp/b.output" },
+    ],
+  };
+
+  it("is one envelope listing every monitor id, with wakeIds and as-of injection", () => {
+    const wake = formatFamulusWake(details);
+    expect(wake.customType).toBe(FAMULUS_WAKE_CUSTOM_TYPE);
+    expect(wake.content.match(/<pi-famulus-wake /g)).toHaveLength(1);
+    expect(wake.content).toContain('kind="monitor-session-end"');
+    expect(wake.content).toContain("mon_a");
+    expect(wake.content).toContain("mon_b");
+    expect(wake.content).toContain("alpha logs");
+    expect(wake.content).toContain("while the log is retained");
+    expect(wakeIds(wake.details)).toEqual(["mon_a", "mon_b"]);
+    const idsFromMonitors = {
+      kind: "monitor-session-end",
+      ids: [] as string[],
+      monitors: [{ id: "mon_a" }, { id: "mon_b" }],
+    };
+    expect(wakeIds(idsFromMonitors)).toEqual(["mon_a", "mon_b"]);
+    const stamped = stampWakeAsOf(
+      { customType: wake.customType, content: wake.content, details: wake.details },
+      Date.UTC(2026, 9, 5, 12, 27, 26),
+    );
+    expect(stamped.content).toContain("as-of=");
+    const events: string[] = [];
+    const out = onWakeMessageEnd(
+      { role: "custom", ...stamped },
+      { now: () => Date.UTC(2026, 9, 5, 12, 27, 26) + 4000, logEvent: (type) => events.push(type) },
+    );
+    expect(events).toEqual(["wake.inject"]);
+    expect(out?.content).toContain("age-ms=\"4000\"");
+    expect(out?.details).toMatchObject({ kind: "monitor-session-end", ids: ["mon_a", "mon_b"], ageMs: 4000 });
+  });
+
+  it("renders a pill without throwing and names the stopped monitors when expanded", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerFamulusMessageRenderers({
+      registerMessageRenderer(type: string, fn: unknown) {
+        map.set(type, fn as never);
+      },
+    } as never);
+    const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text };
+    const wake = formatFamulusWake(details);
+    const collapsed = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: false, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    const expanded = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: true, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    expect(collapsed.join("")).not.toContain("undefined");
+    expect(collapsed.join("")).toContain("2 stopped");
+    expect(collapsed.join("")).toContain("new");
+    expect(expanded.join("")).toContain("mon_a");
+    expect(expanded.join("")).toContain("mon_b");
+    expect(expanded.join("")).toContain("while the log is retained");
   });
 });

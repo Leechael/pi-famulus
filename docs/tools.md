@@ -2,7 +2,7 @@
 
 What pi-famulus registers in pi, with parameters and limits. For the architecture behind it see [design.md](design.md); for the daemon CLI see [cli.md](cli.md).
 
-A **wake** is the message pi-famulus injects into the model's context when background work finishes or needs attention. It appears to the model as `<pi-famulus-wake kind="...">`. Kinds: `task`, `monitor`, `subagent-done`, `subagent-handover`, `subagent-overrun`, `supervisor-request`, `supervisor-update`. The wake is how the model learns a result without polling.
+A **wake** is the message pi-famulus injects into the model's context when background work finishes or needs attention. It appears to the model as `<pi-famulus-wake kind="...">`. Kinds: `task`, `monitor`, `monitor-session-end`, `subagent-done`, `subagent-handover`, `subagent-overrun`, `supervisor-request`, `supervisor-update`. The wake is how the model learns a result without polling. `monitor-session-end` is one passive message listing every running monitor stopped because the session was replaced or the reload handoff ended.
 
 ## Tools
 
