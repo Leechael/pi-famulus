@@ -47,10 +47,7 @@ function parent(ctx: FauxCallContext) {
   }
   if (!called(ctx, (n, a) => n === "bash" && a.command === "sleep 1")) return call("bash", { command: "sleep 1" });
   if (!called(ctx, (n) => n === "monitor")) {
-    // Avoid the Windows startup-output loss tracked in
-    // https://github.com/Leechael/pi-famulus/issues/115; the harness still
-    // requires both the real monitor output and its monitor-terminal wake.
-    return call("monitor", { command: "sleep 1; echo mon-line; sleep 30", description: "surface monitor", timeout_ms: 1500 });
+    return call("monitor", { command: "echo mon-line; sleep 30", description: "surface monitor", timeout_ms: 1500 });
   }
   if (!called(ctx, (n) => n === "subagent")) {
     return call("subagent", {
