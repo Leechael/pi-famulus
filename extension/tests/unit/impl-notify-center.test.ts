@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatMonitorEvent } from "../../src/format";
 import { NotifyCenter } from "../../src/notify";
-import type { FamulusWake } from "../../src/wake";
+import { wakeIds, type FamulusWake } from "../../src/wake";
 
 describe("NotifyCenter monitor batching", () => {
   it("coalesces busy monitor output per monitor and flushes one wake when idle", () => {
@@ -189,7 +189,11 @@ describe("NotifyCenter monitor batching", () => {
     center.settled();
     expect(sent.map((entry) => entry.message.details)).toMatchObject([
       { event: "2 events\nbefore stop\nlast line", asOf: 1_000 },
-      { status: "stopped", asOf: 1_000 },
+    ]);
+    clock.advanceBy(5_000);
+    expect(sent.map((entry) => entry.message.details)).toMatchObject([
+      { event: "2 events\nbefore stop\nlast line", asOf: 1_000 },
+      { kind: "monitor-terminal", asOf: 11_000 },
     ]);
     expect(sent.map((entry) => entry.options)).toEqual([{ triggerTurn: false }, { triggerTurn: false }]);
     expect(acknowledgedAt).toEqual([1]);
@@ -214,7 +218,6 @@ describe("NotifyCenter monitor batching", () => {
     center.notify({ customType: exit.customType, content: exit.content, details: exit.details });
     expect(sent.map((s) => s.message.details)).toMatchObject([
       { kind: "monitor", id: "mon_1", event: "noop" },
-      { kind: "monitor", id: "mon_1", status: "exited" },
     ]);
     expect(sent.every((s) => (s.options as { deliverAs?: string }).deliverAs === "steer")).toBe(true);
     // Another monitor's pending events keep waiting for the agent to settle.
@@ -315,8 +318,9 @@ describe("NotifyCenter stamps every wake with as-of", () => {
     idle = true;
     c.settled();
     expect(sent).toHaveLength(1);
-    expect(sent[0].message.details).toMatchObject({ asOf: T0 });
-    expect(sent[0].message.content).toContain('status="stopped" as-of="2026-10-05T12:27:26Z">');
+    expect(sent[0].message.details).toMatchObject({ kind: "monitor-terminal", asOf: T0 + 10_000 });
+    expect(sent[0].message.content).toContain('as-of="2026-10-05T12:27:36Z"');
+    expect(sent[0].message.content).toContain('status="stopped"');
   });
 
   it("a task batch is stamped when it is built (window flush)", () => {
@@ -341,5 +345,325 @@ describe("NotifyCenter stamps every wake with as-of", () => {
     const { sent, c } = center(() => true);
     c.notify({ customType: "something-else", content: '<pi-famulus-wake kind="x">', details: { kind: "x" } });
     expect(sent[0].message).toMatchObject({ content: '<pi-famulus-wake kind="x">', details: { kind: "x" } });
+  });
+});
+
+describe("NotifyCenter monitor terminal coalescing", () => {
+  const WINDOW_MS = 10_000;
+
+  function setup(idle: () => boolean = () => true) {
+    const clock = new ManualClock(0);
+    const sent: { message: { customType: string; content: string; details?: unknown }; options: unknown }[] = [];
+    const center = new NotifyCenter({
+      sendMessage: (message, options) => sent.push({ message, options }),
+      isIdle: idle,
+      clock,
+    });
+    const terminal = (id: string, description: string, status: "timeout" | "exited" | "stopped", event: string, opts?: { passive?: boolean; quietEvents?: boolean }) => {
+      const wake = formatMonitorEvent(description, id, event, status);
+      center.notify({ customType: wake.customType, content: wake.content, details: wake.details }, opts);
+    };
+    return { clock, sent, center, terminal };
+  }
+
+  function drainMessages(drained: unknown): Array<{ details?: unknown; content?: string }> {
+    if (Array.isArray(drained)) return drained as Array<{ details?: unknown; content?: string }>;
+    if (drained && typeof drained === "object") return [drained as { details?: unknown; content?: string }];
+    return [];
+  }
+
+  function drainKinds(drained: unknown): Array<string | undefined> {
+    return drainMessages(drained).map((message) => (message.details as { kind?: string } | undefined)?.kind);
+  }
+
+  it("t0 and t9.9s join one batch listing every invalidated monitor", () => {
+    const { clock, sent, center, terminal } = setup();
+    terminal("mon_a", "alpha", "timeout", "[Monitor timed out — re-arm if needed.]");
+    clock.advanceBy(9_900);
+    terminal("mon_b", "beta", "timeout", "[Monitor timed out — re-arm if needed.]");
+    expect(sent).toHaveLength(0);
+    clock.advanceBy(100);
+    expect(sent).toHaveLength(1);
+    const details = sent[0].message.details as FamulusWake;
+    expect(details.kind).toBe("monitor-terminal");
+    expect((details as { id?: string }).id).toBeUndefined();
+    expect(wakeIds(details)).toEqual(["mon_a", "mon_b"]);
+    expect(sent[0].message.content).toContain('kind="monitor-terminal"');
+    expect(sent[0].message.content).toMatch(/These monitors have stopped; nothing watches their sources now/);
+    expect(sent[0].message.content).toContain("alpha");
+    expect(sent[0].message.content).toContain("beta");
+    expect(sent[0].message.content).not.toMatch(/re-arm if needed/);
+    expect(sent[0].options).toEqual({ triggerTurn: true });
+    center.dispose();
+  });
+
+  it("t10.001 starts a second fixed window", () => {
+    const { clock, sent, center, terminal } = setup();
+    terminal("mon_a", "alpha", "timeout", "stopped");
+    clock.advanceBy(WINDOW_MS);
+    expect(sent).toHaveLength(1);
+    expect(wakeIds(sent[0].message.details as FamulusWake)).toEqual(["mon_a"]);
+    terminal("mon_b", "beta", "timeout", "stopped");
+    clock.advanceBy(1);
+    expect(sent).toHaveLength(1);
+    clock.advanceBy(WINDOW_MS);
+    expect(sent).toHaveLength(2);
+    expect(wakeIds(sent[1].message.details as FamulusWake)).toEqual(["mon_b"]);
+    center.dispose();
+  });
+
+  it("does not reset the window when a later same-class terminal joins", () => {
+    const { clock, sent, center, terminal } = setup();
+    terminal("mon_a", "alpha", "exited", "Monitor process exited");
+    clock.advanceBy(9_000);
+    terminal("mon_b", "beta", "exited", "Monitor process exited");
+    clock.advanceBy(1_000);
+    expect(sent).toHaveLength(1);
+    expect(wakeIds(sent[0].message.details as FamulusWake)).toEqual(["mon_a", "mon_b"]);
+    clock.advanceBy(9_000);
+    expect(sent).toHaveLength(1);
+    center.dispose();
+  });
+
+  it("joins mixed timeout/exited/stopped in one fixed window and leaves output events out", () => {
+    const { clock, sent, center, terminal } = setup();
+    terminal("mon_a", "alpha", "timeout", "timed out");
+    center.notifyMonitorEvent("alpha", "mon_a_live", "tick-1");
+    clock.advanceBy(9_900);
+    terminal("mon_b", "beta", "exited", "Monitor process exited");
+    clock.advanceBy(50);
+    terminal("mon_c", "gamma", "stopped", "Monitor stopped.", { passive: true });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].message.details).toMatchObject({ kind: "monitor", id: "mon_a_live", event: "tick-1" });
+    clock.advanceBy(50);
+    const terminals = sent.filter((entry) => (entry.message.details as { kind?: string }).kind === "monitor-terminal");
+    expect(terminals).toHaveLength(1);
+    const details = terminals[0].message.details as Extract<FamulusWake, { kind: "monitor-terminal" }>;
+    expect(wakeIds(details)).toEqual(["mon_a", "mon_b", "mon_c"]);
+    expect(details.monitors.map((monitor) => monitor.status)).toEqual(["timeout", "exited", "stopped"]);
+    expect(details.monitors.map((monitor) => monitor.detail)).toEqual([
+      "Timed out.",
+      "Monitor process exited",
+      "Monitor stopped.",
+    ]);
+    expect(terminals[0].options).toEqual({ triggerTurn: true });
+    terminal("mon_d", "delta", "timeout", "timed out");
+    clock.advanceBy(1);
+    expect(sent.filter((entry) => (entry.message.details as { kind?: string }).kind === "monitor-terminal")).toHaveLength(1);
+    clock.advanceBy(WINDOW_MS);
+    const after = sent.filter((entry) => (entry.message.details as { kind?: string }).kind === "monitor-terminal");
+    expect(after).toHaveLength(2);
+    expect(wakeIds(after[1].message.details as FamulusWake)).toEqual(["mon_d"]);
+    center.dispose();
+  });
+
+  it("flushes a monitor's own pending output before its terminal notice and leaves others pending", () => {
+    let idle = false;
+    const { clock, sent, center, terminal } = setup(() => idle);
+    center.notifyMonitorEvent("watcher", "mon_1", "noop");
+    center.notifyMonitorEvent("other", "mon_2", "still going");
+    terminal("mon_1", "watcher", "exited", "Monitor process exited (exit code 0).");
+    expect(sent.map((entry) => entry.message.details)).toMatchObject([
+      { kind: "monitor", id: "mon_1", event: "noop" },
+    ]);
+    expect(sent.every((entry) => (entry.options as { deliverAs?: string }).deliverAs === "steer")).toBe(true);
+    clock.advanceBy(WINDOW_MS);
+    expect(sent.map((entry) => entry.message.details)).toMatchObject([
+      { kind: "monitor", id: "mon_1", event: "noop" },
+      { kind: "monitor-terminal" },
+    ]);
+    expect(wakeIds(sent[1].message.details as FamulusWake)).toEqual(["mon_1"]);
+    expect(sent.some((entry) => (entry.message.details as { id?: string }).id === "mon_2")).toBe(false);
+    idle = true;
+    center.settled();
+    expect(sent.some((entry) => (entry.message.details as { id?: string }).id === "mon_2")).toBe(true);
+    center.dispose();
+  });
+
+  it("keeps caused-by-event and model-stopped notices passive after the window", () => {
+    let idle = false;
+    const { clock, sent, center, terminal } = setup(() => idle);
+    terminal("mon_1", "watcher", "exited", "Monitor process exited", { passive: true, quietEvents: true });
+    clock.advanceBy(WINDOW_MS);
+    expect(sent).toHaveLength(0);
+    idle = true;
+    center.settled();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].options).toEqual({ triggerTurn: false });
+    expect((sent[0].message.details as FamulusWake).kind).toBe("monitor-terminal");
+    center.dispose();
+  });
+
+  it("flush() releases pending terminals immediately without waiting for the window", () => {
+    const { clock, sent, center, terminal } = setup();
+    terminal("mon_a", "alpha", "timeout", "timed out");
+    clock.advanceBy(3_000);
+    terminal("mon_b", "beta", "exited", "Monitor process exited");
+    expect(sent).toHaveLength(0);
+    center.flush();
+    expect(sent).toHaveLength(1);
+    expect(wakeIds(sent[0].message.details as FamulusWake)).toEqual(["mon_a", "mon_b"]);
+    clock.advanceBy(WINDOW_MS);
+    expect(sent).toHaveLength(1);
+    center.dispose();
+  });
+
+  it("dispose flushes pending terminals instead of dropping them", () => {
+    const { sent, center, terminal } = setup();
+    terminal("mon_a", "alpha", "timeout", "timed out");
+    expect(sent).toHaveLength(0);
+    center.dispose();
+    expect(sent).toHaveLength(1);
+    expect(wakeIds(sent[0].message.details as FamulusWake)).toEqual(["mon_a"]);
+    expect(sent[0].message.content).toMatch(/<pi-famulus-wake kind="monitor-terminal"[^>]*>\s*<summary>These monitors have stopped; nothing watches their sources now\.<\/summary>/);
+  });
+
+  it("dispose delivers a busy passive terminal exactly once", () => {
+    let idle = false;
+    const { sent, center, terminal } = setup(() => idle);
+    terminal("mon_a", "alpha", "exited", "Monitor process exited", { passive: true });
+    expect(sent).toHaveLength(0);
+    center.dispose();
+    expect(sent.map((entry) => ({
+      kind: (entry.message.details as { kind?: string }).kind,
+      options: entry.options,
+    }))).toEqual([
+      { kind: "monitor-terminal", options: { triggerTurn: false } },
+    ]);
+    expect(wakeIds(sent[0].message.details as FamulusWake)).toEqual(["mon_a"]);
+    center.dispose();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("drainPendingMonitorTerminals returns the wake without sending through pi", () => {
+    const { sent, center, terminal } = setup();
+    terminal("mon_a", "alpha", "timeout", "timed out");
+    const drained = center.drainPendingMonitorTerminals();
+    expect(sent).toHaveLength(0);
+    expect(drainKinds(drained)).toEqual(["monitor-terminal"]);
+    expect(wakeIds(drainMessages(drained)[0]!.details as FamulusWake)).toEqual(["mon_a"]);
+    center.dispose();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("drainPendingMonitorTerminals returns held own output then the terminal, without sending through pi", () => {
+    let idle = false;
+    const acknowledgedAt: number[] = [];
+    const { sent, center, terminal } = setup(() => idle);
+    const onDelivered = () => acknowledgedAt.push(sent.length);
+    center.notifyMonitorEvent("quiet", "mon_q", "line-q", 0, { onDelivered });
+    terminal("mon_q", "quiet", "exited", "Monitor process exited", { passive: true, quietEvents: true });
+    terminal("mon_a", "active", "timeout", "timed out");
+    const keep = formatMonitorEvent("kept", "mon_keep", "keep-me");
+    center.notify({ customType: keep.customType, content: keep.content, details: keep.details }, { passive: true });
+    const drained = center.drainPendingMonitorTerminals();
+    expect(sent).toHaveLength(0);
+    expect(drainKinds(drained)).toEqual(["monitor", "monitor-terminal"]);
+    const messages = drainMessages(drained);
+    expect((messages[0]?.details as { id?: string }).id).toBe("mon_q");
+    expect(JSON.stringify(messages[0]?.details)).toContain("line-q");
+    expect(wakeIds(messages[1]?.details as FamulusWake)).toEqual(["mon_q", "mon_a"]);
+    expect(acknowledgedAt).toEqual([0]);
+    idle = true;
+    center.settled();
+    expect(sent.map((entry) => entry.message.details)).toMatchObject([{ kind: "monitor", id: "mon_keep" }]);
+    expect(acknowledgedAt).toEqual([0]);
+    center.dispose();
+    expect(sent).toHaveLength(1);
+    expect(acknowledgedAt).toEqual([0]);
+  });
+
+  it("file drain takes a timer-flushed busy passive terminal from held, without sending through pi", () => {
+    let idle = false;
+    const { clock, sent, center, terminal } = setup(() => idle);
+    center.notifyMonitorEvent("quiet", "mon_q", "line-q", 0, { quiet: true });
+    terminal("mon_q", "quiet", "exited", "Monitor process exited", { passive: true, quietEvents: true });
+    expect(sent).toHaveLength(0);
+    clock.advanceBy(WINDOW_MS);
+    expect(sent.filter((entry) => (entry.message.details as { kind?: string }).kind === "monitor-terminal")).toHaveLength(0);
+    const drained = center.drainPendingMonitorTerminals();
+    expect(sent.filter((entry) => (entry.message.details as { kind?: string }).kind === "monitor-terminal")).toHaveLength(0);
+    expect(drainKinds(drained)).toEqual(["monitor", "monitor-terminal"]);
+    const messages = drainMessages(drained);
+    expect((messages[0]?.details as { id?: string }).id).toBe("mon_q");
+    expect(JSON.stringify(messages[0]?.details)).toContain("line-q");
+    expect(wakeIds(messages[1]?.details as FamulusWake)).toEqual(["mon_q"]);
+    const again = center.drainPendingMonitorTerminals();
+    expect(drainKinds(again)).toEqual([]);
+    center.dispose();
+    expect(sent.filter((entry) => (entry.message.details as { kind?: string }).kind === "monitor-terminal")).toHaveLength(0);
+  });
+
+  it("file drain does not re-acknowledge output already delivered live", () => {
+    let idle = false;
+    let acknowledged = 0;
+    const { sent, center, terminal } = setup(() => idle);
+    const onDelivered = () => { acknowledged++; };
+    center.notifyMonitorEvent("live", "mon_n", "line-n", 0, { onDelivered });
+    terminal("mon_n", "live", "exited", "Monitor process exited");
+    expect(sent.map((entry) => (entry.message.details as { kind?: string }).kind)).toEqual(["monitor"]);
+    expect(acknowledged).toBe(1);
+    const drained = center.drainPendingMonitorTerminals();
+    expect(drainKinds(drained)).toEqual(["monitor-terminal"]);
+    expect(acknowledged).toBe(1);
+    center.dispose();
+    expect(acknowledged).toBe(1);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("merges a same-id exited/stopped race into one richer item", () => {
+    const { clock, sent, center, terminal } = setup();
+    terminal("mon_1", "watcher", "exited", "Monitor process exited (exit code 0).");
+    terminal("mon_1", "watcher rate-limit", "stopped", "Monitor stopped.", {
+      // second notice carries output metadata the first lacked
+    });
+    const withOutput = formatMonitorEvent("watcher", "mon_1", "Monitor stopped.", "stopped", {
+      droppedLines: 4,
+      output: { cursorStart: 0, cursorEnd: 12, suppressedCount: 2, firstObservedAt: 1, lastObservedAt: 2 },
+    });
+    center.notify({ customType: withOutput.customType, content: withOutput.content, details: withOutput.details });
+    clock.advanceBy(WINDOW_MS);
+    expect(sent).toHaveLength(1);
+    const details = sent[0].message.details as Extract<FamulusWake, { kind: "monitor-terminal" }>;
+    expect(wakeIds(details)).toEqual(["mon_1"]);
+    expect(details.monitors).toHaveLength(1);
+    expect(details.monitors[0]?.status).toBe("stopped");
+    expect(details.monitors[0]?.droppedLines).toBe(4);
+    expect(details.monitors[0]?.output?.suppressedCount).toBe(2);
+    expect(details.monitors[0]?.detail).toBe("Monitor process exited (exit code 0).");
+    center.dispose();
+  });
+
+  it("does not open a second window for a late duplicate of an already delivered id", () => {
+    const { clock, sent, center, terminal } = setup();
+    terminal("mon_1", "watcher", "exited", "Monitor process exited");
+    clock.advanceBy(WINDOW_MS);
+    expect(sent).toHaveLength(1);
+    terminal("mon_1", "watcher", "stopped", "Monitor stopped.");
+    clock.advanceBy(WINDOW_MS);
+    expect(sent).toHaveLength(1);
+    expect(wakeIds(sent[0].message.details as FamulusWake)).toEqual(["mon_1"]);
+    center.dispose();
+  });
+
+  it("drains held quiet output before a mixed terminal batch without starting an extra turn", () => {
+    let idle = false;
+    const { clock, sent, center, terminal } = setup(() => idle);
+    center.notifyMonitorEvent("quiet", "mon_q", "line-q");
+    terminal("mon_q", "quiet", "exited", "Monitor process exited", { passive: true, quietEvents: true });
+    terminal("mon_a", "active", "timeout", "timed out");
+    expect(sent).toHaveLength(0);
+    clock.advanceBy(WINDOW_MS);
+    expect(sent.map((entry) => ({
+      kind: (entry.message.details as { kind?: string }).kind,
+      options: entry.options,
+    }))).toEqual([
+      { kind: "monitor", options: { triggerTurn: false } },
+      { kind: "monitor-terminal", options: { deliverAs: "steer" } },
+    ]);
+    expect((sent[0].message.details as { id?: string }).id).toBe("mon_q");
+    expect(JSON.stringify(sent[0].message.details)).toContain("line-q");
+    expect(wakeIds(sent[1].message.details as FamulusWake)).toEqual(["mon_q", "mon_a"]);
+    center.dispose();
   });
 });

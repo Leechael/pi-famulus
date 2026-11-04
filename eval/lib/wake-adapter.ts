@@ -16,6 +16,7 @@ export { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN };
 export type WakeKind =
   | "task"
   | "monitor"
+  | "monitor-terminal"
   | "subagent-handover"
   | "subagent-done"
   | "subagent-overrun"
@@ -232,6 +233,19 @@ function fromDetails(customType: string, raw: string, leadIn: string, d: Details
     }
     case "monitor":
       return { ...w, kind: "monitor", taskIds: [String(d.id)], status: (d.status as string | undefined) ?? "event", body: String(d.event ?? "") };
+    case "monitor-terminal": {
+      const monitors = ((d.monitors as Array<Record<string, unknown>>) ?? []);
+      const ids = ((d.ids as unknown[] | undefined) ?? []).map(String).filter(Boolean);
+      const taskIds = ids.length > 0 ? ids : monitors.map((monitor) => String(monitor.id));
+      const statuses = [...new Set(monitors.map((monitor) => String(monitor.status ?? "")))].filter(Boolean);
+      return {
+        ...w,
+        kind: "monitor-terminal",
+        taskIds,
+        status: statuses.length === 1 ? statuses[0] : statuses.join(","),
+        body: String(d.summary ?? monitors.map((monitor) => monitor.detail).join("\n")),
+      };
+    }
     case "subagent-handover":
       return {
         ...w,
@@ -303,6 +317,17 @@ function fromXml(customType: string, raw: string, leadIn: string): Wake {
     }
     case "monitor":
       return { ...w, kind: "monitor", taskIds: a.id ? [a.id] : [], status: a.status ?? "event", body: child(inner, "event") ?? "" };
+    case "monitor-terminal": {
+      const monitors = elements(inner, "monitor");
+      const statuses = [...new Set(monitors.map((monitor) => monitor.attrs.status ?? ""))].filter(Boolean);
+      return {
+        ...w,
+        kind: "monitor-terminal",
+        taskIds: monitors.map((monitor) => monitor.attrs.id ?? "").filter(Boolean),
+        status: statuses.length === 1 ? statuses[0] : statuses.join(","),
+        body: child(inner, "summary") ?? monitors.map((monitor) => monitor.inner).join("\n"),
+      };
+    }
     case "subagent-handover":
       return { ...w, kind: "subagent-handover", runId: a["run-id"], childId: a["child-id"], childName: a.name, status: a.status, stillRunning: stillRunningXml(inner), body: child(inner, "result") ?? "" };
     case "subagent-done": {

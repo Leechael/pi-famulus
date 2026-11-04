@@ -286,14 +286,14 @@ export function fakeHostPi() {
   return { api: api as unknown as ExtensionAPI, sent, emit, tool };
 }
 
-export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: () => boolean; mode?: string } = {}) {
+export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: () => boolean; mode?: string; sessionFile?: string } = {}) {
   return {
     cwd,
     hasUI: false,
     mode: options.mode ?? "rpc",
     ui: { notify: () => {}, setWidget: () => {} },
     isIdle: options.idle ?? (() => true),
-    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined },
+    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => options.sessionFile },
     modelRegistry: null,
     scopedModels: [],
     isProjectTrusted: () => false,
@@ -309,9 +309,9 @@ export function fakeHostCtx(sessionId: string, cwd: string, options: { idle?: ()
  * inside the first test's 5s timeout. Imported at collection time, the
  * dynamic import below is a cache hit.
  */
-export async function startHostedExtension(opts: { sessionId: string; cwd: string; idle?: () => boolean; reason?: string; mode?: string }) {
+export async function startHostedExtension(opts: { sessionId: string; cwd: string; idle?: () => boolean; reason?: string; mode?: string; sessionFile?: string }) {
   const pi = fakeHostPi();
-  const ctx = fakeHostCtx(opts.sessionId, opts.cwd, { idle: opts.idle, mode: opts.mode });
+  const ctx = fakeHostCtx(opts.sessionId, opts.cwd, { idle: opts.idle, mode: opts.mode, sessionFile: opts.sessionFile });
   const { default: extension } = await import("../../src/index");
   extension(pi.api);
   await pi.emit("session_start", { reason: opts.reason ?? "startup" }, ctx);

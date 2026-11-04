@@ -118,3 +118,82 @@ describe("task_list scope", () => {
     expect(schema).toMatch(/finished/i);
   });
 });
+
+describe("task_list monitor timeout and last output", () => {
+  function fakeClient(): ManagerClient {
+    return {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      list: async () => [],
+    } as unknown as ManagerClient;
+  }
+
+  async function listText(opts: {
+    now: number;
+    items: Parameters<WorkIndex["upsert"]>[0][];
+    live?: { taskId: string; remainingMs: number | null; persistent: boolean; lastOutputAt?: number }[];
+  }): Promise<string> {
+    const clock = new ManualClock(opts.now);
+    const index = new WorkIndex({ clock });
+    for (const item of opts.items) index.upsert(item);
+    const tool = createTaskListTool({
+      getClient: fakeClient,
+      getIndex: () => index,
+      clock,
+      getMonitorLive: () => opts.live ?? [],
+    });
+    const res = await tool.execute("t", {}, undefined as never, undefined as never, {} as never);
+    return (res.content[0] as { text: string }).text;
+  }
+
+  it("shows remaining timeout and last output on a timed monitor, not on shell or subagent rows", async () => {
+    const text = await listText({
+      now: 10_000,
+      items: [
+        { id: "mon_1", kind: "monitor", status: "running", title: "watch logs", startedAt: 0, countsAsWorker: false },
+        { id: "sh_1", kind: "shell", status: "running", title: "npm test", startedAt: 0, countsAsWorker: true },
+        { id: "ch_1", kind: "agent", status: "running", title: "review", startedAt: 0, countsAsWorker: false },
+      ],
+      live: [{ taskId: "mon_1", remainingMs: 90_000, persistent: false, lastOutputAt: 7_000 }],
+    });
+    expect(text).toMatch(/mon_1 \[monitor\] running \(10s\) "watch logs".*timeout in 1m30s/);
+    expect(text).toMatch(/mon_1 \[monitor\].*last output 3s ago/);
+    expect(text).toMatch(/sh_1 \[shell\] running \(10s\) "npm test"/);
+    expect(text).not.toMatch(/sh_1.*timeout|sh_1.*last output|sh_1.*persistent/);
+    expect(text).toMatch(/ch_1 \[agent\] running \(10s\) "review"/);
+    expect(text).not.toMatch(/ch_1.*timeout|ch_1.*last output|ch_1.*persistent/);
+  });
+
+  it("shows persistent and no output yet for a monitor that has not printed", async () => {
+    const text = await listText({
+      now: 5_000,
+      items: [
+        { id: "mon_p", kind: "monitor", status: "running", title: "forever", startedAt: 0, countsAsWorker: false },
+      ],
+      live: [{ taskId: "mon_p", remainingMs: null, persistent: true }],
+    });
+    expect(text).toMatch(/mon_p \[monitor\] running \(5s\) "forever".*persistent/);
+    expect(text).toMatch(/mon_p \[monitor\].*no output yet/);
+    expect(text).not.toMatch(/timeout in/);
+  });
+
+  it("treats repeated deduped output as recent and omits last output when none arrived", async () => {
+    const recent = await listText({
+      now: 10_000,
+      items: [
+        { id: "mon_1", kind: "monitor", status: "running", title: "watch", startedAt: 0, countsAsWorker: false },
+      ],
+      live: [{ taskId: "mon_1", remainingMs: null, persistent: true, lastOutputAt: 9_000 }],
+    });
+    expect(recent).toMatch(/mon_1 \[monitor\].*last output 1s ago/);
+    const none = await listText({
+      now: 10_000,
+      items: [
+        { id: "mon_1", kind: "monitor", status: "running", title: "watch", startedAt: 0, countsAsWorker: false },
+      ],
+      live: [{ taskId: "mon_1", remainingMs: null, persistent: true }],
+    });
+    expect(none).toMatch(/mon_1 \[monitor\].*no output yet/);
+    expect(none).not.toMatch(/last output/);
+  });
+});

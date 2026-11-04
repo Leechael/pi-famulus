@@ -134,6 +134,7 @@ describe("wakes", () => {
       end_reason: "shell-start-failed",
     });
     center.settled();
+    clock.advanceBy(10_000);
     expect(sent.map((m) => m.content).join("\n")).toMatch(/Windows runtime startup failure[\s\S]*may have partially run/);
   });
 });

@@ -128,6 +128,7 @@ describe("faux e2e", { concurrency: true }, () => {
     const ep = await runFaux({
       script: "monitor-timeout.ts",
       until: (items) => wakes(items).some((w) => w.wake.status === "timeout"),
+      untilTimeoutMs: 30_000,
       quietMs: 2000,
     });
     episodes.push(ep);
@@ -137,16 +138,17 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match(taskId, /^mon_[0-9a-f]{8}$/);
 
     const ws = wakes(ep.items);
-    assert.ok(ws.every((w) => w.wake.customType === "pi-famulus-wake" && w.wake.kind === "monitor"), explain(ep));
-    assert.ok(ws.every((w) => w.wake.taskIds[0] === taskId), explain(ep));
-    const events = ws.filter((w) => w.wake.status === "event");
+    assert.ok(ws.every((w) => w.wake.customType === "pi-famulus-wake" && (w.wake.kind === "monitor" || w.wake.kind === "monitor-terminal")), explain(ep));
+    assert.ok(ws.every((w) => w.wake.taskIds.includes(taskId)), explain(ep));
+    const events = ws.filter((w) => w.wake.kind === "monitor" && w.wake.status === "event");
     const timeouts = ws.filter((w) => w.wake.status === "timeout");
     assert.ok(events.length >= 1, `no monitor events\n${explain(ep)}`);
     // All lines delivered, in order, across however many batches.
     const lines = events.flatMap((w) => w.wake.body.split("\n")).filter(Boolean);
     assert.deepEqual(lines, ["tick-1", "tick-2", "tick-3"], explain(ep));
     assert.equal(timeouts.length, 1, `expected one timeout notice\n${explain(ep)}`);
-    assert.match(timeouts[0].wake.body, /Monitor timed out — re-arm if needed/);
+    assert.equal(timeouts[0].wake.kind, "monitor-terminal");
+    assert.match(timeouts[0].wake.body, /These monitors have stopped; nothing watches their sources now/);
     assert.ok(events.every((w) => w.seq < timeouts[0].seq), "event after timeout");
     // Killed by the timeout: no separate "exited" notice.
     assert.equal(ws.filter((w) => w.wake.status === "exited").length, 0, explain(ep));
@@ -264,8 +266,8 @@ describe("faux e2e", { concurrency: true }, () => {
       },
       until: (items) =>
         wakes(items).some((w) => w.wake.kind === "task") &&
-        wakes(items).some((w) => w.wake.kind === "monitor" && w.wake.status === "exited"),
-      untilTimeoutMs: 25_000,
+        wakes(items).some((w) => w.wake.status === "exited"),
+      untilTimeoutMs: 40_000,
       quietMs: 1500,
     });
     episodes.push(ep);
@@ -289,7 +291,7 @@ describe("faux e2e", { concurrency: true }, () => {
     // Every monitor line once, in order, across the upgrade.
     const monitorResult = toolResults(ep.items).find((r) => r.toolName === "monitor");
     const monId = String(monitorResult?.details?.task_id);
-    const monWakes = wakes(ep.items).filter((w) => w.wake.kind === "monitor" && w.wake.taskIds[0] === monId);
+    const monWakes = wakes(ep.items).filter((w) => (w.wake.kind === "monitor" || w.wake.kind === "monitor-terminal") && w.wake.taskIds.includes(monId));
     const lines = monWakes.filter((w) => w.wake.status === "event").flatMap((w) => w.wake.body.split("\n")).filter(Boolean);
     const detail = monWakes.map((w) => `${w.seq} ${w.wake.status} ${JSON.stringify(w.wake.body)}`).join("\n");
     assert.deepEqual(lines, Array.from({ length: 30 }, (_, i) => `m-${i + 1}`), `${detail}\n${explain(ep)}`);
@@ -353,6 +355,7 @@ describe("faux e2e", { concurrency: true }, () => {
     const ep = await runFaux({
       script: "monitor-busy-exit.ts",
       until: (items) => wakes(items).some((w) => w.wake.status === "exited"),
+      untilTimeoutMs: 25_000,
       quietMs: 1500,
     });
     episodes.push(ep);

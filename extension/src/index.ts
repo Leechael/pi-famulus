@@ -15,7 +15,7 @@ import { statSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { resolveAgent as resolveAgentDef } from "./agents/definition";
 import { createAgentLoader, type AgentLoader } from "./agents/loader";
 import { createBashOverride } from "./bash-override";
@@ -26,12 +26,12 @@ import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
 import { ensureNativeManagerInstalled } from "./native-manager.js";
-import type { TaskExitInfo } from "./format";
+import { formatDuration, type TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { registerIntercom } from "./intercom/intercom";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
-import { NotifyCenter } from "./notify";
+import { attachCompactRecovery, NotifyCenter } from "./notify";
 import { onWakeMessageEnd, registryStatusLookup } from "./wake-delivery";
 import { ChildShellTracker, createOverrunNotifier } from "./subagent/overrun";
 import {
@@ -62,7 +62,7 @@ import { registerFamulusCommand } from "./tui/famulus-command";
 import { registerFamulusMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
 import { stderrPathFor } from "./tui/task-output-paths";
-import { shellWakeTitle } from "./wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, formatFamulusWake, shellWakeTitle, stampWakeAsOf, wakeIds } from "./wake";
 
 async function promptIfHostedSession(
   c: ManagerClient,
@@ -384,7 +384,35 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
    * daemon already ended as manager-shutdown / manager-crash.
    * A hosted child that is still warm is left for resume.
    */
-  const recoverCrashedSession = async (sessionId: string): Promise<void> => {
+  const collectNoticedMonitorIds = (file: string | undefined): Set<string> => {
+    const ids = new Set<string>();
+    if (!file) return ids;
+    try {
+      for (const entry of SessionManager.open(file).getEntries()) {
+        if (entry.type !== "custom_message") continue;
+        const custom = entry as { customType?: string; details?: unknown };
+        if (custom.customType !== FAMULUS_WAKE_CUSTOM_TYPE) continue;
+        const details = custom.details as
+          | { kind?: string; ids?: unknown; monitors?: unknown; tasks?: unknown }
+          | undefined;
+        if (!details || typeof details !== "object") continue;
+        if (details.kind === "monitor-session-end") {
+          for (const id of wakeIds(details)) ids.add(id);
+        } else if (details.kind === "session-recovery") {
+          if (Array.isArray(details.monitors)) {
+            for (const id of details.monitors) if (typeof id === "string") ids.add(id);
+          }
+          if (Array.isArray(details.tasks)) {
+            for (const id of details.tasks) if (typeof id === "string") ids.add(id);
+          }
+        }
+      }
+    } catch {
+      return ids;
+    }
+    return ids;
+  };
+  const recoverCrashedSession = async (sessionId: string, sessionFile?: string): Promise<void> => {
     if (!recoverPreviousProcess || !sessionId || recoveredSessions.has(sessionId)) return;
     const manager = client;
     const center = notifyCenter;
@@ -399,14 +427,20 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         if (!recoverPreviousProcess || client !== manager || notifyCenter !== center) return;
         killed = tasks.filter((task) => {
           if (task.session_id && task.session_id !== sessionId) return false;
-          if (task.kind !== "shell") return false;
-          return task.end_reason === "manager-shutdown" || task.end_reason === "manager-crash";
+          if (task.kind === "shell") {
+            return task.end_reason === "manager-shutdown" || task.end_reason === "manager-crash";
+          }
+          if (task.kind === "monitor") return task.end_reason === "session-end";
+          return false;
         });
       } catch {
         killed = [];
       }
     }
-    if (interrupted.length === 0 && killed.length === 0) {
+    const noticed = collectNoticedMonitorIds(sessionFile ?? noticeSessionFile);
+    const monitors = killed.filter((task) => task.kind === "monitor" && !noticed.has(task.task_id));
+    const shells = killed.filter((task) => task.kind === "shell");
+    if (interrupted.length === 0 && shells.length === 0 && monitors.length === 0) {
       recoveredSessions.delete(sessionId);
       return;
     }
@@ -418,16 +452,20 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     for (const rec of interrupted) {
       lines.push(`Interrupted subagent ${rec.child_id} (${rec.name}).`);
     }
-    for (const task of killed) {
+    for (const task of shells) {
       lines.push(`Command ${task.task_id} ended while the session was gone (${task.end_reason ?? task.status}).`);
     }
+    for (const task of monitors) {
+      lines.push(`Monitor ${task.task_id} ended when the session ended (${task.end_reason ?? task.status}).`);
+    }
     center?.notify({
-      customType: "pi-famulus-wake",
+      customType: FAMULUS_WAKE_CUSTOM_TYPE,
       content: lines.join("\n"),
       details: {
         kind: "session-recovery",
         children: interrupted.map((rec) => rec.child_id),
-        tasks: killed.map((task) => task.task_id),
+        tasks: shells.map((task) => task.task_id),
+        monitors: monitors.map((task) => task.task_id),
       },
     });
   };
@@ -593,8 +631,23 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     afterStop: () => void syncWithManager(),
   });
 
+  const compactRecovery = attachCompactRecovery(pi, {
+    getCenter: () => notifyCenter,
+    getCtx: () => ctx,
+    listRunningMonitors: () =>
+      (monitorRegistry?.listActive() ?? []).map((mon) => ({
+        id: mon.taskId,
+        description: mon.description,
+        remaining: mon.persistent ? "persistent" : `${formatDuration(mon.remainingMs ?? 0)} remaining`,
+      })),
+  });
+
   pi.registerTool(createBashOverride(deps));
-  pi.registerTool(createTaskListTool({ ...deps, getIndex: () => workIndex }));
+  pi.registerTool(createTaskListTool({
+    ...deps,
+    getIndex: () => workIndex,
+    getMonitorLive: () => monitorRegistry?.listActive() ?? [],
+  }));
   pi.registerTool(createTaskOutputTool({ ...deps, getIndex: () => workIndex }));
   pi.registerTool(
     createTaskStopTool({
@@ -733,6 +786,90 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
 
   /** Session whose runtime a /reload parked; the reloaded instance's session_start resumes it. */
   let parkedSessionId: string | null = null;
+  /** Old session identity for teardown notices after detach / attach. */
+  let noticeSessionId: string | undefined;
+  let noticeSessionFile: string | undefined;
+  const MONITOR_TEARDOWN_SEND_TIMEOUT_MS = 2_000;
+  type MonitorTeardownReason = "new" | "resumed" | "forked" | "handoff-ended" | "session-mismatch";
+  const mappedTeardownReason = (reason: string | undefined): MonitorTeardownReason | null => {
+    if (reason === "new") return "new";
+    if (reason === "resume") return "resumed";
+    if (reason === "fork") return "forked";
+    if (reason === "session-mismatch") return "session-mismatch";
+    return null;
+  };
+  const emitMonitorTeardownNotice = async (mapped: MonitorTeardownReason, dest: "live" | "file"): Promise<void> => {
+    const noticed = collectNoticedMonitorIds(noticeSessionFile);
+    const active = (monitorRegistry?.listActive() ?? []).filter((mon) => !noticed.has(mon.taskId));
+    if (active.length === 0) return;
+    const now = clock.now();
+    const sid = noticeSessionId ?? ctx?.sessionManager.getSessionId() ?? "";
+    const monitors = active.map((mon) => ({
+      id: mon.taskId,
+      description: mon.description,
+      elapsedMs: Math.max(0, now - mon.startedAt),
+      outputPath: workIndex.get(mon.taskId)?.outputPath || taskOutputPath(home, sid, mon.taskId),
+    }));
+    const formatted = formatFamulusWake({
+      kind: "monitor-session-end",
+      reason: mapped,
+      ids: monitors.map((monitor) => monitor.id),
+      monitors,
+    });
+    const message = stampWakeAsOf(
+      { customType: formatted.customType, content: formatted.content, details: formatted.details, display: true },
+      now,
+    );
+    if (dest === "live") {
+      let timeout: unknown = null;
+      try {
+        await Promise.race([
+          Promise.resolve(pi.sendMessage(
+            { customType: message.customType, content: message.content, display: true, details: message.details },
+            { triggerTurn: false },
+          )),
+          new Promise<never>((_resolve, reject) => {
+            timeout = clock.setTimeout(() => reject(new Error("live send timed out")), MONITOR_TEARDOWN_SEND_TIMEOUT_MS);
+            if (timeout) clock.unref?.(timeout);
+          }),
+        ]);
+      } catch (error) {
+        logEvent("monitor.teardown-fallback", {
+          reason: mapped,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        appendWakeToOldSessionFile(message);
+      } finally {
+        if (timeout !== null) clock.clearTimeout(timeout);
+      }
+      return;
+    }
+    appendWakeToOldSessionFile(message);
+  };
+  const appendWakeToOldSessionFile = (message: { content: string; details?: unknown }): void => {
+    const file = noticeSessionFile;
+    if (!file) return;
+    try {
+      SessionManager.open(file).appendCustomMessageEntry(FAMULUS_WAKE_CUSTOM_TYPE, message.content, true, message.details);
+    } catch {
+      // Missing or unreadable session file: teardown still proceeds.
+    }
+  };
+  const deliverPendingMonitorTerminals = (dest: "live" | "file"): void => {
+    const center = notifyCenter;
+    if (!center) return;
+    if (dest === "live") {
+      center.flush();
+      return;
+    }
+    const messages = center.drainPendingMonitorTerminals();
+    for (const message of messages) {
+      appendWakeToOldSessionFile(stampWakeAsOf(
+        { customType: message.customType, content: message.content, details: message.details, display: true },
+        clock.now(),
+      ));
+    }
+  };
   const startFleetWidget = (startCtx: ExtensionContext) => {
     if (!startCtx.hasUI) return;
     fleetWidget = new FleetWidget({
@@ -745,6 +882,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
 
   pi.on("session_start", async (event, startCtx) => {
     recoverPreviousProcess = event.reason !== "reload";
+    const startFile = startCtx.sessionManager.getSessionFile?.();
     if (parkedSessionId !== null) {
       const resumed = event.reason === "reload" && startCtx.sessionManager.getSessionId() === parkedSessionId;
       parkedSessionId = null;
@@ -752,16 +890,20 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         // Same session after /reload: the client, registry and monitors kept
         // running; only the context and the UI belong to the new instance.
         ctx = startCtx;
+        noticeSessionId = startCtx.sessionManager.getSessionId();
+        noticeSessionFile = startFile;
         binding.ready();
         startFleetWidget(startCtx);
         void syncWithManager();
         return;
       }
       binding.discardQueued();
-      await teardown();
+      await teardown({ reason: "session-mismatch", dest: "file" });
     }
     await retiring;
     ctx = startCtx;
+    noticeSessionId = startCtx.sessionManager.getSessionId();
+    noticeSessionFile = startFile;
     binding.ready();
     notifyCenter?.dispose();
     notifyCenter = new NotifyCenter({
@@ -1178,7 +1320,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     });
     startFleetWidget(startCtx);
     if (client?.isAvailable()) {
-      await recoverCrashedSession(startCtx.sessionManager.getSessionId());
+      await recoverCrashedSession(startCtx.sessionManager.getSessionId(), startCtx.sessionManager.getSessionFile?.());
     }
 
     // Connect in the background: a cold manager spawn must not stall the
@@ -1201,7 +1343,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
           const sid = startCtx.sessionManager.getSessionId();
           void promptIfHostedSession(c, () => ctx, { sessionFile: file, sessionId: sid }, "start").catch(() => {});
           void syncWithManager();
-          void recoverCrashedSession(sid);
+          void recoverCrashedSession(sid, file);
           return;
         }
         // A /reload may have replaced startCtx by now; report to the live one.
@@ -1221,7 +1363,10 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       .catch(() => {});
   });
 
-  const teardown = async (): Promise<void> => {
+  const teardown = async (notice?: { reason: MonitorTeardownReason; dest: "live" | "file" }): Promise<void> => {
+    if (notice) await emitMonitorTeardownNotice(notice.reason, notice.dest);
+    compactRecovery.dispose();
+    deliverPendingMonitorTerminals(notice?.dest ?? "live");
     exitWatchdog.dispose();
     fleetWidget?.dispose();
     fleetWidget = null;
@@ -1270,11 +1415,17 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       // Keep the session's shells, monitors and subagents running; the
       // reloaded instance adopts this runtime.
       parkedSessionId = ctx.sessionManager.getSessionId();
+      noticeSessionId = parkedSessionId;
+      noticeSessionFile = ctx.sessionManager.getSessionFile?.();
       fleetWidget?.dispose();
       fleetWidget = null;
       ctx = null;
       binding.detach();
-      parkRuntime({ version: EXTENSION_VERSION, runtime, dispose: teardown });
+      parkRuntime({
+        version: EXTENSION_VERSION,
+        runtime,
+        dispose: () => teardown({ reason: "handoff-ended", dest: "file" }),
+      });
       return;
     }
     if (String((ctx as { mode?: string } | null)?.mode) === "print") {
@@ -1285,7 +1436,8 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
       const warning = printModeDropWarning([...new Set(ids)]);
       if (warning) process.stderr.write(warning);
     }
-    await teardown();
+    const mapped = mappedTeardownReason(typeof event.reason === "string" ? event.reason : undefined);
+    await teardown(mapped ? { reason: mapped, dest: "live" } : undefined);
   });
 
   pi.on("agent_settled", async () => {

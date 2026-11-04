@@ -218,6 +218,49 @@ export function formatMonitorEvent(
   });
 }
 
+/** One short still-running list after compaction (id, description, remaining). */
+export function formatRunningMonitorList(
+  items: { id: string; description: string; remaining: string }[],
+): FormattedWake {
+  return formatFamulusWake({ kind: "running-monitors", monitors: items });
+}
+
+export const MONITOR_UNWATCHED_SUMMARY =
+  "These monitors have stopped; nothing watches their sources now.";
+
+export type MonitorTerminalStatus = "timeout" | "exited" | "stopped";
+
+export interface MonitorTerminalInfo {
+  id: string;
+  description: string;
+  status: MonitorTerminalStatus;
+  event?: string;
+  droppedLines?: number;
+  output?: MonitorOutputInfo;
+}
+
+function terminalDetail(info: MonitorTerminalInfo): string {
+  if (info.status === "timeout") return "Timed out.";
+  return info.event ?? "";
+}
+
+/** One <pi-famulus-wake kind="monitor-terminal"> listing every monitor in the window. */
+export function formatMonitorTerminal(monitors: MonitorTerminalInfo[]): FormattedWake {
+  return formatFamulusWake({
+    kind: "monitor-terminal",
+    ids: monitors.map((monitor) => monitor.id),
+    summary: MONITOR_UNWATCHED_SUMMARY,
+    monitors: monitors.map((monitor) => ({
+      id: monitor.id,
+      description: monitor.description,
+      status: monitor.status,
+      detail: terminalDetail(monitor),
+      ...(monitor.droppedLines ? { droppedLines: monitor.droppedLines } : {}),
+      ...(monitor.output ? { output: monitor.output } : {}),
+    })),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // M3: subagent run completion notification (design doc §4.6)
 // ---------------------------------------------------------------------------

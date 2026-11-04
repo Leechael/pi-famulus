@@ -1,6 +1,19 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMonitorTool, MonitorRegistry } from "../../src/monitor";
 import { WorkIndex } from "../../src/work-index";
+
+const repoRoot = join(import.meta.dirname, "..", "..", "..");
+
+function emptyRegistry() {
+  return new MonitorRegistry({
+    getClient: () => null,
+    sessionEnv: () => ({}),
+    getNotifyCenter: () => null,
+    trackTask: () => {},
+  });
+}
 
 describe("monitor tool result rendering", () => {
   it("renders failed tool results as failures and avoids key-hint glyphs", () => {
@@ -124,5 +137,81 @@ describe("monitor transcript row status", () => {
     const index = new WorkIndex();
     index.upsert({ id: "mon_1", kind: "monitor", status: "running", title: "ready", startedAt: 0, countsAsWorker: false });
     expect(render(() => index)).toContain("●");
+  });
+});
+
+describe("monitor lifecycle guidance", () => {
+  const expiry =
+    /Expiry ends the monitor; nothing watches the source afterwards, and the timeout notice can arrive late while you are busy/;
+  const sampling =
+    /Sampling windows must not overlap and must not leave gaps \(window = interval\), or keep a cursor\/last-seen state in the script and report only new items/;
+  const stagger = /If you use timeouts for several monitors, stagger them/;
+
+  it("description carries lifecycle once and keeps required behavior", () => {
+    const description = createMonitorTool(emptyRegistry()).description;
+    expect(description).toMatch(/timeout_ms defaults to 5 minutes \(max 1 hour\)/);
+    expect(description).toMatch(expiry);
+    expect(description).toMatch(/persistent:true for long monitoring/);
+    expect(description).toMatch(stagger);
+    expect(description).toMatch(/Prefer `tail -F` \/ `journalctl -f` over polling/);
+    expect(description).toMatch(/edge-triggered/);
+    expect(description).toMatch(/normally zero output, one line only for a new problem signature/);
+    expect(description).toMatch(/one recovery line/);
+    expect(description).toMatch(sampling);
+    expect(description).toMatch(/do not print a heartbeat on every check/);
+    expect(description).toMatch(/keep running/);
+    expect(description).toMatch(/Silence is not success/);
+    expect(description).toMatch(/Do not poll/);
+    expect(description).toMatch(/simply wait for the next notification/);
+    expect(description).not.toMatch(/expiry is a silent event/);
+    expect(description).not.toMatch(/liveness belongs/);
+    expect(description).not.toMatch(/same instant/);
+    expect(description).not.toMatch(/self-heartbeats/);
+  });
+
+  it("rules only add the short persistent hint", () => {
+    const guidelines = createMonitorTool(emptyRegistry()).promptGuidelines ?? [];
+    const rules = guidelines.join("\n");
+    expect(guidelines.at(-1)).toBe("Use persistent:true for long monitoring.");
+    expect(guidelines).toHaveLength(4);
+    expect(rules).toMatch(/Use the monitor tool to watch for conditions/);
+    expect(rules).toMatch(/<pi-famulus-wake kind="monitor">/);
+    expect(rules).not.toMatch(expiry);
+    expect(rules).not.toMatch(stagger);
+    expect(rules).not.toMatch(/edge-triggered/);
+    expect(rules).not.toMatch(sampling);
+    expect(rules).not.toMatch(/liveness belongs/);
+    expect(rules).not.toMatch(/expiry is a silent event/);
+  });
+
+  it("params carry timeout bounds and persistent long-monitoring only", () => {
+    const params = JSON.parse(JSON.stringify(createMonitorTool(emptyRegistry()).parameters)) as {
+      properties: { timeout_ms: { description: string }; persistent: { description: string } };
+    };
+    expect(params.properties.timeout_ms.description).toMatch(/5 minutes/);
+    expect(params.properties.timeout_ms.description).toMatch(/1 hour/);
+    expect(params.properties.timeout_ms.description).toMatch(/default/);
+    expect(params.properties.timeout_ms.description).not.toMatch(/silent event/);
+    expect(params.properties.timeout_ms.description).not.toMatch(/Expiry ends/);
+    expect(params.properties.persistent.description).toMatch(/persistent:true for long monitoring/);
+  });
+
+  it("docs\/tools.md and README carry the same monitor lifecycle guidance", () => {
+    const tools = readFileSync(join(repoRoot, "docs", "tools.md"), "utf8");
+    const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
+    expect(tools).toMatch(/Exit and timeout produce notifications/);
+    for (const text of [tools, readme]) {
+      expect(text).toMatch(/5 minutes/);
+      expect(text).toMatch(/1 hour/);
+      expect(text).toMatch(expiry);
+      expect(text).toMatch(/persistent:true/);
+      expect(text).toMatch(stagger);
+      expect(text).toMatch(/journalctl -f/);
+      expect(text).toMatch(/edge-triggered/);
+      expect(text).toMatch(sampling);
+      expect(text).not.toMatch(/expiry is a silent event/);
+      expect(text).not.toMatch(/liveness belongs/);
+      expect(text).not.toMatch(/same instant/);
+    }
   });
 });

@@ -117,6 +117,17 @@ function collapsedText(details: FamulusWake, theme: Theme): string {
       ].join("\n");
     case "supervisor-update":
       return `${theme.fg("muted", "↑")} ${theme.fg("muted", "supervisor update")} ${details.message.slice(0, 100)}`;
+    case "monitor-session-end": {
+      const n = details.ids.length || details.monitors.length;
+      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "session monitors")} ${n} stopped · ${details.reason}`;
+    }
+    case "running-monitors":
+      return `${theme.fg("accent", "›")} ${theme.fg("muted", "running")} ${details.monitors.length} monitor${details.monitors.length === 1 ? "" : "s"}`;
+    case "monitor-terminal": {
+      const n = details.ids.length || details.monitors.length;
+      const statuses = countStatuses(details.monitors.map((monitor) => monitor.status));
+      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "monitors")} ${n} stopped · ${statuses}`;
+    }
   }
 }
 
@@ -195,6 +206,25 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
       return [`Decision requested by ${details.name} (${details.from})`, `Request: ${details.message}`, `Reply with /reply ${details.from} <decision>`].join("\n");
     case "supervisor-update":
       return [`Update from ${details.name} (${details.from})`, details.message].join("\n");
+    case "monitor-session-end":
+      return [
+        `Session monitors stopped (${details.reason}). They are no longer watched.`,
+        ...details.monitors.map((monitor) =>
+          `${monitor.id} "${monitor.description}" elapsed ${formatDuration(monitor.elapsedMs)}; original output: task_output({task_id: "${monitor.id}"}) ${monitor.outputPath} while the log is retained`,
+        ),
+      ].join("\n");
+    case "running-monitors":
+      return [
+        `Still running after compaction (${details.monitors.length})`,
+        ...details.monitors.map((monitor) => `${monitor.id} — ${monitor.description} — ${monitor.remaining}`),
+      ].join("\n");
+    case "monitor-terminal":
+      return [
+        details.summary,
+        ...details.monitors.map((monitor) =>
+          `${monitor.id} "${monitor.description}" · ${monitor.status}${monitor.detail ? `: ${monitor.detail}` : ""}`,
+        ),
+      ].join("\n");
   }
 }
 

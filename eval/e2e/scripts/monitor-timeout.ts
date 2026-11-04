@@ -12,6 +12,6 @@ const script: FauxScript = {
     say("Monitor armed; waiting for events."),
   ],
   // Every wake (event batch or timeout) gets a turn; echo what woke us.
-  fallback: (ctx) => say(`WOKE: ${lastInputText(ctx).includes("timed out") ? "timeout" : "event"}`),
+  fallback: (ctx) => say(`WOKE: ${/timed out|have stopped|kind="monitor-terminal"/.test(lastInputText(ctx)) ? "timeout" : "event"}`),
 };
 export default script;

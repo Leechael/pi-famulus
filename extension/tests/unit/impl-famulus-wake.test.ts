@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import { formatSupervisorRequest } from "../../src/comms/comms";
 import {
   formatMonitorEvent,
+  formatMonitorTerminal,
   formatSubagentHandover,
   formatSubagentNotification,
   formatTaskNotification,
+  MONITOR_UNWATCHED_SUMMARY,
   type TaskExitInfo,
 } from "../../src/format";
-import { formatFamulusWake, stampWakeAsOf, FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
+import { formatFamulusWake, stampWakeAsOf, wakeIds, FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../src/wake";
+import { onWakeMessageEnd } from "../../src/wake-delivery";
 import { registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests, visibleWidth } from "../../src/tui/pi-tui-load";
 
@@ -576,5 +579,176 @@ describe("pi-famulus-wake pill", () => {
     ).render(40) as string[];
     expect(lines.length).toBeGreaterThan(0);
     for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+  });
+});
+
+describe("monitor-session-end wake", () => {
+  const details = {
+    kind: "monitor-session-end" as const,
+    reason: "new" as const,
+    ids: ["mon_a", "mon_b"],
+    monitors: [
+      { id: "mon_a", description: "alpha logs", elapsedMs: 1500, outputPath: "/tmp/a.output" },
+      { id: "mon_b", description: "beta logs", elapsedMs: 2000, outputPath: "/tmp/b.output" },
+    ],
+  };
+
+  it("is one envelope listing every monitor id, with wakeIds and as-of injection", () => {
+    const wake = formatFamulusWake(details);
+    expect(wake.customType).toBe(FAMULUS_WAKE_CUSTOM_TYPE);
+    expect(wake.content.match(/<pi-famulus-wake /g)).toHaveLength(1);
+    expect(wake.content).toContain('kind="monitor-session-end"');
+    expect(wake.content).toContain("mon_a");
+    expect(wake.content).toContain("mon_b");
+    expect(wake.content).toContain("alpha logs");
+    expect(wake.content).toContain("while the log is retained");
+    expect(wakeIds(wake.details)).toEqual(["mon_a", "mon_b"]);
+    const idsFromMonitors = {
+      kind: "monitor-session-end",
+      ids: [] as string[],
+      monitors: [{ id: "mon_a" }, { id: "mon_b" }],
+    };
+    expect(wakeIds(idsFromMonitors)).toEqual(["mon_a", "mon_b"]);
+    const stamped = stampWakeAsOf(
+      { customType: wake.customType, content: wake.content, details: wake.details },
+      Date.UTC(2026, 9, 5, 12, 27, 26),
+    );
+    expect(stamped.content).toContain("as-of=");
+    const events: string[] = [];
+    const out = onWakeMessageEnd(
+      { role: "custom", ...stamped },
+      { now: () => Date.UTC(2026, 9, 5, 12, 27, 26) + 4000, logEvent: (type) => events.push(type) },
+    );
+    expect(events).toEqual(["wake.inject"]);
+    expect(out?.content).toContain("age-ms=\"4000\"");
+    expect(out?.details).toMatchObject({ kind: "monitor-session-end", ids: ["mon_a", "mon_b"], ageMs: 4000 });
+  });
+
+  it("renders a pill without throwing and names the stopped monitors when expanded", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerFamulusMessageRenderers({
+      registerMessageRenderer(type: string, fn: unknown) {
+        map.set(type, fn as never);
+      },
+    } as never);
+    const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text };
+    const wake = formatFamulusWake(details);
+    const collapsed = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: false, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    const expanded = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: true, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    expect(collapsed.join("")).not.toContain("undefined");
+    expect(collapsed.join("")).toContain("2 stopped");
+    expect(collapsed.join("")).toContain("new");
+    expect(expanded.join("")).toContain("mon_a");
+    expect(expanded.join("")).toContain("mon_b");
+    expect(expanded.join("")).toContain("while the log is retained");
+  });
+});
+
+describe("monitor-terminal wake", () => {
+  const summaryFirst = `<pi-famulus-wake kind="monitor-terminal">\n  <summary>${MONITOR_UNWATCHED_SUMMARY}</summary>`;
+  function assertSummaryFirst(content: string) {
+    const xml = content.slice(content.indexOf('<pi-famulus-wake kind="monitor-terminal">'));
+    expect(xml.startsWith(summaryFirst)).toBe(true);
+  }
+
+  it("is one envelope listing every monitor id, never a single monitor id", () => {
+    const wake = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout", event: "[Monitor timed out — re-arm if needed.]" },
+      { id: "mon_b", description: "beta", status: "timeout" },
+    ]);
+    expect(wake.customType).toBe(FAMULUS_WAKE_CUSTOM_TYPE);
+    expect(wake.content.match(/<pi-famulus-wake /g)).toHaveLength(1);
+    expect(wake.content).toContain('kind="monitor-terminal"');
+    assertSummaryFirst(wake.content);
+    expect(wake.content).not.toMatch(/re-arm if needed/);
+    expect(wake.content).toContain("mon_a");
+    expect(wake.content).toContain("mon_b");
+    expect((wake.details as { id?: string }).id).toBeUndefined();
+    expect(wakeIds(wake.details)).toEqual(["mon_a", "mon_b"]);
+    const idsFromMonitors = {
+      kind: "monitor-terminal",
+      ids: [] as string[],
+      monitors: [{ id: "mon_a" }, { id: "mon_b" }],
+    };
+    expect(wakeIds(idsFromMonitors)).toEqual(["mon_a", "mon_b"]);
+  });
+
+  it("single-monitor content also starts with the shared unwatched summary", () => {
+    const wake = formatMonitorTerminal([{ id: "mon_a", description: "alpha", status: "timeout" }]);
+    assertSummaryFirst(wake.content);
+    expect(wake.content).toContain("mon_a");
+    expect(wake.content).not.toContain("mon_b");
+  });
+
+  it("renders output metadata in model-visible XML for single and multiple monitors", () => {
+    const output = {
+      firstObservedAt: Date.UTC(2026, 9, 5, 12, 27, 26),
+      lastObservedAt: Date.UTC(2026, 9, 5, 12, 27, 27),
+      cursorStart: 10,
+      cursorEnd: 40,
+      truncated: true,
+      suppressedCount: 2,
+      omittedChars: 7,
+    };
+    const single = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout", output },
+    ]);
+    const multi = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout", output },
+      { id: "mon_b", description: "beta", status: "exited", event: "Monitor process exited" },
+    ]);
+    for (const wake of [single, multi]) {
+      assertSummaryFirst(wake.content);
+      expect(wake.content).toContain('first-observed-at="2026-10-05T12:27:26Z"');
+      expect(wake.content).toContain('last-observed-at="2026-10-05T12:27:27Z"');
+      expect(wake.content).toContain('cursor-start="10"');
+      expect(wake.content).toContain('cursor-end="40"');
+      expect(wake.content).toContain('truncated="true"');
+      expect(wake.content).toContain('duplicates-suppressed="2"');
+      expect(wake.content).toContain('omitted-chars="7"');
+      expect(wake.content).toContain("Read original bytes with task_output");
+    }
+    expect(multi.content).toContain("mon_b");
+  });
+
+  it("renders a pill without throwing and names the stopped monitors when expanded", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerFamulusMessageRenderers({
+      registerMessageRenderer(type: string, fn: unknown) {
+        map.set(type, fn as never);
+      },
+    } as never);
+    const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text };
+    const wake = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "timeout" },
+      { id: "mon_b", description: "beta", status: "timeout" },
+    ]);
+    const collapsed = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: false, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    const expanded = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
+      { content: wake.content, details: wake.details },
+      { expanded: true, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    expect(collapsed.join("")).not.toContain("undefined");
+    expect(collapsed.join("")).toContain("2 stopped");
+    const expandedText = expanded.join("\n");
+    expect(expandedText.indexOf(MONITOR_UNWATCHED_SUMMARY)).toBeGreaterThanOrEqual(0);
+    expect(expandedText.indexOf(MONITOR_UNWATCHED_SUMMARY)).toBeLessThan(expandedText.indexOf("mon_a"));
+    expect(expanded.join("")).toContain("mon_a");
+    expect(expanded.join("")).toContain("mon_b");
   });
 });
