@@ -193,6 +193,14 @@ const behaviors: Record<string, FauxScript> = {
     steps: [call("bash", { command: "./fetch-key.sh" }), say("The key is KEY-ABCD1234.")],
     fallback: echoFromWake(/KEY-[A-Z0-9]+/),
   },
+  "monitor-behavior-alternative/good": {
+    steps: [
+      call("monitor", { command: "node behavior-source.cjs slow", description: "temporary diagnostic", timeout_ms: 8000 }),
+      call("monitor", { command: "node behavior-source.cjs slow", description: "ongoing observation", persistent: true }),
+      say("Watching both observations."),
+    ],
+    fallback: echoFromWake(/ALERT fixture-ready/),
+  },
   "monitor-not-sleep/good": {
     steps: [
       call("monitor", { command: "tail -n +1 -F service.log | grep --line-buffered READY", description: "service ready", timeout_ms: 60000 }),
