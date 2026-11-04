@@ -319,6 +319,7 @@ pub fn persist_record(home: &Path, record: &TaskRecord) -> io::Result<()> {
     persisted.live_cpu_percent = None;
     persisted.live_cpu_sampled_at = None;
     persisted.live_cpu_stale = false;
+    persisted.live_rss_kb = None;
     fs::write(&tmp_path, serde_json::to_vec(&persisted).map_err(io::Error::other)?)?;
     fs::rename(&tmp_path, &final_path)?;
     Ok(())
@@ -397,6 +398,7 @@ mod tests {
             live_cpu_percent: None,
             live_cpu_sampled_at: None,
             live_cpu_stale: false,
+            live_rss_kb: None,
             label: None,
         }
     }

@@ -23,25 +23,36 @@ use tokio::sync::mpsc;
 
 pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
 
-/// Best-effort live CPU for requested process groups. Values are cumulative
-/// user/system milliseconds for currently visible members (Linux `/proc`,
-/// Darwin `proc_pidinfo`); reaped descendants are intentionally not inferred.
-pub fn live_group_cpu_ms_many(pgids: &[u32]) -> HashMap<u32, Option<(u64, u64)>> {
-    let mut readings: HashMap<u32, Option<(u64, u64)>> =
+/// One best-effort usage sample of a live process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveGroupUsage {
+    pub user_ms: u64,
+    pub system_ms: u64,
+    /// Summed resident set size of visible members, in KiB.
+    pub rss_kb: u64,
+}
+
+/// Best-effort live CPU and memory for requested process groups. CPU values
+/// are cumulative user/system milliseconds for currently visible members
+/// (Linux `/proc`, Darwin `proc_pidinfo`); reaped descendants are
+/// intentionally not inferred. RSS is the current sum over the same members.
+pub fn live_group_usage_many(pgids: &[u32]) -> HashMap<u32, Option<LiveGroupUsage>> {
+    let mut readings: HashMap<u32, Option<LiveGroupUsage>> =
         pgids.iter().copied().map(|pgid| (pgid, None)).collect();
     let Some(ticks) = crate::sys::clock_ticks_per_second() else {
         return readings;
     };
-    let Ok(groups) = crate::sys::group_cpu_ticks_by_pgid(pgids) else {
+    let Ok(groups) = crate::sys::group_usage_by_pgid(pgids) else {
         return readings;
     };
-    for (pgid, (user, system)) in groups {
+    for (pgid, (user, system, rss_kb)) in groups {
         readings.insert(
             pgid,
-            Some((
-                user.saturating_mul(1000) / ticks,
-                system.saturating_mul(1000) / ticks,
-            )),
+            Some(LiveGroupUsage {
+                user_ms: user.saturating_mul(1000) / ticks,
+                system_ms: system.saturating_mul(1000) / ticks,
+                rss_kb,
+            }),
         );
     }
     readings

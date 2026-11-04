@@ -663,6 +663,7 @@ mod tests {
             live_cpu_percent: None,
             live_cpu_sampled_at: None,
             live_cpu_stale: false,
+            live_rss_kb: None,
             label: None,
         };
         registry::persist_record(&home, &rec).unwrap();
@@ -711,6 +712,7 @@ mod tests {
             live_cpu_percent: None,
             live_cpu_sampled_at: None,
             live_cpu_stale: false,
+            live_rss_kb: None,
             label: None,
         };
         registry::persist_record(&home, &rec).unwrap();

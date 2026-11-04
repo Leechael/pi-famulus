@@ -514,8 +514,18 @@ fn task_info(t: &TaskRecord, now: u64) -> TaskInfo {
         work_kind: inspect::work_kind(t).to_string(),
         exit: t.signal.clone().or_else(|| t.exit_code.map(|c| c.to_string())),
         reason: t.end_reason.clone(),
-        output: t.output_path.clone(),
+        output: absolute(Path::new(&t.output_path)),
+        stderr: absolute(&task::stderr_path_for(Path::new(&t.output_path))),
+        mem_kb: if running { t.live_rss_kb } else { None },
+        peak_kb: t.max_rss_kb,
     }
+}
+
+fn absolute(p: &Path) -> String {
+    if p.as_os_str().is_empty() {
+        return String::new();
+    }
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
 }
 
 fn tail_file(path: &Path) -> Vec<String> {
@@ -659,6 +669,8 @@ pub fn open_detail(state: &TopState) -> Option<Detail> {
         hits: Vec::new(),
         log: LogView::default(),
         fold_count: 0,
+        cmd_full: false,
+        notice: None,
     })
 }
 
@@ -698,6 +710,7 @@ mod tests {
             live_cpu_percent: live.then_some(10.0),
             live_cpu_sampled_at: None,
             live_cpu_stale: false,
+            live_rss_kb: None,
             label: None,
         }
     }

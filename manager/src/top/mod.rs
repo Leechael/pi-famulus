@@ -4,6 +4,7 @@
 //! `--once` was passed. Restoration of the terminal (raw mode, alternate
 //! screen) is guaranteed on return, error, and panic.
 
+pub mod clipboard;
 pub mod collector;
 pub mod live;
 pub mod model;
@@ -293,6 +294,8 @@ fn open_focused(state: &mut TopState) {
         hits: Vec::new(),
         log: crate::top::model::LogView::default(),
         fold_count: 0,
+        cmd_full: false,
+        notice: None,
     });
 }
 
@@ -705,6 +708,17 @@ fn jump_match(d: &mut Detail, forward: bool) {
     d.scroll = d.log.matches[d.log.current].saturating_sub(d.view_h / 3);
 }
 
+/// Copy `text` and describe the outcome for the detail's bottom border.
+fn copy_notice(what: &str, text: &str) -> String {
+    if text.is_empty() {
+        return format!("no {what} to copy");
+    }
+    match clipboard::copy(text) {
+        Ok(route) => format!("copied {what} to {route}"),
+        Err(e) => e,
+    }
+}
+
 /// Typing into a task output's search prompt.
 fn handle_search(d: &mut Detail, key: KeyEvent) {
     match key.code {
@@ -744,6 +758,7 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
         handle_search(d, key);
         return false;
     }
+    d.notice = None;
     match key.code {
         KeyCode::Esc if log && !d.log.query.is_empty() => {
             d.log.query.clear();
@@ -760,6 +775,18 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
         KeyCode::Char('n') if log => jump_match(d, true),
         KeyCode::Char('N') if log => jump_match(d, false),
         KeyCode::Char('b') if log => d.log.show_blank = !d.log.show_blank,
+        KeyCode::Char('e') if log => d.cmd_full = !d.cmd_full,
+        KeyCode::Char('c') if log => {
+            if let DetailBody::Log { info, .. } = &d.body {
+                d.notice = Some(copy_notice("command", &info.command));
+            }
+        }
+        KeyCode::Char('p') if log => {
+            if let DetailBody::Log { info, .. } = &d.body {
+                let (what, path) = if d.tab == 1 { ("stderr path", &info.stderr) } else { ("stdout path", &info.output) };
+                d.notice = Some(copy_notice(what, path));
+            }
+        }
         KeyCode::Char('f') | KeyCode::Char('F') => {
             d.follow = !d.follow;
             d.hold = !d.follow;
@@ -1013,6 +1040,8 @@ mod tests {
             hits: Vec::new(),
             log: LogView::default(),
             fold_count: 0,
+            cmd_full: false,
+            notice: None,
         }
     }
 
@@ -1043,6 +1072,8 @@ mod tests {
             hits: Vec::new(),
             log: LogView::default(),
             fold_count: 0,
+            cmd_full: false,
+            notice: None,
         }
     }
 

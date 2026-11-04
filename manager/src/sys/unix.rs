@@ -279,22 +279,34 @@ pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
     Ok(out)
 }
 
-/// One `/proc` walk for all requested process groups, returning cumulative
-/// user/system CPU ticks by process group. Unreadable or racing processes are
-/// skipped; a missing group entry means no member was readable.
-#[cfg(target_os = "linux")]
+/// Cumulative user/system CPU ticks by process group (see [`group_usage_by_pgid`]).
+#[cfg(test)]
 pub fn group_cpu_ticks_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64)>> {
+    Ok(group_usage_by_pgid(pgids)?
+        .into_iter()
+        .map(|(pgid, (user, system, _))| (pgid, (user, system)))
+        .collect())
+}
+
+/// One `/proc` walk for all requested process groups, returning cumulative
+/// user/system CPU ticks and summed resident set size (KiB) by process group.
+/// Unreadable or racing processes are skipped; a missing group entry means no
+/// member was readable.
+#[cfg(target_os = "linux")]
+pub fn group_usage_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64, u64)>> {
     let wanted: HashSet<u32> = pgids.iter().copied().collect();
     let mut totals = HashMap::new();
     if wanted.is_empty() {
         return Ok(totals);
     }
+    let page_kb = page_size_kb();
     for entry in std::fs::read_dir("/proc")?.flatten() {
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
         // `comm` can contain spaces and parentheses. Fields after its last
-        // `)` begin with state (field 3): pgrp is index 2, utime/stime 11/12.
+        // `)` begin with state (field 3): pgrp is index 2, utime/stime 11/12,
+        // rss (pages) 21.
         let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
             continue;
         };
@@ -312,21 +324,35 @@ pub fn group_cpu_ticks_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u
             continue;
         };
         if wanted.contains(&pgrp) {
-            let total = totals.entry(pgrp).or_insert((0u64, 0u64));
+            let rss_pages = fields.get(21).and_then(|r| r.parse::<i64>().ok()).unwrap_or(0).max(0) as u64;
+            let total = totals.entry(pgrp).or_insert((0u64, 0u64, 0u64));
             total.0 = total.0.saturating_add(user);
             total.1 = total.1.saturating_add(system);
+            total.2 = total.2.saturating_add(rss_pages.saturating_mul(page_kb));
         }
     }
     Ok(totals)
 }
 
-/// Cumulative user/system CPU in milliseconds for each requested process
-/// group, summed across live members (`proc_listpgrppids` + `PROC_PIDTASKINFO`).
-/// Unreadable or racing processes are skipped; a missing group entry means no
-/// member was readable. Callers treat the unit as ticks at 1000 Hz so
-/// [`clock_ticks_per_second`] converts them back to milliseconds unchanged.
+#[cfg(target_os = "linux")]
+fn page_size_kb() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n > 0 {
+        (n as u64 / 1024).max(1)
+    } else {
+        4
+    }
+}
+
+/// Cumulative user/system CPU in milliseconds and summed resident size (KiB)
+/// for each requested process group, across live members
+/// (`proc_listpgrppids` + `PROC_PIDTASKINFO`). Unreadable or racing processes
+/// are skipped; a missing group entry means no member was readable. Callers
+/// treat the CPU unit as ticks at 1000 Hz so [`clock_ticks_per_second`]
+/// converts them back to milliseconds unchanged.
 #[cfg(target_os = "macos")]
-pub fn group_cpu_ticks_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64)>> {
+pub fn group_usage_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64, u64)>> {
     let mut totals = HashMap::new();
     for &pgid in pgids {
         let Ok(members) = group_members(pgid) else {
@@ -334,32 +360,34 @@ pub fn group_cpu_ticks_by_pgid(pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u
         };
         let mut user = 0u64;
         let mut system = 0u64;
+        let mut rss_kb = 0u64;
         let mut any = false;
         for pid in members {
-            let Some((u, s)) = pid_cpu_ms(pid) else {
+            let Some((u, s, r)) = pid_usage(pid) else {
                 continue;
             };
             user = user.saturating_add(u);
             system = system.saturating_add(s);
+            rss_kb = rss_kb.saturating_add(r);
             any = true;
         }
         if any {
-            totals.insert(pgid, (user, system));
+            totals.insert(pgid, (user, system, rss_kb));
         }
     }
     Ok(totals)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn group_cpu_ticks_by_pgid(_pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64)>> {
+pub fn group_usage_by_pgid(_pgids: &[u32]) -> io::Result<HashMap<u32, (u64, u64, u64)>> {
     Ok(HashMap::new())
 }
 
 /// Mach absolute time → milliseconds for one Darwin pid (`pti_total_user` /
-/// `pti_total_system`). `None` if the process is gone or `proc_pidinfo` did
-/// not fill a complete `proc_taskinfo`.
+/// `pti_total_system`), plus resident size in KiB. `None` if the process is
+/// gone or `proc_pidinfo` did not fill a complete `proc_taskinfo`.
 #[cfg(target_os = "macos")]
-fn pid_cpu_ms(pid: u32) -> Option<(u64, u64)> {
+fn pid_usage(pid: u32) -> Option<(u64, u64, u64)> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     // SAFETY: the kernel writes at most `size` bytes into `info`.
@@ -379,7 +407,7 @@ fn pid_cpu_ms(pid: u32) -> Option<(u64, u64)> {
     let info = unsafe { info.assume_init() };
     let (numer, denom) = mach_timebase();
     let to_ms = |ticks: u64| ticks.saturating_mul(numer) / denom / 1_000_000;
-    Some((to_ms(info.pti_total_user), to_ms(info.pti_total_system)))
+    Some((to_ms(info.pti_total_user), to_ms(info.pti_total_system), info.pti_resident_size / 1024))
 }
 
 /// Cached `mach_timebase_info` (numer, denom). Falls back to 1/1 if the
@@ -418,7 +446,7 @@ pub fn clock_ticks_per_second() -> Option<u64> {
 }
 
 /// Darwin samples are already milliseconds; 1000 Hz makes
-/// `ticks * 1000 / hz` a no-op in [`crate::task::live_group_cpu_ms_many`].
+/// `ticks * 1000 / hz` a no-op in [`crate::task::live_group_usage_many`].
 #[cfg(target_os = "macos")]
 pub fn clock_ticks_per_second() -> Option<u64> {
     Some(1_000)
@@ -835,5 +863,27 @@ mod tests {
             "cpu ticks should grow: {first:?} -> {second:?}"
         );
         assert!(group_cpu_ticks_by_pgid(&[]).unwrap().is_empty());
+    }
+
+    /// A live group reports a nonzero resident size alongside its CPU.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn group_usage_reports_resident_memory() {
+        let mut child = command_std("/bin/sh");
+        child.args(["-c", "sleep 5"]);
+        apply_new_session_std(&mut child);
+        let mut child = child.spawn().unwrap();
+        let pgid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let rss = loop {
+            if let Some((_, _, rss)) = group_usage_by_pgid(&[pgid]).unwrap().get(&pgid).copied() {
+                break rss;
+            }
+            assert!(std::time::Instant::now() < deadline, "group never became visible");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        signal_group(pgid, SIGKILL).unwrap();
+        let _ = child.wait();
+        assert!(rss > 0, "resident size should be positive");
     }
 }

@@ -427,6 +427,8 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &TopState, hclass: HeightCl
         line2.push(unit("  cpu "));
         line2.extend(sparkline(&state.cpu_hist, 8, 100.0));
         line2.push(val(format!(" {}", now_cell(h.cpu_now, false))));
+        line2.push(unit("  mem "));
+        line2.push(val(mem_cell(h.mem_now)));
         line2.push(unit("  tok "));
         line2.push(val(compact_num(h.tokens_in.unwrap_or(0))));
         line2.push(unit("/"));
@@ -524,7 +526,9 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
         val(h.cpu_now.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into())),
         unit(" now · "),
         val(h.cpu_tot.map(fmt::human_duration).unwrap_or_else(|| "-".into())),
-        unit(" total"),
+        unit(" total · "),
+        val(mem_cell(h.mem_now)),
+        unit(" mem"),
     ]);
     rows.push(stat_row("cpu", cpu));
 
@@ -950,6 +954,8 @@ const HELP: &[(&str, &str)] = &[
     ("/  n N", "search · next · prev"),
     ("&  Tab", "filter or highlight"),
     ("b", "show blank lines"),
+    ("e", "full / clipped command & paths"),
+    ("c  p", "copy command · stream path"),
     ("", "mouse"),
     ("click  wheel", "select · scroll"),
     ("tabs · scope · sort", "click to switch"),
@@ -1348,7 +1354,11 @@ fn layout_log(lines: &[String], width: usize, view: &model::LogView, current_row
 }
 
 /// Pinned panel above a task's output: state, cost, command, and where.
-fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
+///
+/// Compact (default): the command's first line, clipped, and the absolute
+/// path of the stream on screen. `full` (`e`): every command line wrapped to
+/// `width`, and both stream paths in full. At most `max_h` lines.
+fn info_card(info: &model::TaskInfo, width: usize, tab: usize, full: bool, max_h: usize) -> Vec<Line<'static>> {
     let color = glyph_color(&info.status, info.running);
     let glyph = if info.running { spin_glyph() } else { status_glyph(&info.status, false) };
     let pair = |label: &str, value: String| vec![sp(fg(DIM), format!("   {label} ")), val(value)];
@@ -1363,6 +1373,10 @@ fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
         let now = now_cell(info.cpu_now, info.cpu_stale);
         let now = if now.parse::<f64>().is_ok() { format!("{now}%") } else { now };
         l1.extend(pair("now", now));
+        l1.extend(pair("mem", mem_cell(info.mem_kb)));
+    }
+    if let Some(peak) = info.peak_kb {
+        l1.extend(pair("peak", fmt::human_kib(peak)));
     }
     if let Some(exit) = &info.exit {
         let bad = exit != "0";
@@ -1372,14 +1386,8 @@ fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
     if let Some(reason) = info.reason.as_ref().filter(|r| r.as_str() != "exited") {
         l1.extend(pair("ended", reason.clone()));
     }
-    let more = if info.command.trim_end().contains('\n') { " …" } else { "" };
-    let l2 = vec![
-        sp(fg(ACCENT).add_modifier(Modifier::BOLD), "$ "),
-        sp(fg(TEXT).add_modifier(Modifier::BOLD), fmt::first_line(&info.command).to_string()),
-        sp(fg(DIM), more),
-    ];
     let started = fmt::datetime(info.started_at);
-    let mut l3 = vec![
+    let l3 = vec![
         sp(fg(DIM), "cwd "),
         sp(fg(MUTED), fmt::tilde(&info.cwd)),
         sp(fg(DIM), "   pid "),
@@ -1389,12 +1397,71 @@ fn info_card(info: &model::TaskInfo, width: usize) -> Vec<Line<'static>> {
         sp(fg(DIM), "   session "),
         sp(fg(MUTED), info.session.chars().take(8).collect::<String>()),
     ];
-    let used = spans_width(&l3) + 5;
-    if !info.output.is_empty() && used + 12 < width {
-        l3.push(sp(fg(DIM), "   "));
-        l3.push(sp(fg(DIM), fmt::truncate_width_left(&info.output, width - used)));
+    let cmd_style = fg(TEXT).add_modifier(Modifier::BOLD);
+    let prompt = || sp(fg(ACCENT).add_modifier(Modifier::BOLD), "$ ");
+    let path_line = |label: &str, path: &str, clip: bool| -> Vec<Vec<Span<'static>>> {
+        let head = format!("{label} ");
+        let room = width.saturating_sub(head.len()).max(8);
+        let text = if path.is_empty() { "-".to_string() } else { path.to_string() };
+        if clip {
+            vec![vec![sp(fg(DIM), head), sp(fg(MUTED), fmt::truncate_width_left(&text, room))]]
+        } else {
+            fmt::wrap_width(&text, room)
+                .into_iter()
+                .enumerate()
+                .map(|(i, seg)| {
+                    let lead = if i == 0 { head.clone() } else { " ".repeat(head.len()) };
+                    vec![sp(fg(DIM), lead), sp(fg(MUTED), seg)]
+                })
+                .collect()
+        }
+    };
+
+    let mut out: Vec<Vec<Span<'static>>> = vec![l1];
+    if full {
+        let room = width.saturating_sub(2).max(8);
+        let mut cmd = Vec::new();
+        for (i, line) in info.command.trim_end().lines().enumerate() {
+            for (j, seg) in fmt::wrap_width(line, room).into_iter().enumerate() {
+                let lead = if i == 0 && j == 0 { prompt() } else { Span::raw("  ") };
+                cmd.push(vec![lead, sp(cmd_style, seg)]);
+            }
+        }
+        if cmd.is_empty() {
+            cmd.push(vec![prompt()]);
+        }
+        // Keep the status, cwd and path lines; the command gets the rest.
+        let fixed = 2 + path_line("stdout", &info.output, false).len() + path_line("stderr", &info.stderr, false).len();
+        let room_h = max_h.saturating_sub(fixed).max(1);
+        if cmd.len() > room_h {
+            let hidden = cmd.len() - room_h + 1;
+            cmd.truncate(room_h - 1);
+            cmd.push(vec![Span::raw("  "), sp(fg(DIM), format!("… {hidden} more lines (c copies it all)"))]);
+        }
+        out.extend(cmd);
+        out.push(l3);
+        out.extend(path_line("stdout", &info.output, false));
+        out.extend(path_line("stderr", &info.stderr, false));
+    } else {
+        let lines = info.command.trim_end().lines().count();
+        let first = fmt::first_line(&info.command).to_string();
+        let clipped = lines > 1 || fmt::display_width(&first) + 2 > width;
+        let mut l2 = vec![prompt()];
+        if clipped {
+            let more = if lines > 1 { format!(" … +{} lines", lines - 1) } else { " …".to_string() };
+            let room = width.saturating_sub(2 + more.len());
+            l2.push(sp(cmd_style, fmt::truncate_width(&first, room)));
+            l2.push(sp(fg(DIM), more));
+        } else {
+            l2.push(sp(cmd_style, first));
+        }
+        out.push(l2);
+        out.push(l3);
+        let (label, path) = if tab == 1 { ("stderr", &info.stderr) } else { ("stdout", &info.output) };
+        out.extend(path_line(label, path, true));
     }
-    [l1, l2, l3].into_iter().map(|l| Line::from(fit_spans(l, width))).collect()
+    out.truncate(max_h.max(1));
+    out.into_iter().map(|l| Line::from(fit_spans(l, width))).collect()
 }
 
 fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
@@ -1408,12 +1475,15 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
         ),
     };
     let inner = Block::bordered().inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+    let w = inner.width as usize;
+    // Leave the tab row and at least three output rows under the card.
+    let max_card = (inner.height as usize).saturating_sub(4).max(1);
+    let card = info_card(&info, w, d.tab, d.cmd_full, max_card);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
+        .constraints([Constraint::Length(card.len() as u16), Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
-    let w = inner.width as usize;
-    frame.render_widget(Paragraph::new(info_card(&info, w)), chunks[0]);
+    frame.render_widget(Paragraph::new(card), chunks[0]);
 
     // Body first: the tab row reports what the body ended up showing.
     let body = chunks[2];
@@ -1500,7 +1570,14 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
         )
     } else {
         let mut keys: Vec<Key> = Vec::new();
-        let prefix = if q {
+        let prefix = if let Some(n) = &d.notice {
+            if q {
+                keys.push(("n N", "next", 1));
+            } else {
+                keys.push(("/", "search", 1));
+            }
+            seg_bottom(BOX_MAIN, vec![sp(fg(WARN), n.clone())])
+        } else if q {
             keys.push(("n N", "next", 1));
             seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), d.log.query.clone())])
         } else {
@@ -1510,6 +1587,9 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
         keys.push(("&", mode, 2));
         keys.push(("b", if d.log.show_blank { "hide blank" } else { "show blank" }, 4));
         keys.push(("1 2", "stream", 5));
+        keys.push(("e", if d.cmd_full { "collapse" } else { "expand" }, 3));
+        keys.push(("c", "copy cmd", 3));
+        keys.push(("p", "copy path", 6));
         if info.running {
             keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 3));
         }
@@ -2315,6 +2395,7 @@ fn cell_spans(state: &TopState, vr: &VisibleRow, col: Col) -> Vec<Span<'static>>
                 fg(MUTED)
             }
             Col::Now if text != "0.0%" => fg(OK),
+            Col::Mem if mem_is_peak(state, vr) => fg(DIM),
             _ => Style::default(),
         }
     };
@@ -2370,6 +2451,7 @@ fn cell_text(state: &TopState, vr: &VisibleRow, col: Col) -> String {
         Col::Wall | Col::Dur => wall_cell(n.metrics.wall_ms),
         Col::Cpu => cpu_cell(n.metrics.cpu_ms),
         Col::Now => now_cell(n.metrics.cpu_now, n.metrics.cpu_stale),
+        Col::Mem => mem_cell(n.metrics.mem_kb.or(n.metrics.peak_kb)),
         Col::Cores => inspect_cores(n.metrics.cpu_ms, n.metrics.wall_ms),
         Col::TokIo => tok_io_cell(n.metrics.tokens_in, n.metrics.tokens_out),
         Col::TokS => n.metrics.tok_s.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
@@ -2409,6 +2491,7 @@ fn task_cell(state: &TopState, r: &crate::inspect::Row, col: Col) -> String {
         Col::Dur | Col::Wall => r.duration_ms.map(wall_cell).unwrap_or_else(|| "-".into()),
         Col::Cpu => cpu_cell(cpu),
         Col::Now => now_cell(r.live_cpu_percent, r.live_cpu_stale),
+        Col::Mem => mem_cell(if r.running { r.live_rss_kb } else { r.max_rss_kb }),
         Col::Title => r.title.clone(),
         Col::Sess => r.session_id.chars().take(8).collect(),
         Col::Cwd | Col::CwdModel => r.cwd.as_deref().map(fmt::tilde).unwrap_or_else(|| "-".into()),
@@ -2424,6 +2507,21 @@ fn task_cell(state: &TopState, r: &crate::inspect::Row, col: Col) -> String {
             .unwrap_or_else(|| "-".into()),
         _ => String::new(),
     }
+}
+
+/// Memory cell: live RSS for running work, peak RSS for finished tasks.
+fn mem_cell(kb: Option<u64>) -> String {
+    kb.map(fmt::human_kib).unwrap_or_else(|| "-".into())
+}
+
+/// A finished row's MEM is its recorded peak, not current use: dim it.
+fn mem_is_peak(state: &TopState, vr: &VisibleRow) -> bool {
+    if state.tab == Tab::Tasks {
+        if let Some(&i) = state.task_index.get(&vr.id) {
+            return !state.task_rows[i].running;
+        }
+    }
+    state.nodes.get(&vr.id).is_some_and(|n| n.metrics.mem_kb.is_none() && n.metrics.peak_kb.is_some())
 }
 
 fn inspect_cores(cpu: Option<u64>, wall: u64) -> String {
@@ -2489,6 +2587,7 @@ mod tests {
             live_cpu_percent: running.then_some(40.0),
             live_cpu_sampled_at: running.then_some(2_000),
             live_cpu_stale: false,
+            live_rss_kb: None,
             label: None,
         }
     }
@@ -2947,6 +3046,53 @@ mod tests {
         let col = fmt::display_width(&tab_line[..tab_line.find("stderr").unwrap()]) as u16;
         let (x0, x1, tab) = d.log.tab_hits[1];
         assert!(x0 <= col && col < x1 && tab == 1, "{tab_line:?} {:?}", d.log.tab_hits);
+    }
+
+    #[test]
+    fn info_card_toggles_full_command_and_shows_absolute_paths() {
+        let long = format!("cargo test --workspace -- {}\necho second line", "x".repeat(200));
+        let info = model::TaskInfo {
+            status: "running".into(),
+            running: true,
+            command: long.clone(),
+            output: "/home/u/.pi-famulus/sessions/s/tasks/sh_1.output".into(),
+            stderr: "/home/u/.pi-famulus/sessions/s/tasks/sh_1.stderr".into(),
+            mem_kb: Some(150 * 1024),
+            peak_kb: None,
+            ..Default::default()
+        };
+        let text = |lines: Vec<Line<'static>>| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+
+        let compact = text(info_card(&info, 80, 0, false, 20));
+        assert_eq!(compact.len(), 4, "{compact:?}");
+        assert!(compact[0].contains("mem 150M"), "{compact:?}");
+        assert!(compact[1].starts_with("$ cargo test") && compact[1].contains("… +1 lines"), "{compact:?}");
+        assert!(compact[3].starts_with("stdout ") && compact[3].ends_with("sh_1.output"), "{compact:?}");
+        let on_stderr = text(info_card(&info, 80, 1, false, 20));
+        assert!(on_stderr[3].starts_with("stderr ") && on_stderr[3].ends_with("sh_1.stderr"), "{on_stderr:?}");
+
+        let full = text(info_card(&info, 80, 0, true, 20));
+        let joined: String = full.iter().map(|l| l.trim_start_matches("$ ").trim()).collect();
+        assert!(joined.contains(&"x".repeat(200)), "every byte of the command is shown: {full:?}");
+        assert!(full.iter().any(|l| l.trim() == "echo second line"), "{full:?}");
+        assert!(full.iter().any(|l| l == "stdout /home/u/.pi-famulus/sessions/s/tasks/sh_1.output"), "{full:?}");
+        assert!(full.iter().any(|l| l == "stderr /home/u/.pi-famulus/sessions/s/tasks/sh_1.stderr"), "{full:?}");
+        assert!(full.iter().all(|l| fmt::display_width(l) <= 80), "{full:?}");
+
+        let capped = text(info_card(&info, 80, 0, true, 6));
+        assert_eq!(capped.len(), 6, "{capped:?}");
+        assert!(capped.iter().any(|l| l.contains("more lines (c copies it all)")), "{capped:?}");
+    }
+
+    #[test]
+    fn detail_footer_names_expand_and_copy_keys_and_shows_notice() {
+        let mut state = task_detail(log_lines());
+        let text = render(160, 24, &mut state);
+        assert!(text.contains("e expand") && text.contains("c copy cmd"), "{text}");
+        state.detail.as_mut().unwrap().cmd_full = true;
+        state.detail.as_mut().unwrap().notice = Some("copied command to clipboard".into());
+        let text = render(160, 24, &mut state);
+        assert!(text.contains("e collapse") && text.contains("copied command to clipboard"), "{text}");
     }
 
     #[test]
