@@ -25,6 +25,46 @@ function setup(mode: "exact" | "ignore-timestamps" = "exact", idle = true) {
 }
 
 describe("Rust records through monitor registry (regression)", () => {
+  it("preserves the recorded TUI stop in a terminal batch", async () => {
+    const clock = new ManualClock();
+    const sent: { content: string; details?: unknown }[] = [];
+    const center = new NotifyCenter({ clock, isIdle: () => true, sendMessage: (m) => sent.push(m) });
+    const client = { ensureAvailable: async () => true, start: async () => ({ task_id: "mon_921a905e" }), watch: async () => {} } as unknown as ManagerClient;
+    const toasts: string[] = [];
+    const registry = new MonitorRegistry({ clock, getClient: () => client, sessionEnv: () => ({}), getNotifyCenter: () => center, trackTask: () => {}, toast: (message) => toasts.push(message) });
+    await registry.start({ command: "follow deployment", description: "deployment", persistent: true }, { cwd: "/tmp" } as never);
+    registry.handleExit("mon_921a905e", { event: "task_exited", task_id: "mon_921a905e", exit_code: null, signal: "SIGTERM", end_reason: "stopped:tui", duration_ms: 9255590 });
+    clock.advanceBy(10_000);
+    expect(sent[0].details).toMatchObject({ kind: "monitor-terminal", monitors: [{ id: "mon_921a905e", exitFacts: { endReason: "stopped:tui", signal: "SIGTERM", exitCode: null } }] });
+    expect(sent[0].content).toContain("TUI");
+    expect(sent[0].content).toContain("SIGTERM");
+    expect(toasts[0]).toContain("Stopped via TUI");
+    expect(toasts[0]).toContain("SIGTERM");
+    registry.disposeAll(); center.dispose();
+  });
+  it.each([
+    ["stopped:tui", "TUI"], ["stopped:cli", "CLI"], ["stopped:tool", "tool"],
+    ["timeout", "timeout"], ["session-end", "session-end"], ["crash", "crash"], [undefined, "unknown"],
+  ])("retains reason %s on event and reconcile", async (reason, expected) => {
+    const results: unknown[] = [];
+    for (const reconcile of [false, true]) {
+      const clock = new ManualClock();
+      const sent: { content: string; details?: unknown }[] = [];
+      const center = new NotifyCenter({ clock, isIdle: () => true, sendMessage: (m) => sent.push(m) });
+      const client = { ensureAvailable: async () => true, start: async () => ({ task_id: "mon_1" }), watch: async () => {} } as unknown as ManagerClient;
+      const registry = new MonitorRegistry({ clock, getClient: () => client, sessionEnv: () => ({}), getNotifyCenter: () => center, trackTask: () => {} });
+      await registry.start({ command: "follow", description: "watch", persistent: true }, { cwd: "/tmp" } as never);
+      if (reconcile) registry.reconcile([{ task_id: "mon_1", status: "completed", exit_code: 0, signal: null, end_reason: reason, started_at: 0, ended_at: 1000, output_path: "" } as never]);
+      else registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: 0, signal: null, end_reason: reason, duration_ms: 1000 });
+      center.flush();
+      expect(sent[0].content).toContain(expected);
+      expect(sent[0].content).not.toMatch(/other session|naturally/i);
+      results.push((sent[0].details as { monitors: unknown[] }).monitors);
+      registry.disposeAll(); center.dispose();
+    }
+    expect(results[0]).toEqual(results[1]);
+  });
+
   it("falls back to original startup bytes when dense metadata exceeds the early-event budget", async () => {
     const clock = new ManualClock();
     const sent: { content: string }[] = [];
@@ -42,6 +82,67 @@ describe("Rust records through monitor registry (regression)", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0].content).toContain("HOST_READY");
     expect(sent[0].content).toContain('cursor-end="311"');
+    registry.disposeAll(); center.dispose();
+  });
+
+  it("batches a confirmed TUI exit with an unconfirmed timeout without mixing facts", async () => {
+    const clock = new ManualClock();
+    const sent: { content: string; details?: unknown }[] = [];
+    const center = new NotifyCenter({ clock, isIdle: () => true, sendMessage: (m) => sent.push(m) });
+    let next = 0;
+    const client = { ensureAvailable: async () => true, start: async () => ({ task_id: `mon_${++next}` }), watch: async () => {}, stop: async (id: string) => { if (id === "mon_3") throw new Error("unavailable"); } } as unknown as ManagerClient;
+    const registry = new MonitorRegistry({ clock, getClient: () => client, sessionEnv: () => ({}), getNotifyCenter: () => center, trackTask: () => {} });
+    await registry.start({ command: "follow one", description: "one", timeout_ms: 1000 }, { cwd: "/tmp" } as never);
+    await registry.start({ command: "follow two", description: "two", persistent: true }, { cwd: "/tmp" } as never);
+    await registry.start({ command: "follow three", description: "three", timeout_ms: 1000 }, { cwd: "/tmp" } as never);
+    registry.handleExit("mon_2", { event: "task_exited", task_id: "mon_2", end_reason: "stopped:tui", signal: "SIGTERM", exit_code: null });
+    clock.advanceBy(1000);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    center.flush();
+    const terminal = sent[0].details as { monitors: { id: string; detail: string; exitFacts?: unknown }[] };
+    expect(terminal.monitors).toHaveLength(3);
+    expect(terminal.monitors.find((m) => m.id === "mon_2")?.exitFacts).toMatchObject({ endReason: "stopped:tui", signal: "SIGTERM", exitCode: null });
+    expect(terminal.monitors.find((m) => m.id === "mon_1")?.detail).toContain("exit unconfirmed");
+    expect(terminal.monitors.find((m) => m.id === "mon_1")?.exitFacts).toBeUndefined();
+    expect(terminal.monitors.find((m) => m.id === "mon_3")?.detail).toMatch(/Stop request failed: Error: unavailable\. Exit unconfirmed/);
+    expect(terminal.monitors.find((m) => m.id === "mon_3")?.exitFacts).toBeUndefined();
+    expect(sent[0].content).not.toMatch(/nothing watches|these monitors have stopped/i);
+    registry.disposeAll(); center.dispose();
+  });
+
+  it.each([false, true])("timeout stop rejection %s does not claim a confirmed exit", async (reject) => {
+    const clock = new ManualClock();
+    const sent: { content: string }[] = [];
+    const center = new NotifyCenter({ clock, isIdle: () => true, sendMessage: (m) => sent.push(m) });
+    const client = { ensureAvailable: async () => true, start: async () => ({ task_id: "mon_1" }), watch: async () => {}, stop: async () => { if (reject) throw new Error("stop unavailable"); } } as unknown as ManagerClient;
+    const registry = new MonitorRegistry({ clock, getClient: () => client, sessionEnv: () => ({}), getNotifyCenter: () => center, trackTask: () => {} });
+    await registry.start({ command: "follow", description: "watch", timeout_ms: 1000 }, { cwd: "/tmp" } as never);
+    clock.advanceBy(1000);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    center.flush();
+    expect(sent[0].content).toMatch(/exit unconfirmed/i);
+    expect(sent[0].content).toContain(reject ? "Stop request failed: Error: stop unavailable" : "Stop requested");
+    expect(sent[0].content).not.toContain("nothing watches");
+    registry.disposeAll(); center.dispose();
+  });
+
+  it("keeps a persistent control running when a busy session makes no renewals", async () => {
+    const clock = new ManualClock();
+    const stops: string[] = [];
+    const deliveries: { mode: string }[] = [];
+    const center = new NotifyCenter({ clock, isIdle: () => false, sendMessage: (_m, options) => deliveries.push({ mode: options.deliverAs ?? "other" }) });
+    let next = 0;
+    const client = { ensureAvailable: async () => true, start: async () => ({ task_id: `mon_${++next}` }), watch: async () => {}, stop: async (id: string) => { stops.push(id); } } as unknown as ManagerClient;
+    const registry = new MonitorRegistry({ clock, getClient: () => client, sessionEnv: () => ({}), getNotifyCenter: () => center, trackTask: () => {} });
+    for (let i = 0; i < 5; i++) await registry.start({ command: `follow ${i}`, description: `timed ${i}`, timeout_ms: 3_600_000 }, { cwd: "/tmp" } as never);
+    await registry.start({ command: "follow persistent", description: "control", persistent: true }, { cwd: "/tmp" } as never);
+    // Simulate no model response or renewal; no provider is invoked.
+    clock.advanceBy(3_600_000);
+    await Promise.resolve(); await Promise.resolve();
+    center.flush();
+    expect(stops).toEqual(["mon_1", "mon_2", "mon_3", "mon_4", "mon_5"]);
+    expect(deliveries).toEqual([{ mode: "steer" }]);
+    expect(registry.listActive().map((item) => item.taskId)).toEqual(["mon_6"]);
     registry.disposeAll(); center.dispose();
   });
 
@@ -63,6 +164,8 @@ describe("Rust records through monitor registry (regression)", () => {
     clock.advanceBy(10_000);
     const terminal = sent.map((m) => m.details as { kind?: string; monitors?: { status: string; output?: MonitorOutputInfo }[] }).find((w) => w.kind === "monitor-terminal");
     expect(terminal?.monitors?.[0]?.output?.suppressedCount).toBe(1);
+    // The timeout path owns this notice even if the actual exit races stop().
+    expect(terminal?.monitors?.[0]).not.toHaveProperty("exitFacts");
     expect(sent).toHaveLength(2);
     registry.disposeAll(); center.dispose();
   });

@@ -30,6 +30,7 @@ export interface TaskWake {
   exitCode: number | null;
   /** Signal name ("SIGTERM" | "SIGKILL"). Omitted when the exit had no signal. */
   signal?: string;
+  endReason?: string;
 }
 
 export type WakeChildStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
@@ -105,6 +106,13 @@ export interface MonitorOutputInfo {
   omittedChars?: number;
 }
 
+export interface MonitorExitFacts {
+  endReason?: string;
+  signal?: string;
+  exitCode?: number | null;
+  stopRequested?: boolean;
+}
+
 export type FamulusWake = FamulusWakeBody & WakeTiming;
 
 type FamulusWakeBody =
@@ -118,6 +126,8 @@ type FamulusWakeBody =
       eventCount?: number;
       droppedLines?: number;
       output?: MonitorOutputInfo;
+      exitFacts?: MonitorExitFacts;
+      exitContext?: string;
     }
   | {
       kind: "subagent-handover";
@@ -188,6 +198,7 @@ type FamulusWakeBody =
         detail: string;
         droppedLines?: number;
         output?: MonitorOutputInfo;
+        exitFacts?: MonitorExitFacts;
       }>;
     };
 
@@ -592,7 +603,7 @@ function renderMonitorTerminal(details: Extract<FamulusWake, { kind: "monitor-te
 function renderMonitorSessionEnd(details: Extract<FamulusWake, { kind: "monitor-session-end" }>): string {
   const parts = [
     `<pi-famulus-wake kind="monitor-session-end" reason="${escapeXmlAttr(details.reason)}">`,
-    `  <summary>${escapeXml(`These monitors stopped (${details.reason}). They are no longer watched.`)}</summary>`,
+    `  <summary>${escapeXml(`Session monitor teardown (${details.reason}); process exits are not confirmed by this notice.`)}</summary>`,
   ];
   for (const monitor of details.monitors) {
     const pointer = `task_output({task_id: "${monitor.id}"}) ${monitor.outputPath} while the log is retained`;

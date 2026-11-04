@@ -119,14 +119,14 @@ function collapsedText(details: FamulusWake, theme: Theme): string {
       return `${theme.fg("muted", "↑")} ${theme.fg("muted", "supervisor update")} ${details.message.slice(0, 100)}`;
     case "monitor-session-end": {
       const n = details.ids.length || details.monitors.length;
-      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "session monitors")} ${n} stopped · ${details.reason}`;
+      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "session monitors")} ${n} teardown · ${details.reason}`;
     }
     case "running-monitors":
       return `${theme.fg("accent", "›")} ${theme.fg("muted", "running")} ${details.monitors.length} monitor${details.monitors.length === 1 ? "" : "s"}`;
     case "monitor-terminal": {
       const n = details.ids.length || details.monitors.length;
       const statuses = countStatuses(details.monitors.map((monitor) => monitor.status));
-      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "monitors")} ${n} stopped · ${statuses}`;
+      return `${theme.fg("warning", "✗")} ${theme.fg("muted", "monitors")} ${n} lifecycle updates · ${statuses}`;
     }
   }
 }
@@ -208,7 +208,7 @@ export function expandedWakeText(details: FamulusWake | undefined, content: stri
       return [`Update from ${details.name} (${details.from})`, details.message].join("\n");
     case "monitor-session-end":
       return [
-        `Session monitors stopped (${details.reason}). They are no longer watched.`,
+        `Session monitor teardown (${details.reason}); process exits are not confirmed by this notice.`,
         ...details.monitors.map((monitor) =>
           `${monitor.id} "${monitor.description}" elapsed ${formatDuration(monitor.elapsedMs)}; original output: task_output({task_id: "${monitor.id}"}) ${monitor.outputPath} while the log is retained`,
         ),

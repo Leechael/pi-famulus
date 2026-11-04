@@ -109,6 +109,17 @@ function displayCommand(command: string): string {
   return shellWakeTitle(command);
 }
 
+export function exitReasonPhrase(endReason: string | undefined): string {
+  const source = endReason?.startsWith("stopped:") ? endReason.slice("stopped:".length) : undefined;
+  return source !== undefined
+    ? `Stopped via ${source === "tui" ? "TUI" : source === "cli" ? "CLI" : source} (reason: ${endReason})`
+    : endReason === "exited" ? "Process exited" : `Process ended (reason: ${endReason ?? "unknown"})`;
+}
+
+export function formatExitFacts(facts: import("./wake").MonitorExitFacts): string {
+  return `${exitReasonPhrase(facts.endReason)}; exit code ${facts.exitCode == null ? "unknown" : facts.exitCode}${facts.signal ? `; signal ${facts.signal}` : ""}.${facts.stopRequested ? " This agent requested a stop." : ""}`;
+}
+
 function statusPhrase(info: TaskExitInfo): string {
   const startFailure = shellStartStatus(info.endReason);
   if (startFailure) return startFailure;
@@ -119,7 +130,7 @@ function statusPhrase(info: TaskExitInfo): string {
     case "failed":
       return code ? `failed (${code})` : "failed";
     case "killed":
-      return "was killed";
+      return `was killed; ${exitReasonPhrase(info.endReason)}${info.signal ? `; signal ${info.signal}` : ""}`;
     case "orphaned":
       return "ended when pi-famulus crashed";
   }
@@ -159,6 +170,7 @@ export function formatTaskNotification(
         durationMs: info.durationMs,
         exitCode: info.exitCode,
         ...(info.signal ? { signal: info.signal } : {}),
+        ...(info.endReason ? { endReason: info.endReason } : {}),
       })),
     },
     leadIn,
@@ -204,7 +216,7 @@ export function formatMonitorEvent(
   taskId: string,
   batchText: string,
   status?: string,
-  extras: { eventCount?: number; droppedLines?: number; output?: MonitorOutputInfo } = {},
+  extras: { eventCount?: number; droppedLines?: number; output?: MonitorOutputInfo; exitFacts?: import("./wake").MonitorExitFacts; exitContext?: string } = {},
 ): FormattedWake {
   return formatFamulusWake({
     kind: "monitor",
@@ -215,6 +227,8 @@ export function formatMonitorEvent(
     ...(extras.eventCount !== undefined ? { eventCount: extras.eventCount } : {}),
     ...(extras.droppedLines !== undefined ? { droppedLines: extras.droppedLines } : {}),
     ...(extras.output ? { output: extras.output } : {}),
+    ...(extras.exitFacts ? { exitFacts: extras.exitFacts } : {}),
+    ...(extras.exitContext ? { exitContext: extras.exitContext } : {}),
   });
 }
 
@@ -226,7 +240,7 @@ export function formatRunningMonitorList(
 }
 
 export const MONITOR_UNWATCHED_SUMMARY =
-  "These monitors have stopped; nothing watches their sources now.";
+  "Monitor lifecycle updates.";
 
 export type MonitorTerminalStatus = "timeout" | "exited" | "stopped";
 
@@ -237,10 +251,10 @@ export interface MonitorTerminalInfo {
   event?: string;
   droppedLines?: number;
   output?: MonitorOutputInfo;
+  exitFacts?: import("./wake").MonitorExitFacts;
 }
 
 function terminalDetail(info: MonitorTerminalInfo): string {
-  if (info.status === "timeout") return "Timed out.";
   return info.event ?? "";
 }
 
@@ -257,6 +271,7 @@ export function formatMonitorTerminal(monitors: MonitorTerminalInfo[]): Formatte
       detail: terminalDetail(monitor),
       ...(monitor.droppedLines ? { droppedLines: monitor.droppedLines } : {}),
       ...(monitor.output ? { output: monitor.output } : {}),
+      ...(monitor.exitFacts ? { exitFacts: monitor.exitFacts } : {}),
     })),
   });
 }

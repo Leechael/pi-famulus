@@ -13,7 +13,7 @@
  *   <pi-famulus-wake kind="task"> payload, and the same task/event pair is only
  *   ever delivered once.
  */
-import { formatMonitorEvent, formatMonitorTerminal, formatRunningMonitorList, formatTaskNotification, type MonitorTerminalStatus, type TaskExitInfo } from "./format";
+import { formatExitFacts, formatMonitorEvent, formatMonitorTerminal, formatRunningMonitorList, formatTaskNotification, type MonitorTerminalStatus, type TaskExitInfo } from "./format";
 import { FAMULUS_WAKE_CUSTOM_TYPE, stampWakeAsOf, wakeIds, type MonitorOutputInfo, type WakeItem } from "./wake";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
@@ -48,13 +48,42 @@ interface PendingMonitorTerminal {
   event: string;
   droppedLines?: number;
   output?: MonitorOutputInfo;
+  exitFacts?: import("./wake").MonitorExitFacts;
+  exitContext?: string;
   passive: boolean;
 }
 
-function mergeTerminal(previous: PendingMonitorTerminal, next: PendingMonitorTerminal): PendingMonitorTerminal {
+function mergeTerminal(previous: PendingMonitorTerminal, next: PendingMonitorTerminal, onConflict: (fields: string[]) => void): PendingMonitorTerminal {
   const status =
     TERMINAL_STATUS_RANK[next.status] > TERMINAL_STATUS_RANK[previous.status] ? next.status : previous.status;
-  const event = (next.event?.length ?? 0) > (previous.event?.length ?? 0) ? next.event : previous.event;
+  const hasFacts = (facts: PendingMonitorTerminal["exitFacts"]) => !!facts &&
+    (facts.endReason !== undefined || facts.signal !== undefined || facts.exitCode !== undefined || facts.stopRequested === true);
+  const previousKnown = hasFacts(previous.exitFacts);
+  const nextKnown = hasFacts(next.exitFacts);
+  const chosen = previousKnown ? previous : nextKnown ? next : next.event.length > previous.event.length ? next : previous;
+  const other = chosen === next ? previous : next;
+  const a = chosen.exitFacts;
+  const b = other.exitFacts;
+  const conflicts: string[] = [];
+  if (a && b) {
+    if (a.endReason !== undefined && b.endReason !== undefined && a.endReason !== b.endReason) conflicts.push("endReason");
+    if (a.signal !== undefined && b.signal !== undefined && a.signal !== b.signal) conflicts.push("signal");
+    if (a.exitCode != null && b.exitCode != null && a.exitCode !== b.exitCode) conflicts.push("exitCode");
+  }
+  const conflict = conflicts.length > 0;
+  if (conflict) onConflict(conflicts);
+  const exitFacts = a && b && !conflict ? {
+    ...b,
+    ...a,
+    ...(a.endReason === undefined && b.endReason !== undefined ? { endReason: b.endReason } : {}),
+    ...(a.signal === undefined && b.signal !== undefined ? { signal: b.signal } : {}),
+    ...(a.exitCode == null && b.exitCode != null ? { exitCode: b.exitCode } : {}),
+    ...(a.stopRequested === true || b.stopRequested === true ? { stopRequested: true } : {}),
+  } : a;
+  const exitContext = chosen.exitContext ?? (!conflict ? other.exitContext : undefined);
+  const event = previousKnown && nextKnown && !conflict && exitFacts
+    ? `${formatExitFacts(exitFacts)}${exitContext ? ` ${exitContext}` : ""}`
+    : chosen.event;
   const description = next.description.length > previous.description.length ? next.description : previous.description;
   const droppedLines = Math.max(previous.droppedLines ?? 0, next.droppedLines ?? 0);
   return {
@@ -64,6 +93,8 @@ function mergeTerminal(previous: PendingMonitorTerminal, next: PendingMonitorTer
     event,
     ...(droppedLines > 0 ? { droppedLines } : {}),
     output: mergeMonitorOutput(previous.output, next.output),
+    exitFacts,
+    exitContext,
     passive: previous.passive && next.passive,
   };
 }
@@ -210,6 +241,8 @@ export class NotifyCenter {
       event?: string;
       droppedLines?: number;
       output?: MonitorOutputInfo;
+      exitFacts?: import("./wake").MonitorExitFacts;
+      exitContext?: string;
     } | undefined;
     if (wake?.kind === "monitor" && typeof wake.id === "string") {
       this.flushMonitor(wake.id, opts.quietEvents);
@@ -221,6 +254,8 @@ export class NotifyCenter {
           event: wake.event ?? "",
           droppedLines: wake.droppedLines,
           output: wake.output,
+          exitFacts: wake.exitFacts,
+          exitContext: wake.exitContext,
           passive: opts.passive === true,
         });
         return;
@@ -432,7 +467,9 @@ export class NotifyCenter {
     if (this.seenTerminalIds.has(item.id)) return;
     const existing = this.pendingTerminals.findIndex((pending) => pending.id === item.id);
     if (existing >= 0) {
-      this.pendingTerminals[existing] = mergeTerminal(this.pendingTerminals[existing], item);
+      this.pendingTerminals[existing] = mergeTerminal(this.pendingTerminals[existing], item, (fields) => {
+        this.deps.logEvent?.("monitor.exit-facts-conflict", { id: item.id, fields });
+      });
       return;
     }
     this.pendingTerminals.push(item);

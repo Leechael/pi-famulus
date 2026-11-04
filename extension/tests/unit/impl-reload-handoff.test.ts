@@ -647,7 +647,7 @@ describe("monitor teardown notices", () => {
       const sessionEnd = teardownNotices(pi.sent);
       expect(terminals).toHaveLength(1);
       expect(terminals[0]?.details).toMatchObject({ kind: "monitor-terminal", ids: ["mon_to"] });
-      expect(terminals[0]?.content).toMatch(/These monitors have stopped; nothing watches their sources now/);
+      expect(terminals[0]?.content).toMatch(/Monitor lifecycle updates/);
       expect(JSON.stringify(sessionEnd)).not.toContain("mon_to");
       if (reason === "quit") {
         expect(sessionEnd).toEqual([]);
@@ -860,7 +860,7 @@ describe("monitor teardown notice for handoff expiry and session mismatch", () =
       expect(terminalNotices(after.sent)).toEqual([]);
       expect(fileTerminals).toHaveLength(1);
       expect(fileTerminals[0]?.details).toMatchObject({ kind: "monitor-terminal", ids: ["mon_to"] });
-      expect(String(fileTerminals[0]?.content)).toMatch(/These monitors have stopped; nothing watches their sources now/);
+      expect(String(fileTerminals[0]?.content)).toMatch(/Monitor lifecycle updates/);
     } finally {
       try {
         await after.emit("session_shutdown", { reason: "quit" });

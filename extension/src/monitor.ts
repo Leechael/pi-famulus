@@ -10,7 +10,7 @@
 import { Type } from "typebox";
 import { shellStartStatus } from "./shell-start";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { formatMonitorEvent } from "./format";
+import { formatExitFacts, formatMonitorEvent } from "./format";
 import { MONITOR_IDLE_INSTRUCTION } from "./behavior-guidelines";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
@@ -393,19 +393,27 @@ export class MonitorRegistry {
       this.clock.now() - entry.lastEventAt <= EXIT_AFTER_EVENT_MS;
     const duration =
       typeof event.duration_ms === "number" ? `${(event.duration_ms / 1000).toFixed(1)}s` : "unknown duration";
-    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: event.end_reason ?? "exited" });
+    const facts = {
+      ...(event.end_reason ? { endReason: event.end_reason } : {}),
+      ...(event.signal ? { signal: event.signal } : {}),
+      exitCode,
+      ...(entry.stopRequested ? { stopRequested: true } : {}),
+    };
+    const exitContext = `After ${duration}.${startFailureNote(event.end_reason)} No further events will be delivered.${entry.droppedLinesPending > 0 ? ` ${entry.droppedLinesPending} output lines were dropped.` : ""}`;
+    const detail = `${formatExitFacts(facts)} ${exitContext}`;
+    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: event.end_reason ?? "unknown" });
     this.deps.getNotifyCenter()?.notify(
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}).${startFailureNote(event.end_reason)} No further events will be delivered.${entry.droppedLinesPending > 0 ? ` ${entry.droppedLinesPending} output lines were dropped.` : ""}`,
+        detail,
         "exited",
-        { droppedLines: entry.droppedLinesPending, ...(summary.suppressedCount ? { output: summary } : {}) },
+        { droppedLines: entry.droppedLinesPending, exitFacts: facts, exitContext, ...(summary.suppressedCount ? { output: summary } : {}) },
       ),
       { passive: causedByEvent || entry.stopRequested === true, quietEvents: entry.stopRequested === true },
     );
     this.deps.toast?.(
-      `Monitor "${entry.description}" exited (code ${exitCode === null ? "?" : exitCode})`,
+      `Monitor "${entry.description}": ${detail}`,
       exitCode === 0 || exitCode === null ? "info" : "warning",
     );
     return true;
@@ -525,17 +533,20 @@ export class MonitorRegistry {
     entry.stopped = true;
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "timeout" });
     const client = this.deps.getClient();
-    await client?.stop(entry.taskId, "timeout").catch(() => {});
+    let stopFailed = false;
+    let stopError: unknown;
+    if (client) await client.stop(entry.taskId, "timeout").catch((error: unknown) => { stopFailed = true; stopError = error; });
+    const stopDetail = stopFailed ? `Stop request failed: ${String(stopError)}. Exit unconfirmed.` : client ? "Stop requested; exit unconfirmed." : "Stop request unavailable; exit unconfirmed.";
     this.deps.getNotifyCenter()?.notify(
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        "Timed out.",
+        `Timeout elapsed. ${stopDetail}`,
         "timeout",
         { droppedLines: entry.droppedLinesPending, output: entry.output.takeSummary() },
       ),
     );
-    this.deps.toast?.(`Monitor "${entry.description}" timed out; nothing watches this source now.`, "warning");
+    this.deps.toast?.(`Monitor "${entry.description}": timeout elapsed. ${stopDetail}`, "warning");
     this.cleanup(entry);
     this.deps.afterStop?.();
   }
@@ -551,18 +562,21 @@ export class MonitorRegistry {
     entry.stopped = true;
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "rate-limit" });
     const client = this.deps.getClient();
-    await client?.stop(entry.taskId, "rate-limit").catch(() => {});
+    let stopFailed = false;
+    let stopError: unknown;
+    if (client) await client.stop(entry.taskId, "rate-limit").catch((error: unknown) => { stopFailed = true; stopError = error; });
+    const stopDetail = stopFailed ? `Stop request failed: ${String(stopError)}. Exit unconfirmed.` : client ? "Stop requested; exit unconfirmed." : "Stop request unavailable; exit unconfirmed.";
     this.deps.getNotifyCenter()?.notify(
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        entry.overload.stopNotice(),
+        `${entry.overload.stopNotice().replace("Monitor stopped:", "Monitor protection threshold reached:")} ${stopDetail}`,
         "stopped",
         { droppedLines: entry.droppedLinesPending, output: entry.output.takeSummary() },
       ),
     );
     this.deps.toast?.(
-      `Monitor "${entry.description}" stopped — input rate safety backstop.`,
+      `Monitor "${entry.description}": input rate safety backstop. ${stopDetail}`,
       "warning",
     );
     this.cleanup(entry);

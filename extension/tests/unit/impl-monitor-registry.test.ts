@@ -130,6 +130,8 @@ describe("MonitorRegistry saturation", () => {
     clock.advanceBy(TERMINAL_MS);
     const stopWake = terminals().find((wake) => wake.monitors.some((monitor) => monitor.status === "stopped"));
     expect(stopWake?.monitors[0]?.detail).toMatch(/1000 lines\/s|lines\/s for 60s|safety backstop/i);
+    expect(stopWake?.monitors[0]?.detail).toMatch(/Stop requested; exit unconfirmed/);
+    expect(stopWake?.monitors[0]?.detail).not.toMatch(/monitor stopped|was stopped/i);
     expect(events).toContainEqual({ type: "monitor.stop", fields: { id: "mon_1", reason: "rate-limit" } });
     center.dispose();
     registry.disposeAll();
@@ -722,12 +724,12 @@ describe("MonitorRegistry stop handling, from review", () => {
     expect(turns()).toHaveLength(0);
   });
 
-  it("a clean exit right after an event, but stopped from the TUI, still wakes", async () => {
+  it.each(["stopped:tui", "stopped:cli"])("a clean exit right after an event, but %s, still wakes", async (reason) => {
     const { center, clock, registry, turns, statuses } = await setup();
     registry.handleOutput("mon_1", "line a\n");
     clock.advanceBy(300);
     center.settled();
-    registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: 0, end_reason: "tui", duration_ms: 10 });
+    registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: 0, end_reason: reason, duration_ms: 10 });
     clock.advanceBy(TERMINAL_MS);
     expect(statuses()).toEqual(["event", "exited"]);
     expect(turns()).toHaveLength(2);
@@ -866,7 +868,7 @@ describe("MonitorRegistry stores deadline and last output", () => {
     registry.disposeAll();
   });
 
-  it("timeout notice uses unwatched wording after the terminal window", async () => {
+  it("timeout notice reports an unconfirmed exit after the terminal window", async () => {
     const { clock, registry, center, sent } = await start({ timeout_ms: 5_000 });
     clock.advanceBy(5_000);
     await Promise.resolve();
@@ -875,7 +877,7 @@ describe("MonitorRegistry stores deadline and last output", () => {
     expect(beforeWindow).toHaveLength(0);
     clock.advanceBy(10_000);
     const timeout = sent.find((entry) => (entry.details as { kind?: string } | undefined)?.kind === "monitor-terminal");
-    expect(timeout?.content).toMatch(/These monitors have stopped; nothing watches their sources now/);
+    expect(timeout?.content).toMatch(/Timeout elapsed\. Stop requested; exit unconfirmed/);
     expect(timeout?.content).not.toMatch(/re-arm if needed/);
     expect(JSON.stringify(timeout?.details)).not.toMatch(/re-arm if needed/);
     center.dispose();
