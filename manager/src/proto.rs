@@ -240,6 +240,10 @@ pub struct TaskRecord {
     /// The most recent sampling attempt failed; cumulative CPU may be stale.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live_cpu_stale: bool,
+    /// Best-effort resident set size of the live process group, in KiB, from
+    /// the latest sample (daemon responses only; never retained on disk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_rss_kb: Option<u64>,
     /// Human-readable name from the client (monitor `description`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,

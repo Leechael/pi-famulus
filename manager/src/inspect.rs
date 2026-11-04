@@ -482,6 +482,8 @@ pub struct Row {
     pub live_cpu_sampled_at: Option<u64>,
     pub live_cpu_stale: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_rss_kb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<Origin>,
@@ -637,6 +639,7 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         live_cpu_percent: t.live_cpu_percent,
         live_cpu_sampled_at: t.live_cpu_sampled_at,
         live_cpu_stale: t.live_cpu_stale,
+        live_rss_kb: t.live_rss_kb,
         pid: Some(t.pid),
         origin: t.origin.clone(),
         backgrounded_at: t.backgrounded_at,
@@ -674,6 +677,7 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         live_cpu_percent: None,
         live_cpu_sampled_at: None,
         live_cpu_stale: false,
+        live_rss_kb: None,
         pid: None,
         origin: None,
         backgrounded_at: None,

@@ -225,6 +225,27 @@ pub fn pad(s: &str, w: usize) -> String {
     format!("{s}{}", " ".repeat(w - dw))
 }
 
+/// Compact memory size from KiB: `512K`, `12.3M`, `340M`, `1.2G`.
+pub fn human_kib(kb: u64) -> String {
+    const M: u64 = 1024;
+    const G: u64 = 1024 * 1024;
+    let scaled = |v: u64, unit: u64, suffix: &str| {
+        let x = v as f64 / unit as f64;
+        if x < 99.95 {
+            format!("{x:.1}{suffix}")
+        } else {
+            format!("{x:.0}{suffix}")
+        }
+    };
+    if kb < M {
+        format!("{kb}K")
+    } else if kb < G {
+        scaled(kb, M, "M")
+    } else {
+        scaled(kb, G, "G")
+    }
+}
+
 /// "850ms", "12s", "3m04s", "2h03m", "3d04h".
 pub fn human_duration(ms: u64) -> String {
     if ms < 1000 {
@@ -342,6 +363,14 @@ pub fn first_line(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn human_kib_is_compact() {
+        assert_eq!(human_kib(512), "512K");
+        assert_eq!(human_kib(1536), "1.5M");
+        assert_eq!(human_kib(340 * 1024), "340M");
+        assert_eq!(human_kib(1024 * 1024 + 200 * 1024), "1.2G");
+    }
     #[test]
     fn wrap_keeps_the_space_after_a_carried_word() {
         let s = "arrived after your continue; hold STARTING normal prek/source edits under hooks until we coordinate";

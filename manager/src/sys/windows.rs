@@ -625,7 +625,7 @@ pub fn clock_ticks_per_second() -> Option<u64> {
     None
 }
 
-pub fn group_cpu_ticks_by_pgid(_pgids: &[u32]) -> io::Result<std::collections::HashMap<u32, (u64, u64)>> {
+pub fn group_usage_by_pgid(_pgids: &[u32]) -> io::Result<std::collections::HashMap<u32, (u64, u64, u64)>> {
     Ok(std::collections::HashMap::new())
 }
 

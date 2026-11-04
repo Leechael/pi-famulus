@@ -818,25 +818,26 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
             let at = std::time::Instant::now();
             let sampled_at = now_ms();
             let pgids: Vec<u32> = running.iter().map(|(_, pgid)| *pgid).collect();
-            let samples = task::live_group_cpu_ms_many(&pgids);
-            let readings: Vec<(String, Option<task::LiveCpuReading>)> = running
+            let samples = task::live_group_usage_many(&pgids);
+            let readings: Vec<(String, Option<task::LiveCpuReading>, Option<u64>)> = running
                 .into_iter()
                 .map(|(id, pgid)| {
-                    let reading = match samples.get(&pgid).copied().flatten() {
-                        Some((user, system)) => Some(tracker.update(&id, at, user, system)),
+                    let usage = samples.get(&pgid).copied().flatten();
+                    let reading = match usage {
+                        Some(u) => Some(tracker.update(&id, at, u.user_ms, u.system_ms)),
                         None => {
                             tracker.mark_unavailable(&id);
                             None
                         }
                     };
-                    (id, reading)
+                    (id, reading, usage.map(|u| u.rss_kb))
                 })
                 .collect();
             if readings.is_empty() {
                 continue;
             }
             let mut st = state.lock().unwrap();
-            for (id, reading) in readings {
+            for (id, reading, rss_kb) in readings {
                 let Some(entry) = st.registry.tasks.get_mut(&id) else {
                     continue;
                 };
@@ -844,6 +845,7 @@ fn spawn_live_cpu_sampler(state: &Shared) -> tokio::task::JoinHandle<()> {
                     continue;
                 }
                 apply_live_cpu_sample(&mut entry.record, reading, sampled_at);
+                entry.record.live_rss_kb = rss_kb;
             }
         }
     })
@@ -2547,6 +2549,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         live_cpu_percent: None,
         live_cpu_sampled_at: None,
         live_cpu_stale: false,
+        live_rss_kb: None,
         label: label.clone(),
     };
     if let Err(e) = registry::persist_record(&home, &record) {
@@ -5062,6 +5065,7 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         entry.record.live_cpu_percent = None;
         entry.record.live_cpu_sampled_at = None;
         entry.record.live_cpu_stale = false;
+        entry.record.live_rss_kb = None;
         // Why it ended: our kill's reason; otherwise a natural exit.
         entry.record.end_reason = Some(
             entry
@@ -5257,6 +5261,7 @@ async fn graceful_shutdown(state: &Shared) {
                 e.record.live_cpu_percent = None;
                 e.record.live_cpu_sampled_at = None;
                 e.record.live_cpu_stale = false;
+                e.record.live_rss_kb = None;
                 e.record.ended_at = Some(now);
                 e.record.output_size = e.output.lock().unwrap().total_size;
                 e.record.end_reason = Some(

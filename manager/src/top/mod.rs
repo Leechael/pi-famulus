@@ -4,6 +4,7 @@
 //! `--once` was passed. Restoration of the terminal (raw mode, alternate
 //! screen) is guaranteed on return, error, and panic.
 
+pub mod clipboard;
 pub mod collector;
 pub mod live;
 pub mod model;
@@ -13,7 +14,7 @@ use crate::client::{self, HelloMode};
 use crate::proto::{RequestKind, UnitOk};
 use crate::top::collector::{open_detail, CollectView, Collector, Tick};
 use crate::top::live::{LiveCmd, LiveMsg};
-use crate::top::model::{AgentComposer, Chat, Detail, DetailBody, NodeKind, Tab, TabHit, TopState};
+use crate::top::model::{AgentComposer, Chat, CopyRequest, Detail, DetailBody, NodeKind, Tab, TabHit, TopState};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -42,6 +43,35 @@ struct Lease(tokio::task::JoinHandle<()>);
 impl Drop for Lease {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Replacing a copy or leaving the TUI cancels its helper and reaps it.
+struct CopyJob {
+    detail_id: String,
+    pending_notice: String,
+    task: tokio::task::JoinHandle<String>,
+}
+
+impl CopyJob {
+    fn start(request: CopyRequest) -> Self {
+        let pending_notice = format!("copying {}…", request.what);
+        let task = tokio::spawn(async move { copy_notice(request.what, &request.text).await });
+        Self { detail_id: request.detail_id, pending_notice, task }
+    }
+
+    fn apply(&self, state: &mut TopState, notice: String) {
+        if let Some(d) = state.detail.as_mut() {
+            if d.id == self.detail_id && d.notice.as_deref() == Some(self.pending_notice.as_str()) {
+                d.notice = Some(notice);
+            }
+        }
+    }
+}
+
+impl Drop for CopyJob {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -125,6 +155,7 @@ pub async fn run(
         }
     });
 
+    let mut copy_job: Option<CopyJob> = None;
     loop {
         terminal.draw(|f| ui::draw(f, &mut state)).map_err(|e| e.to_string())?;
         let anim = state.wants_anim();
@@ -136,6 +167,11 @@ pub async fn run(
                 }
             }
             Some(msg) = live_rx.recv() => apply_live(&mut state, msg),
+            result = async { (&mut copy_job.as_mut().unwrap().task).await }, if copy_job.is_some() => {
+                let job = copy_job.take().unwrap();
+                let notice = result.unwrap_or_else(|e| format!("copy failed: {e}"));
+                job.apply(&mut state, notice);
+            }
             _ = tokio::time::sleep(Duration::from_millis(80)), if anim => {}
         }
         while let Ok(ev) = ev_rx.try_recv() {
@@ -148,6 +184,9 @@ pub async fn run(
         }
         while let Ok(msg) = live_rx.try_recv() {
             apply_live(&mut state, msg);
+        }
+        if let Some(request) = state.pending_copy.take() {
+            copy_job = Some(CopyJob::start(request));
         }
         sync_live(&mut state, home, &mut live_slot, &live_tx);
         for (op, text) in std::mem::take(&mut state.pending_live) {
@@ -293,6 +332,8 @@ fn open_focused(state: &mut TopState) {
         hits: Vec::new(),
         log: crate::top::model::LogView::default(),
         fold_count: 0,
+        cmd_full: false,
+        notice: None,
     });
 }
 
@@ -705,6 +746,28 @@ fn jump_match(d: &mut Detail, forward: bool) {
     d.scroll = d.log.matches[d.log.current].saturating_sub(d.view_h / 3);
 }
 
+/// Copy `text` and describe the outcome for the detail's bottom border.
+async fn copy_notice(what: &str, text: &str) -> String {
+    if text.is_empty() {
+        return format!("no {what} to copy");
+    }
+    match clipboard::copy(text).await {
+        Ok(clipboard::CopyRoute::Native) => format!("copied {what} to clipboard"),
+        Ok(clipboard::CopyRoute::Osc52) => format!("sent {what} via OSC 52 (unconfirmed)"),
+        Err(e) => e,
+    }
+}
+
+fn queue_copy(d: &mut Detail, what: &'static str, text: String) -> Option<CopyRequest> {
+    if text.is_empty() {
+        d.notice = Some(format!("no {what} to copy"));
+        None
+    } else {
+        d.notice = Some(format!("copying {what}…"));
+        Some(CopyRequest { detail_id: d.id.clone(), what, text })
+    }
+}
+
 /// Typing into a task output's search prompt.
 fn handle_search(d: &mut Detail, key: KeyEvent) {
     match key.code {
@@ -744,6 +807,7 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
         handle_search(d, key);
         return false;
     }
+    d.notice = None;
     match key.code {
         KeyCode::Esc if log && !d.log.query.is_empty() => {
             d.log.query.clear();
@@ -760,6 +824,19 @@ fn handle_detail(state: &mut TopState, key: KeyEvent) -> bool {
         KeyCode::Char('n') if log => jump_match(d, true),
         KeyCode::Char('N') if log => jump_match(d, false),
         KeyCode::Char('b') if log => d.log.show_blank = !d.log.show_blank,
+        KeyCode::Char('e') if log => d.cmd_full = !d.cmd_full,
+        KeyCode::Char('c') if log => {
+            if let DetailBody::Log { info, .. } = &d.body {
+                let text = info.command.clone();
+                state.pending_copy = queue_copy(d, "command", text);
+            }
+        }
+        KeyCode::Char('p') if log => {
+            if let DetailBody::Log { info, .. } = &d.body {
+                let (what, path) = if d.tab == 1 { ("stderr path", info.stderr.clone()) } else { ("stdout path", info.output.clone()) };
+                state.pending_copy = queue_copy(d, what, path);
+            }
+        }
         KeyCode::Char('f') | KeyCode::Char('F') => {
             d.follow = !d.follow;
             d.hold = !d.follow;
@@ -1013,6 +1090,8 @@ mod tests {
             hits: Vec::new(),
             log: LogView::default(),
             fold_count: 0,
+            cmd_full: false,
+            notice: None,
         }
     }
 
@@ -1043,6 +1122,8 @@ mod tests {
             hits: Vec::new(),
             log: LogView::default(),
             fold_count: 0,
+            cmd_full: false,
+            notice: None,
         }
     }
 
@@ -1109,6 +1190,69 @@ mod tests {
         state.message = Some("stopped sh_x".into());
         assert!(!handle_key(&mut state, key(KeyCode::Down), &home).await.unwrap());
         assert_eq!(state.message, None);
+    }
+
+    #[tokio::test]
+    async fn copy_keys_queue_the_full_command_and_selected_stream_without_blocking_quit() {
+        let home = std::env::temp_dir();
+        let mut state = TopState::new(1_000, None, None);
+        let mut detail = log_detail();
+        if let DetailBody::Log { info, .. } = &mut detail.body {
+            info.command = "printf '你好'\necho second line\n".into();
+            info.output = "/tmp/sh_1.output".into();
+            info.stderr = "/tmp/sh_1.stderr".into();
+        }
+        state.detail = Some(detail);
+        assert!(!handle_key(&mut state, key(KeyCode::Char('c')), &home).await.unwrap());
+        let request = state.pending_copy.take().unwrap();
+        assert_eq!(request.detail_id, "sh_1");
+        assert_eq!(request.what, "command");
+        assert_eq!(request.text, "printf '你好'\necho second line\n");
+        assert_eq!(state.detail.as_ref().unwrap().notice.as_deref(), Some("copying command…"));
+        assert!(!handle_key(&mut state, key(KeyCode::Char('p')), &home).await.unwrap());
+        let request = state.pending_copy.take().unwrap();
+        assert_eq!((request.what, request.text.as_str()), ("stdout path", "/tmp/sh_1.output"));
+        handle_key(&mut state, key(KeyCode::Char('2')), &home).await.unwrap();
+        handle_key(&mut state, key(KeyCode::Char('p')), &home).await.unwrap();
+        let request = state.pending_copy.take().unwrap();
+        assert_eq!((request.what, request.text.as_str()), ("stderr path", "/tmp/sh_1.stderr"));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(handle_key(&mut state, ctrl_c, &home).await.unwrap());
+        assert!(state.pending_copy.is_none());
+    }
+
+    #[tokio::test]
+    async fn copy_completion_does_not_overwrite_dismissed_notices_or_another_detail() {
+        let mut state = TopState::new(1_000, None, None);
+        let mut detail = log_detail();
+        detail.notice = Some("copying command…".into());
+        state.detail = Some(detail);
+        let job = CopyJob {
+            detail_id: "sh_1".into(),
+            pending_notice: "copying command…".into(),
+            task: tokio::spawn(std::future::pending()),
+        };
+        job.apply(&mut state, "copied command to clipboard".into());
+        assert_eq!(state.detail.as_ref().unwrap().notice.as_deref(), Some("copied command to clipboard"));
+        handle_detail(&mut state, key(KeyCode::Down));
+        job.apply(&mut state, "late completion".into());
+        assert!(state.detail.as_ref().unwrap().notice.is_none());
+        let d = state.detail.as_mut().unwrap();
+        d.id = "sh_2".into();
+        d.notice = Some("copying command…".into());
+        job.apply(&mut state, "another late completion".into());
+        assert_eq!(state.detail.as_ref().unwrap().notice.as_deref(), Some("copying command…"));
+    }
+
+    #[test]
+    fn typing_c_and_p_in_search_does_not_copy() {
+        let mut state = TopState::new(1_000, None, None);
+        state.detail = Some(log_detail());
+        for ch in ['/', 'c', 'p'] {
+            handle_detail(&mut state, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(state.detail.as_ref().unwrap().log.query, "cp");
+        assert!(state.pending_copy.is_none());
     }
 
     #[test]
