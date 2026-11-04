@@ -13,6 +13,8 @@ Execute bash commands (ls, grep, find, etc.)
 - <!--seg:rules.pi-env-->You can inspect PI_* environment variables for current model and session details.<!--/seg-->
 - <!--seg:rules.bash-no-poll-->Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them.<!--/seg--> End your turn (a reply with no tool call) and resume from the task wake when it arrives.
 
+- Use bash only to perform concrete work or obtain needed information, never to occupy time while awaiting an event. No-op commands such as `true` or `:` do not wait for background work or yield control. If no actionable work remains, end your response without a tool call; the notification will resume you.
+
 # param: command
 
 The bash command to execute
