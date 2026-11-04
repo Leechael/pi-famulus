@@ -84,13 +84,15 @@ pub enum SortKey {
     Wall,
     Tasks,
     Tokens,
+    Mem,
     Time,
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 6] = [
+    pub const ALL: [SortKey; 7] = [
         SortKey::Cpu,
         SortKey::Now,
+        SortKey::Mem,
         SortKey::Wall,
         SortKey::Tasks,
         SortKey::Tokens,
@@ -114,6 +116,7 @@ impl SortKey {
             SortKey::Wall => "WALL",
             SortKey::Tasks => "TASKS",
             SortKey::Tokens => "TOKENS",
+            SortKey::Mem => "MEM",
             SortKey::Time => "TIME",
         }
     }
@@ -155,6 +158,7 @@ pub enum Col {
     Wall,
     Cpu,
     Now,
+    Mem,
     Cores,
     TokIo,
     TokS,
@@ -182,6 +186,7 @@ impl Col {
             Col::Wall => "WALL",
             Col::Cpu => "CPU",
             Col::Now => "NOW%",
+            Col::Mem => "MEM",
             Col::Cores => "CORES",
             Col::TokIo => "TOK I/O",
             Col::TokS => "TOK/S",
@@ -207,7 +212,7 @@ impl Col {
             Col::CwdModel => 20,
             Col::Status => 9,
             Col::Tasks => 5,
-            Col::Wall | Col::Cpu | Col::Dur => 6,
+            Col::Wall | Col::Cpu | Col::Dur | Col::Mem => 6,
             Col::Now | Col::Cores => 5,
             Col::TokIo | Col::Cache => 11,
             Col::TokS => 6,
@@ -264,6 +269,7 @@ pub fn tree_cols(w: WidthClass) -> &'static [Col] {
             Col::Wall,
             Col::Cpu,
             Col::Now,
+            Col::Mem,
             Col::Cores,
             Col::TokIo,
             Col::TokS,
@@ -276,6 +282,7 @@ pub fn tree_cols(w: WidthClass) -> &'static [Col] {
             Col::Wall,
             Col::Cpu,
             Col::Now,
+            Col::Mem,
             Col::Cores,
             Col::TokIo,
             Col::TokS,
@@ -292,7 +299,7 @@ pub fn agent_cols(w: WidthClass) -> &'static [Col] {
 
 pub fn task_cols(w: WidthClass) -> &'static [Col] {
     match w {
-        WidthClass::Compact => &[Col::Id, Col::Kind, Col::Status, Col::Dur, Col::Now, Col::TokIo, Col::Title],
+        WidthClass::Compact => &[Col::Id, Col::Kind, Col::Status, Col::Dur, Col::Now, Col::Mem, Col::TokIo, Col::Title],
         WidthClass::Standard => &[
             Col::Id,
             Col::Kind,
@@ -300,6 +307,7 @@ pub fn task_cols(w: WidthClass) -> &'static [Col] {
             Col::Dur,
             Col::Cpu,
             Col::Now,
+            Col::Mem,
             Col::TokIo,
             Col::Sess,
             Col::Cwd,
@@ -314,6 +322,7 @@ pub fn task_cols(w: WidthClass) -> &'static [Col] {
             Col::Dur,
             Col::Cpu,
             Col::Now,
+            Col::Mem,
             Col::Sess,
             Col::Cwd,
             Col::Cores,
@@ -347,6 +356,10 @@ pub struct Metrics {
     pub cpu_ms: Option<u64>,
     pub cpu_now: Option<f64>,
     pub cpu_stale: bool,
+    /// Current resident memory in KiB, summed over running tasks below.
+    pub mem_kb: Option<u64>,
+    /// A finished task's peak RSS in KiB (largest single process); leaves only.
+    pub peak_kb: Option<u64>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
     pub tok_s: Option<f64>,
@@ -434,6 +447,8 @@ pub struct Header {
     pub tasks_ag: usize,
     pub cpu_now: Option<f64>,
     pub cpu_tot: Option<u64>,
+    /// Current resident memory of all running tasks, in KiB.
+    pub mem_now: Option<u64>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
     pub tok_s: Option<f64>,
@@ -462,6 +477,7 @@ impl Default for Header {
             tasks_ag: 0,
             cpu_now: None,
             cpu_tot: None,
+            mem_now: None,
             tokens_in: None,
             tokens_out: None,
             tok_s: None,
@@ -555,7 +571,14 @@ pub struct TaskInfo {
     pub work_kind: String,
     pub exit: Option<String>,
     pub reason: Option<String>,
+    /// Absolute path of the stdout (merged output) file.
     pub output: String,
+    /// Absolute path of the stderr file.
+    pub stderr: String,
+    /// Current RSS of the running process group, KiB.
+    pub mem_kb: Option<u64>,
+    /// Peak RSS of the largest process once finished, KiB.
+    pub peak_kb: Option<u64>,
 }
 
 impl Eq for TaskInfo {}
@@ -607,6 +630,10 @@ pub struct Detail {
     pub log: LogView,
     /// Foldable blocks in the chat from the last draw (for expand-all).
     pub fold_count: usize,
+    /// `e` shows the task's full command (every line, wrapped) and full paths.
+    pub cmd_full: bool,
+    /// One-shot feedback (e.g. after a copy), shown until the next key.
+    pub notice: Option<String>,
 }
 
 /// Click target for one foldable header. Coordinates are relative to the chat pane.
@@ -615,6 +642,14 @@ pub struct FoldHit {
     pub id: usize,
     pub x0: u16,
     pub x1: u16,
+}
+
+/// Clipboard work queued by a key, performed outside the UI event handler.
+#[derive(Debug)]
+pub struct CopyRequest {
+    pub detail_id: String,
+    pub what: &'static str,
+    pub text: String,
 }
 
 #[derive(Debug)]
@@ -662,6 +697,7 @@ pub struct TopState {
     pub composer: Option<AgentComposer>,
     /// Commands the UI loop should hand to the live watch (`op`, `text`).
     pub pending_live: Vec<(String, String)>,
+    pub pending_copy: Option<CopyRequest>,
 }
 
 /// What the user is typing to a hosted subagent, plus the header facts.
@@ -748,6 +784,7 @@ impl TopState {
             focus: None,
             composer: None,
             pending_live: Vec::new(),
+            pending_copy: None,
         }
     }
 
@@ -877,6 +914,11 @@ impl TopState {
                 .count(),
             cpu_now: tot.cpu_now_percent,
             cpu_tot: (tot.measured > 0).then(|| tot.cpu_ms()),
+            mem_now: snap
+                .tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Running)
+                .fold(None, |acc, t| add_partial(acc, t.live_rss_kb)),
             tokens_in,
             tokens_out,
             tok_s: inspect::pooled_output_tokens_per_second(
@@ -1680,6 +1722,8 @@ fn task_node(t: &TaskRecord, now: u64) -> Node {
             cpu_ms: cpu,
             cpu_now,
             cpu_stale,
+            mem_kb: if running { t.live_rss_kb } else { None },
+            peak_kb: if running { None } else { t.max_rss_kb },
             running,
             started_at: t.started_at,
             active_at: t.ended_at.unwrap_or(t.started_at),
@@ -1761,6 +1805,7 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
             m.queue_ms = add_partial(m.queue_ms, cn.metrics.queue_ms);
         }
         m.cpu_ms = add_partial(m.cpu_ms, cn.metrics.cpu_ms);
+        m.mem_kb = add_partial(m.mem_kb, cn.metrics.mem_kb);
         merge_now(&mut m, &cn.metrics);
         m.running |= cn.metrics.running;
         if cn.metrics.started_at > 0 {
@@ -1782,6 +1827,7 @@ fn rollup(nodes: &mut HashMap<String, Node>, id: &str) {
         n.metrics.cpu_ms = m.cpu_ms;
         n.metrics.cpu_now = m.cpu_now;
         n.metrics.cpu_stale = m.cpu_stale;
+        n.metrics.mem_kb = m.mem_kb;
         n.metrics.running = m.running;
         n.metrics.started_at = m.started_at;
         n.metrics.active_at = m.active_at;
@@ -1889,6 +1935,7 @@ fn cmp_metrics(a: &Metrics, b: &Metrics, key: SortKey, desc: bool) -> Ordering {
     let rest = [
         SortKey::Now,
         SortKey::Cpu,
+        SortKey::Mem,
         SortKey::Wall,
         SortKey::Tasks,
         SortKey::Tokens,
@@ -1911,6 +1958,7 @@ fn cmp_key(a: &Metrics, b: &Metrics, key: SortKey) -> Ordering {
         SortKey::Wall => a.wall_ms.cmp(&b.wall_ms),
         SortKey::Tasks => a.tasks.cmp(&b.tasks),
         SortKey::Tokens => a.tokens_out.unwrap_or(0).cmp(&b.tokens_out.unwrap_or(0)),
+        SortKey::Mem => a.mem_kb.or(a.peak_kb).unwrap_or(0).cmp(&b.mem_kb.or(b.peak_kb).unwrap_or(0)),
         SortKey::Time => a.active_at.cmp(&b.active_at),
     }
 }
@@ -1937,6 +1985,8 @@ fn row_metrics(r: &Row) -> Metrics {
         cpu_ms: cpu,
         cpu_now: if r.live_cpu_stale { None } else { r.live_cpu_percent },
         cpu_stale: r.live_cpu_stale,
+        mem_kb: if r.running { r.live_rss_kb } else { None },
+        peak_kb: if r.running { None } else { r.max_rss_kb },
         running: r.running,
         started_at: r.started_at.unwrap_or(0),
         active_at: r.active_at.unwrap_or(0),
@@ -2044,6 +2094,7 @@ mod tests {
             live_cpu_percent: now_pct,
             live_cpu_sampled_at: now_pct.map(|_| 2_000),
             live_cpu_stale: false,
+            live_rss_kb: None,
             label: None,
         }
     }
