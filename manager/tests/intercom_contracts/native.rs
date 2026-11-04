@@ -19,17 +19,25 @@ listener.bind(sys.argv[1])
 os.chmod(sys.argv[1], 0o600)
 listener.listen(16)
 print(json.dumps({'fixture_ready': True}), flush=True)
+# Read stdin at the fd level: sys.stdin.readline() buffers every line the
+# pipe holds, select() then no longer reports the fd ready, and a second
+# send_to written back to back is never acted on.
+stdin = sys.stdin.fileno()
+pending = b''
 while True:
-    ready, _, _ = select.select([listener, sys.stdin], [], [], 0.1)
-    if sys.stdin in ready:
-        line = sys.stdin.readline()
-        if not line:
+    ready, _, _ = select.select([listener, stdin], [], [], 0.1)
+    if stdin in ready:
+        chunk = os.read(stdin, 65536)
+        if not chunk:
             break
-        command = json.loads(line)
-        with socket.socket(socket.AF_UNIX) as outgoing:
-            outgoing.settimeout(2)
-            outgoing.connect(command['send_to'])
-            outgoing.sendall((json.dumps(command['frame'])+'\n').encode())
+        pending += chunk
+        while b'\n' in pending:
+            line, pending = pending.split(b'\n', 1)
+            command = json.loads(line)
+            with socket.socket(socket.AF_UNIX) as outgoing:
+                outgoing.settimeout(2)
+                outgoing.connect(command['send_to'])
+                outgoing.sendall((json.dumps(command['frame'])+'\n').encode())
     if listener in ready:
         stream, _ = listener.accept()
         with stream:
@@ -735,7 +743,7 @@ impl CodexPeer {
     }
 
     pub(super) fn request(&self, method: &str) -> Value {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
         loop {
             let request = self
                 .requests

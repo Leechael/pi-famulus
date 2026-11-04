@@ -256,9 +256,9 @@ fn g9_response_of_exactly_max_frame_is_delivered() {
     assert_eq!(r["error"]["code"], "E_NOT_FOUND", "4 MiB response was replaced");
 }
 
-/// CPU time used by `pid` so far, in milliseconds (`ps -o time=`).
-/// How many of `n` back-to-back scheduler-state samples (`ps -o stat=`,
-/// Linux and macOS) found `pid` runnable (`R`).
+/// How many of `n` back-to-back scheduler-state samples (`ps -o stat=`)
+/// found `pid` runnable (`R`).
+#[cfg(not(target_os = "linux"))]
 fn runnable_samples(pid: u32, n: usize) -> usize {
     (0..n)
         .filter(|_| {
@@ -432,11 +432,24 @@ fn g14_guardian_runner_does_not_spin() {
     let gc = wait_for_pids(&mut c, &id, 1)[0];
     assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "completed");
     assert!(pid_running(runner), "the runner guards the leftover child");
-    // Sampled, not timed: a spinning runner is runnable (R) whenever it is
-    // looked at, a guarding one is blocked (S). Back-to-back samples, no
-    // measurement window.
-    let running = runnable_samples(runner, 40);
-    // gc is the background child's pid, not a process-group id.
-    kill_pid(gc, libc::SIGKILL);
-    assert!(running <= 4, "guardian runner was runnable in {running}/40 samples: it spins");
+    #[cfg(target_os = "linux")]
+    {
+        // R includes a healthy guardian scanning /proc or waiting for CPU.
+        // Observe its actual sleep instead: a guardian with the sleep removed
+        // may block in I/O, but never waits in hrtimer_nanosleep.
+        let mut wchan = String::new();
+        let sleeping = poll_true(S(5), || {
+            wchan = std::fs::read_to_string(format!("/proc/{runner}/wchan")).expect("read guardian wchan");
+            wchan.trim() == "hrtimer_nanosleep"
+        });
+        // gc is the background child's pid, not a process-group id.
+        kill_pid(gc, libc::SIGKILL);
+        assert!(sleeping, "guardian runner never entered nanosleep (last wchan: {wchan:?})");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let running = runnable_samples(runner, 40);
+        kill_pid(gc, libc::SIGKILL);
+        assert!(running <= 4, "guardian runner was runnable in {running}/40 samples: it spins");
+    }
 }

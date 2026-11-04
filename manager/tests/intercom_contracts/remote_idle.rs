@@ -281,7 +281,7 @@ fn remote_idle_ownership_snapshot_omits_internal_directory_fields() {
     assert_eq!(subscribed["status"], "subscribed");
     // The daemon also snapshots periodically, so skip earlier (pre-registration)
     // snapshots until the ownership snapshot that carries the local target.
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
     let mut sessions = Vec::new();
     while !sessions.iter().any(|row: &Value| row["id"] == "pi/target") {
         assert!(

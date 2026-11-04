@@ -26,19 +26,20 @@ test('collects exactly the test executables cargo built, including custom harnes
 });
 
 test('schedules every binary once: longest first, load-sensitive suites alone at the end', () => {
-  const names = ['cli', 'timing_canary', 'backpressure', 'zzz_new', 'intercom', 'lifecycle_adversarial', 'pi-famulus'];
+  const names = ['cli', 'timing_canary', 'backpressure', 'zzz_new', 'intercom', 'lifecycle_adversarial', 'lifecycle_stress', 'pi-famulus'];
   const { parallel, solo } = schedule(names.map(name => ({ name })));
   assert.deepEqual(parallel.map(b => b.name), ['intercom', 'pi-famulus', 'cli', 'zzz_new']);
-  assert.deepEqual(solo.map(b => b.name), ['lifecycle_adversarial', 'backpressure', 'timing_canary']);
+  assert.deepEqual(solo.map(b => b.name), ['lifecycle_stress', 'lifecycle_adversarial', 'backpressure', 'timing_canary']);
   assert.equal(parallel.length + solo.length, names.length);
 });
 
 test('every suite that documents a wall-clock or CPU-saturation contract runs alone', () => {
-  // backpressure was split from lifecycle_adversarial so its latency bound
-  // never measures the CPU burners; timing_canary pins real durations.
+  // backpressure was split out so its latency bound never measures the CPU
+  // burners, which live alone in lifecycle_stress; lifecycle_adversarial and
+  // timing_canary pin real durations.
   const header = readFileSync(new URL('../manager/tests/backpressure.rs', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
-  assert.match(header, /lifecycle_adversarial deliberately\n\/\/! saturates every CPU/);
-  for (const name of ['lifecycle_adversarial', 'backpressure', 'timing_canary']) assert.ok(SOLO.includes(name), name);
+  assert.match(header, /lifecycle_stress deliberately\n\/\/! saturates every CPU/);
+  for (const name of ['lifecycle_stress', 'lifecycle_adversarial', 'backpressure', 'timing_canary']) assert.ok(SOLO.includes(name), name);
 });
 
 test('overlaps binaries on Unix but keeps Windows sequential', () => {

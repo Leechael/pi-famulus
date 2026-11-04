@@ -243,12 +243,12 @@ impl WssRelay {
     fn registered(&self, fixture: &Fixture) {
         assert!(
             self.handshakes
-                .recv_timeout(TIMEOUT)
+                .recv_timeout(RESPONSE_TIMEOUT)
                 .expect("TLS13/WebSocket handshake"),
             "TLS13 connection was rejected: {}",
             fixture.log()
         );
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
         loop {
             let request = self
                 .requests

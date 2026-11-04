@@ -47,7 +47,7 @@ fn http(
         }
         // The MCP listener binds after the local socket the fixture waits for;
         // a refused connect sent nothing, so retrying it is safe.
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
         let response = loop {
             match request.try_clone().unwrap().send().await {
                 Err(error) if error.is_connect() && Instant::now() < deadline => {
@@ -717,7 +717,7 @@ impl WireRelay {
     }
 
     pub(super) fn request(&self, kind: &str) -> Value {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
         loop {
             let frame = self
                 .requests

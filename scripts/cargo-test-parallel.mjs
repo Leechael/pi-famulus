@@ -13,9 +13,9 @@
 // - ordinary binaries start longest-first, at most PI_FAMULUS_TEST_JOBS at a
 //   time, each with libtest's own default thread count;
 // - SOLO binaries then run one by one with the machine to themselves. They
-//   either load every CPU on purpose (lifecycle_adversarial) or assert
-//   wall-clock bounds that must not measure other suites' load (backpressure,
-//   timing_canary). tests/backpressure.rs was split out for exactly that
+//   either load every CPU on purpose (lifecycle_stress) or assert wall-clock
+//   bounds that must not measure other suites' load (lifecycle_adversarial,
+//   backpressure, timing_canary). tests/backpressure.rs was split out for exactly that
 //   reason; overlapping it with anything reintroduces the problem;
 // - each binary's output is buffered and printed whole when it finishes, in
 //   a collapsible group on GitHub Actions, followed by a duration table.
@@ -36,6 +36,7 @@ const manager = join(dirname(fileURLToPath(import.meta.url)), '..', 'manager');
 const WEIGHT = {
   intercom: 180,
   lifecycle_adversarial: 80,
+  lifecycle_stress: 30,
   'pi-famulus': 35,
   backpressure: 35,
   upgrade: 32,
@@ -47,7 +48,7 @@ const WEIGHT = {
   startup_retry: 10,
 };
 // Never overlapped with anything; see the header.
-export const SOLO = ['lifecycle_adversarial', 'backpressure', 'timing_canary'];
+export const SOLO = ['lifecycle_stress', 'lifecycle_adversarial', 'backpressure', 'timing_canary'];
 
 export function defaultJobs(platform = process.platform, cpus = availableParallelism()) {
   if (platform === 'win32') return 1;

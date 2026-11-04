@@ -6,7 +6,7 @@
 //! asserts the customer-visible invariant: which processes are alive, which
 //! files exist, what the wire says. No crate internals are used.
 //!
-//! Tests d2, d3, d12, t5b, t6b, t6c, o3, o4 began as `#[ignore = "bug: …"]`
+//! Tests d3, d12, t5b, t6b, t6c, o3, o4 began as `#[ignore = "bug: …"]`
 //! reproducers that failed against the original code. Each bug is fixed and
 //! the test now guards the fix; see manager/TESTING.md "Bugs found".
 
@@ -114,38 +114,6 @@ fn lifetime_lock_free_path(path: &std::path::Path) -> bool {
     unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
-/// Everything the diagnostics of a failed D1 round need. Capture a sample
-/// before `Home::drop` cleans up a still-live daemon; substring matches on the
-/// home path are unsafe (`...-d1` also matches `...-d15`).
-fn d1_diagnostics(home: &Home) -> String {
-    let pids = daemon_pids_for(&home.path);
-    let processes: Vec<String> = pids
-        .iter()
-        .map(|pid| {
-            let pid_arg = pid.to_string();
-            let ps = common::command("ps")
-                .args(["-p", pid_arg.as_str(), "-o", "pid=,ppid=,state=,command="])
-                .output();
-            let ps = ps
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_else(|e| e.to_string());
-            #[cfg(target_os = "macos")]
-            let sample = common::command("sample")
-                .args([pid_arg.as_str(), "1"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_else(|e| e.to_string());
-            #[cfg(not(target_os = "macos"))]
-            let sample = "sample unavailable on this platform".to_string();
-            format!("pid={pid}: ps={ps}\nsample:\n{sample}")
-        })
-        .collect();
-    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
-    format!(
-        "pidfile={:?}; live daemon pids={pids:?}; processes={processes:#?}\nmanager.log:\n{log}",
-        home.pidfile_pid()
-    )
-}
 
 /// D1: N clients race to auto-spawn the daemon on an empty home.
 ///
@@ -195,7 +163,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                 "round {round}: client failed: {} {}\n{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
-                d1_diagnostics(&home)
+                daemon_diagnostics(&home)
             );
             let stdout = String::from_utf8_lossy(&out.stdout);
             let task_id = stdout
@@ -215,7 +183,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
             panic!(
                 "round {round}: daemon count did not converge to 1 within 2s: {:?}\n{}",
                 daemon_pids_for(&home.path),
-                d1_diagnostics(&home)
+                daemon_diagnostics(&home)
             );
         };
 
@@ -237,7 +205,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
             assert!(
                 served.contains(&sid.as_str()),
                 "round {round}: client {sid} was not served by the surviving daemon {daemon}: {st}\n{}",
-                d1_diagnostics(&home)
+                daemon_diagnostics(&home)
             );
         }
         // All clients have returned from `start`, not necessarily from their
@@ -258,12 +226,12 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
             poll_true(S(5), || lifetime_lock_free(&home)),
             "round {round}: manager.lock stayed held after shutdown (pid {daemon} alive={})\n{}",
             pid_running(daemon),
-            d1_diagnostics(&home)
+            daemon_diagnostics(&home)
         );
         assert!(
             poll_true(S(10), || daemon_pids_for(&home.path).is_empty()),
             "round {round}: a pi-famulus daemon outlived shutdown\n{}",
-            d1_diagnostics(&home)
+            daemon_diagnostics(&home)
         );
     }
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
@@ -271,134 +239,6 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
         "d1: redundant daemons that exited \"already running\": {}",
         log.matches("already running").count()
     );
-}
-
-/// CPU burners for race reproducers; killed on drop. Drop never runs when the
-/// test binary itself is killed (Ctrl-C, a timeout), so each burner also spins
-/// only while its parent is alive: an orphan exits instead of pinning a core.
-struct Burners(Vec<std::process::Child>);
-impl Burners {
-    fn start() -> Burners {
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Burners(
-            (0..n)
-                .map(|_| {
-                    common::command("sh")
-                        .args(["-c", "while kill -0 $PPID 2>/dev/null; do :; done"])
-                        .spawn()
-                        .unwrap()
-                })
-                .collect(),
-        )
-    }
-}
-impl Drop for Burners {
-    fn drop(&mut self) {
-        for b in self.0.iter_mut() {
-            let _ = b.kill();
-            let _ = b.wait();
-        }
-    }
-}
-
-/// Failure-only snapshot: distinguish a rejected singleton claim from a slow
-/// startup or a missing/unlinked socket. This is diagnostics, not a race fix.
-fn d2_diagnostics(home: &Home, old: u32) -> String {
-    use std::os::unix::io::AsRawFd;
-    let files: Vec<_> = ["manager.sock", "manager.pid", "manager.pid.tmp", "manager.lock", "manager.spawn.lock"]
-        .iter()
-        .map(|name| format!("{name}: {:?}", std::fs::symlink_metadata(home.path.join(name))))
-        .collect();
-    let locks: Vec<_> = ["manager.lock", "manager.spawn.lock"]
-        .iter()
-        .map(|name| {
-            let result = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(home.path.join(name))
-                .map(|f| {
-                    // SAFETY: probe an fd we own; a successful lock is released
-                    // when f drops. Never unlink or create a lock file here.
-                    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                        "free".to_string()
-                    } else {
-                        format!("probe failed: {}", std::io::Error::last_os_error())
-                    }
-                });
-            format!("{name}: {result:?}")
-        })
-        .collect();
-    format!(
-        "old pid={old} running={}; files={files:#?}; locks={locks:#?}; raw pidfile={:?}\n{}",
-        pid_running(old),
-        std::fs::read_to_string(home.pidfile()),
-        d1_diagnostics(home)
-    )
-}
-
-/// D2: the same race, but starting from stale socket/pid files left by a
-/// SIGKILLed daemon. Regression guard: clients used to delete "zombie" files
-/// themselves, and a slow one could unlink the socket of the daemon a faster
-/// client had just spawned. Invariant: every client succeeds, and exactly one
-/// reachable daemon remains.
-#[test]
-fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
-    let home = Home::new("d2");
-    // Scheduler pressure widens the microsecond race window the way a busy
-    // laptop does; without it the race needs many rounds to show.
-    let _burn = Burners::start();
-    for round in 0..30 {
-        // Leave stale files behind: start a daemon, SIGKILL it.
-        let out = home.cli(&["ls"], S(10));
-        assert!(out.status.success());
-        let old = home.pidfile_pid().expect("pid file");
-        kill_pid(old, libc::SIGKILL);
-        assert!(poll_true(S(3), || !pid_running(old)));
-        assert!(home.sock().exists() && home.pidfile().exists(), "stale files expected");
-
-        let kids: Vec<_> = (0..24)
-            .map(|_| {
-                common::famulus_command(BIN)
-                    .arg("--home")
-                    .arg(&home.path)
-                    .arg("ls")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-        let mut failures = Vec::new();
-        for k in kids {
-            let out = k.wait_with_output().unwrap();
-            if !out.status.success() {
-                failures.push(String::from_utf8_lossy(&out.stderr).to_string());
-            }
-        }
-        let mut live = daemon_pids_for(&home.path);
-        assert!(
-            failures.is_empty(),
-            "round {round}: clients failed: {failures:?}\n{}",
-            d2_diagnostics(&home, old)
-        );
-        let mut c = home.connect();
-        let h = c.hello_cli();
-        // A losing spawn can still be finishing its bounded lifetime-lock
-        // retry after every CLI has connected to the winner. Wait for those
-        // non-serving contenders to exit before asserting the process count.
-        // Same scheduling slack as d3: a loaded darwin-x64 runner can still
-        // be retrying after 15s.
-        assert!(poll_true(S(45), || {
-            live = daemon_pids_for(&home.path);
-            live.len() <= 1
-        }), "round {round}: daemon contenders did not settle\n{}", d2_diagnostics(&home, old));
-        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}\n{}", d2_diagnostics(&home, old));
-        // The survivor must own the well-known socket; the retained client
-        // also prevents idle shutdown while contenders finish their retries.
-        assert_eq!(h["pid"].as_u64().map(|p| p as u32), Some(live[0]), "round {round}: socket owner\n{}", d2_diagnostics(&home, old));
-        drop(c);
-    }
 }
 
 /// D3: several `daemon` processes started at the same instant (bypassing the

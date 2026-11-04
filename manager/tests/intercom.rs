@@ -42,6 +42,11 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 const TIMEOUT: Duration = Duration::from_secs(8);
+/// Wall-clock bound for a reply or frame that needs no daemon time (an RPC
+/// response, a relay or native frame the daemon is already sending). It only
+/// detects a hang, so it is generous: 8s failed on darwin runners whose cores
+/// other test binaries were sharing, and a passing run never waits for it.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Outlasts the 750ms idle settle plus two 250ms maintenance ticks (daemon
 /// time: stepped on the manual clock, see `Peer::quiet_for`).
 const IDLE_QUIET_MS: u64 = 1500;
@@ -711,7 +716,7 @@ impl Peer {
     }
 
     fn write(&mut self, value: &Value) {
-        self.try_write(value, Instant::now() + TIMEOUT).unwrap();
+        self.try_write(value, Instant::now() + RESPONSE_TIMEOUT).unwrap();
     }
 
     fn try_read(&mut self, deadline: Instant) -> std::io::Result<Value> {
@@ -755,7 +760,7 @@ impl Peer {
     }
 
     fn read(&mut self) -> Value {
-        self.try_read(Instant::now() + TIMEOUT)
+        self.try_read(Instant::now() + RESPONSE_TIMEOUT)
             .expect("read JSONL response before deadline")
     }
 
@@ -779,7 +784,7 @@ impl Peer {
     }
 
     fn call(&mut self, request: Value) -> Value {
-        self.try_call(request, Instant::now() + TIMEOUT)
+        self.try_call(request, Instant::now() + RESPONSE_TIMEOUT)
             .expect("intercom RPC response before deadline")
     }
 
