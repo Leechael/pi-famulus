@@ -144,7 +144,7 @@ pub struct AgentPermit {
     pub(crate) turn_started: bool,
 }
 
-pub(crate) struct UndeliveredGrant {
+pub struct UndeliveredGrant {
     child_id: String,
     queued_behind: Option<u64>,
     /// None: the parent session's connection. Some: that hosted child only.
