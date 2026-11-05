@@ -6,8 +6,12 @@ part of the manager's workspace, CI, or npm packages.
 
 ```sh
 cd gui
-cargo run          # AppKit on macOS, GTK 4 on Linux, Win32 on Windows
+cargo run                      # AppKit on macOS, GTK 4 on Linux, Win32 on Windows
+nsh package --target macos     # -> .nsh/out/pi-famulus.app (ad hoc signed)
 ```
+
+`nsh package` needs the nsh CLI at the same version as the crates (0.4.0). The crate follows
+nsh's Rust template: `src/lib.rs` holds `#[native_module]`, and `nsh.json` names the root (`App`).
 
 `rust-toolchain.toml` pins Rust 1.99.1, because nsh-core 0.4.0 uses `isolate_lowest_one`,
 which Rust 1.95 does not have as a stable API. The manager still builds with plain `stable`.
@@ -32,8 +36,10 @@ which Rust 1.95 does not have as a stable API. The manager still builds with pla
 - `cargo build` pulls a newer tokio than `manager/Cargo.lock` pins, and that version
   deprecates `AsyncFd::new` (`manager/src/intercom/native/alias.rs`). The warning shows up
   only in the GUI build.
-- An unbundled binary is not a macOS app. Screenshots and other tooling need an `.app`
-  bundle, which `nsh package --target macos` produces.
+- `nsh package --target macos` builds a 46 MB ad hoc signed `.app` with the repo logo as its
+  icon. The Rust crate took 56 s to build and the macOS runner 2 min 41 s, on a cold cache.
+- The packaged release build used more, not less: about 837 MB RSS, and CPU between 2% and
+  26% in 3-second samples. Per-row native views remain the main cost.
 
 ## Not done
 

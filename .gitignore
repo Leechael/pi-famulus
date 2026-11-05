@@ -37,3 +37,6 @@ tmp/
 
 # Local git worktrees
 .worktree/
+
+# nsh run / nsh package output
+.nsh/

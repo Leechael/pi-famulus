@@ -9,12 +9,11 @@ use nsh_platform_macos as platform;
 #[cfg(target_os = "windows")]
 use nsh_platform_windows as platform;
 
-mod app;
 
 fn main() -> impl std::process::Termination {
     env_logger::init();
     platform::run_app(
-        platform::AppSource::Rust(platform::Root::of::<app::App>()),
+        platform::AppSource::Rust(platform::Root::of::<pi_famulus_gui::App>()),
         platform::AppOptions {
             title: "pi-famulus".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
