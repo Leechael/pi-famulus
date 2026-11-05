@@ -16,6 +16,10 @@ pi-famulus = { path = "../manager" }
 nsh-core = "0.4.0"
 nsh-base = "0.4.0"
 env_logger = "0.11"
+# The TUI's view types, at the versions the manager uses.
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nsh-platform-macos = { version = "0.4.0", default-features = false }

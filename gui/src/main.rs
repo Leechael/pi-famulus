@@ -18,7 +18,7 @@ fn main() -> impl std::process::Termination {
             title: "pi-famulus".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             app_id: "network.phala.pi-famulus".to_owned(),
-            size: (900, 560),
+            size: (1280, 820),
             ..Default::default()
         },
     )

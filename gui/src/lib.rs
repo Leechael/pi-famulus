@@ -4,6 +4,8 @@
 use nsh_core::prelude::*;
 
 mod app;
+mod engine;
+mod keys;
 
 pub use app::App;
 

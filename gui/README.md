@@ -1,8 +1,8 @@
 # pi-famulus GUI (spike)
 
-A native desktop window that shows the same task list as `pi-famulus top`, built on
-[NSH](https://nsh.dev/docs/) 0.4.0. It is a spike, not a shipped component: it is not
-part of the manager's workspace, CI, or npm packages.
+`pi-famulus top` in a native desktop window, built on [NSH](https://nsh.dev/docs/) 0.4.0. It
+has the same screens, page flow and keys as the TUI. It is a spike, not a shipped component:
+it is not part of the manager's workspace, CI, or npm packages.
 
 ```sh
 cd gui
@@ -12,35 +12,58 @@ nsh package --target macos     # -> .nsh/out/pi-famulus.app (ad hoc signed)
 
 `nsh package` needs the nsh CLI at the same version as the crates (0.4.0). The crate follows
 nsh's Rust template: `src/lib.rs` holds `#[native_module]`, and `nsh.json` names the root (`App`).
-
 `rust-toolchain.toml` pins Rust 1.99.1, because nsh-core 0.4.0 uses `isolate_lowest_one`,
 which Rust 1.95 does not have as a stable API. The manager still builds with plain `stable`.
 
-## How it is wired
+## Same behavior as the TUI, by construction
 
-- `manager` now has a library target (`src/lib.rs`), and `main.rs` imports it. The GUI
-  depends on `pi-famulus` by path and reuses `top::collector::Collector` directly. Nothing in
-  `top::{model,collector,live}` depends on ratatui.
-- `spawn` runs on NSH's engine thread and owns the signals. `background` is `tokio::spawn`
-  on NSH's own multi-thread runtime, which is built with `enable_all`. The collector's IPC
-  and disk reads run there. The collector moves into each tick and comes back with the
-  result, so no lock is needed. See `src/app.rs`.
+The TUI and the GUI drive one state machine, so they cannot drift apart:
 
-## What the spike showed (macOS, debug build, real home with ~4100 tasks)
+- **One controller.** `manager/src/top/controller.rs` holds the session: state, collector,
+  live agent link, copying, stopping. The TUI's `run` and this crate's `src/engine.rs` both
+  drive a `Controller`. The GUI's engine runs it on its own thread and publishes a `Frame`
+  per change.
+- **Same keys.** `src/keys.rs` binds every key `top` handles and hands the controller the
+  same `crossterm` key event the terminal would. Filter, output search and the agent input
+  are native text fields; their text reaches the controller as `Action::Text`, which leaves
+  the state as typing would.
+- **Same pointer actions.** Clicks on rows, tabs, scope, sort, the column header, stream tabs,
+  fold chevrons and the scrollbar send `top::Action`s. Each runs the code the TUI's mouse
+  handling runs for that target. The wheel moves the selection, as in the terminal.
+- **Same text.** Cells, the overview, work kinds, preview, help, the task info card, output
+  search, and the agent thread come from the TUI's view functions in `top::ui`, at the size
+  the window measures in character cells. Those functions also do the scroll, follow and
+  match bookkeeping, so both frontends scroll and search the same way.
+- **Same paging.** Like the terminal, the window renders only the rows in view.
 
-- It works: the daemon is reached, the list refreshes every second (ages tick, new tasks
-  appear), and idle CPU stays under 1%.
-- RSS is about 685 MB. `each` creates a native view for every one of the ~4100 rows, and
-  nothing is virtualized. A real GUI needs NSH's list component or windowing before it can
-  show the full history.
+## Verified (macOS, live daemon, ~4,100 retained tasks, 248 agents)
+
+- Tree, agents and tasks tabs show the TUI's columns and values. Scope cycles through
+  active, connected and all; tab counts and the `n/total` position update.
+- A task detail shows the pinned info card, the `output` / `stderr` tabs, the line count and
+  the footer keys. An agent detail shows its usage line and the live input with its facts.
+- Clicks reach the controller (logged end to end): tabs, scope, rows, second click to open.
+- The release build uses about 210 MB (the earlier spike, with a native row per task, used
+  837 MB). CPU is 30–48% at the default 1 s refresh. The release TUI under the same load
+  uses 22–42% CPU, so the cost is the shared collector, not the window.
+
+## Not verified yet
+
+- **Keys in the window.** Background automation cannot send keystrokes to a window that is
+  not key, so no key was tested end to end in the window. Every binding registers at
+  startup (nsh panics on an invalid or reserved keystroke), and the handler behind them is
+  the TUI's, which its tests cover.
+- Help (`?`), preview (`v`), filter (`/`), output search, stop (`x`), copy (`c` / `p`) and
+  the agent input are reached by keys, as in the TUI, so they are untested in the window.
+- Linux and Windows.
+
+## Known
+
+- An agent whose live session has no entries shows `(no conversation yet)` once the live
+  link connects, even though its transcript on disk has turns. This is the shared
+  `apply_live` code, so the TUI does the same.
 - `cargo build` pulls a newer tokio than `manager/Cargo.lock` pins, and that version
   deprecates `AsyncFd::new` (`manager/src/intercom/native/alias.rs`). The warning shows up
   only in the GUI build.
 - `nsh package --target macos` builds a 46 MB ad hoc signed `.app` with the repo logo as its
-  icon. The Rust crate took 56 s to build and the macOS runner 2 min 41 s, on a cold cache.
-- The packaged release build used more, not less: about 837 MB RSS, and CPU between 2% and
-  26% in 3-second samples. Per-row native views remain the main cost.
-
-## Not done
-
-Detail view, agents tab, stop/copy actions, and testing on Linux or Windows.
+  icon.

@@ -2587,6 +2587,7 @@ dependencies = [
 name = "pi-famulus-gui"
 version = "0.0.0"
 dependencies = [
+ "crossterm",
  "env_logger",
  "nsh-base",
  "nsh-core",
@@ -2594,6 +2595,8 @@ dependencies = [
  "nsh-platform-macos",
  "nsh-platform-windows",
  "pi-famulus",
+ "ratatui",
+ "tokio",
 ]
 
 [[package]]
