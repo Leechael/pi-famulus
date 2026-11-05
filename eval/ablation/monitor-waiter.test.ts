@@ -231,16 +231,25 @@ describe("scenario controls", () => {
   it("old default grid never loads compatibility extension", () => {
     assert.equal(DEFAULT_SCENARIOS.length, 10, "the 8 original probes and overrun-stuck/overrun-progressing");
     assert.ok(DEFAULT_SCENARIOS.every((s) => !s.extensions && !s.optIn));
-    assert.equal(SCENARIOS.filter((s) => s.optIn).length, 9);
+    assert.equal(SCENARIOS.filter((s) => s.optIn).length, 11);
   });
 });
 describe("monitor behavior probes", () => {
+  it("writes a comment-free fixture that does not leak scenario intent", () => {
+    for (const kind of ["long", "hour", "alternative", "noise", "cleanup", "natural", "renew"]) {
+      const view = ep([]);
+      getScenario(`monitor-behavior-${kind}`).setup(view.cwd, view.secretDir);
+      const source = readFileSync(join(view.cwd, "behavior-source.cjs"), "utf8");
+      assert.doesNotMatch(source, /\/\/|\/\*/, `${kind}: comment in fixture`);
+      assert.doesNotMatch(source, /timeout|batch|persistent/i, `${kind}: leaky word in fixture`);
+    }
+  });
   const itemsFor = (kind: string): Item[] => {
     const command = `node behavior-source.cjs${kind === "noise" ? " | grep --line-buffered '^ALERT'" : ""}`;
     return [call(1, "monitor", { command, ...(kind === "hour" ? { timeout_ms: 3600000 } : { persistent: true }) }), result(2, "monitor", { task_id: "mon_1" }), wake(3, "event", "ALERT fixture-ready"), say(4, "ALERT fixture-ready"), ...(kind === "cleanup" ? [call(5, "task_stop", { task_id: "mon_1" }), result(6, "task_stop", { ok: true })] : [])];
   };
   it("grades duration, evidence, noise and cleanup with negative controls", () => {
-    for (const kind of ["long", "hour", "noise", "cleanup"]) {
+    for (const kind of ["long", "hour", "noise", "cleanup", "natural"]) {
       const scenario = getScenario(`monitor-behavior-${kind}`);
       const items = itemsFor(kind);
       const view = ep(items);
@@ -268,7 +277,7 @@ describe("monitor behavior probes", () => {
   it("runs the noise producer and its filter without a provider", async () => {
     const scenario = getScenario("monitor-behavior-noise");
     const view = ep([]); scenario.setup(view.cwd, view.secretDir);
-    const child = spawn("sh", ["-c", "exec node behavior-source.cjs | grep --line-buffered '^ALERT'"], { cwd: view.cwd, detached: true });
+    const child = spawn("sh", ["-c", "exec node behavior-source.cjs | grep --line-buffered '^ALERT'"], { cwd: view.cwd, detached: true, env: { ...process.env, SRC_INTERVAL_MS: "800" } });
     let output = "";
     try {
       await new Promise<void>((resolve, reject) => {
@@ -294,8 +303,37 @@ describe("monitor behavior probes", () => {
     assert.equal(scenario.grade(ep([...items.slice(0, 4), call(4.2, "task_stop", { task_id: "mon_1" }), result(5.2, "task_stop", { ok: true }), ...items.slice(4)])).pass, false);
     assert.equal(scenario.grade(ep([...items.slice(0, 5), wake(6, "event", "ALERT fixture-ready", "mon_0"), say(7, "ALERT fixture-ready")])).pass, false);
   });
+  it("renew: continuation after a real trial expiry must be persistent", () => {
+    const scenario = getScenario("monitor-behavior-renew");
+    const command = "node behavior-source.cjs slow";
+    const build = (cont: Record<string, unknown>, trial: Record<string, unknown> = { timeout_ms: 10000 }) => [
+      call(1, "monitor", { command, ...trial }), result(2, "monitor", { task_id: "mon_0" }),
+      wake(3, "timeout", "expired", "mon_0"),
+      call(4, "monitor", { command, ...cont }), result(5, "monitor", { task_id: "mon_1" }),
+      wake(6, "event", "ALERT fixture-ready", "mon_1"), say(7, "ALERT fixture-ready")].map((i) => i.seq >= 3 ? { ...i, t: i.seq + 20_000 } : i);
+    const good = build({ persistent: true });
+    const view = ep(good); scenario.setup(view.cwd, view.secretDir);
+    assert.equal(scenario.grade(view).pass, true);
+    assert.equal(scenario.done(good, view), true);
+    // The incident: re-arming with another (max) timeout is a FAIL, as is leaving the default timeout.
+    const hourly = scenario.grade(ep(build({ timeout_ms: 3600000 })));
+    assert.equal(hourly.pass, false); assert.equal(hourly.metrics.continuation, "timeout:3600000");
+    assert.equal(scenario.grade(ep(build({}))).pass, false);
+    assert.equal(scenario.grade(ep(build({}))).metrics.continuation, "default-timeout");
+    // Decision point not reproduced → INVALID, not FAIL.
+    assert.equal(scenario.grade(ep(good.filter((i) => i.seq !== 3))).pass, null);
+    assert.equal(scenario.grade(ep(build({ persistent: true }, { persistent: true }))).pass, null);
+    // Started before the trial's wall-clock expiry → INVALID; a late-delivered (batched) notice does not matter.
+    const early = good.map((i) => i.seq === 4 || i.seq === 5 ? { ...i, t: 5000 } : i);
+    assert.equal(scenario.grade(ep(early)).pass, null);
+    const lateNotice = [good[0], good[1], good[3], good[4], { ...good[2], seq: 5.5 }, good[5], good[6]];
+    assert.equal(scenario.grade(ep(lateNotice)).pass, true);
+    // A third start or a poll is still a FAIL.
+    assert.equal(scenario.grade(ep([...good, call(8, "monitor", { command, persistent: true }), result(9, "monitor", { task_id: "mon_2" })])).pass, false);
+    assert.equal(scenario.grade(ep([...good, call(10, "task_list", {})])).pass, false);
+  });
   it("describes intent without revealing duration parameters or a noise filter", () => {
-    for (const kind of ["long", "hour", "noise", "alternative", "cleanup"]) {
+    for (const kind of ["long", "hour", "noise", "alternative", "cleanup", "natural", "renew"]) {
       const scenario = getScenario(`monitor-behavior-${kind}`), view = ep([]);
       const prompt = scenario.setup(view.cwd, view.secretDir).prompt;
       assert.doesNotMatch(prompt, /persistent|timeout_ms|grep|--line-buffered/i);

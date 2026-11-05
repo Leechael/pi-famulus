@@ -173,32 +173,49 @@ const uiControl: Scenario = {
     return { pass: !!observation && !!success && answered && !polls, reason: answered && !polls ? "observed state + UI predicate + correct successor token" : "missing genuine UI wait/observation/token", metrics };
   },
 };
-type BehaviorProbe = "long" | "hour" | "alternative" | "noise" | "cleanup";
+type BehaviorProbe = "long" | "hour" | "alternative" | "noise" | "cleanup" | "natural" | "renew";
 
 // The producer emits distinct, low-frequency routine lines before a terminal
 // event. Keeping it alive lets the cleanup probe distinguish stopping it from
-// simply observing an already-exited process.
+// simply observing an already-exited process. In slow mode the alert lands at
+// 24s, after the 8s timeout and 10s terminal batch. Keep the fixture itself
+// comment-free: models cat it, and comments would leak the scenario's intent.
 const behaviorSource = `let n = 0;
 const timer = setInterval(() => {
   n++;
   console.log(n < 3 ? 'ROUTINE ' + n : 'ALERT fixture-ready');
   if (n === 3) clearInterval(timer);
-// Slow alert at 24s, after the 8s timeout and 10s terminal batch.
-}, process.argv.includes('slow') ? 8000 : 800);
+}, Number(process.env.SRC_INTERVAL_MS) * (process.argv.includes('slow') ? 10 : 1));
 setInterval(() => {}, 1000);
 `;
+const BEHAVIOR_TESTS: Record<BehaviorProbe, string> = {
+  long: "open-ended observation (\"no planned end\") selects a persistent monitor and reports its alert",
+  hour: "an explicit one-hour observation selects timeout_ms 3600000, not persistence",
+  alternative: "an already-running alternative monitor delivers the alert after the other monitor's timeout, without another start",
+  noise: "a persistent observation suppresses routine-line wakes and reports the alert",
+  cleanup: "after the alert, an accepted task_stop targets the active monitor",
+  natural: "", renew: "",
+};
 function behaviorProbe(kind: BehaviorProbe): Scenario {
   const id = `monitor-behavior-${kind}`;
   const alternative = kind === "alternative";
   const cleanup = kind === "cleanup";
+  const natural = kind === "natural";
+  const renew = kind === "renew";
+  const slow = alternative || renew;
   const prompt = alternative
     ? "We need two independent observations of the same stream, `node behavior-source.cjs slow`: start a temporary diagnostic observation lasting eight seconds and, before it expires, a separate ongoing observation. Continue watching for the ALERT and report it."
+    : natural ? scenarioText("monitor-behavior-natural.prompt")
+    : renew ? scenarioText("monitor-behavior-renew.prompt")
     : `Watch the stream from \`node behavior-source.cjs\`. ${kind === "hour" ? "The observation should last exactly one hour, then end." : "This is ongoing observation with no planned end."} ${kind === "noise" ? "ROUTINE lines are unimportant; notify me only about ALERT lines." : "Report the ALERT line when it arrives."}${cleanup ? " After the alert, the observation is no longer needed; stop it and confirm completion." : ""}`;
   return {
-    id, behavior: `Monitor behavior: ${kind}`, optIn: true, famulusConfig: {}, timeoutMs: 60_000, quietMs: 2000, estCalls: 5,
+    id, behavior: natural || renew ? scenarioText(`${id}.tests`) : BEHAVIOR_TESTS[kind], optIn: true, famulusConfig: {}, timeoutMs: 120_000, quietMs: 2000, estCalls: 5,
+    // renew: the trial's batched timeout notice (≤10 s) lands after its task has left `ls`.
+    ...(renew ? { idleGiveUpMs: 20_000 } : {}),
     setup(cwd) {
       writeFileSync(join(cwd, "behavior-source.cjs"), behaviorSource);
-      return { prompt };
+      // Timing lives in env so reading the source does not reveal how soon ALERT comes.
+      return { prompt, env: { SRC_INTERVAL_MS: "800" } };
     },
     done(_items, ep) { return this.grade(ep).pass === true; },
     grade({ items }) {
@@ -206,7 +223,7 @@ function behaviorProbe(kind: BehaviorProbe): Scenario {
       const results = toolResults(items);
       const starts = calls.filter((c) => c.name === "monitor");
       const accepted = starts.filter((c) => results.some((r) => r.toolCallId === c.id && !r.isError && r.details?.ok !== false && typeof r.details?.task_id === "string"));
-      const start = accepted[alternative ? 1 : 0];
+      const start = accepted[alternative || renew ? 1 : 0];
       const started = results.find((r) => r.toolCallId === start?.id);
       const taskId = String(started?.details?.task_id ?? "");
       const events = wakes(items).filter((w) => w.wake.kind === "monitor" && w.wake.status === "event" && w.wake.taskIds.includes(taskId));
@@ -214,21 +231,30 @@ function behaviorProbe(kind: BehaviorProbe): Scenario {
       const reported = !!alert && assistantTextBetween(items, alert.seq).includes("ALERT fixture-ready");
       const firstResult = results.find((r) => r.toolCallId === accepted[0]?.id);
       const firstId = String(firstResult?.details?.task_id ?? "");
-      const timeout = wakes(items).find((w) => (w.wake.kind === "monitor" || w.wake.kind === "monitor-terminal") && w.wake.status === "timeout" && w.wake.taskIds.includes(firstId) && w.seq > (started?.seq ?? Infinity));
+      const timeout = wakes(items).find((w) => (w.wake.kind === "monitor" || w.wake.kind === "monitor-terminal") && w.wake.status === "timeout" && w.wake.taskIds.includes(firstId) && w.seq > ((renew ? firstResult : started)?.seq ?? Infinity));
       const activeAtTimeout = !!timeout && !!started && started.seq < timeout.seq && !!taskId && taskId !== firstId && !wakes(items).some((w) => w.seq < timeout.seq && w.seq > started.seq && w.wake.taskIds.includes(taskId) && (w.wake.kind === "monitor-terminal" || (w.wake.kind === "monitor" && w.wake.status !== "event"))) && !calls.some((c) => c.name === "task_stop" && c.args.task_id === taskId && c.seq < timeout.seq && results.some((r) => r.toolCallId === c.id && !r.isError && r.details?.ok !== false));
-      const polls = calls.filter(isPoll).length;
+      const polls = (starts[0] ? callsBetween(items, starts[0].seq) : []).filter(isPoll).length;
       const routineWakes = events.filter((w) => /ROUTINE/.test(w.wake.body)).length;
       const stopped = cleanup && !!alert && calls.some((c) => c.name === "task_stop" && c.seq > alert.seq && c.args.task_id === taskId && results.some((r) => r.toolCallId === c.id && !r.isError && r.details?.ok !== false));
-      const sourceCommand = (command: string) => /\bnode\s+(?:\.\/)?behavior-source\.cjs\b/.test(command) && (!alternative || /\bslow\b/.test(command));
-      const correctCommand = !!start && sourceCommand(cmd(start)) && (!alternative || sourceCommand(cmd(accepted[0])));
+      const sourceCommand = (command: string) => /\bnode\s+\S*behavior-source\.cjs\b/.test(command) && (!slow || /\bslow\b/.test(command));
+      const correctCommand = !!start && sourceCommand(cmd(start)) && (!(alternative || renew) || sourceCommand(cmd(accepted[0])));
       const correctDuration = !!start && (kind === "hour" ? start.args.timeout_ms === 3_600_000 && start.args.persistent !== true : start.args.persistent === true) && (!alternative || (accepted[0]?.args.timeout_ms === 8000 && accepted[0]?.args.persistent !== true));
+      const trialMs = accepted[0]?.args.timeout_ms;
+      // renew: the trial must be a 5 s timed start; the continuation after its expiry must be persistent, not another timeout.
+      const trialOk = !renew || (typeof trialMs === "number" && trialMs >= 1000 && trialMs <= 15_000 && accepted[0]?.args.persistent !== true);
+      const continuedAfterTimeout = !renew || (!!timeout && !!start && !!firstResult && typeof trialMs === "number" && start.t >= firstResult.t + trialMs);
+      const continuation = !start ? "none" : start.args.persistent === true ? "persistent" : typeof start.args.timeout_ms === "number" ? `timeout:${start.args.timeout_ms}` : "default-timeout";
       const alertAfterTimeout = !!alert && !!timeout && alert.seq > timeout.seq;
-      const metrics = { monitorAttempts: starts.length, monitorStarts: accepted.length, correctCommand, correctDuration, eventWakes: events.length, routineWakes, alertSeen: !!alert, reported, polls, stopped: !!stopped, timeoutSeen: !!timeout, activeAtTimeout, alertAfterTimeout };
+      const metrics = { monitorAttempts: starts.length, monitorStarts: accepted.length, correctCommand, correctDuration, continuation, trialOk, continuedAfterTimeout, eventWakes: events.length, routineWakes, alertSeen: !!alert, reported, polls, stopped: !!stopped, timeoutSeen: !!timeout, activeAtTimeout, alertAfterTimeout };
       const duplicateAfterTimeout = !!timeout && starts.some((c) => c.seq > timeout.seq);
+      // The decision point (continuation after a real expiry) was not reproduced: INVALID, not FAIL.
+      if (renew && accepted.length >= 1 && !trialOk) return { pass: null, reason: "trial not started as a short timed watch", metrics };
+      if (renew && start && firstResult && typeof trialMs === "number" && start.t < firstResult.t + trialMs) return { pass: null, reason: "continuation preceded trial expiry", metrics };
+      if (renew && accepted.length >= 1 && !timeout) return { pass: null, reason: "trial monitor timeout not observed", metrics };
       if (alternative && !timeout && !duplicateAfterTimeout) return { pass: null, reason: "temporary monitor timeout with an already-running alternative not observed", metrics };
-      const pass = starts.length === (alternative ? 2 : 1) && accepted.length === (alternative ? 2 : 1) && correctCommand && correctDuration && !!alert && reported && !polls && (kind !== "noise" || routineWakes === 0) && (!cleanup || stopped) && (!alternative || (activeAtTimeout && alertAfterTimeout && !duplicateAfterTimeout));
+      const pass = starts.length === (alternative || renew ? 2 : 1) && accepted.length === (alternative || renew ? 2 : 1) && trialOk && continuedAfterTimeout && correctCommand && correctDuration && !!alert && reported && !polls && (kind !== "noise" || routineWakes === 0) && (!cleanup || stopped) && (!alternative || (activeAtTimeout && alertAfterTimeout && !duplicateAfterTimeout));
       return { pass, reason: pass ? "behavior and evidence matched" : "behavior or evidence missing", metrics };
     },
   };
 }
-export const monitorWaiterScenarios: Scenario[] = [negative(false, false), negative(true, false), negative(false, true), uiControl, ...(["long", "hour", "alternative", "noise", "cleanup"] as const).map(behaviorProbe)];
+export const monitorWaiterScenarios: Scenario[] = [negative(false, false), negative(true, false), negative(false, true), uiControl, ...(["long", "hour", "alternative", "noise", "cleanup", "natural", "renew"] as const).map(behaviorProbe)];

@@ -59,6 +59,9 @@ export interface Scenario {
   /** Stop waiting early once this holds (then a short quiet window). */
   done: (items: Item[], ep: EpisodeView) => boolean;
   quietMs: number;
+  /** Settled+silent time before giving up when nothing runs (default 6000). Raise it when a
+   *  wake is expected after all tasks ended, e.g. a batched monitor timeout notice (≤10 s). */
+  idleGiveUpMs?: number;
   /** Rough model calls per episode (parent + children), for cost estimates. */
   estCalls: number;
   setup: (cwd: string, secretDir: string) => ScenarioSetup;

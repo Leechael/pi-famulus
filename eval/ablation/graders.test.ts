@@ -104,6 +104,18 @@ describe("monitor behavior integration", () => {
   });
 });
 
+describe("monitor renew integration", () => {
+  it("delivers the batched trial timeout before giving up, then grades a persistent continuation green", async () => {
+    await withDiagnostics(async (directory) => {
+      const result = await episode("monitor-behavior-renew", "good", directory);
+      assert.equal(result.error, undefined);
+      assert.equal(result.grade.pass, true, JSON.stringify(result.grade));
+      assert.equal(result.grade.metrics.timeoutSeen, true);
+      assert.equal(result.grade.metrics.continuation, "persistent");
+    });
+  });
+});
+
 describe("tail-grep timing regressions", () => {
   it("regression: fresh Node watchdog terminates and reaps a hung process tree", async () => {
     const timersBefore = process.getActiveResourcesInfo().filter((type) => type === "Timeout");
