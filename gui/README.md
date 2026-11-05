@@ -49,12 +49,10 @@ The TUI and the GUI drive one state machine, so they cannot drift apart:
 
 ## Not verified yet
 
-- **Keys in the window.** Background automation cannot send keystrokes to a window that is
-  not key, so no key was tested end to end in the window. Every binding registers at
-  startup (nsh panics on an invalid or reserved keystroke), and the handler behind them is
-  the TUI's, which its tests cover.
-- Help (`?`), preview (`v`), filter (`/`), output search, stop (`x`), copy (`c` / `p`) and
-  the agent input are reached by keys, as in the TUI, so they are untested in the window.
+- **Not every key.** The main keys were tried by hand in the window and behave as in the
+  TUI. Not every key was covered. Stopping a task (`x`, then `y`) and sending to or aborting
+  an agent were deliberately left untried, so no real process or agent was touched. Both
+  run the TUI's code path, and stop asks for confirmation first.
 - Linux and Windows.
 
 ## Known
