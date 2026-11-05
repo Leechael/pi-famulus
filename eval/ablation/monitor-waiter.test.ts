@@ -1,5 +1,6 @@
 /** Deterministic compatibility graders/fixture contracts; no pi or model calls. */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { MONITOR_IDLE_INSTRUCTION } from "../../extension/src/behavior-guidelines.ts";
 import { tmpdir } from "node:os";
@@ -230,7 +231,75 @@ describe("scenario controls", () => {
   it("old default grid never loads compatibility extension", () => {
     assert.equal(DEFAULT_SCENARIOS.length, 10, "the 8 original probes and overrun-stuck/overrun-progressing");
     assert.ok(DEFAULT_SCENARIOS.every((s) => !s.extensions && !s.optIn));
-    assert.equal(SCENARIOS.filter((s) => s.optIn).length, 4);
+    assert.equal(SCENARIOS.filter((s) => s.optIn).length, 9);
+  });
+});
+describe("monitor behavior probes", () => {
+  const itemsFor = (kind: string): Item[] => {
+    const command = `node behavior-source.cjs${kind === "noise" ? " | grep --line-buffered '^ALERT'" : ""}`;
+    return [call(1, "monitor", { command, ...(kind === "hour" ? { timeout_ms: 3600000 } : { persistent: true }) }), result(2, "monitor", { task_id: "mon_1" }), wake(3, "event", "ALERT fixture-ready"), say(4, "ALERT fixture-ready"), ...(kind === "cleanup" ? [call(5, "task_stop", { task_id: "mon_1" }), result(6, "task_stop", { ok: true })] : [])];
+  };
+  it("grades duration, evidence, noise and cleanup with negative controls", () => {
+    for (const kind of ["long", "hour", "noise", "cleanup"]) {
+      const scenario = getScenario(`monitor-behavior-${kind}`);
+      const items = itemsFor(kind);
+      const view = ep(items);
+      scenario.setup(view.cwd, view.secretDir);
+      assert.equal(scenario.grade(view).pass, true, kind);
+      assert.equal(scenario.done(items, view), true);
+      assert.equal(scenario.grade(ep(items.filter((i) => i.kind !== "wake"))).pass, false);
+      assert.equal(scenario.grade(ep([...items, call(10, "task_list", {})])).pass, false);
+      const wrong = itemsFor(kind); (wrong[0] as Extract<Item, {kind: "assistant"}>).toolCalls[0].args = { command: "bad", persistent: true };
+      assert.equal(scenario.grade(ep(wrong)).pass, false);
+      const wrongDuration = itemsFor(kind); (wrongDuration[0] as Extract<Item, {kind: "assistant"}>).toolCalls[0].args = { command: "node behavior-source.cjs", ...(kind === "hour" ? { persistent: true } : { timeout_ms: 300000 }) };
+      assert.equal(scenario.grade(ep(wrongDuration)).metrics.correctDuration, false);
+      assert.equal(scenario.grade(ep(wrongDuration)).pass, false);
+      if (kind === "noise") {
+        const noisy = [...items.slice(0, 2), wake(2.5, "event", "ROUTINE 1"), ...items.slice(2)];
+        assert.equal(scenario.grade(ep(noisy)).metrics.routineWakes, 1);
+        assert.equal(scenario.grade(ep(noisy)).pass, false);
+        const differentFilter = itemsFor(kind);
+        (differentFilter[0] as Extract<Item, {kind: "assistant"}>).toolCalls[0].args.command = "node behavior-source.cjs | awk '/ALERT/ { print; fflush() }'";
+        assert.equal(scenario.grade(ep(differentFilter)).pass, true);
+      }
+      if (kind === "cleanup") assert.equal(scenario.grade(ep(items.slice(0, 4))).pass, false);
+    }
+  });
+  it("runs the noise producer and its filter without a provider", async () => {
+    const scenario = getScenario("monitor-behavior-noise");
+    const view = ep([]); scenario.setup(view.cwd, view.secretDir);
+    const child = spawn("sh", ["-c", "exec node behavior-source.cjs | grep --line-buffered '^ALERT'"], { cwd: view.cwd, detached: true });
+    let output = "";
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("fixture timed out")), 6000);
+        child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); if (output.includes("ALERT fixture-ready")) { clearTimeout(timer); resolve(); } });
+        child.on("error", (error) => { clearTimeout(timer); reject(error); });
+      });
+      assert.equal(output, "ALERT fixture-ready\n");
+    } finally { if (child.pid) process.kill(-child.pid, "SIGTERM"); }
+  });
+  it("requires the existing monitor to survive the other monitor's timeout", () => {
+    const scenario = getScenario("monitor-behavior-alternative");
+    const command = "node behavior-source.cjs slow";
+    const items = [call(1, "monitor", { command, timeout_ms: 8000 }), result(2, "monitor", { task_id: "mon_0" }),
+      call(3, "monitor", { command, persistent: true }), result(4, "monitor", { task_id: "mon_1" }),
+      wake(5, "timeout", "expired", "mon_0"), wake(6, "event", "ALERT fixture-ready", "mon_1"), say(7, "ALERT fixture-ready")];
+    const view = ep(items); scenario.setup(view.cwd, view.secretDir);
+    assert.equal(scenario.grade(view).pass, true);
+    assert.equal(scenario.grade(view).metrics.activeAtTimeout, true);
+    assert.equal(scenario.grade(ep(items.filter((i) => i.seq !== 5))).pass, null);
+    assert.equal(scenario.grade(ep([...items, call(8, "monitor", { command, persistent: true }), result(9, "monitor", { task_id: "mon_2" })])).pass, false);
+    assert.equal(scenario.grade(ep([...items.slice(0, 4), wake(4.5, "timeout", "expired", "mon_1"), ...items.slice(4)])).pass, false);
+    assert.equal(scenario.grade(ep([...items.slice(0, 4), call(4.2, "task_stop", { task_id: "mon_1" }), result(5.2, "task_stop", { ok: true }), ...items.slice(4)])).pass, false);
+    assert.equal(scenario.grade(ep([...items.slice(0, 5), wake(6, "event", "ALERT fixture-ready", "mon_0"), say(7, "ALERT fixture-ready")])).pass, false);
+  });
+  it("describes intent without revealing duration parameters or a noise filter", () => {
+    for (const kind of ["long", "hour", "noise", "alternative", "cleanup"]) {
+      const scenario = getScenario(`monitor-behavior-${kind}`), view = ep([]);
+      const prompt = scenario.setup(view.cwd, view.secretDir).prompt;
+      assert.doesNotMatch(prompt, /persistent|timeout_ms|grep|--line-buffered/i);
+    }
   });
 });
 describe("monitor manifest segments", () => {
@@ -240,7 +309,7 @@ describe("monitor manifest segments", () => {
     const started = resolveVariant(manifest, "result.monitor-started-instruction").segments[0];
     assert.equal(idle.prompt, "guidelines.monitor-idle");
     assert.equal(idle.text, MONITOR_IDLE_INSTRUCTION);
-    for (const id of ["monitor-not-sleep", ...SCENARIOS.filter((s) => s.optIn).map((s) => s.id)]) assert.ok(idle.affects.includes(id));
+    for (const id of ["monitor-not-sleep", ...SCENARIOS.filter((s) => s.id.startsWith("monitor-waiter-")).map((s) => s.id)]) assert.ok(idle.affects.includes(id));
     // The start result's text lives in extension/prompts/tools/monitor.md (markers stripped).
     const source = readFileSync(new URL("../../extension/prompts/tools/monitor.md", import.meta.url), "utf8").replace(/<!--\/?seg[^>]*-->/g, "");
     const block = source.split("# result: started")[1];

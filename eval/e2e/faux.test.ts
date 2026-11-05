@@ -148,7 +148,7 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.deepEqual(lines, ["tick-1", "tick-2", "tick-3"], explain(ep));
     assert.equal(timeouts.length, 1, `expected one timeout notice\n${explain(ep)}`);
     assert.equal(timeouts[0].wake.kind, "monitor-terminal");
-    assert.match(timeouts[0].wake.body, /These monitors have stopped; nothing watches their sources now/);
+    assert.match(timeouts[0].wake.body, /Monitor lifecycle updates/);
     assert.ok(events.every((w) => w.seq < timeouts[0].seq), "event after timeout");
     // Killed by the timeout: no separate "exited" notice.
     assert.equal(ws.filter((w) => w.wake.status === "exited").length, 0, explain(ep));

@@ -456,7 +456,7 @@ export class OverloadController {
 
   stopNotice(): string {
     const secs = Math.round(this.stopSustainMs / 1000);
-    return `[Monitor stopped: input exceeded ~${this.stopLinesPerSec} lines/s for ${secs}s (unverified safety backstop).]`;
+    return `[Monitor protection threshold reached: input exceeded ~${this.stopLinesPerSec} lines/s for ${secs}s (unverified safety backstop).]`;
   }
 
   recordInput(input: OverloadInput): void {

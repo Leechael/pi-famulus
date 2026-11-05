@@ -376,11 +376,79 @@ describe("NotifyCenter monitor terminal coalescing", () => {
     return drainMessages(drained).map((message) => (message.details as { kind?: string } | undefined)?.kind);
   }
 
+  it.each([false, true])("rebuilds visible details from genuinely complementary exit facts, reversed %s", (reverse) => {
+    const { sent, center } = setup();
+    const first = formatMonitorEvent("alpha", "mon_a", "Stopped via TUI; exit code unknown.", "exited", { exitFacts: { endReason: "stopped:tui", exitCode: null } });
+    const second = formatMonitorEvent("alpha", "mon_a", "Process ended (reason: unknown); exit code 4; signal SIGTERM.", "exited", { exitFacts: { signal: "SIGTERM", exitCode: 4 } });
+    for (const wake of reverse ? [second, first] : [first, second]) center.notify(wake);
+    center.flush();
+    const item = (sent[0].message.details as Extract<FamulusWake, { kind: "monitor-terminal" }>).monitors[0];
+    expect(item.exitFacts).toEqual({ endReason: "stopped:tui", signal: "SIGTERM", exitCode: 4 });
+    for (const text of [item.detail, sent[0].message.content]) {
+      expect(text).toContain("TUI"); expect(text).toContain("SIGTERM"); expect(text).toContain("exit code 4");
+      expect(text).not.toContain("reason: unknown"); expect(text).not.toContain("exit code unknown");
+    }
+    center.dispose();
+  });
+
+  it("retains explicit exit context when rebuilding duplicate details", () => {
+    const { sent, center } = setup();
+    const first = formatMonitorEvent("alpha", "mon_a", "old details", "exited", { exitFacts: { endReason: "stopped:tui", exitCode: null }, exitContext: "After 9255.6s. Startup failed. No further events will be delivered. 5 output lines were dropped." });
+    const second = formatMonitorEvent("alpha", "mon_a", "partial", "exited", { exitFacts: { signal: "SIGTERM", exitCode: 4 } });
+    center.notify(first); center.notify(second); center.flush();
+    const item = (sent[0].message.details as Extract<FamulusWake, { kind: "monitor-terminal" }>).monitors[0];
+    expect(item.detail).toContain("TUI");
+    expect(item.detail).toContain("signal SIGTERM");
+    expect(item.detail).toContain("After 9255.6s. Startup failed. No further events will be delivered. 5 output lines were dropped.");
+    expect(item.detail).not.toContain("old details");
+    center.dispose();
+  });
+
+  it.each([false, true])("preserves superset duplicate exit facts, reversed %s", (reverse) => {
+    const { sent, center } = setup();
+    const rich = formatMonitorEvent("alpha", "mon_a", "Stopped via TUI; signal SIGTERM; exit code 4.", "exited", { exitFacts: { endReason: "stopped:tui", signal: "SIGTERM", exitCode: 4, stopRequested: true } });
+    const partial = formatMonitorEvent("alpha", "mon_a", "Stopped via TUI.", "exited", { exitFacts: { endReason: "stopped:tui", exitCode: null } });
+    for (const wake of reverse ? [partial, rich] : [rich, partial]) center.notify(wake);
+    center.flush();
+    const details = sent[0].message.details as Extract<FamulusWake, { kind: "monitor-terminal" }>;
+    expect(details.monitors[0].exitFacts).toEqual({ endReason: "stopped:tui", signal: "SIGTERM", exitCode: 4, stopRequested: true });
+    expect(details.monitors[0].detail).toContain("signal SIGTERM");
+    expect(details.monitors[0].detail).toContain("exit code 4");
+    center.dispose();
+  });
+
+  it.each([false, true])("keeps confirmed facts and detail over an empty duplicate, reversed %s", (reverse) => {
+    const { sent, center } = setup();
+    const confirmed = formatMonitorEvent("alpha", "mon_a", "Stopped via TUI; signal SIGTERM.", "exited", { exitFacts: { endReason: "stopped:tui", signal: "SIGTERM", exitCode: null } });
+    const empty = formatMonitorEvent("alpha", "mon_a", "A much longer timeout notice that is only a stop request and not confirmation.", "timeout", { exitFacts: {} });
+    for (const wake of reverse ? [empty, confirmed] : [confirmed, empty]) center.notify(wake);
+    center.flush();
+    const item = (sent[0].message.details as Extract<FamulusWake, { kind: "monitor-terminal" }>).monitors[0];
+    expect(item.exitFacts).toEqual({ endReason: "stopped:tui", signal: "SIGTERM", exitCode: null });
+    expect(item.detail).toContain("Stopped via TUI; signal SIGTERM");
+    center.dispose();
+  });
+
+  it.each([false, true])("keeps the first conflicting record and logs fields, reversed %s", (reverse) => {
+    const sent: { message: { details?: unknown } }[] = [];
+    const logs: { type: string; fields?: Record<string, unknown> }[] = [];
+    const center = new NotifyCenter({ clock: new ManualClock(), isIdle: () => true, sendMessage: (message) => sent.push({ message }), logEvent: (type, fields) => logs.push({ type, fields }) });
+    const first = formatMonitorEvent("alpha", "mon_a", "Stopped via TUI; signal SIGTERM.", "exited", { exitFacts: { endReason: "stopped:tui", signal: "SIGTERM", exitCode: null } });
+    const second = formatMonitorEvent("alpha", "mon_a", "Stopped via CLI; signal SIGKILL.", "exited", { exitFacts: { endReason: "stopped:cli", signal: "SIGKILL", exitCode: null } });
+    for (const wake of reverse ? [second, first] : [first, second]) center.notify(wake);
+    center.flush();
+    const item = (sent[0].message.details as Extract<FamulusWake, { kind: "monitor-terminal" }>).monitors[0];
+    expect(item.exitFacts).toEqual(reverse ? { endReason: "stopped:cli", signal: "SIGKILL", exitCode: null } : { endReason: "stopped:tui", signal: "SIGTERM", exitCode: null });
+    expect(item.detail).toBe(reverse ? "Stopped via CLI; signal SIGKILL." : "Stopped via TUI; signal SIGTERM.");
+    expect(logs).toContainEqual({ type: "monitor.exit-facts-conflict", fields: { id: "mon_a", fields: ["endReason", "signal"] } });
+    center.dispose();
+  });
+
   it("t0 and t9.9s join one batch listing every invalidated monitor", () => {
     const { clock, sent, center, terminal } = setup();
-    terminal("mon_a", "alpha", "timeout", "[Monitor timed out — re-arm if needed.]");
+    terminal("mon_a", "alpha", "timeout", "Timeout elapsed. Stop requested; exit unconfirmed.");
     clock.advanceBy(9_900);
-    terminal("mon_b", "beta", "timeout", "[Monitor timed out — re-arm if needed.]");
+    terminal("mon_b", "beta", "timeout", "Timeout elapsed. Stop requested; exit unconfirmed.");
     expect(sent).toHaveLength(0);
     clock.advanceBy(100);
     expect(sent).toHaveLength(1);
@@ -389,7 +457,7 @@ describe("NotifyCenter monitor terminal coalescing", () => {
     expect((details as { id?: string }).id).toBeUndefined();
     expect(wakeIds(details)).toEqual(["mon_a", "mon_b"]);
     expect(sent[0].message.content).toContain('kind="monitor-terminal"');
-    expect(sent[0].message.content).toMatch(/These monitors have stopped; nothing watches their sources now/);
+    expect(sent[0].message.content).toMatch(/Monitor lifecycle updates/);
     expect(sent[0].message.content).toContain("alpha");
     expect(sent[0].message.content).toContain("beta");
     expect(sent[0].message.content).not.toMatch(/re-arm if needed/);
@@ -442,7 +510,7 @@ describe("NotifyCenter monitor terminal coalescing", () => {
     expect(wakeIds(details)).toEqual(["mon_a", "mon_b", "mon_c"]);
     expect(details.monitors.map((monitor) => monitor.status)).toEqual(["timeout", "exited", "stopped"]);
     expect(details.monitors.map((monitor) => monitor.detail)).toEqual([
-      "Timed out.",
+      "timed out",
       "Monitor process exited",
       "Monitor stopped.",
     ]);
@@ -515,7 +583,7 @@ describe("NotifyCenter monitor terminal coalescing", () => {
     center.dispose();
     expect(sent).toHaveLength(1);
     expect(wakeIds(sent[0].message.details as FamulusWake)).toEqual(["mon_a"]);
-    expect(sent[0].message.content).toMatch(/<pi-famulus-wake kind="monitor-terminal"[^>]*>\s*<summary>These monitors have stopped; nothing watches their sources now\.<\/summary>/);
+    expect(sent[0].message.content).toMatch(/<pi-famulus-wake kind="monitor-terminal"[^>]*>\s*<summary>Monitor lifecycle updates\.<\/summary>/);
   });
 
   it("dispose delivers a busy passive terminal exactly once", () => {

@@ -598,6 +598,8 @@ describe("monitor-session-end wake", () => {
     expect(wake.customType).toBe(FAMULUS_WAKE_CUSTOM_TYPE);
     expect(wake.content.match(/<pi-famulus-wake /g)).toHaveLength(1);
     expect(wake.content).toContain('kind="monitor-session-end"');
+    expect(wake.content).toContain("process exits are not confirmed by this notice");
+    expect(wake.content).not.toContain("no longer watched");
     expect(wake.content).toContain("mon_a");
     expect(wake.content).toContain("mon_b");
     expect(wake.content).toContain("alpha logs");
@@ -645,11 +647,39 @@ describe("monitor-session-end wake", () => {
       theme,
     ).render(80) as string[];
     expect(collapsed.join("")).not.toContain("undefined");
-    expect(collapsed.join("")).toContain("2 stopped");
+    expect(collapsed.join("")).toContain("2 teardown");
     expect(collapsed.join("")).toContain("new");
     expect(expanded.join("")).toContain("mon_a");
     expect(expanded.join("")).toContain("mon_b");
     expect(expanded.join("")).toContain("while the log is retained");
+  });
+});
+
+describe("shell exit facts", () => {
+  it("phrases killed status without duplicated reasons or placeholders", () => {
+    const phrase = (extra: object) => formatTaskNotification([{ taskId: "sh_2", kind: "shell", command: "build", status: "killed", exitCode: null, durationMs: 1000, outputPath: "/tmp/out", preview: "", ...extra } as never], []).content;
+    const tui = phrase({ endReason: "stopped:tui", signal: "SIGTERM" });
+    expect(tui).toContain('"build" was killed (stopped via TUI, SIGTERM)');
+    expect(tui).not.toContain("reason:");
+    expect(phrase({ endReason: "timeout" })).toContain('"build" was killed (timeout)');
+    const noReason = phrase({ signal: "SIGKILL" });
+    expect(noReason).toContain('"build" was killed (SIGKILL)');
+    expect(noReason).not.toContain("reason: unknown");
+    expect(phrase({})).toMatch(/"build" was killed(?! \()/);
+  });
+
+  it("retains killed signal and stop source in summary and details", () => {
+    const wake = formatTaskNotification([{ taskId: "sh_1", kind: "shell", command: "build", status: "killed", exitCode: null, durationMs: 1000, outputPath: "/tmp/out", preview: "", endReason: "stopped:tui", signal: "SIGTERM" }], []);
+    expect(wake.content).toContain("TUI");
+    expect(wake.content).toContain("SIGTERM");
+    expect(wake.details).toMatchObject({ tasks: [{ endReason: "stopped:tui", signal: "SIGTERM", exitCode: null }] });
+    setPiTuiForTests(null);
+    const renderers = new Map<string, Function>();
+    registerFamulusMessageRenderers({ registerMessageRenderer: (type: string, fn: unknown) => renderers.set(type, fn as never) } as never);
+    const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text };
+    const expanded = renderers.get(FAMULUS_WAKE_CUSTOM_TYPE)!({ content: wake.content, details: wake.details }, { expanded: true, outputPad: 0 }, theme).render(120).join("\n");
+    expect(expanded).toContain("TUI");
+    expect(expanded).toContain("SIGTERM");
   });
 });
 
@@ -662,7 +692,7 @@ describe("monitor-terminal wake", () => {
 
   it("is one envelope listing every monitor id, never a single monitor id", () => {
     const wake = formatMonitorTerminal([
-      { id: "mon_a", description: "alpha", status: "timeout", event: "[Monitor timed out — re-arm if needed.]" },
+      { id: "mon_a", description: "alpha", status: "timeout", event: "Timeout elapsed. Stop requested; exit unconfirmed." },
       { id: "mon_b", description: "beta", status: "timeout" },
     ]);
     expect(wake.customType).toBe(FAMULUS_WAKE_CUSTOM_TYPE);
@@ -687,6 +717,25 @@ describe("monitor-terminal wake", () => {
     assertSummaryFirst(wake.content);
     expect(wake.content).toContain("mon_a");
     expect(wake.content).not.toContain("mon_b");
+  });
+
+  it("renders mixed confirmed and unconfirmed terminal facts without claiming all stopped", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerFamulusMessageRenderers({ registerMessageRenderer: (type: string, fn: unknown) => map.set(type, fn as never) } as never);
+    const theme = { fg: (_c: string, text: string) => text, bg: (_c: string, text: string) => text };
+    const wake = formatMonitorTerminal([
+      { id: "mon_a", description: "alpha", status: "exited", event: "Stopped via TUI; signal SIGTERM; exit code unknown.", exitFacts: { endReason: "stopped:tui", signal: "SIGTERM", exitCode: null } },
+      { id: "mon_b", description: "beta", status: "timeout", event: "Timeout elapsed. Stop requested; exit unconfirmed." },
+    ]);
+    expect(wake.content).toContain("Stopped via TUI; signal SIGTERM");
+    expect(wake.details).toMatchObject({ monitors: [{ exitFacts: { endReason: "stopped:tui", signal: "SIGTERM", exitCode: null } }, {}] });
+    const render = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!;
+    const collapsed = (render({ content: wake.content, details: wake.details }, { expanded: false, outputPad: 0 }, theme).render(120) as string[]).join("");
+    const expanded = (render({ content: wake.content, details: wake.details }, { expanded: true, outputPad: 0 }, theme).render(120) as string[]).join("\n");
+    expect(collapsed).not.toMatch(/2 stopped/);
+    expect(expanded).toContain("Stopped via TUI; signal SIGTERM");
+    expect(expanded).toContain("exit unconfirmed");
   });
 
   it("renders output metadata in model-visible XML for single and multiple monitors", () => {
@@ -744,7 +793,7 @@ describe("monitor-terminal wake", () => {
       theme,
     ).render(80) as string[];
     expect(collapsed.join("")).not.toContain("undefined");
-    expect(collapsed.join("")).toContain("2 stopped");
+    expect(collapsed.join("")).toContain("2 lifecycle updates");
     const expandedText = expanded.join("\n");
     expect(expandedText.indexOf(MONITOR_UNWATCHED_SUMMARY)).toBeGreaterThanOrEqual(0);
     expect(expandedText.indexOf(MONITOR_UNWATCHED_SUMMARY)).toBeLessThan(expandedText.indexOf("mon_a"));

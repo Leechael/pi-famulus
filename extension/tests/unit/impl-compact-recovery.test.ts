@@ -192,7 +192,7 @@ describe("NotifyCenter compact hold and one-turn flush", () => {
     });
     center.beginHold();
     center.notifyMonitorEvent("watcher", "mon_1", "tick-line");
-    const timeout = formatMonitorEvent("watcher", "mon_1", "[Monitor timed out — re-arm if needed.]", "timeout");
+    const timeout = formatMonitorEvent("watcher", "mon_1", "Timeout elapsed. Stop requested; exit unconfirmed.", "timeout");
     center.notify({ customType: timeout.customType, content: timeout.content, details: timeout.details });
     clock.advanceBy(10_000);
     expect(sent).toHaveLength(0);
@@ -220,7 +220,7 @@ describe("NotifyCenter compact hold and one-turn flush", () => {
     });
     center.beginHold();
     center.notifyMonitorEvent("watcher", "mon_1", "tick-line", 0, { quiet: true });
-    const timeout = formatMonitorEvent("watcher", "mon_1", "[Monitor timed out — re-arm if needed.]", "timeout");
+    const timeout = formatMonitorEvent("watcher", "mon_1", "Timeout elapsed. Stop requested; exit unconfirmed.", "timeout");
     center.notify(
       { customType: timeout.customType, content: timeout.content, details: timeout.details },
       { passive: true, quietEvents: true },

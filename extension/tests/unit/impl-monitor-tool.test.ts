@@ -142,7 +142,7 @@ describe("monitor transcript row status", () => {
 
 describe("monitor lifecycle guidance", () => {
   const expiry =
-    /Expiry ends the monitor; nothing watches the source afterwards, and the timeout notice can arrive late while you are busy/;
+    /Expiry requests this monitor's stop; the timeout notice can arrive late while you are busy/;
   const sampling =
     /Sampling windows must not overlap and must not leave gaps \(window = interval\), or keep a cursor\/last-seen state in the script and report only new items/;
   const stagger = /If you use timeouts for several monitors, stagger them/;

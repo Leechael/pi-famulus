@@ -82,6 +82,28 @@ const CASES: Array<[string, string, boolean, RegExp]> = [
   ["overrun-progressing", "interrupt", false, /interrupted a child that was making progress/],
 ];
 
+describe("monitor behavior integration", () => {
+  it("observes a real timeout while an alternative monitor stays active", async () => {
+    await withDiagnostics(async (directory) => {
+      const result = await episode("monitor-behavior-alternative", "good", directory);
+      assert.equal(result.error, undefined);
+      assert.equal(result.grade.pass, true, JSON.stringify(result.grade));
+      assert.equal(result.grade.metrics.activeAtTimeout, true);
+      assert.equal(result.grade.metrics.alertAfterTimeout, true);
+      assert.equal(result.grade.metrics.monitorStarts, 2);
+      const items = itemsFromEvents(readFileSync(result.transcriptPath!, "utf8").trim().split("\n").map((line) => JSON.parse(line)));
+      const starts = toolResults(items).filter((r) => r.toolName === "monitor" && !r.isError);
+      assert.equal(starts.length, 2);
+      const firstId = String(starts[0].details?.task_id), secondId = String(starts[1].details?.task_id);
+      assert.notEqual(firstId, secondId);
+      const timeout = wakes(items).find((w) => w.wake.status === "timeout" && w.wake.taskIds.includes(firstId));
+      const alert = wakes(items).find((w) => w.wake.kind === "monitor" && w.wake.taskIds.includes(secondId) && w.wake.body.includes("ALERT fixture-ready"));
+      assert.ok(timeout && alert, "both real monitor wakes must be delivered");
+      assert.ok(timeout.seq > starts[1].seq && alert.seq > timeout.seq, `start=${starts[1].t} timeout=${timeout.t} alert=${alert.t}`);
+    });
+  });
+});
+
 describe("tail-grep timing regressions", () => {
   it("regression: fresh Node watchdog terminates and reaps a hung process tree", async () => {
     const timersBefore = process.getActiveResourcesInfo().filter((type) => type === "Timeout");
