@@ -78,6 +78,48 @@ The messaging bridge reads only the `messaging` object in this same file. It is 
 | `eventLogSize` | `4096` | Maximum retained bridge events. |
 | `endpoints` | `[]` | Webhook objects with required `name` and `url`, optional `secret` (default empty), and `auth` (default `"hmac"`). Secret-bearing webhooks require HTTPS or a loopback URL. |
 
+## Monitor decision model (shadow mode)
+
+An optional cheap classifier model can judge each monitor wake: does this output need the agent now? This release records that judgement only. It never suppresses, delays or changes a wake, and the model sees no prompt change. It is off by default.
+
+```json
+{
+  "decisionModel": { "enabled": true, "model": "typesafe/jev-1", "timeoutMs": 3000 }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turn shadow classification on. Only `true` enables it. Read when pi starts; `/reload` keeps the running setting along with the running monitors, so restart pi after changing it. |
+| `model` | unset | Classifier as `provider/id` (the id may contain `/`). Unset: the first classifier model pi has working credentials for (`getAvailableOfType("classifier")`). |
+| `timeoutMs` | 3000 | Per-call limit (100 to 60000). A call past it is aborted and recorded as a timeout. |
+
+pi-famulus has no API-key setting for this. It uses pi's own models and credentials (see pi's "Use classifier models" in `docs/models.md`). When the flag is off, no classifier is available, the configured model is not in pi's registry, or the running pi has no classifier support, monitors behave exactly as without this feature and no error reaches the model. `/famulus` then shows `Decision model: shadow · unavailable (<reason>)`.
+
+**Privacy.** When enabled, monitor output leaves the machine: each classified batch (up to the last 40 lines and 4000 characters of output, the monitor description and command, each up to 500 characters, and up to 500 characters of the previous batch) is sent to the chosen classifier provider. Do not enable it for monitors that print secrets unless you trust that provider with them.
+
+What is classified: ordinary monitor output batches when they are admitted as a wake, and overload summaries. Not classified: overload enter/leave notices, exit, timeout and protection-stop notices, output the model already asked to stop (`task_stop`), and batches dropped by the rate limit or held back by summary mode. A classified batch can still be coalesced with others into one wake while the agent is busy; the log counts batches.
+
+The question asked is a single `bool`, `needs_attention`: "Does this monitor output show a problem or event the agent watching '<description>' must act on now?". At most 4 calls run at once; extra batches are logged as skipped.
+
+### Shadow log
+
+Every decision is one JSON line in `<famulus home>/decision-shadow.jsonl` (default `~/.pi/agent/pi-famulus/decision-shadow.jsonl`; it rotates to `decision-shadow.jsonl.1` past 10 MB):
+
+```json
+{"v":1,"ts":1762300000000,"sessionId":"…","taskId":"mon_…","kind":"batch","lines":12,"stateChars":930,"truncated":false,"model":"typesafe/jev-1","needsAttention":false,"probability":0.07,"latencyMs":182,"usage":{"input":310,"output":1,"costTotal":0.00002},"stopReason":"stop","error":null}
+```
+
+`kind` is `batch` or `summary`; `lines` is the batch's line count before the 40-line bound. `needsAttention` is `probability >= 0.5`. Failed calls have `probability: null` and an `error` (`timeout after 3000ms`, the provider's error message, or `skipped: in-flight limit`).
+
+"Would have suppressed N of M wakes" at the 0.5 threshold, or any other:
+
+```sh
+jq -s '[.[] | select(.error == null)] | {judged: length, wouldSuppress: map(select(.probability < 0.5)) | length}' ~/.pi/agent/pi-famulus/decision-shadow.jsonl
+```
+
+`/famulus` shows the running count for this session, e.g. `Decision model: shadow · typesafe/jev-1 · would suppress 7 of 19 · <log path>`.
+
 ## Environment variables
 
 | Variable | Meaning |
