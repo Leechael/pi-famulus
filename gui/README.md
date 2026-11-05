@@ -36,6 +36,16 @@ The TUI and the GUI drive one state machine, so they cannot drift apart:
   match bookkeeping, so both frontends scroll and search the same way.
 - **Same paging.** Like the terminal, the window renders only the rows in view.
 
+## Window settings (menu bar, kept across launches)
+
+- **View → Appearance:** System, Light or Dark. Each color is a dark/light pair: the window's
+  own colors have hand-picked light versions, and the TUI's colors get the same hue with the
+  lightness turned over (`light` and `flip` in `src/app.rs`).
+- **View → Minimize to Menu Bar** (macOS, on by default): the app gets an icon in the menu
+  bar. Minimizing (the yellow button, ⌘M, Window → Minimize) hides the window there and drops
+  the Dock icon; clicking the icon brings the window back. NSH 0.4 has no status item, so
+  `src/tray.rs` uses AppKit directly. Off, minimizing goes to the Dock as usual.
+
 ## Verified (macOS, live daemon, ~4,100 retained tasks, 248 agents)
 
 - Tree, agents and tasks tabs show the TUI's columns and values. Scope cycles through
@@ -53,6 +63,9 @@ The TUI and the GUI drive one state machine, so they cannot drift apart:
   TUI. Not every key was covered. Stopping a task (`x`, then `y`) and sending to or aborting
   an agent were deliberately left untried, so no real process or agent was touched. Both
   run the TUI's code path, and stop asks for confirmation first.
+- **The menu bar icon and the yellow button in tray mode.** Window → Minimize hides the
+  window and drops the Dock icon, and opening the app again brings both back (checked). The
+  icon itself and a click on it, and the yellow button, were not checked by hand yet.
 - Linux and Windows.
 
 ## Known

@@ -6,6 +6,8 @@ use nsh_core::prelude::*;
 mod app;
 mod engine;
 mod keys;
+mod theme;
+mod tray;
 
 pub use app::App;
 

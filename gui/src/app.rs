@@ -25,7 +25,8 @@ const PAD: f32 = 10.0;
 /// Scroll views that only report the wheel sit at this offset.
 const WHEEL_REST: f32 = 400.0;
 
-// The TUI's palette (`top::ui`), on a terminal-like dark surface.
+// The TUI's palette (`top::ui`), on a terminal-like dark surface; [`light`]
+// gives each its light-theme counterpart.
 const BG: u32 = 0x15171d;
 const PANEL: u32 = 0x1b1e26;
 const BORDER: u32 = 0x2c303c;
@@ -42,8 +43,68 @@ const BOX_KINDS: u32 = 0x807a50;
 const BOX_MAIN: u32 = 0x625e9c;
 const BOX_PREVIEW: u32 = 0x885a60;
 
+/// A palette color (written for the dark surface) with its light-mode
+/// counterpart; the window shows whichever the appearance asks for.
 fn c(hex: u32) -> AdaptiveColor {
-    AdaptiveColor::rgb(hex, hex)
+    AdaptiveColor::rgb(light(hex), hex)
+}
+
+/// The light theme: the window's own colors by hand, the TUI's run colors
+/// by rule ([`flip`]).
+fn light(hex: u32) -> u32 {
+    match hex {
+        BG => 0xf3f4f7,
+        PANEL => 0xffffff,
+        BORDER => 0xd5d8e0,
+        TEXT => 0x1e222c,
+        MUTED => 0x585e6e,
+        DIM => 0x868c9b,
+        ACCENT => 0x2c5bd0,
+        HOT => 0xc23434,
+        SEL_BG => 0xdde5f8,
+        WARN => 0x8f6200,
+        ERR => 0xc22d3a,
+        BOX_OVERVIEW => 0x5f9a72,
+        BOX_KINDS => 0xa89a4a,
+        BOX_MAIN => 0x7d78c8,
+        BOX_PREVIEW => 0xb8737c,
+        _ => flip(hex),
+    }
+}
+
+/// Same hue, lightness turned over: dark surfaces become light ones, and
+/// light text becomes dark text (kept dark enough to read on white).
+fn flip(hex: u32) -> u32 {
+    let ch = |shift: u32| ((hex >> shift) & 0xff) as f32 / 255.0;
+    let (r, g, b) = (ch(16), ch(8), ch(0));
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    let s = if d == 0.0 { 0.0 } else { d / (1.0 - (2.0 * l - 1.0).abs()) };
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    let l = if l < 0.3 { 1.0 - l * 0.45 } else { (1.0 - l).clamp(0.2, 0.42) };
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s.min(0.85);
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h as u32 / 60 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let to = |v: f32| (((v + m) * 255.0).round().clamp(0.0, 255.0)) as u32;
+    (to(r) << 16) | (to(g) << 8) | to(b)
 }
 
 fn mono(t: impl IntoReactive<SharedString>) -> Text {
@@ -125,6 +186,7 @@ pub fn App() -> impl IntoElement {
         });
     }
     keys::bind(&engine);
+    crate::theme::install();
     {
         let engine = engine.clone();
         effect(move || engine.viewport(viewport.get()));
