@@ -52,6 +52,47 @@ These keys belong in the `subagent` object unless noted otherwise.
 | `idleGraceMs` | `15000` | Daemon | Grace period after the estimated prompt-cache expiry. |
 | `idleMaxMs` | `3600000` | Daemon | Maximum warm idle lifetime. |
 
+## Cache warming settings
+
+These keys belong in the `cacheWarming` object. Warming is off by default.
+
+| Key | Default | Used by | Description |
+|---|---|---|---|
+| `enabled` | `false` | Extension | Keep the provider prompt cache warm while the session sits idle behind a persistent monitor. |
+| `maxIdleMs` | `21600000` (6 h) | Extension | Stop warming this long after the last real request. |
+
+```json
+{ "cacheWarming": { "enabled": true, "maxIdleMs": 21600000 } }
+```
+
+A persistent monitor can wake a session hours after its last turn. By then the provider prompt cache has expired, and the whole context is written again at full price. Pi's own cache warmer stops 30 minutes after the last request, so it does not cover this.
+
+With `enabled: true`, while the agent is idle and at least one persistent monitor runs, pi-famulus replays the last real session request with a one-token output cap. It sends the replay at `min(0.9 x TTL, TTL - 10s)` after that request, then the same interval after each successful replay. While pi-famulus warms, it answers pi's `cache_warming_decision` with `stop`, so only one warmer runs. Every replay is logged (`cache-warm.sent` in the extension event log) and appended to the session as a `famulus-cache-warm` custom entry. Each entry holds the token usage and cost of that replay, plus the running count and total cost. Custom entries are never sent to the model.
+
+**TTLs come from pi, not from pi-famulus.** pi-famulus warms only models that declare `promptCache` in pi's `models.json`, for example through `modelOverrides`; see pi's [Prompt Cache Lifetimes](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/models.md#prompt-cache-lifetimes). The tier follows pi: `long` when `PI_CACHE_RETENTION=long`, otherwise `short`. pi-famulus ships no TTL table and never edits pi's config.
+
+The first time a persistent monitor starts while the current model has no TTL for the active tier, or while warming is off, an interactive session shows one info notice explaining how to turn warming on. It shows at most once per session and model, and never enters the model's context.
+
+Warming stops when:
+
+- the agent starts a new run or sends a real request (an in-flight replay is aborted; warming reschedules from the new request once the agent settles)
+- no persistent monitor remains
+- `maxIdleMs` has passed since the last real request
+- the model or thinking level changes, the session is compacted, the session tree is navigated, or the session restarts, reloads or shuts down
+- a replay misses the cache (no cache read, or more cache write than read), fails, or its timer fires after the safe refresh point; warming then stays off until the next real request
+
+Supported request APIs and the output-cap field each one uses:
+
+| API | Field |
+|---|---|
+| `anthropic-messages` | `max_tokens` |
+| `bedrock-converse-stream` | `inferenceConfig.maxTokens` |
+| `openai-completions` | `max_completion_tokens` or `max_tokens`, whichever the provider uses |
+| `openai-responses`, `azure-openai-responses` | `max_output_tokens` (16, the API minimum) |
+| `mistral-conversations` | `maxTokens` |
+
+pi-famulus does not warm `openai-codex-responses`, `google-generative-ai`, `google-vertex`, `pi-messages`, virtual or custom APIs, or requests that use budget-based thinking (`thinking.type: "enabled"`), an Anthropic `thread`, or `previous_response_id`. Pi's own warmer still applies to those, within its 30-minute limit.
+
 ## Messaging bridge settings
 
 These keys belong in the `messaging` object in the same `config.json`. Messaging is disabled unless `messaging.enabled` is explicitly `true`; setting a server or token alone does not enable it. While disabled, the plugin registers no messaging tools (`SendMessage`, `ListSessions`, documented in [tools.md](tools.md)), commands, prompts or completion, and the daemon starts no bridge. `PI_FAMULUS_NO_INTERCOM` also disables messaging. Other messaging settings have no environment-variable or alternate-file overrides. Reload the extension after changing `enabled`; daemon-owned settings are reloaded when supervision starts and otherwise require a daemon restart.

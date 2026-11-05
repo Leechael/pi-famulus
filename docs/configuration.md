@@ -45,6 +45,10 @@ The `subagent` timeouts are staggered so they do not fire together:
 
 All keys above except `foregroundBudgetMs`, `managerPath`, and `maxWarmAgents` belong in the `subagent` object. `maxWarmAgents` is top-level; the daemon reads it from there.
 
+## Cache warming keys
+
+`cacheWarming.enabled` (default `false`) and `cacheWarming.maxIdleMs` (default 6 h) control idle prompt-cache warming while persistent monitors run. Prompt cache TTLs come from pi's own `models.json` (`promptCache`), not from this file. See [Cache warming settings](config.md#cache-warming-settings).
+
 ## Daemon keys
 
 The daemon reads these keys from the same file:

@@ -21,6 +21,29 @@ export interface FamulusConfig {
   messaging?: { enabled: boolean };
   /** Optional M3 subagent tuning section (design doc §4.6 limits). */
   subagent?: FamulusSubagentConfig;
+  /** Idle prompt-cache warming while persistent monitors run (off by default). */
+  cacheWarming?: { enabled?: boolean; maxIdleMs?: number };
+}
+
+/** Idle cache warming with every field resolved. */
+export interface ResolvedCacheWarmingConfig {
+  enabled: boolean;
+  /** Stop warming this long after the last real request (ms). */
+  maxIdleMs: number;
+}
+
+export const DEFAULT_CACHE_WARMING: ResolvedCacheWarmingConfig = {
+  enabled: false,
+  maxIdleMs: 6 * 60 * 60_000,
+};
+
+/** Defaults <- cacheWarming section. */
+export function resolveCacheWarmingConfig(config: FamulusConfig): ResolvedCacheWarmingConfig {
+  const section = config.cacheWarming ?? {};
+  return {
+    enabled: section.enabled === true,
+    maxIdleMs: typeof section.maxIdleMs === "number" && section.maxIdleMs > 0 ? section.maxIdleMs : DEFAULT_CACHE_WARMING.maxIdleMs,
+  };
 }
 
 /** Optional `subagent` section of config.json; every field defaults (see resolveSubagentConfig). */
@@ -215,6 +238,13 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
   const config = { ...DEFAULT_CONFIG };
   if (typeof obj.messaging === "object" && obj.messaging !== null) {
     config.messaging = { enabled: (obj.messaging as Record<string, unknown>).enabled === true };
+  }
+  if (typeof obj.cacheWarming === "object" && obj.cacheWarming !== null) {
+    const section = obj.cacheWarming as Record<string, unknown>;
+    config.cacheWarming = { enabled: section.enabled === true };
+    if (typeof section.maxIdleMs === "number" && Number.isFinite(section.maxIdleMs) && section.maxIdleMs > 0) {
+      config.cacheWarming.maxIdleMs = Math.floor(section.maxIdleMs);
+    }
   }
   if (typeof obj.foregroundBudgetMs === "number" && obj.foregroundBudgetMs > 0) {
     config.foregroundBudgetMs = obj.foregroundBudgetMs;
