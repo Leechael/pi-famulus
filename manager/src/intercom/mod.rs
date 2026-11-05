@@ -992,6 +992,12 @@ impl Runtime {
             if ignored && !rearm || d.status == "delivered" && !d.route_terminal() {
                 return;
             }
+            // A terminal forward (explicit or a maintenance retry) is already
+            // in flight: it either commits the route or schedules a retry, so
+            // a repeated status must not render the same receipt again.
+            if d.route_terminal() && d.forwarding {
+                return;
+            }
             // Fence maintenance retries off while the first terminal forward is
             // in flight, and keep its reason for any genuine retry.
             d.drop_reason = reason.into();
