@@ -178,6 +178,12 @@ export class MonitorRegistry {
       throw new RangeError("fingerprint_mode must be exact or ignore-timestamps");
     }
     const persistent = params.persistent === true;
+    if (persistent && params.timeout_ms !== undefined) {
+      throw new RangeError("timeout_ms and persistent are exclusive: use timeout_ms for a watch that ends within 1 hour, persistent:true for an open-ended or longer watch");
+    }
+    if (params.timeout_ms !== undefined && params.timeout_ms > MAX_TIMEOUT_MS) {
+      throw new RangeError("timeout_ms exceeds the 1-hour maximum; for longer watches use persistent:true instead of re-arming");
+    }
     let timeoutMs: number | null = null;
     if (!persistent) {
       const requested = params.timeout_ms ?? DEFAULT_TIMEOUT_MS;

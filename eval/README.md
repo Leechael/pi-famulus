@@ -24,7 +24,7 @@ Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION` 
 
 ## Opt-in monitor behavior probes
 
-Five runnable scenarios in `ablation/monitor-waiter-scenarios.ts` are excluded from the default grid:
+Seven runnable scenarios in `ablation/monitor-waiter-scenarios.ts` are excluded from the default grid:
 
 | Scenario | Checks |
 |---|---|
@@ -33,21 +33,23 @@ Five runnable scenarios in `ablation/monitor-waiter-scenarios.ts` are excluded f
 | `monitor-behavior-alternative` | Two accepted monitors watch the same source; after the eight-second diagnostic times out, the already-running alternative delivers the alert without another start. |
 | `monitor-behavior-noise` | Persistent observation suppresses fixture routine-line wakes and reports the alert; no particular filter is required. |
 | `monitor-behavior-cleanup` | After the alert, an accepted `task_stop` targets the active monitor. |
+| `monitor-behavior-natural` | A naturally phrased watch "for the rest of the day" (longer than the 1-hour cap, no "no planned end" cue) selects a persistent monitor. |
+| `monitor-behavior-renew` | After a user-requested short trial monitor really expires, the open-ended continuation is persistent, not another timed monitor (the hourly re-arm incident). A continuation started before expiry, or a trial that is not a short timed monitor, is INVALID. |
 
 From `eval/`, run deterministic tests without a provider, then inspect the real-model plan before any separately authorized provider run:
 
 ```bash
 node --test ablation/monitor-waiter.test.ts
 node --test --test-name-pattern='observes a real timeout' ablation/graders.test.ts
-node ablation/run.ts --models '<provider>/<model>:<thinking>' --variants baseline --scenarios monitor-behavior-long,monitor-behavior-hour,monitor-behavior-alternative,monitor-behavior-noise,monitor-behavior-cleanup --k 3 --transcripts --results results/monitor-behavior/results.jsonl
+node ablation/run.ts --models '<provider>/<model>:<thinking>' --variants baseline --scenarios monitor-behavior-long,monitor-behavior-hour,monitor-behavior-alternative,monitor-behavior-noise,monitor-behavior-cleanup,monitor-behavior-natural,monitor-behavior-renew --k 3 --transcripts --results results/monitor-behavior/results.jsonl
 # Only after reviewing the plan and obtaining authorization, repeat with --yes.
 ```
 
 The integration test uses a faux model but real pi, extension, manager and timed monitor wakes. It is retained as a required test: inability to start or connect the manager is a test failure, not a pass or skip. In a hosted child-agent shell, unset inherited `PI_FAMULUS_CHILD_ID`, `PI_FAMULUS_CHILD_TOKEN`, `PI_FAMULUS_CHILD_RUN`, and `PI_FAMULUS_CHILD_NAME` for this command so the isolated extension starts as a parent. A compatible Rust toolchain is required; set `RUSTUP_TOOLCHAIN` if the default cargo cannot read the lockfile.
 
-The alternative fixture emits its alert at approximately 24 seconds, after the 8-second timeout and 10-second terminal batching window; the grader checks delivered wake order, task IDs, and accepted starts. Metrics include starts, duration selection, wakes, routine wakes, timeout/alternative evidence, polling, reporting, and stop acceptance. Missing timeout evidence is INVALID. The one-hour probe checks the selected parameter, not an actual hour of operation; cleanup checks an accepted stop request, not confirmed process exit. The fixed fixture token and command-shape checks do not prevent all ways to game the grader. These probes do not cover simultaneous expiry batches, provider outages/recovery, process recreation, or long-run cost and wake rates.
+The alternative fixture emits its alert at approximately 24 seconds, after the 8-second timeout and 10-second terminal batching window; the grader checks delivered wake order, task IDs, and accepted starts. Metrics include starts, duration selection, wakes, routine wakes, timeout/alternative evidence, polling, reporting, and stop acceptance. Missing timeout evidence is INVALID. The one-hour probe checks the selected parameter, not an actual hour of operation; cleanup checks an accepted stop request, not confirmed process exit. The fixed fixture token and command-shape checks do not prevent all ways to game the grader. These probes do not cover the agent's own timed choice expiring with no user cue at the expiry (deferred: synthetic-history expiry probe | impact: the incident's exact no-cue decision point is untested | trigger: renew/natural pass but the hourly re-arm recurs in real sessions), simultaneous expiry batches, provider outages/recovery, process recreation, or long-run cost and wake rates.
 
-A candidate timeout instruction still requires a real-model comparison against the current prompt, not historical sessions or faux-model results. Use independent fresh result files, identical model and thinking specifications, repeated episodes, and inspect cost plans. Report uncertainty and provider errors; persistent selection alone is not evidence of lower cost. Do not present candidate guidance as validated without the comparison and relevant noise criteria.
+The lifetime wording now in the product was compared this way in the [2026-11-05 monitor lifetime review](2026-11-05-MONITOR-LIFETIME-REVIEW.md) (RESULTS.md 2026-11-05b/c). Any further candidate timeout instruction still requires a real-model comparison against the current prompt, not historical sessions or faux-model results. Use independent fresh result files, identical model and thinking specifications, repeated episodes, and inspect cost plans. Report uncertainty and provider errors; persistent selection alone is not evidence of lower cost. Do not present candidate guidance as validated without the comparison and relevant noise criteria.
 
 ## E2E (free)
 

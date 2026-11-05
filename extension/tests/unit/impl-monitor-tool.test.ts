@@ -142,18 +142,22 @@ describe("monitor transcript row status", () => {
 
 describe("monitor lifecycle guidance", () => {
   const expiry =
-    /Expiry requests this monitor's stop; the timeout notice can arrive late while you are busy/;
+    /expiry stops the monitor and the notice can arrive late while you are busy/;
   const sampling =
     /Sampling windows must not overlap and must not leave gaps \(window = interval\), or keep a cursor\/last-seen state in the script and report only new items/;
   const stagger = /If you use timeouts for several monitors, stagger them/;
 
   it("description carries lifecycle once and keeps required behavior", () => {
     const description = createMonitorTool(emptyRegistry()).description;
-    expect(description).toMatch(/timeout_ms defaults to 5 minutes \(max 1 hour\)/);
+    expect(description).toMatch(/timeout_ms \(default 5 minutes, max 1 hour\)/);
     expect(description).toMatch(expiry);
-    expect(description).toMatch(/persistent:true for long monitoring/);
+    expect(description).toMatch(/persistent:true when the watch is open-ended or longer than an hour/);
+    expect(description).toMatch(/do not re-arm timed monitors/);
+    expect(description).toMatch(/Never set both/);
+    expect(description).toMatch(/make it the command/);
+    expect(description).toMatch(/do not add end-of-watch lines/);
     expect(description).toMatch(stagger);
-    expect(description).toMatch(/Prefer `tail -F` \/ `journalctl -f` over polling/);
+    expect(description).toMatch(/`journalctl -f` for a source you did not start/);
     expect(description).toMatch(/edge-triggered/);
     expect(description).toMatch(/normally zero output, one line only for a new problem signature/);
     expect(description).toMatch(/one recovery line/);
@@ -169,10 +173,11 @@ describe("monitor lifecycle guidance", () => {
     expect(description).not.toMatch(/self-heartbeats/);
   });
 
-  it("rules only add the short persistent hint", () => {
+  it("rules only add the short lifetime hint", () => {
     const guidelines = createMonitorTool(emptyRegistry()).promptGuidelines ?? [];
     const rules = guidelines.join("\n");
-    expect(guidelines.at(-1)).toBe("Use persistent:true for long monitoring.");
+    expect(guidelines.at(-1)).toBe("For a watch that is open-ended or longer than an hour, use persistent:true rather than timeout_ms.");
+    expect(rules).toMatch(/Report from the <event> itself/);
     expect(guidelines).toHaveLength(4);
     expect(rules).toMatch(/Use the monitor tool to watch for conditions/);
     expect(rules).toMatch(/<pi-famulus-wake kind="monitor">/);
@@ -193,7 +198,9 @@ describe("monitor lifecycle guidance", () => {
     expect(params.properties.timeout_ms.description).toMatch(/default/);
     expect(params.properties.timeout_ms.description).not.toMatch(/silent event/);
     expect(params.properties.timeout_ms.description).not.toMatch(/Expiry ends/);
-    expect(params.properties.persistent.description).toMatch(/persistent:true for long monitoring/);
+    expect(params.properties.persistent.description).toMatch(/open-ended watches or any horizon over 1 hour/);
+    expect(params.properties.persistent.description).toMatch(/Exclusive with timeout_ms/);
+    expect(params.properties.timeout_ms.description).toMatch(/Exclusive with persistent/);
   });
 
   it("docs\/tools.md and README carry the same monitor lifecycle guidance", () => {

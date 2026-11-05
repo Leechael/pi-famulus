@@ -93,7 +93,7 @@ export async function runEpisode(opts: {
     for (;;) {
       if (Date.now() >= deadline || scenario.done(view().items, view())) break;
       const quietFor = pi.now() - (pi.events.at(-1)?.t ?? 0);
-      if (pi.isSettled() && quietFor >= IDLE_GIVE_UP_MS && !hasRunningWork(sb)) {
+      if (pi.isSettled() && quietFor >= (scenario.idleGiveUpMs ?? IDLE_GIVE_UP_MS) && !hasRunningWork(sb)) {
         idleSince ??= pi.now();
         if (pi.now() - idleSince >= NO_WORK_GRACE_MS && pi.now() - (pi.events.at(-1)?.t ?? 0) >= NO_WORK_GRACE_MS) break;
       } else {
