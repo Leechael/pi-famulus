@@ -131,7 +131,7 @@ describe("task_list monitor timeout and last output", () => {
   async function listText(opts: {
     now: number;
     items: Parameters<WorkIndex["upsert"]>[0][];
-    live?: { taskId: string; remainingMs: number | null; persistent: boolean; lastOutputAt?: number }[];
+    live?: { taskId: string; remainingMs: number | null; persistent: boolean; lastOutputAt?: number; wakeOn?: string; stallAfterMs?: number }[];
   }): Promise<string> {
     const clock = new ManualClock(opts.now);
     const index = new WorkIndex({ clock });
@@ -175,6 +175,23 @@ describe("task_list monitor timeout and last output", () => {
     expect(text).toMatch(/mon_p \[monitor\] running \(5s\) "forever".*persistent/);
     expect(text).toMatch(/mon_p \[monitor\].*no output yet/);
     expect(text).not.toMatch(/timeout in/);
+  });
+
+  it("shows a monitor's wake_on filter and stall threshold, so a quiet filtered monitor reads as filtered", async () => {
+    const text = await listText({
+      now: 10_000,
+      items: [
+        { id: "mon_f", kind: "monitor", status: "running", title: "billing", startedAt: 0, countsAsWorker: false },
+        { id: "mon_p", kind: "monitor", status: "running", title: "plain", startedAt: 0, countsAsWorker: false },
+      ],
+      live: [
+        { taskId: "mon_f", remainingMs: null, persistent: true, lastOutputAt: 9_000, wakeOn: "ERROR|unacked=[1-9]", stallAfterMs: 120_000 },
+        { taskId: "mon_p", remainingMs: null, persistent: true },
+      ],
+    });
+    expect(text).toMatch(/mon_f \[monitor\].*wakes only on \/ERROR\|unacked=\[1-9\]\//);
+    expect(text).toMatch(/mon_f \[monitor\].*stall notice after 2m0s/);
+    expect(text).not.toMatch(/mon_p.*wakes only on|mon_p.*stall notice/);
   });
 
   it("treats repeated deduped output as recent and omits last output when none arrived", async () => {

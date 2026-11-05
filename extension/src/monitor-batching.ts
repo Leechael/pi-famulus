@@ -273,6 +273,16 @@ export class LegacyLineAssembler {
     this.start = undefined;
   }
 
+  /** Hand over the retained unterminated line (the monitor exited) and forget it. */
+  drainPartial(): OverloadInput | undefined {
+    const start = this.start;
+    const partial = start === undefined || this.bytes === 0
+      ? undefined
+      : { lines: 1, bytes: this.bytes, text: this.text, cursorStart: start, cursorEnd: start + this.bytes };
+    this.reset();
+    return partial;
+  }
+
   push(chunk: string, chunkBytes: number, cursorStart: number, cursorEnd: number): OverloadInput | undefined {
     if (chunk.length === 0 && chunkBytes === 0) return undefined;
     if (this.start !== undefined && cursorStart !== this.start + this.bytes) this.reset();

@@ -444,3 +444,14 @@ describe("attachCompactRecovery", () => {
     center.dispose();
   });
 });
+
+describe("running-monitors list after compaction keeps the wake_on filter visible", () => {
+  it("renders wake-on for filtered monitors only", () => {
+    const wake = formatRunningMonitorList([
+      { id: "mon_1", description: "billing", remaining: "persistent", wakeOn: "ERROR|a<b" },
+      { id: "mon_2", description: "plain", remaining: "persistent" },
+    ]);
+    expect(wake.content).toContain('<monitor id="mon_1" remaining="persistent" wake-on="ERROR|a&lt;b">billing</monitor>');
+    expect(wake.content).toContain('<monitor id="mon_2" remaining="persistent">plain</monitor>');
+  });
+});

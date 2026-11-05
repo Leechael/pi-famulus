@@ -163,6 +163,8 @@ describe("monitor lifecycle guidance", () => {
     expect(description).toMatch(/one recovery line/);
     expect(description).toMatch(sampling);
     expect(description).toMatch(/do not print a heartbeat on every check/);
+    expect(description).toMatch(/set wake_on to the problem pattern: only matching lines wake you, and task_output keeps every line/);
+    expect(description).toMatch(/Use stall_after_ms instead of heartbeats/);
     expect(description).toMatch(/keep running/);
     expect(description).toMatch(/Silence is not success/);
     expect(description).toMatch(/Do not poll/);
@@ -176,9 +178,10 @@ describe("monitor lifecycle guidance", () => {
   it("rules only add the short lifetime hint", () => {
     const guidelines = createMonitorTool(emptyRegistry()).promptGuidelines ?? [];
     const rules = guidelines.join("\n");
-    expect(guidelines.at(-1)).toBe("For a watch that is open-ended or longer than an hour, use persistent:true rather than timeout_ms.");
+    expect(guidelines[3]).toBe("For a watch that is open-ended or longer than an hour, use persistent:true rather than timeout_ms.");
+    expect(guidelines.at(-1)).toBe("For a persistent monitor, set wake_on to the problem pattern so only problems wake you, and stall_after_ms instead of heartbeats.");
     expect(rules).toMatch(/Report from the <event> itself/);
-    expect(guidelines).toHaveLength(4);
+    expect(guidelines).toHaveLength(5);
     expect(rules).toMatch(/Use the monitor tool to watch for conditions/);
     expect(rules).toMatch(/<pi-famulus-wake kind="monitor">/);
     expect(rules).not.toMatch(expiry);
@@ -203,6 +206,17 @@ describe("monitor lifecycle guidance", () => {
     expect(params.properties.timeout_ms.description).toMatch(/Exclusive with persistent/);
   });
 
+  it("params describe wake_on and stall_after_ms", () => {
+    const params = JSON.parse(JSON.stringify(createMonitorTool(emptyRegistry()).parameters)) as {
+      properties: { wake_on: { description: string }; stall_after_ms: { description: string } };
+    };
+    expect(params.properties.wake_on.description).toMatch(/only matching lines wake you/);
+    expect(params.properties.wake_on.description).toMatch(/every line is still recorded for task_output/);
+    expect(params.properties.wake_on.description).toMatch(/Strongly recommended for persistent monitors/);
+    expect(params.properties.stall_after_ms.description).toMatch(/min 10000, max 86400000/);
+    expect(params.properties.stall_after_ms.description).toMatch(/instead of heartbeat lines/);
+  });
+
   it("docs\/tools.md and README carry the same monitor lifecycle guidance", () => {
     const tools = readFileSync(join(repoRoot, "docs", "tools.md"), "utf8");
     const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
@@ -216,6 +230,8 @@ describe("monitor lifecycle guidance", () => {
       expect(text).toMatch(/journalctl -f/);
       expect(text).toMatch(/edge-triggered/);
       expect(text).toMatch(sampling);
+      expect(text).toMatch(/set `wake_on` to the problem pattern: only matching lines wake the agent, and `task_output` keeps every line/);
+      expect(text).toMatch(/`stall_after_ms` instead of heartbeats/);
       expect(text).not.toMatch(/expiry is a silent event/);
       expect(text).not.toMatch(/liveness belongs/);
       expect(text).not.toMatch(/same instant/);

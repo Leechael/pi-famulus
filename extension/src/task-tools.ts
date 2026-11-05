@@ -30,7 +30,7 @@ export interface TaskToolsDeps {
   /** task_stop on a monitor: its leftover lines and exit should not wake the model. */
   noteStopRequested?: (taskId: string) => (() => void) | void;
   /** Live monitor remaining timeout and last output, from the in-session registry. */
-  getMonitorLive?: () => Iterable<{ taskId: string; remainingMs: number | null; persistent: boolean; lastOutputAt?: number }>;
+  getMonitorLive?: () => Iterable<MonitorLive>;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -73,14 +73,22 @@ function formatDuration(startedAt: number, endedAt: number | null, now: number):
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
 }
 
-function formatMonitorLive(
-  live: { remainingMs: number | null; persistent: boolean; lastOutputAt?: number },
-  now: number,
-): string {
+interface MonitorLive {
+  taskId: string;
+  remainingMs: number | null;
+  persistent: boolean;
+  lastOutputAt?: number;
+  wakeOn?: string;
+  stallAfterMs?: number;
+}
+
+function formatMonitorLive(live: MonitorLive, now: number): string {
   const timeout = live.persistent ? "persistent" : `timeout in ${formatAge(now, now + (live.remainingMs ?? 0), now)}`;
   const last =
     live.lastOutputAt === undefined ? "no output yet" : `last output ${formatAge(live.lastOutputAt, undefined, now)} ago`;
-  return ` ${timeout}; ${last}`;
+  const filter = live.wakeOn === undefined ? "" : `; wakes only on /${live.wakeOn}/`;
+  const stall = live.stallAfterMs === undefined ? "" : `; stall notice after ${formatAge(now, now + live.stallAfterMs, now)}`;
+  return ` ${timeout}; ${last}${filter}${stall}`;
 }
 
 function formatTaskLine(task: TaskRecord, now: number): string {
@@ -126,7 +134,7 @@ export function createTaskListTool(
       const lines: string[] = [];
       const seen = new Set<string>();
       let running = false;
-      const monitorLive = new Map<string, { remainingMs: number | null; persistent: boolean; lastOutputAt?: number }>();
+      const monitorLive = new Map<string, MonitorLive>();
       for (const live of deps.getMonitorLive?.() ?? []) monitorLive.set(live.taskId, live);
 
       const pushItem = (item: WorkItem) => {

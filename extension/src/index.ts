@@ -639,6 +639,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         id: mon.taskId,
         description: mon.description,
         remaining: mon.persistent ? "persistent" : `${formatDuration(mon.remainingMs ?? 0)} remaining`,
+        ...(mon.wakeOn ? { wakeOn: mon.wakeOn } : {}),
       })),
   });
 
