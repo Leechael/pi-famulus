@@ -6,13 +6,15 @@
 
 pub mod clipboard;
 pub mod collector;
+pub mod controller;
 pub mod live;
 pub mod model;
 pub mod ui;
 
 use crate::client::{self, HelloMode};
 use crate::proto::{RequestKind, UnitOk};
-use crate::top::collector::{open_detail, CollectView, Collector, Tick};
+use crate::top::collector::{open_detail, CollectView, Tick};
+use crate::top::controller::Controller;
 use crate::top::live::{LiveCmd, LiveMsg};
 use crate::top::model::{AgentComposer, Chat, CopyRequest, Detail, DetailBody, NodeKind, Tab, TabHit, TopState};
 use crossterm::event::{
@@ -28,7 +30,6 @@ use std::panic;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::MissedTickBehavior;
 
 enum CollectorCmd {
     View(CollectView),
@@ -86,16 +87,7 @@ pub async fn run(
     cwd: Option<String>,
     focus: Option<String>,
 ) -> Result<(), String> {
-    let mut state = TopState::new(interval_ms, session, cwd);
-    state.focus = focus;
-    state.message = Some("loading…".into());
-
-    // The live view is `serve` with a screen: it supervises the manager
-    // until it exits.
-    let lease_home = home.to_path_buf();
-    let _lease = Lease(tokio::spawn(async move {
-        client::hold_supervision(&lease_home, |_| {}).await;
-    }));
+    let mut ctl = Controller::start(home, interval_ms, session, cwd, focus);
     let _guard = TerminalGuard::enter().map_err(|e| e.to_string())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).map_err(|e| e.to_string())?;
 
@@ -115,99 +107,75 @@ pub async fn run(
         }
     });
 
-    let (live_tx, mut live_rx) = mpsc::unbounded_channel::<LiveMsg>();
-    let mut live_slot: Option<(String, mpsc::UnboundedSender<LiveCmd>)> = None;
-    let (tick_tx, mut tick_rx) = mpsc::channel::<Result<Tick, String>>(1);
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CollectorCmd>();
-    let home_buf = home.to_path_buf();
-    let start_interval = state.interval_ms.max(100);
-    let start_view = CollectView::from_state(&state);
-    tokio::spawn(async move {
-        let mut collector = Collector::new(home_buf);
-        let mut interval = tokio::time::interval(Duration::from_millis(start_interval));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut paused = false;
-        let mut view = start_view;
-        loop {
-            tokio::select! {
-                _ = interval.tick(), if !paused => {
-                    let _ = tick_tx.send(collector.tick(&view).await).await;
-                    if collector.disk_stale() {
-                        collector.refresh_disk().await;
-                        let _ = tick_tx.send(collector.tick(&view).await).await;
-                    }
-                }
-                Some(cmd) = cmd_rx.recv() => match cmd {
-                    CollectorCmd::View(v) => view = v,
-                    CollectorCmd::SetInterval(ms) => {
-                        interval = tokio::time::interval(Duration::from_millis(ms.max(100)));
-                        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                    }
-                    CollectorCmd::Pause(p) => paused = p,
-                    CollectorCmd::Refresh => {
-                        let _ = tick_tx.send(collector.tick(&view).await).await;
-                    }
-                    CollectorCmd::Tails => {
-                        let _ = tick_tx.send(Ok(collector.tails(&view))).await;
-                    }
-                }
-            }
-        }
-    });
-
-    let mut copy_job: Option<CopyJob> = None;
     loop {
-        terminal.draw(|f| ui::draw(f, &mut state)).map_err(|e| e.to_string())?;
-        let anim = state.wants_anim();
+        terminal.draw(|f| ui::draw(f, ctl.state_mut())).map_err(|e| e.to_string())?;
         tokio::select! {
-            Some(res) = tick_rx.recv() => apply_latest(&mut state, &mut tick_rx, res),
+            () = ctl.wait() => {}
             Some(ev) = ev_rx.recv() => {
-                if dispatch_event(&mut state, ev, home, &cmd_tx).await? {
-                    break;
+                if let Some(input) = Input::from_event(ev) {
+                    if ctl.input(input).await? {
+                        break;
+                    }
                 }
             }
-            Some(msg) = live_rx.recv() => apply_live(&mut state, msg),
-            result = async { (&mut copy_job.as_mut().unwrap().task).await }, if copy_job.is_some() => {
-                let job = copy_job.take().unwrap();
-                let notice = result.unwrap_or_else(|e| format!("copy failed: {e}"));
-                job.apply(&mut state, notice);
-            }
-            _ = tokio::time::sleep(Duration::from_millis(80)), if anim => {}
         }
         while let Ok(ev) = ev_rx.try_recv() {
-            if dispatch_event(&mut state, ev, home, &cmd_tx).await? {
-                return Ok(());
-            }
-        }
-        while let Ok(res) = tick_rx.try_recv() {
-            apply_latest(&mut state, &mut tick_rx, res);
-        }
-        while let Ok(msg) = live_rx.try_recv() {
-            apply_live(&mut state, msg);
-        }
-        if let Some(request) = state.pending_copy.take() {
-            copy_job = Some(CopyJob::start(request));
-        }
-        sync_live(&mut state, home, &mut live_slot, &live_tx);
-        for (op, text) in std::mem::take(&mut state.pending_live) {
-            let sent = live_slot.as_ref().is_some_and(|(_, tx)| tx.send(LiveCmd::Send { op, text: text.clone() }).is_ok());
-            if !sent {
-                if let Some(composer) = state.composer.as_mut() {
-                    if composer.input.is_empty() {
-                        composer.input = text;
-                    } else {
-                        composer.input.push('\n');
-                        composer.input.push_str(&text);
-                    }
+            if let Some(input) = Input::from_event(ev) {
+                if ctl.input(input).await? {
+                    return Ok(());
                 }
-                state.message = Some("the live session is gone; the message was put back".into());
             }
         }
-    }
-    if let Some((_, tx)) = live_slot {
-        let _ = tx.send(LiveCmd::Stop);
+        ctl.settle();
     }
     Ok(())
+}
+
+/// What a frontend hands the controller: the TUI's crossterm events, or
+/// the GUI's native actions (`Action`).
+#[derive(Debug, Clone)]
+pub enum Input {
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+    Action(Action),
+}
+
+/// A pointer or text action from a frontend that knows what it clicked
+/// (the GUI), rather than a terminal cell. Each runs the same code as the
+/// TUI's mouse handling for that target.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// A click on a row: selects it; on the selected row, folds / unfolds a
+    /// tree branch or opens the detail; a second click within 400ms opens.
+    RowClick(String),
+    /// A double-click on a row: opens its detail.
+    RowOpen(String),
+    /// A click on the table header: the next sort key.
+    HeaderClick,
+    /// A click on a tab, the scope, or the sort control.
+    TabBar(TabHit),
+    /// A click on a detail stream tab (`output` / `stderr`).
+    DetailTab(usize),
+    /// A click on a fold chevron in an agent thread.
+    Fold(usize),
+    /// Wheel ticks; positive scrolls down.
+    Wheel(i32),
+    /// Drag on the detail's scrollbar, as a fraction of its track.
+    ScrollTo(f32),
+    /// The text of the open prompt (filter, output search, or agent input).
+    Text(String),
+    /// A click on an overlay's backdrop.
+    Dismiss,
+}
+
+impl Input {
+    fn from_event(ev: Event) -> Option<Input> {
+        match ev {
+            Event::Key(key) => Some(Input::Key(key)),
+            Event::Mouse(mouse) => Some(Input::Mouse(mouse)),
+            _ => None,
+        }
+    }
 }
 
 fn apply_latest(state: &mut TopState, tick_rx: &mut mpsc::Receiver<Result<Tick, String>>, first: Result<Tick, String>) {
@@ -243,16 +211,16 @@ fn apply_latest(state: &mut TopState, tick_rx: &mut mpsc::Receiver<Result<Tick, 
     }
 }
 
-async fn dispatch_event(
+async fn dispatch(
     state: &mut TopState,
-    ev: Event,
+    input: Input,
     home: &Path,
     cmd_tx: &mpsc::UnboundedSender<CollectorCmd>,
 ) -> Result<bool, String> {
     let prev_interval = state.interval_ms;
     let prev_paused = state.paused;
     let prev_view = CollectView::from_state(state);
-    if handle_event(state, ev, home).await? {
+    if handle_input(state, input, home).await? {
         return Ok(true);
     }
     if state.interval_ms != prev_interval {
@@ -488,14 +456,101 @@ fn conversation(detail: &mut Detail) -> &mut Chat {
     }
 }
 
-async fn handle_event(state: &mut TopState, ev: Event, home: &Path) -> Result<bool, String> {
-    match ev {
-        Event::Key(key) => handle_key(state, key, home).await,
-        Event::Mouse(mouse) => {
+async fn handle_input(state: &mut TopState, input: Input, home: &Path) -> Result<bool, String> {
+    match input {
+        Input::Key(key) => handle_key(state, key, home).await,
+        Input::Mouse(mouse) => {
             handle_mouse(state, mouse);
             Ok(false)
         }
-        _ => Ok(false),
+        Input::Action(action) => {
+            handle_action(state, action);
+            Ok(false)
+        }
+    }
+}
+
+pub(crate) fn handle_action(state: &mut TopState, action: Action) {
+    let blocked = state.help || state.confirm_stop.is_some();
+    match action {
+        Action::Wheel(_) if blocked => {}
+        Action::Wheel(ticks) => {
+            for _ in 0..ticks.unsigned_abs() {
+                wheel(state, ticks > 0);
+            }
+        }
+        Action::Dismiss => state.help = false,
+        _ if state.confirm_stop.is_some() => {}
+        _ if state.help => state.help = false,
+        Action::DetailTab(tab) => {
+            if let Some(d) = state.detail.as_mut() {
+                set_detail_tab(d, tab);
+            }
+        }
+        Action::Fold(id) => {
+            if let Some(d) = state.detail.as_mut() {
+                toggle_fold(d, id);
+            }
+        }
+        Action::ScrollTo(fraction) => {
+            if let Some(d) = state.detail.as_mut() {
+                scroll_to(d, fraction);
+            }
+        }
+        Action::Text(text) => set_prompt_text(state, text),
+        _ if state.detail.is_some() => {}
+        Action::RowClick(id) => {
+            if let Some(i) = state.visible.iter().position(|v| v.id == id) {
+                click_row(state, i);
+            }
+        }
+        Action::RowOpen(id) => {
+            if state.visible.iter().any(|v| v.id == id) {
+                state.selected = Some(id);
+                if let Some(d) = open_detail(state) {
+                    state.detail = Some(d);
+                }
+            }
+        }
+        Action::HeaderClick => state.cycle_sort(false),
+        Action::TabBar(hit) => tab_hit(state, hit),
+    }
+}
+
+/// The open prompt's text, as typing it key by key would leave it.
+fn set_prompt_text(state: &mut TopState, text: String) {
+    if state.confirm_stop.is_some() {
+        return;
+    }
+    if state.filter_editing {
+        state.set_filter(text);
+        return;
+    }
+    let live = state
+        .detail
+        .as_ref()
+        .is_some_and(|d| d.tabs.is_empty() && state.composer.as_ref().is_some_and(|c| c.child_id == d.id));
+    if live {
+        if let Some(c) = state.composer.as_mut() {
+            c.esc_armed = false;
+            c.input = text;
+        }
+        return;
+    }
+    if let Some(d) = state.detail.as_mut() {
+        if matches!(d.body, DetailBody::Log { .. }) && d.log.editing {
+            d.log.query = text;
+            d.log.seek = true;
+        }
+    }
+}
+
+fn wheel(state: &mut TopState, down: bool) {
+    match (state.detail.as_mut(), down) {
+        (Some(d), true) => detail_scroll_down(d, 3),
+        (Some(d), false) => detail_scroll_up(d, 3),
+        (None, true) => state.move_sel(1),
+        (None, false) => state.move_sel(-1),
     }
 }
 
@@ -548,20 +603,8 @@ fn handle_mouse(state: &mut TopState, ev: MouseEvent) {
     let blocked = state.help || state.confirm_stop.is_some();
     match ev.kind {
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if blocked => {}
-        MouseEventKind::ScrollDown => {
-            if let Some(d) = state.detail.as_mut() {
-                detail_scroll_down(d, 3);
-            } else {
-                state.move_sel(1);
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            if let Some(d) = state.detail.as_mut() {
-                detail_scroll_up(d, 3);
-            } else {
-                state.move_sel(-1);
-            }
-        }
+        MouseEventKind::ScrollDown => wheel(state, true),
+        MouseEventKind::ScrollUp => wheel(state, false),
         MouseEventKind::Down(MouseButton::Left) => handle_mouse_click(state, ev.column, ev.row),
         MouseEventKind::Drag(MouseButton::Left) => {
             if state.mouse.dragging_bar {
@@ -615,6 +658,12 @@ fn handle_mouse_click(state: &mut TopState, col: u16, row: u16) {
     if i >= state.visible.len() {
         return;
     }
+    click_row(state, i);
+}
+
+/// A click on visible row `i`: select, then fold / open, or open on a
+/// quick second click.
+fn click_row(state: &mut TopState, i: usize) {
     let id = state.visible[i].id.clone();
     let now = std::time::Instant::now();
     let dbl = state.mouse.last.as_ref().is_some_and(|(prev, at)| prev == &id && now.duration_since(*at) < Duration::from_millis(400));
@@ -643,12 +692,16 @@ fn handle_mouse_click(state: &mut TopState, col: u16, row: u16) {
 
 fn click_tab_bar(state: &mut TopState, col: u16) {
     let x = col.saturating_sub(state.mouse.tabs.x);
-    let hit = state.mouse.tab_hits.iter().find(|(x0, x1, _)| x >= *x0 && x < *x1).map(|h| h.2);
+    if let Some(hit) = state.mouse.tab_hits.iter().find(|(x0, x1, _)| x >= *x0 && x < *x1).map(|h| h.2) {
+        tab_hit(state, hit);
+    }
+}
+
+fn tab_hit(state: &mut TopState, hit: TabHit) {
     match hit {
-        Some(TabHit::Tab(tab)) => state.set_tab(tab),
-        Some(TabHit::Scope) => state.cycle_scope(),
-        Some(TabHit::Sort) => state.cycle_sort(false),
-        None => {}
+        TabHit::Tab(tab) => state.set_tab(tab),
+        TabHit::Scope => state.cycle_scope(),
+        TabHit::Sort => state.cycle_sort(false),
     }
 }
 
@@ -686,14 +739,27 @@ fn toggle_fold_at(state: &mut TopState, col: u16, row: u16) {
     if x < hit.x0 || x >= hit.x1 {
         return;
     }
+    toggle_fold(d, hit.id);
+}
+
+fn toggle_fold(d: &mut Detail, id: usize) {
     // Leaving "unfold all" by clicking one block folds only that block.
     if d.tools_expanded {
         d.tools_expanded = false;
         d.open = (0..d.fold_count).collect();
     }
-    if !d.open.remove(&hit.id) {
-        d.open.insert(hit.id);
+    if !d.open.remove(&id) {
+        d.open.insert(id);
     }
+}
+
+/// Scroll the detail to `fraction` of its length, as dragging the
+/// scrollbar's thumb there does.
+fn scroll_to(d: &mut Detail, fraction: f32) {
+    let max = d.wrap_len.saturating_sub(d.view_h);
+    d.follow = false;
+    d.hold = false;
+    d.scroll = (fraction.clamp(0.0, 1.0) * max as f32).round() as usize;
 }
 
 fn drag_scrollbar(state: &mut TopState, row: u16) {
