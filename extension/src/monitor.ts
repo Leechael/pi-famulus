@@ -341,6 +341,7 @@ export class MonitorRegistry {
       // Empty metadata arrays deliberately hold raw fragments for Rust framing.
       entry.batcher.flush();
       const accepted: MonitorOutputRecord[] = [];
+      let filteredLines = 0;
       let metadataTookOver = false;
       for (const record of records) {
         if (!validRecord(record, entry.cursor)) continue;
@@ -350,12 +351,17 @@ export class MonitorRegistry {
         entry.lastRecordKind = record.kind;
         if (record.kind === "line") entry.lastOutputAt = this.clock.now();
         this.noteActivity(entry);
-        // Filtered-out records never reach dedup or overload accounting.
-        if (!admits(entry, record.preview)) continue;
+        // Filtered-out records reach neither dedup nor wake accounting,
+        // only the stop backstop.
+        if (!admits(entry, record.preview)) {
+          if (record.kind === "line") filteredLines++;
+          continue;
+        }
         entry.output.push(record);
         if (record.kind === "line") accepted.push(record);
       }
       if (metadataTookOver) entry.legacyLines.reset();
+      this.noteFilteredLines(entry, filteredLines);
       if (accepted.length > 0) {
         this.noteInput(entry, {
           lines: accepted.length,
@@ -400,7 +406,9 @@ export class MonitorRegistry {
 
   /** wake_on on the raw path: pass only matching completed lines on to overload accounting and the batcher. */
   private admitLegacyLines(entry: MonitorEntry, assembled: OverloadInput): void {
-    const lines = (assembled.text ?? "").split("\n").filter((line) => admits(entry, line));
+    const all = (assembled.text ?? "").split("\n");
+    const lines = all.filter((line) => admits(entry, line));
+    this.noteFilteredLines(entry, all.length - lines.length);
     if (lines.length === 0) return;
     const now = this.clock.now();
     entry.legacyOutput = mergeOutputInfo(entry.legacyOutput, {
@@ -449,6 +457,13 @@ export class MonitorRegistry {
     if (!center) return;
     this.deps.logEvent?.("monitor.stall", { id: entry.taskId, idleMs: idle });
     center.notifyMonitorEvent(entry.description, entry.taskId, fill("tools.monitor.event.stalled", { idle: formatDuration(idle) }), 0, {});
+  }
+
+  /** Lines wake_on kept from waking still count toward the input-rate stop backstop. */
+  private noteFilteredLines(entry: MonitorEntry, lines: number): void {
+    if (lines <= 0) return;
+    entry.overload.recordFilteredLines(lines);
+    if (entry.overload.shouldStop() && !entry.stopRequested && !entry.stopping) void this.autoStop(entry);
   }
 
   /** Count complete raw lines/chunks before limiter (includes later-deduped lines). */

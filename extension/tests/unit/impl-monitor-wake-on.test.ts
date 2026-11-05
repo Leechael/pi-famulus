@@ -172,10 +172,10 @@ describe("monitor wake_on: dedup, overload and terminal bookkeeping", () => {
     done();
   });
 
-  it("a heartbeat flood does not enter summary mode, drop, or stop, and a later match arrives as a line", async () => {
+  it("a heartbeat flood below the stop rate does not enter summary mode, drop, or stop, and a later match arrives as a line", async () => {
     const { clock, registry, monitorWakes, events, stopped, done } = await setup({
       params: { wake_on: "ERROR", dedup_window_ms: 0 },
-      overload: { windowMs: 1_000, summaryLinesPerSec: 2, stopLinesPerSec: 20, stopSustainMs: 2_000 },
+      overload: { windowMs: 1_000, summaryLinesPerSec: 2, stopLinesPerSec: 100, stopSustainMs: 2_000 },
     });
     for (let s = 0; s < 10; s++) {
       registry.handleOutput("mon_1", `${`${HEARTBEAT} seq=${s}\n`.repeat(50)}`);
@@ -191,6 +191,41 @@ describe("monitor wake_on: dedup, overload and terminal bookkeeping", () => {
     expect(monitorWakes().map((w) => w.event)).toEqual(["ERROR consumer gone"]);
     done();
   });
+
+  // The ~1000 lines/s auto-stop protects CPU, disk and the task log, so it
+  // counts every line, filtered or not.
+  for (const path of ["raw chunks", "framed records"] as const) {
+    it(`a flood of non-matching lines above the stop rate is still auto-stopped, with its notice (${path})`, async () => {
+      const { clock, registry, events, stopped, terminals, monitorWakes, done } = await setup({
+        params: { wake_on: "ERROR", dedup_window_ms: 0 },
+        overload: { windowMs: 1_000, summaryLinesPerSec: 2, stopLinesPerSec: 20, stopSustainMs: 2_000 },
+      });
+      const line = framer();
+      for (let s = 0; s < 4; s++) {
+        if (path === "raw chunks") registry.handleOutput("mon_1", `${`${HEARTBEAT} seq=${s}\n`.repeat(50)}`);
+        else {
+          for (let k = 0; k < 50; k++) {
+            const f = line(`${HEARTBEAT} seq=${s}.${k}`, s);
+            registry.handleOutput("mon_1", f.chunk, f.cursor, [f.record]);
+          }
+        }
+        clock.advanceBy(1_000);
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+      await Promise.resolve();
+      expect(stopped).toEqual(["mon_1:rate-limit"]);
+      expect(events).toContainEqual({ type: "monitor.stop", fields: { id: "mon_1", reason: "rate-limit" } });
+      expect(registry.has("mon_1")).toBe(false);
+      // Filtered lines never entered summary mode on the way.
+      expect(monitorWakes().filter((w) => /overload/.test(w.event))).toEqual([]);
+      clock.advanceBy(TERMINAL_MS);
+      const stop = terminals().find((m) => JSON.stringify(m.details).includes('"status":"stopped"'));
+      expect(stop?.content).toMatch(/safety backstop/);
+      expect(stop?.content).not.toContain("HEARTBEAT");
+      done();
+    });
+  }
 
   it("matching lines still drive overload summaries, and the summary counts only them", async () => {
     const { clock, registry, monitorWakes, done } = await setup({

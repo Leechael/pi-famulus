@@ -405,6 +405,8 @@ export interface OverloadInput {
  * INPUT (line-rate / stop / interval bytes) is complete raw records (`kind:"line"`)
  * or newline-terminated chunks counted in acceptOutput, before the token bucket.
  * Later-deduped lines still count as input; dedup does not consume tokens or the drop budget.
+ * Lines a wake_on filter keeps from waking count only toward the stop backstop
+ * (recordFilteredLines): it protects CPU, disk and the task log, not the wake budget.
  * Interval signature stats begin at summary-mode entry (line-rate trigger included;
  * drop-ratio entry starts empty), then reset on each emitted summary.
  */
@@ -422,7 +424,10 @@ export class OverloadController {
   private readonly onEnter?: OverloadControllerOptions["onEnter"];
   private readonly onExit?: OverloadControllerOptions["onExit"];
   private readonly saturation: SaturationWindow;
+  /** Admitted input: summary-mode line rate. */
   private readonly lineBuckets: { sec: number; n: number; firstAt: number }[] = [];
+  /** Every output line, admitted or filtered out: the stop backstop. */
+  private readonly stopBuckets: { sec: number; n: number; firstAt: number }[] = [];
   private signatures = new Map<string, { count: number; extra: number }>();
   private previousSigs = new Set<string>();
   private sigSeq = 0;
@@ -473,7 +478,10 @@ export class OverloadController {
     if (this.disposed) return;
     const now = this.clock.now();
     const lines = Math.max(0, input.lines);
-    if (lines > 0) this.addLineBucket(lines, now);
+    if (lines > 0) {
+      this.addLineBucket(this.lineBuckets, lines, now);
+      this.addLineBucket(this.stopBuckets, lines, now);
+    }
     const wasSummary = this.summaryMode;
     if (wasSummary) {
       if (lines > 0 || input.bytes > 0) this.addInterval(input, now);
@@ -486,6 +494,12 @@ export class OverloadController {
       this.addInterval(input, now);
     }
     this.evaluateExit(now);
+  }
+
+  /** Lines kept from waking by a filter: they feed only the stop backstop. */
+  recordFilteredLines(lines: number): void {
+    if (this.disposed || lines <= 0) return;
+    this.addLineBucket(this.stopBuckets, lines, this.clock.now());
   }
 
   recordBatch(dropped: boolean): void {
@@ -596,20 +610,20 @@ export class OverloadController {
     this.onSummary?.(text, output);
   }
 
-  private addLineBucket(n: number, now: number): void {
-    if (this.firstInputAt === undefined) this.firstInputAt = now;
+  private addLineBucket(buckets: { sec: number; n: number; firstAt: number }[], n: number, now: number): void {
+    if (buckets === this.lineBuckets && this.firstInputAt === undefined) this.firstInputAt = now;
     const sec = Math.floor(now / 1000);
-    const last = this.lineBuckets[this.lineBuckets.length - 1];
+    const last = buckets[buckets.length - 1];
     if (last && last.sec === sec) {
       const wasBelowStop = last.n < this.stopLinesPerSec;
       last.n += n;
       // Earlier low-rate input in this second is not the start of the flood.
       if (wasBelowStop && last.n >= this.stopLinesPerSec) last.firstAt = now;
     } else {
-      this.lineBuckets.push({ sec, n, firstAt: now });
+      buckets.push({ sec, n, firstAt: now });
     }
     const cutoffSec = Math.floor((now - Math.max(this.windowMs, this.stopSustainMs)) / 1000) - 1;
-    while (this.lineBuckets.length > 0 && this.lineBuckets[0].sec < cutoffSec) this.lineBuckets.shift();
+    while (buckets.length > 0 && buckets[0].sec < cutoffSec) buckets.shift();
   }
 
   /** Average over the last `window` completed seconds; the current partial second is excluded. */
@@ -640,8 +654,8 @@ export class OverloadController {
     let i = 0;
     let runFirstAt: number | undefined;
     for (let sec = from; sec <= to; sec++) {
-      while (i < this.lineBuckets.length && this.lineBuckets[i].sec < sec) i++;
-      const bucket = this.lineBuckets[i];
+      while (i < this.stopBuckets.length && this.stopBuckets[i].sec < sec) i++;
+      const bucket = this.stopBuckets[i];
       if (!bucket || bucket.sec !== sec || bucket.n < this.stopLinesPerSec) return false;
       if (runFirstAt === undefined) runFirstAt = bucket.firstAt;
     }

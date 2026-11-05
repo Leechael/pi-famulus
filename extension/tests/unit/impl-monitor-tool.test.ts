@@ -163,6 +163,8 @@ describe("monitor lifecycle guidance", () => {
     expect(description).toMatch(/one recovery line/);
     expect(description).toMatch(sampling);
     expect(description).toMatch(/do not print a heartbeat on every check/);
+    expect(description).toMatch(/without wake_on, do not print a heartbeat on every check/);
+    expect(description).toMatch(/Without wake_on, write edge-triggered commands: normally zero output/);
     expect(description).toMatch(/set wake_on to the problem pattern: only matching lines wake you, and task_output keeps every line/);
     expect(description).toMatch(/Use stall_after_ms instead of heartbeats/);
     expect(description).toMatch(/keep running/);
@@ -232,6 +234,7 @@ describe("monitor lifecycle guidance", () => {
       expect(text).toMatch(sampling);
       expect(text).toMatch(/set `wake_on` to the problem pattern: only matching lines wake the agent, and `task_output` keeps every line/);
       expect(text).toMatch(/`stall_after_ms` instead of heartbeats/);
+      expect(text).toMatch(/[Ww]ithout `wake_on`, (write|commands should be) edge-triggered/);
       expect(text).not.toMatch(/expiry is a silent event/);
       expect(text).not.toMatch(/liveness belongs/);
       expect(text).not.toMatch(/same instant/);
