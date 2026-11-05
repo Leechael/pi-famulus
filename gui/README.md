@@ -53,6 +53,9 @@ The TUI and the GUI drive one state machine, so they cannot drift apart:
 - A task detail shows the pinned info card, the `output` / `stderr` tabs, the line count and
   the footer keys. An agent detail shows its usage line and the live input with its facts.
 - Clicks reach the controller (logged end to end): tabs, scope, rows, second click to open.
+- Appearance switches between System, Light and Dark at once and is kept. In tray mode the
+  menu bar icon shows; the yellow button, ⌘M and Window → Minimize hide the window and the
+  Dock icon; the icon and reopening the app bring them back (checked by hand).
 - The release build uses about 210 MB (the earlier spike, with a native row per task, used
   837 MB). CPU is 30–48% at the default 1 s refresh. The release TUI under the same load
   uses 22–42% CPU, so the cost is the shared collector, not the window.
@@ -63,9 +66,6 @@ The TUI and the GUI drive one state machine, so they cannot drift apart:
   TUI. Not every key was covered. Stopping a task (`x`, then `y`) and sending to or aborting
   an agent were deliberately left untried, so no real process or agent was touched. Both
   run the TUI's code path, and stop asks for confirmation first.
-- **The menu bar icon and the yellow button in tray mode.** Window → Minimize hides the
-  window and drops the Dock icon, and opening the app again brings both back (checked). The
-  icon itself and a click on it, and the yellow button, were not checked by hand yet.
 - Linux and Windows.
 
 ## Known
