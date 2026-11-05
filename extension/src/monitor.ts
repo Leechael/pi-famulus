@@ -570,7 +570,7 @@ export class MonitorRegistry {
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        `${entry.overload.stopNotice().replace("Monitor stopped:", "Monitor protection threshold reached:")} ${stopDetail}`,
+        `${entry.overload.stopNotice()} ${stopDetail}`,
         "stopped",
         { droppedLines: entry.droppedLinesPending, output: entry.output.takeSummary() },
       ),

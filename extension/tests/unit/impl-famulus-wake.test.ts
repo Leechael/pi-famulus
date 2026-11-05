@@ -656,6 +656,18 @@ describe("monitor-session-end wake", () => {
 });
 
 describe("shell exit facts", () => {
+  it("phrases killed status without duplicated reasons or placeholders", () => {
+    const phrase = (extra: object) => formatTaskNotification([{ taskId: "sh_2", kind: "shell", command: "build", status: "killed", exitCode: null, durationMs: 1000, outputPath: "/tmp/out", preview: "", ...extra } as never], []).content;
+    const tui = phrase({ endReason: "stopped:tui", signal: "SIGTERM" });
+    expect(tui).toContain('"build" was killed (stopped via TUI, SIGTERM)');
+    expect(tui).not.toContain("reason:");
+    expect(phrase({ endReason: "timeout" })).toContain('"build" was killed (timeout)');
+    const noReason = phrase({ signal: "SIGKILL" });
+    expect(noReason).toContain('"build" was killed (SIGKILL)');
+    expect(noReason).not.toContain("reason: unknown");
+    expect(phrase({})).toMatch(/"build" was killed(?! \()/);
+  });
+
   it("retains killed signal and stop source in summary and details", () => {
     const wake = formatTaskNotification([{ taskId: "sh_1", kind: "shell", command: "build", status: "killed", exitCode: null, durationMs: 1000, outputPath: "/tmp/out", preview: "", endReason: "stopped:tui", signal: "SIGTERM" }], []);
     expect(wake.content).toContain("TUI");

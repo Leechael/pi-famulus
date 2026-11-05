@@ -109,15 +109,28 @@ function displayCommand(command: string): string {
   return shellWakeTitle(command);
 }
 
+function stopSourceLabel(source: string): string {
+  return source === "tui" ? "TUI" : source === "cli" ? "CLI" : source;
+}
+
 export function exitReasonPhrase(endReason: string | undefined): string {
   const source = endReason?.startsWith("stopped:") ? endReason.slice("stopped:".length) : undefined;
   return source !== undefined
-    ? `Stopped via ${source === "tui" ? "TUI" : source === "cli" ? "CLI" : source} (reason: ${endReason})`
+    ? `Stopped via ${stopSourceLabel(source)} (reason: ${endReason})`
     : endReason === "exited" ? "Process exited" : `Process ended (reason: ${endReason ?? "unknown"})`;
 }
 
 export function formatExitFacts(facts: import("./wake").MonitorExitFacts): string {
   return `${exitReasonPhrase(facts.endReason)}; exit code ${facts.exitCode == null ? "unknown" : facts.exitCode}${facts.signal ? `; signal ${facts.signal}` : ""}.${facts.stopRequested ? " This agent requested a stop." : ""}`;
+}
+
+function killedPhrase(info: TaskExitInfo): string {
+  const details: string[] = [];
+  if (info.endReason) {
+    details.push(info.endReason.startsWith("stopped:") ? `stopped via ${stopSourceLabel(info.endReason.slice("stopped:".length))}` : info.endReason);
+  }
+  if (info.signal) details.push(info.signal);
+  return details.length ? `was killed (${details.join(", ")})` : "was killed";
 }
 
 function statusPhrase(info: TaskExitInfo): string {
@@ -130,7 +143,7 @@ function statusPhrase(info: TaskExitInfo): string {
     case "failed":
       return code ? `failed (${code})` : "failed";
     case "killed":
-      return `was killed; ${exitReasonPhrase(info.endReason)}${info.signal ? `; signal ${info.signal}` : ""}`;
+      return killedPhrase(info);
     case "orphaned":
       return "ended when pi-famulus crashed";
   }
