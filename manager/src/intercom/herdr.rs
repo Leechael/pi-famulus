@@ -367,21 +367,44 @@ async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, Stri
         }
     }
 }
-async fn start_agent(rt: &Runtime, req: &Value, pane: &str) -> Result<String, String> {
-    quick("agent.start",json!({"name":req["name"],"kind":req["agent"],"pane_id":pane,"args":req["args"].as_array().cloned().unwrap_or_default()})).await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+/// The agent's own argv: the session name goes in as `--name` (pi and Claude
+/// both take it) unless the caller already set one, so the agent registers
+/// under it rather than under its cwd.
+fn agent_args(req: &Value) -> Vec<Value> {
+    let mut args = req["args"].as_array().cloned().unwrap_or_default();
+    let named = args
+        .iter()
+        .any(|a| matches!(a.as_str(), Some("--name" | "-n")));
+    if !named {
+        args.splice(0..0, [json!("--name"), req["name"].clone()]);
+    }
+    args
+}
+
+/// Start the agent and answer with its intercom id and name. Herdr lists the
+/// pane at once under a placeholder row keyed by the pane id; that row is not
+/// addressable as a peer, so wait for the agent's own registration. The wait
+/// stays under a relay call's 15s budget so a cross-machine add still answers;
+/// past it the pane id is returned, as before.
+async fn start_agent(rt: &Runtime, req: &Value, pane: &str) -> Result<(String, String), String> {
+    quick(
+        "agent.start",
+        json!({"name":req["name"],"kind":req["agent"],"pane_id":pane,"args":agent_args(req)}),
+    )
+    .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         if let Some(row) = rt
             .directory()
             .await
             .iter()
-            .find(|r| str_field(r, "herdr_pane_id") == pane)
+            .find(|r| str_field(r, "herdr_pane_id") == pane && str_field(r, "id") != pane)
         {
-            return Ok(str_field(row, "id").into());
+            return Ok((str_field(row, "id").into(), str_field(row, "name").into()));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Ok(pane.into())
+    Ok((pane.into(), str_field(req, "name").into()))
 }
 async fn wait_exited(pane: &str, seconds: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
@@ -530,6 +553,9 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             {
                 return Err("--agent must be pi or claude".into());
             }
+            if !agent.is_empty() && name.starts_with('-') {
+                return Err("--name must not start with '-': it is passed to the agent".into());
+            }
             if relay {
                 relay_cwd(cwd)?;
                 relay_agent_args(&req["args"])?;
@@ -595,12 +621,14 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                         origin: relay_origin.clone(),
                     });
             }
-            let session = if agent.is_empty() {
-                String::new()
+            let mut out = json!({"pane_id":pane});
+            if agent.is_empty() {
+                out["session_id"] = json!("");
             } else {
-                start_agent(rt, req, pane).await?
-            };
-            let mut out = json!({"pane_id":pane,"session_id":session});
+                let (session, name) = start_agent(rt, req, pane).await?;
+                out["session_id"] = json!(session);
+                out["name"] = json!(name);
+            }
             if op == "workspace_create" {
                 out["workspaces"] = json!([{ "id":created,"name":name,"cwd":cwd }]);
             }
