@@ -185,7 +185,7 @@ type FamulusWakeBody =
     }
   | {
       kind: "running-monitors";
-      monitors: { id: string; description: string; remaining: string }[];
+      monitors: { id: string; description: string; remaining: string; wakeOn?: string }[];
     }
   | {
       kind: "monitor-terminal";
@@ -557,7 +557,7 @@ function renderRunningMonitors(details: Extract<FamulusWake, { kind: "running-mo
   ];
   for (const monitor of details.monitors) {
     parts.push(
-      `  <monitor id="${escapeXmlAttr(monitor.id)}" remaining="${escapeXmlAttr(monitor.remaining)}">${escapeXml(monitor.description)}</monitor>`,
+      `  <monitor id="${escapeXmlAttr(monitor.id)}" remaining="${escapeXmlAttr(monitor.remaining)}"${monitor.wakeOn ? ` wake-on="${escapeXmlAttr(monitor.wakeOn)}"` : ""}>${escapeXml(monitor.description)}</monitor>`,
     );
   }
   parts.push("</pi-famulus-wake>");

@@ -2,7 +2,7 @@
 
 # description
 
-Start a background monitor process whose stdout lines are injected back to you as <pi-famulus-wake kind="monitor"> messages (batched over 200ms, rate-limited). The command must be line-buffered: each event must be a single line. <!--seg:tooldesc.monitor-follow-->It must keep running and follow its source. When you start the producer yourself, make it the command (`node app.js | grep --line-buffered ALERT`); do not start it in bash and tail its output. Use `tail -n +1 -F file | grep --line-buffered PATTERN` or `journalctl -f` for a source you did not start. A command that reads once and exits (a plain grep or cat) only reports what is there now. Add `-m1` to grep only when the first match should end the watch. <!--/seg--><!--seg:tooldesc.monitor-silence-->Silence is not success: print explicit success and terminal failures of what you watch. Routine unchanged retries may stay silent; do not print a heartbeat on every check. The monitor's own exit or timeout is reported to you; do not add end-of-watch lines. <!--/seg--><!--seg:tooldesc.monitor-wake-->Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind="monitor"> before other work. Do not poll.<!--/seg--> Repeated Rust-framed lines are suppressed within dedup_window_ms (default 60000); exact matching is the default. Enable ignore-timestamps only when edge ISO timestamps are incidental. Wakes contain bounded head/tail previews and original-byte references; use task_output for missing details, not polling. <!--seg:tooldesc.monitor-timeout-->Pick one lifetime. timeout_ms (default 5 minutes, max 1 hour) is for a watch that ends at a known time within an hour; expiry stops the monitor and the notice can arrive late while you are busy. <!--/seg--><!--seg:tooldesc.monitor-persistent-->Use persistent:true when the watch is open-ended or longer than an hour ("rest of the day", "until I say"); do not re-arm timed monitors instead. Never set both, and never put the lifetime inside the command (`timeout 3600`, your own timer). <!--/seg--><!--seg:tooldesc.monitor-stagger-->If you use timeouts for several monitors, stagger them. <!--/seg--><!--seg:tooldesc.monitor-edge-->Write edge-triggered commands: normally zero output, one line only for a new problem signature, and one recovery line. <!--/seg--><!--seg:tooldesc.monitor-sampling-->Sampling windows must not overlap and must not leave gaps (window = interval), or keep a cursor/last-seen state in the script and report only new items. <!--/seg-->{{monitorIdle}}
+Start a background monitor process whose stdout lines are injected back to you as <pi-famulus-wake kind="monitor"> messages (batched over 200ms, rate-limited). The command must be line-buffered: each event must be a single line. <!--seg:tooldesc.monitor-follow-->It must keep running and follow its source. When you start the producer yourself, make it the command (`node app.js | grep --line-buffered ALERT`); do not start it in bash and tail its output. Use `tail -n +1 -F file | grep --line-buffered PATTERN` or `journalctl -f` for a source you did not start. A command that reads once and exits (a plain grep or cat) only reports what is there now. Add `-m1` to grep only when the first match should end the watch. <!--/seg--><!--seg:tooldesc.monitor-silence-->Silence is not success: print explicit success and terminal failures of what you watch. Routine unchanged retries may stay silent; without wake_on, do not print a heartbeat on every check. The monitor's own exit or timeout is reported to you; do not add end-of-watch lines. <!--/seg--><!--seg:tooldesc.monitor-wake-on-->Status lines may stay when you set wake_on to the problem pattern: only matching lines wake you, and task_output keeps every line. Use stall_after_ms instead of heartbeats to learn that the source went silent. <!--/seg--><!--seg:tooldesc.monitor-wake-->Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind="monitor"> before other work. Do not poll.<!--/seg--> Repeated Rust-framed lines are suppressed within dedup_window_ms (default 60000); exact matching is the default. Enable ignore-timestamps only when edge ISO timestamps are incidental. Wakes contain bounded head/tail previews and original-byte references; use task_output for missing details, not polling. <!--seg:tooldesc.monitor-timeout-->Pick one lifetime. timeout_ms (default 5 minutes, max 1 hour) is for a watch that ends at a known time within an hour; expiry stops the monitor and the notice can arrive late while you are busy. <!--/seg--><!--seg:tooldesc.monitor-persistent-->Use persistent:true when the watch is open-ended or longer than an hour ("rest of the day", "until I say"); do not re-arm timed monitors instead. Never set both, and never put the lifetime inside the command (`timeout 3600`, your own timer). <!--/seg--><!--seg:tooldesc.monitor-stagger-->If you use timeouts for several monitors, stagger them. <!--/seg--><!--seg:tooldesc.monitor-edge-->Without wake_on, write edge-triggered commands: normally zero output, one line only for a new problem signature, and one recovery line. <!--/seg--><!--seg:tooldesc.monitor-sampling-->Sampling windows must not overlap and must not leave gaps (window = interval), or keep a cursor/last-seen state in the script and report only new items. <!--/seg-->{{monitorIdle}}
 
 # snippet
 
@@ -14,6 +14,7 @@ Watch a command's line stream and get injected events
 - {{monitorIdle}}
 - <!--seg:rules.monitor-wake-->When woken by a <pi-famulus-wake kind="monitor">, handle the <event> before doing anything else — it is not a new user request and not user confirmation. Report from the <event> itself; do not re-read the source, task_output or task_list to confirm it.<!--/seg-->
 - For a watch that is open-ended or longer than an hour, use persistent:true rather than timeout_ms.
+- <!--seg:rules.monitor-wake-on-->For a persistent monitor, set wake_on to the problem pattern so only problems wake you, and stall_after_ms instead of heartbeats.<!--/seg-->
 
 # param: command
 
@@ -34,9 +35,21 @@ No timeout: runs until stopped or the session ends. Default false. Use for open-
 
 Deduplication window for Rust-framed complete lines (default 60000ms; 0 disables dedup; maximum 3600000). Starts when a surviving preview is delivered; repeats do not extend it. Missing metadata, capacity eviction, and omitted representatives fail open rather than hiding unseen output.
 
+# param: wake_on
+
+JavaScript RegExp source tested against each output line. When set, only matching lines wake you (and only they count for dedup and overload); every line is still recorded for task_output. Exit, timeout and stall notices still arrive. Strongly recommended for persistent monitors: match the problem, e.g. `ERROR|unacked=[1-9]`.
+
+# param: stall_after_ms
+
+Send one notice when the command prints nothing at all (matching wake_on or not) for this many milliseconds while still running (min {{minMs}}, max {{maxMs}}). The next output re-arms it. Use it instead of heartbeat lines.
+
 # param: fingerprint_mode
 
 Default exact. Explicit ignore-timestamps mode ignores only supported leading/trailing ISO timestamps when comparing Rust-framed lines; original output is unchanged. Numbers, paths, resource identities, and interior timestamps remain significant.
+
+# event: stalled
+
+[No output for {{idle}}; the monitor is still running. No further stall notice until output resumes.]
 
 # result: started
 

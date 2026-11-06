@@ -659,7 +659,7 @@ export function attachCompactRecovery(
   deps: {
     getCenter: () => NotifyCenter | null;
     getCtx: () => { isIdle(): boolean; hasPendingMessages?: () => boolean } | null;
-    listRunningMonitors: () => { id: string; description: string; remaining: string }[];
+    listRunningMonitors: () => { id: string; description: string; remaining: string; wakeOn?: string }[];
     now?: () => number;
     setTimeout?: typeof setTimeout;
     clearTimeout?: typeof clearTimeout;
