@@ -1220,6 +1220,70 @@ mod tests {
         assert!(delivery.retry_due(delivery.retry_at));
     }
 
+    /// The native target re-sends a terminal status after the origin
+    /// reconnects (as Claude Code does). If that repeat lands after the first
+    /// forward wrote its frame but before the write ack committed the route,
+    /// it must not render the same terminal receipt to the origin again.
+    /// Covers both in-flight sources: an explicit receipt and a maintenance
+    /// retry.
+    #[tokio::test]
+    async fn repeated_terminal_receipt_during_an_in_flight_forward_reaches_the_origin_once() {
+        for source in ["explicit", "maintenance"] {
+            let rt = std::sync::Arc::new(runtime());
+            let mid = "terminal-in-flight";
+            let target = "claude/target";
+            let (tx, mut rx) = mpsc::channel(16);
+            {
+                let mut state = rt.state.lock().unwrap();
+                state.sessions.insert("pi/origin".into(), session(tx, 1, 1));
+                state
+                    .admit(mid, "pi/origin", target, false, false, rt.clock.now_ms())
+                    .unwrap();
+            }
+            let first = tokio::spawn({
+                let rt = rt.clone();
+                async move {
+                    if source == "explicit" {
+                        rt.receipt(mid, target, "denied").await;
+                    } else {
+                        let delivery = {
+                            let mut state = rt.state.lock().unwrap();
+                            let delivery = state.messages.get_mut(mid).unwrap();
+                            delivery.consider("denied", false, rt.clock.now_ms());
+                            delivery.forwarding = true;
+                            delivery.clone()
+                        };
+                        rt.retry_receipt(mid, delivery).await;
+                    }
+                }
+            });
+            let frame = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("first terminal forward must write its frame")
+                .unwrap();
+            assert_eq!(frame.value["status"], "denied");
+            // The frame is written but not yet acknowledged: the route is
+            // still pending when the target repeats its terminal status.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(200),
+                rt.receipt(mid, target, "denied"),
+            )
+            .await;
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "{source}: an in-flight terminal forward was rendered twice"
+            );
+            frame.written.unwrap().send(Ok(())).unwrap();
+            first.await.unwrap();
+            assert!(!rt.state.lock().unwrap().active(mid));
+            rt.receipt(mid, target, "denied").await;
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn maintenance_backs_off_receipt_retries_to_a_failing_origin() {
         let rt = std::sync::Arc::new(runtime());
