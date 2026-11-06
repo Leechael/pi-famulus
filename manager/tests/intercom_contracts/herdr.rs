@@ -307,14 +307,20 @@ fn herdr_session_create_prompt_keys_read_wait_and_close_use_native_methods() {
     let path = herdr.path.to_str().unwrap().to_string();
     fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
     let _pane = pane_plugin(&fixture, "pi-pane", "pane-one");
-    let _created = pane_plugin(&fixture, "pi-created", "pane-new");
+    let mut created_plugin = fixture.connect();
+    created_plugin.ok(json!({"op":"register","session":{"id":"pi-created","name":"Created Pi","cwd":"/fixture/new","status":"idle","pid":std::process::id(),"herdr_pane_id":"pane-new","caps":["read_receipts","idle_state_v1"]}}));
     let mut cli = fixture.connect();
     let created=cli.ok(json!({"op":"session_create","name":"Created Pi","cwd":"/fixture/new","agent":"pi","workspace":"ws-one","args":["--offline"]}));
     assert_eq!(created["pane_id"], "pane-new");
     assert_eq!(created["session_id"], "pi/pi-created");
+    assert_eq!(created["name"], "Created Pi");
     let started = herdr.request("agent.start");
     assert_eq!(started["params"]["kind"], "pi");
-    assert_eq!(started["params"]["args"], json!(["--offline"]));
+    assert_eq!(
+        started["params"]["args"],
+        json!(["--name", "Created Pi", "--offline"]),
+        "the session name must reach the agent, not only the Herdr label"
+    );
     cli.ok(json!({"op":"agent_prompt","to":"pi/pi-pane","body":"pane prompt","wait":true,"until":"idle","timeout_ms":1234}));
     let prompt = herdr.request("agent.prompt");
     assert_eq!(prompt["params"]["target"], "pane-one");
@@ -438,7 +444,7 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
     let started = herdr.request("agent.start");
     assert_eq!(
         started["params"]["args"],
-        json!(["--offline", "--model", "sonnet"]),
+        json!(["--name", "Created Pi", "--offline", "--model", "sonnet"]),
         "a refused session_create reached agent.start"
     );
     for foreign in ["ws-one", "ws-agents"] {
@@ -584,6 +590,8 @@ fn relay_workspace_ownership_is_scoped_to_the_creating_origin() {
     );
     relay.request("register");
     fixture.wait_session("pi/remote");
+    // The agent the "Member" session starts registers, as a real one does.
+    let _created = pane_plugin(&fixture, "pi-created", "pane-new");
     let call = |frame: Value| {
         let id = uuid::Uuid::new_v4().to_string();
         let mut frame = frame;
@@ -958,5 +966,54 @@ fn cross_machine_workspace_ops_forward_end_to_end_with_origin_provenance() {
     assert_eq!(
         herdr_b.request("workspace.close")["params"]["workspace_id"],
         "ws-new"
+    );
+}
+
+#[test]
+fn herdr_session_create_waits_for_the_agent_registration_not_the_pane_placeholder() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let fixture = &fixture;
+    std::thread::scope(|scope| {
+        // The agent registers only after Herdr already lists its pane, as a
+        // real pi does a few seconds after `agent.start`.
+        let late = scope.spawn(move || {
+            thread::sleep(Duration::from_millis(800));
+            let mut plugin = fixture.connect();
+            plugin.ok(json!({"op":"register","session":{"id":"pi-created","name":"Created Pi","cwd":"/fixture/new","status":"idle","pid":std::process::id(),"herdr_pane_id":"pane-new","caps":["read_receipts","idle_state_v1"]}}));
+            plugin
+        });
+        let mut cli = fixture.connect();
+        let created = cli.ok(json!({"op":"session_create","name":"Created Pi","cwd":"/fixture/new","agent":"pi","workspace":"ws-one"}));
+        assert_eq!(
+            created["session_id"], "pi/pi-created",
+            "session_create answered with the pane placeholder before the agent registered: {created}"
+        );
+        assert_eq!(created["name"], "Created Pi");
+        let _plugin = late.join().unwrap();
+    });
+}
+
+#[test]
+fn herdr_session_create_keeps_an_explicit_agent_name_and_refuses_flag_like_names() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let _created = pane_plugin(&fixture, "pi-created", "pane-new");
+    let mut cli = fixture.connect();
+    for args in [json!(["--name", "Own"]), json!(["-n", "Own"])] {
+        cli.ok(json!({"op":"session_create","name":"Label","cwd":"/fixture/new","agent":"pi","workspace":"ws-one","args":args}));
+        assert_eq!(
+            herdr.request("agent.start")["params"]["args"],
+            args,
+            "an explicit agent --name was overridden or duplicated"
+        );
+    }
+    cli.reject(
+        json!({"op":"session_create","name":"--dangerously-skip-permissions","cwd":"/fixture/new","agent":"claude","workspace":"ws-one"}),
+        "must not start with '-'",
     );
 }
