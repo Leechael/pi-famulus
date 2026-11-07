@@ -87,6 +87,8 @@ export const PROMPTS = {
   "tools.task_stop.description": "Stop a running background task (SIGTERM to the process group, SIGKILL after a 2s grace).",
   "tools.task_stop.snippet": "Stop a background task",
   "tools.task_stop.param.task_id": "Task id to stop, e.g. sh_a1b2c3d4",
+  "tools.task_stop.result.stopped": "Task {{taskId}} stopped (SIGTERM; SIGKILL after 2s grace if needed).",
+  "tools.task_stop.result.already-ended": "Task {{taskId}} had already ended ({{outcome}}); nothing was stopped.",
   "wakes.lead-in": "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.",
   "wakes.monitor.output-hint": "Read original bytes with task_output using this monitor id and cursor-start, with a bounded max_bytes (for example 8192); next_cursor continues the read. The range may include interleaved events. A preview is not the full log.",
   "wakes.running-monitors.guidance": "This is an informational list of monitors still running after compaction, not an event. No response is needed; do not use it to poll.",
@@ -127,6 +129,8 @@ export interface PromptVars {
   "tools.subagent.result.resumed": "name" | "childId" | "runId" | "queued";
   "tools.subagent.error.resume-queued": "name" | "childId";
   "tools.task_output.error.no-new-output": "taskId" | "hint";
+  "tools.task_stop.result.stopped": "taskId";
+  "tools.task_stop.result.already-ended": "taskId" | "outcome";
   "wakes.overrun.summary": "name" | "elapsed" | "budget" | "shell";
   "wakes.overrun.summary-shell": "elapsed";
   "wakes.overrun.actions": "runId" | "childId";
