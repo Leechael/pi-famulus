@@ -9,10 +9,10 @@ The 2026-11-07 log-monitor session (`deepseek-flash:high`, pi-famulus 0.2.3):
 - 76 bash `sleep` calls of 40-70 s.
 - 258 `task_output` calls, 326 of them "no new output" replies.
 - Producers started with `(... &)` and then checked with `ps`.
-- 10 of 17 monitors timed out.
+- 10 of 17 monitors were started with an explicit `timeout_ms` (600000 to 2400000).
 - In its thinking, 65 of the 70 waits of `sleep` 10 s or more never mentioned `monitor`.
 
-The monitor prompt offered `persistent` as a thing to opt into, and the 5-minute default made the unmarked choice a timed one.
+The monitor prompt (0.2.3, and 0.2.4 in other words) presented `timeout_ms` as the lifetime for a watch expected to end within an hour and `persistent` as the opt-in for longer ones, so the model estimated a duration itself. None of the 10 timed monitors relied on the 5-minute default.
 
 ## Changes
 
