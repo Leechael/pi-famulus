@@ -66,7 +66,27 @@ First run of the `monitor-behavior-*` probes (the agent-wait rows of that run ar
 
 The hour control (an explicit one-hour watch must keep `timeout_ms: 3600000`) shows no regression under the default.
 
-<<<<<<< HEAD
+## Other models: gpt-6-luna and gpt-6.1-terra
+
+`openai-codex/gpt-6-luna:medium` and `openai-codex/gpt-6.1-terra:medium`, k=3, each arm run as its own baseline in its own results directory. `noise` is regraded from the saved transcripts with the report fix below; every other cell is the run's own verdict and matches the regrade.
+
+| Probe | luna A | luna B | terra A | terra B |
+|---|---:|---:|---:|---:|
+| `agent-wait-job` | 3/3 | 3/3 | 3/3 | 3/3 |
+| `agent-wait-ready` | 0/3 | 0/3 | 0/3 | 2/3 |
+| long | 3/3 | 3/3 | 3/3 | 3/3 |
+| hour | 2/3 | 2/3 | 3/3 | 3/3 |
+| natural | 2/3 | 0/3 | 3/3 | 3/3 |
+| renew | 1/3 (+1 INVALID) | 0/3 (+2 INVALID) | 3/3 | 3/3 |
+| noise | 3/3 | 3/3 | 3/3 | 3/3 |
+| cleanup | 0/3 | 0/3 | 3/3 | 3/3 |
+| alternative | 0/3 (+1 INVALID) | 1/3 | 3/3 | 3/3 |
+
+- terra behaves like deepseek-flash on `agent-wait-ready`: under main it sized the timeout itself (300000, 60000, 30000), under B it started the readiness monitor without one. B's failure is the next point.
+- luna already chooses lifetimes correctly in every arm (`correctDuration` true in nearly every episode), so the default does not change it. All 6 of its `agent-wait-ready` episodes, and one terra B episode, failed another way: the server was started with `run_in_background` and the turn ended with nothing watching ("I'll run the smoke test once it's up"). A background command wakes the agent only when it exits, and a server never exits. That is addressed separately, not by this change.
+- luna's other failures are command shape (the producer started in bash, then its output file tailed) and polls while a monitor runs, in every arm.
+- No hour-control regression on either model.
+
 ## Wait guard
 
 The prompt and the default did not change the choice in the incident context. The guard does not make the model choose a persistent monitor either; it refuses the bad forms of waiting. `extension/src/wait-guard.ts` runs before a bash call and blocks it without ending the run when it waits in bash (`sleep N` with N of 10 or more, or a `sleep` inside a `while`/`until`/`for` loop body) or detaches a process (a lone `&`, `nohup`, `setsid`, `disown`). Quoted strings, heredoc bodies and comments are ignored. The refusal names the alternative: a persistent monitor, ending the turn, or running in the foreground. Config `waitGuard`, default true; `false` disables it (`mech.wait-guard` in the ablation manifest).
@@ -103,29 +123,23 @@ Clean-context probes (same model, k=3). Arm C is arm B (default-persistent + new
 - The guard did not help `agent-wait-ready` in a clean context (B 2/3, C 1/3). In the incident-context replay PASS went from 6/24 to 9/24, within what k=5 can separate; its measurable effect there is the removal of sleep and detach (16 to 0).
 - C's `monitor-behavior-*` cells come from the first run, before the `for`-loop fix.
 
+Arm C on the other two models (same run as their A and B; `noise` regraded):
+
+| Probe | luna C | terra C |
+|---|---:|---:|
+| `agent-wait-job` | 3/3 | 3/3 |
+| `agent-wait-ready` | 0/3 | 1/3 |
+| long | 3/3 | 3/3 |
+| hour | 1/3 | 3/3 |
+| natural | 2/3 | 3/3 |
+| renew | 0/0 (+3 INVALID) | 3/3 |
+| noise | 3/3 | 3/3 |
+| cleanup | 1/3 | 3/3 |
+| alternative | 0/3 (+2 INVALID) | 3/3 |
+
+All five failed `agent-wait-ready` episodes ended the turn after `run_in_background` with nothing watching; the guard does not see that, because nothing sleeps or detaches.
+
 **Deferred:** the poll guard, which would end a run on `task_output` of a still-running task. A replay count showed 43 trips. `deferred: poll guard (end a run on task_output of a still-running task) | impact: with the wait guard on, waits move to task_output/task_list polling (polls 3 to 12 in replay) | trigger: polling remains the dominant wait pattern in a real session after the wait guard`
-=======
-## Other models: gpt-6-luna and gpt-6.1-terra
-
-`openai-codex/gpt-6-luna:medium` and `openai-codex/gpt-6.1-terra:medium`, k=3, each arm run as its own baseline in its own results directory. `noise` is regraded from the saved transcripts with the report fix below; every other cell is the run's own verdict and matches the regrade.
-
-| Probe | luna A | luna B | terra A | terra B |
-|---|---:|---:|---:|---:|
-| `agent-wait-job` | 3/3 | 3/3 | 3/3 | 3/3 |
-| `agent-wait-ready` | 0/3 | 0/3 | 0/3 | 2/3 |
-| long | 3/3 | 3/3 | 3/3 | 3/3 |
-| hour | 2/3 | 2/3 | 3/3 | 3/3 |
-| natural | 2/3 | 0/3 | 3/3 | 3/3 |
-| renew | 1/3 (+1 INVALID) | 0/3 (+2 INVALID) | 3/3 | 3/3 |
-| noise | 3/3 | 3/3 | 3/3 | 3/3 |
-| cleanup | 0/3 | 0/3 | 3/3 | 3/3 |
-| alternative | 0/3 (+1 INVALID) | 1/3 | 3/3 | 3/3 |
-
-- terra behaves like deepseek-flash on `agent-wait-ready`: under main it sized the timeout itself (300000, 60000, 30000), under B it started the readiness monitor without one. B's failure is the next point.
-- luna already chooses lifetimes correctly in every arm (`correctDuration` true in nearly every episode), so the default does not change it. All 6 of its `agent-wait-ready` episodes, and one terra B episode, failed another way: the server was started with `run_in_background` and the turn ended with nothing watching ("I'll run the smoke test once it's up"). A background command wakes the agent only when it exits, and a server never exits. That is addressed separately, not by this change.
-- luna's other failures are command shape (the producer started in bash, then its output file tailed) and polls while a monitor runs, in every arm.
-- No hour-control regression on either model.
->>>>>>> feat/monitor-default-persistent
 
 ## Harness and grader issues found and fixed during the run
 
