@@ -26,6 +26,7 @@ import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
 import { installIdleTurnGuard } from "./idle-turn-guard";
 import { installWaitGuard } from "./wait-guard";
+import { installPollGuard } from "./poll-guard";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
 import { ensureNativeManagerInstalled } from "./native-manager.js";
 import { formatDuration, type TaskExitInfo } from "./format";
@@ -1454,6 +1455,11 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   installWaitGuard(pi, {
     enabled: config.waitGuard !== false,
     onBlock: (info) => logEvent("guard.wait", info),
+  });
+  installPollGuard(pi, {
+    enabled: config.pollGuard !== false,
+    getIndex: () => workIndex,
+    onBlock: (info) => logEvent("guard.poll", info),
   });
 
   // A wake entering the model's context (steer / triggerTurn); see wake-delivery.ts.

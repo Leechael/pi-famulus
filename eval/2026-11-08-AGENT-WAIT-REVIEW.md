@@ -139,7 +139,7 @@ Arm C on the other two models (same run as their A and B; `noise` regraded):
 
 All five failed `agent-wait-ready` episodes ended the turn after `run_in_background` with nothing watching; the guard does not see that, because nothing sleeps or detaches.
 
-**Deferred:** the poll guard, which would end a run on `task_output` of a still-running task. A replay count showed 43 trips. `deferred: poll guard (end a run on task_output of a still-running task) | impact: with the wait guard on, waits move to task_output/task_list polling (polls 3 to 12 in replay) | trigger: polling remains the dominant wait pattern in a real session after the wait guard`
+**Deferred (since done):** the poll guard; see the Poll guard section below.
 
 ## Background commands that never exit
 
@@ -158,6 +158,20 @@ luna (all 9 `agent-wait-ready` episodes across A, B and C) and terra (3 of 6 in 
 | `monitor-not-sleep` | 3/3 | 3/3 | 1/3 | 0/3 | 3/3 | 3/3 |
 
 The C cells of `agent-wait-*` come from the clean-context runs above. luna's D score did not move, but its behaviour did: all 3 D episodes started a persistent monitor on the server's output (0 of 9 before), then ran the smoke test in the same turn before the ready event, or listed tasks. luna's `monitor-not-sleep` failures are the same single `task_list` after the monitor in both arms, as in the 2026-11-07 review. The deepseek D `agent-wait-job` failure is one `sleep` attempt before the result.
+
+## Poll guard
+
+After the wait guard, the remaining bad wait was polling: gpt-6-luna kept a persistent monitor and still called `task_list`/`task_output` before its event, and the wait guard moves sleeps into exactly these calls. `extension/src/poll-guard.ts` refuses (without ending the run) a `task_output` on a still-running task with no wake for it since the last read and no cursor past 0, and a `task_list` while work runs with no wake, user or peer message since the last list or since work was last started. Reading a wake's details, paging on with a cursor, and reading finished tasks stay allowed. The refusal says to end the turn, or to start a monitor first when nothing would wake the agent. Config `pollGuard`, default true. It refuses rather than ends the run, because ending it could leave an agent with nothing that will wake it.
+
+Arm E is arm D plus the poll guard; E2 is E after two gaps the E run exposed were fixed: luna's polls carried `max_bytes`, which the first version treated as paging, and its first `task_list` came right after starting the server and monitor in the same turn. Same three models, k=3.
+
+| | D | E | E2 |
+|---|---:|---:|---:|
+| executed `task_output` on a running task (agent-wait-*, monitor-not-sleep) | 6 | 4 | 0 |
+| executed `task_list` with work running | 3 | 2 | 2 (both after a new wake, allowed by design) |
+| `bg-end-turn`, `still-running-continue`, `wake-continue` (all models) | 27/27 | 27/27 | 27/27 |
+
+Pass rates of `agent-wait-ready` and `monitor-not-sleep` do not move, because their graders count attempted polls, refused or not. The outcome changes: in E2 luna's refused polls in `monitor-not-sleep` were followed by ending the turn and answering from the monitor's wake (2 of 3); its third episode never hit the guard (it set a 40 s timeout and stopped its own monitor). The remaining `task_output` calls the graders count are reads of finished smoke tasks after their wakes. luna still runs the smoke test before the ready event; no guard covers that.
 
 ## Harness and grader issues found and fixed during the run
 

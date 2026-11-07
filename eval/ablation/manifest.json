@@ -352,6 +352,22 @@
         "monitor-behavior-natural",
         "monitor-behavior-renew"
       ]
+    },
+    {
+      "id": "mech.poll-guard",
+      "kind": "config",
+      "surface": "mechanism: poll guard (extension/src/poll-guard.ts); disabled via pollGuard:false",
+      "famulusConfig": {
+        "pollGuard": false
+      },
+      "affects": [
+        "agent-wait-job",
+        "agent-wait-ready",
+        "monitor-not-sleep",
+        "bg-end-turn",
+        "still-running-continue",
+        "wake-continue"
+      ]
     }
   ],
   "groups": [
