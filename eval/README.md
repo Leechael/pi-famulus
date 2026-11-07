@@ -51,6 +51,12 @@ The alternative fixture emits its alert at approximately 24 seconds, after the 8
 
 The lifetime wording now in the product was compared this way in the [2026-11-05 monitor lifetime review](2026-11-05-MONITOR-LIFETIME-REVIEW.md) (RESULTS.md 2026-11-05b/c). Any further candidate timeout instruction still requires a real-model comparison against the current prompt, not historical sessions or faux-model results. Use independent fresh result files, identical model and thinking specifications, repeated episodes, and inspect cost plans. Report uncertainty and provider errors; persistent selection alone is not evidence of lower cost. Do not present candidate guidance as validated without the comparison and relevant noise criteria.
 
+## Idle-after-done probes and replay
+
+Opt-in `idle-after-done-peer`, `-user`, `-peer-long` and `-user-long` (`ablation/idle-after-done-scenarios.ts`) check that the agent ends its turn after reporting, instead of making no-op calls. PASS: the final line is reported, and no run makes more than 2 idle turns in a row or 3 in all. The peer variants run through `harness/peer-ext.ts`, which delivers the task as a cross-session message with no user turn, using the extension's own cross-session prompt and SendMessage surface. `mech.idle-turn-guard` turns the guard off. `node --test ablation/idle-after-done.test.ts` checks the grader without a model.
+
+These probes did not reproduce the 2026-11-07 loop. `replay/run-replay.ts` did: it resumes a real session from an entry with a real model, with tool calls neutralized. See [2026-11-07 idle turn review](2026-11-07-IDLE-TURN-REVIEW.md). Never commit session files or replay outputs.
+
 ## E2E (free)
 
 ```bash

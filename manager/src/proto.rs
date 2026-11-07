@@ -542,6 +542,22 @@ pub struct SuperviseOk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitOk {}
 
+/// `stop` success. `already_ended` is set when the task had already ended and
+/// nothing was signalled, so callers do not report a stop that never happened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopOk {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_ended: Option<AlreadyEnded>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlreadyEnded {
+    pub status: TaskStatus,
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloOk {
     pub version: String,

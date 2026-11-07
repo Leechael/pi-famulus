@@ -11,3 +11,11 @@ Stop a background task
 # param: task_id
 
 Task id to stop, e.g. sh_a1b2c3d4
+
+# result: stopped
+
+Task {{taskId}} stopped (SIGTERM; SIGKILL after 2s grace if needed).
+
+# result: already-ended
+
+Task {{taskId}} had already ended ({{outcome}}); nothing was stopped.

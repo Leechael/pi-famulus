@@ -526,13 +526,15 @@ pub async fn cmd_stop(home: &Path, typed: &str) -> Result<(), String> {
     let mut conn = connect(home, &HelloMode::Cli).await?;
     // Sent even for a finished task: the daemon then clears any leftover
     // process group it still tracks, without changing the record.
-    let _: UnitOk = conn
+    let r: StopOk = conn
         .roundtrip(RequestKind::Stop {
             task_id: t.task_id.clone(),
             reason: Some("cli".into()),
         })
         .await?;
-    if t.status.is_terminal() {
+    // The daemon's answer wins over the snapshot: the task may have ended
+    // between the two.
+    if r.already_ended.is_some() || t.status.is_terminal() {
         let why = t.end_reason.clone().unwrap_or_else(|| {
             serde_json::to_value(t.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
         });

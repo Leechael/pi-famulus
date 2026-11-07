@@ -15,6 +15,7 @@ Set `PI_FAMULUS_HOME` to move the Famulus home directory, or pass `--home` to th
 | `foregroundBudgetMs` | `20000` | Extension | How long `bash` waits before moving a command to the background, in milliseconds. |
 | `subagentBudgetMs` | `45000` | Extension | Default time a `subagent` call waits before running in the background. `subagent.budgetMs` overrides it. |
 | `managerPath` | `null` | Extension; `doctor` | Explicit manager executable. |
+| `idleTurnGuard` | `true` | Extension | Ends a run once two assistant turns in a row, or three in one run, make only no-op or status calls (`true`, `:`, `pwd`, `exit`, `date`, `echo`, `printf`, `sleep`, `task_list`). The calls are not run; the model sees why. A reply, a wake, or a new message starts the count over. Set `false` to disable. |
 | `logLevel` | `"info"` | Extension | Accepted values: `debug`, `info`, `warn`, `error`. Currently parsed but not otherwise used. |
 | `maxWarmAgents` | `4` | Daemon | Maximum number of warm hosted agents. |
 | `goneSessionRetention` | `"24h"` | Daemon | Retention for files belonging to disconnected sessions. |

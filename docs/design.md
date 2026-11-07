@@ -213,9 +213,10 @@ The manager records `backgrounded_at` (ms) in TaskRecord; only the first value i
 ```json
 → {"type":"stop", "task_id":"sh_a1b2c3d4", "reason":"tui"|"cli"|"tool"|"timeout"|"rate-limit"|"session-end"}
 ← {"ok":true}
+← {"ok":true, "already_ended":{"status":"completed", "exit_code":0}}   // task had ended; nothing was signalled
 ```
 `reason` is optional (defaults to `"tool"`, compatible with older extensions); unknown values → `E_BAD_REQUEST`. CLI `stop` sends `"cli"`.
-SIGTERM process group → 2s → SIGKILL (sent to the group even if its leader exited). Terminal state `killed`. For an ended task with leftover background children, `stop` also cleans up its group without changing its status.
+SIGTERM process group → 2s → SIGKILL (sent to the group even if its leader exited). Terminal state `killed`. For an ended task with leftover background children, `stop` also cleans up its group without changing its status. An ended task with nothing left is a no-op: still `ok`, with `already_ended` (`status`, `exit_code`, and `signal` when set) so callers do not report a stop that never happened.
 
 **end_reason** (TaskRecord and `task_exited` event): why a task ended, one of
 `exited` (natural exit, any code) | `timeout` | `stopped:tui` | `stopped:cli` | `stopped:tool` | `rate-limit` | `session-end` | `manager-shutdown` | `manager-crash` | `shell-start-failed` | `shell-start-hung`.

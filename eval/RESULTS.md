@@ -13,6 +13,10 @@ When to rerun and with which models: [BASELINES.md](BASELINES.md#when-to-rerun).
 
 <!-- runs: newest first -->
 
+## 2026-11-07: idle turn guard, decision-point replay
+
+Extension tree `18a8291`. A real-context replay of two incident sessions (k3.1-pro:high, k3-256k:high), k=5 per arm: 10/15 runaway with the guard off, 0/15 with it on (44 vs ≥125 turns). The default turn-control probes on k3.1-pro and gpt-6-luna, k=3, guard on: 22 PASS, 2 FAIL (luna polling, below the guard's bounds), 1 ERR, 0 guard trips. Synthetic `idle-after-done-*` probes did not reproduce the loop. See [2026-11-07 idle turn review](2026-11-07-IDLE-TURN-REVIEW.md).
+
 ## 2026-11-05c: monitor lifetime probes, candidate prompt + parameter validation
 
 Extension tree `bb71504`: rewritten monitor lifetime, command and wake wording; `timeout_ms` with `persistent`, or above 1 hour, is rejected. Same harness, graders, fixture, models, k and concurrency as 2026-11-05b, run in parallel. 136 episodes: 116 PASS, 17 FAIL, 3 INVALID/ERR; no graded episode chose the wrong lifetime. Remaining failures are polling (kimi/k3 renew) and luna restarting monitors. See [2026-11-05 monitor lifetime review](2026-11-05-MONITOR-LIFETIME-REVIEW.md).

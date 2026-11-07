@@ -124,6 +124,27 @@ describe("faux e2e", { concurrency: true }, () => {
     assertScriptConsumedExactly(ep, 2);
   });
 
+  it("(b2) the idle turn guard ends a run of no-op calls on the second idle turn", async () => {
+    const ep = await runFaux({ script: "idle-loop.ts", quietMs: 2000 });
+    episodes.push(ep);
+    assertScriptConsumedExactly(ep, 2);
+    const results = toolResults(ep.items);
+    assert.equal(results.length, 2, explain(ep));
+    assert.equal(results[0].isError, false, explain(ep));
+    assert.equal(results[1].toolName, "task_list");
+    assert.equal(results[1].isError, true, explain(ep));
+    assert.match(results[1].text, /pi-famulus ended this run: 2 turns in a row/);
+    const trips = extensionEvents(ep).filter((e) => e.type === "guard.idle-turn");
+    assert.equal(trips.length, 1, explain(ep));
+  });
+
+  it("(b3) with idleTurnGuard off the same model runs every no-op (the guard is what stops it)", async () => {
+    const ep = await runFaux({ script: "idle-loop.ts", famulusConfig: { idleTurnGuard: false }, quietMs: 2000 });
+    episodes.push(ep);
+    assertScriptConsumedExactly(ep, 5);
+    assert.ok(toolResults(ep.items).every((r) => !r.isError), explain(ep));
+  });
+
   it("(c) monitor lines arrive as monitor events, then exactly one timeout notice", async () => {
     const ep = await runFaux({
       script: "monitor-timeout.ts",

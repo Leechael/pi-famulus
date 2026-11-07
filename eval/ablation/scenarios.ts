@@ -8,6 +8,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Item, toolResults, wakes } from "../lib/transcript.ts";
+import { idleAfterDoneScenarios } from "./idle-after-done-scenarios.ts";
 import { monitorWaiterScenarios } from "./monitor-waiter-scenarios.ts";
 import {
   ackAndStop,
@@ -619,6 +620,7 @@ export const SCENARIOS: Scenario[] = [
   overrunStuck,
   overrunProgressing,
   ...monitorWaiterScenarios,
+  ...idleAfterDoneScenarios,
 ];
 
 /** Preserve the original smoke/full grid unless explicitly selected. */

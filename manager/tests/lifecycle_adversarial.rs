@@ -1246,6 +1246,31 @@ fn t5b_signal_field_is_signal_name() {
     );
 }
 
+/// T5c: stopping a task that already ended is still `ok` (idempotent), but the
+/// response says so. Incident 2026-11-07: task_stop on two `gh pr checks`
+/// tasks that had exited 0 five minutes earlier told the model they were
+/// "stopped (SIGTERM; SIGKILL after 2s grace if needed)".
+#[test]
+fn t5c_stop_of_ended_task_reports_it_already_ended() {
+    let home = Home::new("t5c");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (done, _) = c.start("exit 0");
+    let t = c.wait_terminal(&done, S(3)).unwrap();
+    assert_eq!(t["status"], "completed", "{t}");
+    let r = c.request_ok(json!({"type":"stop","task_id":done}));
+    assert_eq!(r["already_ended"]["status"], "completed", "{r}");
+    assert_eq!(r["already_ended"]["exit_code"], 0, "{r}");
+    let after = c.wait_terminal(&done, S(1)).unwrap();
+    assert_eq!(after["end_reason"], "exited", "a no-op stop must not rewrite the record: {after}");
+
+    let (live, _) = c.start("echo armed; sleep 300");
+    wait_output_contains(&mut c, &live, "armed");
+    let r = c.request_ok(json!({"type":"stop","task_id":live}));
+    assert!(r.get("already_ended").is_none(), "a live stop has nothing already ended: {r}");
+}
+
 /// R1: tasks run under `pi-famulus __run`, and the record still carries
 /// the command's own status: its exit code, the signal it died of, and for
 /// a stop the SIGTERM that ended it (not anything about the runner).
