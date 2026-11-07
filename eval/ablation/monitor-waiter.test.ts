@@ -277,6 +277,12 @@ describe("monitor behavior probes", () => {
         assert.equal(scenario.grade(ep(differentFilter)).pass, true);
       }
       if (kind === "cleanup") assert.equal(scenario.grade(ep(items.slice(0, 4))).pass, false);
+      // A report names the alert's unique payload in any format ("ALERT: `fixture-ready`", 2026-11-08 luna/deepseek noise runs);
+      // a report written before the alert wake still does not count.
+      const reformatted = items.map((i) => i.kind === "assistant" && i.text === "ALERT fixture-ready" ? { ...i, text: "ALERT: `fixture-ready`" } : i);
+      assert.equal(scenario.grade(ep(reformatted)).pass, true, `${kind}: reformatted report`);
+      const early = [...items.slice(0, 2), say(2.5, "fixture-ready"), ...items.slice(2).filter((i) => !(i.kind === "assistant" && i.text === "ALERT fixture-ready"))];
+      assert.equal(scenario.grade(ep(early)).pass, false, `${kind}: report before the alert`);
       // Lifetime is graded from the start result: a bare start passes as persistent only where the extension defaults to that.
       if (kind !== "hour") {
         const bare = { command: `node behavior-source.cjs${kind === "noise" ? " | grep --line-buffered '^ALERT'" : ""}` };

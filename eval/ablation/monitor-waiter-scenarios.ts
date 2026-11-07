@@ -228,7 +228,8 @@ function behaviorProbe(kind: BehaviorProbe): Scenario {
       const taskId = String(started?.details?.task_id ?? "");
       const events = wakes(items).filter((w) => w.wake.kind === "monitor" && w.wake.status === "event" && w.wake.taskIds.includes(taskId));
       const alert = events.find((w) => w.wake.body.includes("ALERT fixture-ready"));
-      const reported = !!alert && assistantTextBetween(items, alert.seq).includes("ALERT fixture-ready");
+      // The payload is unique to the alert line; models reformat it ("ALERT: `fixture-ready`").
+      const reported = !!alert && assistantTextBetween(items, alert.seq).includes("fixture-ready");
       const firstResult = results.find((r) => r.toolCallId === accepted[0]?.id);
       const firstId = String(firstResult?.details?.task_id ?? "");
       const timeout = wakes(items).find((w) => (w.wake.kind === "monitor" || w.wake.kind === "monitor-terminal") && w.wake.status === "timeout" && w.wake.taskIds.includes(firstId) && w.seq > ((renew ? firstResult : started)?.seq ?? Infinity));
