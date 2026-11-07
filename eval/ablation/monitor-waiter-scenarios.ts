@@ -228,7 +228,8 @@ function behaviorProbe(kind: BehaviorProbe): Scenario {
       const taskId = String(started?.details?.task_id ?? "");
       const events = wakes(items).filter((w) => w.wake.kind === "monitor" && w.wake.status === "event" && w.wake.taskIds.includes(taskId));
       const alert = events.find((w) => w.wake.body.includes("ALERT fixture-ready"));
-      const reported = !!alert && assistantTextBetween(items, alert.seq).includes("ALERT fixture-ready");
+      // The payload is unique to the alert line; models reformat it ("ALERT: `fixture-ready`").
+      const reported = !!alert && assistantTextBetween(items, alert.seq).includes("fixture-ready");
       const firstResult = results.find((r) => r.toolCallId === accepted[0]?.id);
       const firstId = String(firstResult?.details?.task_id ?? "");
       const timeout = wakes(items).find((w) => (w.wake.kind === "monitor" || w.wake.kind === "monitor-terminal") && w.wake.status === "timeout" && w.wake.taskIds.includes(firstId) && w.seq > ((renew ? firstResult : started)?.seq ?? Infinity));
@@ -238,12 +239,15 @@ function behaviorProbe(kind: BehaviorProbe): Scenario {
       const stopped = cleanup && !!alert && calls.some((c) => c.name === "task_stop" && c.seq > alert.seq && c.args.task_id === taskId && results.some((r) => r.toolCallId === c.id && !r.isError && r.details?.ok !== false));
       const sourceCommand = (command: string) => /\bnode\s+\S*behavior-source\.cjs\b/.test(command) && (!slow || /\bslow\b/.test(command));
       const correctCommand = !!start && sourceCommand(cmd(start)) && (!(alternative || renew) || sourceCommand(cmd(accepted[0])));
-      const correctDuration = !!start && (kind === "hour" ? start.args.timeout_ms === 3_600_000 && start.args.persistent !== true : start.args.persistent === true) && (!alternative || (accepted[0]?.args.timeout_ms === 8000 && accepted[0]?.args.persistent !== true));
+      // The effective lifetime from the start result (timeout_ms null = persistent), not the arguments:
+      // a monitor started without either argument is persistent when the extension defaults to that.
+      const lifetime = (r: typeof started) => (r?.details && "timeout_ms" in r.details ? (r.details.timeout_ms as number | null) : undefined);
+      const correctDuration = !!start && (kind === "hour" ? lifetime(started) === 3_600_000 : lifetime(started) === null) && (!alternative || lifetime(firstResult) === 8000);
       const trialMs = accepted[0]?.args.timeout_ms;
       // renew: the trial must be a 5 s timed start; the continuation after its expiry must be persistent, not another timeout.
       const trialOk = !renew || (typeof trialMs === "number" && trialMs >= 1000 && trialMs <= 15_000 && accepted[0]?.args.persistent !== true);
       const continuedAfterTimeout = !renew || (!!timeout && !!start && !!firstResult && typeof trialMs === "number" && start.t >= firstResult.t + trialMs);
-      const continuation = !start ? "none" : start.args.persistent === true ? "persistent" : typeof start.args.timeout_ms === "number" ? `timeout:${start.args.timeout_ms}` : "default-timeout";
+      const continuation = !start ? "none" : lifetime(started) === null ? "persistent" : typeof lifetime(started) === "number" ? `timeout:${lifetime(started)}` : "unknown";
       const alertAfterTimeout = !!alert && !!timeout && alert.seq > timeout.seq;
       const metrics = { monitorAttempts: starts.length, monitorStarts: accepted.length, correctCommand, correctDuration, continuation, trialOk, continuedAfterTimeout, eventWakes: events.length, routineWakes, alertSeen: !!alert, reported, polls, stopped: !!stopped, timeoutSeen: !!timeout, activeAtTimeout, alertAfterTimeout };
       const duplicateAfterTimeout = !!timeout && starts.some((c) => c.seq > timeout.seq);

@@ -28,6 +28,9 @@ function ep(items: Item[]) {
 const call = (seq: number, name: string, args: Record<string, unknown>): Item => ({ kind: "assistant", seq, t: seq, text: "", toolCalls: [{ id: `c${seq}`, name, args }] });
 const say = (seq: number, text: string): Item => ({ kind: "assistant", seq, t: seq, text, toolCalls: [] });
 const result = (seq: number, toolName: string, details: Record<string, unknown>, isError = false, text = ""): Item => ({ kind: "toolResult", seq, t: seq, toolName, toolCallId: `c${seq - 1}`, details, isError, text });
+/** A monitor start result as the extension returns it, with the effective lifetime (null = persistent). */
+const started = (seq: number, taskId: string, args: Record<string, unknown>, defaultPersistent = false): Item =>
+  result(seq, "monitor", { task_id: taskId, timeout_ms: args.persistent === true || (defaultPersistent && args.persistent !== false && args.timeout_ms === undefined) ? null : (args.timeout_ms ?? 300000) });
 const wake = (seq: number, status: string, body: string, taskId = "mon_1"): Item => ({ kind: "wake", seq, t: seq, wake: { kind: "monitor", status, body, taskIds: [taskId], tasks: [], children: [], stillRunning: [] } as unknown as Wake });
 const observe = () => [call(1, "observe_ui", {}), result(2, "observe_ui", { capture: { stateId: "eval-ui-1" }, renderedOutline: '@e1 AXWindow "Export preview"\n  @e2 AXStaticText "Preparing export"' })];
 const goodWait = (seq = 3) => call(seq, "wait_for", { stateId: "eval-ui-1", ref: "@e2", text: "Export ready", timeoutMs: 100 });
@@ -231,8 +234,8 @@ describe("scenario controls", () => {
   it("old default grid never loads compatibility extension", () => {
     assert.equal(DEFAULT_SCENARIOS.length, 10, "the 8 original probes and overrun-stuck/overrun-progressing");
     assert.ok(DEFAULT_SCENARIOS.every((s) => !s.extensions && !s.optIn));
-    // 11 monitor/compat probes and 4 idle-after-done probes.
-    assert.equal(SCENARIOS.filter((s) => s.optIn).length, 15);
+    // 11 monitor/compat probes, 4 idle-after-done probes and 2 agent-wait probes.
+    assert.equal(SCENARIOS.filter((s) => s.optIn).length, 17);
   });
 });
 describe("monitor behavior probes", () => {
@@ -245,9 +248,10 @@ describe("monitor behavior probes", () => {
       assert.doesNotMatch(source, /timeout|batch|persistent/i, `${kind}: leaky word in fixture`);
     }
   });
-  const itemsFor = (kind: string): Item[] => {
+  const itemsFor = (kind: string, override?: Record<string, unknown>, defaultPersistent = false): Item[] => {
     const command = `node behavior-source.cjs${kind === "noise" ? " | grep --line-buffered '^ALERT'" : ""}`;
-    return [call(1, "monitor", { command, ...(kind === "hour" ? { timeout_ms: 3600000 } : { persistent: true }) }), result(2, "monitor", { task_id: "mon_1" }), wake(3, "event", "ALERT fixture-ready"), say(4, "ALERT fixture-ready"), ...(kind === "cleanup" ? [call(5, "task_stop", { task_id: "mon_1" }), result(6, "task_stop", { ok: true })] : [])];
+    const args = override ?? { command, ...(kind === "hour" ? { timeout_ms: 3600000 } : { persistent: true }) };
+    return [call(1, "monitor", args), started(2, "mon_1", args, defaultPersistent), wake(3, "event", "ALERT fixture-ready"), say(4, "ALERT fixture-ready"), ...(kind === "cleanup" ? [call(5, "task_stop", { task_id: "mon_1" }), result(6, "task_stop", { ok: true })] : [])];
   };
   it("grades duration, evidence, noise and cleanup with negative controls", () => {
     for (const kind of ["long", "hour", "noise", "cleanup", "natural"]) {
@@ -259,9 +263,9 @@ describe("monitor behavior probes", () => {
       assert.equal(scenario.done(items, view), true);
       assert.equal(scenario.grade(ep(items.filter((i) => i.kind !== "wake"))).pass, false);
       assert.equal(scenario.grade(ep([...items, call(10, "task_list", {})])).pass, false);
-      const wrong = itemsFor(kind); (wrong[0] as Extract<Item, {kind: "assistant"}>).toolCalls[0].args = { command: "bad", persistent: true };
+      const wrong = itemsFor(kind, { command: "bad", persistent: true });
       assert.equal(scenario.grade(ep(wrong)).pass, false);
-      const wrongDuration = itemsFor(kind); (wrongDuration[0] as Extract<Item, {kind: "assistant"}>).toolCalls[0].args = { command: "node behavior-source.cjs", ...(kind === "hour" ? { persistent: true } : { timeout_ms: 300000 }) };
+      const wrongDuration = itemsFor(kind, { command: "node behavior-source.cjs", ...(kind === "hour" ? { persistent: true } : { timeout_ms: 300000 }) });
       assert.equal(scenario.grade(ep(wrongDuration)).metrics.correctDuration, false);
       assert.equal(scenario.grade(ep(wrongDuration)).pass, false);
       if (kind === "noise") {
@@ -273,6 +277,18 @@ describe("monitor behavior probes", () => {
         assert.equal(scenario.grade(ep(differentFilter)).pass, true);
       }
       if (kind === "cleanup") assert.equal(scenario.grade(ep(items.slice(0, 4))).pass, false);
+      // A report names the alert's unique payload in any format ("ALERT: `fixture-ready`", 2026-11-08 luna/deepseek noise runs);
+      // a report written before the alert wake still does not count.
+      const reformatted = items.map((i) => i.kind === "assistant" && i.text === "ALERT fixture-ready" ? { ...i, text: "ALERT: `fixture-ready`" } : i);
+      assert.equal(scenario.grade(ep(reformatted)).pass, true, `${kind}: reformatted report`);
+      const early = [...items.slice(0, 2), say(2.5, "fixture-ready"), ...items.slice(2).filter((i) => !(i.kind === "assistant" && i.text === "ALERT fixture-ready"))];
+      assert.equal(scenario.grade(ep(early)).pass, false, `${kind}: report before the alert`);
+      // Lifetime is graded from the start result: a bare start passes as persistent only where the extension defaults to that.
+      if (kind !== "hour") {
+        const bare = { command: `node behavior-source.cjs${kind === "noise" ? " | grep --line-buffered '^ALERT'" : ""}` };
+        assert.equal(scenario.grade(ep(itemsFor(kind, bare, true))).pass, true, `${kind}: bare start, persistent default`);
+        assert.equal(scenario.grade(ep(itemsFor(kind, bare, false))).pass, false, `${kind}: bare start, timed default`);
+      }
     }
   });
   it("runs the noise producer and its filter without a provider", async () => {
@@ -292,14 +308,14 @@ describe("monitor behavior probes", () => {
   it("requires the existing monitor to survive the other monitor's timeout", () => {
     const scenario = getScenario("monitor-behavior-alternative");
     const command = "node behavior-source.cjs slow";
-    const items = [call(1, "monitor", { command, timeout_ms: 8000 }), result(2, "monitor", { task_id: "mon_0" }),
-      call(3, "monitor", { command, persistent: true }), result(4, "monitor", { task_id: "mon_1" }),
+    const items = [call(1, "monitor", { command, timeout_ms: 8000 }), started(2, "mon_0", { timeout_ms: 8000 }),
+      call(3, "monitor", { command, persistent: true }), started(4, "mon_1", { persistent: true }),
       wake(5, "timeout", "expired", "mon_0"), wake(6, "event", "ALERT fixture-ready", "mon_1"), say(7, "ALERT fixture-ready")];
     const view = ep(items); scenario.setup(view.cwd, view.secretDir);
     assert.equal(scenario.grade(view).pass, true);
     assert.equal(scenario.grade(view).metrics.activeAtTimeout, true);
     assert.equal(scenario.grade(ep(items.filter((i) => i.seq !== 5))).pass, null);
-    assert.equal(scenario.grade(ep([...items, call(8, "monitor", { command, persistent: true }), result(9, "monitor", { task_id: "mon_2" })])).pass, false);
+    assert.equal(scenario.grade(ep([...items, call(8, "monitor", { command, persistent: true }), started(9, "mon_2", { persistent: true })])).pass, false);
     assert.equal(scenario.grade(ep([...items.slice(0, 4), wake(4.5, "timeout", "expired", "mon_1"), ...items.slice(4)])).pass, false);
     assert.equal(scenario.grade(ep([...items.slice(0, 4), call(4.2, "task_stop", { task_id: "mon_1" }), result(5.2, "task_stop", { ok: true }), ...items.slice(4)])).pass, false);
     assert.equal(scenario.grade(ep([...items.slice(0, 5), wake(6, "event", "ALERT fixture-ready", "mon_0"), say(7, "ALERT fixture-ready")])).pass, false);
@@ -307,10 +323,10 @@ describe("monitor behavior probes", () => {
   it("renew: continuation after a real trial expiry must be persistent", () => {
     const scenario = getScenario("monitor-behavior-renew");
     const command = "node behavior-source.cjs slow";
-    const build = (cont: Record<string, unknown>, trial: Record<string, unknown> = { timeout_ms: 10000 }) => [
-      call(1, "monitor", { command, ...trial }), result(2, "monitor", { task_id: "mon_0" }),
+    const build = (cont: Record<string, unknown>, trial: Record<string, unknown> = { timeout_ms: 10000 }, defaultPersistent = false) => [
+      call(1, "monitor", { command, ...trial }), started(2, "mon_0", trial, defaultPersistent),
       wake(3, "timeout", "expired", "mon_0"),
-      call(4, "monitor", { command, ...cont }), result(5, "monitor", { task_id: "mon_1" }),
+      call(4, "monitor", { command, ...cont }), started(5, "mon_1", cont, defaultPersistent),
       wake(6, "event", "ALERT fixture-ready", "mon_1"), say(7, "ALERT fixture-ready")].map((i) => i.seq >= 3 ? { ...i, t: i.seq + 20_000 } : i);
     const good = build({ persistent: true });
     const view = ep(good); scenario.setup(view.cwd, view.secretDir);
@@ -320,7 +336,9 @@ describe("monitor behavior probes", () => {
     const hourly = scenario.grade(ep(build({ timeout_ms: 3600000 })));
     assert.equal(hourly.pass, false); assert.equal(hourly.metrics.continuation, "timeout:3600000");
     assert.equal(scenario.grade(ep(build({}))).pass, false);
-    assert.equal(scenario.grade(ep(build({}))).metrics.continuation, "default-timeout");
+    assert.equal(scenario.grade(ep(build({}))).metrics.continuation, "timeout:300000");
+    // With a persistent default, the same bare continuation is persistent and passes.
+    assert.equal(scenario.grade(ep(build({}, { timeout_ms: 10000 }, true))).pass, true);
     // Decision point not reproduced → INVALID, not FAIL.
     assert.equal(scenario.grade(ep(good.filter((i) => i.seq !== 3))).pass, null);
     assert.equal(scenario.grade(ep(build({ persistent: true }, { persistent: true }))).pass, null);
@@ -330,7 +348,7 @@ describe("monitor behavior probes", () => {
     const lateNotice = [good[0], good[1], good[3], good[4], { ...good[2], seq: 5.5 }, good[5], good[6]];
     assert.equal(scenario.grade(ep(lateNotice)).pass, true);
     // A third start or a poll is still a FAIL.
-    assert.equal(scenario.grade(ep([...good, call(8, "monitor", { command, persistent: true }), result(9, "monitor", { task_id: "mon_2" })])).pass, false);
+    assert.equal(scenario.grade(ep([...good, call(8, "monitor", { command, persistent: true }), started(9, "mon_2", { persistent: true })])).pass, false);
     assert.equal(scenario.grade(ep([...good, call(10, "task_list", {})])).pass, false);
   });
   it("describes intent without revealing duration parameters or a noise filter", () => {

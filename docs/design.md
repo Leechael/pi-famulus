@@ -428,8 +428,8 @@ execute:
 ### 4.4 monitor tool (`src/monitor.ts`)
 
 ```
-monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
-          persistent = false, dedup_window_ms = 60000, fingerprint_mode = "exact",
+monitor({ command, description, timeout_ms? (min 1000, max 3600000),
+          persistent? (default true when timeout_ms is absent; false = 300000 ms timeout), dedup_window_ms = 60000, fingerprint_mode = "exact",
           wake_on?, stall_after_ms? (min 10000, max 86400000) })
 ```
 
@@ -444,7 +444,7 @@ monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
   - `NotifyCenter`: while busy, retains bounded head/tail content instead of overwriting with only the latest batch; output range/timing/count metadata merges, and one stable callback per pending monitor acknowledges delivery.
 - Event injection: `<pi-famulus-wake kind="monitor">` (see §4.5); idle→triggerTurn; while busy, events are never steered: they coalesce per monitor and are sent after `agent_settled`, carrying `event-count` and `dropped-lines`
 - Process exit, timeout, and rate-limit stop → terminal notices. timeout/exited/stopped notices share one fixed 10s non-resetting window (`MONITOR_TERMINAL_BATCH_MS`) into one `<pi-famulus-wake kind="monitor-terminal">` listing every invalidated monitor (`These monitors have stopped; nothing watches their sources now.`). A monitor's own pending output is flushed before its terminal notice; other monitors' pending output is left alone. Caused-by-event and model-stopped exits stay passive.
-- `persistent:true` → lives until session ends (no timeout)
+- No `timeout_ms` and `persistent` not `false` → persistent: lives until the command exits, `task_stop`, or session end (no timeout). `persistent:false` without `timeout_ms` → 300000 ms. `persistent:true` with `timeout_ms` is rejected.
 - All time sources and timers use the `Clock` injected from extension scope, including batching, rate limiting, and timeout; tests use `ManualClock`, not global fake-timer replacement
 - Prompt wording (misuse prevention): commands must be line-buffered; print explicit success and terminal failures, but routine unchanged retries may remain silent. Handling an event does not require a user-visible reply. On-demand `task_output` details/paging are allowed; polling to wait is not.
 - Delivery acknowledgement starts a dedup window only for complete representative preview lines present in the actual delivered event, after both local and busy-agent truncation. Omitted/partially retained representatives fail open; they may appear on a later repeat rather than being silently suppressed. Pending metadata that exceeds the early-start buffer budget falls back to original bytes when they fit.

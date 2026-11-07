@@ -195,8 +195,7 @@ export class MonitorRegistry {
     if (params.fingerprint_mode !== undefined && params.fingerprint_mode !== "exact" && params.fingerprint_mode !== "ignore-timestamps") {
       throw new RangeError("fingerprint_mode must be exact or ignore-timestamps");
     }
-    const persistent = params.persistent === true;
-    if (persistent && params.timeout_ms !== undefined) {
+    if (params.persistent === true && params.timeout_ms !== undefined) {
       throw new RangeError("timeout_ms and persistent are exclusive: use timeout_ms for a watch that ends within 1 hour, persistent:true for an open-ended or longer watch");
     }
     if (params.timeout_ms !== undefined && params.timeout_ms > MAX_TIMEOUT_MS) {
@@ -216,6 +215,9 @@ export class MonitorRegistry {
     if (params.stall_after_ms !== undefined && (!Number.isSafeInteger(params.stall_after_ms) || params.stall_after_ms < MIN_STALL_MS || params.stall_after_ms > MAX_STALL_MS)) {
       throw new RangeError(`stall_after_ms must be an integer between ${MIN_STALL_MS} and ${MAX_STALL_MS}`);
     }
+    // No lifetime given: run until the command exits or the monitor is stopped.
+    // persistent:false without timeout_ms keeps the 5-minute default.
+    const persistent = params.persistent === true || (params.persistent !== false && params.timeout_ms === undefined);
     let timeoutMs: number | null = null;
     if (!persistent) {
       const requested = params.timeout_ms ?? DEFAULT_TIMEOUT_MS;

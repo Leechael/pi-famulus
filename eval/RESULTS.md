@@ -13,6 +13,10 @@ When to rerun and with which models: [BASELINES.md](BASELINES.md#when-to-rerun).
 
 <!-- runs: newest first -->
 
+## 2026-11-08: agent wait, default-persistent monitor
+
+Prose only; no matrix. deepseek-flash only, k=3 for the clean-context probes. `agent-wait-ready`: a persistent monitor gave readiness in 0/3 episodes on main 0.2.4 (all three passed explicit timeouts) and 2/3 with the default-persistent monitor and new prompt (3/3 monitors started without a timeout; one failure was polling). `agent-wait-job` passed 3/3 on both arms. A replay of the incident's own context (10 decision points, k=5 per arm) did not change the choice: main 6/24, new prompt with the default 5/29. See [2026-11-08 agent wait review](2026-11-08-AGENT-WAIT-REVIEW.md).
+
 ## 2026-11-07: idle turn guard, decision-point replay
 
 Extension tree `18a8291`. A real-context replay of two incident sessions (k3.1-pro:high, k3-256k:high), k=5 per arm: 10/15 runaway with the guard off, 0/15 with it on (44 vs ≥125 turns). The default turn-control probes on k3.1-pro and gpt-6-luna, k=3, guard on: 22 PASS, 2 FAIL (luna polling, below the guard's bounds), 1 ERR, 0 guard trips. Synthetic `idle-after-done-*` probes did not reproduce the loop. See [2026-11-07 idle turn review](2026-11-07-IDLE-TURN-REVIEW.md).

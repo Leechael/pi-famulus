@@ -24,7 +24,7 @@ Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION` 
 
 ## Opt-in monitor behavior probes
 
-Seven runnable scenarios in `ablation/monitor-waiter-scenarios.ts` are excluded from the default grid:
+Seven runnable scenarios in `ablation/monitor-waiter-scenarios.ts` and two in `ablation/agent-wait-scenarios.ts` are excluded from the default grid. Monitor lifetimes are graded from the effective lifetime in the monitor start result (`details.timeout_ms`; `null` = persistent), not from the call arguments, because a monitor started with neither `timeout_ms` nor `persistent` is persistent:
 
 | Scenario | Checks |
 |---|---|
@@ -35,21 +35,34 @@ Seven runnable scenarios in `ablation/monitor-waiter-scenarios.ts` are excluded 
 | `monitor-behavior-cleanup` | After the alert, an accepted `task_stop` targets the active monitor. |
 | `monitor-behavior-natural` | A naturally phrased watch "for the rest of the day" (longer than the 1-hour cap, no "no planned end" cue) selects a persistent monitor. |
 | `monitor-behavior-renew` | After a user-requested short trial monitor really expires, the open-ended continuation is persistent, not another timed monitor (the hourly re-arm incident). A continuation started before expiry, or a trial that is not a short timed monitor, is INVALID. |
+| `agent-wait-job` | A job the agent starts that outlasts the foreground budget (6 s steps) is waited on through its completion wake or a persistent monitor. FAIL on a bash sleep of 10 s or more, a sleep loop, `&`/nohup/setsid, a timed monitor, or polls (`task_output`, `task_list`) while the job runs. The `RESULT` line must come from the job's own output (per-episode token). |
+| `agent-wait-ready` | A server the agent starts never exits, so no completion wake comes. It must be seen ready through a persistent monitor's wake before `node smoke.cjs` runs, and the smoke output must carry the episode's token. A monitor with a timeout, a sleep or loop wait, a detached start or polls while it runs is FAIL. Any persistent monitor's wake counts as readiness; the monitor command need not be the server. |
+
+Polls and sleeps count only in the waiting window (from the start until the wake or readiness arrives); a `task_list` after the result, to clean up, is not a poll.
 
 From `eval/`, run deterministic tests without a provider, then inspect the real-model plan before any separately authorized provider run:
 
 ```bash
-node --test ablation/monitor-waiter.test.ts
+node --test ablation/monitor-waiter.test.ts ablation/agent-wait.test.ts replay/wait-choice.test.ts
 node --test --test-name-pattern='observes a real timeout' ablation/graders.test.ts
 node ablation/run.ts --models '<provider>/<model>:<thinking>' --variants baseline --scenarios monitor-behavior-long,monitor-behavior-hour,monitor-behavior-alternative,monitor-behavior-noise,monitor-behavior-cleanup,monitor-behavior-natural,monitor-behavior-renew --k 3 --transcripts --results results/monitor-behavior/results.jsonl
 # Only after reviewing the plan and obtaining authorization, repeat with --yes.
+
+# The two agent-wait probes (opt-in; ids are explicit):
+node ablation/run.ts --models '<provider>/<model>:<thinking>' --variants baseline --scenarios agent-wait-job,agent-wait-ready --k 3 --transcripts --results results/agent-wait/results.jsonl
 ```
+
+When comparing arms, give each arm its own results directory: transcripts of two runs with the same variant name overwrite each other in one directory.
 
 The integration test uses a faux model but real pi, extension, manager and timed monitor wakes. It is retained as a required test: inability to start or connect the manager is a test failure, not a pass or skip. In a hosted child-agent shell, unset inherited `PI_FAMULUS_CHILD_ID`, `PI_FAMULUS_CHILD_TOKEN`, `PI_FAMULUS_CHILD_RUN`, and `PI_FAMULUS_CHILD_NAME` for this command so the isolated extension starts as a parent. A compatible Rust toolchain is required; set `RUSTUP_TOOLCHAIN` if the default cargo cannot read the lockfile.
 
 The alternative fixture emits its alert at approximately 24 seconds, after the 8-second timeout and 10-second terminal batching window; the grader checks delivered wake order, task IDs, and accepted starts. Metrics include starts, duration selection, wakes, routine wakes, timeout/alternative evidence, polling, reporting, and stop acceptance. Missing timeout evidence is INVALID. The one-hour probe checks the selected parameter, not an actual hour of operation; cleanup checks an accepted stop request, not confirmed process exit. The fixed fixture token and command-shape checks do not prevent all ways to game the grader. These probes do not cover the agent's own timed choice expiring with no user cue at the expiry (deferred: synthetic-history expiry probe | impact: the incident's exact no-cue decision point is untested | trigger: renew/natural pass but the hourly re-arm recurs in real sessions), simultaneous expiry batches, provider outages/recovery, process recreation, or long-run cost and wake rates.
 
 The lifetime wording now in the product was compared this way in the [2026-11-05 monitor lifetime review](2026-11-05-MONITOR-LIFETIME-REVIEW.md) (RESULTS.md 2026-11-05b/c). Any further candidate timeout instruction still requires a real-model comparison against the current prompt, not historical sessions or faux-model results. Use independent fresh result files, identical model and thinking specifications, repeated episodes, and inspect cost plans. Report uncertainty and provider errors; persistent selection alone is not evidence of lower cost. Do not present candidate guidance as validated without the comparison and relevant noise criteria.
+
+## Wait choice replay and agent-wait probes
+
+`replay/run-replay.ts` also measures what a model does the first time it has to wait (`replay/wait-choice.ts` classifies the first wait decision at turn 0: persistent monitor, timed monitor, sleep, evasion, poll, end turn). `REPLAY_PROMPTS_FROM=<prompts.generated.ts of the version that wrote the session>` swaps the session's recorded pi-famulus prompt text for the extension under test's (`replay/prompt-splice.ts`); without it the replay shows the recorded rules next to the tool definitions of the extension under test. `REPLAY_WAIT_GUARD=on` turns the wait guard on in the replay sandbox. See the [2026-11-08 agent wait review](2026-11-08-AGENT-WAIT-REVIEW.md).
 
 ## Idle-after-done probes and replay
 
