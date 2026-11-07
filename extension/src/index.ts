@@ -24,7 +24,8 @@ import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
-import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
+import { describeManagerSearch, getFamulusHome, loadConfig, resolveCacheWarmingConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
+import { registerCacheWarming } from "./cache-warm";
 import { ensureNativeManagerInstalled } from "./native-manager.js";
 import { formatDuration, type TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
@@ -658,6 +659,18 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     }),
   );
   pi.registerTool(createMonitorTool(monitorRegistry, () => workIndex));
+  // Idle prompt-cache warming while persistent monitors run (cache-warm.ts).
+  // Settings are re-read on every attach so a /reload applies config changes.
+  let cacheWarmSettings = resolveCacheWarmingConfig(config);
+  const cacheWarm = registerCacheWarming(pi, {
+    clock,
+    getSettings: () => cacheWarmSettings,
+    hasPersistentMonitor: () => (monitorRegistry?.listActive() ?? []).some((mon) => mon.persistent),
+    logEvent,
+    appendEntry: (customType, data) => pi.appendEntry(customType, data),
+    configPath: join(home, "config.json"),
+  });
+  monitorRegistry.onChange(() => cacheWarm.onMonitorsChanged(monitorRegistry?.listActive() ?? [], ctx));
   registerTasksCommand(pi, {
     getRegistry: () => subagentRegistry,
     getIndex: () => workIndex,
@@ -1394,6 +1407,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
   };
   const runtime: FamulusRuntime = {
     attach: (host) => {
+      cacheWarmSettings = resolveCacheWarmingConfig(loadConfig(home));
       const enabled = loadConfig(home).messaging?.enabled === true && process.env.PI_FAMULUS_NO_INTERCOM === undefined;
       if (famulusInfo) famulusInfo.messagingEnabled = enabled;
       binding.attach(host);
