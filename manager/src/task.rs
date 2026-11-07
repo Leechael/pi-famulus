@@ -211,6 +211,10 @@ impl RingBuffer {
         self.buf.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     /// Copy out `len` bytes starting at `skip` (from the oldest retained byte).
     pub fn slice(&self, skip: usize, len: usize) -> Vec<u8> {
         self.buf.iter().skip(skip).take(len).copied().collect()

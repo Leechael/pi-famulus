@@ -1,0 +1,4 @@
+[toolchain]
+# nsh-core 0.4.0 needs APIs stabilised after 1.95 (`isolate_lowest_one`).
+channel = "1.99.1"
+components = ["clippy"]

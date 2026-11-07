@@ -311,7 +311,7 @@ fn sparkline(hist: &[f64], cells: usize, ceil: f64) -> Vec<Span<'static>> {
 
 // ── header ─────────────────────────────────────────────────────────────────
 
-fn live_pill(state: &TopState) -> Vec<Span<'static>> {
+pub fn live_pill(state: &TopState) -> Vec<Span<'static>> {
     let at = clock((state.now > 0).then_some(state.now));
     let at = if at.is_empty() { String::new() } else { format!(" · {at}") };
     if state.paused {
@@ -324,7 +324,7 @@ fn live_pill(state: &TopState) -> Vec<Span<'static>> {
 }
 
 /// Relay link of the messaging bridge: `● msg connected · name`.
-fn messaging_spans(m: &crate::proto::MessagingStatus) -> Vec<Span<'static>> {
+pub fn messaging_spans(m: &crate::proto::MessagingStatus) -> Vec<Span<'static>> {
     let (dot, color, label) = match m.state.as_str() {
         "connected" => ("● ", OK, "connected"),
         "disconnected" => ("○ ", ERR, "disconnected"),
@@ -344,7 +344,7 @@ fn messaging_spans(m: &crate::proto::MessagingStatus) -> Vec<Span<'static>> {
     spans
 }
 
-fn interval_text(ms: u64) -> String {
+pub fn interval_text(ms: u64) -> String {
     if ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
     } else {
@@ -483,6 +483,15 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let w = inner.width as usize;
+    let rows = overview_rows(state, w);
+    let lines: Vec<Line> = rows.into_iter().take(inner.height as usize).map(|r| Line::from(fit_spans(r, w))).collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The overview's stat rows (agents, tasks, cpu, tokens, wall), sized for
+/// `w` columns; each row is clipped by the caller.
+pub fn overview_rows(state: &TopState, w: usize) -> Vec<Vec<Span<'static>>> {
+    let h = &state.header;
     let graph_w = w.saturating_sub(40).clamp(8, 32);
 
     let mut rows = Vec::new();
@@ -556,15 +565,20 @@ fn draw_overview(frame: &mut Frame, area: Rect, state: &TopState) {
     ]);
     rows.push(stat_row("wall", wall));
 
-    let lines: Vec<Line> = rows.into_iter().take(inner.height as usize).map(|r| Line::from(fit_spans(r, w))).collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    rows
 }
 
 fn draw_kinds(frame: &mut Frame, area: Rect, state: &TopState) {
     let block = panel_box(BOX_KINDS).title(Line::from(lead(BOX_KINDS, titled_seg(BOX_KINDS, "", "work kinds"))));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let w = inner.width as usize;
+    let lines = kinds_lines(state, inner.width as usize, inner.height as usize);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The work-kinds table for a box `w` columns wide and `height` rows tall:
+/// columns drop whole when they do not fit, rows collapse into `+N more`.
+pub fn kinds_lines(state: &TopState, w: usize, height: usize) -> Vec<Line<'static>> {
     // Columns drop whole, least useful first, rather than clipping mid-word:
     // kind 12 + slots 10 always; now 7, tasks 6, wall 8, cpu 7 while they fit.
     let mut room = w.saturating_sub(22);
@@ -591,7 +605,7 @@ fn draw_kinds(frame: &mut Frame, area: Rect, state: &TopState) {
         head.push_str(&format!(" {:>6}", "now"));
     }
     let mut lines = vec![Line::from(fit_spans(vec![sp(fg(MUTED), head)], w))];
-    let rows_room = (inner.height as usize).saturating_sub(1);
+    let rows_room = height.saturating_sub(1);
     let shown = if kinds.len() > rows_room { rows_room.saturating_sub(1) } else { kinds.len() };
     for k in kinds.iter().take(shown) {
         let mut row = vec![sp(fg(if k.used > 0 { TEXT } else { MUTED }), format!(" {:<11} ", fmt::truncate_width(&k.kind, 11)))];
@@ -628,7 +642,7 @@ fn draw_kinds(frame: &mut Frame, area: Rect, state: &TopState) {
     if kinds.is_empty() {
         lines.push(Line::from(sp(fg(DIM), " (no work yet)")));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines
 }
 
 // ── main box ───────────────────────────────────────────────────────────────
@@ -693,14 +707,14 @@ fn scope_sort_segments(state: &TopState) -> (Vec<Span<'static>>, usize, usize) {
 fn bottom_segments(state: &TopState, room: usize) -> Vec<Span<'static>> {
     if let Some(id) = &state.confirm_stop {
         let prefix = seg_bottom(BOX_MAIN, vec![sp(fg(ERR).add_modifier(Modifier::BOLD), format!("■ stop {id}?"))]);
-        return fit_keys(prefix, &[("y ⏎", "confirm", 0), ("n esc", "cancel", 0)], room);
+        return fit_keys(prefix, &main_keys(state), room);
     }
     if state.filter_editing {
         let prefix = seg_bottom(
             BOX_MAIN,
             vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), state.filter.clone()), sp(fg(ACCENT), "▏")],
         );
-        return fit_keys(prefix, &[("enter", "apply", 0), ("esc", "clear", 0)], room);
+        return fit_keys(prefix, &main_keys(state), room);
     }
     let mut prefix = Vec::new();
     if !state.filter.is_empty() {
@@ -709,7 +723,18 @@ fn bottom_segments(state: &TopState, room: usize) -> Vec<Span<'static>> {
     if let Some(m) = &state.message {
         prefix.extend(seg_bottom(BOX_MAIN, vec![sp(fg(WARN), m.clone())]));
     }
-    let mut keys: Vec<Key> = vec![("↑↓", "select", 3)];
+    fit_keys(prefix, &main_keys(state), room)
+}
+
+/// Key hints for the main view's footer, in display order.
+pub fn main_keys(state: &TopState) -> Vec<KeyHint> {
+    if state.confirm_stop.is_some() {
+        return vec![("y ⏎", "confirm", 0), ("n esc", "cancel", 0)];
+    }
+    if state.filter_editing {
+        return vec![("enter", "apply", 0), ("esc", "clear", 0)];
+    }
+    let mut keys: Vec<KeyHint> = vec![("↑↓", "select", 3)];
     if state.tab != Tab::Events {
         keys.push(("⏎", "open", 1));
     }
@@ -724,7 +749,7 @@ fn bottom_segments(state: &TopState, room: usize) -> Vec<Span<'static>> {
         keys.push(("x", "stop", 6));
     }
     keys.extend([("?", "help", 0), ("q", "quit", 0)]);
-    fit_keys(prefix, &keys, room)
+    keys
 }
 
 fn position(state: &TopState) -> Vec<Span<'static>> {
@@ -795,7 +820,7 @@ fn is_blank_cell(text: &str) -> bool {
 /// Columns worth showing for the rows in view. The label, status, and
 /// title columns always stay; any other column that is blank on every
 /// visible row gives its width back to the flex column.
-fn live_cols(state: &TopState, rows: &[VisibleRow], cols: &[Col]) -> Vec<Col> {
+pub fn live_cols(state: &TopState, rows: &[VisibleRow], cols: &[Col]) -> Vec<Col> {
     cols.iter()
         .copied()
         .filter(|c| {
@@ -865,6 +890,21 @@ fn event_color(ty: &str) -> Color {
     }
 }
 
+/// Column titles of the events table.
+pub const EVENTS_HEADER: [&str; 6] = ["time", "session", "source", "type", "id", "detail"];
+
+/// One event row's cells, padded like the TUI's table.
+pub fn event_spans(ev: &model::EventRow) -> Vec<Span<'static>> {
+    vec![
+        sp(fg(DIM), format!("{:<19} ", fmt::datetime_ms(ev.ts))),
+        sp(fg(MUTED), format!("{:<9} ", ev.session)),
+        sp(fg(MUTED), format!("{:<9} ", ev.src)),
+        sp(fg(event_color(&ev.ty)), format!("{:<18} ", ev.ty)),
+        sp(fg(TEXT), format!("{:<12} ", ev.id)),
+        sp(fg(MUTED), ev.summary.clone()),
+    ]
+}
+
 fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
     state.mouse.table = hit_rect(area);
     let page = area.height.saturating_sub(1) as usize;
@@ -884,18 +924,9 @@ fn draw_events(frame: &mut Frame, area: Rect, state: &mut TopState) {
         let Some(&i) = state.event_index.get(&vr.id) else {
             continue;
         };
-        let ev = &state.events[i];
         let selected = sel.as_deref() == Some(vr.id.as_str());
-        let spans = vec![
-            marker(selected),
-            Span::raw(" "),
-            sp(fg(DIM), format!("{:<19} ", fmt::datetime_ms(ev.ts))),
-            sp(fg(MUTED), format!("{:<9} ", ev.session)),
-            sp(fg(MUTED), format!("{:<9} ", ev.src)),
-            sp(fg(event_color(&ev.ty)), format!("{:<18} ", ev.ty)),
-            sp(fg(TEXT), format!("{:<12} ", ev.id)),
-            sp(fg(MUTED), ev.summary.clone()),
-        ];
+        let mut spans = vec![marker(selected), Span::raw(" ")];
+        spans.extend(event_spans(&state.events[i]));
         let mut line = Line::from(fit_spans(spans, width));
         if selected {
             line = line.style(Style::default().bg(SEL_BG).fg(TEXT));
@@ -917,17 +948,18 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &TopState) {
         .title(Line::from(fit_spans(lead(BOX_PREVIEW, seg(BOX_PREVIEW, body)), area.width.saturating_sub(2) as usize)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let painted = layout_detail(&state.preview_body, inner.width as usize, &HashSet::new(), false);
-    let start = painted.len().saturating_sub(inner.height as usize);
-    let lines: Vec<Line> = painted[start..]
-        .iter()
-        .map(|p| Line::from(fit_spans(p.spans.clone(), inner.width as usize)))
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(preview_lines(state, inner.width as usize, inner.height as usize)), inner);
+}
+
+/// The last `height` rows of the selection's preview, `width` columns wide.
+pub fn preview_lines(state: &TopState, width: usize, height: usize) -> Vec<Line<'static>> {
+    let painted = layout_detail(&state.preview_body, width, &HashSet::new(), false);
+    let start = painted.len().saturating_sub(height);
+    painted[start..].iter().map(|p| Line::from(fit_spans(p.spans.clone(), width))).collect()
 }
 
 /// Help rows; a row with an empty key is a section heading.
-const HELP: &[(&str, &str)] = &[
+pub const HELP: &[(&str, &str)] = &[
     ("", "main"),
     ("1 2 3 4  Tab", "tree · agents · tasks · events"),
     ("↑↓ j k  PgUp PgDn", "move"),
@@ -1014,16 +1046,12 @@ fn draw_detail(
     mouse: &mut model::MouseHit,
 ) {
     // Tasks always use the task view, also before their first body arrives.
-    if !d.tabs.is_empty() || matches!(d.body, DetailBody::Log { .. }) {
+    if is_task_detail(d) {
         draw_task_detail(frame, area, d, mouse);
         return;
     }
     frame.render_widget(Clear, area);
     let inner = Block::bordered().inner(area).inner(Margin { horizontal: 1, vertical: 0 });
-    let chat = match &d.body {
-        DetailBody::Conversation(c) => Some((c.stats.clone(), c.running, c.note.clone())),
-        _ => None,
-    };
     let live = composer.filter(|c| c.child_id == d.id);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1035,8 +1063,61 @@ fn draw_detail(
         .split(inner);
     let body = chunks[0];
     let text_w = body.width.saturating_sub(2).max(1);
-    let width = text_w as usize;
     let height = body.height as usize;
+    let view = chat_body(d, text_w as usize, height);
+    let chat_rect = Rect { x: body.x, y: body.y, width: text_w, height: body.height };
+    let bar = Rect { x: body.x + body.width.saturating_sub(1), y: body.y, width: 1, height: body.height };
+    mouse.detail = hit_rect(area);
+    mouse.chat = hit_rect(chat_rect);
+    mouse.scrollbar = hit_rect(bar);
+    frame.render_widget(Paragraph::new(view.rows), chat_rect);
+    draw_scrollbar(frame, bar, view.len, height, d.scroll);
+
+    let status_row = if live.is_some() { chunks[2] } else { chunks[1] };
+    frame.render_widget(Paragraph::new(Line::from(fit_spans(chat_status(d), status_row.width as usize))), status_row);
+    if let Some(c) = live {
+        let facts = composer_facts(c);
+        let width = chunks[1].width as usize;
+        let suffix = if facts.is_empty() { String::new() } else { format!("  {facts}") };
+        let budget = width.saturating_sub(2 + suffix.chars().count() + 1);
+        let shown = tail_columns(&c.input, budget);
+        let prompt = format!("› {shown}▏{suffix}");
+        frame.render_widget(Paragraph::new(Line::from(sp(fg(ACCENT), prompt))), chunks[1]);
+    }
+
+    let running = chat_running(d);
+    let keys = chat_keys(d, live.is_some());
+    let pill = pos_pill(d.follow, running, view.len, height, d.scroll);
+    frame.render_widget(detail_block(&d.title, pill, Vec::new(), &keys, area.width), area);
+}
+
+// ── shared detail views ────────────────────────────────────────────────────
+//
+// What a detail shows, computed once for every frontend: the TUI paints it
+// into bordered boxes, the desktop GUI into native panels. Each call also
+// does the detail's scroll / follow / match bookkeeping, exactly as a frame
+// of the TUI does, so both frontends scroll and search the same way.
+
+/// A key hint: key, label, drop priority (0 always stays).
+pub type KeyHint = (&'static str, &'static str, u8);
+
+/// Whether `d` shows a task (info card, streams) rather than an agent thread.
+pub fn is_task_detail(d: &model::Detail) -> bool {
+    !d.tabs.is_empty() || matches!(d.body, DetailBody::Log { .. })
+}
+
+/// Visible rows of an agent thread, and where its fold chevrons sit.
+pub struct ChatBody {
+    pub rows: Vec<Line<'static>>,
+    /// Per visible row: the fold chevron on it, if any.
+    pub folds: Vec<Option<FoldHit>>,
+    /// Painted rows in the whole thread.
+    pub len: usize,
+}
+
+/// Lays the thread out `width` columns wide and returns the `height` rows
+/// on screen, updating the detail's scroll, follow and fold bookkeeping.
+pub fn chat_body(d: &mut model::Detail, width: usize, height: usize) -> ChatBody {
     let painted = layout_detail(&d.body, width, &d.open, d.tools_expanded);
     d.wrap_len = painted.len();
     d.view_h = height;
@@ -1046,32 +1127,31 @@ fn draw_detail(
     d.scroll = scroll;
     let start = d.scroll.min(painted.len());
     d.hits = painted[start..].iter().take(height).map(|p| p.fold).collect();
-    let lines: Vec<Line> =
-        painted[start..].iter().take(height).map(|p| Line::from(fit_spans(p.spans.clone(), width))).collect();
-    let chat_rect = Rect { x: body.x, y: body.y, width: text_w, height: body.height };
-    let bar = Rect { x: body.x + body.width.saturating_sub(1), y: body.y, width: 1, height: body.height };
-    mouse.detail = hit_rect(area);
-    mouse.chat = hit_rect(chat_rect);
-    mouse.scrollbar = hit_rect(bar);
-    frame.render_widget(Paragraph::new(lines), chat_rect);
-    draw_scrollbar(frame, bar, painted.len(), height, d.scroll);
+    let rows = painted[start..].iter().take(height).map(|p| Line::from(fit_spans(p.spans.clone(), width))).collect();
+    ChatBody { rows, folds: d.hits.clone(), len: painted.len() }
+}
 
-    // Status line: live spinner, then usage (or why there is none).
-    let running = chat.as_ref().is_some_and(|c| c.1);
+/// Whether the agent is working right now.
+pub fn chat_running(d: &model::Detail) -> bool {
+    matches!(&d.body, DetailBody::Conversation(c) if c.running)
+}
+
+/// The thread's status line: live spinner, then usage (or why there is none).
+pub fn chat_status(d: &model::Detail) -> Vec<Span<'static>> {
     let mut left = Vec::new();
-    if let Some((stats, running, note)) = &chat {
-        if *running {
+    if let DetailBody::Conversation(c) = &d.body {
+        if c.running {
             left.push(sp(fg(ACCENT), format!("{} ", spin_glyph())));
             left.push(sp(fg(ACCENT).add_modifier(Modifier::ITALIC), "working   "));
         }
         // Without recorded usage only the shell count (from tasks) is real.
-        let shown: &[(String, String)] = match note {
+        let shown: &[(String, String)] = match &c.note {
             Some(n) => {
                 left.push(sp(fg(WARN), n.clone()));
                 left.push(sp(fg(RULE), " · "));
-                stats.last().map(std::slice::from_ref).unwrap_or(&[])
+                c.stats.last().map(std::slice::from_ref).unwrap_or(&[])
             }
-            None => stats,
+            None => &c.stats,
         };
         for (i, (v, l)) in shown.iter().enumerate() {
             if i > 0 {
@@ -1081,34 +1161,156 @@ fn draw_detail(
             left.push(unit(&format!(" {l}")));
         }
     }
-    let status_row = if live.is_some() { chunks[2] } else { chunks[1] };
-    frame.render_widget(Paragraph::new(Line::from(fit_spans(left, status_row.width as usize))), status_row);
-    if let Some(c) = live {
-        let facts = [c.activity.as_str(), c.residency.as_str(), c.model.as_str(), c.cache.as_str(), c.context.as_str()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let width = chunks[1].width as usize;
-        let suffix = if facts.is_empty() { String::new() } else { format!("  {facts}") };
-        let budget = width.saturating_sub(2 + suffix.chars().count() + 1);
-        let shown = tail_columns(&c.input, budget);
-        let prompt = format!("› {shown}▏{suffix}");
-        frame.render_widget(Paragraph::new(Line::from(sp(fg(ACCENT), prompt))), chunks[1]);
-    }
+    left
+}
 
-    let keys: Vec<Key> = if live.is_some() {
+/// Facts about a live agent beside its input: activity, residency, model,
+/// cache, context.
+pub fn composer_facts(c: &AgentComposer) -> String {
+    [c.activity.as_str(), c.residency.as_str(), c.model.as_str(), c.cache.as_str(), c.context.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Key hints for an agent thread (`live`: the composer has the keyboard).
+pub fn chat_keys(d: &model::Detail, live: bool) -> Vec<KeyHint> {
+    if live {
         vec![("q", "close", 0), ("enter", "send", 1), ("alt-enter", "later", 2), ("esc esc", "abort", 3), ("↑↓", "scroll", 4)]
     } else {
         let mut keys = vec![("esc", "close", 0), ("o", if d.tools_expanded { "fold all" } else { "unfold all" }, 1)];
-        if running {
+        if chat_running(d) {
             keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 2));
         }
         keys.extend([("↑↓", "scroll", 3), ("g G", "top / end", 4)]);
         keys
+    }
+}
+
+/// The task a detail shows and its output lines (a placeholder before the
+/// collector delivers the body).
+pub fn task_parts(d: &model::Detail) -> (model::TaskInfo, Vec<String>) {
+    match &d.body {
+        DetailBody::Log { info, lines } => ((**info).clone(), lines.clone()),
+        // First frame, before the collector delivers the body.
+        _ => (
+            model::TaskInfo { id: d.id.clone(), status: "loading".into(), ..Default::default() },
+            vec!["(loading…)".to_string()],
+        ),
+    }
+}
+
+/// The pinned info card for a detail `width` columns wide whose inner
+/// height is `inner_h`, leaving the tab row and three output rows below it.
+pub fn task_card(info: &model::TaskInfo, d: &model::Detail, width: usize, inner_h: usize) -> Vec<Line<'static>> {
+    let max_card = inner_h.saturating_sub(4).max(1);
+    info_card(info, width, d.tab, d.cmd_full, max_card)
+}
+
+/// Visible rows of a task's output and the counts its tab row reports.
+pub struct TaskBody {
+    pub rows: Vec<Line<'static>>,
+    /// Painted rows in the whole (filtered) output.
+    pub len: usize,
+    pub shown: usize,
+    pub total: usize,
+}
+
+/// Lays the output out `width` columns wide and returns the `height` rows
+/// on screen, updating scroll, follow, and the search's matches.
+pub fn task_body(d: &mut model::Detail, lines: &[String], width: usize, height: usize) -> TaskBody {
+    let current_row = d.log.matches.get(d.log.current).copied();
+    let laid = layout_log(lines, width, &d.log, current_row);
+    d.wrap_len = laid.lines.len();
+    d.view_h = height;
+    d.log.matches = laid.matches.clone();
+    if d.log.seek && !d.log.matches.is_empty() {
+        let next = d.log.matches.iter().position(|&m| m >= d.scroll).unwrap_or(d.log.matches.len() - 1);
+        d.log.current = next;
+        d.follow = false;
+        d.scroll = d.log.matches[next].saturating_sub(height / 3);
+    }
+    d.log.seek = false;
+    d.log.current = d.log.current.min(d.log.matches.len().saturating_sub(1));
+    let (follow, scroll) = stick_scroll(d.follow, d.hold, d.scroll, laid.lines.len(), height);
+    d.follow = follow;
+    d.scroll = scroll;
+    d.hits.clear();
+    let start = d.scroll.min(laid.lines.len());
+    let rows = laid.lines[start..].iter().take(height).map(|p| Line::from(fit_spans(p.spans.clone(), width))).collect();
+    TaskBody { rows, len: laid.lines.len(), shown: laid.shown, total: laid.total }
+}
+
+/// What the tab row reports: lines, blank lines hidden, or search matches.
+pub fn task_count(d: &model::Detail, body: &TaskBody) -> Vec<Span<'static>> {
+    let q = !d.log.query.is_empty();
+    if q && d.log.filter {
+        vec![sp(fg(TEXT), body.shown.to_string()), sp(fg(DIM), format!(" of {}", plural(body.total, "line")))]
+    } else if q {
+        let n = d.log.matches.len();
+        let at = if n == 0 { 0 } else { d.log.current + 1 };
+        vec![sp(fg(if n == 0 { ERR } else { TEXT }), format!("{at}/{n}")), sp(fg(DIM), " matching rows")]
+    } else {
+        let hidden = body.total - body.shown;
+        let mut v = vec![sp(fg(TEXT), body.total.to_string()), sp(fg(DIM), if body.total == 1 { " line" } else { " lines" })];
+        if hidden > 0 && !d.log.show_blank {
+            v.push(sp(fg(DIM), format!(" · {hidden} blank hidden")));
+        }
+        v
+    }
+}
+
+/// The task detail's footer: a prompt or notice (if any) and the key hints,
+/// named for the mode each key switches to.
+pub fn task_footer(d: &model::Detail, running: bool) -> (Option<Vec<Span<'static>>>, Vec<KeyHint>) {
+    let q = !d.log.query.is_empty();
+    let mode = if d.log.filter { "highlight" } else { "filter" };
+    if d.log.editing {
+        return (
+            Some(vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), d.log.query.clone()), sp(fg(ACCENT), "▏")]),
+            vec![("enter", "apply", 0), ("tab", mode, 1), ("esc", "clear", 0)],
+        );
+    }
+    let mut keys: Vec<KeyHint> = Vec::new();
+    let prefix = if let Some(n) = &d.notice {
+        if q {
+            keys.push(("n N", "next", 1));
+        } else {
+            keys.push(("/", "search", 1));
+        }
+        Some(vec![sp(fg(WARN), n.clone())])
+    } else if q {
+        keys.push(("n N", "next", 1));
+        Some(vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), d.log.query.clone())])
+    } else {
+        keys.push(("/", "search", 1));
+        None
     };
-    let pill = pos_pill(d.follow, running, painted.len(), height, d.scroll);
-    frame.render_widget(detail_block(&d.title, pill, Vec::new(), &keys, area.width), area);
+    keys.push(("&", mode, 2));
+    keys.push(("b", if d.log.show_blank { "hide blank" } else { "show blank" }, 4));
+    keys.push(("1 2", "stream", 5));
+    keys.push(("e", if d.cmd_full { "collapse" } else { "expand" }, 3));
+    keys.push(("c", "copy cmd", 3));
+    keys.push(("p", "copy path", 6));
+    if running {
+        keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 3));
+    }
+    keys.push(("esc", if q { "clear" } else { "close" }, 0));
+    (prefix, keys)
+}
+
+/// Right-hand position for a detail: `NN%` when scrolled back, `following`
+/// while live at the end, nothing otherwise.
+pub fn detail_position(follow: bool, running: bool, len: usize, height: usize, scroll: usize) -> Option<String> {
+    if !follow && len > height {
+        let max = len - height;
+        Some(format!("{}%", scroll * 100 / max.max(1)))
+    } else if follow && running {
+        Some("● following".into())
+    } else {
+        None
+    }
 }
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -1498,19 +1700,10 @@ fn info_card(info: &model::TaskInfo, width: usize, tab: usize, full: bool, max_h
 
 fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse: &mut model::MouseHit) {
     frame.render_widget(Clear, area);
-    let (info, lines) = match &d.body {
-        DetailBody::Log { info, lines } => ((**info).clone(), lines.clone()),
-        // First frame, before the collector delivers the body.
-        _ => (
-            model::TaskInfo { id: d.id.clone(), status: "loading".into(), ..Default::default() },
-            vec!["(loading…)".to_string()],
-        ),
-    };
+    let (info, lines) = task_parts(d);
     let inner = Block::bordered().inner(area).inner(Margin { horizontal: 1, vertical: 0 });
     let w = inner.width as usize;
-    // Leave the tab row and at least three output rows under the card.
-    let max_card = (inner.height as usize).saturating_sub(4).max(1);
-    let card = info_card(&info, w, d.tab, d.cmd_full, max_card);
+    let card = task_card(&info, d, w, inner.height as usize);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(card.len() as u16), Constraint::Length(1), Constraint::Min(1)])
@@ -1521,33 +1714,13 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
     let body = chunks[2];
     let text_w = body.width.saturating_sub(2).max(1);
     let height = body.height as usize;
-    let current_row = d.log.matches.get(d.log.current).copied();
-    let laid = layout_log(&lines, text_w as usize, &d.log, current_row);
-    d.wrap_len = laid.lines.len();
-    d.view_h = height;
-    d.log.matches = laid.matches.clone();
-    if d.log.seek && !d.log.matches.is_empty() {
-        let next = d.log.matches.iter().position(|&m| m >= d.scroll).unwrap_or(d.log.matches.len() - 1);
-        d.log.current = next;
-        d.follow = false;
-        d.scroll = d.log.matches[next].saturating_sub(height / 3);
-    }
-    d.log.seek = false;
-    d.log.current = d.log.current.min(d.log.matches.len().saturating_sub(1));
-    let (follow, scroll) = stick_scroll(d.follow, d.hold, d.scroll, laid.lines.len(), height);
-    d.follow = follow;
-    d.scroll = scroll;
-    d.hits.clear();
-    let start = d.scroll.min(laid.lines.len());
-    let rows: Vec<Line> = laid.lines[start..]
-        .iter()
-        .take(height)
-        .map(|p| Line::from(fit_spans(p.spans.clone(), text_w as usize)))
-        .collect();
+    let laid = task_body(d, &lines, text_w as usize, height);
     let text = Rect { x: body.x, y: body.y, width: text_w, height: body.height };
     let bar = Rect { x: body.x + body.width.saturating_sub(1), y: body.y, width: 1, height: body.height };
-    frame.render_widget(Paragraph::new(rows), text);
-    draw_scrollbar(frame, bar, laid.lines.len(), height, d.scroll);
+    let len = laid.len;
+    let count = task_count(d, &laid);
+    frame.render_widget(Paragraph::new(laid.rows), text);
+    draw_scrollbar(frame, bar, len, height, d.scroll);
 
     // Tab row: `─┐¹output┌┐²stderr┌──────┐17 of 1203 lines┌─`.
     // The tab row joins the box border: `├─┐¹output┌┐²stderr┌───┐24 lines┌─┤`.
@@ -1566,21 +1739,6 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
         hits.push((row.x + x0 as u16, row.x + (x0 + spans_width(&s)) as u16, i));
         tabs.extend(s);
     }
-    let q = !d.log.query.is_empty();
-    let count = if q && d.log.filter {
-        vec![sp(fg(TEXT), laid.shown.to_string()), sp(fg(DIM), format!(" of {}", plural(laid.total, "line")))]
-    } else if q {
-        let n = laid.matches.len();
-        let at = if n == 0 { 0 } else { d.log.current + 1 };
-        vec![sp(fg(if n == 0 { ERR } else { TEXT }), format!("{at}/{n}")), sp(fg(DIM), " matching rows")]
-    } else {
-        let hidden = laid.total - laid.shown;
-        let mut v = vec![sp(fg(TEXT), laid.total.to_string()), sp(fg(DIM), if laid.total == 1 { " line" } else { " lines" })];
-        if hidden > 0 && !d.log.show_blank {
-            v.push(sp(fg(DIM), format!(" · {hidden} blank hidden")));
-        }
-        v
-    };
     let mut right = seg(BOX_MAIN, count);
     right.push(sp(fg(BOX_MAIN), "─┤"));
     let fill = w.saturating_sub(spans_width(&tabs) + spans_width(&right));
@@ -1590,45 +1748,9 @@ fn draw_task_detail(frame: &mut Frame, area: Rect, d: &mut model::Detail, mouse:
     d.log.tab_y = row.y;
 
     // Frame: title, follow state, and keys / search prompt in the bottom border.
-    // Keys name the mode they switch to.
-    let mode = if d.log.filter { "highlight" } else { "filter" };
-    let (prefix, keys): (Vec<Span<'static>>, Vec<Key>) = if d.log.editing {
-        (
-            seg_bottom(
-                BOX_MAIN,
-                vec![sp(fg(ACCENT).add_modifier(Modifier::BOLD), "/ "), sp(fg(TEXT), d.log.query.clone()), sp(fg(ACCENT), "▏")],
-            ),
-            vec![("enter", "apply", 0), ("tab", mode, 1), ("esc", "clear", 0)],
-        )
-    } else {
-        let mut keys: Vec<Key> = Vec::new();
-        let prefix = if let Some(n) = &d.notice {
-            if q {
-                keys.push(("n N", "next", 1));
-            } else {
-                keys.push(("/", "search", 1));
-            }
-            seg_bottom(BOX_MAIN, vec![sp(fg(WARN), n.clone())])
-        } else if q {
-            keys.push(("n N", "next", 1));
-            seg_bottom(BOX_MAIN, vec![sp(fg(ACCENT), "/ "), sp(fg(TEXT), d.log.query.clone())])
-        } else {
-            keys.push(("/", "search", 1));
-            Vec::new()
-        };
-        keys.push(("&", mode, 2));
-        keys.push(("b", if d.log.show_blank { "hide blank" } else { "show blank" }, 4));
-        keys.push(("1 2", "stream", 5));
-        keys.push(("e", if d.cmd_full { "collapse" } else { "expand" }, 3));
-        keys.push(("c", "copy cmd", 3));
-        keys.push(("p", "copy path", 6));
-        if info.running {
-            keys.push(("f", if d.follow { "unfollow" } else { "follow" }, 3));
-        }
-        keys.push(("esc", if q { "clear" } else { "close" }, 0));
-        (prefix, keys)
-    };
-    let pill = pos_pill(d.follow, info.running, laid.lines.len(), height, d.scroll);
+    let (prefix, keys) = task_footer(d, info.running);
+    let prefix = prefix.map(|p| seg_bottom(BOX_MAIN, p)).unwrap_or_default();
+    let pill = pos_pill(d.follow, info.running, len, height, d.scroll);
     frame.render_widget(detail_block(&d.title, pill, prefix, &keys, area.width), area);
     frame.render_widget(Paragraph::new(Line::from(fit_spans(tabs, w))), row);
     mouse.detail = hit_rect(area);
@@ -2398,7 +2520,7 @@ fn status_glyph(status: &str, running: bool) -> &'static str {
 
 /// Styled cell: the tree label gets chevron + status glyph, status words are
 /// colored, and placeholders are dim.
-fn cell_spans(state: &TopState, vr: &VisibleRow, col: Col) -> Vec<Span<'static>> {
+pub fn cell_spans(state: &TopState, vr: &VisibleRow, col: Col) -> Vec<Span<'static>> {
     // Flat task table: the id carries the same status glyph as the tree.
     if state.tab == Tab::Tasks && col == Col::Id {
         if let Some(&i) = state.task_index.get(&vr.id) {
@@ -3387,5 +3509,151 @@ mod tests {
         let top_pos = top.iter().position(|c| *c == THUMB).unwrap();
         let bot_pos = bottom.iter().position(|c| *c == THUMB).unwrap();
         assert!(top_pos < bot_pos, "top {top_pos} bottom {bot_pos}");
+    }
+
+
+    // ── GUI actions: each must leave the state as the TUI's mouse / typing would.
+
+    fn act(state: &mut TopState, a: crate::top::Action) {
+        crate::top::handle_action(state, a);
+    }
+
+    fn main_state() -> TopState {
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap(), &[], &HashMap::new());
+        state
+    }
+
+    #[test]
+    fn row_click_selects_then_folds_and_row_open_opens_the_detail() {
+        use crate::top::Action;
+        let mut state = main_state();
+        let parent = state.visible.iter().find(|v| v.expanded).map(|v| v.id.clone()).expect("an expanded branch");
+        let before = state.visible.len();
+        state.selected = None;
+        act(&mut state, Action::RowClick(parent.clone()));
+        assert_eq!(state.selected.as_deref(), Some(parent.as_str()));
+        assert_eq!(state.visible.len(), before, "first click only selects");
+        // A second click inside 400ms would open: clear the click memory first.
+        state.mouse.last = None;
+        act(&mut state, Action::RowClick(parent.clone()));
+        assert!(state.visible.len() < before, "second click on the selected branch folds it");
+        assert!(state.detail.is_none());
+
+        act(&mut state, Action::RowOpen("sh_live".into()));
+        assert!(state.detail.is_none(), "rows not in view do not open");
+        let mut state = main_state();
+        assert!(state.visible.iter().any(|v| v.id == "sh_live"), "the running task is in view");
+        act(&mut state, Action::RowOpen("sh_live".into()));
+        assert_eq!(state.detail.as_ref().map(|d| d.id.as_str()), Some("sh_live"));
+        assert_eq!(state.selected.as_deref(), Some("sh_live"));
+    }
+
+    #[test]
+    fn prompt_text_goes_to_the_open_prompt_only() {
+        use crate::top::Action;
+        let mut state = main_state();
+        act(&mut state, Action::Text("zzz-nothing".into()));
+        assert!(state.filter.is_empty(), "no prompt open: text is ignored");
+        state.filter_editing = true;
+        act(&mut state, Action::Text("zzz-nothing".into()));
+        assert_eq!(state.filter, "zzz-nothing");
+        assert!(state.visible.is_empty(), "the filter applies as it is typed");
+        state.filter_editing = false;
+        state.set_filter(String::new());
+
+        let mut state = task_detail(log_lines());
+        act(&mut state, Action::Text("verify".into()));
+        assert!(state.detail.as_ref().unwrap().log.query.is_empty(), "search not open");
+        state.detail.as_mut().unwrap().log.editing = true;
+        act(&mut state, Action::Text("verify".into()));
+        let d = state.detail.as_ref().unwrap();
+        assert!(d.log.query == "verify" && d.log.seek);
+
+        let mut state = chat_state(true, true);
+        state.composer.as_mut().unwrap().esc_armed = true;
+        act(&mut state, Action::Text("hello".into()));
+        let c = state.composer.as_ref().unwrap();
+        assert!(c.input == "hello" && !c.esc_armed, "typing disarms the abort");
+    }
+
+    #[test]
+    fn overlays_swallow_pointer_actions_like_the_tui() {
+        use crate::top::Action;
+        let mut state = main_state();
+        let first = state.selected.clone();
+        state.help = true;
+        act(&mut state, Action::Wheel(2));
+        assert!(state.help && state.selected == first, "the wheel never moves the table under help");
+        act(&mut state, Action::TabBar(TabHit::Tab(Tab::Tasks)));
+        assert!(!state.help && state.tab != Tab::Tasks, "a click closes help and does nothing else");
+        state.confirm_stop = Some("sh_live".into());
+        act(&mut state, Action::RowClick("sh_old".into()));
+        act(&mut state, Action::Dismiss);
+        assert_eq!(state.confirm_stop.as_deref(), Some("sh_live"), "the stop prompt needs y / n");
+        state.confirm_stop = None;
+        act(&mut state, Action::Wheel(1));
+        assert_ne!(state.selected, first, "the wheel moves the selection");
+    }
+
+    #[test]
+    fn detail_actions_switch_streams_scroll_and_fold() {
+        use crate::top::Action;
+        let mut lines: Vec<String> = (0..200).map(|i| format!("row {i}")).collect();
+        lines.push("tail".into());
+        let mut state = task_detail(lines);
+        render(100, 30, &mut state);
+        act(&mut state, Action::ScrollTo(0.0));
+        let d = state.detail.as_ref().unwrap();
+        assert!(!d.follow && d.scroll == 0);
+        act(&mut state, Action::ScrollTo(1.0));
+        let d = state.detail.as_ref().unwrap();
+        assert_eq!(d.scroll, d.wrap_len - d.view_h);
+        act(&mut state, Action::DetailTab(1));
+        let d = state.detail.as_ref().unwrap();
+        assert!(d.tab == 1 && d.follow && d.scroll == 0, "a new stream starts at its live end");
+
+        let mut state = chat_state(false, false);
+        render(100, 30, &mut state);
+        assert!(state.detail.as_ref().unwrap().fold_count > 2);
+        act(&mut state, Action::Fold(1));
+        assert!(state.detail.as_ref().unwrap().open.contains(&1));
+        act(&mut state, Action::Fold(1));
+        assert!(!state.detail.as_ref().unwrap().open.contains(&1));
+        state.detail.as_mut().unwrap().tools_expanded = true;
+        act(&mut state, Action::Fold(0));
+        let d = state.detail.as_ref().unwrap();
+        assert!(!d.tools_expanded && !d.open.contains(&0) && d.open.contains(&1), "leaving unfold-all folds only that block");
+    }
+
+    /// An agent detail with a long thread of prose, tools and thinking.
+    fn chat_state(running: bool, live: bool) -> TopState {
+        let snap = snap();
+        let mut state = TopState::new(1_000, None, None);
+        state.apply(&snap, &[], &HashMap::new());
+        state.selected = Some("ch_a".into());
+        let mut d = open_detail(&state).expect("agent opens");
+        let mut turns = vec![mk_turn("user", "inspect the loader please, and then report back")];
+        for i in 0..30 {
+            turns.push(mk_turn("assistant", &format!("## Step {i}\n- run `cargo test` now\n- **ship** it\nsome longer prose that wraps around the panel width {i}")));
+            turns.push(tool_turn("bash", Some(r#"{"command":"rg loader src"}"#), "src/a.rs:1: loader\nsrc/b.rs:2: loader"));
+            turns.push(mk_turn("thinking", "pondering the loader"));
+        }
+        d.body = DetailBody::Conversation(Chat {
+            turns,
+            agent: "worker".into(),
+            note: if running { None } else { Some("usage not recorded".into()) },
+            stats: vec![("100".into(), "in".into()), ("20".into(), "out".into()), ("1".into(), "shell".into())],
+            running,
+        });
+        if live {
+            let mut c = AgentComposer::new("ch_a".into());
+            c.input = "next step please".into();
+            c.activity = "running".into();
+            c.model = "haiku".into();
+            state.composer = Some(c);
+        }
+        state.detail = Some(d);
+        state
     }
 }
