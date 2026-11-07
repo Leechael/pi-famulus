@@ -32,6 +32,7 @@ import {
   type OverloadSummaryOutput,
 } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
+import type { DecisionShadow } from "./decision-model";
 import { fill, fillList, PROMPTS } from "./prompts.generated";
 import { statusGlyph, toolComponent } from "./tui/tool-component";
 import type { WorkIndex } from "./work-index";
@@ -86,11 +87,17 @@ export interface MonitorDeps {
   afterStop?: () => void;
   /** Optional overload-policy overrides for tests. Production uses draft constants. */
   overload?: Partial<OverloadControllerOptions>;
+  /**
+   * Shadow decision model: sees each admitted output batch and overload
+   * summary after the wake is handed to the notify center. Never gates it.
+   */
+  decision?: DecisionShadow | null;
 }
 
 interface MonitorEntry {
   taskId: string;
   description: string;
+  command: string;
   startedAt: number;
   batcher: LineBatcher;
   output: MonitorOutputBuffer;
@@ -239,6 +246,7 @@ export class MonitorRegistry {
     const entry: MonitorEntry = {
       taskId: task_id,
       description: params.description,
+      command: params.command,
       startedAt: now,
       batcher: null as unknown as LineBatcher, // assigned below (self-reference in callback)
       output: null as unknown as MonitorOutputBuffer,
@@ -263,7 +271,7 @@ export class MonitorRegistry {
     entry.overload = new OverloadController({
       clock: this.clock,
       ...this.deps.overload,
-      onSummary: (text, output) => this.emitOverloadNotice(entry, text, output),
+      onSummary: (text, output) => this.emitOverloadNotice(entry, text, output, true),
       onEnter: (reason) => this.emitOverloadNotice(entry, this.enterNotice(reason)),
       onExit: () => this.emitOverloadNotice(entry, "[Monitor overload: leaving summary mode. Individual lines resume.]"),
     });
@@ -609,12 +617,25 @@ export class MonitorRegistry {
     return `[Monitor overload: entering summary mode (${why}). Individual lines are suppressed. First summary after ${Math.round(cadenceMs / 1000)}s. Raw output via task_output.]`;
   }
 
-  private emitOverloadNotice(entry: MonitorEntry, text: string, output?: OverloadSummaryOutput): void {
+  private emitOverloadNotice(entry: MonitorEntry, text: string, output?: OverloadSummaryOutput, isSummary = false): void {
     if (entry.stopped || entry.stopRequested) return;
     const center = this.deps.getNotifyCenter();
     if (!center) return;
     center.notifyMonitorEvent(entry.description, entry.taskId, text, 0, output ? { output } : {});
     entry.lastEventAt = this.clock.now();
+    // Summaries carry output; enter/leave notices are mode changes, not output.
+    if (isSummary) this.observeDecision(entry, text, "summary");
+  }
+
+  /** Shadow judgement after the wake was handed off; failures stay out of the wake path. */
+  private observeDecision(entry: MonitorEntry, text: string, kind: "batch" | "summary"): void {
+    const decision = this.deps.decision;
+    if (!decision) return;
+    try {
+      decision.observe({ taskId: entry.taskId, description: entry.description, command: entry.command, text, kind });
+    } catch {
+      // shadow only
+    }
   }
 
   private onBatch(entry: MonitorEntry, text: string, output?: MonitorOutputInfo, onDelivered?: () => void): boolean {
@@ -649,6 +670,7 @@ export class MonitorRegistry {
       output,
       onDelivered,
     });
+    if (entry.stopRequested !== true) this.observeDecision(entry, text, "batch");
     return true;
   }
 
@@ -714,6 +736,7 @@ export class MonitorRegistry {
 
   private cleanup(entry: MonitorEntry): void {
     entry.stopped = true;
+    this.deps.decision?.forget(entry.taskId);
     entry.batcher.dispose();
     entry.output.dispose();
     entry.limiter.dispose();

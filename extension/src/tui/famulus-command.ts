@@ -19,6 +19,8 @@ export interface FamulusCommandDeps {
   getClient: () => ManagerClient | null;
   /** Effective plugin opt-in, including the environment disable override. */
   messagingEnabled?: boolean;
+  /** Decision-model shadow status line; absent while the feature is off. */
+  decisionModel?: () => string;
   /** `<binary> --version`; null when it cannot be run. */
   binaryVersion?: (path: string) => Promise<string | null>;
   /** Exchange an enrollment token using the current messaging configuration. */
@@ -35,6 +37,8 @@ export interface FamulusInfo {
   daemonError: string;
   /** Null when the manager is not connected or did not report it. */
   messaging: MessagingStatus | null;
+  /** Decision-model shadow status, only when enabled. */
+  decisionModel?: string;
 }
 
 const RELAY_STATES: Record<string, string> = {
@@ -88,6 +92,7 @@ export function formatFamulusInfo(info: FamulusInfo): string {
     `CLI binary: ${binary}`,
     `Manager: ${manager}`,
     `Messaging: ${formatMessaging(info)}`,
+    ...(info.decisionModel ? [`Decision model: ${info.decisionModel}`] : []),
     `Config: ${info.configPath}`,
   ].join("\n");
 }
@@ -142,6 +147,7 @@ export async function collectFamulusInfo(deps: FamulusCommandDeps): Promise<Famu
     messaging: deps.messagingEnabled === false
       ? { state: "disabled", name: "" }
       : connected && client ? await readMessaging(client) : null,
+    ...(deps.decisionModel ? { decisionModel: deps.decisionModel() } : {}),
   };
 }
 
