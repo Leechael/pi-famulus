@@ -141,6 +141,24 @@ All five failed `agent-wait-ready` episodes ended the turn after `run_in_backgro
 
 **Deferred:** the poll guard, which would end a run on `task_output` of a still-running task. A replay count showed 43 trips. `deferred: poll guard (end a run on task_output of a still-running task) | impact: with the wait guard on, waits move to task_output/task_list polling (polls 3 to 12 in replay) | trigger: polling remains the dominant wait pattern in a real session after the wait guard`
 
+## Background commands that never exit
+
+luna (all 9 `agent-wait-ready` episodes across A, B and C) and terra (3 of 6 in B and C) started the server with `run_in_background` and ended the turn. The backgrounded result told them "You will be notified when it completes … reply to the user now with no tool call", and they did; a server never completes, so no wake came.
+
+- **Prompt**: the backgrounded result (`result.bash-bg-exit-only`, a new segment), the `run_in_background` parameter and the first pi-famulus guideline now say the task wake comes only when the command exits, and that a command that keeps running (a server, a watcher) needs a monitor before the turn ends.
+- **Eval**: arm D is arm C plus this wording. `agent-wait-*` and four default turn-control scenarios that check ending the turn after a background command, on three models, k=3. The turn-control scenarios also ran on arm C for comparison.
+
+| Scenario | deepseek C | deepseek D | luna C | luna D | terra C | terra D |
+|---|---:|---:|---:|---:|---:|---:|
+| `agent-wait-ready` | 1/3 | 2/3 | 0/3 | 0/3 | 1/3 | 3/3 |
+| `agent-wait-job` | 3/3 | 2/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+| `bg-end-turn` | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+| `still-running-continue` | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+| `wake-continue` | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+| `monitor-not-sleep` | 3/3 | 3/3 | 1/3 | 0/3 | 3/3 | 3/3 |
+
+The C cells of `agent-wait-*` come from the clean-context runs above. luna's D score did not move, but its behaviour did: all 3 D episodes started a persistent monitor on the server's output (0 of 9 before), then ran the smoke test in the same turn before the ready event, or listed tasks. luna's `monitor-not-sleep` failures are the same single `task_list` after the monitor in both arms, as in the 2026-11-07 review. The deepseek D `agent-wait-job` failure is one `sleep` attempt before the result.
+
 ## Harness and grader issues found and fixed during the run
 
 - The ablation runner's "floor" early stop skips variant cells when the baseline arm is below 20%. Arm B's agent-wait cells were therefore run separately, as a baseline against an extension copy.
