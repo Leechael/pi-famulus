@@ -68,7 +68,7 @@ The hour control (an explicit one-hour watch must keep `timeout_ms: 3600000`) sh
 
 ## Wait guard
 
-The prompt and the default did not change the choice in the incident context, so a mechanism does. `extension/src/wait-guard.ts` runs before a bash call and blocks it without ending the run when it waits in bash (`sleep N` with N of 10 or more, or a `sleep` inside a `while`/`until`/`for` loop body) or detaches a process (a lone `&`, `nohup`, `setsid`, `disown`). Quoted strings, heredoc bodies and comments are ignored. The refusal names the alternative: a persistent monitor, ending the turn, or running in the foreground. Config `waitGuard`, default true; `false` disables it (`mech.wait-guard` in the ablation manifest).
+The prompt and the default did not change the choice in the incident context. The guard does not make the model choose a persistent monitor either; it refuses the bad forms of waiting. `extension/src/wait-guard.ts` runs before a bash call and blocks it without ending the run when it waits in bash (`sleep N` with N of 10 or more, or a `sleep` inside a `while`/`until`/`for` loop body) or detaches a process (a lone `&`, `nohup`, `setsid`, `disown`). Quoted strings, heredoc bodies and comments are ignored. The refusal names the alternative: a persistent monitor, ending the turn, or running in the foreground. Config `waitGuard`, default true; `false` disables it (`mech.wait-guard` in the ablation manifest).
 
 Replay of the incident context (same 10 decision points, k=5 per arm, turn 0 only), PASS / FAIL:
 
@@ -99,7 +99,8 @@ Clean-context probes (same model, k=3). Arm C is arm B (default-persistent + new
 - `agent-wait-job`: all nine passed through the bash completion wake.
 - `agent-wait-ready`: readiness came from a persistent monitor in C 3/3. C's two failures: one model overrode the fixture env (`READY_MS=100 SERVER_TOKEN=...`), so the token did not match the smoke output; another, after the guard refused a `for`-loop wait, read the task output file.
 - The eval found that the guard missed `for ... do ... sleep ... done`. That is fixed, and a `sleep` after a loop's `done` is not flagged.
-- The guard did not help `agent-wait-ready` in a clean context (B 2/3, C 1/3); in the incident-context replay it raised PASS from 6/24 to 9/24.
+- The guard did not help `agent-wait-ready` in a clean context (B 2/3, C 1/3). In the incident-context replay PASS went from 6/24 to 9/24, within what k=5 can separate; its measurable effect there is the removal of sleep and detach (16 to 0).
+- C's `monitor-behavior-*` cells come from the first run, before the `for`-loop fix.
 
 **Deferred:** the poll guard, which would end a run on `task_output` of a still-running task. A replay count showed 43 trips. `deferred: poll guard (end a run on task_output of a still-running task) | impact: with the wait guard on, waits move to task_output/task_list polling (polls 3 to 12 in replay) | trigger: polling remains the dominant wait pattern in a real session after the wait guard`
 
