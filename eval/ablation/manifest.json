@@ -319,6 +319,20 @@
         "bg-end-turn",
         "no-fabrication"
       ]
+    },
+    {
+      "id": "mech.idle-turn-guard",
+      "kind": "config",
+      "surface": "mechanism: idle turn guard (extension/src/idle-turn-guard.ts); disabled via idleTurnGuard:false",
+      "famulusConfig": {
+        "idleTurnGuard": false
+      },
+      "affects": [
+        "idle-after-done-peer",
+        "idle-after-done-user",
+        "idle-after-done-peer-long",
+        "idle-after-done-user-long"
+      ]
     }
   ],
   "groups": [
