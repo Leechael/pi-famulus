@@ -189,7 +189,8 @@ describe("faux e2e", { concurrency: true }, () => {
     t.after(() => runnerObserver?.dispose());
     const ep = await runFaux({
       script: "manager-crash.ts",
-      famulusConfig: { foregroundBudgetMs: 300 },
+      // The script's sleeps are a stand-in workload, not an agent waiting; the wait guard would refuse them.
+      famulusConfig: { foregroundBudgetMs: 300, waitGuard: false },
       midway: {
         when: (items) => toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true),
         act: async (sb) => {
@@ -273,7 +274,8 @@ describe("faux e2e", { concurrency: true }, () => {
     let before: { pid?: number } = {};
     const ep = await runFaux({
       script: "manager-upgrade.ts",
-      famulusConfig: { foregroundBudgetMs: 300 },
+      // The script's sleeps are a stand-in workload, not an agent waiting; the wait guard would refuse them.
+      famulusConfig: { foregroundBudgetMs: 300, waitGuard: false },
       midway: {
         when: (items) =>
           toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true) &&
