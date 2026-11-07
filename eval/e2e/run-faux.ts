@@ -68,7 +68,8 @@ export async function runFaux(opts: FauxRunOptions): Promise<FauxEpisode> {
   let midwayError: string | undefined;
   try {
     if (opts.warm !== false) {
-      const boot = await pi.ready(60_000);
+      // macOS CI runners take close to 60 s to answer get_state (62-66 s per pi-spawning test on main, 2026-11-07).
+      const boot = await pi.ready(120_000);
       await waitManagerReady(sandbox).catch((err: Error) => {
         throw new Error(`${err.message} (pi booted in ${boot}ms; pi stderr: ${pi.stderr.join("").slice(-2000)})`);
       });
