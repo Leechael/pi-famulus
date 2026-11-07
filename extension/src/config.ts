@@ -21,6 +21,8 @@ export interface FamulusConfig {
   messaging?: { enabled: boolean };
   /** End a run that keeps making only no-op/status calls (src/idle-turn-guard.ts). */
   idleTurnGuard?: boolean;
+  /** Block bash that waits (`sleep N`, sleep loops) or detaches (`&`, nohup); src/wait-guard.ts. */
+  waitGuard?: boolean;
   /** Optional M3 subagent tuning section (design doc §4.6 limits). */
   subagent?: FamulusSubagentConfig;
 }
@@ -145,6 +147,7 @@ export const DEFAULT_CONFIG: FamulusConfig = {
   logLevel: "info",
   messaging: { enabled: false },
   idleTurnGuard: true,
+  waitGuard: true,
 };
 
 /** Resolve the pi-famulus base directory. PI_FAMULUS_HOME overrides the default. */
@@ -220,6 +223,7 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
     config.messaging = { enabled: (obj.messaging as Record<string, unknown>).enabled === true };
   }
   if (obj.idleTurnGuard === false) config.idleTurnGuard = false;
+  if (obj.waitGuard === false) config.waitGuard = false;
   if (typeof obj.foregroundBudgetMs === "number" && obj.foregroundBudgetMs > 0) {
     config.foregroundBudgetMs = obj.foregroundBudgetMs;
   }
