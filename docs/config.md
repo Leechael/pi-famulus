@@ -16,6 +16,7 @@ Set `PI_FAMULUS_HOME` to move the Famulus home directory, or pass `--home` to th
 | `subagentBudgetMs` | `45000` | Extension | Default time a `subagent` call waits before running in the background. `subagent.budgetMs` overrides it. |
 | `managerPath` | `null` | Extension; `doctor` | Explicit manager executable. |
 | `idleTurnGuard` | `true` | Extension | Ends a run once two assistant turns in a row, or three in one run, make only no-op or status calls (`true`, `:`, `pwd`, `exit`, `date`, `echo`, `printf`, `sleep`, `task_list`). The calls are not run; the model sees why. A reply, a wake, or a new message starts the count over. Set `false` to disable. |
+| `waitGuard` | `true` | Extension | Before a bash call runs, refuses (without ending the run) a command that waits in bash (`sleep N` with N of 10 or more, or a `sleep` inside a `while`/`until`/`for` body) or detaches a process (a lone `&`, `nohup`, `setsid`, `disown`). Quoted strings, heredoc bodies and comments are ignored. The refusal names the alternative: a persistent monitor, ending the turn, or running in the foreground. Set `false` to disable. |
 | `logLevel` | `"info"` | Extension | Accepted values: `debug`, `info`, `warn`, `error`. Currently parsed but not otherwise used. |
 | `maxWarmAgents` | `4` | Daemon | Maximum number of warm hosted agents. |
 | `goneSessionRetention` | `"24h"` | Daemon | Retention for files belonging to disconnected sessions. |

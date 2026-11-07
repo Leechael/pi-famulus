@@ -333,6 +333,25 @@
         "idle-after-done-peer-long",
         "idle-after-done-user-long"
       ]
+    },
+    {
+      "id": "mech.wait-guard",
+      "kind": "config",
+      "surface": "mechanism: wait guard (extension/src/wait-guard.ts); disabled via waitGuard:false",
+      "famulusConfig": {
+        "waitGuard": false
+      },
+      "affects": [
+        "agent-wait-job",
+        "agent-wait-ready",
+        "monitor-behavior-long",
+        "monitor-behavior-hour",
+        "monitor-behavior-alternative",
+        "monitor-behavior-noise",
+        "monitor-behavior-cleanup",
+        "monitor-behavior-natural",
+        "monitor-behavior-renew"
+      ]
     }
   ],
   "groups": [

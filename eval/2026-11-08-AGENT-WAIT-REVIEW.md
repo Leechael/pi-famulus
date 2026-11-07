@@ -38,7 +38,7 @@ The monitor prompt (0.2.3, and 0.2.4 in other words) presented `timeout_ms` as t
 
 The alias was called twice in 100 episodes and was dropped. Timed monitors in the replay reused timeout values from the session's own history (1500000, 1800000, 2400000, 600000, 900000).
 
-In a context already full of the bad pattern, neither wording, naming nor the default changes the choice. The arms are within what k=5 can separate. Guard arms of the same replay are in the wait guard PR.
+In a context already full of the bad pattern, neither wording, naming nor the default changes the choice. The arms are within what k=5 can separate. Guard arms of the same replay are in the Wait guard section.
 
 ## Clean-context probes
 
@@ -86,6 +86,60 @@ The hour control (an explicit one-hour watch must keep `timeout_ms: 3600000`) sh
 - luna already chooses lifetimes correctly in every arm (`correctDuration` true in nearly every episode), so the default does not change it. All 6 of its `agent-wait-ready` episodes, and one terra B episode, failed another way: the server was started with `run_in_background` and the turn ended with nothing watching ("I'll run the smoke test once it's up"). A background command wakes the agent only when it exits, and a server never exits. That is addressed separately, not by this change.
 - luna's other failures are command shape (the producer started in bash, then its output file tailed) and polls while a monitor runs, in every arm.
 - No hour-control regression on either model.
+
+## Wait guard
+
+The prompt and the default did not change the choice in the incident context. The guard does not make the model choose a persistent monitor either; it refuses the bad forms of waiting. `extension/src/wait-guard.ts` runs before a bash call and blocks it without ending the run when it waits in bash (`sleep N` with N of 10 or more, or a `sleep` inside a `while`/`until`/`for` loop body) or detaches a process (a lone `&`, `nohup`, `setsid`, `disown`). Quoted strings, heredoc bodies and comments are ignored. The refusal names the alternative: a persistent monitor, ending the turn, or running in the foreground. Config `waitGuard`, default true; `false` disables it (`mech.wait-guard` in the ablation manifest).
+
+Replay of the incident context (same 10 decision points, k=5 per arm, turn 0 only), PASS / FAIL:
+
+| Arm | PASS / FAIL |
+|---|---:|
+| main | 6/24 |
+| wait guard | 9/24 |
+| `wait_until` alias + guard | 9/22 |
+| default-persistent + new prompt | 5/29 |
+| default-persistent + new prompt + guard | 9/25 |
+
+With the guard, sleep plus detach choices went from 16 to 0, and polls from 3 to 12: the model leaves bash waiting and moves to `task_output`/`task_list`.
+
+Clean-context probes (same model, k=3). Arm C is arm B (default-persistent + new prompt) plus the wait guard.
+
+| Probe | A (main 0.2.4) | B | C |
+|---|---:|---:|---:|
+| `agent-wait-job` | 3/3 | 3/3 | 3/3 |
+| `agent-wait-ready` | 0/3 | 2/3 | 1/3 |
+| long | 2/3 | 3/3 | 3/3 |
+| hour | 3/3 | 3/3 | 2/3 |
+| natural | 2/3 | 2/3 | 2/3 |
+| renew | 2/3 (+1 INVALID) | 1/3 | 2/3 |
+| noise | 2/3 | 3/3 | 2/3 |
+| cleanup | 1/3 | 3/3 | 1/3 |
+| alternative | 1/3 | 1/3 | 2/3 |
+
+- `agent-wait-job`: all nine passed through the bash completion wake.
+- `agent-wait-ready`: readiness came from a persistent monitor in C 3/3. C's two failures: one model overrode the fixture env (`READY_MS=100 SERVER_TOKEN=...`), so the token did not match the smoke output; another, after the guard refused a `for`-loop wait, read the task output file.
+- The eval found that the guard missed `for ... do ... sleep ... done`. That is fixed, and a `sleep` after a loop's `done` is not flagged.
+- The guard did not help `agent-wait-ready` in a clean context (B 2/3, C 1/3). In the incident-context replay PASS went from 6/24 to 9/24, within what k=5 can separate; its measurable effect there is the removal of sleep and detach (16 to 0).
+- C's `monitor-behavior-*` cells come from the first run, before the `for`-loop fix.
+
+Arm C on the other two models (same run as their A and B; `noise` regraded):
+
+| Probe | luna C | terra C |
+|---|---:|---:|
+| `agent-wait-job` | 3/3 | 3/3 |
+| `agent-wait-ready` | 0/3 | 1/3 |
+| long | 3/3 | 3/3 |
+| hour | 1/3 | 3/3 |
+| natural | 2/3 | 3/3 |
+| renew | 0/0 (+3 INVALID) | 3/3 |
+| noise | 3/3 | 3/3 |
+| cleanup | 1/3 | 3/3 |
+| alternative | 0/3 (+2 INVALID) | 3/3 |
+
+All five failed `agent-wait-ready` episodes ended the turn after `run_in_background` with nothing watching; the guard does not see that, because nothing sleeps or detaches.
+
+**Deferred:** the poll guard, which would end a run on `task_output` of a still-running task. A replay count showed 43 trips. `deferred: poll guard (end a run on task_output of a still-running task) | impact: with the wait guard on, waits move to task_output/task_list polling (polls 3 to 12 in replay) | trigger: polling remains the dominant wait pattern in a real session after the wait guard`
 
 ## Harness and grader issues found and fixed during the run
 
