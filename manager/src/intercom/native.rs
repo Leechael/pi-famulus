@@ -140,6 +140,12 @@ fn claude_envelope(from: &str, mode: &str, body: &str) -> Result<String, String>
         escape_envelope_body(body)
     ))
 }
+impl Default for Native {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Native {
     pub fn new() -> Self {
         Self {

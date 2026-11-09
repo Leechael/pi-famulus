@@ -16,19 +16,19 @@ use crate::VERSION;
     args_override_self = false,
     completion
 )]
-pub(crate) struct Cli {
+pub struct Cli {
     /// Base directory (`--home` > `PI_FAMULUS_HOME` > `~/.pi/agent/pi-famulus`).
     #[usage(long, global, display_order = 1)]
-    pub(crate) home: Option<PathBuf>,
+    pub home: Option<PathBuf>,
     /// Never page output (else `PI_FAMULUS_PAGER` / `PAGER` / `less -FRX` on a TTY).
     #[usage(long, global, display_order = 2)]
-    pub(crate) no_pager: bool,
+    pub no_pager: bool,
     #[usage(subcommand)]
-    pub(crate) cmd: Sub,
+    pub cmd: Sub,
 }
 
 #[derive(usage::Subcommands)]
-pub(crate) enum ConfigAction {
+pub enum ConfigAction {
     /// Read a setting.
     Get { key: String },
     /// Persist and immediately apply a setting.
@@ -37,7 +37,7 @@ pub(crate) enum ConfigAction {
 
 impl Sub {
     /// Listings and dumps a person reads; not a follow, not an action.
-    pub(crate) fn pages(&self) -> bool {
+    pub fn pages(&self) -> bool {
         match self {
             Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } | Sub::Stats { .. } => true,
             Sub::Top { json, once, .. } => !crate::top::wants_interactive(*json, *once),
@@ -55,7 +55,7 @@ impl Sub {
 // usage flatten requires CommandArgs, which is not implemented for Box<T>.
 #[allow(clippy::large_enum_variant)]
 #[derive(usage::Subcommands)]
-pub(crate) enum Sub {
+pub enum Sub {
     /// Cross-harness and cross-machine agent intercom client.
     Intercom {
         #[usage(flatten)]

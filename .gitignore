@@ -1,5 +1,6 @@
 # Rust
 manager/target/
+gui/target/
 
 # Node
 extension/node_modules/
@@ -36,3 +37,6 @@ tmp/
 
 # Local git worktrees
 .worktree/
+
+# nsh run / nsh package output
+.nsh/
