@@ -44,9 +44,12 @@ jobs:
     with:
       ref: ${{ inputs.ref || '' }}
       version: ${{ inputs.version || '' }}
-      manager-tests: ${{ needs.pi-matrix.outputs.rust == 'true' }}
-      all-architectures: ${{ github.event_name != 'pull_request' }}
-      packages: ${{ needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true' }}
+      # Nested workflow_call can deliver a boolean comparison as false even
+      # when the output is 'true'. Pass the explicit 'true'/'false' text that
+      # native-packages.yml compares with format('{0}', input) == 'true'.
+      manager-tests: ${{ needs.pi-matrix.outputs.rust }}
+      all-architectures: ${{ github.event_name != 'pull_request' && 'true' || 'false' }}
+      packages: ${{ (needs.pi-matrix.outputs.rust == 'true' || needs.pi-matrix.outputs.extension == 'true') && 'true' || 'false' }}
 
   # Lint gate: clippy warnings fail the build. Each OS compiles its own cfg
   # branches (Unix handover, macOS proc_pidinfo, Windows job objects), so a

@@ -264,8 +264,14 @@ test('CI shares scope, forces explicit build inputs, and gates all expensive job
   for (const combo of combos) {
     const outputs = Object.fromEntries(Object.entries(combo).map(([k, v]) => [k, String(v)]));
     const ctx = { needs: { 'pi-matrix': { outputs } } };
-    assert.equal(evaluate(expression(packages, 'manager-tests'), ctx), combo.rust, `manager-tests ${JSON.stringify(combo)}`);
-    assert.equal(evaluate(expression(packages, 'packages'), ctx), combo.rust || combo.extension, `packages ${JSON.stringify(combo)}`);
+    // Nested workflow_call can drop boolean comparison results. Pass the
+    // explicit 'true'/'false' strings that format('{0}', x) == 'true' accepts.
+    assert.equal(evaluate(expression(packages, 'manager-tests'), ctx), outputs.rust, `manager-tests ${JSON.stringify(combo)}`);
+    assert.equal(
+      evaluate(expression(packages, 'packages'), ctx),
+      combo.rust || combo.extension ? 'true' : 'false',
+      `packages ${JSON.stringify(combo)}`,
+    );
   }
 });
 
@@ -309,7 +315,7 @@ test('required extension check gates every CI family and does not prolong cancel
     const label = JSON.stringify(scope);
     cases.push([`${label}: exactly the selected families ran`, fixture(scope), true]);
     for (const [name, run] of Object.entries(want(scope))) {
-      const rejected = run ? ['failure', 'cancelled', 'skipped'] : ['failure', 'cancelled', 'success'];
+      const rejected = run ? ['failure', 'cancelled', 'skipped', 'abandoned'] : ['failure', 'cancelled', 'success', 'abandoned'];
       for (const result of rejected) {
         const results = fixture(scope);
         results[name].result = result;
@@ -338,6 +344,25 @@ test('required extension check gates every CI family and does not prolong cancel
     results['pi-matrix'] = bad;
     cases.push([`invalid scope ${JSON.stringify(bad)}`, results, false]);
   }
+  // Publish npm packages #47 (42672645648): nested workflow_call reported
+  // selected families as abandoned, so the release gate must stay red.
+  cases.push(['publish 42672645648 abandoned families', {
+    'pi-matrix': {
+      result: 'success',
+      outputs: {
+        matrix: '{"include":[]}',
+        code: 'true',
+        rust: 'true',
+        extension: 'true',
+        eval: 'true',
+      },
+    },
+    'native-packages': { result: 'abandoned', outputs: {} },
+    clippy: { result: 'abandoned', outputs: {} },
+    'extension-compat': { result: 'success', outputs: {} },
+    'extension-windows': { result: 'abandoned', outputs: {} },
+    e2e: { result: 'abandoned', outputs: {} },
+  }, false]);
   for (const [label, results, success] of cases) {
     const result = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], {
       env: { ...process.env, RESULTS: JSON.stringify(results) },
@@ -363,9 +388,9 @@ test('PRs run one architecture per OS; main pushes, dispatches and releases run 
   for (const event of ['pull_request', 'push', 'workflow_dispatch', 'workflow_call', 'schedule']) {
     const pr = event === 'pull_request';
     const allArchitectures = evaluate(all, { github: { event_name: event } });
-    assert.equal(allArchitectures, !pr, event);
-    // The input may arrive as a boolean or a string; the selector gets text.
-    for (const delivered of [allArchitectures, String(allArchitectures)]) {
+    assert.equal(allArchitectures, pr ? 'false' : 'true', event);
+    // workflow_dispatch still sends a boolean; workflow_call now sends text.
+    for (const delivered of [allArchitectures === 'true', allArchitectures]) {
       const text = String(evaluate(selector, { format, inputs: { 'all-architectures': delivered } }));
       const ran = matrix(text).include.map(row => row.platform);
       assert.deepEqual(ran, pr ? ['linux-x64', 'darwin-arm64', 'win32-x64'] : platforms, `${event} (${typeof delivered})`);
@@ -379,6 +404,11 @@ test('PRs run one architecture per OS; main pushes, dispatches and releases run 
 test('package and manager-suite switches honor false whether delivered as a boolean or a string', () => {
   const native = read('.github/workflows/native-packages.yml');
   const format = (template, ...args) => template.replace(/\{(\d+)\}/g, (_, i) => String(args[i]));
+  const call = native.slice(native.indexOf('  workflow_call:'));
+  for (const name of ['manager-tests', 'packages', 'all-architectures']) {
+    const block = call.slice(call.indexOf(`      ${name}:\n`));
+    assert.match(block, /type: string\n        default: 'true'/, `${name} workflow_call input`);
+  }
   for (const [name, input] of [['manager-tests', 'manager-tests'], ['native', 'packages']]) {
     const gate = job(native, name).match(/^    if: (.+)$/m)?.[1];
     assert.ok(gate, `missing gate: ${name}`);
