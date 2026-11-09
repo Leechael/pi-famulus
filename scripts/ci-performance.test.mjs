@@ -74,8 +74,8 @@ test('scope gating never skips the workflow and routes each family by its own ar
   };
   for (const [name, gate] of Object.entries(gates)) assert.ok(job(ci, name).includes(`    ${gate}\n`), name);
   const packages = job(ci, 'native-packages');
-  assert.match(packages, /manager-tests: \$\{\{ needs.pi-matrix.outputs.rust == 'true' \}\}/);
-  assert.match(packages, /packages: \$\{\{ needs.pi-matrix.outputs.rust == 'true' \|\| needs.pi-matrix.outputs.extension == 'true' \}\}/);
+  assert.match(packages, /manager-tests: \$\{\{ needs.pi-matrix.outputs.rust \}\}/);
+  assert.match(packages, /packages: \$\{\{ \(needs.pi-matrix.outputs.rust == 'true' \|\| needs.pi-matrix.outputs.extension == 'true'\) && 'true' \|\| 'false' \}\}/);
   const aggregate = job(ci, 'extension');
   assert.match(aggregate, /if: \$\{\{ !cancelled\(\) \}\}/);
   assert.match(aggregate, /needs: \[pi-matrix, native-packages, clippy, extension-compat, extension-windows, e2e\]/);
