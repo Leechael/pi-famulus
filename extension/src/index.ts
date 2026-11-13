@@ -33,6 +33,7 @@ import { formatDuration, type TaskExitInfo } from "./format";
 import { EXTENSION_VERSION, ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { registerIntercom } from "./intercom/intercom";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
+import { DecisionShadow, decisionLogPath, formatDecisionShadow } from "./decision-model";
 import { admitAgentChild, reregisterAgentLeases } from "./subagent/admission";
 import { attachCompactRecovery, NotifyCenter } from "./notify";
 import { onWakeMessageEnd, registryStatusLookup } from "./wake-delivery";
@@ -173,6 +174,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     describeSearch: () => string;
     getClient: () => ManagerClient | null;
     messagingEnabled: boolean;
+    decisionModel?: () => string;
   } | null = null;
   const nativeRestore: Promise<string | null> = managerPath
     ? Promise.resolve(managerPath)
@@ -620,7 +622,20 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     syncWithManager: () => syncWithManager(),
   };
 
+  // Shadow-mode wake classifier: records judgements only, never gates a wake.
+  const decisionShadow = config.decisionModel?.enabled
+    ? new DecisionShadow({
+      config: config.decisionModel,
+      getRegistry: () => ctx?.modelRegistry ?? null,
+      sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
+      logPath: decisionLogPath(home),
+      clock,
+      logEvent,
+    })
+    : null;
+
   monitorRegistry = new MonitorRegistry({
+    decision: decisionShadow,
     getClient: () => client,
     sessionEnv,
     getNotifyCenter: () => notifyCenter,
@@ -681,6 +696,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     describeSearch: () => describeManagerSearch(config, home),
     getClient: () => client,
     messagingEnabled: false,
+    decisionModel: decisionShadow ? () => formatDecisionShadow(decisionShadow, decisionLogPath(home)) : undefined,
   };
   registerFamulusCommand(pi, famulusInfo);
   monitorRegistry.onChange(() => {
@@ -1379,6 +1395,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
     subagentRegistry = null;
     agentLoader = null;
     monitorRegistry?.disposeAll();
+    decisionShadow?.dispose();
     notifyCenter?.dispose();
     recoveredSessions.clear();
     cleanupSessionSpillFiles();

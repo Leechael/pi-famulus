@@ -8,6 +8,7 @@ import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, win32 } from "node:path";
 import { describeNativeLookup, resolveNativeManagerPath } from "./native-manager.js";
+import { parseDecisionModelConfig, type DecisionModelConfig } from "./decision-model";
 
 export interface FamulusConfig {
   /** Foreground budget for bash before auto-backgrounding (ms). */
@@ -27,6 +28,8 @@ export interface FamulusConfig {
   pollGuard?: boolean;
   /** Optional M3 subagent tuning section (design doc §4.6 limits). */
   subagent?: FamulusSubagentConfig;
+  /** Shadow-mode monitor wake classifier (docs/configuration.md). Off unless enabled is true. */
+  decisionModel?: DecisionModelConfig;
 }
 
 /** Optional `subagent` section of config.json; every field defaults (see resolveSubagentConfig). */
@@ -245,6 +248,8 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
   ) {
     config.logLevel = obj.logLevel;
   }
+  const decisionModel = parseDecisionModelConfig(obj.decisionModel);
+  if (decisionModel) config.decisionModel = decisionModel;
   if (typeof obj.subagent === "object" && obj.subagent !== null) {
     const section = obj.subagent as Record<string, unknown>;
     const subagent: FamulusSubagentConfig = {};
