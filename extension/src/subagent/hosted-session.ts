@@ -34,6 +34,33 @@ interface HostingView {
   sessionId?: string;
 }
 
+/**
+ * One prompt whose turn the parent supervises.
+ *
+ * A prompt is not the same as its RPC acknowledgement: the daemon's cold
+ * `get_state` handshake for a respawned parked child reports `idle` before the
+ * prompt has run, and events may arrive before the RPC response. Completion is
+ * therefore fenced by this turn's own `agent_start`/`agent_settled` lifecycle,
+ * never by transport readiness.
+ */
+interface ActiveTurn {
+  /** Resolves when this prompt's run lifecycle ends (or it was handled). */
+  done: Promise<void>;
+  resolve: () => void;
+  /** The daemon's RPC response for the dispatch was processed. */
+  accepted: boolean;
+  /** `disposition` from that response (`started` | `queued` | `handled`). */
+  disposition: string | undefined;
+  /** A run for this turn is active (observed `agent_start`, or joined live). */
+  sawStart: boolean;
+  /** An `agent_settled` was observed and no newer run started since. */
+  settled: boolean;
+  /** The hosted process reported failure before the turn ended. */
+  processFailed: boolean;
+  /** The prompt was steered into a run already in flight (out-of-band work). */
+  joinedRun: boolean;
+}
+
 export function createHostedSessionFn(deps: HostedSessionDeps): CreateSessionFn {
   return async (req) => {
     const client = deps.getClient();
@@ -104,7 +131,8 @@ class HostedRpcSession implements ChildSessionAdapter {
   private lastFailure: { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   private turns: { role: string; text: string }[] = [];
   private usage: ChildTokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-  private settle: (() => void) | null = null;
+  /** The prompt turn awaiting its own completion; null between turns. */
+  private activeTurn: ActiveTurn | null = null;
   private hostingView: HostingView;
   private disposed = false;
 
@@ -131,10 +159,28 @@ class HostedRpcSession implements ChildSessionAdapter {
   }
 
   async prompt(text: string): Promise<void> {
-    const done = this.armSettle();
-    const op = this.streaming ? "prompt_steer" : "prompt";
-    await this.client.agentInput(this.childId, op, text, "parent");
-    if (!this.streaming) await done;
+    // A run already in flight is not ours: a user/UI attach or a sibling drove
+    // it. Steering delivers this prompt into that run, and its settle is this
+    // turn's completion — returning early would report the child finished while
+    // the run is still executing.
+    const joinedRun = this.streaming;
+    // A new prompt supersedes any turn still armed (defensive: the runner
+    // serializes generations, so this should not happen).
+    if (this.activeTurn) this.finishTurn(this.activeTurn);
+    const turn = this.beginTurn(joinedRun);
+    try {
+      const response = await this.client.agentInput(
+        this.childId,
+        joinedRun ? "prompt_steer" : "prompt",
+        text,
+        "parent",
+      );
+      this.acceptPrompt(turn, response);
+    } catch (err) {
+      this.finishTurn(turn);
+      throw err;
+    }
+    await turn.done;
   }
 
   async steer(text: string): Promise<void> {
@@ -146,10 +192,15 @@ class HostedRpcSession implements ChildSessionAdapter {
   }
 
   async abort(): Promise<void> {
-    await this.client.agentInput(this.childId, "abort", "", "parent");
-    this.streaming = false;
-    this.settle?.();
-    this.settle = null;
+    try {
+      await this.client.agentInput(this.childId, "abort", "", "parent");
+    } finally {
+      // The abort response is sent after the child became idle, so the turn can
+      // end now; its `agent_settled` is already drained or no longer relevant.
+      // A failed abort (dead child) must not leave the turn supervised forever.
+      this.streaming = false;
+      if (this.activeTurn) this.finishTurn(this.activeTurn);
+    }
   }
 
   async park(): Promise<void> {
@@ -158,8 +209,9 @@ class HostedRpcSession implements ChildSessionAdapter {
   }
 
   async waitForIdle(): Promise<void> {
-    if (!this.streaming) return;
-    await this.armSettle();
+    const turn = this.activeTurn;
+    if (!turn || !this.streaming) return;
+    await turn.done;
   }
 
   getLastAssistantText(): string | undefined {
@@ -191,14 +243,71 @@ class HostedRpcSession implements ChildSessionAdapter {
     if (this.disposed) return;
     this.disposed = true;
     this.unsubscribe();
-    this.settle?.();
-    this.settle = null;
+    if (this.activeTurn) this.finishTurn(this.activeTurn);
   }
 
-  private armSettle(): Promise<void> {
-    return new Promise((resolve) => {
-      this.settle = resolve;
+  private beginTurn(joinedRun: boolean): ActiveTurn {
+    let resolve!: () => void;
+    const done = new Promise<void>((res) => {
+      resolve = res;
     });
+    // Failure/result state is turn-scoped: the previous turn's abort error must
+    // not describe this one.
+    this.lastFailure = undefined;
+    const turn: ActiveTurn = {
+      done,
+      resolve,
+      accepted: false,
+      disposition: undefined,
+      sawStart: joinedRun,
+      settled: false,
+      processFailed: false,
+      joinedRun,
+    };
+    this.activeTurn = turn;
+    return turn;
+  }
+
+  /** Apply the prompt RPC's disposition, then wait or finish accordingly. */
+  private acceptPrompt(turn: ActiveTurn, response: Record<string, unknown>): void {
+    if (this.activeTurn !== turn) return;
+    turn.accepted = true;
+    turn.disposition = typeof response.disposition === "string" ? response.disposition : undefined;
+    if (turn.disposition === "handled" && !turn.joinedRun) {
+      // An extension command or input handler consumed the prompt: no run
+      // starts for it, so there is nothing to wait for. A handled prompt that
+      // was steered into a live run still waits for that run to end.
+      this.streaming = false;
+      this.finishTurn(turn);
+      return;
+    }
+    if (turn.disposition === "queued") {
+      // The prompt joined a run that was already streaming (our view said
+      // idle). That run's `agent_settled` is this turn's completion.
+      turn.sawStart = true;
+    }
+    if (turn.processFailed) {
+      this.lastFailure = { stopReason: "error", errorMessage: "hosted child process failed" };
+      this.finishTurn(turn);
+      return;
+    }
+    this.maybeFinishTurn(turn);
+  }
+
+  private maybeFinishTurn(turn: ActiveTurn): void {
+    if (this.activeTurn !== turn || !turn.accepted || !turn.settled) return;
+    // `started` (or a legacy response without a disposition) must have shown a
+    // run start after this turn was armed: a stale `agent_settled` from the
+    // previous generation is not this prompt's completion.
+    if (turn.disposition !== "queued" && !turn.sawStart) return;
+    this.finishTurn(turn);
+  }
+
+  private finishTurn(turn: ActiveTurn): void {
+    if (this.activeTurn !== turn) return;
+    this.activeTurn = null;
+    this.streaming = false;
+    turn.resolve();
   }
 
   private onManagerEvent(event: ManagerEvent & Record<string, unknown>): void {
@@ -213,13 +322,28 @@ class HostedRpcSession implements ChildSessionAdapter {
         sessionId: typeof event.session_id === "string" ? event.session_id : this.hostingView.sessionId,
       };
       if (event.activity === "running") this.streaming = true;
-      if (event.activity === "idle" || event.activity === "failed") {
-        if (event.activity === "failed" && !this.lastFailure) {
-          this.lastFailure = { stopReason: "error", errorMessage: "hosted child process failed" };
-        }
+      if (event.activity === "idle") {
+        // Transport/process readiness, not turn completion: a respawned parked
+        // child reports idle from its cold get_state handshake before the
+        // resumed prompt has run. Completion comes from `agent_settled`.
         this.streaming = false;
-        this.settle?.();
-        this.settle = null;
+        return;
+      }
+      if (event.activity === "failed") {
+        this.streaming = false;
+        // Explicit process failure is a real terminal signal even before the
+        // run starts (the daemon filters stale generations). Before the RPC
+        // response the failure is held on the turn and applied on acceptance,
+        // so an accepted prompt cannot wait forever for a settle that will
+        // never come.
+        const turn = this.activeTurn;
+        if (turn) {
+          turn.processFailed = true;
+          if (turn.accepted) {
+            this.lastFailure = { stopReason: "error", errorMessage: "hosted child process failed" };
+            this.finishTurn(turn);
+          }
+        }
       }
       return;
     }
@@ -239,13 +363,28 @@ class HostedRpcSession implements ChildSessionAdapter {
       isError?: boolean;
     };
     const type = record.type ?? "";
-    if (type === "agent_start") this.streaming = true;
+    if (type === "agent_start") {
+      this.streaming = true;
+      const turn = this.activeTurn;
+      if (turn) {
+        turn.sawStart = true;
+        // A run that starts after a settle means the record was not terminal
+        // for this prompt (Pi is still working), so it cannot close the turn.
+        turn.settled = false;
+      }
+    }
     if (type === "agent_settled") {
       this.streaming = false;
-      this.settle?.();
-      this.settle = null;
+      const turn = this.activeTurn;
+      if (turn) {
+        turn.settled = true;
+        this.maybeFinishTurn(turn);
+      }
     }
-    if (type === "message_end" && record.message?.role === "assistant") {
+    // Content bookkeeping belongs only to work the parent is supervising: a
+    // late record from a drained generation must not rewrite this turn.
+    const owned = this.streaming || this.activeTurn?.sawStart === true;
+    if (owned && type === "message_end" && record.message?.role === "assistant") {
       const text = (record.message.content ?? []).map((part) => part.text ?? "").join("");
       if (text) {
         this.lastText = text;
@@ -271,11 +410,11 @@ class HostedRpcSession implements ChildSessionAdapter {
         this.usage.cacheWrite += num(usage.cacheWrite);
       }
     }
-    if (type === "message_end" && record.message?.role === "user") {
+    if (owned && type === "message_end" && record.message?.role === "user") {
       const text = (record.message.content ?? []).map((part) => part.text ?? "").join("");
       if (text) this.turns.push({ role: "user", text });
     }
-    if (type === "tool_execution_end") {
+    if (owned && type === "tool_execution_end") {
       const name = record.toolName ?? "tool";
       const text = record.args === undefined ? name : `${name} ${JSON.stringify(record.args)}`;
       this.turns.push({

@@ -375,6 +375,21 @@ export class MonitorRegistry {
       }
     } else if (deliver.byteLength > 0) {
       // Legacy manager or unavailable replay metadata: fail open, never hash in JS.
+      // Raw framing accounts for every COMPLETE line through `entry.cursor`. The
+      // manager re-sends records at a cursor it already wrote (`replay_at` in
+      // daemon.rs), so a line delivered raw must count as seen or a burst that
+      // arrived unframed (post-upgrade MonitorState rebuild) repeats its last
+      // line. Complete lines only: a trailing fragment is still framed by the
+      // manager's own finish/EOF line record at the same cursor, and under
+      // wake_on that fragment has not been admitted yet.
+      const lastNewline = deliver.lastIndexOf(0x0a);
+      if (lastNewline >= 0) {
+        const completed = entry.cursor - deliver.byteLength + lastNewline + 1;
+        if (completed > entry.recordCursor) {
+          entry.recordCursor = completed;
+          entry.lastRecordKind = "line";
+        }
+      }
       entry.output.flush();
       const cursorStart = Math.max(previousCursor, entry.cursor - deliver.byteLength);
       const text = deliver.toString("utf8");
