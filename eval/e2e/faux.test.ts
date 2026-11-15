@@ -366,12 +366,24 @@ describe("faux e2e", { concurrency: true }, () => {
   });
 
   it("(b2) a command killed by its own timeout is reported as timed out", async () => {
-    const ep = await runFaux({ script: "bash-timeout.ts", until: (items) => toolResults(items).some((r) => r.toolName === "bash") });
+    const ep = await runFaux({
+      script: "bash-timeout.ts",
+      until: (items) => toolResults(items).some((r) => r.toolName === "bash"),
+      // The episode's own budget is the command's 10s timeout, plus whatever
+      // the sandbox and the shell need on a loaded runner.
+      untilTimeoutMs: 30_000,
+      // The script's sleep is a stand-in workload, not an agent waiting; the
+      // wait guard would refuse it (and a 4s deadline cannot outlast a slow
+      // Windows shell start, so the workload has to be longer than that).
+      famulusConfig: { waitGuard: false },
+    });
     episodes.push(ep);
     const r = toolResults(ep.items).find((x) => x.toolName === "bash");
     assert.ok(r, explain(ep));
     assert.equal(r.isError, true, `killed command reported as success: ${r.text}\n${explain(ep)}`);
-    assert.match(r.text, /started[\s\S]*timed out after 4 seconds/, explain(ep));
+    // The timeout's budget must outlast shell start-up: a deadline the shell
+    // itself cannot meet says nothing about partial output (see the script).
+    assert.match(r.text, /started[\s\S]*timed out after 10 seconds/, explain(ep));
   });
 
   it("(c3) a monitor that prints and exits while the agent is busy: event first, exit starts no turn", async () => {
