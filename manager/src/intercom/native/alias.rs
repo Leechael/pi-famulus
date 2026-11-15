@@ -378,14 +378,20 @@ fn previous_kernel_start(old: &str, current: &str) -> bool {
     if old.is_empty() || current.is_empty() || old == current {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    {
-        old.parse::<u64>().is_ok() && current.parse::<u64>().is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
+    kernel_start_is_newer(old, current)
+}
+
+/// Only Linux exposes a kernel start time (the clock-tick count since boot).
+/// Elsewhere the recorded value is opaque, so a changed one is all we can
+/// read into it.
+#[cfg(all(unix, target_os = "linux"))]
+fn kernel_start_is_newer(old: &str, current: &str) -> bool {
+    old.parse::<u64>().is_ok() && current.parse::<u64>().is_ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn kernel_start_is_newer(_old: &str, _current: &str) -> bool {
+    true
 }
 
 #[cfg(unix)]
