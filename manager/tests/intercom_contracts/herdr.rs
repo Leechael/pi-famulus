@@ -8,6 +8,7 @@ struct Herdr {
     requests: mpsc::Receiver<Value>,
     panes: Arc<std::sync::Mutex<Vec<Value>>>,
     foreground: Arc<std::sync::Mutex<Vec<Value>>>,
+    failing: Arc<std::sync::Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -27,6 +28,8 @@ impl Herdr {
         let listed_panes = panes.clone();
         let foreground = Arc::new(std::sync::Mutex::new(Vec::new()));
         let running = foreground.clone();
+        let failing = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let refused = failing.clone();
         let worker = thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
                 let mut stream = match listener.accept() {
@@ -56,6 +59,12 @@ impl Herdr {
                     continue;
                 };
                 let _ = tx.send(request.clone());
+                let method = request["method"].as_str().unwrap_or_default().to_string();
+                if refused.lock().unwrap().contains(&method) {
+                    let response = json!({"id":request["id"],"error":{"code":"failed","message":format!("fixture refuses {method}")}});
+                    let _ = stream.write_all(format!("{response}\n").as_bytes());
+                    continue;
+                }
                 let result = match request["method"].as_str().unwrap_or_default() {
                     "ping" => json!({"type":"pong","version":"fixture","protocol":5}),
                     "workspace.list" => {
@@ -91,6 +100,7 @@ impl Herdr {
             requests,
             panes,
             foreground,
+            failing,
             stop,
             worker: Some(worker),
         }
@@ -98,6 +108,11 @@ impl Herdr {
 
     fn set_foreground(&self, processes: Vec<Value>) {
         *self.foreground.lock().unwrap() = processes;
+    }
+
+    /// Answer every later request for one of `methods` with an error.
+    fn fail(&self, methods: &[&str]) {
+        *self.failing.lock().unwrap() = methods.iter().map(|m| m.to_string()).collect();
     }
 
     fn set_panes(&self, panes: Vec<Value>) {
@@ -1024,6 +1039,27 @@ fn herdr_session_create_keeps_an_explicit_agent_name_and_refuses_flag_like_names
         json!({"op":"session_create","name":"--dangerously-skip-permissions","cwd":"/fixture/new","agent":"claude","workspace":"ws-one"}),
         "must not start with '-'",
     );
+}
+
+/// `session add` whose agent fails to start leaves no pane behind, and says
+/// so; when the cleanup fails too, the error names the pane left open.
+#[test]
+fn herdr_session_create_closes_its_pane_when_the_agent_fails_to_start() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let mut cli = fixture.connect();
+    let add = json!({"op":"session_create","name":"Broken","cwd":"/fixture/new","agent":"pi","workspace":"ws-one"});
+    herdr.fail(&["agent.start"]);
+    let reply = cli.reject(add.clone(), "closed pane pane-new");
+    assert!(
+        reply["error"].as_str().unwrap().contains("agent.start"),
+        "{reply}"
+    );
+    assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "pane-new");
+    herdr.fail(&["agent.start", "pane.close"]);
+    cli.reject(add, "pane pane-new is left open");
 }
 
 fn probe_pane() -> Value {

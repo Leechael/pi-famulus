@@ -680,7 +680,25 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             if agent.is_empty() {
                 out["session_id"] = json!("");
             } else {
-                let (session, name) = start_agent(rt, req, pane).await?;
+                // A pane whose agent never started is closed again, so a failed
+                // add leaves nothing behind; the error names what happened to it.
+                // deferred: an `agent.start` that timed out although herdr started the agent,
+                // followed by a failed `pane.close` | impact: that agent keeps running in the
+                // pane the error names, and on the relay path the relay_workspaces entry
+                // outlives its workspace | trigger: herdr reports agent start outcomes
+                // idempotently, or such leftovers are seen in use
+                let (session, name) = match start_agent(rt, req, pane).await {
+                    Ok(started) => started,
+                    Err(error) => {
+                        let failed = format!("agent.start failed in new pane {pane}: {error}");
+                        return Err(match quick("pane.close", json!({"pane_id":pane})).await {
+                            Ok(_) => format!("{failed}; closed pane {pane}"),
+                            Err(close) => format!(
+                                "{failed}; closing it failed too ({close}): pane {pane} is left open"
+                            ),
+                        });
+                    }
+                };
                 out["session_id"] = json!(session);
                 out["name"] = json!(name);
             }
