@@ -877,6 +877,11 @@ fn start_session_without_herdr_fails_cleanly_and_records_nothing() {
     )
     .unwrap_err();
     assert!(text.contains("not implemented"), "{text}");
+    assert_eq!(
+        text.matches("not available").count(),
+        1,
+        "the error repeats itself: {text}"
+    );
     let text = call(address, "stop_session", json!({"session":"pane-new"})).unwrap_err();
     assert!(text.contains("not started by this daemon"), "{text}");
     let text = session_status(address, "pane-new").unwrap_err();
@@ -1535,4 +1540,51 @@ fn an_mcp_stop_is_never_relayed_to_another_machine() {
     assert!(!text.contains("relay"), "the stop was relayed: {text}");
     assert!(text.contains("pane-new"), "{text}");
     super::herdr::assert_no_herdr_method(&herdr, &["agent.send_keys", "pane.close"]);
+}
+
+/// The name given to start_session stays a handle for its record once the
+/// registration row is gone, for status and stop alike.
+#[test]
+fn the_start_name_stays_a_handle_after_the_row_is_gone() {
+    let (fixture, address, herdr) = herdr_mcp();
+    let (started, registration) = start_registered_without_pid(&fixture, address, "keeper");
+    assert_eq!(started["id"], "pi/pi-created", "{started}");
+    drop(registration);
+    wait_unlisted(address, "pi/pi-created");
+    let status = session_status(address, "keeper").unwrap();
+    assert_eq!(
+        status["host"], "herdr",
+        "not the recorded session: {status}"
+    );
+    assert_eq!(status["id"], "pi/pi-created", "{status}");
+    let stopped = call(address, "stop_session", json!({"session":"keeper"})).unwrap();
+    assert_eq!(stopped["already_exited"], false, "{stopped}");
+    assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "pane-new");
+}
+
+/// A start name that names more than one session is refused as ambiguous:
+/// two records, or a record and another session's live row.
+#[test]
+fn a_start_name_that_names_more_than_one_session_is_ambiguous() {
+    let (fixture, address, _herdr) = herdr_mcp();
+    let (_, registration) = start_registered_without_pid(&fixture, address, "solo");
+    drop(registration);
+    wait_unlisted(address, "pi/pi-created");
+    // Another session that happens to carry the same name.
+    let mut other = fixture.connect();
+    other.ok(json!({"op":"register","session":{"id":"other","name":"solo","status":"idle"}}));
+    for tool in ["session_status", "stop_session"] {
+        let text = call(address, tool, json!({"session":"solo"})).unwrap_err();
+        assert!(text.contains("ambiguous"), "{tool}: {text}");
+    }
+    drop(other);
+    wait_unlisted(address, "pi/other");
+    // A second session started under the same name.
+    let (_, registration) = start_registered_without_pid(&fixture, address, "solo");
+    drop(registration);
+    wait_unlisted(address, "pi/pi-created");
+    for tool in ["session_status", "stop_session"] {
+        let text = call(address, tool, json!({"session":"solo"})).unwrap_err();
+        assert!(text.contains("ambiguous"), "{tool}: {text}");
+    }
 }

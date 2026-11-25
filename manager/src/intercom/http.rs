@@ -822,11 +822,10 @@ async fn session_status(rt: &Shared, session: &str) -> Result<Value, String> {
         return Err("session required".into());
     }
     let rows = rt.directory().await;
-    let row = find_row(&rows, session);
-    if let Some(index) = find_created(rt, session, row.as_ref().ok().copied()) {
+    if let Some(index) = find_created(rt, &rows, session)? {
         return Ok(created_status(rt, &rows, index).await);
     }
-    let row = row?;
+    let row = find_row(&rows, session)?;
     let id = str_field(row, "id");
     let (state, process) = row_liveness(rt, row).await;
     let mut result = json!({"id":id,"name":str_field(row,"name"),"harness":str_field(row,"harness"),
@@ -932,21 +931,48 @@ impl CreatedSession {
     }
 }
 
-/// The record `handle` names: by its pane id or intercom id, or through
-/// `row` (the directory row `handle` resolves to) when that row is the
-/// recorded session's registration.
-fn find_created(rt: &Shared, handle: &str, row: Option<&Value>) -> Option<usize> {
+/// The record `handle` names: by its pane id or intercom id; by the name it
+/// was started under, which stays a handle after its row is gone unless it
+/// is ambiguous (several records carry it, or a live row of another session
+/// does); or through the directory row `handle` resolves to, when that row is
+/// the recorded session's registration.
+fn find_created(rt: &Shared, rows: &[Value], handle: &str) -> Result<Option<usize>, String> {
     let state = rt.state.lock().unwrap();
     let created = &state.created;
-    created
+    if let Some(index) = created
         .iter()
         .rposition(|c| c.pane == handle || (!c.id.is_empty() && c.id == handle))
-        .or_else(|| {
-            let row = row?;
-            created
+    {
+        return Ok(Some(index));
+    }
+    let named: Vec<usize> = (0..created.len())
+        .filter(|&i| created[i].name == handle)
+        .collect();
+    match named.as_slice() {
+        [] => {}
+        [index] => {
+            let c = &created[*index];
+            if rows
                 .iter()
-                .rposition(|c| c.registration(row, &rt.machine))
-        })
+                .any(|row| str_field(row, "name") == handle && !c.registration(row, &rt.machine))
+            {
+                return Err(format!(
+                    "session name {handle:?} is ambiguous: another session carries it too; use the session id or pane id"
+                ));
+            }
+            return Ok(Some(*index));
+        }
+        _ => {
+            return Err(format!(
+                "session name {handle:?} is ambiguous: several sessions started here carry it; use the session id or pane id"
+            ))
+        }
+    }
+    Ok(find_row(rows, handle).ok().and_then(|row| {
+        created
+            .iter()
+            .rposition(|c| c.registration(row, &rt.machine))
+    }))
 }
 
 /// The state of the recorded session `index`, learning its intercom id and
@@ -1103,8 +1129,10 @@ async fn start_session(rt: &Shared, args: &Value) -> Result<Value, String> {
     super::herdr::call("ping", json!({}), Duration::from_secs(8))
         .await
         .map_err(|e| {
+            // herdr's own error already starts with "herdr not available".
+            let reason = e.strip_prefix("herdr not available: ").unwrap_or(&e);
             format!(
-                "daemon-hosted sessions are not implemented yet, and herdr is not available: {e}"
+                "daemon-hosted sessions are not implemented yet, and herdr is not available: {reason}"
             )
         })?;
     // Creation and its record complete together even if the caller goes
@@ -1153,8 +1181,7 @@ async fn stop_session(rt: &Shared, session: &str) -> Result<Value, String> {
         return Err("session required".into());
     }
     let rows = rt.directory().await;
-    let row = find_row(&rows, session).ok();
-    let Some(index) = find_created(rt, session, row) else {
+    let Some(index) = find_created(rt, &rows, session)? else {
         return Err(format!(
             "session {session:?} was not started by this daemon; stop_session stops only sessions start_session created here"
         ));
@@ -1487,10 +1514,10 @@ fn tools() -> Vec<Value> {
         ("idle_status", "Look up the latest status of an idle notification subscription", &[
             ("subscription_id", "subscription id returned by notify_when_idle", true),
         ]),
-        (SESSION_STATUS, "Report whether a session's process is alive, exited, or unknown to this daemon (no pid, or another machine). Judged from the process, not the advisory registry status. Read-only.", &[
+        (SESSION_STATUS, "Report whether a session's process is alive, exited, or unknown to this daemon (no pid, or another machine); starting only for a session start_session returned before it registered. Judged from the process, not the advisory registry status. Read-only.", &[
             ("session", "session id or unique name", true),
         ]),
-        (START_SESSION, "Experimental: start a pi agent session in a new herdr pane in cwd and track it. Returns its intercom id once it registers; if it has not registered within 10s, state starting with pane_id as the handle for session_status and stop_session.", &[
+        (START_SESSION, "Experimental: start a pi agent session in a new herdr pane in cwd and track it. The call returns once the agent has registered (normally a few seconds), with its intercom id and state alive; only if it has not registered within 10s does it return state starting, with pane_id as the handle. The session id, the pane id and the name given here are handles for session_status and stop_session.", &[
             ("cwd", "existing absolute directory to run the agent in", true),
             ("name", "session name (must not start with '-')", true),
             ("model", "optional model name, passed as --model", false),
