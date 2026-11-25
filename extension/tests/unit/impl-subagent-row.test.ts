@@ -24,7 +24,10 @@ type CallRenderer = NonNullable<typeof callTool.renderCall>;
 
 function callRow(args: Parameters<CallRenderer>[0]) {
   let component: ReturnType<CallRenderer>;
+  // Supply fields required by newer Pi without excess-property errors on 1.0.0.
+  const rendererOptions = { durationMs: undefined, outputPad: 1, keyText: () => "", keyHint: () => "" };
   const context: Parameters<CallRenderer>[2] = {
+    ...rendererOptions,
     args, toolCallId: "call", lastComponent: undefined, state: {}, cwd: "/tmp",
     executionStarted: true, argsComplete: true, isPartial: true,
     expanded: false, showImages: false, isError: false,
