@@ -7,6 +7,9 @@ use std::sync::{mpsc, Arc};
 const FOCUSED_PANE: &str = "w0:p0";
 /// The pid of every stub pane's shell.
 const SHELL_PID: u32 = 4000;
+/// herdr 0.9.5 kept listing an exited pi (agent and agent_session) for
+/// 0.06-0.35s after its pid died; the stub uses the worst case seen.
+const AGENT_REPORT_LAG: Duration = Duration::from_millis(350);
 
 struct Herdr {
     path: PathBuf,
@@ -14,6 +17,8 @@ struct Herdr {
     panes: Arc<std::sync::Mutex<Vec<Value>>>,
     foreground: Arc<std::sync::Mutex<Vec<Value>>>,
     failing: Arc<std::sync::Mutex<Vec<String>>>,
+    /// How long herdr keeps listing an agent after it exits.
+    lag: std::sync::Mutex<Duration>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -132,6 +137,7 @@ impl Herdr {
             panes,
             foreground,
             failing,
+            lag: std::sync::Mutex::new(AGENT_REPORT_LAG),
             stop,
             worker: Some(worker),
         }
@@ -150,6 +156,23 @@ impl Herdr {
 
     fn set_panes(&self, panes: Vec<Value>) {
         *self.panes.lock().unwrap() = panes;
+    }
+
+    /// The agent in the foreground exits, as herdr 0.9.5 reports it: the
+    /// shell has the terminal back at once, but `pane.list` keeps the agent
+    /// and its session for a moment (the lag), then shows `after`.
+    fn agent_exits(&self, after: Vec<Value>) {
+        self.set_foreground(vec![]);
+        let panes = self.panes.clone();
+        let lag = *self.lag.lock().unwrap();
+        thread::spawn(move || {
+            thread::sleep(lag);
+            *panes.lock().unwrap() = after;
+        });
+    }
+
+    fn set_lag(&self, lag: Duration) {
+        *self.lag.lock().unwrap() = lag;
     }
 
     fn request(&self, method: &str) -> Value {
@@ -1120,8 +1143,7 @@ fn rm_while_the_agent_exits(
         );
         drop(plugin);
         fixture.wait_absent("pi/probe");
-        herdr.set_panes(after);
-        herdr.set_foreground(vec![]);
+        herdr.agent_exits(after);
         rm.join().unwrap()
     })
 }
@@ -1238,8 +1260,7 @@ fn herdr_session_rm_by_name_never_acts_on_the_pane_the_name_moved_to() {
         let other = register_in_pane(fixture, "other", "worker", "w1:p7");
         fixture.wait_session("pi/other");
         let shell = json!({"pane_id":"w1:p6","workspace_id":"w1","cwd":"/fixture/new"});
-        herdr.set_panes(vec![shell, other_pane]);
-        herdr.set_foreground(vec![]);
+        herdr.agent_exits(vec![shell, other_pane]);
         (rm.join().unwrap(), other)
     });
     assert_eq!(reply["ok"], true, "{reply}");
@@ -1335,10 +1356,9 @@ fn herdr_session_rm_gives_a_pi_ctrl_d_soon_and_closes_once_it_exits() {
         // the terminal again.
         drop(plugin);
         fixture.wait_absent("pi/probe");
-        herdr.set_panes(vec![
+        herdr.agent_exits(vec![
             json!({"pane_id":"w1:p6","workspace_id":"w1","cwd":"/fixture/new"}),
         ]);
-        herdr.set_foreground(vec![]);
         let exited = Instant::now();
         let reply = rm.join().unwrap();
         assert!(
@@ -1348,6 +1368,26 @@ fn herdr_session_rm_gives_a_pi_ctrl_d_soon_and_closes_once_it_exits() {
         );
         reply
     });
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "w1:p6");
+}
+
+/// herdr still lists the stopped pi after the bounded wait for its report to
+/// clear: the same agent (same session id as before the keys) with its shell
+/// back in the foreground is that stale report, and the pane is closed.
+#[test]
+fn herdr_session_rm_closes_a_pane_whose_stale_report_names_the_stopped_agent() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    herdr.set_panes(vec![probe_pane()]);
+    herdr.set_foreground(vec![json!({"pid":4242,"name":"pi"})]);
+    herdr.set_lag(Duration::from_secs(20));
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let plugin = pane_plugin(&fixture, "probe", "w1:p6");
+    fixture.wait_session("pi/probe");
+    let shell = json!({"pane_id":"w1:p6","workspace_id":"w1","cwd":"/fixture/new"});
+    let reply = rm_while_the_agent_exits(&fixture, &herdr, plugin, "pi/probe", vec![shell]);
     assert_eq!(reply["ok"], true, "{reply}");
     assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "w1:p6");
 }

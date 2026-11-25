@@ -460,6 +460,7 @@ async fn pane_after_stop(
     target: &str,
     relay: bool,
     pane: &str,
+    stopped: &[String],
     done: &str,
 ) -> Result<Option<String>, String> {
     // The target counts only while it still resolves to the pane that was
@@ -482,6 +483,10 @@ async fn pane_after_stop(
             }
             Ok(Some(pane.into()))
         }
+        // herdr still names the agent that was stopped (the same session id
+        // as before the keys) while the shell has the terminal again: a stale
+        // report of that agent, not another one.
+        Some(p) if same_agent(p, stopped) && !pane_busy(pane).await => Ok(Some(pane.into())),
         Some(_) => Err(format!(
             "{done}, but pane {pane} now hosts another agent; left it open ({error})"
         )),
@@ -489,6 +494,34 @@ async fn pane_after_stop(
 }
 fn hosts_agent(pane: &Value) -> bool {
     !native_ids(pane).is_empty() || !str_field(pane, "agent").is_empty()
+}
+/// Whether herdr identifies the agent in `pane` as one of `stopped`, the
+/// session ids it reported for the pane before the stop.
+fn same_agent(pane: &Value, stopped: &[String]) -> bool {
+    native_ids(pane).iter().any(|id| stopped.contains(id))
+}
+/// herdr 0.9.5 kept listing an exited pi (`agent` and `agent_session`) for
+/// 0.06-0.35s after its pid died, while its shell already had the terminal.
+/// After the agent exits, `session rm` waits this long, about six times the
+/// worst lag seen, for the report to clear before judging the pane.
+const AGENT_REPORT_CLEAR: Duration = Duration::from_secs(2);
+/// Waits, up to [`AGENT_REPORT_CLEAR`], until herdr no longer lists an agent
+/// in `pane` (or the pane is gone, or herdr cannot be asked).
+async fn wait_report_cleared(pane: &str) {
+    let deadline = tokio::time::Instant::now() + AGENT_REPORT_CLEAR;
+    loop {
+        match panes().await {
+            Ok(listed) => match listed.iter().find(|p| str_field(p, "pane_id") == pane) {
+                Some(p) if hosts_agent(p) => {}
+                _ => return,
+            },
+            Err(_) => return,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 /// Whether the user may be working in `pane`: something other than its
 /// shell has the terminal, or herdr cannot say.
@@ -787,23 +820,27 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             // pi does not exit on one ctrl+c (herdr 0.9.5 with pi 1.5.2: still
             // running 3s later) and exits on ctrl+d in about 0.06s, so a pi gets
             // its ctrl+d after a short wait; other agents keep the long one.
-            let first_wait = match panes().await {
-                Ok(listed)
-                    if listed.iter().any(|p| {
-                        str_field(p, "pane_id") == pane && str_field(p, "agent") == "pi"
-                    }) =>
-                {
-                    PI_CTRL_C_WAIT_SECS
-                }
-                _ => CTRL_C_WAIT_SECS,
+            // The identity herdr reports for the agent being stopped, taken
+            // before any key, so a stale report of it can be told from another
+            // agent afterwards.
+            let listed = panes().await.unwrap_or_default();
+            let before = listed.iter().find(|p| str_field(p, "pane_id") == pane);
+            let stopped = before.map(native_ids).unwrap_or_default();
+            let first_wait = if before.is_some_and(|p| str_field(p, "agent") == "pi") {
+                PI_CTRL_C_WAIT_SECS
+            } else {
+                CTRL_C_WAIT_SECS
             };
             let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+c"]})).await;
             let mut done = format!("sent ctrl+c to pane {pane}");
-            if !wait_exited(&pane, first_wait).await {
+            let mut exited = wait_exited(&pane, first_wait).await;
+            if !exited {
                 // The user may have reassigned the pane during the wait.
                 // Revalidate before every later destructive operation rather
                 // than sending ctrl+d or closing a shell/new agent.
-                let Some(current) = pane_after_stop(rt, target, relay, &pane, &done).await? else {
+                let Some(current) =
+                    pane_after_stop(rt, target, relay, &pane, &stopped, &done).await?
+                else {
                     return Ok(json!({}));
                 };
                 let _ = quick(
@@ -812,9 +849,14 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 )
                 .await;
                 done.push_str(" and ctrl+d");
-                wait_exited(&current, 5).await;
+                exited = wait_exited(&current, 5).await;
             }
-            if let Some(current) = pane_after_stop(rt, target, relay, &pane, &done).await? {
+            if exited {
+                wait_report_cleared(&pane).await;
+            }
+            if let Some(current) =
+                pane_after_stop(rt, target, relay, &pane, &stopped, &done).await?
+            {
                 quick("pane.close", json!({"pane_id":current}))
                     .await
                     .map_err(|e| format!("{done}, then pane.close failed: {e}"))?;
