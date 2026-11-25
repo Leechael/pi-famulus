@@ -28,9 +28,7 @@ describe("tool rows stay within width without pi-tui", () => {
     setPiTuiForTests(null);
     const tool = createMonitorTool(new MonitorRegistry({} as never));
     const desc = `watch ${"宽".repeat(40)} ${"x".repeat(80)}`;
-    const component = tool.renderCall!({ command: "true", description: desc }, theme as never, {} as never) as {
-      render: (width: number) => string[];
-    };
+    const component = tool.renderCall!({ command: "true", description: desc }, theme as never, {} as never);
     const lines = component.render(40);
     expect(lines.length).toBeGreaterThan(0);
     for (const line of lines) {
