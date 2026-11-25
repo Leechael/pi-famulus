@@ -21,6 +21,7 @@ import { realClock, type Clock, type ClockTimer } from "../clock";
 
 import type { NotifyCenter } from "../notify";
 import { statusGlyph, toolComponent } from "../tui/tool-component";
+import { truncateToWidth } from "../tui/pi-tui-load";
 import { scrubTty } from "../tui/conversation-view";
 import type { WorkIndex } from "../work-index";
 import { fill, PROMPTS } from "../prompts.generated";
@@ -732,6 +733,42 @@ export function createSubagentTool(
     promptSnippet: PROMPTS["tools.subagent.snippet"],
     promptGuidelines: [...PROMPTS["tools.subagent.rules"]],
     parameters: subagentParameters,
+    renderCall(args, theme, context) {
+      const summary: string[] = [];
+      if (typeof args?.action === "string" && /^[a-z]+$/.test(args.action)) summary.push(args.action);
+      if (Array.isArray(args?.tasks)) summary.push(`${args.tasks.length} ${args.tasks.length === 1 ? "task" : "tasks"}`);
+      if (Array.isArray(args?.chain)) summary.push(`chain · ${args.chain.length} ${args.chain.length === 1 ? "step" : "steps"}`);
+      if (typeof args?.concurrency === "number") summary.push(`concurrency ${args.concurrency}`);
+
+      const state = context.state as { callHeader?: { piExpanded: boolean; expanded: boolean } };
+      // When Pi changes its expansion state (e.g. Ctrl+O), drop the local override.
+      if (state.callHeader?.piExpanded !== context.expanded) {
+        state.callHeader = { piExpanded: context.expanded, expanded: context.expanded };
+      }
+      const callHeader = state.callHeader;
+      const expanded = callHeader.expanded;
+      const title = `${theme.fg("muted", expanded ? "▾" : "▸")} ${theme.fg("toolTitle", theme.bold("subagent"))}`;
+      const header = [title, ...summary.map((part) => theme.fg("muted", part))].join(" · ");
+      const body = expanded ? toolComponent(
+        // JSON quotes C0 controls; escape DEL and C1 controls too before sending to the terminal.
+        JSON.stringify(args ?? {}, null, 2).replace(/[\u007f-\u009f]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`)
+          .split("\n").map((line) => theme.fg("muted", line)),
+      ) : undefined;
+      return {
+        render(width) {
+          return [truncateToWidth(header, width), ...(body?.render(width) ?? [])];
+        },
+        invalidate() {},
+        handleMouse(event) {
+          if (event.type !== "click" || event.button !== "left") return undefined;
+          // Pi's default click is gated on having a result. Consume the click
+          // here so it toggles only the arguments, even while the call is running.
+          callHeader.expanded = !expanded;
+          context.invalidate();
+          return { handled: true };
+        },
+      };
+    },
     renderResult(result, { expanded }, theme, context) {
       const details = result.details as { run_id?: string; status?: string } | undefined;
       const record = details?.run_id ? deps.getRegistry()?.get(details.run_id) : undefined;
