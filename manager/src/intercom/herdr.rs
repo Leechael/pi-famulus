@@ -399,13 +399,17 @@ async fn start_agent(rt: &Runtime, req: &Value, pane: &str) -> Result<(String, S
     )
     .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Only a local registration of the agent kind just started can be it: a
+    // row from another machine may carry the same pane id.
+    let started = |r: &Value| {
+        let owner = str_field(r, "machine_id");
+        (owner.is_empty() || owner == rt.machine)
+            && str_field(r, "harness") == str_field(req, "agent")
+            && str_field(r, "herdr_pane_id") == pane
+            && str_field(r, "id") != pane
+    };
     while tokio::time::Instant::now() < deadline {
-        if let Some(row) = rt
-            .directory()
-            .await
-            .iter()
-            .find(|r| str_field(r, "herdr_pane_id") == pane && str_field(r, "id") != pane)
-        {
+        if let Some(row) = rt.directory().await.iter().find(|r| started(r)) {
             return Ok((str_field(row, "id").into(), str_field(row, "name").into()));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
