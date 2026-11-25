@@ -3,6 +3,11 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
+/// The pane herdr answers `pane.process_info` for when no `pane_id` is given.
+const FOCUSED_PANE: &str = "w0:p0";
+/// The pid of every stub pane's shell.
+const SHELL_PID: u32 = 4000;
+
 struct Herdr {
     path: PathBuf,
     requests: mpsc::Receiver<Value>,
@@ -26,7 +31,7 @@ impl Herdr {
             json!({"pane_id":"pane-new","workspace_id":"ws-one","cwd":"/fixture/new","label":"Created Pi","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-created"}}),
         ]));
         let listed_panes = panes.clone();
-        let foreground = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let foreground = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let running = foreground.clone();
         let failing = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let refused = failing.clone();
@@ -80,8 +85,34 @@ impl Herdr {
                         json!({"type":"tab_created","root_pane":{"pane_id":"pane-new","workspace_id":"ws-one","cwd":"/fixture/new"}})
                     }
                     "agent.read" => json!({"type":"pane_read","read":{"text":"pane output\n世界"}}),
+                    // As herdr 0.9.5 does: only `pane_id` selects the pane;
+                    // without it the answer is for the focused pane. An idle
+                    // shell lists itself, and the terminal's foreground group
+                    // is then the shell's own; a job in the foreground (the
+                    // `set_foreground` processes) takes the group over.
                     "pane.process_info" => {
-                        json!({"type":"process_info","process_info":{"pane_id":"pane-one","foreground_processes":*running.lock().unwrap()}})
+                        let asked = request["params"]["pane_id"].as_str();
+                        let pane = asked.unwrap_or(FOCUSED_PANE);
+                        let known = pane == FOCUSED_PANE
+                            || listed_panes
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .any(|p| p["pane_id"] == pane);
+                        if !known {
+                            let response = json!({"id":request["id"],"error":{"code":"pane_not_found","message":format!("pane {pane} not found")}});
+                            let _ = stream.write_all(format!("{response}\n").as_bytes());
+                            continue;
+                        }
+                        let running = running.lock().unwrap().clone();
+                        let shell = json!({"pid":SHELL_PID,"name":"zsh","argv":["/usr/bin/zsh"]});
+                        let (processes, group) = if asked.is_none() || running.is_empty() {
+                            (vec![shell], json!(SHELL_PID))
+                        } else {
+                            let group = running[0]["pid"].clone();
+                            (running, group)
+                        };
+                        json!({"type":"process_info","process_info":{"pane_id":pane,"shell_pid":SHELL_PID,"foreground_process_group_id":group,"foreground_processes":processes}})
                     }
                     "workspace.close" | "pane.close" | "agent.start" | "agent.prompt"
                     | "agent.send_keys" | "agent.wait" => json!({"type":"ok"}),
@@ -106,6 +137,8 @@ impl Herdr {
         }
     }
 
+    /// The processes in the foreground of a pane `process_info` is asked
+    /// about; empty means the pane's shell has the terminal (idle).
     fn set_foreground(&self, processes: Vec<Value>) {
         *self.foreground.lock().unwrap() = processes;
     }
@@ -1262,4 +1295,59 @@ fn herdr_session_rm_leaves_a_pane_with_a_foreground_process_open() {
         "{reply}"
     );
     assert_no_herdr_method(&herdr, &["agent.send_keys", "pane.close"]);
+}
+
+/// pi does not exit on one ctrl+c (herdr 0.9.5 with pi 1.5.2: still running
+/// 3s later) but exits on ctrl+d in about 0.06s. `session rm` sends a pi its
+/// ctrl+d after a short wait, and closes the pane as soon as pi is gone.
+#[test]
+fn herdr_session_rm_gives_a_pi_ctrl_d_soon_and_closes_once_it_exits() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    herdr.set_panes(vec![probe_pane()]);
+    herdr.set_foreground(vec![json!({"pid":4242,"name":"pi"})]);
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let plugin = pane_plugin(&fixture, "probe", "w1:p6");
+    fixture.wait_session("pi/probe");
+    let fixture = &fixture;
+    let reply = std::thread::scope(|scope| {
+        let rm = scope.spawn(move || {
+            fixture
+                .connect()
+                .call(json!({"op":"session_close","to":"pi/probe"}))
+        });
+        assert_eq!(
+            herdr.request("agent.send_keys")["params"],
+            json!({"target":"w1:p6","keys":["ctrl+c"]})
+        );
+        let after_ctrl_c = Instant::now();
+        assert_eq!(
+            herdr.request("agent.send_keys")["params"],
+            json!({"target":"w1:p6","keys":["ctrl+d"]})
+        );
+        let waited = after_ctrl_c.elapsed();
+        assert!(
+            waited < Duration::from_secs(6),
+            "ctrl+d came {waited:?} after ctrl+c"
+        );
+        // pi exits on the ctrl+d: its registration drops and its shell has
+        // the terminal again.
+        drop(plugin);
+        fixture.wait_absent("pi/probe");
+        herdr.set_panes(vec![
+            json!({"pane_id":"w1:p6","workspace_id":"w1","cwd":"/fixture/new"}),
+        ]);
+        herdr.set_foreground(vec![]);
+        let exited = Instant::now();
+        let reply = rm.join().unwrap();
+        assert!(
+            exited.elapsed() < Duration::from_secs(3),
+            "session rm took {:?} to notice that pi exited",
+            exited.elapsed()
+        );
+        reply
+    });
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "w1:p6");
 }

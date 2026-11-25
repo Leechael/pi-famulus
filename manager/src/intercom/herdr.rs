@@ -193,7 +193,7 @@ async fn overlay_at(
         if let Ok(result) = call_at(
             path,
             "pane.process_info",
-            json!({"target":pane["pane_id"]}),
+            json!({"pane_id":pane["pane_id"]}),
             remaining(),
         )
         .await
@@ -320,7 +320,7 @@ async fn revalidate_pane(row: &Value, pane_id: &str) -> Result<(), String> {
         ));
     }
     if str_field(row, "harness") == "claude" && row["pid"].as_u64().unwrap_or(0) > 0 {
-        if let Ok(result) = quick("pane.process_info", json!({"target": pane_id})).await {
+        if let Ok(result) = quick("pane.process_info", json!({ "pane_id": pane_id })).await {
             if result["process_info"]["foreground_processes"]
                 .as_array()
                 .into_iter()
@@ -412,20 +412,43 @@ async fn start_agent(rt: &Runtime, req: &Value, pane: &str) -> Result<(String, S
     }
     Ok((pane.into(), str_field(req, "name").into()))
 }
+/// Whether `pane`'s own shell has its terminal back: herdr's
+/// `pane.process_info` names the terminal's foreground process group, which
+/// is the shell's own group (`shell_pid`) exactly when nothing else runs in
+/// the foreground; any foreground job, an agent included, takes the group
+/// over. herdr 0.9.5 lists an idle shell itself as a foreground process, so
+/// the process list alone cannot tell idle from busy. `None` when herdr does
+/// not say.
+fn shell_has_terminal(process_info: &Value) -> Option<bool> {
+    let info = &process_info["process_info"];
+    let shell = info["shell_pid"].as_u64()?;
+    let group = info["foreground_process_group_id"].as_u64()?;
+    Some(shell == group)
+}
+/// `pane.process_info` for `pane`; herdr selects the pane by `pane_id` only
+/// and answers for the focused pane without it.
+async fn process_info(pane: &str) -> Result<Value, String> {
+    quick("pane.process_info", json!({ "pane_id": pane })).await
+}
+/// How long `session rm` waits after ctrl+c before sending ctrl+d: a pi
+/// was still running 3s after one ctrl+c, so waiting longer for it only
+/// delays the stop (the ctrl+c still gets to cancel a turn first).
+const PI_CTRL_C_WAIT_SECS: u64 = 3;
+const CTRL_C_WAIT_SECS: u64 = 10;
+/// Waits up to `seconds` for the agent in `pane` to exit, returning as soon
+/// as the pane's shell has its terminal back (or the pane is gone, or herdr
+/// cannot be asked: later steps check the pane again).
 async fn wait_exited(pane: &str, seconds: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
     loop {
-        match quick("pane.process_info", json!({"target":pane})).await {
-            Ok(r)
-                if r["process_info"]["foreground_processes"]
-                    .as_array()
-                    .is_some_and(|a| !a.is_empty()) => {}
+        match process_info(pane).await {
+            Ok(r) if shell_has_terminal(&r) != Some(true) => {}
             _ => return true,
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 /// The pane `session rm` may still act on after stopping the agent in `pane`.
@@ -467,13 +490,14 @@ async fn pane_after_stop(
 fn hosts_agent(pane: &Value) -> bool {
     !native_ids(pane).is_empty() || !str_field(pane, "agent").is_empty()
 }
-/// Whether the user may be working in `pane`: it runs a foreground process,
-/// or herdr cannot say.
+/// Whether the user may be working in `pane`: something other than its
+/// shell has the terminal, or herdr cannot say.
+// deferred: background jobs of an idle shell | impact: herdr reports only the foreground
+// group, so a pane whose shell has the terminal while it runs `cmd &` reads idle, and closing
+// it ends those jobs | trigger: herdr reports a pane's background jobs, or such a loss is seen
 async fn pane_busy(pane: &str) -> bool {
-    match quick("pane.process_info", json!({ "target": pane })).await {
-        Ok(r) => r["process_info"]["foreground_processes"]
-            .as_array()
-            .is_none_or(|a| !a.is_empty()),
+    match process_info(pane).await {
+        Ok(r) => shell_has_terminal(&r) != Some(true),
         Err(_) => true,
     }
 }
@@ -760,9 +784,22 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             // `run`/`pane_for` to another machine's row by an exact id equal to a pane-id
             // string or by a substring name match, and is then forwarded | trigger: relay
             // frames carry a protocol version the sender can require
+            // pi does not exit on one ctrl+c (herdr 0.9.5 with pi 1.5.2: still
+            // running 3s later) and exits on ctrl+d in about 0.06s, so a pi gets
+            // its ctrl+d after a short wait; other agents keep the long one.
+            let first_wait = match panes().await {
+                Ok(listed)
+                    if listed.iter().any(|p| {
+                        str_field(p, "pane_id") == pane && str_field(p, "agent") == "pi"
+                    }) =>
+                {
+                    PI_CTRL_C_WAIT_SECS
+                }
+                _ => CTRL_C_WAIT_SECS,
+            };
             let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+c"]})).await;
             let mut done = format!("sent ctrl+c to pane {pane}");
-            if !wait_exited(&pane, 10).await {
+            if !wait_exited(&pane, first_wait).await {
                 // The user may have reassigned the pane during the wait.
                 // Revalidate before every later destructive operation rather
                 // than sending ctrl+d or closing a shell/new agent.
@@ -849,6 +886,25 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// herdr 0.9.5 payloads: an idle zsh lists itself; `sleep 300` and pi
+    /// take the foreground group over.
+    #[test]
+    fn a_pane_is_idle_only_while_its_shell_has_the_terminal() {
+        let info = |group: Value, processes: Value| {
+            json!({"process_info":{"pane_id":"w5:p1","shell_pid":768189,
+                "foreground_process_group_id":group,"foreground_processes":processes}})
+        };
+        let idle = info(json!(768189), json!([{"pid":768189,"name":"zsh"}]));
+        assert_eq!(shell_has_terminal(&idle), Some(true));
+        let sleeping = info(json!(768275), json!([{"pid":768275,"name":"sleep"}]));
+        assert_eq!(shell_has_terminal(&sleeping), Some(false));
+        let pi = info(json!(763192), json!([{"pid":763192,"name":"pi"}]));
+        assert_eq!(shell_has_terminal(&pi), Some(false));
+        let unknown = json!({"process_info":{"pane_id":"w5:p1","shell_pid":null,
+            "foreground_process_group_id":768189,"foreground_processes":[]}});
+        assert_eq!(shell_has_terminal(&unknown), None);
+    }
 
     #[tokio::test]
     async fn wedged_herdr_delays_the_directory_overlay_by_at_most_its_budget() {
