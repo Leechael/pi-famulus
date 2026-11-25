@@ -1087,25 +1087,26 @@ async fn created_status(rt: &Shared, rows: &[Value], index: usize) -> Value {
     result
 }
 
-/// A name `start_session` passes to pi: conservative, whatever the agent or
-/// herdr would accept.
-// deferred: names without spaces | impact: none while herdr passes `agent.start` args as an argv
-// (no shell); if herdr ever built a shell line, a name with a space would split into extra
-// arguments | trigger: herdr changes how it launches agents
+/// The longest name herdr accepts for an agent.
+const MAX_SESSION_NAME: usize = 32;
+/// A name `start_session` gives the agent: what herdr 0.9.5 accepts as an
+/// agent name, which it states as "agent name must start with a lowercase
+/// letter and contain only lowercase letters, digits, '-' or '_' (1-32
+/// characters)". herdr refuses anything else with `invalid_agent_name`,
+/// but only after the pane is open. (A name therefore never starts with
+/// `-`, so pi cannot take it for a flag.)
 fn check_session_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("name required".into());
     }
-    if name.starts_with('-') {
-        return Err("name must not start with '-': it is passed to the agent".into());
-    }
-    if name.len() > 64
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c))
+    let mut chars = name.chars();
+    let starts_lowercase = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+    if !starts_lowercase
+        || name.len() > MAX_SESSION_NAME
+        || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_".contains(c))
     {
         return Err(format!(
-            "name {name:?} may use only letters, digits, space, '.', '_' and '-', at most 64"
+            "name {name:?} must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-{MAX_SESSION_NAME} characters), as herdr requires"
         ));
     }
     Ok(())
@@ -1519,7 +1520,7 @@ fn tools() -> Vec<Value> {
         ]),
         (START_SESSION, "Experimental: start a pi agent session in a new herdr pane in cwd and track it. The call returns once the agent has registered (normally a few seconds), with its intercom id and state alive; only if it has not registered within 10s does it return state starting, with pane_id as the handle. The session id, the pane id and the name given here are handles for session_status and stop_session.", &[
             ("cwd", "existing absolute directory to run the agent in", true),
-            ("name", "session name (must not start with '-')", true),
+            ("name", "session name: starts with a lowercase letter, then lowercase letters, digits, '-' or '_'; 1-32 characters", true),
             ("model", "optional model name, passed as --model", false),
         ]),
         (STOP_SESSION, "Experimental: stop a session that start_session created on this daemon, the way `session rm` does. Any other session is refused. Stopping an exited session succeeds.", &[

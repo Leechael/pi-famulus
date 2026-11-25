@@ -998,9 +998,10 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 };
                 // Keys go only to an agent herdr identifies as this session.
                 // deferred: a foreground-process check on `Ours` before ctrl+d and the close |
-                // impact: if herdr keeps reporting the exited pi's agent_session for a moment,
-                // ctrl+d or the close can reach something the user just started in that pane |
-                // trigger: herdr's agent-detection lag is measured against a real herdr
+                // impact: herdr 0.9.5 keeps reporting an exited pi for 0.06-0.35s and the close
+                // waits up to 2s for that report to clear; something the user starts in the
+                // pane within that window can be hit by ctrl+d or the close | trigger: such a
+                // loss is seen, or herdr reports an agent's exit without lag
                 if identified {
                     require_ours(&current, &ids, &done).await?;
                 }

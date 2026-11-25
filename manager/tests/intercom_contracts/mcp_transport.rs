@@ -853,6 +853,19 @@ fn start_session_refuses_bad_input_before_any_herdr_mutation() {
         (json!({"cwd":cwd,"name":"naïve"}), "name"),
         (json!({"cwd":cwd,"name":"$(id)"}), "name"),
         (json!({"cwd":cwd,"name":"x".repeat(65)}), "name"),
+        // Names herdr 0.9.5 refuses with `invalid_agent_name`.
+        (json!({"cwd":cwd,"name":"Upper"}), "lowercase"),
+        (json!({"cwd":cwd,"name":"two words"}), "lowercase"),
+        (json!({"cwd":cwd,"name":"a.b"}), "lowercase"),
+        (json!({"cwd":cwd,"name":"x".repeat(33)}), "32"),
+        (
+            json!({"cwd":cwd,"name":"1abc"}),
+            "start with a lowercase letter",
+        ),
+        (
+            json!({"cwd":cwd,"name":"_x"}),
+            "start with a lowercase letter",
+        ),
         (json!({"name":"w"}), "cwd"),
         (
             json!({"cwd":cwd,"name":"w","args":"--x"}),
