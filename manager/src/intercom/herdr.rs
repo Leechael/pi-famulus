@@ -334,6 +334,12 @@ async fn revalidate_pane(row: &Value, pane_id: &str) -> Result<(), String> {
     }
     Err(format!("pane {pane_id} no longer hosts session {id}"))
 }
+/// Whether `token` has the shape of a raw herdr pane or tab id, which herdr
+/// 0.9.5 writes as `<workspace>:p<n>` / `<workspace>:t<n>` (e.g. `w1Q:p5T`).
+/// The one place to change if herdr's id format changes.
+fn looks_like_pane_id(token: &str) -> bool {
+    token.contains(":p") || token.contains(":t")
+}
 /// A relay peer may only drive panes that host a local agent session; raw pane
 /// ids and Herdr-detected panes without an intercom session are local-only.
 async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, String> {
@@ -355,7 +361,7 @@ async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, Stri
         )),
         Err(error) => {
             if !relay
-                && (token.contains(":p") || token.contains(":t"))
+                && looks_like_pane_id(token)
                 && panes()
                     .await?
                     .iter()
@@ -420,6 +426,55 @@ async fn wait_exited(pane: &str, seconds: u64) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+/// The pane `session rm` may still act on after stopping the agent in `pane`.
+/// An agent that exited took its registration with it, so its id no longer
+/// resolves; its pane is then still ours while it hosts no agent. `None`
+/// means the pane is already gone. Errors say what `done` already did.
+async fn pane_after_stop(
+    rt: &Runtime,
+    target: &str,
+    relay: bool,
+    pane: &str,
+    done: &str,
+) -> Result<Option<String>, String> {
+    // The target counts only while it still resolves to the pane that was
+    // stopped: a name can move to another session in another pane.
+    let error = match pane_for(rt, target, relay).await {
+        Ok(current) if current == pane => return Ok(Some(current)),
+        Ok(other) => format!("{target} now resolves to pane {other}"),
+        Err(error) => error,
+    };
+    let listed = panes()
+        .await
+        .map_err(|e| format!("{done}, then could not list panes: {e}"))?;
+    match listed.iter().find(|p| str_field(p, "pane_id") == pane) {
+        None => Ok(None),
+        Some(p) if !hosts_agent(p) => {
+            if pane_busy(pane).await {
+                return Err(format!(
+                    "{done}; pane {pane} hosts no agent but runs a foreground process; left it open"
+                ));
+            }
+            Ok(Some(pane.into()))
+        }
+        Some(_) => Err(format!(
+            "{done}, but pane {pane} now hosts another agent; left it open ({error})"
+        )),
+    }
+}
+fn hosts_agent(pane: &Value) -> bool {
+    !native_ids(pane).is_empty() || !str_field(pane, "agent").is_empty()
+}
+/// Whether the user may be working in `pane`: it runs a foreground process,
+/// or herdr cannot say.
+async fn pane_busy(pane: &str) -> bool {
+    match quick("pane.process_info", json!({ "target": pane })).await {
+        Ok(r) => r["process_info"]["foreground_processes"]
+            .as_array()
+            .is_none_or(|a| !a.is_empty()),
+        Err(_) => true,
     }
 }
 /// Flags a relay peer may pass to an agent it starts here. Anything else could
@@ -676,21 +731,39 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
         }
         "session_close" => {
             let pane = pane_for(rt, target, relay).await?;
+            // deferred: an identity check for a local `session_close` (the CLI `session rm`,
+            // and every local agent session on the client or manager socket, see port.rs) |
+            // impact: targeting a raw pane id or a stale offline row sends ctrl+c/ctrl+d to and
+            // closes whatever agent or foreground work that pane holds now; relay peers are not
+            // affected, `revalidate_pane` and `pane_after_stop` check their target | trigger:
+            // `session rm` records the identity of agents it starts, or local callers can no
+            // longer target raw pane ids
+            // deferred: identity checks across machines | impact: a target can resolve in
+            // `run`/`pane_for` to another machine's row by an exact id equal to a pane-id
+            // string or by a substring name match, and is then forwarded | trigger: relay
+            // frames carry a protocol version the sender can require
             let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+c"]})).await;
+            let mut done = format!("sent ctrl+c to pane {pane}");
             if !wait_exited(&pane, 10).await {
                 // The user may have reassigned the pane during the wait.
                 // Revalidate before every later destructive operation rather
                 // than sending ctrl+d or closing a shell/new agent.
-                let current = pane_for(rt, target, relay).await?;
+                let Some(current) = pane_after_stop(rt, target, relay, &pane, &done).await? else {
+                    return Ok(json!({}));
+                };
                 let _ = quick(
                     "agent.send_keys",
                     json!({"target":current,"keys":["ctrl+d"]}),
                 )
                 .await;
+                done.push_str(" and ctrl+d");
                 wait_exited(&current, 5).await;
             }
-            let current = pane_for(rt, target, relay).await?;
-            quick("pane.close", json!({"pane_id":current})).await?;
+            if let Some(current) = pane_after_stop(rt, target, relay, &pane, &done).await? {
+                quick("pane.close", json!({"pane_id":current}))
+                    .await
+                    .map_err(|e| format!("{done}, then pane.close failed: {e}"))?;
+            }
             Ok(json!({}))
         }
         "agent_prompt" | "agent_keys" | "agent_read" | "agent_wait" => {
