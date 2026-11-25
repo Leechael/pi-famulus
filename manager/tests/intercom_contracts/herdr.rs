@@ -1391,3 +1391,51 @@ fn herdr_session_rm_closes_a_pane_whose_stale_report_names_the_stopped_agent() {
     assert_eq!(reply["ok"], true, "{reply}");
     assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "w1:p6");
 }
+
+/// The user starts a command in the pane the moment pi exits (seen on real
+/// herdr: `sleep 300` took the foreground 0.01s after pi died, and herdr
+/// kept listing pi while it ran). The pane is left open at once, and the
+/// error says what is true: pi was stopped, something else runs there.
+#[test]
+fn herdr_session_rm_leaves_the_pane_at_once_when_a_command_takes_the_foreground() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    herdr.set_panes(vec![probe_pane()]);
+    herdr.set_foreground(vec![json!({"pid":4242,"name":"pi"})]);
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let plugin = pane_plugin(&fixture, "probe", "w1:p6");
+    fixture.wait_session("pi/probe");
+    let fixture = &fixture;
+    let (reply, after_exit) = std::thread::scope(|scope| {
+        let rm = scope.spawn(move || {
+            fixture
+                .connect()
+                .call(json!({"op":"session_close","to":"pi/probe"}))
+        });
+        herdr.request("agent.send_keys");
+        assert_eq!(
+            herdr.request("agent.send_keys")["params"],
+            json!({"target":"w1:p6","keys":["ctrl+d"]})
+        );
+        // pi exits on the ctrl+d and the user's command takes the terminal;
+        // herdr keeps listing pi meanwhile (the pane list is not changed).
+        drop(plugin);
+        herdr.set_foreground(vec![json!({"pid":5555,"name":"sleep"})]);
+        let exited = Instant::now();
+        fixture.wait_absent("pi/probe");
+        (rm.join().unwrap(), exited.elapsed())
+    });
+    assert_ne!(reply["ok"], true, "{reply}");
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("ctrl+d") && error.contains("foreground"),
+        "{reply}"
+    );
+    assert!(!error.contains("another agent"), "{reply}");
+    assert!(
+        after_exit < Duration::from_secs(2),
+        "decided {after_exit:?} after pi exited"
+    );
+    assert_no_herdr_method(&herdr, &["agent.send_keys", "pane.close"]);
+}

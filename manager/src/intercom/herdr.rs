@@ -435,18 +435,47 @@ async fn process_info(pane: &str) -> Result<Value, String> {
 /// delays the stop (the ctrl+c still gets to cancel a turn first).
 const PI_CTRL_C_WAIT_SECS: u64 = 3;
 const CTRL_C_WAIT_SECS: u64 = 10;
-/// Waits up to `seconds` for the agent in `pane` to exit, returning as soon
-/// as the pane's shell has its terminal back (or the pane is gone, or herdr
-/// cannot be asked: later steps check the pane again).
-async fn wait_exited(pane: &str, seconds: u64) -> bool {
+/// What holds a pane's terminal while `session rm` waits for its agent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Foreground {
+    /// The pane's shell has it back (or the pane is gone, or herdr cannot be
+    /// asked: later steps check the pane again).
+    Shell,
+    /// A process group other than the agent's has it: something the user
+    /// started there. Nothing herdr reports later changes that the pane is
+    /// left open, so this is decided at once.
+    Other,
+    /// The agent (or something herdr cannot tell apart from it) still has it.
+    Agent,
+}
+fn foreground_group(process_info: &Value) -> Option<u64> {
+    process_info["process_info"]["foreground_process_group_id"].as_u64()
+}
+/// The process group in `pane`'s foreground before the stop, when it is not
+/// the shell's: the agent's, to tell it from whatever runs there later.
+async fn agent_group(pane: &str) -> Option<u64> {
+    match process_info(pane).await {
+        Ok(r) if shell_has_terminal(&r) == Some(false) => foreground_group(&r),
+        _ => None,
+    }
+}
+/// Waits up to `seconds` for the agent (process group `agent`, when known)
+/// to leave `pane`'s foreground, returning as soon as it has.
+async fn wait_exited(pane: &str, seconds: u64, agent: Option<u64>) -> Foreground {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
     loop {
         match process_info(pane).await {
-            Ok(r) if shell_has_terminal(&r) != Some(true) => {}
-            _ => return true,
+            Ok(r) => match shell_has_terminal(&r) {
+                Some(true) => return Foreground::Shell,
+                Some(false) if agent.is_some() && foreground_group(&r) != agent => {
+                    return Foreground::Other
+                }
+                _ => {}
+            },
+            Err(_) => return Foreground::Shell,
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return Foreground::Agent;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -461,6 +490,7 @@ async fn pane_after_stop(
     relay: bool,
     pane: &str,
     stopped: &[String],
+    closing: bool,
     done: &str,
 ) -> Result<Option<String>, String> {
     // The target counts only while it still resolves to the pane that was
@@ -484,9 +514,17 @@ async fn pane_after_stop(
             Ok(Some(pane.into()))
         }
         // herdr still names the agent that was stopped (the same session id
-        // as before the keys) while the shell has the terminal again: a stale
-        // report of that agent, not another one.
-        Some(p) if same_agent(p, stopped) && !pane_busy(pane).await => Ok(Some(pane.into())),
+        // as before the keys). Before the close that is the agent itself,
+        // still running; at the close, with the shell in the foreground, it
+        // is a stale report of the agent just stopped.
+        Some(p) if same_agent(p, stopped) => {
+            if closing && pane_busy(pane).await {
+                return Err(format!(
+                    "{done}; pane {pane} runs something other than its shell in the foreground; left it open"
+                ));
+            }
+            Ok(Some(pane.into()))
+        }
         Some(_) => Err(format!(
             "{done}, but pane {pane} now hosts another agent; left it open ({error})"
         )),
@@ -506,7 +544,9 @@ fn same_agent(pane: &Value, stopped: &[String]) -> bool {
 /// worst lag seen, for the report to clear before judging the pane.
 const AGENT_REPORT_CLEAR: Duration = Duration::from_secs(2);
 /// Waits, up to [`AGENT_REPORT_CLEAR`], until herdr no longer lists an agent
-/// in `pane` (or the pane is gone, or herdr cannot be asked).
+/// in `pane` (or the pane is gone, or herdr cannot be asked). Called only
+/// once the shell has the terminal back. The wait can change the outcome:
+/// within it the stale report may clear, or another agent may replace it.
 async fn wait_report_cleared(pane: &str) {
     let deadline = tokio::time::Instant::now() + AGENT_REPORT_CLEAR;
     loop {
@@ -826,6 +866,7 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             let listed = panes().await.unwrap_or_default();
             let before = listed.iter().find(|p| str_field(p, "pane_id") == pane);
             let stopped = before.map(native_ids).unwrap_or_default();
+            let agent = agent_group(&pane).await;
             let first_wait = if before.is_some_and(|p| str_field(p, "agent") == "pi") {
                 PI_CTRL_C_WAIT_SECS
             } else {
@@ -833,13 +874,13 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             };
             let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+c"]})).await;
             let mut done = format!("sent ctrl+c to pane {pane}");
-            let mut exited = wait_exited(&pane, first_wait).await;
-            if !exited {
+            let mut held = wait_exited(&pane, first_wait, agent).await;
+            if held == Foreground::Agent {
                 // The user may have reassigned the pane during the wait.
                 // Revalidate before every later destructive operation rather
                 // than sending ctrl+d or closing a shell/new agent.
                 let Some(current) =
-                    pane_after_stop(rt, target, relay, &pane, &stopped, &done).await?
+                    pane_after_stop(rt, target, relay, &pane, &stopped, false, &done).await?
                 else {
                     return Ok(json!({}));
                 };
@@ -849,13 +890,23 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 )
                 .await;
                 done.push_str(" and ctrl+d");
-                exited = wait_exited(&current, 5).await;
+                held = wait_exited(&current, 5, agent).await;
             }
-            if exited {
-                wait_report_cleared(&pane).await;
+            match held {
+                Foreground::Other => {
+                    return Err(format!(
+                        "{done}; the agent left pane {pane}, but something else now runs in its foreground; left it open"
+                    ))
+                }
+                Foreground::Shell => wait_report_cleared(&pane).await,
+                Foreground::Agent => {}
             }
+            // Worst case for a pi: 3s after ctrl+c, 5s after ctrl+d, then up to
+            // 2s while herdr still lists an agent (10s), plus the herdr
+            // requests; 17s for other agents. A command that takes the
+            // foreground ends the waiting at once.
             if let Some(current) =
-                pane_after_stop(rt, target, relay, &pane, &stopped, &done).await?
+                pane_after_stop(rt, target, relay, &pane, &stopped, true, &done).await?
             {
                 quick("pane.close", json!({"pane_id":current}))
                     .await
