@@ -11,9 +11,9 @@ const SHELL_PID: u32 = 4000;
 /// 0.06-0.35s after its pid died; the stub uses the worst case seen.
 const AGENT_REPORT_LAG: Duration = Duration::from_millis(350);
 
-struct Herdr {
-    path: PathBuf,
-    requests: mpsc::Receiver<Value>,
+pub(super) struct Herdr {
+    pub(super) path: PathBuf,
+    pub(super) requests: mpsc::Receiver<Value>,
     panes: Arc<std::sync::Mutex<Vec<Value>>>,
     foreground: Arc<std::sync::Mutex<Vec<Value>>>,
     failing: Arc<std::sync::Mutex<Vec<String>>>,
@@ -24,7 +24,7 @@ struct Herdr {
 }
 
 impl Herdr {
-    fn new(fixture: &Fixture) -> Self {
+    pub(super) fn new(fixture: &Fixture) -> Self {
         let path = fixture.root.join("herdr.sock");
         let listener = common::bind_private_unix(&path);
         listener.set_nonblocking(true).unwrap();
@@ -145,16 +145,26 @@ impl Herdr {
 
     /// The processes in the foreground of a pane `process_info` is asked
     /// about; empty means the pane's shell has the terminal (idle).
-    fn set_foreground(&self, processes: Vec<Value>) {
+    pub(super) fn set_foreground(&self, processes: Vec<Value>) {
         *self.foreground.lock().unwrap() = processes;
     }
 
+    /// Forget the requests received so far (e.g. the daemon's own startup
+    /// `ping` from `status`), so a later assertion sees only what follows.
+    pub(super) fn drain(&self) {
+        while self
+            .requests
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok()
+        {}
+    }
+
     /// Answer every later request for one of `methods` with an error.
-    fn fail(&self, methods: &[&str]) {
+    pub(super) fn fail(&self, methods: &[&str]) {
         *self.failing.lock().unwrap() = methods.iter().map(|m| m.to_string()).collect();
     }
 
-    fn set_panes(&self, panes: Vec<Value>) {
+    pub(super) fn set_panes(&self, panes: Vec<Value>) {
         *self.panes.lock().unwrap() = panes;
     }
 
@@ -175,7 +185,7 @@ impl Herdr {
         *self.lag.lock().unwrap() = lag;
     }
 
-    fn request(&self, method: &str) -> Value {
+    pub(super) fn request(&self, method: &str) -> Value {
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
         loop {
             let request = self
@@ -1149,7 +1159,7 @@ fn rm_while_the_agent_exits(
 }
 
 /// Assert no request with any of `methods` reaches Herdr within the window.
-fn assert_no_herdr_method(herdr: &Herdr, methods: &[&str]) {
+pub(super) fn assert_no_herdr_method(herdr: &Herdr, methods: &[&str]) {
     let deadline = Instant::now() + Duration::from_millis(500);
     while let Ok(request) = herdr
         .requests

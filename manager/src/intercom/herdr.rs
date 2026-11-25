@@ -572,15 +572,88 @@ async fn wait_report_cleared(pane: &str) {
 // deferred: background jobs of an idle shell | impact: herdr reports only the foreground
 // group, so a pane whose shell has the terminal while it runs `cmd &` reads idle, and closing
 // it ends those jobs | trigger: herdr reports a pane's background jobs, or such a loss is seen
-async fn pane_busy(pane: &str) -> bool {
+pub(super) async fn pane_busy(pane: &str) -> bool {
     match process_info(pane).await {
         Ok(r) => shell_has_terminal(&r) != Some(true),
         Err(_) => true,
     }
 }
+/// What a pane holds, judged against the session ids `ids` a caller knows
+/// for its agent. Only herdr's own identification of the agent counts: a
+/// registration row's `herdr_pane_id` is an environment variable of the
+/// registering process, not a fact about the pane.
+#[derive(Debug, PartialEq)]
+pub(super) enum PaneView {
+    Gone,
+    /// Hosts no agent.
+    Vacant,
+    /// Hosts an agent herdr identifies as one of `ids`.
+    Ours,
+    /// Hosts an agent herdr identifies as someone else, or not a pi.
+    Foreign,
+    /// Hosts a pi agent herdr has not identified.
+    Unidentified,
+}
+pub(super) async fn view_pane(pane: &str, ids: &[String]) -> Result<PaneView, String> {
+    let listed = panes().await?;
+    let Some(p) = listed.iter().find(|p| str_field(p, "pane_id") == pane) else {
+        return Ok(PaneView::Gone);
+    };
+    Ok(classify(p, ids))
+}
+fn classify(p: &Value, ids: &[String]) -> PaneView {
+    let native = native_ids(p);
+    if !native.is_empty() {
+        return if native.iter().any(|id| ids.contains(id)) {
+            PaneView::Ours
+        } else {
+            PaneView::Foreign
+        };
+    }
+    match str_field(p, "agent") {
+        "" => PaneView::Vacant,
+        "pi" => PaneView::Unidentified,
+        _ => PaneView::Foreign,
+    }
+}
+/// The session ids herdr reports for the pi agent in `pane`, if any.
+pub(super) async fn pane_pi_ids(pane: &str) -> Result<Vec<String>, String> {
+    Ok(panes()
+        .await?
+        .iter()
+        .find(|p| str_field(p, "pane_id") == pane && str_field(p, "agent") == "pi")
+        .map(native_ids)
+        .unwrap_or_default())
+}
+/// `session_close` for a caller that knows which agent it means (`ids`):
+/// keys go to `pane` only while herdr identifies its agent as one of `ids`.
+async fn require_ours(pane: &str, ids: &[String], done: &str) -> Result<(), String> {
+    match view_pane(pane, ids).await {
+        Ok(PaneView::Ours) => Ok(()),
+        Ok(view) => Err(format!(
+            "{done}; pane {pane} does not host an agent identified as this session ({view:?}); left it untouched"
+        )),
+        Err(e) => Err(format!("{done}; could not list panes ({e}); left pane {pane} untouched")),
+    }
+}
+/// The close at the end of such a stop, which itself just found the pane
+/// `Ours` and sent the keys: the pane may hold that agent still, or nothing
+/// once it exited, but never another agent or the user's running process.
+async fn require_closable(pane: &str, ids: &[String], done: &str) -> Result<(), String> {
+    match view_pane(pane, ids).await {
+        Ok(PaneView::Ours) => Ok(()),
+        Ok(PaneView::Vacant) if !pane_busy(pane).await => Ok(()),
+        Ok(view) => Err(format!(
+            "{done}; pane {pane} now holds {view:?} or a foreground process; left it open"
+        )),
+        Err(e) => Err(format!(
+            "{done}; could not list panes ({e}); left pane {pane} open"
+        )),
+    }
+}
 /// Flags a relay peer may pass to an agent it starts here. Anything else could
 /// disable permission prompts or load peer-chosen code (settings, extensions).
-fn relay_agent_args(args: &Value) -> Result<(), String> {
+pub(super) fn relay_agent_args(args: &Value) -> Result<(), String> {
     let args = match args {
         Value::Null => return Ok(()),
         Value::Array(args) => args,
@@ -611,7 +684,7 @@ fn relay_agent_args(args: &Value) -> Result<(), String> {
     }
     Ok(())
 }
-fn relay_cwd(cwd: &str) -> Result<(), String> {
+pub(super) fn relay_cwd(cwd: &str) -> Result<(), String> {
     let path = std::path::Path::new(cwd);
     if path.is_absolute() && path.is_dir() {
         Ok(())
@@ -645,7 +718,20 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             .map(|r| str_field(r, "machine_id"))
             .unwrap_or("")
     };
-    if !remote.is_empty() && remote != rt.machine {
+    // An identity-checked request (the MCP stop) is judged against this
+    // machine's herdr and never relayed: a peer, perhaps on an older version,
+    // would not check the expectations, and its row may merely share the
+    // target's pane-id string. Asked for another machine explicitly, refuse.
+    let checked = !str_field(req, "expect_pane").is_empty()
+        || req["expect_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty());
+    if checked && !machine.is_empty() && machine != rt.machine {
+        return Err(format!(
+            "an identity-checked {op} is handled only on this machine; refused for {machine}"
+        ));
+    }
+    if !checked && !remote.is_empty() && remote != rt.machine {
         if rt.cfg.remote_messages == "refuse" {
             return Err("cross-machine operation refused: remote_messages=refuse".into());
         }
@@ -784,10 +870,10 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 // A pane whose agent never started is closed again, so a failed
                 // add leaves nothing behind; the error names what happened to it.
                 // deferred: an `agent.start` that timed out although herdr started the agent,
-                // followed by a failed `pane.close` | impact: that agent keeps running in the
-                // pane the error names, and on the relay path the relay_workspaces entry
-                // outlives its workspace | trigger: herdr reports agent start outcomes
-                // idempotently, or such leftovers are seen in use
+                // followed by a failed `pane.close` | impact: that agent runs unrecorded, so MCP
+                // cannot stop it (the error names its pane), and on the relay path the
+                // relay_workspaces entry outlives its workspace | trigger: herdr reports agent
+                // start outcomes idempotently, or such leftovers are seen in use
                 let (session, name) = match start_agent(rt, req, pane).await {
                     Ok(started) => started,
                     Err(error) => {
@@ -850,17 +936,39 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
         }
         "session_close" => {
             let pane = pane_for(rt, target, relay).await?;
-            // deferred: an identity check for a local `session_close` (the CLI `session rm`,
-            // and every local agent session on the client or manager socket, see port.rs) |
-            // impact: targeting a raw pane id or a stale offline row sends ctrl+c/ctrl+d to and
-            // closes whatever agent or foreground work that pane holds now; relay peers are not
-            // affected, `revalidate_pane` and `pane_after_stop` check their target | trigger:
-            // `session rm` records the identity of agents it starts, or local callers can no
-            // longer target raw pane ids
-            // deferred: identity checks across machines | impact: a target can resolve in
-            // `run`/`pane_for` to another machine's row by an exact id equal to a pane-id
-            // string or by a substring name match, and is then forwarded | trigger: relay
-            // frames carry a protocol version the sender can require
+            // A caller that knows the agent's identity (the MCP stop) names
+            // the pane and session ids it expects; every destructive step
+            // below re-checks them right before acting.
+            let expected = str_field(req, "expect_pane");
+            if !expected.is_empty() && pane != expected {
+                return Err(format!(
+                    "session {target} is now in pane {pane}, not {expected}; left it untouched"
+                ));
+            }
+            let ids: Vec<String> = req["expect_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect();
+            // deferred: an identity check for a local `session_close` without expect_ids (the
+            // CLI `session rm`, and every local agent session on the client or manager socket,
+            // see port.rs) | impact: as on main, targeting a raw pane id or a stale offline row
+            // sends ctrl+c/ctrl+d to and closes whatever agent or foreground work that pane
+            // holds now; relay peers are not affected, `revalidate_pane` and `pane_after_stop`
+            // check their target | trigger: `session rm` records the identity of agents it
+            // starts, or local callers can no longer target raw pane ids
+            // deferred: identity checks across machines | impact: for a request without
+            // expect_ids, a target can resolve in `run`/`pane_for` to another machine's row by
+            // an exact id equal to a pane-id string or by a substring name match, and is then
+            // forwarded; a peer on an older version would ignore expect_pane/expect_ids. Since
+            // `run` never relays an identity-checked request, this no longer applies to the MCP
+            // stop | trigger: MCP stops need to reach other machines, or relay frames carry a
+            // protocol version the sender can require
+            let identified = !ids.is_empty();
+            if identified {
+                require_ours(&pane, &ids, "nothing was sent").await?;
+            }
             // pi does not exit on one ctrl+c (herdr 0.9.5 with pi 1.5.2: still
             // running 3s later) and exits on ctrl+d in about 0.06s, so a pi gets
             // its ctrl+d after a short wait; other agents keep the long one.
@@ -888,6 +996,14 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
                 else {
                     return Ok(json!({}));
                 };
+                // Keys go only to an agent herdr identifies as this session.
+                // deferred: a foreground-process check on `Ours` before ctrl+d and the close |
+                // impact: if herdr keeps reporting the exited pi's agent_session for a moment,
+                // ctrl+d or the close can reach something the user just started in that pane |
+                // trigger: herdr's agent-detection lag is measured against a real herdr
+                if identified {
+                    require_ours(&current, &ids, &done).await?;
+                }
                 let _ = quick(
                     "agent.send_keys",
                     json!({"target":current,"keys":["ctrl+d"]}),
@@ -912,6 +1028,9 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             if let Some(current) =
                 pane_after_stop(rt, target, relay, &pane, &stopped, true, &done).await?
             {
+                if identified {
+                    require_closable(&current, &ids, &done).await?;
+                }
                 quick("pane.close", json!({"pane_id":current}))
                     .await
                     .map_err(|e| format!("{done}, then pane.close failed: {e}"))?;
