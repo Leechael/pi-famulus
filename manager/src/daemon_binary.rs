@@ -27,7 +27,8 @@ pub enum DaemonBinary {
 }
 
 /// What a client is told when no manager runs and none may be started.
-pub const NO_DAEMON: &str = "no pi-famulus daemon is running, and this program has no daemon binary to start one";
+pub const NO_DAEMON: &str =
+    "no pi-famulus daemon is running, and this program has no daemon binary to start one";
 
 static DECLARED: Mutex<Option<DaemonBinary>> = Mutex::new(None);
 
@@ -73,7 +74,11 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// File name of the binary in `<home>/bin` and on `PATH`.
-pub const FILE_NAME: &str = if cfg!(windows) { "pi-famulus.exe" } else { "pi-famulus" };
+pub const FILE_NAME: &str = if cfg!(windows) {
+    "pi-famulus.exe"
+} else {
+    "pi-famulus"
+};
 
 /// Where [`find`] looks, in order. Each field is one step of the order the
 /// extension uses (docs/configuration.md, "Manager binary discovery"),
@@ -101,13 +106,21 @@ impl Search {
         let config_path = std::fs::read(home.join("config.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|v| v.get("managerPath").and_then(|p| p.as_str()).map(PathBuf::from))
+            .and_then(|v| {
+                v.get("managerPath")
+                    .and_then(|p| p.as_str())
+                    .map(PathBuf::from)
+            })
             .filter(|p| !p.as_os_str().is_empty());
         let env_path = std::env::var_os("PI_FAMULUS_MANAGER_PATH")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from);
         let path_dirs = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).filter(|d| !d.as_os_str().is_empty()).collect())
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
         Search {
             config_path,
@@ -125,7 +138,12 @@ impl Search {
         out.extend(self.config_path.clone());
         out.extend(self.env_path.clone());
         out.push(self.home_bin.join(FILE_NAME));
-        out.extend(self.path_dirs.iter().chain(&self.fallback_dirs).map(|d| d.join(FILE_NAME)));
+        out.extend(
+            self.path_dirs
+                .iter()
+                .chain(&self.fallback_dirs)
+                .map(|d| d.join(FILE_NAME)),
+        );
         out
     }
 
@@ -136,7 +154,11 @@ impl Search {
     }
 
     fn usable(&self, path: &Path) -> bool {
-        is_executable_file(path) && !self.this_exe.as_deref().is_some_and(|this| same_file(path, this))
+        is_executable_file(path)
+            && !self
+                .this_exe
+                .as_deref()
+                .is_some_and(|this| same_file(path, this))
     }
 }
 
@@ -144,7 +166,10 @@ fn fallback_dirs(home: Option<&OsStr>) -> Vec<PathBuf> {
     if cfg!(windows) {
         return Vec::new();
     }
-    let mut dirs = vec![PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ];
     if let Some(home) = home.filter(|h| !h.is_empty()) {
         dirs.push(Path::new(home).join(".local/bin"));
     }
@@ -181,7 +206,10 @@ mod tests {
     struct Dir(PathBuf);
     impl Dir {
         fn new(name: &str) -> Dir {
-            let path = std::env::temp_dir().join(format!("pi-famulus-daemon-binary-{}-{name}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "pi-famulus-daemon-binary-{}-{name}",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             Dir(path)
@@ -232,13 +260,21 @@ mod tests {
     fn the_binary_is_looked_for_in_the_documented_order() {
         let dir = Dir::new("order");
         let (search, places) = full(&dir);
-        assert_eq!(search.candidates(), places, "config, env, home/bin, PATH in order, fallbacks");
+        assert_eq!(
+            search.candidates(),
+            places,
+            "config, env, home/bin, PATH in order, fallbacks"
+        );
         // Remove the winner each time: the next place in the order answers.
         for (i, place) in places.iter().enumerate() {
             assert_eq!(search.find().as_ref(), Some(place), "step {i}");
             std::fs::remove_file(place).unwrap();
         }
-        assert_eq!(search.find(), None, "nothing left: not found, never a guess");
+        assert_eq!(
+            search.find(),
+            None,
+            "nothing left: not found, never a guess"
+        );
     }
 
     #[test]
@@ -247,9 +283,17 @@ mod tests {
         let (mut search, places) = full(&dir);
         search.config_path = Some(dir.file("config/not-executable"));
         search.env_path = Some(dir.0.join("env"));
-        assert_eq!(search.find().as_ref(), Some(&places[2]), "a plain file and a directory are skipped");
+        assert_eq!(
+            search.find().as_ref(),
+            Some(&places[2]),
+            "a plain file and a directory are skipped"
+        );
         search.env_path = Some(dir.0.join("env/missing"));
-        assert_eq!(search.find().as_ref(), Some(&places[2]), "so is a path that does not exist");
+        assert_eq!(
+            search.find().as_ref(),
+            Some(&places[2]),
+            "so is a path that does not exist"
+        );
     }
 
     #[test]
@@ -262,20 +306,41 @@ mod tests {
         let link = dir.0.join("env/link-to-self");
         std::os::unix::fs::symlink(&places[0], &link).unwrap();
         search.env_path = Some(link);
-        assert_eq!(search.find().as_ref(), Some(&places[2]), "both spellings of this executable are skipped");
+        assert_eq!(
+            search.find().as_ref(),
+            Some(&places[2]),
+            "both spellings of this executable are skipped"
+        );
         for place in &places[2..] {
             std::fs::remove_file(place).unwrap();
         }
-        assert_eq!(search.find(), None, "with only itself to find, nothing is found");
+        assert_eq!(
+            search.find(),
+            None,
+            "with only itself to find, nothing is found"
+        );
 
         // And if a program names itself anyway, the spawn refuses it.
         let this = std::env::current_exe().unwrap();
         let error = executable(Some(DaemonBinary::At(this.clone()))).unwrap_err();
-        assert!(error.contains("is this program, not the pi-famulus daemon binary"), "{error}");
+        assert!(
+            error.contains("is this program, not the pi-famulus daemon binary"),
+            "{error}"
+        );
         let link = dir.0.join("link-to-this-test");
         std::os::unix::fs::symlink(&this, &link).unwrap();
-        assert!(executable(Some(DaemonBinary::At(link))).is_err(), "a symlink to itself is refused too");
-        assert_eq!(executable(Some(DaemonBinary::At(places[1].clone()))).unwrap(), places[1]);
-        assert_eq!(executable(None).unwrap_err(), NO_DAEMON, "nothing declared: nothing to run");
+        assert!(
+            executable(Some(DaemonBinary::At(link))).is_err(),
+            "a symlink to itself is refused too"
+        );
+        assert_eq!(
+            executable(Some(DaemonBinary::At(places[1].clone()))).unwrap(),
+            places[1]
+        );
+        assert_eq!(
+            executable(None).unwrap_err(),
+            NO_DAEMON,
+            "nothing declared: nothing to run"
+        );
     }
 }

@@ -39,10 +39,22 @@ async fn assert_nothing_started(ctl: &mut Controller, home: &Home, why: &str) {
     assert!(!ctl.state().header.live, "{why}: nothing is running");
     // `spawn_daemon` opens manager.log before it launches anything, so its
     // absence shows no start was even attempted.
-    assert!(!home.path.join("manager.log").exists(), "{why}: a daemon start was attempted");
-    assert!(!home.path.join("manager.spawn.lock").exists(), "{why}: the spawn lock was taken");
-    assert!(!home.sock().exists() && home.pidfile_pid().is_none(), "{why}");
-    assert!(daemon_pids_for(&home.path).is_empty(), "{why}: a process was started for this home");
+    assert!(
+        !home.path.join("manager.log").exists(),
+        "{why}: a daemon start was attempted"
+    );
+    assert!(
+        !home.path.join("manager.spawn.lock").exists(),
+        "{why}: the spawn lock was taken"
+    );
+    assert!(
+        !home.sock().exists() && home.pidfile_pid().is_none(),
+        "{why}"
+    );
+    assert!(
+        daemon_pids_for(&home.path).is_empty(),
+        "{why}: a process was started for this home"
+    );
 }
 
 fn live(state: &TopState) -> bool {
@@ -68,7 +80,11 @@ fn a_library_frontend_never_runs_itself_as_the_daemon() {
             drive(&mut ctl, Duration::from_secs(20), live).await,
             "the frontend did not connect to the manager that started later"
         );
-        assert_eq!(ctl.state().header.pid, home.pidfile_pid(), "it shows that manager");
+        assert_eq!(
+            ctl.state().header.pid,
+            home.pidfile_pid(),
+            "it shows that manager"
+        );
         drop(ctl);
 
         // Declaring this very executable is refused, through a symlink too.
@@ -97,9 +113,21 @@ fn a_library_frontend_never_runs_itself_as_the_daemon() {
         let mut second = Controller::start(&home.path, 100, None, None, None);
         assert!(drive(&mut second, Duration::from_secs(20), live).await);
         drive(&mut ctl, Duration::from_secs(2), |_| false).await;
-        assert_eq!(second.state().header.pid, Some(started), "both show the one manager");
-        assert_eq!(home.pidfile_pid(), Some(started), "no successor replaced it");
-        assert_eq!(daemon_pids_for(&home.path), vec![started], "exactly one daemon for the home");
+        assert_eq!(
+            second.state().header.pid,
+            Some(started),
+            "both show the one manager"
+        );
+        assert_eq!(
+            home.pidfile_pid(),
+            Some(started),
+            "no successor replaced it"
+        );
+        assert_eq!(
+            daemon_pids_for(&home.path),
+            vec![started],
+            "exactly one daemon for the home"
+        );
         daemon_binary::declare(None);
     });
 }

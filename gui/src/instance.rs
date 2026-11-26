@@ -49,7 +49,11 @@ pub enum Claim {
 /// The per-user directory of the lock and socket; `None` when the
 /// environment names no place for one.
 pub fn dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
     if cfg!(target_os = "macos") {
         Some(var("HOME")?.join("Library/Caches").join(crate::APP_ID))
     } else if cfg!(windows) {
@@ -68,12 +72,24 @@ pub fn claim(dir: &Path, on_show: impl Fn() + Send + 'static) -> io::Result<Clai
     claim_within(dir, on_show, ANSWER_WAIT)
 }
 
-fn claim_within(dir: &Path, on_show: impl Fn() + Send + 'static, wait: Duration) -> io::Result<Claim> {
+fn claim_within(
+    dir: &Path,
+    on_show: impl Fn() + Send + 'static,
+    wait: Duration,
+) -> io::Result<Claim> {
     create_private_dir(dir)?;
-    let lock = File::options().create(true).truncate(false).write(true).open(dir.join(LOCK_FILE))?;
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_FILE))?;
     match lock.try_lock() {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(Claim::Second { shown: ask_to_show(dir, wait) }),
+        Err(TryLockError::WouldBlock) => {
+            return Ok(Claim::Second {
+                shown: ask_to_show(dir, wait),
+            })
+        }
         Err(TryLockError::Error(e)) => return Err(e),
     }
     #[cfg(unix)]
@@ -151,22 +167,27 @@ mod unix {
         let listener = UnixListener::bind(path)?;
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopped);
-        std::thread::Builder::new().name("single-instance".into()).spawn(move || {
-            for stream in listener.incoming() {
-                if stop.load(Ordering::SeqCst) {
-                    return;
+        std::thread::Builder::new()
+            .name("single-instance".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    let _ = stream.set_read_timeout(Some(IO_WAIT));
+                    let _ = stream.set_write_timeout(Some(IO_WAIT));
+                    let mut request = [0u8; SHOW.len()];
+                    if stream.read_exact(&mut request).is_ok() && request == SHOW {
+                        on_show();
+                        let _ = stream.write_all(SHOWN);
+                    }
                 }
-                let Ok(mut stream) = stream else { continue };
-                let _ = stream.set_read_timeout(Some(IO_WAIT));
-                let _ = stream.set_write_timeout(Some(IO_WAIT));
-                let mut request = [0u8; SHOW.len()];
-                if stream.read_exact(&mut request).is_ok() && request == SHOW {
-                    on_show();
-                    let _ = stream.write_all(SHOWN);
-                }
-            }
-        })?;
-        Ok(Listening { path: path.to_path_buf(), stopped })
+            })?;
+        Ok(Listening {
+            path: path.to_path_buf(),
+            stopped,
+        })
     }
 
     /// Asks the instance listening at `path` to show its window; whether it
@@ -178,7 +199,10 @@ mod unix {
                 let _ = stream.set_read_timeout(Some(IO_WAIT));
                 let _ = stream.set_write_timeout(Some(IO_WAIT));
                 let mut reply = [0u8; SHOWN.len()];
-                if stream.write_all(SHOW).is_ok() && stream.read_exact(&mut reply).is_ok() && reply == SHOWN {
+                if stream.write_all(SHOW).is_ok()
+                    && stream.read_exact(&mut reply).is_ok()
+                    && reply == SHOWN
+                {
                     return true;
                 }
             }
@@ -277,22 +301,41 @@ mod tests {
         for launch in 1..=2 {
             let (never, on_show) = counter();
             match claim(&dir.0, on_show).unwrap() {
-                Claim::Second { shown } => assert!(shown, "the first instance confirmed the request"),
-                Claim::First(_) => panic!("launch {launch} became a second instance beside the first"),
+                Claim::Second { shown } => {
+                    assert!(shown, "the first instance confirmed the request")
+                }
+                Claim::First(_) => {
+                    panic!("launch {launch} became a second instance beside the first")
+                }
             }
-            assert_eq!(shows.load(Ordering::SeqCst), launch, "the first instance was asked to show its window");
-            assert_eq!(never.load(Ordering::SeqCst), 0, "the second launch's own callback never runs");
+            assert_eq!(
+                shows.load(Ordering::SeqCst),
+                launch,
+                "the first instance was asked to show its window"
+            );
+            assert_eq!(
+                never.load(Ordering::SeqCst),
+                0,
+                "the second launch's own callback never runs"
+            );
         }
 
         drop(instance);
-        assert!(!dir.0.join(SOCK_FILE).exists(), "the socket goes with the instance");
+        assert!(
+            !dir.0.join(SOCK_FILE).exists(),
+            "the socket goes with the instance"
+        );
         let (shows, on_show) = counter();
         let next = first(claim(&dir.0, on_show));
         match claim(&dir.0, || {}).unwrap() {
             Claim::Second { shown } => assert!(shown),
             Claim::First(_) => panic!("two instances at once"),
         }
-        assert_eq!(shows.load(Ordering::SeqCst), 1, "the new first instance answers now");
+        assert_eq!(
+            shows.load(Ordering::SeqCst),
+            1,
+            "the new first instance answers now"
+        );
         drop(next);
     }
 
@@ -309,7 +352,9 @@ mod tests {
         let (shows, on_show) = counter();
         let instance = first(claim(&dir.0, on_show));
         match claim(&dir.0, || {}).unwrap() {
-            Claim::Second { shown } => assert!(shown, "the stale socket was replaced by a live one"),
+            Claim::Second { shown } => {
+                assert!(shown, "the stale socket was replaced by a live one")
+            }
             Claim::First(_) => panic!("two instances at once"),
         }
         assert_eq!(shows.load(Ordering::SeqCst), 1);
@@ -321,7 +366,12 @@ mod tests {
         let dir = Dir::new("mute");
         create_private_dir(&dir.0).unwrap();
         // The lock is held, but nothing listens (an instance that is stuck).
-        let held = File::options().create(true).truncate(false).write(true).open(dir.0.join(LOCK_FILE)).unwrap();
+        let held = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.0.join(LOCK_FILE))
+            .unwrap();
         held.try_lock().unwrap();
         match claim_within(&dir.0, || {}, Duration::from_millis(200)).unwrap() {
             Claim::Second { shown } => assert!(!shown, "nobody confirmed"),
@@ -337,6 +387,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = Dir::new("mode");
         drop(first(claim(&dir.0, || {})));
-        assert_eq!(std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }
