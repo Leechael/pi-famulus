@@ -108,7 +108,7 @@ test('bump-release moves the manager version the GUI lockfile pins, and nothing 
   assert.equal(readFileSync(join(root, 'gui/Cargo.lock'), 'utf8'), guiCargoLock('0.1.3'), 'only the pi-famulus entry moves');
   // A lockfile without the entry is a broken tree, not something to skip.
   put('gui/Cargo.lock', guiCargoLock('0.1.3').replace('name = "pi-famulus"\n', 'name = "pi-famulus-renamed"\n'));
-  assert.throws(() => bumpRelease(root, '0.1.4'), /gui\/Cargo\.lock pi-famulus version not updated/);
+  assert.throws(() => bumpRelease(root, '0.1.4'), /gui[\\/]Cargo\.lock pi-famulus version not updated/);
 });
 
 function lockedFixture(t, v) {
