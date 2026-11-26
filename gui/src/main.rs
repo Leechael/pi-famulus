@@ -22,7 +22,7 @@ fn main() -> impl std::process::Termination {
         platform::AppOptions {
             title: "pi-famulus".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
-            app_id: APP_ID.to_owned(),
+            app_id: "network.phala.pi-famulus".to_owned(),
             size: (1280, 820),
             ..Default::default()
         },
