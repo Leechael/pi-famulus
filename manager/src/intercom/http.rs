@@ -845,6 +845,14 @@ async fn session_status(rt: &Shared, session: &str) -> Result<Value, String> {
 const START_DEADLINE: Duration = Duration::from_secs(10);
 /// How long a stop waits for a known pid to die once its pane is closed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long a stop waits for herdr to identify the agent in the session's
+/// pane while the session's pi (its known pid) holds that pane's foreground.
+/// start_session returns on pi's registration with this daemon, and herdr
+/// identifies the pi only once the pi reports to herdr. With herdr 0.9.5 and
+/// pi 1.5.2, in 1 of 105 starts herdr identified it after start_session
+/// returned (0.23s after; 3.9s after the call, the longest seen); a stop in
+/// that gap found no agent in the pane and was refused.
+const IDENTIFY_WAIT: Duration = Duration::from_secs(5);
 
 /// A pi session `start_session` created through herdr on this daemon, kept so
 /// `session_status` and `stop_session` can follow it before it registers and
@@ -1260,6 +1268,18 @@ async fn stop_created(rt: &Shared, rows: Vec<Value>, index: usize) -> Result<Val
         Some(_) => c.id.clone(),
         None => pane.clone(),
     };
+    // The session's pi is in the pane's foreground but herdr has not
+    // identified it yet: wait for herdr's identification (bounded), since
+    // keys go only to an agent herdr identifies as this session.
+    if let Some((pid, _)) = &c.pid {
+        if !super::herdr::await_identification(&pane, &ids, *pid, IDENTIFY_WAIT).await {
+            return Err(format!(
+                "stop of session {:?} in pane {pane}: nothing was sent; its pi (pid {pid}) runs in the pane, but herdr has not identified the pane's agent as this session within {}s; left it untouched",
+                c.name,
+                IDENTIFY_WAIT.as_secs()
+            ));
+        }
+    }
     // deferred: a partial failure of session_close | impact: on an error after ctrl+c was sent
     // the record keeps its last state until a later call observes the exit | trigger: callers
     // need stop_session to report a stopped-but-pane-left-open outcome as a success
@@ -1523,7 +1543,7 @@ fn tools() -> Vec<Value> {
             ("name", "session name: starts with a lowercase letter, then lowercase letters, digits, '-' or '_'; 1-32 characters", true),
             ("model", "optional model name, passed as --model", false),
         ]),
-        (STOP_SESSION, "Experimental: stop a session that start_session created on this daemon, the way `session rm` does. Any other session is refused. Stopping an exited session succeeds.", &[
+        (STOP_SESSION, "Experimental: stop a session that start_session created on this daemon, the way `session rm` does. Any other session is refused. Stopping an exited session succeeds. While herdr has not yet identified the session's agent in its pane, the stop waits up to 5s for it, then refuses without sending anything.", &[
             ("session", "session id, unique name, or the pane_id start_session returned", true),
         ]),
     ];

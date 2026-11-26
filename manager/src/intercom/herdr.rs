@@ -616,6 +616,45 @@ fn classify(p: &Value, ids: &[String]) -> PaneView {
         _ => PaneView::Foreign,
     }
 }
+/// Waits, up to `bound`, while herdr does not identify `pane`'s agent (it
+/// lists no agent, or a pi it has not identified) and the session's own pi
+/// (`pid`) holds the pane's foreground. herdr identifies a pi only once the
+/// pi reports to it, which can come after the pi registered with this
+/// daemon. Nothing is sent here. `false` only when the bound expired in that
+/// state; any other view (identified, another agent, gone, a foreground that
+/// is not `pid`, herdr not answering) returns `true` at once, for
+/// `session_close` to judge.
+pub(super) async fn await_identification(
+    pane: &str,
+    ids: &[String],
+    pid: u32,
+    bound: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        match view_pane(pane, ids).await {
+            Ok(PaneView::Vacant | PaneView::Unidentified)
+                if runs_in_foreground(pane, pid).await => {}
+            _ => return true,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// Whether `pid` is in `pane`'s foreground, with the shell not holding it.
+async fn runs_in_foreground(pane: &str, pid: u32) -> bool {
+    match process_info(pane).await {
+        Ok(r) => {
+            shell_has_terminal(&r) == Some(false)
+                && r["process_info"]["foreground_processes"]
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p["pid"].as_u64() == Some(u64::from(pid))))
+        }
+        Err(_) => false,
+    }
+}
 /// The session ids herdr reports for the pi agent in `pane`, if any.
 pub(super) async fn pane_pi_ids(pane: &str) -> Result<Vec<String>, String> {
     Ok(panes()

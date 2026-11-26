@@ -168,6 +168,17 @@ impl Herdr {
         *self.panes.lock().unwrap() = panes;
     }
 
+    /// `pane.list` shows `panes` from `delay` from now on: herdr identifies
+    /// an agent only once the agent reports to it, which can come after the
+    /// agent registered with the daemon.
+    pub(super) fn set_panes_after(&self, delay: Duration, panes: Vec<Value>) {
+        let listed = self.panes.clone();
+        thread::spawn(move || {
+            thread::sleep(delay);
+            *listed.lock().unwrap() = panes;
+        });
+    }
+
     /// The agent in the foreground exits, as herdr 0.9.5 reports it: the
     /// shell has the terminal back at once, but `pane.list` keeps the agent
     /// and its session for a moment (the lag), then shows `after`.

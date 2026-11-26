@@ -1349,6 +1349,144 @@ fn overlapping_stops_dispatch_once() {
     super::herdr::assert_no_herdr_method(&herdr, &["agent.send_keys", "pane.close"]);
 }
 
+/// How long a stop waits for herdr to identify a registered agent that runs
+/// in its pane's foreground (the daemon's `IDENTIFY_WAIT`).
+const IDENTIFY_WAIT: Duration = Duration::from_secs(5);
+
+/// The pane `start_session` created, as herdr lists it before it identifies
+/// the agent: no `agent`, no `agent_session`.
+fn unidentified_pane() -> Value {
+    json!({"pane_id":"pane-new","workspace_id":"ws-new","cwd":"/fixture/new"})
+}
+
+/// The same pane once herdr identified its agent as `pi-created`.
+fn identified_pane() -> Value {
+    json!({"pane_id":"pane-new","workspace_id":"ws-new","cwd":"/fixture/new","agent":"pi","agent_status":"idle","agent_session":{"source":"native","agent":"pi","kind":"session_id","value":"pi-created"}})
+}
+
+/// Start a session whose pi (`pid`, in the pane's foreground) registers
+/// 300ms into the start, while herdr does not identify it yet.
+fn start_unidentified(
+    fixture: &Fixture,
+    address: SocketAddr,
+    herdr: &super::herdr::Herdr,
+    pid: u32,
+) -> (Value, crate::common::Conn) {
+    herdr.set_panes(vec![unidentified_pane()]);
+    herdr.set_foreground(vec![json!({"pid":pid,"name":"pi"})]);
+    let (started, registration) = thread::scope(|scope| {
+        let late = scope.spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            manager_pi(
+                fixture,
+                "pi-created",
+                pid,
+                json!({"name":"late","herdr_pane_id":"pane-new"}),
+            )
+        });
+        let started = call(
+            address,
+            "start_session",
+            json!({"cwd":cwd(fixture),"name":"late"}),
+        );
+        (started, late.join().unwrap())
+    });
+    let started = started.unwrap();
+    assert_eq!(started["state"], "alive", "{started}");
+    assert_eq!(started["id"], "pi/pi-created", "{started}");
+    (started, registration)
+}
+
+/// herdr identifies a started pi only once that pi reports to it, which can
+/// come after the pi registered with the daemon and start_session returned.
+/// A stop in that gap waits for herdr's identification instead of acting
+/// without it (or refusing a session it just reported alive), then stops it.
+#[test]
+fn a_stop_waits_for_herdr_to_identify_the_started_agent() {
+    let (fixture, address, herdr) = herdr_mcp();
+    let mut standin = Standin::spawn();
+    let me = standin.pid();
+    let (_started, _registration) = start_unidentified(&fixture, address, &herdr, me);
+    herdr.drain();
+    // herdr identifies the agent 1.5s after start_session returned.
+    herdr.set_panes_after(Duration::from_millis(1500), vec![identified_pane()]);
+    let began = Instant::now();
+    thread::scope(|scope| {
+        let stop =
+            scope.spawn(|| call(address, "stop_session", json!({"session":"pi/pi-created"})));
+        let keys = loop {
+            if stop.is_finished() {
+                panic!(
+                    "stop_session answered before sending any key: {:?}",
+                    stop.join().unwrap()
+                );
+            }
+            match herdr.requests.recv_timeout(Duration::from_millis(20)) {
+                Ok(request) if request["method"] == "agent.send_keys" => {
+                    break request["params"].clone()
+                }
+                Ok(request) => assert_ne!(request["method"], "pane.close", "{request}"),
+                Err(_) => {}
+            }
+        };
+        // No key before herdr identified the agent as this session.
+        assert!(
+            began.elapsed() >= Duration::from_millis(1500),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(keys, json!({"target":"pane-new","keys":["ctrl+c"]}));
+        // pi exits on the ctrl+c: the shell has the terminal, herdr lists no agent.
+        standin.die();
+        herdr.set_foreground(vec![]);
+        herdr.set_panes(vec![unidentified_pane()]);
+        assert_eq!(herdr.request("pane.close")["params"]["pane_id"], "pane-new");
+        let stopped = stop.join().unwrap().unwrap();
+        assert_eq!(stopped["state"], "exited", "{stopped}");
+        assert_eq!(stopped["pane"], "closed", "{stopped}");
+    });
+}
+
+/// herdr never identifies the agent in the pane: the stop waits at most
+/// IDENTIFY_WAIT, then refuses, sending nothing and closing nothing. A pane
+/// whose foreground is not the session's pi (the user's command) is refused
+/// at once, without that wait.
+#[test]
+fn a_stop_that_herdr_never_identifies_refuses_after_the_bound_and_sends_nothing() {
+    let (fixture, address, herdr) = herdr_mcp();
+    let standin = Standin::spawn();
+    let (_started, _registration) = start_unidentified(&fixture, address, &herdr, standin.pid());
+    herdr.drain();
+    let began = Instant::now();
+    let text = call(address, "stop_session", json!({"session":"pi/pi-created"})).unwrap_err();
+    let waited = began.elapsed();
+    assert!(
+        text.contains("nothing was sent") && text.contains("pane-new"),
+        "{text}"
+    );
+    assert!(text.contains("not identified"), "{text}");
+    assert!(
+        waited >= IDENTIFY_WAIT && waited < IDENTIFY_WAIT + Duration::from_secs(3),
+        "waited {waited:?}"
+    );
+    super::herdr::assert_no_herdr_method(&herdr, &["agent.send_keys", "pane.close"]);
+
+    // The user's command, not the session's pi, has the terminal.
+    herdr.set_foreground(vec![json!({"pid":4343,"name":"vim"})]);
+    let began = Instant::now();
+    let text = call(address, "stop_session", json!({"session":"pi/pi-created"})).unwrap_err();
+    assert!(
+        text.contains("nothing was sent") && text.contains("pane-new"),
+        "{text}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
+    super::herdr::assert_no_herdr_method(&herdr, &["agent.send_keys", "pane.close"]);
+}
+
 fn wait_unlisted(address: SocketAddr, id: &str) {
     let deadline = Instant::now() + TIMEOUT;
     while list_sessions(address)
