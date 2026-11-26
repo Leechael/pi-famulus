@@ -27,16 +27,26 @@ executable file, and is not the GUI itself, wins:
 
 1. `managerPath` in `<home>/config.json`
 2. `PI_FAMULUS_MANAGER_PATH`
-3. `<home>/bin/pi-famulus`
-4. `pi-famulus` in each directory of `PATH`
-5. `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` (not on Windows)
+3. The native npm package of this platform, `pi-famulus-<linux|darwin|win>-<x64|arm64>`
+   (`bin/pi-famulus`, `bin/pi-famulus.exe` on Windows):
+   - in pi's npm tree, `~/.pi/agent/npm/node_modules/<package>`: the standard install;
+   - in the extension's cache, `~/.cache/pi-famulus/native/<version>/<os>-<arch>/node_modules/<package>`
+     (`$XDG_CACHE_HOME` if set; `%LOCALAPPDATA%` on Windows), for the version this GUI was
+     built from.
+4. `<home>/bin/pi-famulus`
+5. `pi-famulus` in each directory of `PATH`
+6. `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` (not on Windows)
 
-Steps 1 to 4 are the extension's order ([configuration](../docs/configuration.md#manager-binary-discovery))
-without its npm step: the GUI cannot find the native npm package that the extension installs.
-Step 5 is there because an app opened from the Finder or a desktop launcher does not get your
-shell's `PATH`. If your only copy is the npm package, set `managerPath` or
-`PI_FAMULUS_MANAGER_PATH`. The daemon that gets started is the installed binary, so it can be
-a different version from the library this GUI was built with.
+Steps 1 to 5 are the extension's order ([configuration](../docs/configuration.md#manager-binary-discovery)).
+Step 3 differs in how it gets there: the extension walks up from its own files and insists
+on its own exact version; the GUI looks in the two places such an install puts the package
+and takes the version it finds in pi's tree. `~/.pi/agent` is always pi's default agent
+directory, even when `PI_FAMULUS_HOME` points elsewhere. Step 6 is there because an app
+opened from the Finder or a desktop launcher does not get your shell's `PATH`.
+
+The daemon that gets started is the installed binary, so it can be a different build from
+the library this GUI was compiled with. When the daemon's version differs, the title shows
+both: `<daemon version> · this window is built from <its own>`.
 
 When nothing is live, the header says why, and the window keeps retrying once a second:
 
@@ -151,6 +161,10 @@ Found by reading the code, not by running it. Each needs checking by hand at the
   lock-only instance check on Windows) has never been compiled.
 - **Bringing the window forward on a second launch** is tested up to the request reaching
   the first instance, not by watching the window.
+- **A daemon that refuses this build's hello** (a build too far apart) is retried once a
+  second for as long as the window is open, and each retry starts the installed binary,
+  which exits at once on the running daemon's lock. Nothing is damaged; it is one
+  short-lived process a second, and the header stays on `daemon not reachable`.
 - **Ctrl+X** (stop the selected task) is still bound on Linux and Windows, where it is the
   cut chord.
 - The "preview needs a taller terminal" message says "terminal" in the window too. It shows
