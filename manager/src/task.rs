@@ -374,8 +374,8 @@ pub fn runner_exe() -> io::Result<PathBuf> {
                 return Ok(candidate);
             }
         }
-        // Nothing built it (e.g. `cargo test --bin pi-famulus` alone skips the
-        // binary target): say what is missing instead of naming a path cargo
+        // Nothing built it (e.g. `cargo test --lib` alone skips the binary
+        // target): say what is missing instead of naming a path cargo
         // never writes — the unified layout's build directory is no home for it.
         Err(io::Error::new(
             io::ErrorKind::NotFound,
