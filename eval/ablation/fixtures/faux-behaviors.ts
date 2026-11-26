@@ -201,6 +201,20 @@ const behaviors: Record<string, FauxScript> = {
     ],
     fallback: echoFromWake(/ALERT fixture-ready/),
   },
+  "monitor-behavior-renew/good": {
+    steps: [
+      call("monitor", { command: "node behavior-source.cjs slow", description: "trial", timeout_ms: 10000 }),
+      say("Trial running."),
+    ],
+    fallback: (ctx) => {
+      const text = lastInputText(ctx);
+      if (/ALERT fixture-ready/.test(text)) return say("ALERT fixture-ready");
+      if (/timeout|timed out/i.test(text) && !/persistent/.test(text)) {
+        return call("monitor", { command: "node behavior-source.cjs slow", description: "rest of day", persistent: true });
+      }
+      return say("Watching.");
+    },
+  },
   "monitor-not-sleep/good": {
     steps: [
       call("monitor", { command: "tail -n +1 -F service.log | grep --line-buffered READY", description: "service ready", timeout_ms: 60000 }),

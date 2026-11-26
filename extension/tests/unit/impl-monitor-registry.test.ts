@@ -763,6 +763,25 @@ describe("MonitorRegistry stores deadline and last output", () => {
     return { clock, registry, center, sent };
   }
 
+  it("rejects timeout_ms combined with persistent:true instead of silently ignoring it", async () => {
+    await expect(start({ timeout_ms: 3_600_000, persistent: true })).rejects.toThrow(
+      /timeout_ms and persistent are exclusive/,
+    );
+    await expect(start({ timeout_ms: 60_000, persistent: true })).rejects.toBeInstanceOf(RangeError);
+  });
+
+  it("rejects timeout_ms above the 1-hour maximum instead of silently clamping", async () => {
+    await expect(start({ timeout_ms: 8 * 3_600_000 })).rejects.toThrow(/exceeds the 1-hour maximum.*persistent:true/);
+    await expect(start({ timeout_ms: 3_600_001 })).rejects.toBeInstanceOf(RangeError);
+  });
+
+  it("still accepts valid timeout_ms, persistent:false with timeout_ms, and bare persistent", async () => {
+    expect((await start({ timeout_ms: 3_600_000 })).registry.listActive()[0]).toMatchObject({ persistent: false, remainingMs: 3_600_000 });
+    expect((await start({ timeout_ms: 90_000, persistent: false })).registry.listActive()[0]).toMatchObject({ persistent: false, remainingMs: 90_000 });
+    expect((await start({ persistent: true })).registry.listActive()[0]).toMatchObject({ persistent: true, remainingMs: null });
+    expect((await start({ timeout_ms: 10 })).registry.listActive()[0]).toMatchObject({ remainingMs: 1_000 });
+  });
+
   it("stores a deadline for timed monitors and marks persistent ones", async () => {
     const clock = new ManualClock(1_000);
     let nextId = 1;

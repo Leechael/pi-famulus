@@ -319,6 +319,55 @@
         "bg-end-turn",
         "no-fabrication"
       ]
+    },
+    {
+      "id": "mech.idle-turn-guard",
+      "kind": "config",
+      "surface": "mechanism: idle turn guard (extension/src/idle-turn-guard.ts); disabled via idleTurnGuard:false",
+      "famulusConfig": {
+        "idleTurnGuard": false
+      },
+      "affects": [
+        "idle-after-done-peer",
+        "idle-after-done-user",
+        "idle-after-done-peer-long",
+        "idle-after-done-user-long"
+      ]
+    },
+    {
+      "id": "mech.wait-guard",
+      "kind": "config",
+      "surface": "mechanism: wait guard (extension/src/wait-guard.ts); disabled via waitGuard:false",
+      "famulusConfig": {
+        "waitGuard": false
+      },
+      "affects": [
+        "agent-wait-job",
+        "agent-wait-ready",
+        "monitor-behavior-long",
+        "monitor-behavior-hour",
+        "monitor-behavior-alternative",
+        "monitor-behavior-noise",
+        "monitor-behavior-cleanup",
+        "monitor-behavior-natural",
+        "monitor-behavior-renew"
+      ]
+    },
+    {
+      "id": "mech.poll-guard",
+      "kind": "config",
+      "surface": "mechanism: poll guard (extension/src/poll-guard.ts); disabled via pollGuard:false",
+      "famulusConfig": {
+        "pollGuard": false
+      },
+      "affects": [
+        "agent-wait-job",
+        "agent-wait-ready",
+        "monitor-not-sleep",
+        "bg-end-turn",
+        "still-running-continue",
+        "wake-continue"
+      ]
     }
   ],
   "groups": [

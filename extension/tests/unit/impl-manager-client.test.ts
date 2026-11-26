@@ -298,7 +298,7 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(out.next_cursor).toBe(13);
     expect(out.total_size).toBe(13);
 
-    await expect(client.stop("sh_a1b2c3d4", "tui")).resolves.toBeUndefined();
+    await expect(client.stop("sh_a1b2c3d4", "tui")).resolves.toEqual({ alreadyEnded: null });
     expect(fake.received.find((message) => message.type === "stop")).toMatchObject({ reason: "tui" });
     await expect(client.list()).resolves.toEqual([]);
     await expect(client.shutdownSession()).resolves.toEqual(["sh_a1b2c3d4"]);
@@ -441,7 +441,7 @@ describe("ManagerClient (integration, fake manager)", () => {
 
   it("surfaces manager errors as ManagerError with code", async () => {
     await client.connect();
-    await expect(client.stop("nope")).resolves.toBeUndefined(); // stop is ok in fake
+    await expect(client.stop("nope")).resolves.toEqual({ alreadyEnded: null }); // stop is ok in fake
     const bad = client.output("nope", 0, 1).catch((err) => err);
     // fake returns ok for output; use an unknown request type via list(all) path instead
     await expect(bad).resolves.toMatchObject({ chunk: "hello output\n" });

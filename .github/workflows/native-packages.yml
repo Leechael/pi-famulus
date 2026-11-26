@@ -36,16 +36,18 @@ on:
         default: ''
       manager-tests:
         description: Run the manager's Cargo suites (CI skips them when manager/ is unchanged)
-        type: boolean
-        default: true
+        # String, not boolean: nested workflow_call comparison expressions can
+        # arrive as false even when the caller's output is 'true'.
+        type: string
+        default: 'true'
       packages:
         description: Build, benchmark, pack and install-test the native packages
-        type: boolean
-        default: true
+        type: string
+        default: 'true'
       all-architectures:
         description: Run manager suites and packages on both architectures of every OS (false runs one per OS)
-        type: boolean
-        default: true
+        type: string
+        default: 'true'
 
 permissions:
   contents: read

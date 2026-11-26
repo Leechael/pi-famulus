@@ -24,6 +24,9 @@ import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
+import { installIdleTurnGuard } from "./idle-turn-guard";
+import { installWaitGuard } from "./wait-guard";
+import { installPollGuard } from "./poll-guard";
 import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig, taskOutputPath } from "./config";
 import { ensureNativeManagerInstalled } from "./native-manager.js";
 import { formatDuration, type TaskExitInfo } from "./format";
@@ -639,6 +642,7 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
         id: mon.taskId,
         description: mon.description,
         remaining: mon.persistent ? "persistent" : `${formatDuration(mon.remainingMs ?? 0)} remaining`,
+        ...(mon.wakeOn ? { wakeOn: mon.wakeOn } : {}),
       })),
   });
 
@@ -1442,6 +1446,20 @@ function createFamulusRuntime(retiring?: Promise<unknown>): FamulusRuntime {
 
   pi.on("agent_settled", async () => {
     notifyCenter?.settled();
+  });
+
+  installIdleTurnGuard(pi, {
+    enabled: config.idleTurnGuard !== false,
+    onTrip: (info) => logEvent("guard.idle-turn", { count: info.count, calls: info.calls }),
+  });
+  installWaitGuard(pi, {
+    enabled: config.waitGuard !== false,
+    onBlock: (info) => logEvent("guard.wait", info),
+  });
+  installPollGuard(pi, {
+    enabled: config.pollGuard !== false,
+    getIndex: () => workIndex,
+    onBlock: (info) => logEvent("guard.poll", info),
   });
 
   // A wake entering the model's context (steer / triggerTurn); see wake-delivery.ts.

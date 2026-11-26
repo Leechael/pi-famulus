@@ -4,7 +4,7 @@
 import { Type } from "typebox";
 import { realClock, type Clock } from "./clock";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { ManagerClient, TaskRecord } from "./manager-client";
+import type { ManagerClient, StopResult, TaskRecord } from "./manager-client";
 import { fnv1a64 } from "./config";
 import { fill, PROMPTS } from "./prompts.generated";
 import {
@@ -30,7 +30,7 @@ export interface TaskToolsDeps {
   /** task_stop on a monitor: its leftover lines and exit should not wake the model. */
   noteStopRequested?: (taskId: string) => (() => void) | void;
   /** Live monitor remaining timeout and last output, from the in-session registry. */
-  getMonitorLive?: () => Iterable<{ taskId: string; remainingMs: number | null; persistent: boolean; lastOutputAt?: number }>;
+  getMonitorLive?: () => Iterable<MonitorLive>;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -73,14 +73,22 @@ function formatDuration(startedAt: number, endedAt: number | null, now: number):
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
 }
 
-function formatMonitorLive(
-  live: { remainingMs: number | null; persistent: boolean; lastOutputAt?: number },
-  now: number,
-): string {
+interface MonitorLive {
+  taskId: string;
+  remainingMs: number | null;
+  persistent: boolean;
+  lastOutputAt?: number;
+  wakeOn?: string;
+  stallAfterMs?: number;
+}
+
+function formatMonitorLive(live: MonitorLive, now: number): string {
   const timeout = live.persistent ? "persistent" : `timeout in ${formatAge(now, now + (live.remainingMs ?? 0), now)}`;
   const last =
     live.lastOutputAt === undefined ? "no output yet" : `last output ${formatAge(live.lastOutputAt, undefined, now)} ago`;
-  return ` ${timeout}; ${last}`;
+  const filter = live.wakeOn === undefined ? "" : `; wakes only on /${live.wakeOn}/`;
+  const stall = live.stallAfterMs === undefined ? "" : `; stall notice after ${formatAge(now, now + live.stallAfterMs, now)}`;
+  return ` ${timeout}; ${last}${filter}${stall}`;
 }
 
 function formatTaskLine(task: TaskRecord, now: number): string {
@@ -126,7 +134,7 @@ export function createTaskListTool(
       const lines: string[] = [];
       const seen = new Set<string>();
       let running = false;
-      const monitorLive = new Map<string, { remainingMs: number | null; persistent: boolean; lastOutputAt?: number }>();
+      const monitorLive = new Map<string, MonitorLive>();
       for (const live of deps.getMonitorLive?.() ?? []) monitorLive.set(live.taskId, live);
 
       const pushItem = (item: WorkItem) => {
@@ -312,6 +320,12 @@ const taskStopParameters = Type.Object({
   task_id: Type.String({ description: PROMPTS["tools.task_stop.param.task_id"] }),
 });
 
+function endedOutcome(ended: NonNullable<StopResult["alreadyEnded"]>): string {
+  if (ended.signal) return `${ended.status}, killed by ${ended.signal}`;
+  if (ended.exitCode !== null) return `${ended.status}, exit code ${ended.exitCode}`;
+  return ended.status;
+}
+
 export function createTaskStopTool(
   deps: TaskToolsDeps,
 ): ToolDefinition<typeof taskStopParameters, { task_id: string; stopped: boolean }> {
@@ -335,8 +349,9 @@ export function createTaskStopTool(
       }
       const client = await requireClient(deps);
       const undoNote = deps.noteStopRequested?.(params.task_id);
+      let result: StopResult | undefined;
       try {
-        await client.stop(params.task_id, "tool");
+        result = await client.stop(params.task_id, "tool");
       } catch (err) {
         undoNote?.();
         throw err;
@@ -344,13 +359,17 @@ export function createTaskStopTool(
         // Stopping a task that already ended emits no new exit event.
         await deps.syncWithManager?.();
       }
+      const ended = result?.alreadyEnded;
+      if (ended) {
+        // Nothing was stopped, so its exit is not a stop the model asked for.
+        undoNote?.();
+        return {
+          content: [{ type: "text", text: fill("tools.task_stop.result.already-ended", { taskId: params.task_id, outcome: endedOutcome(ended) }) }],
+          details: { task_id: params.task_id, stopped: false },
+        };
+      }
       return {
-        content: [
-          {
-            type: "text",
-            text: `Task ${params.task_id} stopped (SIGTERM; SIGKILL after 2s grace if needed).`,
-          },
-        ],
+        content: [{ type: "text", text: fill("tools.task_stop.result.stopped", { taskId: params.task_id }) }],
         details: { task_id: params.task_id, stopped: true },
       };
     },

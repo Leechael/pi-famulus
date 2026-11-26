@@ -65,8 +65,11 @@ export function createSandbox(opts: SandboxOptions = {}): Sandbox {
   const root = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "eval-"));
   const cwd = join(root, "w");
   const famulusHome = join(root, "h");
+  // Per-episode TMPDIR so concurrent episodes do not share mktemp/$TMPDIR files.
+  const tmp = join(root, "t");
   mkdirSync(cwd, { recursive: true });
   mkdirSync(famulusHome, { recursive: true });
+  mkdirSync(tmp, { recursive: true });
   const mgr = managerPath();
   writeFileSync(
     join(famulusHome, "config.json"),
@@ -83,7 +86,7 @@ export function createSandbox(opts: SandboxOptions = {}): Sandbox {
     cwd,
     famulusHome,
     tracePath,
-    env: { PI_FAMULUS_HOME: famulusHome, PI_FAMULUS_MANAGER_PATH: mgr },
+    env: { PI_FAMULUS_HOME: famulusHome, PI_FAMULUS_MANAGER_PATH: mgr, TMPDIR: tmp },
     cleanup() {
       // The manager exits by itself 5s after its last client; do not wait.
       spawnSync(mgr, ["--home", famulusHome, "shutdown"], { stdio: "ignore", timeout: 5000 });

@@ -124,6 +124,27 @@ describe("faux e2e", { concurrency: true }, () => {
     assertScriptConsumedExactly(ep, 2);
   });
 
+  it("(b2) the idle turn guard ends a run of no-op calls on the second idle turn", async () => {
+    const ep = await runFaux({ script: "idle-loop.ts", quietMs: 2000 });
+    episodes.push(ep);
+    assertScriptConsumedExactly(ep, 2);
+    const results = toolResults(ep.items);
+    assert.equal(results.length, 2, explain(ep));
+    assert.equal(results[0].isError, false, explain(ep));
+    assert.equal(results[1].toolName, "task_list");
+    assert.equal(results[1].isError, true, explain(ep));
+    assert.match(results[1].text, /pi-famulus ended this run: 2 turns in a row/);
+    const trips = extensionEvents(ep).filter((e) => e.type === "guard.idle-turn");
+    assert.equal(trips.length, 1, explain(ep));
+  });
+
+  it("(b3) with idleTurnGuard off the same model runs every no-op (the guard is what stops it)", async () => {
+    const ep = await runFaux({ script: "idle-loop.ts", famulusConfig: { idleTurnGuard: false }, quietMs: 2000 });
+    episodes.push(ep);
+    assertScriptConsumedExactly(ep, 5);
+    assert.ok(toolResults(ep.items).every((r) => !r.isError), explain(ep));
+  });
+
   it("(c) monitor lines arrive as monitor events, then exactly one timeout notice", async () => {
     const ep = await runFaux({
       script: "monitor-timeout.ts",
@@ -168,7 +189,8 @@ describe("faux e2e", { concurrency: true }, () => {
     t.after(() => runnerObserver?.dispose());
     const ep = await runFaux({
       script: "manager-crash.ts",
-      famulusConfig: { foregroundBudgetMs: 300 },
+      // The script's sleeps are a stand-in workload, not an agent waiting; the wait guard would refuse them.
+      famulusConfig: { foregroundBudgetMs: 300, waitGuard: false },
       midway: {
         when: (items) => toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true),
         act: async (sb) => {
@@ -252,7 +274,8 @@ describe("faux e2e", { concurrency: true }, () => {
     let before: { pid?: number } = {};
     const ep = await runFaux({
       script: "manager-upgrade.ts",
-      famulusConfig: { foregroundBudgetMs: 300 },
+      // The script's sleeps are a stand-in workload, not an agent waiting; the wait guard would refuse them.
+      famulusConfig: { foregroundBudgetMs: 300, waitGuard: false },
       midway: {
         when: (items) =>
           toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true) &&
@@ -343,12 +366,24 @@ describe("faux e2e", { concurrency: true }, () => {
   });
 
   it("(b2) a command killed by its own timeout is reported as timed out", async () => {
-    const ep = await runFaux({ script: "bash-timeout.ts", until: (items) => toolResults(items).some((r) => r.toolName === "bash") });
+    const ep = await runFaux({
+      script: "bash-timeout.ts",
+      until: (items) => toolResults(items).some((r) => r.toolName === "bash"),
+      // The episode's own budget is the command's 10s timeout, plus whatever
+      // the sandbox and the shell need on a loaded runner.
+      untilTimeoutMs: 30_000,
+      // The script's sleep is a stand-in workload, not an agent waiting; the
+      // wait guard would refuse it (and a 4s deadline cannot outlast a slow
+      // Windows shell start, so the workload has to be longer than that).
+      famulusConfig: { waitGuard: false },
+    });
     episodes.push(ep);
     const r = toolResults(ep.items).find((x) => x.toolName === "bash");
     assert.ok(r, explain(ep));
     assert.equal(r.isError, true, `killed command reported as success: ${r.text}\n${explain(ep)}`);
-    assert.match(r.text, /started[\s\S]*timed out after 4 seconds/, explain(ep));
+    // The timeout's budget must outlast shell start-up: a deadline the shell
+    // itself cannot meet says nothing about partial output (see the script).
+    assert.match(r.text, /started[\s\S]*timed out after 10 seconds/, explain(ep));
   });
 
   it("(c3) a monitor that prints and exits while the agent is busy: event first, exit starts no turn", async () => {

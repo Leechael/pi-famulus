@@ -13,6 +13,44 @@ When to rerun and with which models: [BASELINES.md](BASELINES.md#when-to-rerun).
 
 <!-- runs: newest first -->
 
+## 2026-11-08: agent wait, default-persistent monitor
+
+Prose only; no matrix. deepseek-flash only, k=3 for the clean-context probes. `agent-wait-ready`: a persistent monitor gave readiness in 0/3 episodes on main 0.2.4 (all three passed explicit timeouts) and 2/3 with the default-persistent monitor and new prompt (3/3 monitors started without a timeout; one failure was polling). `agent-wait-job` passed 3/3 on both arms. A replay of the incident's own context (10 decision points, k=5 per arm) did not change the choice: main 6/24, new prompt with the default 5/29. See [2026-11-08 agent wait review](2026-11-08-AGENT-WAIT-REVIEW.md).
+
+## 2026-11-07: idle turn guard, decision-point replay
+
+Extension tree `18a8291`. A real-context replay of two incident sessions (k3.1-pro:high, k3-256k:high), k=5 per arm: 10/15 runaway with the guard off, 0/15 with it on (44 vs ≥125 turns). The default turn-control probes on k3.1-pro and gpt-6-luna, k=3, guard on: 22 PASS, 2 FAIL (luna polling, below the guard's bounds), 1 ERR, 0 guard trips. Synthetic `idle-after-done-*` probes did not reproduce the loop. See [2026-11-07 idle turn review](2026-11-07-IDLE-TURN-REVIEW.md).
+
+## 2026-11-05c: monitor lifetime probes, candidate prompt + parameter validation
+
+Extension tree `bb71504`: rewritten monitor lifetime, command and wake wording; `timeout_ms` with `persistent`, or above 1 hour, is rejected. Same harness, graders, fixture, models, k and concurrency as 2026-11-05b, run in parallel. 136 episodes: 116 PASS, 17 FAIL, 3 INVALID/ERR; no graded episode chose the wrong lifetime. Remaining failures are polling (kimi/k3 renew) and luna restarting monitors. See [2026-11-05 monitor lifetime review](2026-11-05-MONITOR-LIFETIME-REVIEW.md).
+
+Blank: 3 of 3 scored episodes passed. X: any FAIL, or fewer than 3 scored (INVALID and errors excluded).
+
+| scenario | tests | `gpt-6-astra:medium` | `gpt-6-luna:medium` | `gpt-6-sol:medium` | `gpt-6.1-sol:medium` | `gpt-6.1-terra:medium` | `deepseek-flash:medium` | `kimi-for-coding:medium` | `k3-256k:medium` | `k3.1-pro:medium` | `grok-4.6:medium` | `grok-4.7:medium` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `monitor-behavior-long` | open-ended observation ("no planned end") selects a persistent monitor and reports its alert |  | X |  |  |  |  | X |  |  |  |  |
+| `monitor-behavior-hour` | an explicit one-hour observation selects timeout_ms 3600000, not persistence |  | X |  |  |  |  |  |  |  |  |  |
+| `monitor-behavior-natural` | an open-ended watch phrased naturally (no "no planned end" cue, horizon longer than the 1-hour timeout cap) selects persistent:true rather than a timed monitor |  | X |  |  |  | X |  |  |  |  |  |
+| `monitor-behavior-renew` | after a short timed monitor expires, continuing an open-ended watch (horizon beyond the 1-hour timeout cap) starts a persistent monitor rather than another timed one |  | X |  |  |  | X | X | X | X |  |  |
+
+<sub>results: `results/monitor-r2-candidate/results.jsonl`</sub>
+
+## 2026-11-05b: monitor lifetime probes, baseline prompt (c12f2f7)
+
+Extension tree `c12f2f7` (monitor prompt before the lifetime rewrite); harness, graders and fixture from the eval/monitor-persistent branch. Eleven `:medium` models, k=3, concurrency 2, run in parallel with 2026-11-05c. Opt-in monitor-behavior probes only. 135 episodes: 92 PASS, 39 FAIL, 4 INVALID/ERR; 10 graded episodes chose the wrong monitor lifetime. See [2026-11-05 monitor lifetime review](2026-11-05-MONITOR-LIFETIME-REVIEW.md).
+
+Blank: 3 of 3 scored episodes passed. X: any FAIL, or fewer than 3 scored (INVALID and errors excluded).
+
+| scenario | tests | `gpt-6-astra:medium` | `gpt-6-luna:medium` | `gpt-6-sol:medium` | `gpt-6.1-sol:medium` | `gpt-6.1-terra:medium` | `deepseek-flash:medium` | `kimi-for-coding:medium` | `k3-256k:medium` | `k3.1-pro:medium` | `grok-4.6:medium` | `grok-4.7:medium` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `monitor-behavior-long` | open-ended observation ("no planned end") selects a persistent monitor and reports its alert |  | X |  |  |  | X |  |  |  |  |  |
+| `monitor-behavior-hour` | an explicit one-hour observation selects timeout_ms 3600000, not persistence |  | X | X |  | X | X | X |  |  |  |  |
+| `monitor-behavior-natural` | an open-ended watch phrased naturally (no "no planned end" cue, horizon longer than the 1-hour timeout cap) selects persistent:true rather than a timed monitor |  | X | X |  |  | X | X | X |  |  | X |
+| `monitor-behavior-renew` | after a short timed monitor expires, continuing an open-ended watch (horizon beyond the 1-hour timeout cap) starts a persistent monitor rather than another timed one |  | X | X |  |  | X | X | X | X |  | X |
+
+<sub>results: `results/monitor-r2-baseline/results.jsonl`</sub>
+
 ## 2026-10-08: requested xAI/OpenAI thinking matrix
 
 Extension tree `682206a` (base `8d4de1d`), Pi 1.0.3, baseline only, k=10. Twelve supported configurations; requested `grok-4.5:xhigh` clamps to high and is not a separate tested column. 120/120 cells complete: **1198 PASS, 2 FAIL**, with 3 INVALID and 3 ERR excluded. A supplies seven scenarios, B supplies handover/monitor, D supplies still-running; whole cells are replaced, never hand-corrected. D clarifies separate unredirected launches and parent-owned writes, and excludes same-turn completion delivery without a continuation opportunity. B handover transcripts were audited and unaffected by that added precondition. The Luna-medium stuck-child failure has ambiguous growth evidence; the Sol-high progressing-child failure has unresolved child-completion attribution. A separate 3/3 Sol diagnostic does not replace its 9/10 cell. See [campaign review and limitations](2026-10-08-REVIEW.md). No extension/product prompt changes were made.

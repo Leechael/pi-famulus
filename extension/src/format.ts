@@ -247,7 +247,7 @@ export function formatMonitorEvent(
 
 /** One short still-running list after compaction (id, description, remaining). */
 export function formatRunningMonitorList(
-  items: { id: string; description: string; remaining: string }[],
+  items: { id: string; description: string; remaining: string; wakeOn?: string }[],
 ): FormattedWake {
   return formatFamulusWake({ kind: "running-monitors", monitors: items });
 }

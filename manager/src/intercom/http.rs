@@ -1,3 +1,4 @@
+use super::liveness::{self, Liveness};
 use super::{config::Config, str_field, Shared};
 use hmac::{Hmac, Mac};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, Limited, StreamBody};
@@ -23,6 +24,10 @@ const VERSIONS: [&str; 5] = [
     "2025-03-26",
     "2024-11-05",
 ];
+// The experimental session-lifecycle tools, named once so a rename is one edit.
+const START_SESSION: &str = "start_session";
+const SESSION_STATUS: &str = "session_status";
+const STOP_SESSION: &str = "stop_session";
 // Nothing larger than one relay frame can be delivered remotely.
 const MAX_BODY: usize = super::relay::MAX_FRAME;
 type Body = UnsyncBoxBody<Bytes, Infallible>;
@@ -771,15 +776,540 @@ async fn resolve_to(rt: &Shared, to: &str) -> Result<String, String> {
         return Ok(to.into());
     }
     let rows = rt.directory().await;
+    Ok(str_field(find_row(&rows, to)?, "id").into())
+}
+/// The one directory row whose id or name is exactly `to`.
+fn find_row<'a>(rows: &'a [Value], to: &str) -> Result<&'a Value, String> {
     let matches: Vec<_> = rows
         .iter()
         .filter(|row| str_field(row, "id") == to || str_field(row, "name") == to)
         .collect();
     match matches.as_slice() {
         [] => Err(format!("unknown session {to:?}")),
-        [row] => Ok(str_field(row, "id").into()),
+        [row] => Ok(row),
         _ => Err(format!("session {to:?} is ambiguous")),
     }
+}
+/// What this daemon can tell about a listed row's process, and the
+/// `(pid, recorded start)` it vouches for.
+async fn row_liveness(rt: &Shared, row: &Value) -> (Liveness, Option<(u32, String)>) {
+    let manager_port = {
+        let state = rt.state.lock().unwrap();
+        state
+            .sessions
+            .get(str_field(row, "id"))
+            .is_some_and(|session| state.port_conns.contains(&session.owner))
+    };
+    let process = liveness::vouched_process(row, &rt.machine, manager_port);
+    let state = match process.clone() {
+        Some((pid, start)) => probe(pid, start).await,
+        None => Liveness::Unknown,
+    };
+    (state, process)
+}
+async fn probe(pid: u32, start: String) -> Liveness {
+    tokio::task::spawn_blocking(move || liveness::probe(pid, &start))
+        .await
+        .unwrap_or(Liveness::Unknown)
+}
+/// `session_status`: what this daemon can tell about a session's process.
+/// It changes nothing outside this daemon's own record of the sessions it
+/// created. A session this daemon did not create must name a listed row: one
+/// whose row is gone is unknown, not exited.
+async fn session_status(rt: &Shared, session: &str) -> Result<Value, String> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err("session required".into());
+    }
+    let rows = rt.directory().await;
+    if let Some(index) = find_created(rt, &rows, session)? {
+        return Ok(created_status(rt, &rows, index).await);
+    }
+    let row = find_row(&rows, session)?;
+    let id = str_field(row, "id");
+    let (state, process) = row_liveness(rt, row).await;
+    let mut result = json!({"id":id,"name":str_field(row,"name"),"harness":str_field(row,"harness"),
+        "state":state.as_str(),"advisory_status":str_field(row,"status")});
+    if let Some((pid, _)) = process {
+        result["pid"] = json!(pid);
+    }
+    if !str_field(row, "herdr_pane_id").is_empty() {
+        result["herdr_pane_id"] = row["herdr_pane_id"].clone();
+    }
+    Ok(result)
+}
+
+/// How long `start_session` waits for the agent to register (herdr's
+/// `start_agent` deadline). Past it, a pane with no agent means it never ran,
+/// and an agent the record cannot identify is not taken for it.
+const START_DEADLINE: Duration = Duration::from_secs(10);
+/// How long a stop waits for a known pid to die once its pane is closed.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long a stop waits for herdr to identify the agent in the session's
+/// pane while the session's pi (its known pid) holds that pane's foreground.
+/// start_session returns on pi's registration with this daemon, and herdr
+/// identifies the pi only once the pi reports to herdr. With herdr 0.9.5 and
+/// pi 1.5.2, in 1 of 105 starts herdr identified it after start_session
+/// returned (0.23s after; 3.9s after the call, the longest seen); a stop in
+/// that gap found no agent in the pane and was refused.
+const IDENTIFY_WAIT: Duration = Duration::from_secs(5);
+
+/// A pi session `start_session` created through herdr on this daemon, kept so
+/// `session_status` and `stop_session` can follow it before it registers and
+/// after its row is gone. States change only when a tool call looks at the
+/// record.
+///
+/// Its identity is the session ids herdr reported for the pi in its pane when
+/// it was created, plus the intercom id it registered under; never the pane
+/// id alone, which outlives the agent and can host anyone's next one.
+///
+/// It reads `exited` on evidence judged afresh each time: when a pid is
+/// known, that pid dead or reused; without one, its pane gone, or hosting no
+/// agent and no foreground process once it registered or the start deadline
+/// passed. Only a stop that completed and left no known pid running makes it
+/// `exited` for good. A row's presence or absence alone proves nothing.
+// deferred: an identity for an agent herdr had not identified when start_session returned and
+// that did not register within the start deadline | impact: it reads `unknown` and stop_session
+// refuses it (stop it in herdr) | trigger: herdr's `agent.start` result carries the session id
+// deferred: keeping records across a daemon restart, handover upgrade or bridge restart (each
+// builds a fresh `State`) | impact: after one, stop_session refuses the sessions this daemon
+// started (stop them with `session rm` or in herdr) and session_status answers for them as for
+// any other session | trigger: MCP clients need to stop sessions across daemon upgrades
+// deferred: recording which MCP caller created a session | impact: any holder of the MCP
+// bearer token can stop a session another holder started here | trigger: MCP clients present
+// per-caller credentials
+// deferred: stopping created sessions when their creator goes away | impact: a session outlives
+// the MCP client that started it until someone stops it | trigger: the daemon can observe an
+// MCP client's lifetime
+// deferred: expiring records | impact: one small record per start_session is kept for the
+// daemon's lifetime (unbounded memory under automated starts) | trigger: daemons that serve
+// thousands of start_session calls between restarts
+#[derive(Clone)]
+pub(super) struct CreatedSession {
+    pane: String,
+    /// The intercom id, once its registration was seen.
+    id: String,
+    /// The session ids herdr reported for the pi in its pane at creation.
+    ident: Vec<String>,
+    name: String,
+    created: Instant,
+    /// The pid of the session's current process, from its registration
+    /// (adopted again whenever a registration vouches for another), and its
+    /// recorded start time ("" when none is available).
+    pid: Option<(u32, String)>,
+    /// A stop completed and left no known pid running: final.
+    exited: bool,
+    /// Its pane was closed by a stop or seen gone: the id may since name a
+    /// pane someone else opened, so nothing acts on it again.
+    pane_done: bool,
+    /// A stop is under way; another stop does not dispatch again.
+    stopping: bool,
+}
+
+impl CreatedSession {
+    /// Every id that identifies this session's agent.
+    fn ids(&self) -> Vec<String> {
+        let mut ids = self.ident.clone();
+        if !self.id.is_empty() && !ids.contains(&self.id) {
+            ids.push(self.id.clone());
+        }
+        ids
+    }
+    /// Whether `row` is this session's registration: a local pi row with its
+    /// known id or, before it registered, one that claims its pane and is
+    /// identified as its agent (with no identity yet, only within the start
+    /// deadline).
+    fn registration(&self, row: &Value, machine: &str) -> bool {
+        let owner = str_field(row, "machine_id");
+        if !(owner.is_empty() || owner == machine) || str_field(row, "harness") != "pi" {
+            return false;
+        }
+        let id = str_field(row, "id");
+        if !self.id.is_empty() {
+            return self.id == id;
+        }
+        !self.exited
+            && id != self.pane
+            && str_field(row, "herdr_pane_id") == self.pane
+            && if self.ident.is_empty() {
+                self.created.elapsed() < START_DEADLINE
+            } else {
+                self.ident.iter().any(|known| known == id)
+            }
+    }
+}
+
+/// The record `handle` names: by its pane id or intercom id; by the name it
+/// was started under, which stays a handle after its row is gone unless it
+/// is ambiguous (several records carry it, or a live row of another session
+/// does); or through the directory row `handle` resolves to, when that row is
+/// the recorded session's registration.
+fn find_created(rt: &Shared, rows: &[Value], handle: &str) -> Result<Option<usize>, String> {
+    let state = rt.state.lock().unwrap();
+    let created = &state.created;
+    if let Some(index) = created
+        .iter()
+        .rposition(|c| c.pane == handle || (!c.id.is_empty() && c.id == handle))
+    {
+        return Ok(Some(index));
+    }
+    let named: Vec<usize> = (0..created.len())
+        .filter(|&i| created[i].name == handle)
+        .collect();
+    match named.as_slice() {
+        [] => {}
+        [index] => {
+            let c = &created[*index];
+            if rows
+                .iter()
+                .any(|row| str_field(row, "name") == handle && !c.registration(row, &rt.machine))
+            {
+                return Err(format!(
+                    "session name {handle:?} is ambiguous: another session carries it too; use the session id or pane id"
+                ));
+            }
+            return Ok(Some(*index));
+        }
+        _ => {
+            return Err(format!(
+                "session name {handle:?} is ambiguous: several sessions started here carry it; use the session id or pane id"
+            ))
+        }
+    }
+    Ok(find_row(rows, handle).ok().and_then(|row| {
+        created
+            .iter()
+            .rposition(|c| c.registration(row, &rt.machine))
+    }))
+}
+
+/// The state of the recorded session `index`, learning its intercom id and
+/// current pid from its registration, and recording a terminal `exited`
+/// only on evidence (see [`CreatedSession`]).
+async fn created_status(rt: &Shared, rows: &[Value], index: usize) -> Value {
+    use super::herdr::PaneView;
+    let mut c = rt.state.lock().unwrap().created[index].clone();
+    if !c.exited && c.id.is_empty() {
+        if let Some(row) = rows.iter().find(|row| c.registration(row, &rt.machine)) {
+            c.id = str_field(row, "id").into();
+        }
+    }
+    let row = rows
+        .iter()
+        .find(|row| !c.id.is_empty() && c.registration(row, &rt.machine));
+    let mut result = json!({"name":c.name,"harness":"pi","host":"herdr","pane_id":c.pane});
+    let state = if c.exited {
+        "exited"
+    } else {
+        let liveness = match row {
+            Some(row) => {
+                result["advisory_status"] = row["status"].clone();
+                let (liveness, vouched) = row_liveness(rt, row).await;
+                if vouched.is_some() {
+                    c.pid = vouched;
+                }
+                liveness
+            }
+            None => match c.pid.clone() {
+                Some((pid, start)) => probe(pid, start).await,
+                None => Liveness::Unknown,
+            },
+        };
+        match liveness {
+            Liveness::Exited => "exited",
+            Liveness::Alive => {
+                if row.is_none() {
+                    // Running, but its registration is currently absent: not
+                    // reachable over messaging until it registers again.
+                    result["advisory_status"] = json!("unregistered");
+                }
+                "alive"
+            }
+            // No process to judge by (a registration's presence is no
+            // liveness): only herdr's view of the pane can tell.
+            Liveness::Unknown => {
+                let registered = !c.id.is_empty();
+                let fresh = c.created.elapsed() < START_DEADLINE;
+                let view = if c.pane_done {
+                    // Closed by a stop or seen gone: that id is no longer its pane.
+                    Ok(PaneView::Gone)
+                } else {
+                    super::herdr::view_pane(&c.pane, &c.ids()).await
+                };
+                match view {
+                    Ok(PaneView::Gone) => {
+                        c.pane_done = true;
+                        "exited"
+                    }
+                    // No agent but a foreground process: maybe our pi before
+                    // herdr detects it, maybe the user's work; not an exit.
+                    Ok(PaneView::Vacant) if super::herdr::pane_busy(&c.pane).await => {
+                        if !registered && fresh {
+                            "starting"
+                        } else {
+                            "unknown"
+                        }
+                    }
+                    Ok(PaneView::Vacant) if registered || !fresh => "exited",
+                    Ok(PaneView::Vacant) => "starting",
+                    Ok(PaneView::Ours) if registered => {
+                        if row.is_none() {
+                            result["advisory_status"] = json!("unregistered");
+                        }
+                        "alive"
+                    }
+                    Ok(PaneView::Ours) => "starting",
+                    // Not identified yet, while it may still be starting.
+                    Ok(PaneView::Unidentified) if !registered && fresh => "starting",
+                    Ok(PaneView::Foreign) if !registered && fresh && c.ident.is_empty() => {
+                        "starting"
+                    }
+                    // Another agent, or one that cannot be told apart from it.
+                    Ok(_) => "unknown",
+                    Err(_) if registered => "unknown",
+                    Err(_) => "starting",
+                }
+            }
+        }
+    };
+    if let Some((pid, _)) = &c.pid {
+        result["pid"] = json!(pid);
+    }
+    {
+        let mut state_lock = rt.state.lock().unwrap();
+        let r = &mut state_lock.created[index];
+        if r.id.is_empty() {
+            r.id = c.id.clone();
+        }
+        if c.pid.is_some() {
+            r.pid = c.pid;
+        }
+        // `exited` is recorded only by a completed stop: any other exit
+        // evidence is judged again on each look (pi may resume).
+        r.pane_done |= c.pane_done;
+    }
+    if !c.id.is_empty() {
+        result["id"] = json!(c.id);
+    }
+    result["state"] = json!(state);
+    result
+}
+
+/// The longest name herdr accepts for an agent.
+const MAX_SESSION_NAME: usize = 32;
+/// A name `start_session` gives the agent: what herdr 0.9.5 accepts as an
+/// agent name, which it states as "agent name must start with a lowercase
+/// letter and contain only lowercase letters, digits, '-' or '_' (1-32
+/// characters)". herdr refuses anything else with `invalid_agent_name`,
+/// but only after the pane is open. (A name therefore never starts with
+/// `-`, so pi cannot take it for a flag.)
+fn check_session_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name required".into());
+    }
+    let mut chars = name.chars();
+    let starts_lowercase = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+    if !starts_lowercase
+        || name.len() > MAX_SESSION_NAME
+        || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_".contains(c))
+    {
+        return Err(format!(
+            "name {name:?} must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-{MAX_SESSION_NAME} characters), as herdr requires"
+        ));
+    }
+    Ok(())
+}
+
+/// `start_session`: a pi agent in a new herdr pane in `cwd`, recorded as
+/// created by this daemon. Only `--model` reaches the agent from the caller.
+async fn start_session(rt: &Shared, args: &Value) -> Result<Value, String> {
+    let cwd = str_field(args, "cwd").to_string();
+    let name = str_field(args, "name").to_string();
+    let model = str_field(args, "model");
+    super::herdr::relay_cwd(&cwd)
+        .map_err(|_| format!("cwd {cwd:?} must be an existing absolute directory"))?;
+    check_session_name(&name)?;
+    let mut agent_args = Vec::new();
+    if !model.is_empty() {
+        agent_args = vec![json!("--model"), json!(model)];
+        super::herdr::relay_agent_args(&json!(agent_args))
+            .map_err(|_| format!("model {model:?} is not an accepted model name"))?;
+    }
+    super::herdr::call("ping", json!({}), Duration::from_secs(8))
+        .await
+        .map_err(|e| {
+            // herdr's own error already starts with "herdr not available".
+            let reason = e.strip_prefix("herdr not available: ").unwrap_or(&e);
+            format!(
+                "daemon-hosted sessions are not implemented yet, and herdr is not available: {reason}"
+            )
+        })?;
+    // Creation and its record complete together even if the caller goes
+    // away mid-start (the request future is dropped): otherwise herdr would
+    // run an agent nothing can stop.
+    let task_rt = rt.clone();
+    let index = tokio::spawn(async move {
+        let created = Instant::now();
+        let out = super::herdr::dispatch(
+            &task_rt,
+            &json!({"op":"session_create","name":name,"cwd":cwd,"agent":"pi","args":agent_args}),
+        )
+        .await?;
+        let pane = str_field(&out, "pane_id").to_string();
+        let session = str_field(&out, "session_id");
+        let id = if session == pane { "" } else { session };
+        let ident = super::herdr::pane_pi_ids(&pane).await.unwrap_or_default();
+        let mut state = task_rt.state.lock().unwrap();
+        state.created.push(CreatedSession {
+            pane,
+            id: id.into(),
+            ident,
+            name,
+            created,
+            pid: None,
+            exited: false,
+            pane_done: false,
+            stopping: false,
+        });
+        Ok::<_, String>(state.created.len() - 1)
+    })
+    .await
+    .map_err(|e| format!("start_session failed: {e}"))??;
+    let rows = rt.directory().await;
+    Ok(created_status(rt, &rows, index).await)
+}
+
+/// `stop_session`: stop a session this daemon created, the way `session rm`
+/// does (no pid is signalled). Anything else is refused before any herdr
+/// request that sends keys or closes a pane, and so is a pane whose agent
+/// cannot be identified as this session. Stopping an exited session succeeds
+/// and closes its pane only if it hosts no agent and no foreground process.
+async fn stop_session(rt: &Shared, session: &str) -> Result<Value, String> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err("session required".into());
+    }
+    let rows = rt.directory().await;
+    let Some(index) = find_created(rt, &rows, session)? else {
+        return Err(format!(
+            "session {session:?} was not started by this daemon; stop_session stops only sessions start_session created here"
+        ));
+    };
+    {
+        let mut state = rt.state.lock().unwrap();
+        let c = &mut state.created[index];
+        if c.stopping {
+            let mut result = json!({"name":c.name,"harness":"pi","host":"herdr","pane_id":c.pane,
+                "state":"stopping","stop_in_progress":true});
+            if !c.id.is_empty() {
+                result["id"] = json!(c.id);
+            }
+            return Ok(result);
+        }
+        c.stopping = true;
+    }
+    // Run to the end even if the caller goes away, so `stopping` is cleared.
+    let task_rt = rt.clone();
+    tokio::spawn(async move {
+        let result = stop_created(&task_rt, rows, index).await;
+        task_rt.state.lock().unwrap().created[index].stopping = false;
+        result
+    })
+    .await
+    .map_err(|e| format!("stop_session failed: {e}"))?
+}
+
+/// The one place this daemon sends keys to or closes a pane for MCP: a stop
+/// whose `session_close` finds, right before each key and before the close,
+/// that herdr identifies the pane's agent as this session. Anything else
+/// leaves the pane as it is and reports its id.
+async fn stop_created(rt: &Shared, rows: Vec<Value>, index: usize) -> Result<Value, String> {
+    let mut result = created_status(rt, &rows, index).await;
+    let c = rt.state.lock().unwrap().created[index].clone();
+    let pane = c.pane.clone();
+    if result["state"] == "exited" {
+        // Nothing of ours is left to stop. Its pane id may now name someone
+        // else's pane, so nothing is closed: the caller gets the id.
+        result["already_exited"] = json!(true);
+        result["pane"] = json!("left_open");
+        return Ok(result);
+    }
+    if c.pane_done {
+        // A stop already closed its pane (or it was seen gone): there is
+        // nothing left to act on, only the process to report.
+        result["already_exited"] = json!(false);
+        result["pane"] = json!("closed_earlier");
+        if result["state"] == "alive" {
+            result["still_running"] = json!(true);
+        }
+        return Ok(result);
+    }
+    let ids = c.ids();
+    if ids.is_empty() {
+        return Err(format!(
+            "pane {pane} hosts an agent not yet identified as session {:?}; stopped nothing",
+            c.name
+        ));
+    }
+    // Through its registration while it has one (checked to still be in its
+    // pane), else through the pane itself: an agent whose registration
+    // dropped is still running there. session_close re-checks the pane and
+    // the agent's identity right before each key and before the close.
+    let target = match rows
+        .iter()
+        .find(|row| !c.id.is_empty() && c.registration(row, &rt.machine))
+    {
+        Some(row) if str_field(row, "herdr_pane_id") != pane => {
+            return Err(format!(
+                "session {} is no longer in pane {pane} that this daemon created; stopped nothing",
+                c.id
+            ));
+        }
+        Some(_) => c.id.clone(),
+        None => pane.clone(),
+    };
+    // The session's pi is in the pane's foreground but herdr has not
+    // identified it yet: wait for herdr's identification (bounded), since
+    // keys go only to an agent herdr identifies as this session.
+    if let Some((pid, _)) = &c.pid {
+        if !super::herdr::await_identification(&pane, &ids, *pid, IDENTIFY_WAIT).await {
+            return Err(format!(
+                "stop of session {:?} in pane {pane}: nothing was sent; its pi (pid {pid}) runs in the pane, but herdr has not identified the pane's agent as this session within {}s; left it untouched",
+                c.name,
+                IDENTIFY_WAIT.as_secs()
+            ));
+        }
+    }
+    // deferred: a partial failure of session_close | impact: on an error after ctrl+c was sent
+    // the record keeps its last state until a later call observes the exit | trigger: callers
+    // need stop_session to report a stopped-but-pane-left-open outcome as a success
+    super::herdr::dispatch(
+        rt,
+        &json!({"op":"session_close","to":target,"expect_pane":pane,"expect_ids":ids}),
+    )
+    .await
+    .map_err(|e| format!("stop of session {:?} in pane {pane}: {e}", c.name))?;
+    // session_close answers only after it closed the pane or found it gone.
+    rt.state.lock().unwrap().created[index].pane_done = true;
+    result["already_exited"] = json!(false);
+    result["pane"] = json!("closed");
+    let pid = rt.state.lock().unwrap().created[index].pid.clone();
+    if let Some((pid, start)) = pid {
+        let deadline = Instant::now() + STOP_GRACE;
+        while probe(pid, start.clone()).await == Liveness::Alive {
+            if Instant::now() >= deadline {
+                // Its pane is closed but its process runs: not exited.
+                result["state"] = json!("alive");
+                result["pid"] = json!(pid);
+                result["still_running"] = json!(true);
+                return Ok(result);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    rt.state.lock().unwrap().created[index].exited = true;
+    result["state"] = json!("exited");
+    Ok(result)
 }
 // deferred: binding `from` to a caller credential | impact: any holder of the one MCP bearer
 // token (this user's MCP clients) can speak as any live local agent session, never as a
@@ -887,6 +1417,9 @@ async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, Strin
                 .insert(str_field(&row, "id").into(), name.into());
             Ok(json!({"ok":true}))
         }
+        SESSION_STATUS => session_status(rt, str_field(args, "session")).await,
+        START_SESSION => start_session(rt, args).await,
+        STOP_SESSION => stop_session(rt, str_field(args, "session")).await,
         _ => Err("unknown tool".into()),
     }
 }
@@ -979,7 +1512,7 @@ fn tools() -> Vec<Value> {
         &'static str,
         &'static [(&'static str, &'static str, bool)],
     );
-    let definitions: [ToolDefinition; 6] = [
+    let definitions: [ToolDefinition; 9] = [
         ("send", "Send a message to another agent session over intercom", &[
             ("to", "target session name or id", true),
             ("message", "message text", true),
@@ -1001,6 +1534,17 @@ fn tools() -> Vec<Value> {
         ]),
         ("idle_status", "Look up the latest status of an idle notification subscription", &[
             ("subscription_id", "subscription id returned by notify_when_idle", true),
+        ]),
+        (SESSION_STATUS, "Report whether a session's process is alive, exited, or unknown to this daemon (no pid, or another machine); starting only for a session start_session returned before it registered. Judged from the process, not the advisory registry status. Read-only.", &[
+            ("session", "session id or unique name", true),
+        ]),
+        (START_SESSION, "Experimental: start a pi agent session in a new herdr pane in cwd and track it. The call returns once the agent has registered (normally a few seconds), with its intercom id and state alive; only if it has not registered within 10s does it return state starting, with pane_id as the handle. The session id, the pane id and the name given here are handles for session_status and stop_session.", &[
+            ("cwd", "existing absolute directory to run the agent in", true),
+            ("name", "session name: starts with a lowercase letter, then lowercase letters, digits, '-' or '_'; 1-32 characters", true),
+            ("model", "optional model name, passed as --model", false),
+        ]),
+        (STOP_SESSION, "Experimental: stop a session that start_session created on this daemon, the way `session rm` does. Any other session is refused. Stopping an exited session succeeds. While herdr has not yet identified the session's agent in its pane, the stop waits up to 5s for it, then refuses without sending anything.", &[
+            ("session", "session id, unique name, or the pane_id start_session returned", true),
         ]),
     ];
     let mut tools: Vec<_> = definitions
@@ -1304,6 +1848,23 @@ mod tests {
             server_info()
         );
         assert!(reply.get("error").is_none());
+    }
+
+    #[test]
+    fn session_status_takes_one_required_session_string() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "session_status")
+            .expect("session_status is listed");
+        assert_eq!(tool["inputSchema"]["required"], json!(["session"]));
+        assert!(validate_arguments(&tool, &json!({"session":"pi/a"})).is_ok());
+        for args in [
+            json!({}),
+            json!({"session":1}),
+            json!({"session":"a","pid":"1"}),
+        ] {
+            assert!(validate_arguments(&tool, &args).is_err(), "{args}");
+        }
     }
 
     #[test]

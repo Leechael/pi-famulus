@@ -63,7 +63,9 @@ export function renderMatrix(files: string[], k: number): string {
   const rule = `|---|---|${models.map(() => "---").join("|")}|`;
   // The default grid, plus any opt-in scenario this run actually scored.
   const ran = new Set([...c.keys()].map((key) => key.split("\u0000")[1]));
-  const shown = SCENARIOS.filter((s) => DEFAULT_SCENARIOS.includes(s) || ran.has(s.id));
+  // Default scenarios are always listed (missing = X) unless the run covered only opt-in probes.
+  const anyDefault = DEFAULT_SCENARIOS.some((s) => ran.has(s.id));
+  const shown = SCENARIOS.filter((s) => (anyDefault && DEFAULT_SCENARIOS.includes(s)) || ran.has(s.id));
   const rows = shown.map(
     (s) => `| \`${s.id}\` | ${s.behavior.replace(/\|/g, "\\|")} | ${models.map((m) => (passes(c.get(`${m}\u0000${s.id}`), k) ? "" : "X")).join(" | ")} |`,
   );

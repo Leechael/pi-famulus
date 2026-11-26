@@ -18,7 +18,7 @@ import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
-const EXTENSION_VERSION = "0.2.3";
+const EXTENSION_VERSION = "0.2.6";
 export { EXTENSION_VERSION };
 // 6: hosted subagents. 7: the extension's messaging bridge (`intercom`
 // request plus `intercom`/`intercom_reset` events).
@@ -44,6 +44,10 @@ export type TaskOrigin =
   | { via: "child-bash"; child_id: string; run_id: string };
 
 export type StopReason = "tui" | "cli" | "tool" | "timeout" | "rate-limit" | "session-end";
+
+export interface StopResult {
+  alreadyEnded: { status: string; exitCode: number | null; signal: string | null } | null;
+}
 
 export interface StartRequest {
   kind: "shell" | "monitor";
@@ -495,8 +499,18 @@ export class ManagerClient {
     await this.request({ type: "mark_background", task_id: taskId });
   }
 
-  async stop(taskId: string, reason: StopReason = "tool"): Promise<void> {
-    await this.request({ type: "stop", task_id: taskId, reason });
+  /** `alreadyEnded` is set when the task had ended and nothing was signalled. */
+  async stop(taskId: string, reason: StopReason = "tool"): Promise<StopResult> {
+    const res = await this.request({ type: "stop", task_id: taskId, reason });
+    const ended = (res as { already_ended?: { status?: unknown; exit_code?: unknown; signal?: unknown } } | undefined)?.already_ended;
+    if (!ended || typeof ended.status !== "string") return { alreadyEnded: null };
+    return {
+      alreadyEnded: {
+        status: ended.status,
+        exitCode: typeof ended.exit_code === "number" ? ended.exit_code : null,
+        signal: typeof ended.signal === "string" ? ended.signal : null,
+      },
+    };
   }
 
   async list(all = false): Promise<TaskRecord[]> {

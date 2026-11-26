@@ -25,11 +25,11 @@ Hard kill timeout in seconds (optional, no default timeout)
 
 # param: run_in_background
 
-Start the command in the background and return immediately. You will be notified when it completes.
+Start the command in the background and return immediately. You will be notified when it exits; a command that keeps running (a server, a watcher) never notifies, so to act once it is ready, run it as a monitor command instead.
 # result: backgrounded
 
 Command "{{command}}" moved to background (task_id: {{taskId}}). Output: {{outputPath}}.<!--seg:result.bash-bg-instruction-->
-You will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pi-famulus-wake kind="task"> when it arrives.<!--/seg-->
+You will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pi-famulus-wake kind="task"> when it arrives.<!--/seg--><!--seg:result.bash-bg-exit-only--> That wake comes only when the command exits. If it keeps running (a server, a watcher) and you need to know when it is ready or prints something, start a monitor for that before you end your turn.<!--/seg-->
 
 # error: bare-sleep
 

@@ -2736,7 +2736,7 @@ fn handle_stop(
     conn_id: u64,
     task_id: &str,
     reason: Option<&str>,
-) -> Result<UnitOk, ProtoError> {
+) -> Result<StopOk, ProtoError> {
     if let Some(r) = reason {
         if !STOP_REASONS.contains(&r) {
             return Err(ProtoError::new(
@@ -2754,7 +2754,15 @@ fn handle_stop(
         let acc = access_for(&st, conn_id);
         let e = st.registry.visible_mut(task_id, &acc)?;
         if !e.owns_live_group() {
-            return Ok(UnitOk {}); // idempotent: terminal and nothing left
+            // Idempotent: terminal and nothing left. Say so, so the caller
+            // does not claim it just signalled the task.
+            return Ok(StopOk {
+                already_ended: Some(AlreadyEnded {
+                    status: e.record.status,
+                    exit_code: e.record.exit_code,
+                    signal: e.record.signal.clone(),
+                }),
+            });
         }
         // A terminal task with a lingering group keeps its status; stop
         // still takes down what it left behind.
@@ -2771,7 +2779,9 @@ fn handle_stop(
     // §3.3 stop: SIGTERM the process group, 2s grace, then SIGKILL.
     let _ = task::signal_group(pid, task::SIGTERM);
     spawn_kill_reaper(state, task_id, pid);
-    Ok(UnitOk {})
+    Ok(StopOk {
+        already_ended: None,
+    })
 }
 
 /// A hosted child died. Stop the foreground shells it started so they do

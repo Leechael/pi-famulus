@@ -53,7 +53,8 @@ describe("computer-use compatibility context protocol", () => {
       },
     });
     try {
-      await pi.ready(60_000);
+      // macOS CI runners take close to 60 s to answer get_state (62-66 s per pi-spawning test on main, 2026-11-07).
+      await pi.ready(120_000);
       await pi.prompt("compat-protocol");
       assert.equal(await pi.waitQuiet(100, 30_000), true, pi.stderr.join(""));
       const calls = readFileSync(tracePath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { messages: Array<Record<string, unknown>> });

@@ -144,6 +144,9 @@ fn mcp_lists_non_ui_tools_sends_and_queries_receipts_without_new_turn_injection(
         "message_status",
         "notify_when_idle",
         "idle_status",
+        "session_status",
+        "start_session",
+        "stop_session",
     ] {
         assert!(names.contains(&name), "MCP tool {name} absent: {tools}");
     }

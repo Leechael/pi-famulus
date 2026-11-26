@@ -50,6 +50,14 @@ describe("matrix", () => {
     assert.ok(probed.includes("| `monitor-waiter-event`"));
   });
 
+  it("an opt-in-only run does not list the unrun default scenarios", () => {
+    const optInOnly = renderMatrix([file("optin.jsonl", [ep("p/m:high", "monitor-behavior-natural", true)])], 1);
+    assert.ok(optInOnly.includes("| `monitor-behavior-natural`"));
+    assert.ok(!optInOnly.includes("| `bg-end-turn`"), "defaults nobody ran are not rows of X in an opt-in-only section");
+    const mixed = renderMatrix([file("mixed.jsonl", [ep("p/m:high", "monitor-behavior-natural", true), ep("p/m:high", "bg-end-turn", true)])], 1);
+    assert.ok(mixed.includes("| `resume-finished`"), "a run with any default scenario still lists every default");
+  });
+
   it("escapes | in the tests column so the GFM row keeps its columns", () => {
     const table = renderMatrix([file("one.jsonl", [ep("p/m:high", "bg-end-turn", true)])], 10);
     const row = table.split("\n").find((l) => l.startsWith("| `monitor-not-sleep`"))!;

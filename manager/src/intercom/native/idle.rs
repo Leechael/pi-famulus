@@ -1562,6 +1562,7 @@ mod tests {
                 pending_local: HashSet::new(),
                 pending_remote: HashSet::new(),
                 relay_workspaces: HashSet::new(),
+                created: Vec::new(),
                 supervised: false,
                 incoming: Default::default(),
                 subscriptions: HashMap::new(),

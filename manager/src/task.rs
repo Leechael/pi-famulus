@@ -355,16 +355,36 @@ pub fn lifeline() -> io::Result<&'static Lifeline> {
 
 /// Path of the binary that provides `__run`: this executable. Unit tests
 /// run inside the test harness, so they use the `pi-famulus` binary cargo
-/// builds next to it.
+/// builds next to it; when a filtered `cargo test` never built that binary,
+/// the error says so instead of handing back a path that cannot exist.
 pub fn runner_exe() -> io::Result<PathBuf> {
     #[cfg(test)]
     {
         let exe = std::env::current_exe()?;
-        // target/<profile>/deps/pi_famulus-<hash> -> target/<profile>/pi-famulus
-        if let Some(profile_dir) = exe.parent().and_then(|d| d.parent()) {
-            return Ok(profile_dir.join("pi-famulus"));
+        let name = format!("pi-famulus{}", std::env::consts::EXE_SUFFIX);
+        // Cargo leaves the harness below the profile directory, but not at a
+        // fixed depth: `deps/pi_famulus-<hash>` in the classic layouts, and
+        // `build/<pkg>/<hash>/out/pi_famulus-<hash>` in the unified one
+        // (cargo 1.100). The crate's own binary sits directly in the profile
+        // directory, so climb to the first ancestor that holds it instead of
+        // assuming how many levels the harness is down.
+        for dir in exe.ancestors().skip(1).take(5) {
+            let candidate = dir.join(&name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
-        Ok(exe)
+        // Nothing built it (e.g. `cargo test --bin pi-famulus` alone skips the
+        // binary target): say what is missing instead of naming a path cargo
+        // never writes — the unified layout's build directory is no home for it.
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no pi-famulus runner next to {}; run the tests without a target filter \
+                 (`cargo test`) so cargo builds the crate's binary as well",
+                exe.display()
+            ),
+        ))
     }
     #[cfg(all(not(test), target_os = "linux"))]
     {
@@ -1037,6 +1057,19 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Cargo has moved test harnesses before (deps/ → the unified
+    /// `build/<pkg>/<hash>/out/` layout); a wrong guess here fails every test
+    /// that spawns a real task, so the guess is asserted directly.
+    #[test]
+    fn runner_exe_resolves_the_binary_cargo_built() {
+        let runner = runner_exe().expect("runner path");
+        assert!(runner.is_file(), "runner not built at {}", runner.display());
+        assert_eq!(
+            runner.file_stem().and_then(|stem| stem.to_str()),
+            Some("pi-famulus")
+        );
     }
 
     #[cfg_attr(windows, allow(dead_code))]

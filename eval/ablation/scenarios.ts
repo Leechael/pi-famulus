@@ -8,6 +8,8 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Item, toolResults, wakes } from "../lib/transcript.ts";
+import { agentWaitScenarios } from "./agent-wait-scenarios.ts";
+import { idleAfterDoneScenarios } from "./idle-after-done-scenarios.ts";
 import { monitorWaiterScenarios } from "./monitor-waiter-scenarios.ts";
 import {
   ackAndStop,
@@ -59,6 +61,9 @@ export interface Scenario {
   /** Stop waiting early once this holds (then a short quiet window). */
   done: (items: Item[], ep: EpisodeView) => boolean;
   quietMs: number;
+  /** Settled+silent time before giving up when nothing runs (default 6000). Raise it when a
+   *  wake is expected after all tasks ended, e.g. a batched monitor timeout notice (≤10 s). */
+  idleGiveUpMs?: number;
   /** Rough model calls per episode (parent + children), for cost estimates. */
   estCalls: number;
   setup: (cwd: string, secretDir: string) => ScenarioSetup;
@@ -616,6 +621,8 @@ export const SCENARIOS: Scenario[] = [
   overrunStuck,
   overrunProgressing,
   ...monitorWaiterScenarios,
+  ...idleAfterDoneScenarios,
+  ...agentWaitScenarios,
 ];
 
 /** Preserve the original smoke/full grid unless explicitly selected. */

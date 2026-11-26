@@ -10,7 +10,7 @@
 import { Type } from "typebox";
 import { shellStartStatus } from "./shell-start";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { formatExitFacts, formatMonitorEvent } from "./format";
+import { formatDuration, formatExitFacts, formatMonitorEvent } from "./format";
 import { MONITOR_IDLE_INSTRUCTION } from "./behavior-guidelines";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
@@ -22,11 +22,13 @@ import {
   RateLimiter,
   OverloadController,
   LegacyLineAssembler,
+  LEGACY_PARTIAL_MAX_CHARS,
   OVERLOAD_SUMMARY_LINES_PER_SEC,
   OVERLOAD_WINDOW_MS,
   SUMMARY_CADENCE_MS,
   type OverloadControllerOptions,
   type OverloadEnterReason,
+  type OverloadInput,
   type OverloadSummaryOutput,
 } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
@@ -38,6 +40,9 @@ import type { WorkIndex } from "./work-index";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 3_600_000;
+/** stall_after_ms bounds: shorter than 10s is a heartbeat; a day is the longest useful silence. */
+const MIN_STALL_MS = 10_000;
+const MAX_STALL_MS = 86_400_000;
 /**
  * A clean exit this soon after an event was caused by it (`grep -m1`). Its
  * notice is appended without starting a turn: as a wake it cost every such monitor a
@@ -110,6 +115,17 @@ interface MonitorEntry {
   stopRequested?: boolean;
   /** Prevents autoStop from re-entering while it drains the 200ms batcher. */
   stopping?: boolean;
+  /**
+   * wake_on: only lines matching it reach the batchers, dedup, overload
+   * accounting and wakes. Every line stays in the manager's task log.
+   */
+  wakeOn: RegExp | null;
+  stallAfterMs: number | null;
+  stallTimer: ClockTimer | null;
+  /** Last new output (any line or progress record, matching wake_on or not). */
+  lastActivityAt: number;
+  /** The stall notice went out; the next output re-arms it. */
+  stallNotified: boolean;
 }
 
 export class MonitorRegistry {
@@ -131,7 +147,7 @@ export class MonitorRegistry {
   }
 
   /** Active monitors for the fleet status surface and task_list extras. */
-  listActive(): { taskId: string; description: string; startedAt: number; remainingMs: number | null; persistent: boolean; lastEventAt?: number; lastOutputAt?: number }[] {
+  listActive(): { taskId: string; description: string; startedAt: number; remainingMs: number | null; persistent: boolean; lastEventAt?: number; lastOutputAt?: number; wakeOn?: string; stallAfterMs?: number }[] {
     const now = this.clock.now();
     return [...this.entries.values()]
       .filter((e) => !e.stopped)
@@ -143,6 +159,8 @@ export class MonitorRegistry {
         remainingMs: e.timeoutDeadlineAt === null ? null : Math.max(0, e.timeoutDeadlineAt - now),
         lastEventAt: e.lastEventAt,
         lastOutputAt: e.lastOutputAt,
+        ...(e.wakeOn ? { wakeOn: e.wakeOn.source } : {}),
+        ...(e.stallAfterMs !== null ? { stallAfterMs: e.stallAfterMs } : {}),
       }))
       .sort((a, b) => a.startedAt - b.startedAt);
   }
@@ -163,7 +181,7 @@ export class MonitorRegistry {
 
   /** Start a monitor process and subscribe to its output stream. */
   async start(
-    params: { command: string; description: string; timeout_ms?: number; persistent?: boolean; dedup_window_ms?: number; fingerprint_mode?: FingerprintMode },
+    params: { command: string; description: string; timeout_ms?: number; persistent?: boolean; dedup_window_ms?: number; fingerprint_mode?: FingerprintMode; wake_on?: string; stall_after_ms?: number },
     ctx: ExtensionContext,
   ): Promise<{ taskId: string; timeoutMs: number | null }> {
     const client = this.deps.getClient();
@@ -177,7 +195,29 @@ export class MonitorRegistry {
     if (params.fingerprint_mode !== undefined && params.fingerprint_mode !== "exact" && params.fingerprint_mode !== "ignore-timestamps") {
       throw new RangeError("fingerprint_mode must be exact or ignore-timestamps");
     }
-    const persistent = params.persistent === true;
+    if (params.persistent === true && params.timeout_ms !== undefined) {
+      throw new RangeError("timeout_ms and persistent are exclusive: use timeout_ms for a watch that ends within 1 hour, persistent:true for an open-ended or longer watch");
+    }
+    if (params.timeout_ms !== undefined && params.timeout_ms > MAX_TIMEOUT_MS) {
+      throw new RangeError("timeout_ms exceeds the 1-hour maximum; for longer watches use persistent:true instead of re-arming");
+    }
+    let wakeOn: RegExp | null = null;
+    if (params.wake_on !== undefined) {
+      if (typeof params.wake_on !== "string" || params.wake_on.length === 0) {
+        throw new RangeError("wake_on must be a non-empty regular expression source");
+      }
+      try {
+        wakeOn = new RegExp(params.wake_on);
+      } catch (error) {
+        throw new RangeError(`wake_on is not a valid regular expression: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (params.stall_after_ms !== undefined && (!Number.isSafeInteger(params.stall_after_ms) || params.stall_after_ms < MIN_STALL_MS || params.stall_after_ms > MAX_STALL_MS)) {
+      throw new RangeError(`stall_after_ms must be an integer between ${MIN_STALL_MS} and ${MAX_STALL_MS}`);
+    }
+    // No lifetime given: run until the command exits or the monitor is stopped.
+    // persistent:false without timeout_ms keeps the 5-minute default.
+    const persistent = params.persistent === true || (params.persistent !== false && params.timeout_ms === undefined);
     let timeoutMs: number | null = null;
     if (!persistent) {
       const requested = params.timeout_ms ?? DEFAULT_TIMEOUT_MS;
@@ -216,6 +256,11 @@ export class MonitorRegistry {
       cursor: 0,
       recovering: false,
       queuedOutput: [],
+      wakeOn,
+      stallAfterMs: params.stall_after_ms ?? null,
+      stallTimer: null,
+      lastActivityAt: now,
+      stallNotified: false,
     };
     entry.overload = new OverloadController({
       clock: this.clock,
@@ -245,6 +290,7 @@ export class MonitorRegistry {
       }, timeoutMs);
       this.clock.unref?.(entry.timeoutTimer);
     }
+    if (entry.stallAfterMs !== null) this.armStall(entry, entry.stallAfterMs);
     this.entries.set(task_id, entry);
     this.emitChange();
     // Replay what arrived before we knew the id: lines first, then the exit.
@@ -297,6 +343,7 @@ export class MonitorRegistry {
       // Empty metadata arrays deliberately hold raw fragments for Rust framing.
       entry.batcher.flush();
       const accepted: MonitorOutputRecord[] = [];
+      let filteredLines = 0;
       let metadataTookOver = false;
       for (const record of records) {
         if (!validRecord(record, entry.cursor)) continue;
@@ -305,10 +352,18 @@ export class MonitorRegistry {
         entry.recordCursor = record.cursor_end;
         entry.lastRecordKind = record.kind;
         if (record.kind === "line") entry.lastOutputAt = this.clock.now();
+        this.noteActivity(entry);
+        // Filtered-out records reach neither dedup nor wake accounting,
+        // only the stop backstop.
+        if (!admits(entry, record.preview)) {
+          if (record.kind === "line") filteredLines++;
+          continue;
+        }
         entry.output.push(record);
         if (record.kind === "line") accepted.push(record);
       }
       if (metadataTookOver) entry.legacyLines.reset();
+      this.noteFilteredLines(entry, filteredLines);
       if (accepted.length > 0) {
         this.noteInput(entry, {
           lines: accepted.length,
@@ -320,15 +375,39 @@ export class MonitorRegistry {
       }
     } else if (deliver.byteLength > 0) {
       // Legacy manager or unavailable replay metadata: fail open, never hash in JS.
+      // Raw framing accounts for every COMPLETE line through `entry.cursor`. The
+      // manager re-sends records at a cursor it already wrote (`replay_at` in
+      // daemon.rs), so a line delivered raw must count as seen or a burst that
+      // arrived unframed (post-upgrade MonitorState rebuild) repeats its last
+      // line. Complete lines only: a trailing fragment is still framed by the
+      // manager's own finish/EOF line record at the same cursor, and under
+      // wake_on that fragment has not been admitted yet.
+      const lastNewline = deliver.lastIndexOf(0x0a);
+      if (lastNewline >= 0) {
+        const completed = entry.cursor - deliver.byteLength + lastNewline + 1;
+        if (completed > entry.recordCursor) {
+          entry.recordCursor = completed;
+          entry.lastRecordKind = "line";
+        }
+      }
       entry.output.flush();
       const cursorStart = Math.max(previousCursor, entry.cursor - deliver.byteLength);
       const text = deliver.toString("utf8");
-      if (text.includes("\n")) entry.lastOutputAt = this.clock.now();
+      if (text.includes("\n")) {
+        entry.lastOutputAt = this.clock.now();
+        this.noteActivity(entry);
+      }
+      const assembled = entry.legacyLines.push(text, deliver.byteLength, cursorStart, entry.cursor);
+      if (entry.wakeOn) {
+        // Raw chunks are filtered per completed line; a trailing fragment
+        // waits for its newline (or the exit).
+        if (assembled) this.admitLegacyLines(entry, assembled);
+        return;
+      }
       entry.legacyOutput = mergeOutputInfo(entry.legacyOutput, {
         firstObservedAt: this.clock.now(), lastObservedAt: this.clock.now(),
         cursorStart, cursorEnd: entry.cursor,
       });
-      const assembled = entry.legacyLines.push(text, deliver.byteLength, cursorStart, entry.cursor);
       if (assembled) {
         this.noteInput(entry, {
           lines: assembled.lines,
@@ -340,6 +419,68 @@ export class MonitorRegistry {
       }
       entry.batcher.push(text);
     }
+  }
+
+  /** wake_on on the raw path: pass only matching completed lines on to overload accounting and the batcher. */
+  private admitLegacyLines(entry: MonitorEntry, assembled: OverloadInput): void {
+    const all = (assembled.text ?? "").split("\n");
+    const lines = all.filter((line) => admits(entry, line));
+    this.noteFilteredLines(entry, all.length - lines.length);
+    if (lines.length === 0) return;
+    const now = this.clock.now();
+    entry.legacyOutput = mergeOutputInfo(entry.legacyOutput, {
+      firstObservedAt: now, lastObservedAt: now,
+      cursorStart: assembled.cursorStart, cursorEnd: assembled.cursorEnd,
+      // The assembler keeps at most LEGACY_PARTIAL_MAX_CHARS of a line.
+      truncated: lines.some((line) => line.length >= LEGACY_PARTIAL_MAX_CHARS),
+    });
+    this.noteInput(entry, {
+      lines: lines.length,
+      bytes: lines.reduce((n, line) => n + Buffer.byteLength(line) + 1, 0),
+      text: lines.join("\n"),
+      cursorStart: assembled.cursorStart ?? entry.cursor,
+      cursorEnd: assembled.cursorEnd ?? entry.cursor,
+    });
+    entry.batcher.push(lines.map((line) => `${line}\n`).join(""));
+  }
+
+  /** Any new output proves the source is alive: re-arm a stall notice that already went out. */
+  private noteActivity(entry: MonitorEntry): void {
+    entry.lastActivityAt = this.clock.now();
+    if (entry.stallAfterMs !== null && entry.stallNotified) {
+      entry.stallNotified = false;
+      this.armStall(entry, entry.stallAfterMs);
+    }
+  }
+
+  private armStall(entry: MonitorEntry, delayMs: number): void {
+    if (entry.stallTimer !== null) this.clock.clearTimeout(entry.stallTimer);
+    entry.stallTimer = this.clock.setTimeout(() => this.onStallDue(entry), delayMs);
+    this.clock.unref?.(entry.stallTimer);
+  }
+
+  /** One timer per monitor, re-checked lazily, so output never touches timers. */
+  private onStallDue(entry: MonitorEntry): void {
+    entry.stallTimer = null;
+    if (entry.stopped || entry.stallAfterMs === null) return;
+    const idle = this.clock.now() - entry.lastActivityAt;
+    if (idle < entry.stallAfterMs) {
+      this.armStall(entry, entry.stallAfterMs - idle);
+      return;
+    }
+    entry.stallNotified = true;
+    if (entry.stopRequested || entry.stopping) return;
+    const center = this.deps.getNotifyCenter();
+    if (!center) return;
+    this.deps.logEvent?.("monitor.stall", { id: entry.taskId, idleMs: idle });
+    center.notifyMonitorEvent(entry.description, entry.taskId, fill("tools.monitor.event.stalled", { idle: formatDuration(idle) }), 0, {});
+  }
+
+  /** Lines wake_on kept from waking still count toward the input-rate stop backstop. */
+  private noteFilteredLines(entry: MonitorEntry, lines: number): void {
+    if (lines <= 0) return;
+    entry.overload.recordFilteredLines(lines);
+    if (entry.overload.shouldStop() && !entry.stopRequested && !entry.stopping) void this.autoStop(entry);
   }
 
   /** Count complete raw lines/chunks before limiter (includes later-deduped lines). */
@@ -373,7 +514,12 @@ export class MonitorRegistry {
       this.earlyFor(taskId).exit = event;
       return false;
     }
-    // Drain remaining buffered lines before closing out.
+    // Drain remaining buffered lines before closing out. Unfiltered raw
+    // output already holds the trailing fragment in the batcher.
+    if (entry.wakeOn) {
+      const partial = entry.legacyLines.drainPartial();
+      if (partial) this.admitLegacyLines(entry, partial);
+    }
     entry.batcher.flush();
     entry.output.flush();
     const alreadyStopped = entry.stopped;
@@ -593,9 +739,17 @@ export class MonitorRegistry {
       this.clock.clearTimeout(entry.timeoutTimer);
       entry.timeoutTimer = null;
     }
+    if (entry.stallTimer !== null) {
+      this.clock.clearTimeout(entry.stallTimer);
+      entry.stallTimer = null;
+    }
     this.entries.delete(entry.taskId);
     this.emitChange();
   }
+}
+
+function admits(entry: MonitorEntry, line: string): boolean {
+  return entry.wakeOn === null || entry.wakeOn.test(line);
 }
 
 function validRecord(record: MonitorOutputRecord, cursor: number): boolean {
@@ -643,6 +797,14 @@ const monitorParameters = Type.Object({
   persistent: Type.Optional(Type.Boolean({ description: PROMPTS["tools.monitor.param.persistent"] })),
   dedup_window_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 3_600_000, description: PROMPTS["tools.monitor.param.dedup_window_ms"] })),
   fingerprint_mode: Type.Optional(Type.Union([Type.Literal("exact"), Type.Literal("ignore-timestamps")], { description: PROMPTS["tools.monitor.param.fingerprint_mode"] })),
+  wake_on: Type.Optional(Type.String({ minLength: 1, description: PROMPTS["tools.monitor.param.wake_on"] })),
+  stall_after_ms: Type.Optional(
+    Type.Integer({
+      minimum: MIN_STALL_MS,
+      maximum: MAX_STALL_MS,
+      description: fill("tools.monitor.param.stall_after_ms", { minMs: MIN_STALL_MS, maxMs: MAX_STALL_MS }),
+    }),
+  ),
 });
 
 export function createMonitorTool(
