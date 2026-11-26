@@ -10,6 +10,7 @@ mod deliveries;
 mod herdr;
 mod http;
 mod idle;
+mod liveness;
 mod localrpc;
 pub(crate) mod native;
 pub mod port;
@@ -118,6 +119,8 @@ pub struct State {
     /// Herdr workspaces a relay peer created, with the origin machine that
     /// created each; only that origin may extend or close them.
     pub relay_workspaces: HashSet<RelayWorkspace>,
+    /// Sessions the MCP `start_session` tool created on this daemon.
+    created: Vec<http::CreatedSession>,
     /// A `serve` or `top` lease holds the manager (status reports it).
     pub supervised: bool,
     pub pending_remote: HashSet<String>,
@@ -460,6 +463,7 @@ pub async fn start(c: Config, clock: crate::clock::Clock) -> Result<Running, Str
             pending_local: HashSet::new(),
             pending_remote: HashSet::new(),
             relay_workspaces: HashSet::new(),
+            created: Vec::new(),
             supervised: false,
             incoming: deliveries::InjectionDedup::from_carried(std::mem::take(
                 &mut *CARRIED_DEDUP.lock().unwrap(),

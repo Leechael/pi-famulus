@@ -193,7 +193,7 @@ async fn overlay_at(
         if let Ok(result) = call_at(
             path,
             "pane.process_info",
-            json!({"target":pane["pane_id"]}),
+            json!({"pane_id":pane["pane_id"]}),
             remaining(),
         )
         .await
@@ -320,7 +320,7 @@ async fn revalidate_pane(row: &Value, pane_id: &str) -> Result<(), String> {
         ));
     }
     if str_field(row, "harness") == "claude" && row["pid"].as_u64().unwrap_or(0) > 0 {
-        if let Ok(result) = quick("pane.process_info", json!({"target": pane_id})).await {
+        if let Ok(result) = quick("pane.process_info", json!({ "pane_id": pane_id })).await {
             if result["process_info"]["foreground_processes"]
                 .as_array()
                 .into_iter()
@@ -333,6 +333,12 @@ async fn revalidate_pane(row: &Value, pane_id: &str) -> Result<(), String> {
         return Err(format!("session {id} no longer owns pane {pane_id}"));
     }
     Err(format!("pane {pane_id} no longer hosts session {id}"))
+}
+/// Whether `token` has the shape of a raw herdr pane or tab id, which herdr
+/// 0.9.5 writes as `<workspace>:p<n>` / `<workspace>:t<n>` (e.g. `w1Q:p5T`).
+/// The one place to change if herdr's id format changes.
+fn looks_like_pane_id(token: &str) -> bool {
+    token.contains(":p") || token.contains(":t")
 }
 /// A relay peer may only drive panes that host a local agent session; raw pane
 /// ids and Herdr-detected panes without an intercom session are local-only.
@@ -355,7 +361,7 @@ async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, Stri
         )),
         Err(error) => {
             if !relay
-                && (token.contains(":p") || token.contains(":t"))
+                && looks_like_pane_id(token)
                 && panes()
                     .await?
                     .iter()
@@ -393,38 +399,300 @@ async fn start_agent(rt: &Runtime, req: &Value, pane: &str) -> Result<(String, S
     )
     .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Only a local registration of the agent kind just started can be it: a
+    // row from another machine may carry the same pane id.
+    let started = |r: &Value| {
+        let owner = str_field(r, "machine_id");
+        (owner.is_empty() || owner == rt.machine)
+            && str_field(r, "harness") == str_field(req, "agent")
+            && str_field(r, "herdr_pane_id") == pane
+            && str_field(r, "id") != pane
+    };
     while tokio::time::Instant::now() < deadline {
-        if let Some(row) = rt
-            .directory()
-            .await
-            .iter()
-            .find(|r| str_field(r, "herdr_pane_id") == pane && str_field(r, "id") != pane)
-        {
+        if let Some(row) = rt.directory().await.iter().find(|r| started(r)) {
             return Ok((str_field(row, "id").into(), str_field(row, "name").into()));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     Ok((pane.into(), str_field(req, "name").into()))
 }
-async fn wait_exited(pane: &str, seconds: u64) -> bool {
+/// Whether `pane`'s own shell has its terminal back: herdr's
+/// `pane.process_info` names the terminal's foreground process group, which
+/// is the shell's own group (`shell_pid`) exactly when nothing else runs in
+/// the foreground; any foreground job, an agent included, takes the group
+/// over. herdr 0.9.5 lists an idle shell itself as a foreground process, so
+/// the process list alone cannot tell idle from busy. `None` when herdr does
+/// not say.
+fn shell_has_terminal(process_info: &Value) -> Option<bool> {
+    let info = &process_info["process_info"];
+    let shell = info["shell_pid"].as_u64()?;
+    let group = info["foreground_process_group_id"].as_u64()?;
+    Some(shell == group)
+}
+/// `pane.process_info` for `pane`; herdr selects the pane by `pane_id` only
+/// and answers for the focused pane without it.
+async fn process_info(pane: &str) -> Result<Value, String> {
+    quick("pane.process_info", json!({ "pane_id": pane })).await
+}
+/// How long `session rm` waits after ctrl+c before sending ctrl+d: a pi
+/// was still running 3s after one ctrl+c, so waiting longer for it only
+/// delays the stop (the ctrl+c still gets to cancel a turn first).
+const PI_CTRL_C_WAIT_SECS: u64 = 3;
+const CTRL_C_WAIT_SECS: u64 = 10;
+/// What holds a pane's terminal while `session rm` waits for its agent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Foreground {
+    /// The pane's shell has it back (or the pane is gone, or herdr cannot be
+    /// asked: later steps check the pane again).
+    Shell,
+    /// A process group other than the agent's has it: something the user
+    /// started there. Nothing herdr reports later changes that the pane is
+    /// left open, so this is decided at once.
+    Other,
+    /// The agent (or something herdr cannot tell apart from it) still has it.
+    Agent,
+}
+fn foreground_group(process_info: &Value) -> Option<u64> {
+    process_info["process_info"]["foreground_process_group_id"].as_u64()
+}
+/// The process group in `pane`'s foreground before the stop, when it is not
+/// the shell's: the agent's, to tell it from whatever runs there later.
+async fn agent_group(pane: &str) -> Option<u64> {
+    match process_info(pane).await {
+        Ok(r) if shell_has_terminal(&r) == Some(false) => foreground_group(&r),
+        _ => None,
+    }
+}
+/// Waits up to `seconds` for the agent (process group `agent`, when known)
+/// to leave `pane`'s foreground, returning as soon as it has.
+async fn wait_exited(pane: &str, seconds: u64, agent: Option<u64>) -> Foreground {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
     loop {
-        match quick("pane.process_info", json!({"target":pane})).await {
-            Ok(r)
-                if r["process_info"]["foreground_processes"]
-                    .as_array()
-                    .is_some_and(|a| !a.is_empty()) => {}
+        match process_info(pane).await {
+            Ok(r) => match shell_has_terminal(&r) {
+                Some(true) => return Foreground::Shell,
+                Some(false) if agent.is_some() && foreground_group(&r) != agent => {
+                    return Foreground::Other
+                }
+                _ => {}
+            },
+            Err(_) => return Foreground::Shell,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Foreground::Agent;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// The pane `session rm` may still act on after stopping the agent in `pane`.
+/// An agent that exited took its registration with it, so its id no longer
+/// resolves; its pane is then still ours while it hosts no agent. `None`
+/// means the pane is already gone. Errors say what `done` already did.
+async fn pane_after_stop(
+    rt: &Runtime,
+    target: &str,
+    relay: bool,
+    pane: &str,
+    stopped: &[String],
+    closing: bool,
+    done: &str,
+) -> Result<Option<String>, String> {
+    // The target counts only while it still resolves to the pane that was
+    // stopped: a name can move to another session in another pane.
+    let error = match pane_for(rt, target, relay).await {
+        Ok(current) if current == pane => return Ok(Some(current)),
+        Ok(other) => format!("{target} now resolves to pane {other}"),
+        Err(error) => error,
+    };
+    let listed = panes()
+        .await
+        .map_err(|e| format!("{done}, then could not list panes: {e}"))?;
+    match listed.iter().find(|p| str_field(p, "pane_id") == pane) {
+        None => Ok(None),
+        Some(p) if !hosts_agent(p) => {
+            if pane_busy(pane).await {
+                return Err(format!(
+                    "{done}; pane {pane} hosts no agent but runs a foreground process; left it open"
+                ));
+            }
+            Ok(Some(pane.into()))
+        }
+        // herdr still names the agent that was stopped (the same session id
+        // as before the keys). Before the close that is the agent itself,
+        // still running; at the close, with the shell in the foreground, it
+        // is a stale report of the agent just stopped.
+        Some(p) if same_agent(p, stopped) => {
+            if closing && pane_busy(pane).await {
+                return Err(format!(
+                    "{done}; pane {pane} runs something other than its shell in the foreground; left it open"
+                ));
+            }
+            Ok(Some(pane.into()))
+        }
+        Some(_) => Err(format!(
+            "{done}, but pane {pane} now hosts another agent; left it open ({error})"
+        )),
+    }
+}
+fn hosts_agent(pane: &Value) -> bool {
+    !native_ids(pane).is_empty() || !str_field(pane, "agent").is_empty()
+}
+/// Whether herdr identifies the agent in `pane` as one of `stopped`, the
+/// session ids it reported for the pane before the stop.
+fn same_agent(pane: &Value, stopped: &[String]) -> bool {
+    native_ids(pane).iter().any(|id| stopped.contains(id))
+}
+/// herdr 0.9.5 kept listing an exited pi (`agent` and `agent_session`) for
+/// 0.06-0.35s after its pid died, while its shell already had the terminal.
+/// After the agent exits, `session rm` waits this long, about six times the
+/// worst lag seen, for the report to clear before judging the pane.
+const AGENT_REPORT_CLEAR: Duration = Duration::from_secs(2);
+/// Waits, up to [`AGENT_REPORT_CLEAR`], until herdr no longer lists an agent
+/// in `pane` (or the pane is gone, or herdr cannot be asked). Called only
+/// once the shell has the terminal back. The wait can change the outcome:
+/// within it the stale report may clear, or another agent may replace it.
+async fn wait_report_cleared(pane: &str) {
+    let deadline = tokio::time::Instant::now() + AGENT_REPORT_CLEAR;
+    loop {
+        match panes().await {
+            Ok(listed) => match listed.iter().find(|p| str_field(p, "pane_id") == pane) {
+                Some(p) if hosts_agent(p) => {}
+                _ => return,
+            },
+            Err(_) => return,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+/// Whether the user may be working in `pane`: something other than its
+/// shell has the terminal, or herdr cannot say.
+// deferred: background jobs of an idle shell | impact: herdr reports only the foreground
+// group, so a pane whose shell has the terminal while it runs `cmd &` reads idle, and closing
+// it ends those jobs | trigger: herdr reports a pane's background jobs, or such a loss is seen
+pub(super) async fn pane_busy(pane: &str) -> bool {
+    match process_info(pane).await {
+        Ok(r) => shell_has_terminal(&r) != Some(true),
+        Err(_) => true,
+    }
+}
+/// What a pane holds, judged against the session ids `ids` a caller knows
+/// for its agent. Only herdr's own identification of the agent counts: a
+/// registration row's `herdr_pane_id` is an environment variable of the
+/// registering process, not a fact about the pane.
+#[derive(Debug, PartialEq)]
+pub(super) enum PaneView {
+    Gone,
+    /// Hosts no agent.
+    Vacant,
+    /// Hosts an agent herdr identifies as one of `ids`.
+    Ours,
+    /// Hosts an agent herdr identifies as someone else, or not a pi.
+    Foreign,
+    /// Hosts a pi agent herdr has not identified.
+    Unidentified,
+}
+pub(super) async fn view_pane(pane: &str, ids: &[String]) -> Result<PaneView, String> {
+    let listed = panes().await?;
+    let Some(p) = listed.iter().find(|p| str_field(p, "pane_id") == pane) else {
+        return Ok(PaneView::Gone);
+    };
+    Ok(classify(p, ids))
+}
+fn classify(p: &Value, ids: &[String]) -> PaneView {
+    let native = native_ids(p);
+    if !native.is_empty() {
+        return if native.iter().any(|id| ids.contains(id)) {
+            PaneView::Ours
+        } else {
+            PaneView::Foreign
+        };
+    }
+    match str_field(p, "agent") {
+        "" => PaneView::Vacant,
+        "pi" => PaneView::Unidentified,
+        _ => PaneView::Foreign,
+    }
+}
+/// Waits, up to `bound`, while herdr does not identify `pane`'s agent (it
+/// lists no agent, or a pi it has not identified) and the session's own pi
+/// (`pid`) holds the pane's foreground. herdr identifies a pi only once the
+/// pi reports to it, which can come after the pi registered with this
+/// daemon. Nothing is sent here. `false` only when the bound expired in that
+/// state; any other view (identified, another agent, gone, a foreground that
+/// is not `pid`, herdr not answering) returns `true` at once, for
+/// `session_close` to judge.
+pub(super) async fn await_identification(
+    pane: &str,
+    ids: &[String],
+    pid: u32,
+    bound: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        match view_pane(pane, ids).await {
+            Ok(PaneView::Vacant | PaneView::Unidentified)
+                if runs_in_foreground(pane, pid).await => {}
             _ => return true,
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// Whether `pid` is in `pane`'s foreground, with the shell not holding it.
+async fn runs_in_foreground(pane: &str, pid: u32) -> bool {
+    match process_info(pane).await {
+        Ok(r) => {
+            shell_has_terminal(&r) == Some(false)
+                && r["process_info"]["foreground_processes"]
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p["pid"].as_u64() == Some(u64::from(pid))))
+        }
+        Err(_) => false,
+    }
+}
+/// The session ids herdr reports for the pi agent in `pane`, if any.
+pub(super) async fn pane_pi_ids(pane: &str) -> Result<Vec<String>, String> {
+    Ok(panes()
+        .await?
+        .iter()
+        .find(|p| str_field(p, "pane_id") == pane && str_field(p, "agent") == "pi")
+        .map(native_ids)
+        .unwrap_or_default())
+}
+/// `session_close` for a caller that knows which agent it means (`ids`):
+/// keys go to `pane` only while herdr identifies its agent as one of `ids`.
+async fn require_ours(pane: &str, ids: &[String], done: &str) -> Result<(), String> {
+    match view_pane(pane, ids).await {
+        Ok(PaneView::Ours) => Ok(()),
+        Ok(view) => Err(format!(
+            "{done}; pane {pane} does not host an agent identified as this session ({view:?}); left it untouched"
+        )),
+        Err(e) => Err(format!("{done}; could not list panes ({e}); left pane {pane} untouched")),
+    }
+}
+/// The close at the end of such a stop, which itself just found the pane
+/// `Ours` and sent the keys: the pane may hold that agent still, or nothing
+/// once it exited, but never another agent or the user's running process.
+async fn require_closable(pane: &str, ids: &[String], done: &str) -> Result<(), String> {
+    match view_pane(pane, ids).await {
+        Ok(PaneView::Ours) => Ok(()),
+        Ok(PaneView::Vacant) if !pane_busy(pane).await => Ok(()),
+        Ok(view) => Err(format!(
+            "{done}; pane {pane} now holds {view:?} or a foreground process; left it open"
+        )),
+        Err(e) => Err(format!(
+            "{done}; could not list panes ({e}); left pane {pane} open"
+        )),
     }
 }
 /// Flags a relay peer may pass to an agent it starts here. Anything else could
 /// disable permission prompts or load peer-chosen code (settings, extensions).
-fn relay_agent_args(args: &Value) -> Result<(), String> {
+pub(super) fn relay_agent_args(args: &Value) -> Result<(), String> {
     let args = match args {
         Value::Null => return Ok(()),
         Value::Array(args) => args,
@@ -455,7 +723,7 @@ fn relay_agent_args(args: &Value) -> Result<(), String> {
     }
     Ok(())
 }
-fn relay_cwd(cwd: &str) -> Result<(), String> {
+pub(super) fn relay_cwd(cwd: &str) -> Result<(), String> {
     let path = std::path::Path::new(cwd);
     if path.is_absolute() && path.is_dir() {
         Ok(())
@@ -489,7 +757,20 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             .map(|r| str_field(r, "machine_id"))
             .unwrap_or("")
     };
-    if !remote.is_empty() && remote != rt.machine {
+    // An identity-checked request (the MCP stop) is judged against this
+    // machine's herdr and never relayed: a peer, perhaps on an older version,
+    // would not check the expectations, and its row may merely share the
+    // target's pane-id string. Asked for another machine explicitly, refuse.
+    let checked = !str_field(req, "expect_pane").is_empty()
+        || req["expect_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty());
+    if checked && !machine.is_empty() && machine != rt.machine {
+        return Err(format!(
+            "an identity-checked {op} is handled only on this machine; refused for {machine}"
+        ));
+    }
+    if !checked && !remote.is_empty() && remote != rt.machine {
         if rt.cfg.remote_messages == "refuse" {
             return Err("cross-machine operation refused: remote_messages=refuse".into());
         }
@@ -625,7 +906,25 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             if agent.is_empty() {
                 out["session_id"] = json!("");
             } else {
-                let (session, name) = start_agent(rt, req, pane).await?;
+                // A pane whose agent never started is closed again, so a failed
+                // add leaves nothing behind; the error names what happened to it.
+                // deferred: an `agent.start` that timed out although herdr started the agent,
+                // followed by a failed `pane.close` | impact: that agent runs unrecorded, so MCP
+                // cannot stop it (the error names its pane), and on the relay path the
+                // relay_workspaces entry outlives its workspace | trigger: herdr reports agent
+                // start outcomes idempotently, or such leftovers are seen in use
+                let (session, name) = match start_agent(rt, req, pane).await {
+                    Ok(started) => started,
+                    Err(error) => {
+                        let failed = format!("agent.start failed in new pane {pane}: {error}");
+                        return Err(match quick("pane.close", json!({"pane_id":pane})).await {
+                            Ok(_) => format!("{failed}; closed pane {pane}"),
+                            Err(close) => format!(
+                                "{failed}; closing it failed too ({close}): pane {pane} is left open"
+                            ),
+                        });
+                    }
+                };
                 out["session_id"] = json!(session);
                 out["name"] = json!(name);
             }
@@ -676,21 +975,106 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
         }
         "session_close" => {
             let pane = pane_for(rt, target, relay).await?;
+            // A caller that knows the agent's identity (the MCP stop) names
+            // the pane and session ids it expects; every destructive step
+            // below re-checks them right before acting.
+            let expected = str_field(req, "expect_pane");
+            if !expected.is_empty() && pane != expected {
+                return Err(format!(
+                    "session {target} is now in pane {pane}, not {expected}; left it untouched"
+                ));
+            }
+            let ids: Vec<String> = req["expect_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect();
+            // deferred: an identity check for a local `session_close` without expect_ids (the
+            // CLI `session rm`, and every local agent session on the client or manager socket,
+            // see port.rs) | impact: as on main, targeting a raw pane id or a stale offline row
+            // sends ctrl+c/ctrl+d to and closes whatever agent or foreground work that pane
+            // holds now; relay peers are not affected, `revalidate_pane` and `pane_after_stop`
+            // check their target | trigger: `session rm` records the identity of agents it
+            // starts, or local callers can no longer target raw pane ids
+            // deferred: identity checks across machines | impact: for a request without
+            // expect_ids, a target can resolve in `run`/`pane_for` to another machine's row by
+            // an exact id equal to a pane-id string or by a substring name match, and is then
+            // forwarded; a peer on an older version would ignore expect_pane/expect_ids. Since
+            // `run` never relays an identity-checked request, this no longer applies to the MCP
+            // stop | trigger: MCP stops need to reach other machines, or relay frames carry a
+            // protocol version the sender can require
+            let identified = !ids.is_empty();
+            if identified {
+                require_ours(&pane, &ids, "nothing was sent").await?;
+            }
+            // pi does not exit on one ctrl+c (herdr 0.9.5 with pi 1.5.2: still
+            // running 3s later) and exits on ctrl+d in about 0.06s, so a pi gets
+            // its ctrl+d after a short wait; other agents keep the long one.
+            // The identity herdr reports for the agent being stopped, taken
+            // before any key, so a stale report of it can be told from another
+            // agent afterwards.
+            let listed = panes().await.unwrap_or_default();
+            let before = listed.iter().find(|p| str_field(p, "pane_id") == pane);
+            let stopped = before.map(native_ids).unwrap_or_default();
+            let agent = agent_group(&pane).await;
+            let first_wait = if before.is_some_and(|p| str_field(p, "agent") == "pi") {
+                PI_CTRL_C_WAIT_SECS
+            } else {
+                CTRL_C_WAIT_SECS
+            };
             let _ = quick("agent.send_keys", json!({"target":pane,"keys":["ctrl+c"]})).await;
-            if !wait_exited(&pane, 10).await {
+            let mut done = format!("sent ctrl+c to pane {pane}");
+            let mut held = wait_exited(&pane, first_wait, agent).await;
+            if held == Foreground::Agent {
                 // The user may have reassigned the pane during the wait.
                 // Revalidate before every later destructive operation rather
                 // than sending ctrl+d or closing a shell/new agent.
-                let current = pane_for(rt, target, relay).await?;
+                let Some(current) =
+                    pane_after_stop(rt, target, relay, &pane, &stopped, false, &done).await?
+                else {
+                    return Ok(json!({}));
+                };
+                // Keys go only to an agent herdr identifies as this session.
+                // deferred: a foreground-process check on `Ours` before ctrl+d and the close |
+                // impact: herdr 0.9.5 keeps reporting an exited pi for 0.06-0.35s and the close
+                // waits up to 2s for that report to clear; something the user starts in the
+                // pane within that window can be hit by ctrl+d or the close | trigger: such a
+                // loss is seen, or herdr reports an agent's exit without lag
+                if identified {
+                    require_ours(&current, &ids, &done).await?;
+                }
                 let _ = quick(
                     "agent.send_keys",
                     json!({"target":current,"keys":["ctrl+d"]}),
                 )
                 .await;
-                wait_exited(&current, 5).await;
+                done.push_str(" and ctrl+d");
+                held = wait_exited(&current, 5, agent).await;
             }
-            let current = pane_for(rt, target, relay).await?;
-            quick("pane.close", json!({"pane_id":current})).await?;
+            match held {
+                Foreground::Other => {
+                    return Err(format!(
+                        "{done}; the agent left pane {pane}, but something else now runs in its foreground; left it open"
+                    ))
+                }
+                Foreground::Shell => wait_report_cleared(&pane).await,
+                Foreground::Agent => {}
+            }
+            // Worst case for a pi: 3s after ctrl+c, 5s after ctrl+d, then up to
+            // 2s while herdr still lists an agent (10s), plus the herdr
+            // requests; 17s for other agents. A command that takes the
+            // foreground ends the waiting at once.
+            if let Some(current) =
+                pane_after_stop(rt, target, relay, &pane, &stopped, true, &done).await?
+            {
+                if identified {
+                    require_closable(&current, &ids, &done).await?;
+                }
+                quick("pane.close", json!({"pane_id":current}))
+                    .await
+                    .map_err(|e| format!("{done}, then pane.close failed: {e}"))?;
+            }
             Ok(json!({}))
         }
         "agent_prompt" | "agent_keys" | "agent_read" | "agent_wait" => {
@@ -758,6 +1142,25 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// herdr 0.9.5 payloads: an idle zsh lists itself; `sleep 300` and pi
+    /// take the foreground group over.
+    #[test]
+    fn a_pane_is_idle_only_while_its_shell_has_the_terminal() {
+        let info = |group: Value, processes: Value| {
+            json!({"process_info":{"pane_id":"w5:p1","shell_pid":768189,
+                "foreground_process_group_id":group,"foreground_processes":processes}})
+        };
+        let idle = info(json!(768189), json!([{"pid":768189,"name":"zsh"}]));
+        assert_eq!(shell_has_terminal(&idle), Some(true));
+        let sleeping = info(json!(768275), json!([{"pid":768275,"name":"sleep"}]));
+        assert_eq!(shell_has_terminal(&sleeping), Some(false));
+        let pi = info(json!(763192), json!([{"pid":763192,"name":"pi"}]));
+        assert_eq!(shell_has_terminal(&pi), Some(false));
+        let unknown = json!({"process_info":{"pane_id":"w5:p1","shell_pid":null,
+            "foreground_process_group_id":768189,"foreground_processes":[]}});
+        assert_eq!(shell_has_terminal(&unknown), None);
+    }
 
     #[tokio::test]
     async fn wedged_herdr_delays_the_directory_overlay_by_at_most_its_budget() {

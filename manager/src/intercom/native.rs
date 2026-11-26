@@ -16,6 +16,13 @@ use std::sync::{Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// The start-time identity of `pid` that native rows record as
+/// `_proc_start`, for the session liveness probe; empty when unreadable.
+#[cfg(unix)]
+pub(super) fn process_start(pid: u32) -> String {
+    alias::process_start(pid)
+}
+
 pub struct Native {
     rows: Mutex<Vec<Value>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
