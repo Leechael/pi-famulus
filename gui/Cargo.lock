@@ -2644,6 +2644,7 @@ dependencies = [
  "crossterm",
  "dispatch2",
  "env_logger",
+ "log",
  "nsh-base",
  "nsh-core",
  "nsh-platform-linux",

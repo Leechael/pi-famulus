@@ -6,9 +6,13 @@
 //! character cells, so both frontends show the same rows, cells and text,
 //! and scroll / follow / search the same way.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
+use pi_famulus::daemon_binary::{self, DaemonBinary};
 use pi_famulus::top::controller::Controller;
 use pi_famulus::top::model::{
     agent_cols, task_cols, tree_cols, width_class, Col, Tab, TabHit, TopState,
@@ -37,6 +41,9 @@ pub type Runs = Vec<Run>;
 pub struct Viewport {
     /// Whole window width in columns (picks the TUI's width class).
     pub cols: u16,
+    /// Whole window height in rows: what `v` (preview) asks about, as the
+    /// terminal's height is in the TUI.
+    pub rows: u16,
     /// Table rows that fit below the header row.
     pub table_rows: usize,
     pub overview_cols: usize,
@@ -53,6 +60,7 @@ impl Default for Viewport {
     fn default() -> Self {
         Viewport {
             cols: 120,
+            rows: 48,
             table_rows: 20,
             overview_cols: 70,
             kinds_cols: 50,
@@ -179,6 +187,23 @@ impl Engine {
     }
 }
 
+/// Looks for the installed `pi-famulus` binary and declares it as the one
+/// the session may start the manager from (or that there is none); returns
+/// whether one was found. This program's own executable is never an answer:
+/// `daemon_binary::find` skips it and the spawn refuses it.
+fn locate_daemon_binary(home: &Path, known: &mut Option<std::path::PathBuf>) -> bool {
+    let found = daemon_binary::find(home);
+    if found != *known {
+        match &found {
+            Some(path) => log::info!("daemon binary: {}", path.display()),
+            None => log::warn!("daemon binary: pi-famulus not found; only attaching to a running daemon"),
+        }
+        daemon_binary::declare(found.clone().map(DaemonBinary::At));
+        *known = found;
+    }
+    known.is_some()
+}
+
 /// Starts the controller on its own thread and runtime.
 pub fn start() -> Engine {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
@@ -193,12 +218,28 @@ pub fn start() -> Engine {
                 .expect("engine runtime");
             rt.block_on(async move {
                 let home = pi_famulus::lifecycle::resolve_home(None);
+                // Like `pi-famulus top`, the session starts the manager when
+                // none runs, from the installed binary. Found before the
+                // first connect, and looked for again while the app runs: it
+                // may be installed, or configured, later.
+                let binary_found = Arc::new(AtomicBool::new(false));
+                let mut known = None;
+                binary_found.store(locate_daemon_binary(&home, &mut known), Ordering::Relaxed);
+                tokio::spawn({
+                    let (home, binary_found) = (home.clone(), Arc::clone(&binary_found));
+                    async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            binary_found.store(locate_daemon_binary(&home, &mut known), Ordering::Relaxed);
+                        }
+                    }
+                });
                 let mut ctl = Controller::start(&home, 1_000, None, None, None);
                 let mut view = Viewport::default();
                 let mut quit = false;
                 loop {
                     ctl.settle();
-                    let mut frame = build(ctl.state_mut(), &view);
+                    let mut frame = build(ctl.state_mut(), &view, binary_found.load(Ordering::Relaxed));
                     frame.quit = quit;
                     if **frame_tx.borrow() != frame {
                         let _ = frame_tx.send(Arc::new(frame));
@@ -392,9 +433,51 @@ fn detail(state: &mut TopState, view: &Viewport) -> Option<Detail> {
     })
 }
 
+const PILL_DIM: u32 = 0x646a7c;
+const PILL_WARN: u32 = 0xe6b45a;
+const PILL_ERR: u32 = 0xf06e78;
+
+/// The header's connection pill. While the manager answers (or before the
+/// first snapshot, or paused) it is the TUI's. Otherwise it says in plain
+/// words why nothing is live; the session keeps retrying either way.
+fn pill(state: &TopState, binary_found: bool) -> Runs {
+    if state.now == 0 || state.header.live || state.paused {
+        return runs(&ui::live_pill(state), Default::default());
+    }
+    let (text, color) = if binary_found {
+        ("○ daemon not reachable; starting it · showing what is on disk · retrying", PILL_DIM)
+    } else {
+        ("○ daemon not running; pi-famulus binary not found · showing what is on disk · retrying", PILL_WARN)
+    };
+    vec![Run { text: text.into(), fg: Some(color), ..Default::default() }]
+}
+
+/// What the window shows once the engine is gone (its thread ended without
+/// a quit): the last frame, marked stale in the header and the status line,
+/// with every overlay and prompt closed so that the mark is in view. Nothing
+/// on it answers any more.
+pub fn stopped(last: &Frame) -> Frame {
+    let mut frame = last.clone();
+    frame.pill = vec![Run {
+        text: "✕ session stopped · this data is stale".into(),
+        fg: Some(PILL_ERR),
+        bold: true,
+        ..Default::default()
+    }];
+    frame.message = Some("the session behind this window stopped; what is shown is stale. Quit and reopen the app.".into());
+    frame.detail = None;
+    frame.help = false;
+    frame.confirm_stop = None;
+    frame.filter_editing = false;
+    frame.keys.clear();
+    frame
+}
+
 /// The frame for `state` at `view`'s size. Like a TUI draw, it updates the
-/// table's scroll and the detail's bookkeeping.
-pub fn build(state: &mut TopState, view: &Viewport) -> Frame {
+/// table's scroll and the detail's bookkeeping, and records the height `v`
+/// asks about. `binary_found`: the installed `pi-famulus` binary was found.
+pub fn build(state: &mut TopState, view: &Viewport, binary_found: bool) -> Frame {
+    state.screen_rows = view.rows;
     let h = state.header.clone();
     let (columns, rows) = table(state, view);
     let total = state.visible.len();
@@ -414,7 +497,7 @@ pub fn build(state: &mut TopState, view: &Viewport) -> Frame {
     let detail = detail(state, view);
     Frame {
         version: h.version.clone(),
-        pill: runs(&ui::live_pill(state), Default::default()),
+        pill: pill(state, binary_found),
         pid_up: h.pid.map(|pid| {
             let up = h.uptime_ms.map(pi_famulus::fmt::human_duration).unwrap_or_else(|| "-".into());
             format!("pid {pid} · up {up}")
@@ -438,5 +521,72 @@ pub fn build(state: &mut TopState, view: &Viewport) -> Frame {
         help: state.help,
         detail,
         quit: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(runs: &Runs) -> String {
+        runs.iter().map(|r| r.text.as_str()).collect()
+    }
+
+    /// A session that has read the disk but reached no manager.
+    fn offline() -> TopState {
+        let mut state = TopState::new(1_000, None, None);
+        state.now = 1_795_000_000_000;
+        state
+    }
+
+    #[test]
+    fn the_header_says_in_plain_words_why_nothing_is_live() {
+        let view = Viewport::default();
+        let mut state = offline();
+        let pill = text(&build(&mut state, &view, false).pill);
+        assert!(pill.contains("daemon not running; pi-famulus binary not found"), "{pill}");
+        assert!(pill.contains("retrying"), "{pill}");
+        let pill = text(&build(&mut state, &view, true).pill);
+        assert!(pill.contains("daemon not reachable; starting it") && !pill.contains("not found"), "{pill}");
+
+        // Once a manager answers, it is the TUI's pill again, binary or not.
+        state.header.live = true;
+        for found in [false, true] {
+            let pill = text(&build(&mut state, &view, found).pill);
+            assert!(pill.contains("live 1s") && !pill.contains("daemon"), "{pill}");
+        }
+        // Before the first snapshot nothing is known yet: no verdict.
+        let mut state = TopState::new(1_000, None, None);
+        let pill = text(&build(&mut state, &view, false).pill);
+        assert!(!pill.contains("not found"), "{pill}");
+    }
+
+    #[test]
+    fn a_stopped_engine_is_marked_on_the_main_screen() {
+        let mut state = offline();
+        state.header.live = true;
+        state.help = true;
+        state.confirm_stop = Some("sh_1".into());
+        state.filter_editing = true;
+        let last = build(&mut state, &Viewport::default(), true);
+        assert!(text(&last.pill).contains("live"));
+        let frame = stopped(&last);
+        assert!(text(&frame.pill).contains("session stopped") && text(&frame.pill).contains("stale"), "{:?}", frame.pill);
+        assert!(frame.message.as_deref().is_some_and(|m| m.contains("stopped") && m.contains("stale")));
+        // Nothing may cover the mark, and the footer shows the message only
+        // without a prompt.
+        assert!(!frame.help && frame.detail.is_none() && frame.confirm_stop.is_none() && !frame.filter_editing);
+        assert!(frame.keys.is_empty(), "no key does anything any more");
+        assert_eq!(frame.rows, last.rows, "the last data stays readable");
+    }
+
+    #[test]
+    fn the_preview_key_asks_about_the_windows_height() {
+        let mut state = offline();
+        let short = Viewport { rows: 12, ..Viewport::default() };
+        build(&mut state, &short, true);
+        assert_eq!(state.screen_rows, 12);
+        build(&mut state, &Viewport::default(), true);
+        assert_eq!(state.screen_rows, Viewport::default().rows);
     }
 }

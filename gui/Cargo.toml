@@ -16,6 +16,7 @@ pi-famulus = { path = "../manager" }
 nsh-core = "0.4.0"
 nsh-base = "0.4.0"
 env_logger = "0.11"
+log = "0.4"
 # The TUI's view types, at the versions the manager uses.
 ratatui = "0.29"
 crossterm = "0.28"

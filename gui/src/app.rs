@@ -183,6 +183,25 @@ pub fn App() -> impl IntoElement {
                 }
                 frame.set(f);
             }
+            // The engine is gone without a quit (its thread died): say so
+            // instead of leaving the last frame up as if it were current.
+            log::error!("the session engine stopped; the window shows stale data");
+            frame.set(Arc::new(engine::stopped(&frame.get_untracked())));
+        });
+    }
+    // One window per user: a later launch asks this one to come forward.
+    crate::instance::ensure_single();
+    {
+        let mut shows = crate::instance::show_requested();
+        spawn(async move {
+            loop {
+                if *shows.borrow_and_update() > 0 {
+                    crate::tray::show_window();
+                }
+                if shows.changed().await.is_err() {
+                    return;
+                }
+            }
         });
     }
     keys::bind(&engine);
@@ -205,6 +224,7 @@ pub fn App() -> impl IntoElement {
             let cols = ((b.size.width.0 - 2.0 * PAD) / CHAR_W).floor().max(20.0) as u16;
             viewport.update(|v| {
                 v.cols = cols;
+                v.rows = (b.size.height.0 / LINE_H).floor().max(1.0) as u16;
                 v.overview_cols = ((b.size.width.0 * 0.56 - 3.0 * PAD) / CHAR_W).floor().max(20.0) as usize;
                 v.kinds_cols = ((b.size.width.0 * 0.44 - 3.0 * PAD) / CHAR_W).floor().max(20.0) as usize;
                 v.preview_cols = cols.saturating_sub(4) as usize;

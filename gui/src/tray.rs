@@ -185,6 +185,12 @@ mod imp {
     pub fn minimize() {
         on_main(hide);
     }
+
+    /// Brings the window to the front, out of the tray or the Dock if it
+    /// is hidden there.
+    pub fn show_window() {
+        on_main(show);
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -196,6 +202,10 @@ mod imp {
     pub fn minimize() {
         nsh_core::element::desktop::minimize();
     }
+
+    pub fn show_window() {
+        nsh_core::element::desktop::order_front();
+    }
 }
 
-pub use imp::{minimize, set_enabled, AVAILABLE};
+pub use imp::{minimize, set_enabled, show_window, AVAILABLE};
