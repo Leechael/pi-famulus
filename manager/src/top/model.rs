@@ -666,6 +666,9 @@ pub struct TopState {
     pub revealed: HashSet<String>,
     pub expand_all: bool,
     pub preview: bool,
+    /// The frontend's height in rows as of its last draw: the terminal's in
+    /// the TUI, the window's in a GUI. `v` (preview) needs 20 or more.
+    pub screen_rows: u16,
     pub paused: bool,
     pub interval_ms: u64,
     pub help: bool,
@@ -758,6 +761,7 @@ impl TopState {
             revealed: HashSet::new(),
             expand_all: false,
             preview: false,
+            screen_rows: 24,
             paused: false,
             interval_ms: snap_interval(interval_ms),
             help: false,

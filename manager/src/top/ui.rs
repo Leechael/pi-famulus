@@ -172,6 +172,7 @@ fn detail_block(title: &str, pill: Vec<Span<'static>>, prefix: Vec<Span<'static>
 
 pub fn draw(frame: &mut Frame, state: &mut TopState) {
     let area = frame.area();
+    state.screen_rows = area.height;
     let hclass = height_class(area.height);
     let wclass = width_class(area.width);
     let head_h = header_height(hclass);
@@ -3624,6 +3625,147 @@ mod tests {
         act(&mut state, Action::Fold(0));
         let d = state.detail.as_ref().unwrap();
         assert!(!d.tools_expanded && !d.open.contains(&0) && d.open.contains(&1), "leaving unfold-all folds only that block");
+    }
+
+    fn selected_row(state: &TopState) -> usize {
+        let id = state.selected.as_deref().expect("a selected row");
+        state.visible.iter().position(|v| v.id == id).expect("the selection is in view")
+    }
+
+    #[test]
+    fn the_stop_prompt_swallows_every_click_on_the_table_behind_it() {
+        use crate::top::Action;
+        let mut state = main_state();
+        let other = state.visible.iter().map(|v| v.id.clone()).find(|id| Some(id) != state.selected.as_ref()).expect("a second row");
+        let before = (state.selected.clone(), state.tab, state.scope, state.sort, state.sort_desc, state.visible.len());
+        state.confirm_stop = Some("sh_live".into());
+        for action in [
+            Action::RowClick(other.clone()),
+            Action::RowOpen(other.clone()),
+            Action::HeaderClick,
+            Action::TabBar(TabHit::Tab(Tab::Tasks)),
+            Action::TabBar(TabHit::Scope),
+            Action::TabBar(TabHit::Sort),
+        ] {
+            act(&mut state, action.clone());
+            let after = (state.selected.clone(), state.tab, state.scope, state.sort, state.sort_desc, state.visible.len());
+            assert_eq!(after, before, "{action:?} reached the table under the stop prompt");
+            assert!(state.detail.is_none(), "{action:?} opened a detail under the stop prompt");
+            assert_eq!(state.confirm_stop.as_deref(), Some("sh_live"), "{action:?} answered the prompt");
+        }
+    }
+
+    #[test]
+    fn an_open_detail_swallows_clicks_meant_for_the_table_behind_it() {
+        use crate::top::Action;
+        let mut state = task_detail(log_lines());
+        let other = state.visible.iter().map(|v| v.id.clone()).find(|id| id != "sh_live").expect("a second row");
+        let before = (state.selected.clone(), state.tab, state.scope, state.sort, state.sort_desc, state.visible.len());
+        for action in [
+            Action::RowClick(other.clone()),
+            Action::RowOpen(other.clone()),
+            Action::HeaderClick,
+            Action::TabBar(TabHit::Tab(Tab::Tasks)),
+            Action::TabBar(TabHit::Scope),
+            Action::TabBar(TabHit::Sort),
+        ] {
+            act(&mut state, action.clone());
+            let after = (state.selected.clone(), state.tab, state.scope, state.sort, state.sort_desc, state.visible.len());
+            assert_eq!(after, before, "{action:?} reached the table behind the detail");
+            assert_eq!(state.detail.as_ref().map(|d| d.id.as_str()), Some("sh_live"), "{action:?} replaced the open detail");
+        }
+    }
+
+    #[test]
+    fn header_and_tab_bar_clicks_sort_scope_and_switch_tabs() {
+        use crate::top::Action;
+        let mut state = main_state();
+        let (sort, scope) = (state.sort, state.scope);
+        assert_ne!(state.tab, Tab::Tasks);
+        act(&mut state, Action::HeaderClick);
+        let by_header = state.sort;
+        assert_ne!(by_header, sort, "a click on the column header picks the next sort key");
+        act(&mut state, Action::TabBar(TabHit::Sort));
+        assert_ne!(state.sort, by_header, "so does a click on the sort control");
+        act(&mut state, Action::TabBar(TabHit::Scope));
+        assert_ne!(state.scope, scope, "a click on the scope control picks the next scope");
+        act(&mut state, Action::TabBar(TabHit::Tab(Tab::Tasks)));
+        assert_eq!(state.tab, Tab::Tasks, "a click on a tab shows it");
+        act(&mut state, Action::TabBar(TabHit::Tab(Tab::Events)));
+        assert_eq!(state.tab, Tab::Events);
+    }
+
+    #[test]
+    fn a_backdrop_click_closes_the_help() {
+        use crate::top::Action;
+        let mut state = main_state();
+        let before = (state.selected.clone(), state.tab);
+        state.help = true;
+        act(&mut state, Action::Dismiss);
+        assert!(!state.help, "the help is still open after a click beside it");
+        assert_eq!((state.selected.clone(), state.tab), before, "closing the help changes nothing else");
+    }
+
+    #[test]
+    fn the_wheel_moves_one_step_per_tick_up_to_a_bound() {
+        use crate::top::{Action, MAX_WHEEL_TICKS};
+        // In the table each tick moves the selection one row.
+        let mut state = main_state();
+        state.jump_home();
+        assert!(state.visible.len() >= 3, "the fixture has rows to move across");
+        act(&mut state, Action::Wheel(2));
+        assert_eq!(selected_row(&state), 2, "two ticks down");
+        act(&mut state, Action::Wheel(-1));
+        assert_eq!(selected_row(&state), 1, "one tick up");
+
+        // In a detail each tick scrolls three lines.
+        let mut state = task_detail((0..2_000).map(|i| format!("row {i}")).collect());
+        render(100, 30, &mut state);
+        act(&mut state, Action::ScrollTo(0.0));
+        act(&mut state, Action::Wheel(2));
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 6, "two ticks down");
+        act(&mut state, Action::Wheel(-1));
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 3, "one tick up");
+        // One event never does more than MAX_WHEEL_TICKS steps, whatever a
+        // frontend derives from a pointer delta.
+        act(&mut state, Action::ScrollTo(0.0));
+        act(&mut state, Action::Wheel(1_000));
+        let bound = MAX_WHEEL_TICKS as usize * 3;
+        assert!(bound < 2_000 - 30, "the bound is inside this output");
+        assert_eq!(state.detail.as_ref().unwrap().scroll, bound, "a huge delta is one bounded scroll");
+        act(&mut state, Action::Wheel(-1_000));
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+
+        // The extremes of the type finish at once and stay in range.
+        let mut state = main_state();
+        act(&mut state, Action::Wheel(i32::MAX));
+        assert_eq!(selected_row(&state), state.visible.len() - 1);
+        act(&mut state, Action::Wheel(i32::MIN));
+        assert_eq!(selected_row(&state), 0);
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_to_the_end_follows_again_after_f_held_the_end() {
+        use crate::top::Action;
+        let mut state = task_detail((0..200).map(|i| format!("row {i}")).collect());
+        render(100, 30, &mut state);
+        assert!(state.detail.as_ref().unwrap().follow, "a running task opens following its output");
+        // `f` at the end stops following and holds there across draws.
+        crate::top::handle_detail(&mut state, crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('f'), crossterm::event::KeyModifiers::NONE));
+        render(100, 30, &mut state);
+        assert!(!state.detail.as_ref().unwrap().follow, "f holds the end");
+        act(&mut state, Action::ScrollTo(1.0));
+        render(100, 30, &mut state);
+        assert!(state.detail.as_ref().unwrap().follow, "a drag to the end follows new output again");
+    }
+
+    #[test]
+    fn a_draw_records_the_height_the_preview_key_asks_about() {
+        let mut state = main_state();
+        render(120, 12, &mut state);
+        assert_eq!(state.screen_rows, 12);
+        render(120, 40, &mut state);
+        assert_eq!(state.screen_rows, 40);
     }
 
     /// An agent detail with a long thread of prose, tools and thinking.

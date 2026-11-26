@@ -158,7 +158,8 @@ pub enum Action {
     DetailTab(usize),
     /// A click on a fold chevron in an agent thread.
     Fold(usize),
-    /// Wheel ticks; positive scrolls down.
+    /// Wheel ticks; positive scrolls down. At most [`MAX_WHEEL_TICKS`] are
+    /// performed per action.
     Wheel(i32),
     /// Drag on the detail's scrollbar, as a fraction of its track.
     ScrollTo(f32),
@@ -470,12 +471,16 @@ async fn handle_input(state: &mut TopState, input: Input, home: &Path) -> Result
     }
 }
 
+/// The most wheel ticks one `Action::Wheel` performs. A frontend derives the
+/// count from a pointer delta; a wild delta must not spin here.
+pub(crate) const MAX_WHEEL_TICKS: u32 = 64;
+
 pub(crate) fn handle_action(state: &mut TopState, action: Action) {
     let blocked = state.help || state.confirm_stop.is_some();
     match action {
         Action::Wheel(_) if blocked => {}
         Action::Wheel(ticks) => {
-            for _ in 0..ticks.unsigned_abs() {
+            for _ in 0..ticks.unsigned_abs().min(MAX_WHEEL_TICKS) {
                 wheel(state, ticks > 0);
             }
         }
@@ -1039,9 +1044,9 @@ async fn handle_main(state: &mut TopState, key: KeyEvent) -> Result<bool, String
             state.recompute_visible();
         }
         KeyCode::Char('v') => {
-            if crate::top::model::height_class(crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24))
-                != crate::top::model::HeightClass::Short
-            {
+            // The frontend's own height (`screen_rows`), not the size of
+            // whatever terminal the program was started from.
+            if crate::top::model::height_class(state.screen_rows) != crate::top::model::HeightClass::Short {
                 state.preview = !state.preview;
             } else {
                 state.message = Some("preview needs a taller terminal (20+ rows); Enter opens the detail".into());
@@ -1243,6 +1248,31 @@ mod tests {
         assert!(state.detail.as_ref().is_some_and(|d| d.log.query.is_empty()), "first esc clears the search");
         handle_detail(&mut state, key(KeyCode::Esc));
         assert!(state.detail.is_none(), "second esc closes");
+    }
+
+    #[tokio::test]
+    async fn the_preview_key_goes_by_the_frontends_height() {
+        let home = std::env::temp_dir();
+        // A frontend 12 rows tall, whatever terminal the program was
+        // started from: no room for the preview.
+        let mut state = TopState::new(1_000, None, None);
+        state.screen_rows = 12;
+        handle_key(&mut state, key(KeyCode::Char('v')), &home).await.unwrap();
+        assert!(!state.preview, "a short frontend has no room for the preview");
+        assert!(state.message.as_deref().is_some_and(|m| m.contains("taller")), "{:?}", state.message);
+        // A tall one, likewise whatever the launching terminal is.
+        state.screen_rows = 40;
+        handle_key(&mut state, key(KeyCode::Char('v')), &home).await.unwrap();
+        assert!(state.preview && state.message.is_none(), "a tall frontend shows it");
+        handle_key(&mut state, key(KeyCode::Char('v')), &home).await.unwrap();
+        assert!(!state.preview, "v again hides it");
+        // At the boundary: 19 rows is short, 20 is not.
+        state.screen_rows = 19;
+        handle_key(&mut state, key(KeyCode::Char('v')), &home).await.unwrap();
+        assert!(!state.preview);
+        state.screen_rows = 20;
+        handle_key(&mut state, key(KeyCode::Char('v')), &home).await.unwrap();
+        assert!(state.preview);
     }
 
     #[tokio::test]
