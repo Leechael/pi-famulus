@@ -44,7 +44,9 @@ impl Controller {
         state.message = Some("loading…".into());
 
         // The live view is `serve` with a screen: it supervises the manager
-        // until it exits.
+        // until it exits. A manager is started only from the daemon binary
+        // the program declared (`daemon_binary`); with none declared this
+        // waits for one and leases when it appears.
         let lease_home = home.to_path_buf();
         let lease = Lease(tokio::spawn(async move {
             client::hold_supervision(&lease_home, |_| {}).await;

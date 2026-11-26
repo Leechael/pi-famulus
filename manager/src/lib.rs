@@ -8,6 +8,7 @@ pub mod out;
 pub mod client;
 pub mod clock;
 pub mod daemon;
+pub mod daemon_binary;
 pub mod events;
 pub mod fmt;
 pub mod gc;

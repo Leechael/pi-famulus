@@ -6,6 +6,9 @@ use pi_famulus::*;
 use cli::{Cli, Sub};
 
 fn main() {
+    // This executable is the daemon binary: clients in this process start
+    // the manager from it. Before anything that can connect.
+    daemon_binary::declare(Some(daemon_binary::DaemonBinary::ThisExecutable));
     // `__run` is every task's process-group leader (`runner`): plain
     // threads, no async runtime, and not a user-facing subcommand.
     let mut args = std::env::args().skip(1);

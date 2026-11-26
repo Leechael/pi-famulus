@@ -7,6 +7,7 @@
 //! `log`/`tail` on a task id start the daemon when none runs. `status`,
 //! `sessions`, `show`, `agent`, `events`, `doctor` and `shutdown` never do.
 
+use crate::daemon_binary;
 use crate::fmt;
 use crate::inspect::{self, Live, Target};
 use crate::lifecycle;
@@ -183,8 +184,9 @@ impl Conn {
 }
 
 /// Holds a supervision lease for as long as the returned future runs:
-/// connects (spawning the manager if none runs), asks it to supervise, and
-/// leases again whenever that manager goes away. Dropping the future ends
+/// connects (spawning the manager if none runs and this program declared
+/// its daemon binary; otherwise retrying every second until one appears),
+/// asks it to supervise, and leases again whenever that manager goes away. Dropping the future ends
 /// the lease, and the manager falls back to its self-managed lifetime.
 pub async fn hold_supervision(home: &Path, mut report: impl FnMut(Result<String, String>)) {
     loop {
@@ -336,11 +338,9 @@ async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
 
 /// Spawn `pi-famulus daemon` detached (own session, output to manager.log)
 /// so it outlives this short-lived CLI process (§3.1 step 3).
-fn spawn_daemon(home: &Path) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    let exe = std::path::PathBuf::from("/proc/self/exe");
-    #[cfg(not(target_os = "linux"))]
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+/// `exe` comes from `daemon_binary::executable`, never from anywhere else:
+/// that is what keeps a program from running itself as the daemon.
+fn spawn_daemon(home: &Path, exe: &Path) -> Result<(), String> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -411,6 +411,12 @@ async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, Strin
         if spawned {
             return Err(format!("cannot reach pi-famulus: {last_err}"));
         }
+        // A program that may not start a manager stops here, before touching
+        // the home: no directory, spawn lock or manager.log is created.
+        // Nothing is started unless this program declared its daemon binary,
+        // and a declared path that is this very executable is refused.
+        let exe = daemon_binary::executable(daemon_binary::declared())
+            .map_err(|e| format!("cannot reach pi-famulus: {e}"))?;
         spawned = true;
         // Clients never delete socket/pid files: only the daemon holding
         // manager.lock may (§3.1). A client cleaning up here could unlink the
@@ -419,7 +425,7 @@ async fn connect_with_retry(home: &Path, mode: &HelloMode) -> Result<Conn, Strin
         std::fs::create_dir_all(home).map_err(|e| format!("create {}: {e}", home.display()))?;
         match lifecycle::try_acquire_spawn_lock(home) {
             Ok(Some(guard)) => {
-                spawn_daemon(home)?;
+                spawn_daemon(home, &exe)?;
                 let ok = wait_for_socket(home, SPAWN_SOCKET_WAIT).await;
                 drop(guard); // release the spawn lock (§3.1 step 3)
                 if !ok {
@@ -1103,6 +1109,31 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     } else {
         outln!("{} problem(s) found", r.failures);
         1
+    }
+}
+
+#[cfg(test)]
+mod attach_only_tests {
+    use super::{connect, HelloMode};
+    use crate::daemon_binary::NO_DAEMON;
+
+    /// The unit-test harness is a program that links this library and has
+    /// declared no daemon binary. With no manager running it must be told
+    /// so at once, and must leave no trace of a start attempt: before the
+    /// declaration existed, `connect` created the home, took the spawn lock, opened
+    /// manager.log and ran the harness itself with `--home <home> daemon`.
+    #[tokio::test]
+    async fn a_program_that_declared_no_daemon_binary_never_starts_one() {
+        let home = std::env::temp_dir().join(format!("pi-famulus-attach-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let error = match connect(&home, &HelloMode::Cli).await {
+            Ok(_) => panic!("nothing is running in a home that does not exist"),
+            Err(error) => error,
+        };
+        let touched = home.exists();
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(error.contains(NO_DAEMON), "the caller is told why: {error}");
+        assert!(!touched, "no home, spawn lock or manager.log is created when nothing may be started");
     }
 }
 
