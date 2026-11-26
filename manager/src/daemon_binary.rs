@@ -80,15 +80,81 @@ pub const FILE_NAME: &str = if cfg!(windows) {
     "pi-famulus"
 };
 
-/// Where [`find`] looks, in order. Each field is one step of the order the
-/// extension uses (docs/configuration.md, "Manager binary discovery"),
-/// without its npm package step, which only the extension can resolve.
+/// The npm package that carries the binary for `os` / `arch` (Rust's
+/// `target_os` / `target_arch` names), as the extension names it
+/// (`nativePackageName`): `pi-famulus-<linux|darwin|win>-<x64|arm64>`.
+/// `None` for a platform no package is published for.
+pub fn native_package_name(os: &str, arch: &str) -> Option<String> {
+    let os = match os {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "win",
+        _ => return None,
+    };
+    let arch = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    Some(format!("pi-famulus-{os}-{arch}"))
+}
+
+/// Where the native npm package of this platform may be installed, in the
+/// extension's order: next to the extension in pi's npm tree
+/// (`<pi agent dir>/npm/node_modules`), then the extension's per-version
+/// user cache for `version`.
+pub fn native_package_dirs(
+    agent_dir: &Path,
+    user_home: &Path,
+    version: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let Some(name) = native_package_name(std::env::consts::OS, std::env::consts::ARCH) else {
+        return Vec::new();
+    };
+    let var = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    // The cache directory is named with Node's platform (`win32`), the
+    // package with npm's (`win`).
+    let (cache_base, node_os) = match std::env::consts::OS {
+        "windows" => (
+            var("LOCALAPPDATA").unwrap_or_else(|| user_home.join("AppData").join("Local")),
+            "win32",
+        ),
+        "macos" => (
+            var("XDG_CACHE_HOME").unwrap_or_else(|| user_home.join(".cache")),
+            "darwin",
+        ),
+        other => (
+            var("XDG_CACHE_HOME").unwrap_or_else(|| user_home.join(".cache")),
+            other,
+        ),
+    };
+    let node_arch = name.rsplit('-').next().unwrap_or_default().to_string();
+    vec![
+        agent_dir.join("npm").join("node_modules").join(&name),
+        cache_base
+            .join("pi-famulus")
+            .join("native")
+            .join(version)
+            .join(format!("{node_os}-{node_arch}"))
+            .join("node_modules")
+            .join(&name),
+    ]
+}
+
+/// Where [`find`] looks, in order: the order the extension uses
+/// (docs/configuration.md, "Manager binary discovery"), then the usual
+/// install directories. The extension finds its npm package by walking up
+/// from its own files; here that step is the two places such an install
+/// puts it ([`native_package_dirs`]).
 #[derive(Clone, Debug, Default)]
 pub struct Search {
     /// `managerPath` of `<home>/config.json`.
     pub config_path: Option<PathBuf>,
     /// `PI_FAMULUS_MANAGER_PATH`.
     pub env_path: Option<PathBuf>,
+    /// Directories of the native npm package (`<dir>/bin/pi-famulus`).
+    pub native_dirs: Vec<PathBuf>,
     /// `<home>/bin`.
     pub home_bin: PathBuf,
     /// The directories of `PATH`.
@@ -125,6 +191,12 @@ impl Search {
         Search {
             config_path,
             env_path,
+            native_dirs: native_package_dirs(
+                &crate::lifecycle::pi_agent_dir(),
+                &crate::lifecycle::user_home(),
+                env!("CARGO_PKG_VERSION"),
+                |key| std::env::var_os(key),
+            ),
             home_bin: home.join("bin"),
             path_dirs,
             fallback_dirs: fallback_dirs(std::env::var_os("HOME").as_deref()),
@@ -137,6 +209,11 @@ impl Search {
         let mut out: Vec<PathBuf> = Vec::new();
         out.extend(self.config_path.clone());
         out.extend(self.env_path.clone());
+        out.extend(
+            self.native_dirs
+                .iter()
+                .map(|d| d.join("bin").join(FILE_NAME)),
+        );
         out.push(self.home_bin.join(FILE_NAME));
         out.extend(
             self.path_dirs
@@ -192,8 +269,9 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// The installed `pi-famulus` binary a frontend may start for `home`:
-/// `managerPath` of `<home>/config.json`, `PI_FAMULUS_MANAGER_PATH`,
-/// `<home>/bin`, `PATH`, then the usual install directories.
+/// `managerPath` of `<home>/config.json`, `PI_FAMULUS_MANAGER_PATH`, the
+/// native npm package, `<home>/bin`, `PATH`, then the usual install
+/// directories.
 pub fn find(home: &Path) -> Option<PathBuf> {
     Search::from_env(home).find()
 }
@@ -235,11 +313,26 @@ mod tests {
         }
     }
 
-    /// Every step present: config, env, home/bin, two PATH dirs, a fallback.
-    fn full(dir: &Dir) -> (Search, [PathBuf; 6]) {
+    /// This platform's package, as the extension and `npm/` name it.
+    fn package() -> String {
+        native_package_name(std::env::consts::OS, std::env::consts::ARCH)
+            .expect("a published platform")
+    }
+
+    /// Every step present: config, env, the npm package in pi's tree and in
+    /// the cache, home/bin, two PATH dirs, a fallback.
+    fn full(dir: &Dir) -> (Search, [PathBuf; 8]) {
+        let pkg = package();
+        let native =
+            native_package_dirs(&dir.0.join("agent"), &dir.0.join("user"), "9.9.9", |_| None);
         let places = [
             dir.exe("config/pi-famulus-custom"),
             dir.exe("env/pi-famulus-env"),
+            dir.exe(&format!("agent/npm/node_modules/{pkg}/bin/pi-famulus")),
+            dir.exe(&format!(
+                "user/.cache/pi-famulus/native/9.9.9/{}/node_modules/{pkg}/bin/pi-famulus",
+                pkg.strip_prefix("pi-famulus-").unwrap()
+            )),
             dir.exe("home/bin/pi-famulus"),
             dir.exe("path1/pi-famulus"),
             dir.exe("path2/pi-famulus"),
@@ -248,6 +341,7 @@ mod tests {
         let search = Search {
             config_path: Some(places[0].clone()),
             env_path: Some(places[1].clone()),
+            native_dirs: native,
             home_bin: dir.0.join("home/bin"),
             path_dirs: vec![dir.0.join("path1"), dir.0.join("path2")],
             fallback_dirs: vec![dir.0.join("fallback")],
@@ -257,13 +351,82 @@ mod tests {
     }
 
     #[test]
+    fn the_npm_package_is_named_and_placed_as_the_extension_does() {
+        // The six published packages, by Rust's names for the platform.
+        let published = [
+            ("linux", "x86_64", "npm/linux-x64", "pi-famulus-linux-x64"),
+            (
+                "linux",
+                "aarch64",
+                "npm/linux-arm64",
+                "pi-famulus-linux-arm64",
+            ),
+            ("macos", "x86_64", "npm/darwin-x64", "pi-famulus-darwin-x64"),
+            (
+                "macos",
+                "aarch64",
+                "npm/darwin-arm64",
+                "pi-famulus-darwin-arm64",
+            ),
+            ("windows", "x86_64", "npm/win32-x64", "pi-famulus-win-x64"),
+            (
+                "windows",
+                "aarch64",
+                "npm/win32-arm64",
+                "pi-famulus-win-arm64",
+            ),
+        ];
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for (os, arch, directory, name) in published {
+            assert_eq!(native_package_name(os, arch).as_deref(), Some(name));
+            // The name and the binary's place are the package's own.
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(repo.join(directory).join("package.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["name"], name, "{directory}");
+            let binary = if os == "windows" {
+                "./bin/pi-famulus.exe"
+            } else {
+                "./bin/pi-famulus"
+            };
+            assert_eq!(manifest["main"], binary, "{directory}");
+        }
+        assert_eq!(native_package_name("freebsd", "x86_64"), None);
+        assert_eq!(native_package_name("linux", "riscv64"), None);
+
+        // This build's platform: pi's npm tree first, then the cache.
+        let pkg = package();
+        let id = pkg.strip_prefix("pi-famulus-").unwrap();
+        let dirs = native_package_dirs(Path::new("/agent"), Path::new("/user"), "1.2.3", |_| None);
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(format!("/agent/npm/node_modules/{pkg}")),
+                PathBuf::from(format!(
+                    "/user/.cache/pi-famulus/native/1.2.3/{id}/node_modules/{pkg}"
+                )),
+            ]
+        );
+        let dirs = native_package_dirs(Path::new("/agent"), Path::new("/user"), "1.2.3", |key| {
+            (key == "XDG_CACHE_HOME").then(|| "/xdg".into())
+        });
+        assert_eq!(
+            dirs[1],
+            PathBuf::from(format!(
+                "/xdg/pi-famulus/native/1.2.3/{id}/node_modules/{pkg}"
+            ))
+        );
+    }
+
+    #[test]
     fn the_binary_is_looked_for_in_the_documented_order() {
         let dir = Dir::new("order");
         let (search, places) = full(&dir);
         assert_eq!(
             search.candidates(),
             places,
-            "config, env, home/bin, PATH in order, fallbacks"
+            "config, env, npm package, cache, home/bin, PATH in order, fallbacks"
         );
         // Remove the winner each time: the next place in the order answers.
         for (i, place) in places.iter().enumerate() {

@@ -25,7 +25,12 @@ pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
             return PathBuf::from(env);
         }
     }
-    let home = if cfg!(windows) {
+    pi_agent_dir().join("pi-famulus")
+}
+
+/// The user's home directory as this crate reads it everywhere.
+pub fn user_home() -> PathBuf {
+    if cfg!(windows) {
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
@@ -34,8 +39,13 @@ pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
-    };
-    home.join(".pi").join("agent").join("pi-famulus")
+    }
+}
+
+/// pi's agent directory, `~/.pi/agent`: the default home is its
+/// `pi-famulus`, and pi installs npm packages under its `npm`.
+pub fn pi_agent_dir() -> PathBuf {
+    user_home().join(".pi").join("agent")
 }
 
 /// Namespaced pipe identity (no `\\.\pipe\` prefix), shared with the
