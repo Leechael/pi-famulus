@@ -112,15 +112,9 @@ Each verdict is one line:
 
 At the end: `SUMMARY` (one line per verdict), stop timings, `session rm` results, the `W` outcomes, every pi pid seen, and a `TOTAL PASS n FAIL n OBSERVED n` line. The run exits 0 when there is no FAIL, 1 when there is one, and 2 when preflight stops it.
 
-`sR` and `sRM` print no verdict lines. Their result is only in the tallies, so read these yourself:
+Every stop of a live session the run started, every `session rm` and every `W` case has its own verdict line. The tallies at the end summarize the same results. Then the teardown lines follow. Check them too: every one should say gone, deleted or not running.
 
-- `closed/total` must be equal (every stop of a live session closed its pane).
-- `session rm ok/total` must be equal.
-- every `W outcomes` row must have `True` as its second field.
-
-A failure there does not change the exit code. Then the teardown lines follow. Check them too: every one should say gone, deleted or not running.
-
-A clean run of the full set prints 39 PASS, 0 FAIL, 7 OBSERVED. `S15` is a PASS only when the model answers with the messaging tool. If it does not, `S15` is OBSERVED and the total shifts by one.
+A clean run of the full set prints 57 PASS, 0 FAIL, 7 OBSERVED. `S15` is a PASS only when the model answers with the messaging tool. If it does not, `S15` is OBSERVED and the total shifts by one.
 
 ## Not for CI
 

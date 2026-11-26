@@ -157,8 +157,13 @@ def session_entries(pane_or_path):
 STOPS = []   # (scenario, closed, wall_s, lag_s, lag_kind)
 
 
+def stop_closed(err, res):
+    """A stop of a live session succeeded: exited, its pane closed."""
+    return (not err) and isinstance(res, dict) and res.get("pane") == "closed" and res.get("state") == "exited"
+
+
 def record_stop(sc, err, res, dt, marks):
-    closed = (not err) and isinstance(res, dict) and res.get("pane") == "closed" and res.get("state") == "exited"
+    closed = stop_closed(err, res)
     lag, kind = None, None
     if "pid_dead" in marks:
         if "agent_cleared" in marks:
@@ -807,6 +812,13 @@ def s12(phase):
                 ee, rr, dd, tr, mk = watch_stop(nm, r["pane_id"], r.get("pid"))
                 ev("stop by name %r" % nm, [ee, rr, "%.2fs" % dd])
                 record_stop("S12 accepted name (fresh)", ee, rr, dd, mk)
+                gone = lib.pane(r["pane_id"]) is None
+                if not (stop_closed(ee, rr) and gone):
+                    for line in tr:
+                        log("   stop-trace " + line)
+                check(sc + " stop by name %r" % nm[:12], stop_closed(ee, rr) and gone and not lib.alive(r.get("pid")),
+                      "stop succeeds: exited, pane closed, pid dead",
+                      "err=%s state=%s pane_exists=%s pid_alive=%s %.2fs" % (ee, st_of(rr), not gone, lib.alive(r.get("pid")), dd))
                 close_pane_if_ours(r["pane_id"], "S12 accepted name")
         n1 = len(lib.panes())
     check(sc, all(e for _, e, _ in out) and not herdr_msg and n0 == n1,
@@ -836,6 +848,13 @@ def s12b():
     e, r, dt, trans, marks = watch_stop(b["id"], b["pane_id"], b["pid"])
     ev("stop second dup by id", [e, r, "%.2fs" % dt])
     record_stop("S12b dup (fresh)", e, r, dt, marks)
+    gone = lib.pane(b["pane_id"]) is None
+    if not (stop_closed(e, r) and gone):
+        for line in trans:
+            log("   stop-trace " + line)
+    check(sc + " stop by id", stop_closed(e, r) and gone and not lib.alive(b["pid"]),
+          "stop succeeds: exited, pane closed, pid dead",
+          "err=%s state=%s pane_exists=%s pid_alive=%s %.2fs" % (e, st_of(r), not gone, lib.alive(b["pid"]), dt))
     close_pane_if_ours(b["pane_id"], "S12b")
     close_pane_if_ours(a["pane_id"], "S12b")
 
@@ -960,10 +979,17 @@ def sR():
         record_stop("R fresh #%d (%s focused)" % (i, "own" if i % 2 else "other"), ee, rr, dd, mk)
         diff = snap_diff(others, snapshot_nofocus(exclude=(r["pane_id"],)))
         p = lib.pane(r["pane_id"])
-        if ee or p is not None or lib.alive(r["pid"]) or diff:
+        alive = lib.alive(r["pid"])
+        if ee or p is not None or alive or diff:
             for line in tr:
                 log("   stop-trace " + line)
             ev("failed stop", [ee, rr, mk, diff])
+        check("%s #%d (%s focused)" % (sc, i, "own" if i % 2 else "other"),
+              stop_closed(ee, rr) and p is None and not alive and not diff,
+              "stop succeeds: exited, pane closed, pid dead, other panes unchanged",
+              "err=%s state=%s pane=%s pane_exists=%s pid_alive=%s others changed=%s wall %.2fs" % (
+                  ee, st_of(rr), rr.get("pane") if isinstance(rr, dict) else rr, p is not None, alive, diff, dd))
+        if p is not None:
             close_pane_if_ours(r["pane_id"], "R left open")
     focus(ANCHOR)
 
@@ -995,6 +1021,9 @@ def sRM():
         ok = r.returncode == 0 and p is None and not lib.alive(pid) and not diff
         RMS.append((ok, round(dt, 2)))
         log("   rm-record #%d ok=%s rc=%s wall=%.2fs pane_exists=%s pid_alive=%s %s" % (i, ok, r.returncode, dt, p is not None, lib.alive(pid), r.stderr.strip()[:200]))
+        check("%s #%d" % (sc, i), ok, "rm <intercom id>: exit 0, pi stopped, pane closed, other panes untouched",
+              "rc=%s pane_exists=%s pid_alive=%s others changed=%s in %.2fs %s" % (
+                  r.returncode, p is not None, lib.alive(pid), diff, dt, r.stderr.strip()[:200]))
         if p:
             close_pane_if_ours(pane_id, "RM left open")
 
