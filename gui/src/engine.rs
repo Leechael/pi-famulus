@@ -191,17 +191,18 @@ impl Engine {
 /// the session may start the manager from (or that there is none); returns
 /// whether one was found. This program's own executable is never an answer:
 /// `daemon_binary::find` skips it and the spawn refuses it.
-fn locate_daemon_binary(home: &Path, known: &mut Option<std::path::PathBuf>) -> bool {
+fn locate_daemon_binary(home: &Path, known: &mut Option<Option<std::path::PathBuf>>) -> bool {
     let found = daemon_binary::find(home);
-    if found != *known {
+    // Declared and logged on the first look and whenever the answer changes.
+    if known.as_ref() != Some(&found) {
         match &found {
             Some(path) => log::info!("daemon binary: {}", path.display()),
             None => log::warn!("daemon binary: pi-famulus not found; only attaching to a running daemon"),
         }
         daemon_binary::declare(found.clone().map(DaemonBinary::At));
-        *known = found;
+        *known = Some(found.clone());
     }
-    known.is_some()
+    found.is_some()
 }
 
 /// Starts the controller on its own thread and runtime.
