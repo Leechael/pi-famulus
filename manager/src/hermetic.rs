@@ -1,4 +1,4 @@
-//! The environment every test binary runs in (unit tests: `main.rs`;
+//! The environment every test binary runs in (unit tests: `lib.rs`;
 //! integration tests: `tests/common/mod.rs` includes this file).
 //!
 //! The test setup decides the environment, not the developer's machine.

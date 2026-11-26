@@ -98,9 +98,23 @@ test('bump-release writes every versioned manifest including prerelease', t => {
   validateMetadata(root, { tag: 'v0.1.3-beta.0', repository });
 });
 
+// The GUI workspace's lockfile: the manager by path, between other entries
+// whose versions are not the release's.
+const guiCargoLock = v => `version = 4\n\n[[package]]\nname = "phf"\nversion = "0.11.3"\n\n[[package]]\nname = "pi-famulus"\nversion = "${v}"\ndependencies = [\n "tokio",\n]\n\n[[package]]\nname = "pi-famulus-gui"\nversion = "0.0.0"\ndependencies = [\n "pi-famulus",\n]\n`;
+
+test('bump-release moves the manager version the GUI lockfile pins, and nothing else in it', t => {
+  const { root, put } = lockedFixture(t, '0.1.2');
+  bumpRelease(root, '0.1.3');
+  assert.equal(readFileSync(join(root, 'gui/Cargo.lock'), 'utf8'), guiCargoLock('0.1.3'), 'only the pi-famulus entry moves');
+  // A lockfile without the entry is a broken tree, not something to skip.
+  put('gui/Cargo.lock', guiCargoLock('0.1.3').replace('name = "pi-famulus"\n', 'name = "pi-famulus-renamed"\n'));
+  assert.throws(() => bumpRelease(root, '0.1.4'), /gui[\\/]Cargo\.lock pi-famulus version not updated/);
+});
+
 function lockedFixture(t, v) {
   const f = fixture(t, v);
   f.put('manager/Cargo.lock', `[[package]]\nname = "pi-famulus"\nversion = "${v}"\n`);
+  f.put('gui/Cargo.lock', guiCargoLock(v));
   f.put('extension/package-lock.json', {
     name: 'pi-famulus',
     version: v,
@@ -125,6 +139,7 @@ function versionCarriers(root) {
     ...Object.fromEntries(PLATFORMS.map(p => [`${p.directory}/package.json`, json(`${p.directory}/package.json`).version])),
     'manager/Cargo.toml': text('manager/Cargo.toml').match(/^version = "([^"]+)"/m)[1],
     'manager/Cargo.lock': text('manager/Cargo.lock').match(/name = "pi-famulus"\r?\nversion = "([^"]+)"/)[1],
+    'gui/Cargo.lock': text('gui/Cargo.lock').match(/name = "pi-famulus"\r?\nversion = "([^"]+)"/)[1],
     'extension/src/manager-client.ts': text('extension/src/manager-client.ts').match(/EXTENSION_VERSION = "([^"]+)"/)[1],
     'package-lock root': lock.version,
     'package-lock packages[""]': lock.packages[''].version,

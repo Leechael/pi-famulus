@@ -7,7 +7,10 @@
 // Every test binary cargo would run is built by one `cargo test --no-run`
 // with the same arguments and then executed exactly as cargo runs it (from
 // the package root, no filters or skips). Any binary that exits unsuccessfully fails
-// the run. The crate has no library target, so there are no doctests.
+// the run. Unit tests are the library's harness (`pi_famulus`, kind lib); the
+// binary's own harness (`pi-famulus`, kind bin) has no tests. Doctests are not
+// built by `--no-run` and so are not run here: the library has none today
+// (`cargo test --doc` runs 0), and one added later needs its own step.
 //
 // Coverage is identical to `cargo test`; only scheduling differs:
 // - ordinary binaries start longest-first, at most PI_FAMULUS_TEST_JOBS at a
@@ -37,7 +40,7 @@ const WEIGHT = {
   intercom: 180,
   lifecycle_adversarial: 80,
   lifecycle_stress: 30,
-  'pi-famulus': 35,
+  pi_famulus: 35, // the library's unit tests; the `pi-famulus` bin harness is empty
   backpressure: 35,
   upgrade: 32,
   platform: 24,

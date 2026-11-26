@@ -2,48 +2,13 @@
 //! Single binary: `daemon` runs the manager; every other subcommand is a
 //! socket client (design doc §3.5).
 
-mod capacity;
-mod cli;
-mod out;
-
-mod client;
-mod clock;
-mod daemon;
-mod events;
-mod fmt;
-mod gc;
-mod handover;
-mod hosted;
-mod inspect;
-mod intercom;
-mod ipc;
-mod lifecycle;
-mod monitor;
-mod winpath;
-mod pager;
-mod proto;
-mod registry;
-mod rpc_child;
-mod runner;
-mod shellstart;
-mod stats;
-mod sys;
-mod task;
-mod top;
-mod workkind;
-
-#[cfg(test)]
-mod fs_permissions;
-#[cfg(test)]
-mod hermetic;
-
+use pi_famulus::*;
 use cli::{Cli, Sub};
 
-/// Package version plus the commit it was built from ("0.1.0+066598ae00"):
-/// every build of 0.1.0 would otherwise look the same in `status`.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
-
 fn main() {
+    // This executable is the daemon binary: clients in this process start
+    // the manager from it. Before anything that can connect.
+    daemon_binary::declare(Some(daemon_binary::DaemonBinary::ThisExecutable));
     // `__run` is every task's process-group leader (`runner`): plain
     // threads, no async runtime, and not a user-facing subcommand.
     let mut args = std::env::args().skip(1);

@@ -108,7 +108,7 @@ Run Cargo commands serially when sharing this checkout with another worker:
 cd manager
 flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 test --locked --test intercom
 flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 test --locked --features test-clock --test intercom
-flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 test --locked --bin pi-famulus intercom::
+flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 test --locked --lib intercom::
 flock /tmp/pi-famulus-intercom-cargo.lock cargo +1.91.0 clippy --locked --all-targets -- -D warnings
 ```
 

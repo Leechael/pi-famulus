@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PLATFORMS, validateTag } from './validate-release.mjs';
@@ -10,6 +10,19 @@ function readJson(path) {
 
 function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+/** Set the `pi-famulus` package's version in a Cargo.lock; no other entry changes. */
+function bumpCargoLock(lockPath, version) {
+  const lock = readFileSync(lockPath, 'utf8');
+  // Git's Windows checkout may store CRLF; keep whatever newline the file uses.
+  const ownPackageVersion = text => text.match(/\[\[package\]\]\r?\nname = "pi-famulus"\r?\nversion = "([^"]+)"/)?.[1];
+  const bumpedLock = lock.replace(
+    /(\[\[package\]\]\r?\nname = "pi-famulus"\r?\nversion = ")[^"]+(")/,
+    `$1${version}$2`,
+  );
+  assert.equal(ownPackageVersion(bumpedLock), version, `${lockPath} pi-famulus version not updated`);
+  writeFileSync(lockPath, bumpedLock);
 }
 
 export function bumpRelease(root, version) {
@@ -33,16 +46,12 @@ export function bumpRelease(root, version) {
   assert.ok(bumpedCargo !== cargo || cargo.includes(`version = "${version}"`), 'Cargo.toml [package] version not updated');
   writeFileSync(cargoPath, bumpedCargo);
 
-  const lockPath = join(root, 'manager/Cargo.lock');
-  const lock = readFileSync(lockPath, 'utf8');
-  // Git's Windows checkout may store CRLF; keep whatever newline the file uses.
-  const ownPackageVersion = text => text.match(/\[\[package\]\]\r?\nname = "pi-famulus"\r?\nversion = "([^"]+)"/)?.[1];
-  const bumpedLock = lock.replace(
-    /(\[\[package\]\]\r?\nname = "pi-famulus"\r?\nversion = ")[^"]+(")/,
-    `$1${version}$2`,
-  );
-  assert.equal(ownPackageVersion(bumpedLock), version, 'Cargo.lock pi-famulus version not updated');
-  writeFileSync(lockPath, bumpedLock);
+  bumpCargoLock(join(root, 'manager/Cargo.lock'), version);
+  // The GUI is a cargo workspace of its own that depends on the manager by
+  // path, so its lockfile pins the manager's version too: left behind,
+  // `cargo build --locked` in gui/ fails after every release.
+  const guiLock = join(root, 'gui/Cargo.lock');
+  if (existsSync(guiLock)) bumpCargoLock(guiLock, version);
 
   const clientPath = join(root, 'extension/src/manager-client.ts');
   const client = readFileSync(clientPath, 'utf8');

@@ -12,7 +12,7 @@ mod http;
 mod idle;
 mod liveness;
 mod localrpc;
-pub(crate) mod native;
+pub mod native;
 pub mod port;
 mod relay;
 mod service;

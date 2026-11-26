@@ -1,0 +1,9 @@
+{
+  "name": "pi-famulus",
+  "id": "network.phala.pi-famulus.gui",
+  "version": "0.0.0",
+  "build": 1,
+  "icon": "../assets/logo.png",
+  "rust": ".",
+  "root": "App"
+}
