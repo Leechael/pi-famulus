@@ -453,6 +453,18 @@ fn pill(state: &TopState, binary_found: bool) -> Runs {
     vec![Run { text: text.into(), fg: Some(color), ..Default::default() }]
 }
 
+/// The version beside the title: the daemon's (the header's; this build's
+/// own while no daemon answers). The window may have started, or attached
+/// to, a daemon of another build; then both are shown, as nothing checks
+/// that the two agree beyond the protocol's own hello.
+fn version_text(daemon: &str, this_build: &str) -> String {
+    if daemon == this_build {
+        daemon.to_string()
+    } else {
+        format!("{daemon} · this window is built from {this_build}")
+    }
+}
+
 /// What the window shows once the engine is gone (its thread ended without
 /// a quit): the last frame, marked stale in the header and the status line,
 /// with every overlay and prompt closed so that the mark is in view. Nothing
@@ -497,7 +509,7 @@ pub fn build(state: &mut TopState, view: &Viewport, binary_found: bool) -> Frame
     });
     let detail = detail(state, view);
     Frame {
-        version: h.version.clone(),
+        version: version_text(&h.version, pi_famulus::VERSION),
         pill: pill(state, binary_found),
         pid_up: h.pid.map(|pid| {
             let up = h.uptime_ms.map(pi_famulus::fmt::human_duration).unwrap_or_else(|| "-".into());
@@ -560,6 +572,53 @@ mod tests {
         let mut state = TopState::new(1_000, None, None);
         let pill = text(&build(&mut state, &view, false).pill);
         assert!(!pill.contains("not found"), "{pill}");
+    }
+
+    #[test]
+    fn a_daemon_of_another_build_is_shown_beside_this_windows_version() {
+        assert_eq!(version_text("0.2.6+abc", "0.2.6+abc"), "0.2.6+abc");
+        let both = version_text("0.2.5+old", "0.2.6+abc");
+        assert!(both.starts_with("0.2.5+old") && both.contains("this window is built from 0.2.6+abc"), "{both}");
+        // In the frame: offline the header carries this build's own version.
+        let mut state = offline();
+        let frame = build(&mut state, &Viewport::default(), true);
+        assert_eq!(frame.version, pi_famulus::VERSION);
+        state.header.version = "0.0.1+other".into();
+        let frame = build(&mut state, &Viewport::default(), true);
+        assert!(frame.version.contains("0.0.1+other") && frame.version.contains(pi_famulus::VERSION), "{}", frame.version);
+    }
+
+    /// The standard install on this platform: the binary only in the npm
+    /// package pi installs next to the extension. Nothing is launched.
+    #[cfg(unix)]
+    #[test]
+    fn the_lookup_finds_the_npm_package_of_a_standard_install() {
+        use pi_famulus::daemon_binary::{native_package_dirs, native_package_name, Search};
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("pfg-lookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let agent = root.join("agent");
+        let home = agent.join("pi-famulus");
+        let pkg = native_package_name(std::env::consts::OS, std::env::consts::ARCH).expect("a published platform");
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(pkg, "pi-famulus-darwin-arm64");
+        let binary = agent.join("npm/node_modules").join(&pkg).join("bin/pi-famulus");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let search = |this_exe: Option<std::path::PathBuf>| Search {
+            native_dirs: native_package_dirs(&agent, &root.join("user"), "0.0.0", |_| None),
+            home_bin: home.join("bin"),
+            this_exe,
+            ..Search::default()
+        };
+        assert_eq!(search(None).find(), None, "nothing installed: not found");
+        std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let found = search(std::env::current_exe().ok()).find();
+        println!("resolved: {found:?}");
+        assert_eq!(found.as_ref(), Some(&binary));
+        assert_eq!(search(Some(binary.clone())).find(), None, "never this program itself");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
