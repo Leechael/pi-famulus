@@ -533,6 +533,15 @@ fn relay_peer_drives_only_local_agent_panes_and_starts_agents_without_permission
         foreign["type"], "error",
         "relay added a tab to a workspace it did not create: {foreign}"
     );
+    // A regression that reaches Herdr must fail promptly instead of waiting
+    // for registration, and must not look like an allowlist refusal.
+    herdr.fail(&["agent.start"]);
+    let agy = call(
+        json!({"type":"session_create","name":"Created AGY","cwd":cwd,"agent":"agy","origin_machine":"other-device"}),
+    );
+    herdr.fail(&[]);
+    assert_eq!(agy["type"], "error", "relay started agy: {agy}");
+    assert_eq!(agy["message"], "--agent must be pi or claude", "{agy}");
     let created = call(
         json!({"type":"session_create","name":"Created Pi","cwd":cwd,"agent":"pi","origin_machine":"other-device","args":["--offline","--model","sonnet"]}),
     );
@@ -1116,6 +1125,33 @@ fn herdr_session_create_keeps_an_explicit_agent_name_and_refuses_flag_like_names
         json!({"op":"session_create","name":"--dangerously-skip-permissions","cwd":"/fixture/new","agent":"claude","workspace":"ws-one"}),
         "must not start with '-'",
     );
+}
+
+#[test]
+fn herdr_session_create_admits_agy_locally() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let mut cli = fixture.connect();
+    let created = cli.ok(json!({"op":"session_create","name":"AGY Label","cwd":"/fixture/new","agent":"agy","workspace":"ws-one"}));
+    assert_eq!(created["pane_id"], "pane-new");
+    let started = herdr.request("agent.start");
+    assert_eq!(started["params"]["kind"], "agy");
+    assert_eq!(started["params"]["name"], "AGY Label");
+}
+
+#[test]
+fn herdr_session_create_passes_agy_args_through_without_a_name_flag() {
+    let mut fixture = Fixture::new();
+    let herdr = Herdr::new(&fixture);
+    let path = herdr.path.to_str().unwrap().to_string();
+    fixture.start_with(&[], &[("HERDR_SOCKET_PATH", &path)]);
+    let mut cli = fixture.connect();
+    let args = json!(["--model", "gemini-3.5-flash", "--mode", "plan"]);
+    cli.ok(json!({"op":"session_create","name":"AGY Label","cwd":"/fixture/new","agent":"agy","workspace":"ws-one","args":args}));
+    let started = herdr.request("agent.start");
+    assert_eq!(started["params"]["args"], args, "agy has no --name flag");
 }
 
 /// `session add` whose agent fails to start leaves no pane behind, and says

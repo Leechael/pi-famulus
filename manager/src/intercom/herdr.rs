@@ -111,6 +111,9 @@ fn native_ids(pane: &Value) -> Vec<String> {
         "pi" => vec![format!("pi/pi-{value}"), format!("pi/{value}")],
         "claude" => vec![format!("claude/{value}")],
         "codex" => vec![format!("codex/{}", value.trim_start_matches("codex/"))],
+        // deferred: map Herdr's agy session ID to an intercom ID
+        // | impact: agy panes cannot be resolved to native intercom sessions
+        // | trigger: a native Antigravity adapter publishes a stable session ID
         _ => vec![],
     }
 }
@@ -373,11 +376,17 @@ async fn pane_for(rt: &Runtime, token: &str, relay: bool) -> Result<String, Stri
         }
     }
 }
-/// The agent's own argv: the session name goes in as `--name` (pi and Claude
-/// both take it) unless the caller already set one, so the agent registers
-/// under it rather than under its cwd.
+fn agent_accepts_name(agent: &str) -> bool {
+    matches!(agent, "pi" | "claude")
+}
+
+/// Pass the label as `--name` only to agents that accept it, and only if
+/// the caller hasn't already set one. Herdr gets the label separately.
 fn agent_args(req: &Value) -> Vec<Value> {
     let mut args = req["args"].as_array().cloned().unwrap_or_default();
+    if !agent_accepts_name(str_field(req, "agent")) {
+        return args;
+    }
     let named = args
         .iter()
         .any(|a| matches!(a.as_str(), Some("--name" | "-n")));
@@ -398,6 +407,9 @@ async fn start_agent(rt: &Runtime, req: &Value, pane: &str) -> Result<(String, S
         json!({"name":req["name"],"kind":req["agent"],"pane_id":pane,"args":agent_args(req)}),
     )
     .await?;
+    // deferred: make the registration wait aware of agy
+    // | impact: local agy launches wait for the timeout and return a pane ID, not an intercom ID
+    // | trigger: a native Antigravity adapter provides local registration
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     // Only a local registration of the agent kind just started can be it: a
     // row from another machine may carry the same pane id.
@@ -830,11 +842,19 @@ async fn run(rt: &Runtime, req: &Value, relay: bool) -> Result<Value, String> {
             if name.is_empty() || cwd.is_empty() {
                 return Err("workspace/session add requires --name and --cwd".into());
             }
-            if !(["pi", "claude"].contains(&agent) || op == "workspace_create" && agent.is_empty())
-            {
-                return Err("--agent must be pi or claude".into());
+            // deferred: allow relay peers to start agy
+            // | impact: remote session/workspace add cannot start agy because its pane cannot
+            // be verified as a local agent session | trigger: a native Antigravity adapter
+            // registers agy and supports local pane identity checks
+            let supported = if relay {
+                &["pi", "claude"][..]
+            } else {
+                &["pi", "claude", "agy"][..]
+            };
+            if !(supported.contains(&agent) || op == "workspace_create" && agent.is_empty()) {
+                return Err(format!("--agent must be {}", supported.join(" or ")));
             }
-            if !agent.is_empty() && name.starts_with('-') {
+            if agent_accepts_name(agent) && name.starts_with('-') {
                 return Err("--name must not start with '-': it is passed to the agent".into());
             }
             if relay {
