@@ -110,6 +110,8 @@ The default socket is `$XDG_RUNTIME_DIR/pi-famulus/client.sock` when `XDG_RUNTIM
 
 A non-loopback `mcpListen` requires `mcpAllowNonLoopback: true` and a non-empty `mcpToken`. A webhook with a secret must use HTTPS or a loopback URL.
 
+See [Antigravity CLI as an MCP client](agy-mcp.md) for loopback client setup and the limits of using MCP without a registered intercom session.
+
 ### Hosted server enrollment
 
 Hosted servers exchange an operator-issued enrollment token for a per-device credential. A legacy shared token such as the old `dev-token` example is not a device credential.
