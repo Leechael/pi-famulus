@@ -28,6 +28,8 @@ const VERSIONS: [&str; 5] = [
 const START_SESSION: &str = "start_session";
 const SESSION_STATUS: &str = "session_status";
 const STOP_SESSION: &str = "stop_session";
+const MISSING_FROM: &str =
+    "from required: use the exact ID of your registered local intercom session (see list_sessions)";
 // Nothing larger than one relay frame can be delivered remotely.
 const MAX_BODY: usize = super::relay::MAX_FRAME;
 type Body = UnsyncBoxBody<Bytes, Infallible>;
@@ -727,6 +729,10 @@ fn validate_arguments(tool: &Value, args: &Value) -> Result<(), String> {
         .filter_map(Value::as_str)
     {
         if !args.contains_key(field) {
+            // An omitted watcher ID never reaches the tool's empty-value check.
+            if field == "from" && tool["name"] == "notify_when_idle" {
+                return Err(MISSING_FROM.into());
+            }
             return Err(format!(
                 "validating arguments: missing required property {field:?}"
             ));
@@ -1325,9 +1331,6 @@ async fn local_sender(rt: &Shared, from: &str) -> Result<(), String> {
         Err(format!("from {from:?} is not a local intercom session"))
     }
 }
-const MISSING_FROM: &str =
-    "from required: use the exact ID of your registered local intercom session (see list_sessions)";
-
 async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, String> {
     match name {
         "list_sessions" => {

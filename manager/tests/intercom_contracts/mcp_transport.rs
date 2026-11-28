@@ -579,6 +579,7 @@ fn missing_mcp_sender_points_to_a_registered_session_for_any_client() {
             json!({"to":"pi/target","message":"must not dispatch"}),
         ),
         ("notify_when_idle", json!({"to":"pi/target","from":""})),
+        ("notify_when_idle", json!({"to":"pi/target"})),
     ] {
         let error = call(address, name, args).unwrap_err();
         assert!(error.contains("from required"), "{name}: {error}");
