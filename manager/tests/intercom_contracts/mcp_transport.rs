@@ -538,6 +538,60 @@ fn malformed_json_and_http_content_negotiation_never_produce_successful_tools() 
 }
 
 #[test]
+fn mcp_tool_discovery_explains_the_local_intercom_identity_requirement() {
+    let (_fixture, address) = start();
+    let response = request(
+        address,
+        "POST",
+        &[
+            ("MCP-Protocol-Version", MODERN),
+            ("Mcp-Method", "tools/list"),
+        ],
+        &modern("tools/list", json!({})),
+    );
+    assert_eq!(response.status, 200);
+    let result = response.json();
+    for name in ["send", "notify_when_idle"] {
+        let tool = result["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        let description = tool["inputSchema"]["properties"]["from"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            description.contains("registered local intercom session")
+                && description.contains("list_sessions"),
+            "{name}: {description}"
+        );
+    }
+}
+
+#[test]
+fn missing_mcp_sender_points_to_a_registered_session_for_any_client() {
+    let (fixture, address) = start();
+    let mut target = fixture.plugin("target", "busy");
+    for (name, args) in [
+        (
+            "send",
+            json!({"to":"pi/target","message":"must not dispatch"}),
+        ),
+        ("notify_when_idle", json!({"to":"pi/target","from":""})),
+        ("notify_when_idle", json!({"to":"pi/target"})),
+    ] {
+        let error = call(address, name, args).unwrap_err();
+        assert!(error.contains("from required"), "{name}: {error}");
+        assert!(
+            error.contains("registered local intercom session") && error.contains("list_sessions"),
+            "{name}: {error}"
+        );
+    }
+    target.no_event();
+}
+
+#[test]
 fn notify_when_idle_enforces_the_same_local_sender_policy_as_send() {
     let (fixture, address) = start();
     let _target = fixture.plugin("target", "busy");

@@ -28,6 +28,8 @@ const VERSIONS: [&str; 5] = [
 const START_SESSION: &str = "start_session";
 const SESSION_STATUS: &str = "session_status";
 const STOP_SESSION: &str = "stop_session";
+const MISSING_FROM: &str =
+    "from required: use the exact ID of your registered local intercom session (see list_sessions)";
 // Nothing larger than one relay frame can be delivered remotely.
 const MAX_BODY: usize = super::relay::MAX_FRAME;
 type Body = UnsyncBoxBody<Bytes, Infallible>;
@@ -727,6 +729,10 @@ fn validate_arguments(tool: &Value, args: &Value) -> Result<(), String> {
         .filter_map(Value::as_str)
     {
         if !args.contains_key(field) {
+            // An omitted watcher ID never reaches the tool's empty-value check.
+            if field == "from" && tool["name"] == "notify_when_idle" {
+                return Err(MISSING_FROM.into());
+            }
             return Err(format!(
                 "validating arguments: missing required property {field:?}"
             ));
@@ -1346,9 +1352,7 @@ async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, Strin
         "send" => {
             let from = str_field(args, "from").trim();
             if from.is_empty() {
-                return Err(
-                    "from required: pass your intercom session id (codex/<threadId>)".into(),
-                );
+                return Err(MISSING_FROM.into());
             }
             local_sender(rt, from).await?;
             let to = resolve_to(rt, str_field(args, "to")).await?;
@@ -1383,9 +1387,7 @@ async fn call_tool(rt: &Shared, name: &str, args: &Value) -> Result<Value, Strin
             // session"), which is exactly what `local_sender` enforces.
             let from = str_field(args, "from").trim();
             if from.is_empty() {
-                return Err(
-                    "from required: pass your intercom session id (codex/<threadId>)".into(),
-                );
+                return Err(MISSING_FROM.into());
             }
             let to = resolve_to(rt, str_field(args, "to")).await?;
             let value = rt.subscribe(from, &to).await?;
@@ -1516,7 +1518,7 @@ fn tools() -> Vec<Value> {
         ("send", "Send a message to another agent session over intercom", &[
             ("to", "target session name or id", true),
             ("message", "message text", true),
-            ("from", "sender intercom session id (required)", false),
+            ("from", "Required at runtime: exact ID of your registered local intercom session (see list_sessions)", false),
         ]),
         ("list_sessions", "List agent sessions visible over intercom", &[
             ("query", "optional filter over id, name, machine, cwd", false),
@@ -1529,7 +1531,7 @@ fn tools() -> Vec<Value> {
             ("message_id", "message id returned by send", true),
         ]),
         ("notify_when_idle", "Subscribe once to an agent becoming idle. Returns delivery_mode: pi_push for an upgraded Pi watcher, otherwise query_only (use idle_status); does not inject a turn or native notification into Codex or MCP Claude.", &[
-            ("from", "watcher intercom session id (e.g. codex/<threadId>)", true),
+            ("from", "Exact ID of your registered local intercom session that will watch for idle (see list_sessions)", true),
             ("to", "target session name or id", true),
         ]),
         ("idle_status", "Look up the latest status of an idle notification subscription", &[
