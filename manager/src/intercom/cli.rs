@@ -174,6 +174,7 @@ pub enum SessionCommand {
         name: String,
         #[usage(long)]
         cwd: String,
+        /// Herdr agent: pi, claude, or agy (agy is local only).
         #[usage(long)]
         agent: String,
         #[usage(long)]
@@ -228,6 +229,7 @@ pub enum WorkspaceCommand {
         name: String,
         #[usage(long)]
         cwd: String,
+        /// Herdr agent: pi, claude, or agy (agy is local only).
         #[usage(long)]
         agent: Option<String>,
         #[usage(long)]
@@ -903,8 +905,11 @@ Work without Herdr:
   `herdr not available on <machine>`. The daemon does not start Herdr.
 - prompt, keys, read, wait, and session rm fail with
   `session <id> is not in a herdr pane` when the listed session has no pane.
-- session add only starts `pi` or `claude` through Herdr. There is no
-  fallback that spawns those processes itself.
+- session add and workspace add can start `pi`, `claude`, or `agy` through
+  local Herdr. Over the relay only `pi` and `claude` are supported. There is
+  no fallback that spawns those processes itself.
+- `agy` does not register as an intercom peer. The add command returns its
+  Herdr pane ID after the registration wait, not a sendable intercom ID.
 - `send` still uses the existing plugin/UDS path and is not a fallback
   for `session prompt`.
 
@@ -913,6 +918,7 @@ Work without Herdr:
     pi-famulus intercom session list
     pi-famulus intercom session prompt --until idle --timeout 2m pi/my-session "hello"
     pi-famulus intercom workspace add --name demo --cwd /tmp/proj --agent pi
+    pi-famulus intercom session add --name demo-agy --cwd /tmp/proj --agent agy -- --mode plan
 "#;
 
 const HELP_IDLE: &str = r#"# Idle subscriptions
